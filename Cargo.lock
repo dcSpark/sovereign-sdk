@@ -3631,6 +3631,7 @@ dependencies = [
  "sov-test-modules",
  "sov-test-utils",
  "sov-uniqueness",
+ "sov-value-setter-zk",
  "strum 0.26.3",
 ]
 
@@ -12118,6 +12119,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-ligero-adapter"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "bincode",
+ "borsh",
+ "digest 0.10.7",
+ "hex",
+ "proptest",
+ "rand 0.8.5",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sov-ligero-adapter",
+ "sov-mock-zkvm",
+ "sov-rollup-interface",
+ "sov-zkvm-utils",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "sov-metrics"
 version = "0.3.0"
 dependencies = [
@@ -13140,6 +13166,26 @@ dependencies = [
  "sov-test-utils",
  "sov-value-setter",
  "strum 0.26.3",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sov-value-setter-zk"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "borsh",
+ "schemars 0.8.22",
+ "serde",
+ "sha2 0.10.9",
+ "sov-address",
+ "sov-ligero-adapter",
+ "sov-modules-api",
+ "sov-rollup-interface",
+ "sov-state",
+ "sov-test-utils",
  "tempfile",
  "thiserror 1.0.69",
 ]

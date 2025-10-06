@@ -1724,6 +1724,7 @@ dependencies = [
  "sov-synthetic-load",
  "sov-test-modules",
  "sov-uniqueness",
+ "sov-value-setter-zk",
  "strum 0.26.3",
 ]
 
@@ -5659,6 +5660,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-ligero-adapter"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "borsh",
+ "digest 0.10.7",
+ "hex",
+ "schemars 0.8.21",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sov-mock-zkvm",
+ "sov-rollup-interface",
+ "sov-zkvm-utils",
+ "thiserror 1.0.64",
+ "tracing",
+]
+
+[[package]]
 name = "sov-metrics"
 version = "0.3.0"
 dependencies = [
@@ -5989,6 +6010,22 @@ dependencies = [
  "proc-macro2",
  "sov-universal-wallet-macro-helpers",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "sov-value-setter-zk"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "borsh",
+ "schemars 0.8.21",
+ "serde",
+ "sov-ligero-adapter",
+ "sov-modules-api",
+ "sov-rollup-interface",
+ "sov-state",
+ "thiserror 1.0.64",
 ]
 
 [[package]]

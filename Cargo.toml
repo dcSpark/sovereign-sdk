@@ -52,6 +52,7 @@ members = [
     "crates/module-system/module-implementations/sov-sequencer-registry",
     "crates/module-system/sov-solana-offchain-auth",
     "crates/module-system/module-implementations/sov-value-setter",
+    "crates/module-system/module-implementations/sov-value-setter-zk",
     "crates/module-system/module-implementations/sov-revenue-share",
     "crates/module-system/module-implementations/sov-synthetic-load",
     "crates/module-system/module-implementations/sov-test-modules",
@@ -83,6 +84,7 @@ members = [
     # TODO: https://github.com/Sovereign-Labs/sovereign-sdk-wip/issues/498
     # "crates/adapters/avail",
     "crates/adapters/celestia",
+    "crates/adapters/ligero",
     "crates/adapters/risc0",
     "crates/adapters/sp1",
 ]
@@ -122,6 +124,7 @@ sov-soak-testing-lib = { path = "crates/utils/sov-soak-testing-lib", default-fea
 sov-eth-client = { path = "crates/utils/sov-eth-client", default-features = false, version = "0.3" }
 sov-blob-sender = { path = "crates/full-node/sov-blob-sender", default-features = false, version = "0.3" }
 sov-celestia-adapter = { path = "crates/adapters/celestia", default-features = false, version = "0.3" }
+sov-ligero-adapter = { path = "crates/adapters/ligero", default-features = false, version = "0.3" }
 sov-risc0-adapter = { path = "crates/adapters/risc0", default-features = false, version = "0.3" }
 sov-sp1-adapter = { path = "crates/adapters/sp1", default-features = false, version = "0.3" }
 sov-ethereum = { path = "crates/full-node/sov-ethereum", default-features = false, version = "0.3" }
@@ -133,6 +136,7 @@ sov-node-client = { path = "crates/utils/sov-node-client", default-features = fa
 sov-operator-incentives = { path = "crates/module-system/module-implementations/sov-operator-incentives", default-features = false, version = "0.3" }
 sov-prover-incentives = { path = "crates/module-system/module-implementations/sov-prover-incentives", default-features = false, version = "0.3" }
 sov-value-setter = { path = "crates/module-system/module-implementations/sov-value-setter", default-features = false, version = "0.3" }
+sov-value-setter-zk = { path = "crates/module-system/module-implementations/sov-value-setter-zk", default-features = false, version = "0.3" }
 sov-synthetic-load = { path = "crates/module-system/module-implementations/sov-synthetic-load", default-features = false, version = "0.3" }
 sov-test-modules = { path = "crates/module-system/module-implementations/sov-test-modules", default-features = false, version = "0.3" }
 sov-chain-state = { path = "crates/module-system/module-implementations/sov-chain-state", default-features = false, version = "0.3" }

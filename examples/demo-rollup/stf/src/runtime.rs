@@ -83,6 +83,8 @@ where
     pub access_pattern: sov_test_modules::access_pattern::AccessPattern<S>,
     /// A module for synthetic load testing and state operations.
     pub synthetic_load: sov_synthetic_load::SyntheticLoad<S>,
+    /// The Value Setter ZK module (Ligero proof verification demo).
+    pub value_setter_zk: sov_value_setter_zk::ValueSetterZk<S>,
 }
 
 impl<S> sov_modules_stf_blueprint::Runtime<S> for Runtime<S>
