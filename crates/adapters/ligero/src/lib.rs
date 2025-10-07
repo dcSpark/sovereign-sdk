@@ -71,11 +71,14 @@
 //! See the [README](../README.md) for detailed setup instructions.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use serde::de::DeserializeOwned;
+use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use sov_mock_zkvm::crypto::{Ed25519PublicKey, Ed25519Signature};
 use sov_rollup_interface::zk::{CryptoSpec, ZkVerifier, Zkvm};
 use thiserror::Error;
+use std::convert::TryInto;
+use std::fmt;
 
 mod guest;
 pub use guest::LigeroGuest;
@@ -116,7 +119,7 @@ impl Zkvm for Ligero {
 
 /// Code commitment for Ligero (SHA-256 hash of WASM + packing)
 #[derive(
-    Debug, Clone, PartialEq, Eq, BorshDeserialize, BorshSerialize, Serialize, Deserialize, Default,
+    Debug, Clone, PartialEq, Eq, BorshDeserialize, BorshSerialize, Default,
 )]
 pub struct LigeroCodeCommitment(pub [u8; 32]);
 
@@ -146,6 +149,100 @@ pub enum LigeroCodeCommitmentError {
         /// The size of the input
         found: usize,
     },
+}
+
+impl Serialize for LigeroCodeCommitment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Emit the RISC0-style eight-word representation for compatibility with existing genesis files.
+        let mut seq = serializer.serialize_seq(Some(8))?;
+        for chunk in self.0.chunks_exact(4) {
+            let word = u32::from_le_bytes(chunk.try_into().expect("chunk size is enforced"));
+            seq.serialize_element(&word)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LigeroCodeCommitment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(LigeroCodeCommitmentVisitor)
+    }
+}
+
+struct LigeroCodeCommitmentVisitor;
+
+impl<'de> Visitor<'de> for LigeroCodeCommitmentVisitor {
+    type Value = LigeroCodeCommitment;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a byte array of length 32 or eight 32-bit words")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut elements = Vec::new();
+        while let Some(value) = seq.next_element::<u64>()? {
+            elements.push(value);
+        }
+
+        match elements.len() {
+            32 => {
+                let mut data = [0u8; 32];
+                for (idx, byte) in elements.iter().enumerate() {
+                    if *byte > u8::MAX as u64 {
+                        return Err(de::Error::invalid_value(
+                            de::Unexpected::Unsigned(*byte),
+                            &"a byte-sized value (0-255)",
+                        ));
+                    }
+                    data[idx] = *byte as u8;
+                }
+                Ok(LigeroCodeCommitment(data))
+            }
+            8 => {
+                let mut data = [0u8; 32];
+                for (idx, word) in elements.iter().enumerate() {
+                    if *word > u32::MAX as u64 {
+                        return Err(de::Error::invalid_value(
+                            de::Unexpected::Unsigned(*word),
+                            &"a 32-bit unsigned integer",
+                        ));
+                    }
+                    let word_bytes = (*word as u32).to_le_bytes();
+                    let start = idx * 4;
+                    data[start..start + 4].copy_from_slice(&word_bytes);
+                }
+                Ok(LigeroCodeCommitment(data))
+            }
+            len => Err(de::Error::invalid_length(
+                len,
+                &"expected either 32 byte values or eight 32-bit words",
+            )),
+        }
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if v.len() != 32 {
+            return Err(E::invalid_length(
+                v.len(),
+                &"expected 32 raw bytes for Ligero code commitment",
+            ));
+        }
+        let mut data = [0u8; 32];
+        data.copy_from_slice(v);
+        Ok(LigeroCodeCommitment(data))
+    }
 }
 
 /// A Ligero proof package containing both the proof and public output

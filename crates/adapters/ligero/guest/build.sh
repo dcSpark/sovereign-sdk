@@ -29,7 +29,15 @@ if ! command -v emcc &> /dev/null; then
 fi
 
 # Check for Ligero SDK
-LIGERO_SDK_PATH="${LIGERO_SDK_PATH:-../../../../../ligero-vm/ligero-prover/sdk}"
+# Get the parent directory containing both repositories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# From guest/ go up 5 levels: guest -> ligero -> adapters -> crates -> sovereign-ligero -> parent
+PARENT_DIR="$(cd "$SCRIPT_DIR" && cd ../../../../.. && pwd)"
+DEFAULT_SDK_PATH="$PARENT_DIR/ligero-vm/ligero-prover/sdk"
+LIGERO_SDK_PATH="${LIGERO_SDK_PATH:-$DEFAULT_SDK_PATH}"
+
+echo -e "${YELLOW}Ligero SDK path: ${LIGERO_SDK_PATH}${NC}"
+
 if [ ! -f "$LIGERO_SDK_PATH/build/libligetron.a" ]; then
     echo -e "${RED}Error: Ligero SDK not found or not built!${NC}"
     echo "Expected: $LIGERO_SDK_PATH/build/libligetron.a"
@@ -47,6 +55,16 @@ echo -e "${YELLOW}Creating build directory...${NC}"
 mkdir -p build
 cd build
 
+# Check if CMake cache exists with different source path and clean if needed
+if [ -f "CMakeCache.txt" ]; then
+    CACHED_SOURCE=$(grep "CMAKE_HOME_DIRECTORY:INTERNAL=" CMakeCache.txt | cut -d'=' -f2)
+    CURRENT_SOURCE="$(cd .. && pwd)"
+    if [ "$CACHED_SOURCE" != "$CURRENT_SOURCE" ]; then
+        echo -e "${YELLOW}Detected CMake cache from different location, cleaning...${NC}"
+        rm -rf *
+    fi
+fi
+
 # Configure with CMake
 echo -e "${YELLOW}Configuring with CMake...${NC}"
 emcmake cmake .. -DLIGERO_SDK_PATH="$LIGERO_SDK_PATH"
@@ -62,11 +80,20 @@ if [ -f "value_validator.wasm" ]; then
     echo "Output: $(pwd)/value_validator.wasm"
     echo "Size: $(ls -lh value_validator.wasm | awk '{print $5}')"
     
-    # Optionally copy to bins/programs
-    echo ""
-    read -p "Copy to ../bins/programs/? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # Auto-copy to bins/programs (or prompt if interactive)
+    if [ -t 0 ]; then
+        # Running interactively (stdin is a terminal)
+        echo ""
+        read -p "Copy to ../bins/programs/? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            mkdir -p ../bins/programs
+            cp value_validator.wasm ../bins/programs/
+            echo -e "${GREEN}✓ Copied to ../bins/programs/value_validator.wasm${NC}"
+        fi
+    else
+        # Running non-interactively (e.g., from cargo build) - auto-copy
+        echo "Auto-copying to ../bins/programs/"
         mkdir -p ../bins/programs
         cp value_validator.wasm ../bins/programs/
         echo -e "${GREEN}✓ Copied to ../bins/programs/value_validator.wasm${NC}"

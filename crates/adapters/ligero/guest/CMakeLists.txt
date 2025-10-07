@@ -5,8 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Path to Ligero SDK (adjust if needed)
-# Default assumes ligero-vm is a sibling directory to sovereign-sdk
-set(LIGERO_SDK_PATH "${CMAKE_SOURCE_DIR}/../../../../../ligero-vm/ligero-prover/sdk" CACHE PATH "Path to Ligero SDK")
+# Navigate from guest/ to parent directory: guest -> ligero -> adapters -> crates -> sovereign-ligero -> parent
+get_filename_component(PARENT_DIR "${CMAKE_SOURCE_DIR}/../../../../.." ABSOLUTE)
+set(LIGERO_SDK_PATH "${PARENT_DIR}/ligero-vm/ligero-prover/sdk" CACHE PATH "Path to Ligero SDK")
 
 # Include Ligero SDK headers
 include_directories(${LIGERO_SDK_PATH}/include)

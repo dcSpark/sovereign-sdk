@@ -79,6 +79,8 @@ members = [
     "examples/demo-rollup/rest-api-load-testing",
     "examples/demo-rollup/stf/demo-stf-json-client",
     "examples/demo-rollup/sov-soak-testing",
+    "examples/rollup-ligero",
+    "examples/rollup-ligero/provers/ligero",
     "crates/utils/sov-soak-testing-lib",
     # Adapters
     # TODO: https://github.com/Sovereign-Labs/sovereign-sdk-wip/issues/498
