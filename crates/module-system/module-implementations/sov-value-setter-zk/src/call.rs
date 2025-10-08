@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
-use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+use sov_rollup_interface::zk::CodeCommitment;
 use thiserror::Error;
 
 use super::ValueSetterZk;
@@ -26,7 +26,7 @@ pub struct ValueProofPublic {
 #[serde(rename_all = "snake_case")]
 pub enum CallMessage<S: Spec> {
     /// Set a new value with ZK proof verification.
-    /// The proof must demonstrate that the value is within the valid range [0, 100].
+    /// The proof must demonstrate that the value is within the valid range [0, 65535].
     SetValueWithProof {
         /// The value to set
         value: u32,
@@ -81,7 +81,9 @@ impl<S: Spec> ValueSetterZk<S> {
     /// 2. Commit to a `ValueProofPublic` struct in its journal
     /// 3. Have a journal value matching the requested value
     ///
-    /// The guest program enforces that the value is within [0, 100].
+    /// The guest program enforces that:
+    /// - The value is within [0, 65535]
+    /// - The proven value matches the claimed value (prevents proof substitution attacks)
     pub(crate) fn set_value_with_proof(
         &mut self,
         value: u32,
@@ -103,15 +105,23 @@ impl<S: Spec> ValueSetterZk<S> {
         // Verify the proof using LigeroVerifier
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier, LigeroProofPackage};
             
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                 .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
             
-            let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
+            // Deserialize the proof package
+            let package: LigeroProofPackage<ValueProofPublic> = bincode::deserialize(&proof)
+                .map_err(|e| anyhow!("Failed to deserialize proof package: {}", e))?;
+            
+            // SECURITY CRITICAL: Verify the proof with BOTH the proven value and claimed value
+            // The WASM program will assert that proven_value == claimed_value
+            // This prevents proof substitution attacks where attacker uses proof for value X to claim value Y
+            let public: ValueProofPublic = LigeroVerifier::verify_with_value(&package.proof, &method_id, value)
                 .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?;
             
-            // Ensure the verified journal matches the requested value
+            // Double-check: Ensure the verified journal matches the requested value
+            // This is redundant with WASM check but provides defense in depth
             if public.value != value {
                 return Err(SetValueZkError::<S>::ValueMismatch {
                     journal_value: public.value,

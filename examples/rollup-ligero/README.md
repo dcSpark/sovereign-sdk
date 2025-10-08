@@ -48,6 +48,27 @@ export SOV_PROVER_MODE=execute  # Fast mode without proving
 cargo build --release
 ```
 
+## Environment Variables for Node Verification
+
+**IMPORTANT**: For the node to verify Ligero proofs from the `value-setter-zk` module, you must set these environment variables:
+
+```bash
+# Set Ligero environment variables for proof verification
+export LIGERO_PROGRAM_PATH=$(pwd)/../../crates/adapters/ligero/guest/bins/programs/value_validator.wasm
+export LIGERO_SHADER_PATH=$(pwd)/../../../ligero-vm/ligero-prover/gpu-prover/src/shaders
+```
+
+Or simply source the provided script:
+```bash
+source set_ligero_env.sh
+```
+
+These variables tell the verifier where to find:
+- **LIGERO_PROGRAM_PATH**: The compiled WASM program used to verify proofs
+- **LIGERO_SHADER_PATH**: The GPU shaders for verification
+
+Without these, proof verification will fail with "Code commitment verification failed".
+
 ### Full Build (with Guest Programs)
 
 ```bash

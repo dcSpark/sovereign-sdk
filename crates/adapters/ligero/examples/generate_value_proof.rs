@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <value>", args[0]);
-        eprintln!("  where <value> is a u32 in the range [0, 100]");
+        eprintln!("  where <value> is a u32 in the range [0, 65535]");
         std::process::exit(1);
     }
 
@@ -36,8 +36,8 @@ fn main() -> Result<()> {
         .parse()
         .context("Failed to parse value as u32")?;
 
-    if value > 100 {
-        anyhow::bail!("Value {} is out of range. Must be between 0 and 100.", value);
+    if value > 65535 {
+        anyhow::bail!("Value {} is out of range. Must be between 0 and 65535.", value);
     }
 
     println!("Generating Ligero proof for value: {}", value);
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     // Find the value_validator.wasm program
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let program_path = PathBuf::from(manifest_dir)
-        .join("bins/programs/value_validator.wasm");
+        .join("guest/bins/programs/value_validator.wasm");
 
     if !program_path.exists() {
         anyhow::bail!(
@@ -69,8 +69,12 @@ fn main() -> Result<()> {
     // No private inputs for this example
     // (In a real scenario, you might mark certain inputs as private)
     
-    // Add the value as an argument (as raw bytes)
+    // Add the proven value as the first argument (as raw bytes)
     let value_bytes = value.to_le_bytes();
+    host.add_hex_arg(hex::encode(&value_bytes));
+    
+    // Add the claimed value as the second argument (same as proven value for generation)
+    // During verification, this will be compared against the transaction's claimed value
     host.add_hex_arg(hex::encode(&value_bytes));
 
     // Get the code commitment (method ID)

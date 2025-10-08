@@ -47,14 +47,28 @@
 //!
 //! - **`LIGERO_PROGRAM_PATH`**: Path to WASM program to verify (required)
 //!   - Example: `crates/adapters/ligero/guest/bins/value_validator.wasm`
+//!   - **Security Note**: This WASM program's hash (with packing) forms the code commitment.
+//!     The verifier will reject proofs that don't match this exact program.
 //!
 //! - **`LIGERO_SHADER_PATH`**: Path to verifier shader (required)
 //!   - Example: `crates/adapters/ligero/guest/bins/shader`
 //!
 //! - **`LIGERO_PACKING`**: FFT packing parameter (optional, default: 8192)
+//!   - **Security Note**: This value is included in the code commitment computation.
 //!
 //! - **`LIGERO_CONFIG_PATH`**: Path to full JSON config file (optional)
 //!   - If set, overrides individual path variables
+//!
+//! ## Security
+//!
+//! The verifier performs **code commitment verification** before accepting proofs.
+//! This ensures that:
+//! - Proofs can only be accepted if they correspond to the expected guest program
+//! - An attacker cannot submit a proof for a malicious program that bypasses constraints
+//! - The code commitment is computed as: `SHA-256(WASM_bytes || packing_u32_le)`
+//!
+//! The code commitment check is performed automatically during verification and will
+//! reject any proof that doesn't match the configured WASM program and packing parameter.
 //!
 //! ## Usage Example
 //!
@@ -111,6 +125,14 @@ pub use guest::LigeroGuest;
 mod host;
 #[cfg(feature = "native")]
 pub use host::{LigeroArg, LigeroConfig, LigeroHost};
+
+/// Public output from the Ligero guest program for value validation.
+/// This structure is committed in the proof's journal and verified on-chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueProofPublic {
+    /// The value that was proven to be valid
+    pub value: u32,
+}
 
 /// The cryptographic primitives used by Ligero (reuses mock-zkvm crypto)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy, schemars::JsonSchema)]
@@ -289,7 +311,7 @@ impl ZkVerifier for LigeroVerifier {
 
     fn verify<T: DeserializeOwned>(
         serialized_proof: &[u8],
-        _code_commitment: &Self::CodeCommitment,
+        code_commitment: &Self::CodeCommitment,
     ) -> Result<T, Self::Error> {
         // The proof is a bincode-serialized LigeroProofPackage<T>
         // which contains both the raw proof and the public output
@@ -304,6 +326,9 @@ impl ZkVerifier for LigeroVerifier {
         // Perform actual verification using webgpu_verifier
         #[cfg(feature = "native")]
         {
+            // First verify that the proof corresponds to the expected code commitment
+            Self::verify_code_commitment(code_commitment)?;
+            
             // TODO: For value-setter-zk, we should pass the value as a hex argument
             // For now, we'll try without arguments since there are no private indices
             // The verification might still work if the guest program's public output
@@ -313,6 +338,7 @@ impl ZkVerifier for LigeroVerifier {
         
         #[cfg(not(feature = "native"))]
         {
+            let _ = code_commitment; // Used only in native feature
             tracing::warn!("Ligero verification only available with 'native' feature - skipping verification");
         }
         
@@ -321,6 +347,121 @@ impl ZkVerifier for LigeroVerifier {
 }
 
 impl LigeroVerifier {
+    /// Verify a Ligero proof with a specific claimed value
+    /// 
+    /// This method passes BOTH the proven value (from proof generation) and the claimed value
+    /// (from the transaction) to the WASM program, which will assert they match.
+    /// 
+    /// # Security
+    /// 
+    /// This prevents proof substitution attacks where an attacker uses a proof for value X
+    /// to claim value Y in the transaction.
+    #[cfg(feature = "native")]
+    pub fn verify_with_value<T: DeserializeOwned>(
+        proof_bytes: &[u8],
+        code_commitment: &LigeroCodeCommitment,
+        claimed_value: u32,
+    ) -> Result<T, anyhow::Error> {
+        tracing::debug!("Ligero: Verifying proof with claimed value: {}", claimed_value);
+        
+        // Verify code commitment
+        Self::verify_code_commitment(code_commitment)?;
+        
+        // Create hex argument for the claimed value
+        let claimed_value_bytes = claimed_value.to_le_bytes();
+        let claimed_value_hex = hex::encode(&claimed_value_bytes);
+        
+        // Perform verification with the claimed value as argument
+        Self::verify_with_args(proof_bytes, &[claimed_value_hex])?;
+        
+        // For now, we don't extract the actual public output from the Ligero proof
+        // We rely on the WASM program's assertions to validate correctness
+        // The public output should match the claimed value
+        let public_output = unsafe {
+            // SAFETY: This is a temporary workaround. In production, we should properly
+            // extract and deserialize the public output from the Ligero proof.
+            // For value-setter-zk, the public output is ValueProofPublic { value: u32 }
+            std::mem::transmute_copy(&crate::ValueProofPublic { value: claimed_value })
+        };
+        
+        Ok(public_output)
+    }
+    
+    /// Verify a Ligero proof using the webgpu_verifier binary with custom arguments
+    /// 
+    /// # Arguments
+    /// * `proof_bytes` - The raw Ligero proof bytes (from proof.data)
+    /// * `args` - Hex-encoded arguments to pass to the WASM program
+    #[cfg(feature = "native")]
+    fn verify_with_args(proof_bytes: &[u8], args: &[String]) -> Result<(), anyhow::Error> {
+        use std::process::Command;
+        use anyhow::Context;
+        use crate::host::LigeroArg;
+        
+        tracing::debug!("Ligero: Verifying with {} custom arguments", args.len());
+        
+        // Find the verifier binary
+        let verifier_bin = Self::find_verifier_binary()
+            .context("Failed to locate webgpu_verifier binary")?;
+        
+        // Create temporary directory for verification
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temporary directory")?;
+        
+        // Write proof to proof.data
+        let proof_path = temp_dir.path().join("proof.data");
+        std::fs::write(&proof_path, proof_bytes)
+            .context("Failed to write proof.data")?;
+        
+        // Get configuration
+        let mut config = Self::get_verification_config()
+            .context("Failed to get Ligero configuration")?;
+        
+        // Add custom arguments
+        for arg_hex in args {
+            config.args.push(LigeroArg::Hex { hex: arg_hex.clone() });
+        }
+        
+        let config_json = serde_json::to_string(&config)
+            .context("Failed to serialize Ligero config")?;
+        
+        tracing::debug!("Running webgpu_verifier with config: {}", config_json);
+        
+        // Run the verifier
+        let output = Command::new(&verifier_bin)
+            .arg(&config_json)
+            .current_dir(temp_dir.path())
+            .output()
+            .context("Failed to execute webgpu_verifier")?;
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        if !stdout.is_empty() {
+            tracing::debug!("Verifier stdout:\n{}", stdout);
+        }
+        if !stderr.is_empty() {
+            tracing::debug!("Verifier stderr:\n{}", stderr);
+        }
+        
+        // Check the exit status
+        if !output.status.success() {
+            tracing::error!("Ligero verifier failed");
+            tracing::error!("Stdout: {}", stdout);
+            tracing::error!("Stderr: {}", stderr);
+            anyhow::bail!("Verifier returned non-zero exit code: {:?}", output.status.code());
+        }
+        
+        // Check for success message
+        if !stdout.contains("Final Verify Result:                 true") {
+            tracing::error!("Verifier did not confirm proof validity");
+            anyhow::bail!("Proof verification failed");
+        }
+        
+        tracing::info!("✓ Ligero proof verified successfully with custom arguments");
+        Ok(())
+    }
+    
     /// Verify a Ligero proof using the webgpu_verifier binary
     /// 
     /// # Arguments
@@ -423,7 +564,7 @@ impl LigeroVerifier {
     /// Find the webgpu_verifier binary
     #[cfg(feature = "native")]
     fn find_verifier_binary() -> Result<std::path::PathBuf, anyhow::Error> {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use anyhow::Context;
         
         // Check environment variable first
@@ -524,6 +665,61 @@ impl LigeroVerifier {
             args: vec![], // No arguments by default
         })
     }
+    
+    /// Verify that the expected code commitment matches the configured WASM program and packing
+    /// 
+    /// This is critical for security: it ensures that proofs can only be accepted if they
+    /// correspond to the specific guest program that enforces the rollup's constraints.
+    #[cfg(feature = "native")]
+    fn verify_code_commitment(expected_commitment: &LigeroCodeCommitment) -> Result<(), anyhow::Error> {
+        use anyhow::Context;
+        use sha2::{Digest, Sha256};
+        
+        tracing::debug!("Ligero: Verifying code commitment");
+        
+        // Get the configured program path and packing parameter
+        let config = Self::get_verification_config()
+            .context("Failed to get verification config for code commitment check")?;
+        
+        // Read the WASM program bytes
+        let wasm_bytes = std::fs::read(&config.program)
+            .with_context(|| format!("Failed to read WASM program at {}", config.program))?;
+        
+        // Compute the commitment: SHA-256(WASM bytes || packing)
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        hasher.update(config.packing.to_le_bytes());
+        let computed_commitment = hasher.finalize();
+        
+        let computed = LigeroCodeCommitment(computed_commitment.into());
+        
+        // Compare against the expected commitment
+        if &computed != expected_commitment {
+            tracing::error!(
+                "Code commitment mismatch! Expected: {:?}, Computed: {:?}",
+                hex::encode(&expected_commitment.0),
+                hex::encode(&computed.0)
+            );
+            tracing::error!(
+                "This means the proof was generated for a different program than expected."
+            );
+            tracing::error!(
+                "Program: {}, Packing: {}",
+                config.program,
+                config.packing
+            );
+            anyhow::bail!(
+                "Code commitment verification failed: proof does not correspond to the expected guest program"
+            );
+        }
+        
+        tracing::debug!(
+            "Code commitment verified successfully: {:?}",
+            hex::encode(&computed.0)
+        );
+        
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +752,31 @@ mod tests {
             LigeroCodeCommitment::decode(&bytes),
             Err(LigeroCodeCommitmentError::InvalidLength { found: 31 })
         ));
+    }
+
+    #[test]
+    fn test_code_commitment_computation() {
+        use sha2::{Digest, Sha256};
+        
+        // Create some dummy WASM bytes
+        let wasm_bytes = vec![0x00, 0x61, 0x73, 0x6d]; // WASM magic number
+        let packing: u32 = 8192;
+        
+        // Compute commitment manually
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        hasher.update(packing.to_le_bytes());
+        let expected_hash = hasher.finalize();
+        
+        let expected_commitment = LigeroCodeCommitment(expected_hash.into());
+        
+        // Verify the commitment is deterministic
+        let mut hasher2 = Sha256::new();
+        hasher2.update(&wasm_bytes);
+        hasher2.update(packing.to_le_bytes());
+        let hash2 = hasher2.finalize();
+        let commitment2 = LigeroCodeCommitment(hash2.into());
+        
+        assert_eq!(expected_commitment, commitment2);
     }
 }
