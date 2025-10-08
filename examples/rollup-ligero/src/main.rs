@@ -5,13 +5,13 @@ use anyhow::Context as _;
 use clap::Parser;
 use demo_stf::genesis_config::GenesisPaths;
 use sov_address::MultiAddressEvm;
-use sov_rollup_ligero::{mock_da_ligero_host_args, MockDemoRollup};
 use sov_ligero_adapter::Ligero;
 use sov_mock_da::storable::service::StorableMockDaService;
 use sov_modules_api::capabilities::RollupHeight;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_rollup_blueprint::logging::initialize_logging;
 use sov_modules_rollup_blueprint::{FullNodeBlueprint, Rollup};
+use sov_rollup_ligero::{mock_da_ligero_host_args, MockDemoRollup};
 use sov_stf_runner::processes::{RollupProverConfig, RollupProverConfigDiscriminants};
 use sov_stf_runner::{from_toml_path, RollupConfig};
 use tracing::debug;
@@ -77,10 +77,13 @@ async fn run() -> anyhow::Result<()> {
     let start_at_rollup_height = args.start_at_rollup_height.map(RollupHeight::new);
     let stop_at_rollup_height = args.stop_at_rollup_height.map(RollupHeight::new);
 
-    debug!(config_path = rollup_config_path, "Starting rollup on mock DA with Ligero");
+    debug!(
+        config_path = rollup_config_path,
+        "Starting rollup on mock DA with Ligero"
+    );
 
-    let prover_config = prover_config_disc
-        .map(|config_disc| config_disc.into_config(mock_da_ligero_host_args()));
+    let prover_config =
+        prover_config_disc.map(|config_disc| config_disc.into_config(mock_da_ligero_host_args()));
 
     let rollup = new_rollup_with_mock_da(
         &GenesisPaths::from_dir(&args.genesis_config_dir),
@@ -140,4 +143,3 @@ async fn new_rollup_with_mock_da(
         )
         .await
 }
-

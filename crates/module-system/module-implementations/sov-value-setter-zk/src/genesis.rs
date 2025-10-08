@@ -10,11 +10,11 @@ use super::ValueSetterZk;
 pub struct ValueSetterZkConfig<S: Spec> {
     /// Initial value (if any). If not provided, the value will be unset until the first transaction.
     pub initial_value: Option<u32>,
-    
+
     /// Ligetron method ID (code commitment) of the guest program that verifies value constraints.
     /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
     pub method_id: [u8; 32],
-    
+
     /// Admin of the module who can update the method ID.
     pub admin: S::Address,
 }
@@ -28,15 +28,15 @@ impl<S: Spec> ValueSetterZk<S> {
     ) -> Result<()> {
         // Set the admin
         self.admin.set(&config.admin, state)?;
-        
+
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
-        
+
         // Set initial value if provided
         if let Some(initial_value) = config.initial_value {
             self.value.set(&initial_value, state)?;
         }
-        
+
         Ok(())
     }
 }
@@ -60,9 +60,7 @@ mod tests {
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();
-        let parsed_config: ValueSetterZkConfig<TestSpec> = 
-            serde_json::from_str(&json_str).unwrap();
+        let parsed_config: ValueSetterZkConfig<TestSpec> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed_config, config);
     }
 }
-

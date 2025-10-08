@@ -16,4 +16,3 @@ pub enum Event {
         new_method_id: [u8; 32],
     },
 }
-

@@ -32,4 +32,3 @@ fn should_skip_guest_build() -> bool {
         Ok("0") | Ok("false") | Ok(_) | Err(_) => false,
     }
 }
-

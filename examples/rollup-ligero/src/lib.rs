@@ -29,4 +29,3 @@ fn eth_dev_signer() -> sov_ethereum::Signers {
     )
     .unwrap()])
 }
-

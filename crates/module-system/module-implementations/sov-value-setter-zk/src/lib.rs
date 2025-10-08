@@ -5,8 +5,8 @@
 //! Users must provide a valid proof alongside the value they wish to set.
 
 mod call;
-mod genesis;
 mod event;
+mod genesis;
 
 pub use call::*;
 pub use event::Event;
@@ -78,7 +78,7 @@ impl<S: Spec> Module for ValueSetterZk<S> {
         // Use a revertable state wrapper to ensure atomicity
         let mut state_wrapped = state.to_revertable();
         let state = &mut state_wrapped;
-        
+
         let res = match msg {
             CallMessage::SetValueWithProof { value, proof, gas } => {
                 Ok(self.set_value_with_proof(value, proof, gas, context, state)?)
@@ -87,10 +87,9 @@ impl<S: Spec> Module for ValueSetterZk<S> {
                 Ok(self.update_method_id(new_method_id, context, state)?)
             }
         };
-        
+
         // Commit the state changes if successful
         state_wrapped.commit();
         res
     }
 }
-

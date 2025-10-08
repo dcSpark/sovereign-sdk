@@ -1,11 +1,12 @@
 use std::fmt::Debug;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
-use sov_rollup_interface::zk::CodeCommitment;
+#[cfg(feature = "native")]
+use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 use thiserror::Error;
 
 use super::ValueSetterZk;
@@ -36,7 +37,7 @@ pub enum CallMessage<S: Spec> {
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
-    
+
     /// Update the method ID (admin only).
     /// This allows upgrading the guest program used for proof verification.
     UpdateMethodId {
@@ -58,11 +59,11 @@ pub enum SetValueZkError<S: Spec> {
         /// The sender.
         sender: S::Address,
     },
-    
+
     /// The proof verification failed.
     #[error("Proof verification failed: {0}")]
     ProofVerificationFailed(String),
-    
+
     /// The value in the proof doesn't match the requested value.
     #[error("Proof mismatch: journal value {journal_value} != requested value {requested_value}")]
     ValueMismatch {
@@ -95,59 +96,46 @@ impl<S: Spec> ValueSetterZk<S> {
         // Charge gas first
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         state.charge_gas(&gas)?;
-        
-        // Get the configured method ID from state
-        let method_id_bytes = self
-            .method_id
-            .get(state)?
-            .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
-        
-        // Verify the proof using LigeroVerifier
+
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier, LigeroProofPackage};
-            
+            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+
+            let method_id_bytes = self
+                .method_id
+                .get(state)?
+                .ok_or_else(|| anyhow::anyhow!("method_id not configured in module state"))?;
+
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
-            
-            // Deserialize the proof package
-            let package: LigeroProofPackage<ValueProofPublic> = bincode::deserialize(&proof)
-                .map_err(|e| anyhow!("Failed to deserialize proof package: {}", e))?;
-            
-            // SECURITY CRITICAL: Verify the proof with BOTH the proven value and claimed value
-            // The WASM program will assert that proven_value == claimed_value
-            // This prevents proof substitution attacks where attacker uses proof for value X to claim value Y
-            let public: ValueProofPublic = LigeroVerifier::verify_with_value(&package.proof, &method_id, value)
+                .map_err(|e| anyhow::anyhow!("Invalid method_id bytes in state: {}", e))?;
+
+            let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
                 .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?;
-            
-            // Double-check: Ensure the verified journal matches the requested value
-            // This is redundant with WASM check but provides defense in depth
+
             if public.value != value {
                 return Err(SetValueZkError::<S>::ValueMismatch {
                     journal_value: public.value,
                     requested_value: value,
-                }.into());
+                }
+                .into());
             }
+
+            self.value.set(&value, state)?;
+            self.emit_event(state, Event::ValueSetWithProof { value });
+
+            return Ok(());
         }
-        
-        // In non-native mode (e.g., inside a zkVM), we can't verify Ligero proofs
+
         #[cfg(not(feature = "native"))]
         {
+            let _ = (value, proof);
             anyhow::bail!(
                 "Ligero proof verification is only supported in native mode. \
                  The value-setter-zk module cannot be used inside a zkVM."
             );
         }
-        
-        // All checks passed - set the value
-        self.value.set(&value, state)?;
-        
-        // Emit event
-        self.emit_event(state, Event::ValueSetWithProof { value });
-        
-        Ok(())
     }
-    
+
     /// Update the method ID (admin only).
     pub(crate) fn update_method_id(
         &mut self,
@@ -157,21 +145,21 @@ impl<S: Spec> ValueSetterZk<S> {
     ) -> Result<()> {
         // Check admin authorization
         let admin = self.admin.get_or_err(state)??;
-        
+
         if &admin != context.sender() {
             return Err(SetValueZkError::WrongSender::<S> {
                 admin,
                 sender: context.sender().clone(),
-            }.into());
+            }
+            .into());
         }
-        
+
         // Update the method ID
         self.method_id.set(&new_method_id, state)?;
-        
+
         // Emit event
         self.emit_event(state, Event::MethodIdUpdated { new_method_id });
-        
+
         Ok(())
     }
 }
-

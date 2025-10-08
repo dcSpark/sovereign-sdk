@@ -1,7 +1,7 @@
 use demo_stf::runtime::Runtime;
 use sov_address::MultiAddressEvm;
-use sov_mock_da::MockDaSpec;
 use sov_ligero_adapter::Ligero;
+use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::execution_mode::Native;
 use sov_zkvm_utils::should_skip_guest_build;
@@ -32,4 +32,3 @@ fn main() -> anyhow::Result<()> {
         .build()
         .apply::<S, Runtime<S>>()
 }
-

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sov_rollup_interface::zk::ZkvmHost;
 
@@ -17,19 +17,19 @@ pub enum LigeroArg {
     #[serde(rename = "str")]
     String {
         /// String value
-        str: String
+        str: String,
     },
     /// i64 argument
     #[serde(rename = "i64")]
     I64 {
         /// i64 value
-        i64: i64
+        i64: i64,
     },
     /// Hex argument
     #[serde(rename = "hex")]
     Hex {
         /// Hex string value
-        hex: String
+        hex: String,
     },
 }
 
@@ -57,6 +57,7 @@ pub struct LigeroHost {
     prover_bin: PathBuf,
     verifier_bin: PathBuf,
     bins_dir: PathBuf,
+    public_output: Option<Vec<u8>>,
 }
 
 impl LigeroHost {
@@ -64,12 +65,13 @@ impl LigeroHost {
     pub fn new(program_path: &str) -> Self {
         let bins_dir = Self::find_bins_dir();
         // Use absolute path for shader_path to work from any working directory
-        let shader_path = bins_dir.canonicalize()
+        let shader_path = bins_dir
+            .canonicalize()
             .unwrap_or_else(|_| bins_dir.clone())
             .join("shader")
             .to_string_lossy()
             .to_string();
-        
+
         Self {
             config: LigeroConfig {
                 program: program_path.to_string(),
@@ -81,6 +83,7 @@ impl LigeroHost {
             prover_bin: bins_dir.join("webgpu_prover"),
             verifier_bin: bins_dir.join("webgpu_verifier"),
             bins_dir,
+            public_output: None,
         }
     }
 
@@ -89,11 +92,11 @@ impl LigeroHost {
         // Try to find relative to the crate root
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let bins_dir = PathBuf::from(manifest_dir).join("bins");
-        
+
         if bins_dir.exists() {
             return bins_dir;
         }
-        
+
         // Fallback to current directory
         PathBuf::from("bins")
     }
@@ -108,6 +111,21 @@ impl LigeroHost {
     pub fn with_private_indices(mut self, indices: Vec<usize>) -> Self {
         self.config.private_indices = indices;
         self
+    }
+
+    /// Record the public output that will be embedded in the proof package.
+    ///
+    /// The value is serialized using `bincode` so the verifier can recover it.
+    pub fn set_public_output<T: Serialize>(&mut self, value: &T) -> Result<()> {
+        let bytes = bincode::serialize(value)
+            .context("Failed to serialize Ligero public output with bincode")?;
+        self.public_output = Some(bytes);
+        Ok(())
+    }
+
+    /// Record the public output using raw bytes.
+    pub fn set_public_output_bytes(&mut self, bytes: Vec<u8>) {
+        self.public_output = Some(bytes);
     }
 
     /// Add a string argument
@@ -127,18 +145,18 @@ impl LigeroHost {
 
     /// Run the prover and generate a proof
     fn run_prover(&self) -> Result<Vec<u8>> {
-        let config_json = serde_json::to_string(&self.config)
-            .context("Failed to serialize Ligero config")?;
-        
+        let config_json =
+            serde_json::to_string(&self.config).context("Failed to serialize Ligero config")?;
+
         tracing::debug!("Running Ligero prover with config: {}", config_json);
-        
+
         // Run prover in current directory so proof.data is written to CWD
         // This allows parallel proof generation in worker-specific directories
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
             .output()
             .context("Failed to execute webgpu_prover")?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -149,18 +167,17 @@ impl LigeroHost {
                 stderr
             );
         }
-        
+
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("Final prove result:                  true") {
             anyhow::bail!("Ligero prover did not produce a valid proof");
         }
-        
+
         // Read the proof from proof.data (in current working directory)
         let proof_path = PathBuf::from("proof.data");
-        let proof = std::fs::read(&proof_path)
-            .context("Failed to read proof.data")?;
-        
+        let proof = std::fs::read(&proof_path).context("Failed to read proof.data")?;
+
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
         Ok(proof)
     }
@@ -168,21 +185,21 @@ impl LigeroHost {
     /// Verify a proof (used for testing)
     #[cfg(feature = "native")]
     pub fn verify_proof(&self) -> Result<bool> {
-        let config_json = serde_json::to_string(&self.config)
-            .context("Failed to serialize Ligero config")?;
-        
+        let config_json =
+            serde_json::to_string(&self.config).context("Failed to serialize Ligero config")?;
+
         tracing::debug!("Running Ligero verifier with config: {}", config_json);
-        
+
         let output = Command::new(&self.verifier_bin)
             .arg(&config_json)
             .current_dir(&self.bins_dir)
             .output()
             .context("Failed to execute webgpu_verifier")?;
-        
+
         if !output.status.success() {
             return Ok(false);
         }
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.contains("Final Verify Result:                 true"))
     }
@@ -203,46 +220,40 @@ impl ZkvmHost for LigeroHost {
 
     fn code_commitment(
         &self,
-    ) -> <<Self::Guest as sov_rollup_interface::zk::ZkvmGuest>::Verifier as sov_rollup_interface::zk::ZkVerifier>::CodeCommitment {
+    ) -> <<Self::Guest as sov_rollup_interface::zk::ZkvmGuest>::Verifier as sov_rollup_interface::zk::ZkVerifier>::CodeCommitment{
         // For Ligero, the code commitment is the hash of the WASM program
         use sha2::{Digest, Sha256};
-        
-        let program_bytes = std::fs::read(&self.config.program)
-            .unwrap_or_default();
-        
+
+        let program_bytes = std::fs::read(&self.config.program).unwrap_or_default();
+
         let mut hasher = Sha256::new();
         hasher.update(&program_bytes);
         hasher.update(&self.config.packing.to_le_bytes());
-        
+
         let hash = hasher.finalize();
         let mut commitment = [0u8; 32];
         commitment.copy_from_slice(&hash);
-        
+
         LigeroCodeCommitment(commitment)
     }
 
     fn run(&mut self, with_proof: bool) -> Result<Vec<u8>> {
         if with_proof {
-            // SOV_PROVER_MODE=prove: Generate a proof using webgpu_prover
+            let public_output = self
+                .public_output
+                .clone()
+                .ok_or_else(|| anyhow!("Ligero public output not set; call set_public_output before generating a proof"))?;
+
             tracing::info!("Ligero: Generating proof with webgpu_prover");
             let proof = self.run_prover()?;
-            
-            // Note: The public output should be extracted from the proof
-            // For now, we create an empty public output since we can't easily
-            // parse the Ligero proof format without the SDK
-            // In practice, the proof generator tool will create a proper package
             let package = LigeroProofPackage {
                 proof,
-                public_output: vec![] as Vec<u8>,
+                public_output,
             };
-            
             Ok(bincode::serialize(&package)?)
         } else {
-            // SOV_PROVER_MODE=execute or simulate: Just execute without proving
-            // For Ligero, we can use the verifier to check validity without proof generation
-            // This is much faster for testing/development
             tracing::info!("Ligero: Executing without proof generation (simulation mode)");
-            
+
             #[cfg(feature = "native")]
             {
                 // Run a lightweight verification check if verification is enabled
@@ -251,14 +262,19 @@ impl ZkvmHost for LigeroHost {
                     tracing::warn!("Ligero execution check failed: {}", e);
                 }
             }
-            
-            // Return empty package for execution mode
+
+            let public_output = self.public_output.clone().unwrap_or_else(|| {
+                tracing::debug!(
+                    "LigeroHost::run executed without configured public output; returning empty payload"
+                );
+                Vec::new()
+            });
+
             let package = LigeroProofPackage {
                 proof: vec![],
-                public_output: vec![] as Vec<u8>,
+                public_output,
             };
             Ok(bincode::serialize(&package)?)
         }
     }
 }
-

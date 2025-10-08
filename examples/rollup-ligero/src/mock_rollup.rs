@@ -6,6 +6,7 @@ use sov_address::{EthereumAddress, FromVmAddress, MultiAddressEvm};
 use sov_db::ledger_db::LedgerDb;
 use sov_db::storage_manager::NativeStorageManager;
 use sov_ethereum::EthRpcConfig;
+use sov_ligero_adapter::{Ligero, LigeroHost};
 use sov_mock_da::storable::service::StorableMockDaService;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::{MockCodeCommitment, MockZkvm, MockZkvmHost};
@@ -16,7 +17,6 @@ use sov_modules_api::{NodeEndpoints, Spec, Storage, SyncStatus, ZkVerifier};
 use sov_modules_rollup_blueprint::pluggable_traits::PluggableSpec;
 use sov_modules_rollup_blueprint::proof_sender::SovApiProofSender;
 use sov_modules_rollup_blueprint::{FullNodeBlueprint, RollupBlueprint, SequencerCreationReceipt};
-use sov_ligero_adapter::{Ligero, LigeroHost};
 use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
 use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
@@ -163,4 +163,3 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         Ok(Self::ProofSender::new(sequence_number_provider))
     }
 }
-

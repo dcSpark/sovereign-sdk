@@ -20,4 +20,3 @@ impl ZkvmGuest for LigeroGuest {
         unimplemented!("LigeroGuest::commit - Ligero handles commits within WASM")
     }
 }
-

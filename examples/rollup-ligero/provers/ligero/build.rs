@@ -33,4 +33,3 @@ fn main() {
         std::fs::write(methods_path, wasm).expect("Failed to write Ligero WASM paths");
     }
 }
-

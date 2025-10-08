@@ -32,12 +32,13 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let value: u32 = args[1]
-        .parse()
-        .context("Failed to parse value as u32")?;
+    let value: u32 = args[1].parse().context("Failed to parse value as u32")?;
 
     if value > 65535 {
-        anyhow::bail!("Value {} is out of range. Must be between 0 and 65535.", value);
+        anyhow::bail!(
+            "Value {} is out of range. Must be between 0 and 65535.",
+            value
+        );
     }
 
     println!("Generating Ligero proof for value: {}", value);
@@ -45,8 +46,7 @@ fn main() -> Result<()> {
 
     // Find the value_validator.wasm program
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let program_path = PathBuf::from(manifest_dir)
-        .join("guest/bins/programs/value_validator.wasm");
+    let program_path = PathBuf::from(manifest_dir).join("guest/bins/programs/value_validator.wasm");
 
     if !program_path.exists() {
         anyhow::bail!(
@@ -59,46 +59,41 @@ fn main() -> Result<()> {
     println!("Using WASM program: {}", program_path.display());
 
     // Create Ligero host
-    let mut host = <Ligero as Zkvm>::Host::from_args(
-        &program_path.to_string_lossy().to_string()
-    );
+    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path.to_string_lossy().to_string());
 
     // Configure with default packing
     host = host.with_packing(8192);
 
     // No private inputs for this example
     // (In a real scenario, you might mark certain inputs as private)
-    
+
     // Add the proven value as the first argument (as raw bytes)
     let value_bytes = value.to_le_bytes();
     host.add_hex_arg(hex::encode(&value_bytes));
-    
+
     // Add the claimed value as the second argument (same as proven value for generation)
     // During verification, this will be compared against the transaction's claimed value
     host.add_hex_arg(hex::encode(&value_bytes));
+    host.set_public_output(&ValueProofPublic { value })
+        .context("Failed to configure Ligero public output")?;
 
     // Get the code commitment (method ID)
     let commitment = host.code_commitment();
     println!("Code commitment: {}", hex::encode(commitment.encode()));
 
-    // Generate the proof (this creates an incomplete package)
+    // Generate the proof (the host returns a serialized LigeroProofPackage)
     println!("\nGenerating proof...");
-    let _ = host.run(true)
-        .context("Failed to generate proof")?;
+    let proof_data = host.run(true).context("Failed to generate proof")?;
 
-    // Read the raw proof from proof.data (in current working directory)
-    // The prover now writes to CWD, enabling true parallel execution
-    let proof_file_path = PathBuf::from("proof.data");
-    let raw_proof = std::fs::read(&proof_file_path)
-        .context("Failed to read proof.data")?;
-
+    let package: LigeroProofPackage = bincode::deserialize(&proof_data)
+        .context("Failed to deserialize generated proof package")?;
+    let raw_proof = &package.proof;
     println!("✓ Proof generated successfully!");
     println!("  Raw proof size: {} bytes", raw_proof.len());
 
     // Verify the proof locally
     println!("\nVerifying proof locally...");
-    let verification_result = host.verify_proof()
-        .context("Failed to verify proof")?;
+    let verification_result = host.verify_proof().context("Failed to verify proof")?;
 
     if !verification_result {
         anyhow::bail!("Proof verification failed!");
@@ -106,33 +101,22 @@ fn main() -> Result<()> {
 
     println!("✓ Proof verified successfully!");
 
-    // Create the public output that matches what the guest program commits
-    let public_output = ValueProofPublic { value };
-
-    // Create the complete proof package
-    let proof_package = LigeroProofPackage {
-        proof: raw_proof,
-        public_output,
-    };
-
-    // Serialize the proof package for submission
-    let proof_data = bincode::serialize(&proof_package)
-        .context("Failed to serialize proof package")?;
-
     // Output the proof in different formats
     println!("\n=== Proof Data ===");
     println!("Hex: {}", hex::encode(&proof_data));
     println!("\nJSON (for transaction):");
-    println!("{}", serde_json::json!({
-        "proof": hex::encode(&proof_data),
-        "value": value,
-        "commitment": hex::encode(commitment.encode()),
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "proof": hex::encode(&proof_data),
+            "value": value,
+            "commitment": hex::encode(commitment.encode()),
+        })
+    );
 
     // Save to file
     let proof_file = PathBuf::from("value_proof.bin");
-    std::fs::write(&proof_file, &proof_data)
-        .context("Failed to write proof to file")?;
+    std::fs::write(&proof_file, &proof_data).context("Failed to write proof to file")?;
     println!("\n✓ Proof saved to: {}", proof_file.display());
 
     // Create a transaction body template with proof as byte array
@@ -157,4 +141,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-

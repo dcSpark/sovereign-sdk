@@ -40,8 +40,13 @@ where
         access_pattern_config: <AccessPattern<S> as Genesis>::Config,
     ) -> Self {
         // Extract admin address before moving sequencer_registry
-        let admin_address = minimal_config.config.sequencer_registry.sequencer_config.seq_rollup_address.clone();
-        
+        let admin_address = minimal_config
+            .config
+            .sequencer_registry
+            .sequencer_config
+            .seq_rollup_address
+            .clone();
+
         Self {
             sequencer_registry: minimal_config.config.sequencer_registry,
             bank: minimal_config.config.bank,
