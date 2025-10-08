@@ -63,7 +63,12 @@ impl LigeroHost {
     /// Create a new LigeroHost with the given WASM program path
     pub fn new(program_path: &str) -> Self {
         let bins_dir = Self::find_bins_dir();
-        let shader_path = bins_dir.join("shader").to_string_lossy().to_string();
+        // Use absolute path for shader_path to work from any working directory
+        let shader_path = bins_dir.canonicalize()
+            .unwrap_or_else(|_| bins_dir.clone())
+            .join("shader")
+            .to_string_lossy()
+            .to_string();
         
         Self {
             config: LigeroConfig {
@@ -127,9 +132,10 @@ impl LigeroHost {
         
         tracing::debug!("Running Ligero prover with config: {}", config_json);
         
+        // Run prover in current directory so proof.data is written to CWD
+        // This allows parallel proof generation in worker-specific directories
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
-            .current_dir(&self.bins_dir)
             .output()
             .context("Failed to execute webgpu_prover")?;
         
@@ -150,8 +156,8 @@ impl LigeroHost {
             anyhow::bail!("Ligero prover did not produce a valid proof");
         }
         
-        // Read the proof from proof.data
-        let proof_path = self.bins_dir.join("proof.data");
+        // Read the proof from proof.data (in current working directory)
+        let proof_path = PathBuf::from("proof.data");
         let proof = std::fs::read(&proof_path)
             .context("Failed to read proof.data")?;
         

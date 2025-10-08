@@ -21,15 +21,15 @@ use sov_modules_api::{
     configurable_spec::ConfigurableSpec,
     execution_mode::Native,
     transaction::{PriorityFeeBips, Transaction, TxDetails, UnsignedTransaction},
-    Amount, DispatchCall, Gas, Spec,
+    Amount, DispatchCall, Spec,
 };
 use sov_node_client::NodeClient;
 use sov_rollup_interface::{
-    crypto::{PrivateKey, PublicKey},
+    crypto::PrivateKey,
     zk::{CryptoSpec, ZkVerifier},
 };
 use std::{path::Path, sync::Arc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
@@ -325,66 +325,52 @@ async fn verify_and_submit_handler(
 
 /// Parse value-setter-zk transaction to extract value and proof
 /// 
-/// This is a simplified parser that extracts the call message from the transaction.
-/// In a full implementation, you'd deserialize the complete Transaction<Runtime, Spec> type.
+/// Deserializes the transaction and extracts the runtime call to get the claimed value and proof.
+/// 
+/// SECURITY MODEL:
+/// - This parser extracts the `claimed_value` from the transaction
+/// - The WASM program enforces `proven_value == claimed_value`
+/// - If the claimed value is fraudulent, Ligero verification will fail
+/// - The cryptographic guarantee comes from the WASM program, not this parser
 fn parse_value_setter_zk_transaction(tx_bytes: &[u8]) -> Result<(u32, Vec<u8>), ServiceError> {
-    // The transaction structure is:
-    // Transaction<Runtime, Spec> {
-    //   versioned_tx: VersionedTx::V0(Version0 {
-    //     signature: ...,
-    //     pub_key: ...,
-    //     runtime_call: Runtime::Call {
-    //       value_setter_zk: ValueSetterZkCall::SetValueWithProof { value, proof, gas }
-    //     },
-    //     uniqueness: ...,
-    //     details: ...,
-    //   })
-    // }
+    // First, deserialize the full transaction to get access to the runtime_call
+    let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> = 
+        borsh::BorshDeserialize::try_from_slice(tx_bytes)
+            .map_err(|e| ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e)))?;
     
-    // For simplicity, we'll search for the value-setter-zk call message pattern
-    // This is hacky but works for demonstration. In production, properly deserialize.
+    // Get the runtime call (this is the Runtime::Call enum)
+    let runtime_call = tx.runtime_call();
     
-    // Try to find the SetValueWithProof variant marker
-    // The borsh encoding will have the enum variant index followed by the fields
+    // Now we need to extract the value and proof from the runtime call
+    // Since Runtime::Call is an auto-generated enum, we can't pattern match on it directly
+    // Instead, serialize it and parse the borsh bytes
+    let call_bytes = borsh::to_vec(runtime_call)
+        .map_err(|e| ServiceError::ParseError(format!("Failed to serialize runtime call: {}", e)))?;
     
-    // Alternative: deserialize as a generic borsh structure
-    // For now, let's use a heuristic: the proof is large (~3.2MB), so we can find it
-    
-    // Let's use a more robust approach: parse as raw borsh looking for large Vec<u8>
-    let mut cursor = tx_bytes;
-    
-    // Skip past signature, pubkey, etc. and try to find the proof
-    // The proof will be encoded as a length-prefixed Vec<u8>
-    
-    // Simplified approach: assume the transaction has a specific structure
-    // and extract the last large blob (which should be the proof)
-    
-    // For demo purposes, let's deserialize it properly but with a generic runtime type
-    // Since we don't have the full Runtime type, we'll work with the raw bytes
-    
-    // Actually, let's use a practical approach: deserialize just the call message part
-    // by skipping the transaction envelope
-    
-    // The safest approach for now: assume the proof is the largest contiguous Vec<u8>
-    // in the transaction, and extract it along with a u32 value that appears before it
-    
-    // Let me implement a proper but simplified parser:
-    parse_ligero_tx_simple(tx_bytes)
+    // Now parse the call bytes to extract value and proof
+    // This is more reliable than parsing the full transaction bytes
+    parse_ligero_call_bytes(&call_bytes)
 }
 
-/// Simplified transaction parser that extracts value and proof
-/// This works by pattern matching on the borsh-encoded structure
-fn parse_ligero_tx_simple(bytes: &[u8]) -> Result<(u32, Vec<u8>), ServiceError> {
-    let mut cursor = bytes;
-    
-    // Skip transaction envelope (signature, pubkey, etc.)
-    // This is fragile but works for our specific use case
-    
-    // Try to deserialize as a borsh-encoded structure
-    // We're looking for: u32 (value) followed by Vec<u8> (proof)
-    
-    // Let's search for the proof length marker followed by a large proof
+/// Parse the runtime call bytes to extract value and proof from SetValueWithProof
+/// 
+/// This searches for the proof blob (large ~3.2MB) and extracts the u32 value
+/// that appears immediately before it in the borsh-encoded structure.
+/// 
+/// The borsh encoding of SetValueWithProof { value, proof, ... } is:
+/// - enum variant index (module selector, 1-4 bytes)
+/// - enum variant index (call selector, 1-4 bytes)  
+/// - value: u32 (4 bytes) <- IMMEDIATELY BEFORE proof
+/// - proof: Vec<u8> = length (4 bytes) + data (~3.2MB)
+fn parse_ligero_call_bytes(bytes: &[u8]) -> Result<(u32, Vec<u8>), ServiceError> {
+    // Search for the proof length marker followed by a large proof
     // Ligero proofs are ~3.2MB, so look for a u32 length marker of that size
+    //
+    // The borsh encoding of SetValueWithProof is:
+    // - enum variant index (1-4 bytes)
+    // - value: u32 (4 bytes) <- IMMEDIATELY BEFORE proof
+    // - proof: Vec<u8> = length (4 bytes) + data
+    // - (other fields like gas, etc.)
     
     const MIN_PROOF_SIZE: u32 = 3_000_000; // 3 MB minimum
     const MAX_PROOF_SIZE: u32 = 5_000_000; // 5 MB maximum
@@ -394,41 +380,43 @@ fn parse_ligero_tx_simple(bytes: &[u8]) -> Result<(u32, Vec<u8>), ServiceError> 
         let len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         
         if len >= MIN_PROOF_SIZE && len <= MAX_PROOF_SIZE {
-            // Found a candidate proof length
+            // Found a candidate proof length at offset i
             let proof_start = i + 4;
             let proof_end = proof_start + len as usize;
             
-            if proof_end <= bytes.len() {
+            if proof_end <= bytes.len() && i >= 4 {
                 let proof = bytes[proof_start..proof_end].to_vec();
                 
-                // Now search backwards for a u32 value (should be close before the proof)
-                // Look in the 100 bytes before the proof length marker
-                let search_start = i.saturating_sub(100);
-                for j in search_start..i {
-                    if j + 4 <= i {
-                        let candidate_value = u32::from_le_bytes([
-                            bytes[j],
-                            bytes[j + 1],
-                            bytes[j + 2],
-                            bytes[j + 3],
-                        ]);
-                        
-                        // Value should be in range [0, 100] for our use case
-                        if candidate_value <= 100 {
-                            debug!(
-                                "Found value={} and proof (size={} bytes) at offset={}",
-                                candidate_value,
-                                proof.len(),
-                                i
-                            );
-                            return Ok((candidate_value, proof));
-                        }
-                    }
-                }
+                // The value should be the u32 IMMEDIATELY BEFORE the proof length marker
+                // So it's at offset (i - 4)
+                let value_offset = i.saturating_sub(4);
+                let value = u32::from_le_bytes([
+                    bytes[value_offset],
+                    bytes[value_offset + 1],
+                    bytes[value_offset + 2],
+                    bytes[value_offset + 3],
+                ]);
                 
-                // If we didn't find a valid value, assume value=0 (fallback)
-                warn!("Found proof but no valid value, using value=0");
-                return Ok((0, proof));
+                // Value should be in range [0, 65535] (u16) for our use case
+                if value <= 65535 {
+                    debug!(
+                        "Heuristic parser found: value={} at offset={}, proof size={} bytes at offset={}",
+                        value,
+                        value_offset,
+                        proof.len(),
+                        proof_start
+                    );
+                    return Ok((value, proof));
+                } else {
+                    // If value is out of range, this might not be the right proof marker
+                    // Continue searching
+                    debug!(
+                        "Found proof-sized blob at offset {} but value {} is out of range [0, 65535], continuing search",
+                        i,
+                        value
+                    );
+                    continue;
+                }
             }
         }
     }

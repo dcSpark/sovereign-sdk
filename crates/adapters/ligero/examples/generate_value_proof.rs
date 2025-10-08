@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sov_ligero_adapter::{Ligero, LigeroCodeCommitment, LigeroHost, LigeroProofPackage};
+use sov_ligero_adapter::{Ligero, LigeroProofPackage};
 use sov_rollup_interface::zk::{CodeCommitment, Zkvm, ZkvmHost};
 
 /// The public output structure that matches the guest program and value-setter-zk module
@@ -86,8 +86,9 @@ fn main() -> Result<()> {
     let _ = host.run(true)
         .context("Failed to generate proof")?;
 
-    // Read the raw proof from proof.data
-    let proof_file_path = PathBuf::from(manifest_dir).join("bins/proof.data");
+    // Read the raw proof from proof.data (in current working directory)
+    // The prover now writes to CWD, enabling true parallel execution
+    let proof_file_path = PathBuf::from("proof.data");
     let raw_proof = std::fs::read(&proof_file_path)
         .context("Failed to read proof.data")?;
 
