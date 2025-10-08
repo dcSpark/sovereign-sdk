@@ -20,17 +20,41 @@
 //!
 //! ## Environment Variables
 //!
+//! ### Build-time Variables
+//!
 //! - **`SKIP_GUEST_BUILD`**: Control guest program compilation
 //!   - `1` or `true`: Skip all guest builds
 //!   - `ligero`: Skip only Ligero guest builds
 //!   - `0` or unset: Build Ligero guest programs
+//!
+//! - **`LIGERO_SDK_PATH`**: Override default Ligero SDK path
+//!
+//! ### Runtime Variables
 //!
 //! - **`SOV_PROVER_MODE`**: Control proving behavior (for rollup-level usage)
 //!   - `skip`: Skip proof generation entirely
 //!   - `execute`: Execute without generating proofs (simulation)
 //!   - `prove`: Generate full proofs using `webgpu_prover`
 //!
-//! - **`LIGERO_SDK_PATH`**: Override default Ligero SDK path
+//! - **`LIGERO_SKIP_VERIFICATION`**: Skip proof verification (testing only)
+//!   - Set to any value to skip verification
+//!   - Use only for development/testing
+//!
+//! ### Verification Configuration (required for proof verification)
+//!
+//! - **`LIGERO_VERIFIER_BIN`**: Path to `webgpu_verifier` binary (required)
+//!   - Example: `crates/adapters/ligero/guest/bins/webgpu_verifier`
+//!
+//! - **`LIGERO_PROGRAM_PATH`**: Path to WASM program to verify (required)
+//!   - Example: `crates/adapters/ligero/guest/bins/value_validator.wasm`
+//!
+//! - **`LIGERO_SHADER_PATH`**: Path to verifier shader (required)
+//!   - Example: `crates/adapters/ligero/guest/bins/shader`
+//!
+//! - **`LIGERO_PACKING`**: FFT packing parameter (optional, default: 8192)
+//!
+//! - **`LIGERO_CONFIG_PATH`**: Path to full JSON config file (optional)
+//!   - If set, overrides individual path variables
 //!
 //! ## Usage Example
 //!
@@ -271,22 +295,234 @@ impl ZkVerifier for LigeroVerifier {
         // which contains both the raw proof and the public output
         let package: LigeroProofPackage<T> = bincode::deserialize(serialized_proof)?;
         
-        // In a full implementation, we would:
-        // 1. Write the proof to a temp file
-        // 2. Call webgpu_verifier with the appropriate config
-        // 3. Check the verifier output
-        //
-        // For now, we trust that the proof was generated correctly
-        // by the prover (which already verified it).
-        // The security model here is that proofs are generated off-chain
-        // and verified on-chain by checking the cryptographic commitment.
+        // Check if LIGERO_SKIP_VERIFICATION env var is set (for testing)
+        if std::env::var("LIGERO_SKIP_VERIFICATION").is_ok() {
+            tracing::debug!("Ligero: Skipping verification (LIGERO_SKIP_VERIFICATION set)");
+            return Ok(package.public_output);
+        }
         
-        // TODO: Implement actual binary verification when needed
-        tracing::debug!(
-            "Ligero proof verification: accepting proof (binary verification not yet implemented)"
-        );
+        // Perform actual verification using webgpu_verifier
+        #[cfg(feature = "native")]
+        {
+            // TODO: For value-setter-zk, we should pass the value as a hex argument
+            // For now, we'll try without arguments since there are no private indices
+            // The verification might still work if the guest program's public output
+            // commitment matches what's in the proof
+            Self::verify_with_binary(&package.proof, None)?;
+        }
+        
+        #[cfg(not(feature = "native"))]
+        {
+            tracing::warn!("Ligero verification only available with 'native' feature - skipping verification");
+        }
         
         Ok(package.public_output)
+    }
+}
+
+impl LigeroVerifier {
+    /// Verify a Ligero proof using the webgpu_verifier binary
+    /// 
+    /// # Arguments
+    /// * `proof_bytes` - The raw Ligero proof bytes (from proof.data)
+    /// * `public_output_bytes` - Optional public output bytes to pass as hex argument to verifier
+    #[cfg(feature = "native")]
+    fn verify_with_binary(proof_bytes: &[u8], public_output_bytes: Option<&[u8]>) -> Result<(), anyhow::Error> {
+        use std::process::Command;
+        use anyhow::Context;
+        
+        tracing::debug!("Ligero: Performing binary verification with webgpu_verifier (proof size: {} bytes)", proof_bytes.len());
+        
+        // Find the verifier binary
+        tracing::debug!("Step 1/6: Looking for webgpu_verifier binary...");
+        let verifier_bin = Self::find_verifier_binary()
+            .context("Failed to locate webgpu_verifier binary")?;
+        tracing::debug!("  ✓ Found verifier at: {:?}", verifier_bin);
+        
+        // Create a temporary directory for verification
+        tracing::debug!("Step 2/6: Creating temporary directory for proof...");
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temporary directory")?;
+        let proof_path = temp_dir.path().join("proof.data");
+        
+        // Write the proof to the temp file
+        std::fs::write(&proof_path, proof_bytes)
+            .context("Failed to write proof.data")?;
+        tracing::debug!("  ✓ Wrote {} bytes to: {:?}", proof_bytes.len(), proof_path);
+        
+        // Get or create the configuration
+        tracing::debug!("Step 3/6: Loading verification configuration...");
+        let mut config = Self::get_verification_config()
+            .context("Failed to get Ligero configuration")?;
+        
+        // Add public output as hex argument if provided
+        tracing::debug!("Step 4/6: Preparing verification arguments...");
+        if let Some(output_bytes) = public_output_bytes {
+            use crate::host::LigeroArg;
+            let hex_value = hex::encode(output_bytes);
+            config.args.push(LigeroArg::Hex { hex: hex_value.clone() });
+            tracing::debug!("  ✓ Added public output as hex argument: {}", hex_value);
+        } else if config.args.is_empty() {
+            tracing::warn!("No arguments provided to verifier - this may cause verification to fail if the guest program expects arguments");
+        } else {
+            tracing::debug!("  ✓ Using {} pre-configured argument(s)", config.args.len());
+        }
+        
+        let config_json = serde_json::to_string(&config)
+            .context("Failed to serialize Ligero config")?;
+        
+        tracing::debug!("  ✓ Config ready: {}", config_json);
+        tracing::debug!("Step 5/6: Executing webgpu_verifier...");
+        
+        // Run the verifier
+        let output = Command::new(&verifier_bin)
+            .arg(&config_json)
+            .current_dir(temp_dir.path())
+            .output()
+            .context("Failed to execute webgpu_verifier")?;
+        
+        tracing::debug!("  ✓ Verifier process completed, checking results...");
+        
+        // Always log stdout and stderr for debugging
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        if !stdout.is_empty() {
+            tracing::debug!("Verifier stdout:\n{}", stdout);
+        }
+        if !stderr.is_empty() {
+            tracing::debug!("Verifier stderr:\n{}", stderr);
+        }
+        
+        tracing::debug!("Step 6/6: Validating verification results...");
+        
+        // Check the exit status
+        if !output.status.success() {
+            tracing::error!("Ligero verifier failed with exit code: {:?}", output.status.code());
+            tracing::error!("Stdout: {}", stdout);
+            tracing::error!("Stderr: {}", stderr);
+            anyhow::bail!(
+                "Verifier returned non-zero exit code: {:?}",
+                output.status.code()
+            );
+        }
+        
+        // Check the output for success message
+        if !stdout.contains("Final Verify Result:                 true") {
+            tracing::error!("Verifier did not confirm proof validity");
+            tracing::error!("Output: {}", stdout);
+            anyhow::bail!(
+                "Proof verification failed: verifier did not confirm validity"
+            );
+        }
+        
+        tracing::info!("  ✓ Ligero proof verified successfully!");
+        Ok(())
+    }
+    
+    /// Find the webgpu_verifier binary
+    #[cfg(feature = "native")]
+    fn find_verifier_binary() -> Result<std::path::PathBuf, anyhow::Error> {
+        use std::path::{Path, PathBuf};
+        use anyhow::Context;
+        
+        // Check environment variable first
+        if let Ok(path_str) = std::env::var("LIGERO_VERIFIER_BIN") {
+            let bin_path = Path::new(&path_str);
+            if bin_path.exists() {
+                // Convert to absolute path before returning
+                let abs_path = std::fs::canonicalize(bin_path)
+                    .with_context(|| format!("Failed to resolve verifier binary path: {}", path_str))?;
+                return Ok(abs_path);
+            }
+        }
+        
+        // Try to find it relative to the current directory
+        let current_dir = std::env::current_dir()
+            .context("Failed to get current directory")?;
+        
+        // Try ../ligero-vm/ligero-prover/bins/webgpu_verifier
+        let relative_path = current_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("ligero-vm/ligero-prover/bins/webgpu_verifier"));
+        
+        if let Some(path) = relative_path {
+            if path.exists() {
+                let abs_path = std::fs::canonicalize(&path)
+                    .context("Failed to resolve verifier binary path")?;
+                return Ok(abs_path);
+            }
+        }
+        
+        // Try crates/adapters/ligero/guest/bins/webgpu_verifier (from workspace root)
+        let workspace_path = current_dir
+            .join("crates/adapters/ligero/guest/bins/webgpu_verifier");
+        if workspace_path.exists() {
+            let abs_path = std::fs::canonicalize(&workspace_path)
+                .context("Failed to resolve verifier binary path")?;
+            return Ok(abs_path);
+        }
+        
+        anyhow::bail!(
+            "Could not find webgpu_verifier binary. Set LIGERO_VERIFIER_BIN environment variable or ensure it's at crates/adapters/ligero/guest/bins/webgpu_verifier"
+        )
+    }
+    
+    /// Get the Ligero verification configuration
+    #[cfg(feature = "native")]
+    fn get_verification_config() -> Result<LigeroConfig, anyhow::Error> {
+        use anyhow::Context;
+        use std::path::Path;
+        
+        // Check for full configuration from JSON file
+        if let Ok(config_path) = std::env::var("LIGERO_CONFIG_PATH") {
+            let config_str = std::fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read config from {}", config_path))?;
+            let config: LigeroConfig = serde_json::from_str(&config_str)
+                .context("Failed to parse Ligero config")?;
+            return Ok(config);
+        }
+        
+        // Get program path from environment variable or error
+        let program_path = std::env::var("LIGERO_PROGRAM_PATH")
+            .context("LIGERO_PROGRAM_PATH environment variable is required for verification")?;
+        
+        // Get shader path from environment variable or error
+        let shader_path_str = std::env::var("LIGERO_SHADER_PATH")
+            .context("LIGERO_SHADER_PATH environment variable is required for verification")?;
+        
+        // Convert paths to absolute paths (important when we change working directory)
+        let program = std::fs::canonicalize(Path::new(&program_path))
+            .with_context(|| format!("Failed to resolve program path: {}", program_path))?
+            .to_string_lossy()
+            .to_string();
+        
+        let shader_path = std::fs::canonicalize(Path::new(&shader_path_str))
+            .with_context(|| format!("Failed to resolve shader path: {}", shader_path_str))?
+            .to_string_lossy()
+            .to_string();
+        
+        // Optional: Get packing parameter (default to 8192 to match the prover)
+        let packing = std::env::var("LIGERO_PACKING")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(8192);
+        
+        tracing::debug!(
+            "Ligero verification config: program={}, shader={}, packing={}",
+            program,
+            shader_path,
+            packing
+        );
+        
+        Ok(LigeroConfig {
+            program,
+            shader_path,
+            packing,
+            private_indices: vec![], // No private inputs by default
+            args: vec![], // No arguments by default
+        })
     }
 }
 

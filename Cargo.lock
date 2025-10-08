@@ -12462,6 +12462,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-proof-verifier-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "bincode",
+ "borsh",
+ "clap",
+ "demo-stf",
+ "hex",
+ "reqwest 0.12.23",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.10.9",
+ "sov-address",
+ "sov-api-spec",
+ "sov-ligero-adapter",
+ "sov-mock-da",
+ "sov-mock-zkvm",
+ "sov-modules-api",
+ "sov-modules-stf-blueprint",
+ "sov-node-client",
+ "sov-rollup-interface",
+ "sov-value-setter",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.5.2",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+]
+
+[[package]]
 name = "sov-prover-incentives"
 version = "0.3.0"
 dependencies = [

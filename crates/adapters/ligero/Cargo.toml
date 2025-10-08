@@ -26,6 +26,7 @@ schemars = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["alloc", "derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sov-rollup-interface = { workspace = true }
@@ -58,6 +59,7 @@ required-features = ["native", "arbitrary"]
 default = []
 native = [
     "rand",
+    "tempfile",
     "sov-rollup-interface/native",
     "sov-mock-zkvm/native",
     "sov-ligero-adapter/native"
