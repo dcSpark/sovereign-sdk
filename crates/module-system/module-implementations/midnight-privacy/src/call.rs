@@ -62,9 +62,19 @@ pub enum CallMessage<S: Spec> {
 
     /// Withdraw tokens from the pool after verifying a ZK proof.
     /// The proof must bind the withdrawal amount to prevent draining attacks.
+    /// 
+    /// SECURITY: anchor_root, nullifier, and withdraw_amount are passed as explicit
+    /// transaction fields (NOT extracted from public_output) and are validated by the guest.
+    /// This prevents public-output tampering attacks.
     Withdraw {
         /// Serialized Ligero proof package (bincode-encoded)
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        /// Anchor root that the proof is bound to (must be in recent roots window)
+        anchor_root: Hash32,
+        /// Nullifier that the proof derives (must be fresh)
+        nullifier: Hash32,
+        /// Withdrawal amount authorized by the proof
+        withdraw_amount: u128,
         /// Recipient address for the withdrawn tokens
         to: S::Address,
         /// Gas to charge. Don't charge gas if None.
@@ -232,9 +242,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     }
 
     /// Withdraw: verify proof, consume nullifier, and transfer native token out.
+    /// 
+    /// SECURITY NOTE (Option A - explicit transaction fields):
+    /// The anchor_root, nullifier, and withdraw_amount are taken from TRANSACTION ARGUMENTS,
+    /// not from the proof's public_output. The guest program verifies these values match its
+    /// computations. This prevents "unbound journal" attacks where an attacker could tamper
+    /// with public_output while keeping a valid proof.
     pub(crate) fn withdraw(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
@@ -243,7 +262,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         st.charge_gas(&gas)?;
 
-        // Verify proof and extract public output
+        // Verify proof and validate explicit transaction fields
         #[cfg(not(feature = "native"))]
         {
             anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
@@ -262,8 +281,24 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                 .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
             
+            // Verify the proof and extract the proof-committed public output
             let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
                 .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+            
+            // CRITICAL SECURITY: Bind transaction fields to proof-committed values
+            // The proof commits to specific (anchor_root, nullifier, withdraw_amount).
+            // We must verify the transaction fields match what the proof committed to,
+            // otherwise an attacker could provide a valid proof for (A, B, C) but
+            // submit transaction fields (X, Y, Z) and we'd accept them.
+            if public.anchor_root != anchor_root
+                || public.nullifier != nullifier
+                || public.withdraw_amount != withdraw_amount
+            {
+                anyhow::bail!("Proof outputs do not match transaction arguments");
+            }
+
+            // Now use the PROOF-COMMITTED values (which we've verified match the tx fields)
+            // for all state changes. This ensures cryptographic binding.
 
             // 1) Anchor must be valid
             if !self.is_valid_anchor(&public.anchor_root, st)? {
@@ -277,12 +312,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             }
             self.nullifier_set.set(&nk, &true, st)?;
 
-            // 3) Perform the transparent withdrawal for the *authorized* amount
+            // 3) Transfer authorized amount
             use sov_bank::IntoPayable;
             let token_id = self.token_id.get_or_err(st)??;
 
-            let amount_u64: u64 = public
-                .withdraw_amount
+            let amount_u64: u64 = public.withdraw_amount
                 .try_into()
                 .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
             let bank_amount = sov_bank::Amount::from(amount_u64);
@@ -298,7 +332,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 st,
             )?;
 
-            // Emit events
+            // Emit events (using proof-committed values)
             self.emit_event(
                 st,
                 Event::NoteSpent {

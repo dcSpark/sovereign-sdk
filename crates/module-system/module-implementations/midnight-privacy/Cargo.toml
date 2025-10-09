@@ -41,6 +41,7 @@ bincode = { workspace = true }
 hex = { workspace = true }
 qp-poseidon-core = { version = "0.9.5", features = ["std"] }
 sov-bank = { workspace = true }
+once_cell = { workspace = true }
 
 [features]
 default = ["native"]

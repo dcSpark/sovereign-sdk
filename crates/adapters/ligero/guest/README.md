@@ -1,168 +1,278 @@
-# Ligero Guest Program: Value Validator
+# Ligero Guest Programs
 
-This directory contains the Ligero guest program (WASM) that validates values for the `value-setter-zk` module.
+This directory contains Ligero guest programs (WASM modules) that run inside zero-knowledge proofs. Each guest program implements specific validation logic that can be proven and verified cryptographically.
 
-## Purpose
+## Available Guest Programs
 
-The guest program enforces that a submitted value is within the valid range `[0, 100]`. It:
-1. Reads an `i64` value from command-line arguments
-2. Asserts the value is >= 0
-3. Asserts the value is <= 100
-4. If both assertions pass, the proof is valid
+### 1. `rust-guest/` - Value Validator (PoC)
 
-## Prerequisites
+**Purpose**: Proof-of-concept demonstrating Rust-to-WASM compilation for Ligero.
 
-### 1. Emscripten SDK
+A simple validator that checks:
+- Value is within range `[0, 65535]` (u16)
+- Proven value matches claimed value
+
+**Technology**: Pure Rust `no_std`, minimal dependencies
+
+See: [`rust-guest/README.md`](./rust-guest/README.md)
+
+### 2. `note-spend-guest/` - Note Spend Verifier (Production)
+
+**Purpose**: Production-grade shielded pool spend verification for the Midnight Privacy module.
+
+Verifies:
+- Merkle root recomputation from note commitment and path
+- PRF-based nullifier derivation
+- Solvency constraints (withdraw ≤ note value)
+- Public value binding (anchor, nullifier, withdraw amount)
+
+**Technology**: Rust `no_std` with Poseidon2 cryptography (p3-poseidon2, p3-goldilocks)
+
+See: [`note-spend-guest/README.md`](./note-spend-guest/README.md)
+
+### 3. Legacy C++ Programs
+
+The `value_validator.cpp` and related C++/WAT programs are legacy implementations. They are kept for reference and backward compatibility.
+
+## Quick Start
+
+### Building Rust Guest Programs
+
+Each Rust guest has its own build script:
 
 ```bash
-cd /path/to/emsdk
-source emsdk_env.sh
-```
+# Build value validator (PoC)
+cd rust-guest
+./build.sh
 
-### 2. Ligero SDK
-
-Build the Ligero SDK (must be done once):
-
-```bash
-cd /path/to/ligero-vm/ligero-prover/sdk
-mkdir -p build && cd build
-emcmake cmake ..
-emmake make -j
-```
-
-This will create `libligetron.a` which is required for linking.
-
-## Building
-
-### Option 1: Using the build script (Recommended)
-
-```bash
-# Make sure Emscripten is activated first
-source /path/to/emsdk/emsdk_env.sh
-
-# Run the build script
+# Build note spend verifier (production)
+cd note-spend-guest
 ./build.sh
 ```
 
-The script will:
-- Check for prerequisites
-- Configure and build the program
-- Optionally copy the output to `../bins/programs/`
+Compiled WASM modules are placed in `bins/programs/`.
 
-### Option 2: Manual build
+### Prerequisites
+
+- Rust toolchain (edition 2021)
+- `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
+
+## Integration with Sovereign SDK
+
+### Using a Guest Program
+
+```rust
+use sov_ligero_adapter::{Ligero, LigeroCodeCommitment, LigeroVerifier};
+use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+
+// 1. Load guest program
+let program_path = "path/to/guest.wasm";
+let mut host = <Ligero as Zkvm>::Host::from_args(&program_path);
+
+// 2. Add arguments
+host.add_string_arg(&arg1);
+host.add_i64_arg(arg2);
+// ... etc
+
+// 3. Set public output
+host.set_public_output(&output_data)?;
+
+// 4. Generate proof
+let proof = host.run(true)?;
+
+// 5. Verify proof
+let code_commitment = host.code_commitment();
+let verified_output = LigeroVerifier::verify(&proof, &code_commitment)?;
+```
+
+### Configuration
+
+Guest programs are configured via JSON:
+
+```json
+{
+  "program": "path/to/guest.wasm",
+  "private-indices": [5, 8, 9, 10],
+  "packing": 8192
+}
+```
+
+Private indices specify which arguments should be hidden from the verifier.
+
+## Guest Program Structure
+
+All guest programs follow this pattern:
+
+```rust
+#![no_std]
+
+// 1. WASI imports
+extern "C" {
+    fn assert_one(x: i32);
+    fn args_get(argv_ptrs: *mut *mut u8, argv_buf: *mut u8) -> u32;
+    fn proc_exit(code: u32) -> !;
+}
+
+// 2. Entry point
+#[no_mangle]
+pub unsafe extern "C" fn _start() -> ! {
+    // Parse arguments
+    // Compute values
+    // Assert constraints
+    assert_one(condition as i32);
+    proc_exit(0)
+}
+```
+
+### Key Principles
+
+1. **No Standard Library**: Use `#![no_std]` for minimal WASM size
+2. **WASI Command Module**: Entry point is `_start()`
+3. **Cryptographic Assertions**: Use `assert_one()` for constraints
+4. **Determinism**: Must produce same output for same input
+5. **Privacy**: Mark sensitive arguments as private in config
+
+## Development Guidelines
+
+### Writing a New Guest Program
+
+1. **Create directory structure**:
+   ```
+   my-guest/
+   ├── Cargo.toml
+   ├── build.sh
+   ├── README.md
+   └── src/
+       └── lib.rs
+   ```
+
+2. **Configure Cargo.toml**:
+   ```toml
+   [package]
+   name = "my-guest"
+   edition = "2021"
+   
+   [lib]
+   crate-type = ["cdylib"]
+   
+   [dependencies]
+   # no_std allocator if needed
+   dlmalloc = { version = "0.2", default-features = false }
+   ```
+
+3. **Implement verification logic** in `src/lib.rs`
+
+4. **Build and test**:
+   ```bash
+   ./build.sh
+   # Test integration with Ligero adapter
+   ```
+
+### Best Practices
+
+- ✅ Use `#![no_std]` to minimize WASM size
+- ✅ Parse arguments carefully (validate all inputs)
+- ✅ Use constant-time comparisons for secrets
+- ✅ Document the ABI in comments and README
+- ✅ Match on-chain cryptography exactly (same hashes, etc.)
+- ✅ Include comprehensive tests
+- ❌ Don't use panics (exit with error code instead)
+- ❌ Don't depend on external state or I/O
+- ❌ Don't use floating-point operations (not deterministic)
+
+## Testing
+
+Integration tests are located in the modules that use these guest programs:
 
 ```bash
-# Activate Emscripten
-source /path/to/emsdk/emsdk_env.sh
-
-# Create build directory
-mkdir -p build && cd build
-
-# Configure with CMake
-emcmake cmake .. -DLIGERO_SDK_PATH=/path/to/ligero-vm/ligero-prover/sdk
-
-# Build
-emmake make
-
-# Copy to bins/programs
-cp value_validator.wasm ../../bins/programs/
+# Test note-spend-guest with midnight-privacy module
+cd crates/module-system/module-implementations/midnight-privacy
+cargo test --features native ligero_proof_test -- --nocapture
 ```
 
-### Option 3: Direct compilation (without CMake)
+## Debugging
+
+### Generate WAT Files
+
+To inspect the WebAssembly text format:
 
 ```bash
-em++ -O2 \
-    -I/path/to/ligero-vm/ligero-prover/sdk/include \
-    -L/path/to/ligero-vm/ligero-prover/sdk/build \
-    value_validator.cpp \
-    -o value_validator.wasm \
-    -lligetron
+./build.sh --wat
+# Generates bins/programs/guest_name.wat
 ```
 
-## Program Structure
-
-### Input
-- **Arguments**: Single `i64` value passed as `argv[1]` (cast to `int`)
-- **Format**: The value is passed as raw bytes via WASI command-line args
-
-### Validation Logic
-```cpp
-int value = *reinterpret_cast<const int*>(argv[1]);
-assert_one(value >= 0);   // Must be non-negative
-assert_one(value <= 100);  // Must be at most 100
-```
-
-### Output
-- **Proof**: Generated by Ligero prover if assertions pass
-- **Public Output**: The value itself is part of the proof's public output
-
-## Integration with value-setter-zk
-
-The `value-setter-zk` module:
-1. Receives a transaction with `value` and `proof`
-2. Verifies the proof using `LigeroVerifier`
-3. Extracts the public output (the validated value)
-4. Checks that the public output matches the requested value
-5. Sets the value in state if all checks pass
-
-## Ligero SDK API Reference
-
-### Assertion Functions
-- `assert_one(condition)` - Assert that condition is true (1)
-- `assert_zero(condition)` - Assert that condition is false (0)
-- `assert_constant(value)` - Assert that value is a compile-time constant
-
-### Argument Handling
-- Arguments are passed via standard WASI `main(int argc, char *argv[])`
-- `argv[1], argv[2], ...` contain the argument data as raw bytes
-- Cast the pointers to the appropriate type (e.g., `int*`, `char*`)
-
-### Debug Functions (optional)
-- `print_str(data, len)` - Print a string (for debugging)
-- `dump_memory(addr, len)` - Dump memory contents
-
-## Example: Generating a Proof
-
-After building the guest program:
+### Check WASM Size
 
 ```bash
-cd ../../  # Back to ligero adapter root
-
-# Generate proof for value 42
-cargo run --example generate_value_proof --features native -- 42
-
-# This creates:
-# - target/value_proof.bin (serialized proof package)
-# - target/value_tx.json (transaction template)
+ls -lh bins/programs/guest_name.wasm
 ```
 
-## Troubleshooting
+Smaller WASM = faster proving. Target: < 100 KB for most guests.
 
-### "emcc not found"
-- Make sure Emscripten is activated: `source /path/to/emsdk/emsdk_env.sh`
+### Common Issues
 
-### "libligetron.a not found"
-- Build the Ligero SDK first (see Prerequisites above)
-- Ensure the path in CMakeLists.txt is correct
+**"error: linking with `rust-lld` failed"**
+- Ensure `wasm32-wasip1` target is installed
+- Check RUSTFLAGS are set correctly
 
-### "undefined symbol: assert_one"
-- Make sure you're linking against `libligetron` with `-lligetron`
-- Check that the Ligero SDK is built correctly
+**"undefined symbol: assert_one"**
+- This is expected; the host provides `assert_one` at runtime
+- Make sure you're using `#[link(wasm_import_module = "env")]`
 
-### Linker errors
-- Ensure you're using `em++` (not `g++` or `clang++`)
-- Ensure `emcmake cmake` was used (not regular `cmake`)
+**"proof verification failed"**
+- Check that arguments match expected types and order
+- Verify private-indices configuration
+- Ensure cryptography matches on-chain implementation
 
-## Development Notes
+## Architecture
 
-- All Ligero programs use WASI for I/O
-- Arguments types: `<str>`, `<i64>`, `<hex>`
-- Assertions are cryptographically enforced in the proof
-- Failed assertions cause proof generation to fail
-- The program must be deterministic
+```
+guest/
+├── README.md              # This file
+├── bins/                  # Output directory
+│   └── programs/
+│       ├── value_validator_rust.wasm
+│       └── note_spend_guest.wasm
+├── rust-guest/            # PoC: value validator
+│   ├── Cargo.toml
+│   ├── build.sh
+│   └── src/lib.rs
+├── note-spend-guest/      # Production: note spend verifier
+│   ├── Cargo.toml
+│   ├── build.sh
+│   └── src/lib.rs
+└── value_validator.cpp    # Legacy C++ program
+```
+
+## Performance Characteristics
+
+| Program | Size | Proving Time* | Use Case |
+|---------|------|---------------|----------|
+| value-validator | ~500 B | < 1s | Simple range check |
+| note-spend-guest | 50 KB | ~30s** | Shielded pool spend |
+
+\* Approximate times on WebGPU-capable hardware  
+\*\* Actual proving time depends on Merkle tree depth and hardware
 
 ## References
 
-- [Ligero Prover Repository](https://github.com/ligeroinc/ligero-prover)
-- [Emscripten Documentation](https://emscripten.org/docs/getting_started/)
+- [Ligero Paper](https://eprint.iacr.org/2022/1608)
+- [WebAssembly Specification](https://webassembly.github.io/spec/)
 - [WASI Documentation](https://github.com/WebAssembly/WASI)
+- [Rust Embedded Book](https://docs.rust-embedded.org/book/)
+- [no_std Guide](https://docs.rust-embedded.org/book/intro/no-std.html)
+
+## Contributing
+
+When adding a new guest program:
+
+1. Create a new directory with clear naming
+2. Include comprehensive README.md
+3. Add build script and usage examples
+4. Write integration tests in the appropriate module
+5. Update this README with a new entry
+
+## License
+
+Copyright (C) 2023-2025 Sovereign Labs  
+Licensed under the Apache License, Version 2.0

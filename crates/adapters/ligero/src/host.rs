@@ -246,9 +246,13 @@ impl ZkvmHost for LigeroHost {
 
             tracing::info!("Ligero: Generating proof with webgpu_prover");
             let proof = self.run_prover()?;
+            
+            // Include args and private_indices for verification (serialize args as JSON for bincode compat)
             let package = LigeroProofPackage {
                 proof,
                 public_output,
+                args_json: serde_json::to_vec(&self.config.args)?,
+                private_indices: self.config.private_indices.clone(),
             };
             Ok(bincode::serialize(&package)?)
         } else {
@@ -273,6 +277,8 @@ impl ZkvmHost for LigeroHost {
             let package = LigeroProofPackage {
                 proof: vec![],
                 public_output,
+                args_json: serde_json::to_vec(&self.config.args)?,
+                private_indices: self.config.private_indices.clone(),
             };
             Ok(bincode::serialize(&package)?)
         }

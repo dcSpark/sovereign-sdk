@@ -138,8 +138,8 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             CallMessage::Deposit { amount, rho, recipient, gas } => {
                 Ok(self.deposit(amount, rho, recipient, gas, context, state)?)
             }
-            CallMessage::Withdraw { proof, to, gas } => {
-                Ok(self.withdraw(proof, to, gas, context, state)?)
+            CallMessage::Withdraw { proof, anchor_root, nullifier, withdraw_amount, to, gas } => {
+                Ok(self.withdraw(proof, anchor_root, nullifier, withdraw_amount, to, gas, context, state)?)
             }
             CallMessage::UpdateMethodId { new_method_id } => {
                 Ok(self.update_method_id(new_method_id, context, state)?)

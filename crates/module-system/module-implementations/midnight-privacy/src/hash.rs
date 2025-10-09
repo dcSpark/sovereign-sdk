@@ -41,17 +41,16 @@ impl FromStr for NullifierKey {
     }
 }
 
-/// Global Poseidon2 hasher instance (deterministic with fixed seed)
-fn get_hasher() -> Poseidon2Core {
-    Poseidon2Core::new()
-}
+use once_cell::sync::Lazy;
+
+/// Global static Poseidon2 hasher instance (deterministic with fixed seed).
+/// Using a static instance avoids repeated allocations and initialization overhead.
+static POSEIDON: Lazy<Poseidon2Core> = Lazy::new(Poseidon2Core::new);
 
 /// Domain-separated 32-byte Poseidon2 hash.
 /// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V1", "NF_V1").
 /// This provides collision resistance between different hash use cases.
 pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
-    let hasher = get_hasher();
-    
     // Concatenate tag and all parts
     let mut input = Vec::with_capacity(tag.len() + parts.iter().map(|p| p.len()).sum::<usize>());
     input.extend_from_slice(tag);
@@ -59,22 +58,45 @@ pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
         input.extend_from_slice(part);
     }
     
-    hasher.hash_padded(&input)
+    POSEIDON.hash_padded(&input)
 }
+
+/// Domain tags as fixed-size arrays (avoids const evaluation issues)
+const MT_TAG: &[u8; 10] = b"MT_NODE_V1";
+const NOTE_TAG: &[u8; 7] = b"NOTE_V1";
+const NF_TAG: &[u8; 9] = b"PRF_NF_V1";
 
 /// Combine two children into a parent node in the Merkle tree.
 /// Uses domain tag "MT_NODE_V1" with level to prevent cross-level collisions.
+/// Optimized to avoid heap allocations by using a fixed-size buffer.
+#[inline]
 pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
-    let lvl = [level];
-    poseidon2_hash(b"MT_NODE_V1", &[&lvl, left, right])
+    // Fixed-size buffer: tag (10 bytes) + level (1 byte) + left (32 bytes) + right (32 bytes) = 75 bytes
+    let mut buf = [0u8; 10 + 1 + 32 + 32];
+    buf[..10].copy_from_slice(MT_TAG);
+    buf[10] = level;
+    buf[11..43].copy_from_slice(left);
+    buf[43..].copy_from_slice(right);
+    
+    POSEIDON.hash_padded(&buf)
 }
 
 /// Compute a note commitment.
 /// Commits to: domain tag, value, randomness, and recipient binding.
 /// Uses domain tag "NOTE_V1" for domain separation.
+/// Optimized to avoid heap allocations by using a fixed-size buffer.
+#[inline]
 pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
     let v = value.to_le_bytes();
-    poseidon2_hash(b"NOTE_V1", &[domain, &v, rho, recipient])
+    // Fixed-size buffer: tag (7 bytes) + domain (32 bytes) + value (16 bytes) + rho (32 bytes) + recipient (32 bytes) = 119 bytes
+    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32];
+    buf[..7].copy_from_slice(NOTE_TAG);
+    buf[7..39].copy_from_slice(domain);
+    buf[39..55].copy_from_slice(&v);
+    buf[55..87].copy_from_slice(rho);
+    buf[87..].copy_from_slice(recipient);
+    
+    POSEIDON.hash_padded(&buf)
 }
 
 /// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
@@ -85,8 +107,17 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
 ///
 /// This makes nullifiers position-agnostic: spending the same note across different
 /// anchors yields the same `nf`, enabling reliable double-spend detection across forks.
+/// Optimized to avoid heap allocations by using a fixed-size buffer.
+#[inline]
 pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
-    poseidon2_hash(b"PRF_NF_V1", &[domain, nf_key, rho])
+    // Fixed-size buffer: tag (9 bytes) + domain (32 bytes) + nf_key (32 bytes) + rho (32 bytes) = 105 bytes
+    let mut buf = [0u8; 9 + 32 + 32 + 32];
+    buf[..9].copy_from_slice(NF_TAG);
+    buf[9..41].copy_from_slice(domain);
+    buf[41..73].copy_from_slice(nf_key);
+    buf[73..].copy_from_slice(rho);
+    
+    POSEIDON.hash_padded(&buf)
 }
 
 /// Recompute the Merkle root from a leaf using its authentication path.

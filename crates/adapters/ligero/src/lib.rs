@@ -288,6 +288,12 @@ pub struct LigeroProofPackage {
     pub proof: Vec<u8>,
     /// Serialized public output committed by the guest program.
     pub public_output: Vec<u8>,
+    /// Arguments passed to the guest program (JSON-serialized for bincode compatibility).
+    #[cfg(feature = "native")]
+    pub args_json: Vec<u8>,
+    /// Indices of private arguments (1-based).
+    #[cfg(feature = "native")]
+    pub private_indices: Vec<usize>,
 }
 
 /// Verifier for Ligero proofs
@@ -320,7 +326,9 @@ impl ZkVerifier for LigeroVerifier {
             let paths = native::VerifierPaths::discover()
                 .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
             native::ensure_code_commitment(&paths, code_commitment)?;
-            native::verify_proof(&paths, &package.proof)?;
+            // Deserialize args from JSON
+            let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
+            native::verify_proof(&paths, &package.proof, args, package.private_indices.clone())?;
         }
 
         #[cfg(not(feature = "native"))]
@@ -460,13 +468,13 @@ mod native {
             })
         }
 
-        pub fn to_config(&self) -> LigeroConfig {
+        pub fn to_config(&self, args: Vec<crate::LigeroArg>, private_indices: Vec<usize>) -> LigeroConfig {
             LigeroConfig {
                 program: self.program.to_string_lossy().into_owned(),
                 shader_path: self.shader_path.to_string_lossy().into_owned(),
                 packing: self.packing,
-                private_indices: Vec::new(),
-                args: Vec::new(),
+                private_indices,
+                args,
             }
         }
     }
@@ -498,14 +506,30 @@ mod native {
         Ok(())
     }
 
-    pub fn verify_proof(paths: &VerifierPaths, proof_bytes: &[u8]) -> Result<()> {
+    pub fn verify_proof(
+        paths: &VerifierPaths,
+        proof_bytes: &[u8],
+        mut args: Vec<crate::LigeroArg>,
+        private_indices: Vec<usize>,
+    ) -> Result<()> {
         let temp_dir =
             tempdir().context("Failed to create temporary directory for Ligero verification")?;
         let proof_path = temp_dir.path().join("proof.data");
         fs::write(&proof_path, proof_bytes)
             .context("Failed to write proof.data for Ligero verification")?;
 
-        let config = paths.to_config();
+        // Redact private arguments (replace with dummy values)
+        for &idx in &private_indices {
+            if idx > 0 && idx <= args.len() {
+                // 1-based indexing
+                let arg_idx = idx - 1;
+                args[arg_idx] = crate::LigeroArg::Hex {
+                    hex: "00".repeat(32), // Redacted placeholder
+                };
+            }
+        }
+
+        let config = paths.to_config(args, private_indices);
         let config_json =
             serde_json::to_string(&config).context("Failed to serialize Ligero verifier config")?;
 
