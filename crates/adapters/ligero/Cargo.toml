@@ -1,12 +1,12 @@
 [package]
 name = "sov-ligero-adapter"
 description = "An adapter allowing Ligero to be used with the Sovereign SDK"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-homepage.workspace = true
-repository.workspace = true
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
 readme = "README.md"
 publish = false
 
@@ -62,7 +62,6 @@ native = [
     "tempfile",
     "sov-rollup-interface/native",
     "sov-mock-zkvm/native",
-    "sov-ligero-adapter/native"
 ]
 # bench = [
 #     "sov-metrics",
@@ -72,5 +71,4 @@ arbitrary = [
     "dep:arbitrary",
     "dep:proptest",
     "sov-rollup-interface/arbitrary",
-    "sov-ligero-adapter/arbitrary"
 ]

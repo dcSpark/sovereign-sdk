@@ -21,6 +21,9 @@ sov-modules-api = { workspace = true, features = ["native"] }
 sov-test-utils = { workspace = true }
 sov-state = { workspace = true, features = ["native"] }
 sha2 = { workspace = true }
+sov-ligero-adapter = { workspace = true, features = ["native"] }
+sov-rollup-interface = { workspace = true, features = ["native"] }
+hex = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }

@@ -7006,6 +7006,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "borsh",
+ "hex",
  "schemars 0.8.22",
  "serde",
  "sha2 0.10.9",
