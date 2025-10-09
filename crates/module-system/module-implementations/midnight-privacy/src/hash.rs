@@ -77,11 +77,16 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
     poseidon2_hash(b"NOTE_V1", &[domain, &v, rho, recipient])
 }
 
-/// Compute a nullifier from domain, secret nf_key, note commitment, and position.
-/// Uses domain tag "NF_V1" to prevent collisions with other hash uses.
-pub fn nullifier(domain: &Hash32, nf_key: &Hash32, cm: &Hash32, pos: u64) -> Hash32 {
-    let p = pos.to_le_bytes();
-    poseidon2_hash(b"NF_V1", &[domain, nf_key, cm, &p])
+/// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
+/// nf = Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
+///
+/// - `nf_key` is derived from the spender's secret
+/// - `rho` is the note's randomness (part of the note opening)
+///
+/// This makes nullifiers position-agnostic: spending the same note across different
+/// anchors yields the same `nf`, enabling reliable double-spend detection across forks.
+pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
+    poseidon2_hash(b"PRF_NF_V1", &[domain, nf_key, rho])
 }
 
 /// Recompute the Merkle root from a leaf using its authentication path.

@@ -25,6 +25,7 @@ sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-rollup-interface = { workspace = true, features = ["native"] }
 hex = { workspace = true }
 serde_json = { workspace = true }
+sov-bank = { workspace = true, features = ["native", "test-utils"] }
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,6 +40,7 @@ sov-state = { workspace = true }
 bincode = { workspace = true }
 hex = { workspace = true }
 qp-poseidon-core = { version = "0.9.5", features = ["std"] }
+sov-bank = { workspace = true }
 
 [features]
 default = ["native"]

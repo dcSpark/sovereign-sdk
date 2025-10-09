@@ -12,8 +12,10 @@ use crate::hash::Hash32;
 pub struct SpendPublic {
     /// Anchor root used for membership checks.
     pub anchor_root: Hash32,
-    /// Nullifier of the consumed note.
+    /// Nullifier of the consumed note (PRF-based; no position).
     pub nullifier: Hash32,
+    /// For a single native token, the transparent withdrawal amount authorized by the circuit.
+    pub withdraw_amount: u128,
 }
 
 /// Witness for a single-input spend (simple demo).
@@ -21,20 +23,30 @@ pub struct SpendPublic {
 pub struct SpendWitness {
     /// Tree depth.
     pub tree_depth: u8,
-    /// Domain tag.
+    /// Domain tag (from chain state).
     pub domain: Hash32,
     /// Anchor root.
     pub anchor_root: Hash32,
 
-    /// Note commitment.
-    pub cm: Hash32,
+    // --- Note opening (private) ---
+    /// Value of the note.
+    pub value: u128,
+    /// Random nonce (used in both commitment and nullifier).
+    pub rho: Hash32,
+    /// Recipient binding.
+    pub recipient: Hash32,
     /// Secret nf key to derive the nullifier.
     pub nf_key: Hash32,
 
+    // --- Merkle membership ---
     /// Leaf index.
     pub pos: u64,
     /// Merkle path (bottom-up), length == `tree_depth`.
     pub siblings: Vec<Hash32>,
+
+    // --- Withdrawal binding (public in journal) ---
+    /// Withdrawal amount authorized by this proof.
+    pub withdraw_amount: u128,
 }
 
 /// A note stored in the commitment tree

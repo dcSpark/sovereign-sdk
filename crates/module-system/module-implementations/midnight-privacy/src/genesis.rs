@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
+use crate::hash::Hash32;
 use crate::merkle::MerkleTree;
 
 /// Initial configuration for midnight-privacy module.
@@ -21,6 +22,12 @@ pub struct ValueSetterZkConfig<S: Spec> {
     
     /// Admin of the module who can update the method ID.
     pub admin: S::Address,
+    
+    /// Domain tag used in all note/hash derivations
+    pub domain: Hash32,
+    
+    /// Single supported token (native)
+    pub token_id: sov_bank::TokenId,
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -35,6 +42,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
+        
+        // New: bind domain + native token in state
+        self.domain.set(&config.domain, state)?;
+        self.token_id.set(&config.token_id, state)?;
         
         // Initialize the commitment tree
         let tree = MerkleTree::new(config.tree_depth);
@@ -67,11 +78,15 @@ mod tests {
     fn test_config_serialization() {
         let admin = <TestSpec as Spec>::Address::from([1; 28]);
         let method_id = [0u8; 32];
+        let domain = [0u8; 32];
+        let token_id = sov_bank::TokenId::generate::<TestSpec>("test_token");
         let config = ValueSetterZkConfig::<TestSpec> {
             admin,
             method_id,
             tree_depth: 16,
             root_window_size: 100,
+            domain,
+            token_id,
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();

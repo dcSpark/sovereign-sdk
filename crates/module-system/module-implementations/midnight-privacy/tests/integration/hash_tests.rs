@@ -53,20 +53,24 @@ mod tests {
 
     #[test]
     fn test_nullifier() {
+        // PRF-based nullifier: nf = Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
         let domain = [1u8; 32];
         let nf_key = [2u8; 32];
-        let cm = [3u8; 32];
-        let pos = 42u64;
+        let rho = [3u8; 32];
         
-        let nf1 = nullifier(&domain, &nf_key, &cm, pos);
-        let nf2 = nullifier(&domain, &nf_key, &cm, pos);
+        let nf1 = nullifier(&domain, &nf_key, &rho);
+        let nf2 = nullifier(&domain, &nf_key, &rho);
         
         // Same inputs should produce same nullifier
         assert_eq!(nf1, nf2);
         
-        // Different position should produce different nullifier
-        let nf3 = nullifier(&domain, &nf_key, &cm, pos + 1);
+        // Different rho should produce different nullifier
+        let rho2 = [4u8; 32];
+        let nf3 = nullifier(&domain, &nf_key, &rho2);
         assert_ne!(nf1, nf3);
+        
+        // Nullifier is now position-agnostic (no position in the computation)
+        // This is the key property for parallel transaction safety
     }
 
     #[test]

@@ -28,5 +28,25 @@ pub enum Event {
         /// The new method ID
         new_method_id: [u8; 32],
     },
+    /// Tokens were deposited into the pool and a note was created
+    PoolDeposit {
+        /// Amount deposited
+        amount: u128,
+        /// The note commitment
+        commitment: Hash32,
+        /// Position in the tree
+        position: u64,
+        /// New Merkle root
+        new_root: Hash32,
+    },
+    /// Tokens were withdrawn from the pool after consuming a nullifier
+    PoolWithdraw {
+        /// Amount withdrawn
+        amount: u128,
+        /// The nullifier
+        nullifier: Hash32,
+        /// The anchor root used
+        anchor_root: Hash32,
+    },
 }
 

@@ -26,11 +26,12 @@ use sov_modules_api::{
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
 /// This module allows users to:
-/// 1. Create note commitments and add them to a Merkle tree
+/// 1. Deposit tokens into the pool and create note commitments
 /// 2. Spend notes by providing ZK proofs that demonstrate:
 ///    - Knowledge of a note in the tree
 ///    - A valid Merkle path to an anchor root
 ///    - Proper nullifier derivation
+/// 3. Withdraw tokens from the pool with proof-bound amounts
 ///
 /// The nullifier prevents double-spending, and the anchor root window allows
 /// parallel transactions while maintaining security.
@@ -43,6 +44,9 @@ use sov_modules_api::{
 /// - `root_window_size`: Size of the anchor window
 /// - `method_id`: Ligero method ID (code commitment) for proof verification
 /// - `admin`: Administrator who can update the method ID
+/// - `domain`: Domain tag for all note/hash operations
+/// - `token_id`: The single supported native token
+/// - `bank`: Bank module for token transfers
 ///
 /// # Derives
 /// - `ModuleInfo`: Required for all modules
@@ -81,6 +85,18 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Administrator address who can update the method ID.
     #[state]
     pub admin: StateValue<S::Address>,
+
+    /// Domain tag used in all note/hash derivations.
+    #[state]
+    pub domain: StateValue<Hash32>,
+
+    /// Single supported token (native).
+    #[state]
+    pub token_id: StateValue<sov_bank::TokenId>,
+
+    /// Bank module to hold/transfer the native token.
+    #[module]
+    pub bank: sov_bank::Bank<S>,
 }
 
 impl<S: Spec> Module for ValueMidnightPrivacy<S> {
@@ -118,6 +134,12 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             }
             CallMessage::SpendNote { proof, gas } => {
                 Ok(self.spend_note(proof, gas, context, state)?)
+            }
+            CallMessage::Deposit { amount, rho, recipient, gas } => {
+                Ok(self.deposit(amount, rho, recipient, gas, context, state)?)
+            }
+            CallMessage::Withdraw { proof, to, gas } => {
+                Ok(self.withdraw(proof, to, gas, context, state)?)
             }
             CallMessage::UpdateMethodId { new_method_id } => {
                 Ok(self.update_method_id(new_method_id, context, state)?)

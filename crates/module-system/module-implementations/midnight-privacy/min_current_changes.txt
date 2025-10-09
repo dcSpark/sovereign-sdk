@@ -1,0 +1,629 @@
+==============================================
+Git Diff Report - Thu Oct  9 13:43:32 CDT 2025
+==============================================
+Branch: feature/privacyb
+Commit: 4aac78e2
+Base commit: 4aac78e2
+
+==============================================
+Git Status Summary
+==============================================
+ M src/call.rs
+ M src/event.rs
+ M src/genesis.rs
+ M src/hash.rs
+ M src/lib.rs
+ M src/types.rs
+ M tests/integration/hash_tests.rs
+ M tests/integration/ligero_proof_test.rs
+
+==============================================
+Diff of Modified Files (against HEAD)
+==============================================
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/call.rs b/crates/module-system/module-implementations/midnight-privacy/src/call.rs
+index 38a0e602..001a1332 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/call.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/call.rs
+@@ -38,6 +38,30 @@ pub enum CallMessage<S: Spec> {
+         /// Gas to charge. Don't charge gas if None.
+         gas: Option<S::Gas>,
+     },
++
++    /// Deposit tokens into the pool and create a note commitment.
++    /// Moves `amount` of the native token from sender into the pool.
++    Deposit {
++        /// Amount to deposit
++        amount: u128,
++        /// Random nonce for the note
++        rho: Hash32,
++        /// Recipient binding
++        recipient: Hash32,
++        /// Gas to charge. Don't charge gas if None.
++        gas: Option<S::Gas>,
++    },
++
++    /// Withdraw tokens from the pool after verifying a ZK proof.
++    /// The proof must bind the withdrawal amount to prevent draining attacks.
++    Withdraw {
++        /// Serialized Ligero proof package (bincode-encoded)
++        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
++        /// Recipient address for the withdrawn tokens
++        to: S::Address,
++        /// Gas to charge. Don't charge gas if None.
++        gas: Option<S::Gas>,
++    },
+     
+     /// Update the method ID (admin only).
+     /// This allows upgrading the guest program used for proof verification.
+@@ -76,13 +100,17 @@ pub enum MidnightPrivacyError<S: Spec> {
+     /// The tree is full.
+     #[error("Commitment tree is full (max size: {0})")]
+     TreeFull(usize),
++
++    /// Amount conversion overflow.
++    #[error("Amount {0} does not fit in the bank amount type")]
++    AmountOverflow(u128),
+ }
+ 
+ impl<S: Spec> ValueMidnightPrivacy<S> {
+     /// Create a new note commitment and add it to the Merkle tree.
+     pub(crate) fn create_note(
+         &mut self,
+-        note: Note,
++        mut note: Note,
+         gas: Option<S::Gas>,
+         _context: &Context<S>,
+         state: &mut impl TxState<S>,
+@@ -90,6 +118,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
+         // Charge gas first
+         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
+         state.charge_gas(&gas)?;
++
++        // Force the note domain to match configured domain (defense-in-depth)
++        note.domain = self.domain.get_or_err(state)??;
+         
+         // Get current tree and position
+         let mut tree = self.commitment_tree.get_or_err(state)??;
+@@ -123,14 +154,165 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
+         
+         Ok(())
+     }
++
++    /// Deposit: transfer tokens into the pool, append commitment, update root window.
++    pub(crate) fn deposit(
++        &mut self,
++        amount: u128,
++        rho: Hash32,
++        recipient: Hash32,
++        gas: Option<S::Gas>,
++        ctx: &Context<S>,
++        st: &mut impl TxState<S>,
++    ) -> Result<()> {
++        let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
++        st.charge_gas(&gas)?;
++
++        // Convert amount into the bank's amount type (u64 -> Amount)
++        let amount_u64: u64 = amount
++            .try_into()
++            .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(amount))?;
++        let bank_amount = sov_bank::Amount::from(amount_u64);
++
++        // Pull native token from sender into module account
++        use sov_bank::IntoPayable;
++        let token_id = self.token_id.get_or_err(st)??;
++        let coins = sov_bank::Coins {
++            amount: bank_amount,
++            token_id,
++        };
++        self.bank.transfer_from(
++            ctx.sender(),
++            self.id.to_payable(),
++            coins,
++            st,
++        )?;
++
++        // Build note using the configured domain
++        let domain = self.domain.get_or_err(st)??;
++        let note = Note {
++            domain,
++            value: amount,
++            rho,
++            recipient,
++        };
++
++        // Reuse create_note to append to the tree + emit events
++        self.create_note(note, Some(gas), ctx, st)?;
++
++        // Emit explicit pool deposit event
++        let cm = note_commitment(&domain, amount, &rho, &recipient);
++        let next_pos = self.next_position.get_or_err(st)??;
++        let position = next_pos.saturating_sub(1);
++        let tree = self.commitment_tree.get_or_err(st)??;
++        let new_root = tree.root();
++
++        self.emit_event(
++            st,
++            Event::PoolDeposit {
++                amount,
++                commitment: cm,
++                position,
++                new_root,
++            },
++        );
++
++        Ok(())
++    }
++
++    /// Withdraw: verify proof, consume nullifier, and transfer native token out.
++    pub(crate) fn withdraw(
++        &mut self,
++        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
++        to: S::Address,
++        gas: Option<S::Gas>,
++        _ctx: &Context<S>,
++        st: &mut impl TxState<S>,
++    ) -> Result<()> {
++        let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
++        st.charge_gas(&gas)?;
++
++        // Verify proof and extract public output
++        let method_id_bytes = self
++            .method_id
++            .get(st)?
++            .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
++        let public = {
++            #[cfg(feature = "native")]
++            {
++                use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
++                let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
++                    .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
++                LigeroVerifier::verify::<SpendPublic>(&proof, &method_id)
++                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
++            }
++            #[cfg(not(feature = "native"))]
++            {
++                anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
++            }
++        };
++
++        // 1) Anchor must be valid
++        if !self.is_valid_anchor(&public.anchor_root, st)? {
++            return Err(MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into());
++        }
++
++        // 2) Nullifier must be fresh
++        let nk = NullifierKey(public.nullifier);
++        if self.nullifier_set.get(&nk, st)?.is_some() {
++            return Err(MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into());
++        }
++        self.nullifier_set.set(&nk, &true, st)?;
++
++        // 3) Perform the transparent withdrawal for the *authorized* amount
++        use sov_bank::IntoPayable;
++        let token_id = self.token_id.get_or_err(st)??;
++
++        let amount_u64: u64 = public
++            .withdraw_amount
++            .try_into()
++            .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
++        let bank_amount = sov_bank::Amount::from(amount_u64);
++
++        let coins = sov_bank::Coins {
++            amount: bank_amount,
++            token_id,
++        };
++        self.bank.transfer_from(
++            self.id.to_payable(),
++            &to,
++            coins,
++            st,
++        )?;
++
++        // Emit events
++        self.emit_event(
++            st,
++            Event::NoteSpent {
++                nullifier: public.nullifier,
++                anchor_root: public.anchor_root,
++            },
++        );
++        self.emit_event(
++            st,
++            Event::PoolWithdraw {
++                amount: public.withdraw_amount,
++                nullifier: public.nullifier,
++                anchor_root: public.anchor_root,
++            },
++        );
++
++        Ok(())
++    }
+     
+     /// Spend a note by verifying a ZK proof and consuming its nullifier.
+     ///
+     /// The proof must:
+     /// 1. Be verifiable against the configured method ID
+-    /// 2. Commit to a `SpendPublic` struct containing (anchor_root, nullifier)
++    /// 2. Commit to a `SpendPublic` struct containing (anchor_root, nullifier, withdraw_amount)
+     /// 3. The anchor_root must be in the recent roots window
+     /// 4. The nullifier must not have been seen before
++    /// 5. For pure spends with no withdrawal, withdraw_amount should be 0
+     pub(crate) fn spend_note(
+         &mut self,
+         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+@@ -178,6 +360,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
+                 nullifier: public.nullifier,
+                 anchor_root: public.anchor_root,
+             });
++            
++            // Note: For pure spends without withdrawal, withdraw_amount should be 0.
++            // If withdraw_amount > 0, this indicates the proof authorizes a withdrawal
++            // but the caller should use the Withdraw call instead.
+         }
+         
+         // In non-native mode (e.g., inside a zkVM), we can't verify Ligero proofs
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/event.rs b/crates/module-system/module-implementations/midnight-privacy/src/event.rs
+index 80b3a12f..d9091f05 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/event.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/event.rs
+@@ -28,5 +28,25 @@ pub enum Event {
+         /// The new method ID
+         new_method_id: [u8; 32],
+     },
++    /// Tokens were deposited into the pool and a note was created
++    PoolDeposit {
++        /// Amount deposited
++        amount: u128,
++        /// The note commitment
++        commitment: Hash32,
++        /// Position in the tree
++        position: u64,
++        /// New Merkle root
++        new_root: Hash32,
++    },
++    /// Tokens were withdrawn from the pool after consuming a nullifier
++    PoolWithdraw {
++        /// Amount withdrawn
++        amount: u128,
++        /// The nullifier
++        nullifier: Hash32,
++        /// The anchor root used
++        anchor_root: Hash32,
++    },
+ }
+ 
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/genesis.rs b/crates/module-system/module-implementations/midnight-privacy/src/genesis.rs
+index 377ca4b2..c9a96d04 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/genesis.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/genesis.rs
+@@ -3,6 +3,7 @@ use schemars::JsonSchema;
+ use sov_modules_api::{GenesisState, Spec};
+ 
+ use super::ValueMidnightPrivacy;
++use crate::hash::Hash32;
+ use crate::merkle::MerkleTree;
+ 
+ /// Initial configuration for midnight-privacy module.
+@@ -21,6 +22,12 @@ pub struct ValueSetterZkConfig<S: Spec> {
+     
+     /// Admin of the module who can update the method ID.
+     pub admin: S::Address,
++    
++    /// Domain tag used in all note/hash derivations
++    pub domain: Hash32,
++    
++    /// Single supported token (native)
++    pub token_id: sov_bank::TokenId,
+ }
+ 
+ impl<S: Spec> ValueMidnightPrivacy<S> {
+@@ -36,6 +43,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
+         // Set the method ID
+         self.method_id.set(&config.method_id, state)?;
+         
++        // New: bind domain + native token in state
++        self.domain.set(&config.domain, state)?;
++        self.token_id.set(&config.token_id, state)?;
++        
+         // Initialize the commitment tree
+         let tree = MerkleTree::new(config.tree_depth);
+         self.commitment_tree.set(&tree, state)?;
+@@ -67,11 +78,15 @@ mod tests {
+     fn test_config_serialization() {
+         let admin = <TestSpec as Spec>::Address::from([1; 28]);
+         let method_id = [0u8; 32];
++        let domain = [0u8; 32];
++        let token_id = sov_bank::TokenId::generate::<TestSpec>("test_token");
+         let config = ValueSetterZkConfig::<TestSpec> {
+             admin,
+             method_id,
+             tree_depth: 16,
+             root_window_size: 100,
++            domain,
++            token_id,
+         };
+ 
+         let json_str = serde_json::to_string_pretty(&config).unwrap();
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/hash.rs b/crates/module-system/module-implementations/midnight-privacy/src/hash.rs
+index c35953fa..a6056322 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/hash.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/hash.rs
+@@ -77,11 +77,16 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
+     poseidon2_hash(b"NOTE_V1", &[domain, &v, rho, recipient])
+ }
+ 
+-/// Compute a nullifier from domain, secret nf_key, note commitment, and position.
+-/// Uses domain tag "NF_V1" to prevent collisions with other hash uses.
+-pub fn nullifier(domain: &Hash32, nf_key: &Hash32, cm: &Hash32, pos: u64) -> Hash32 {
+-    let p = pos.to_le_bytes();
+-    poseidon2_hash(b"NF_V1", &[domain, nf_key, cm, &p])
++/// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
++/// nf = Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
++///
++/// - `nf_key` is derived from the spender's secret
++/// - `rho` is the note's randomness (part of the note opening)
++///
++/// This makes nullifiers position-agnostic: spending the same note across different
++/// anchors yields the same `nf`, enabling reliable double-spend detection across forks.
++pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
++    poseidon2_hash(b"PRF_NF_V1", &[domain, nf_key, rho])
+ }
+ 
+ /// Recompute the Merkle root from a leaf using its authentication path.
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/lib.rs b/crates/module-system/module-implementations/midnight-privacy/src/lib.rs
+index e71dd209..77b06072 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/lib.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/lib.rs
+@@ -26,11 +26,12 @@ use sov_modules_api::{
+ /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
+ ///
+ /// This module allows users to:
+-/// 1. Create note commitments and add them to a Merkle tree
++/// 1. Deposit tokens into the pool and create note commitments
+ /// 2. Spend notes by providing ZK proofs that demonstrate:
+ ///    - Knowledge of a note in the tree
+ ///    - A valid Merkle path to an anchor root
+ ///    - Proper nullifier derivation
++/// 3. Withdraw tokens from the pool with proof-bound amounts
+ ///
+ /// The nullifier prevents double-spending, and the anchor root window allows
+ /// parallel transactions while maintaining security.
+@@ -43,6 +44,9 @@ use sov_modules_api::{
+ /// - `root_window_size`: Size of the anchor window
+ /// - `method_id`: Ligero method ID (code commitment) for proof verification
+ /// - `admin`: Administrator who can update the method ID
++/// - `domain`: Domain tag for all note/hash operations
++/// - `token_id`: The single supported native token
++/// - `bank`: Bank module for token transfers
+ ///
+ /// # Derives
+ /// - `ModuleInfo`: Required for all modules
+@@ -81,6 +85,18 @@ pub struct ValueMidnightPrivacy<S: Spec> {
+     /// Administrator address who can update the method ID.
+     #[state]
+     pub admin: StateValue<S::Address>,
++
++    /// Domain tag used in all note/hash derivations.
++    #[state]
++    pub domain: StateValue<Hash32>,
++
++    /// Single supported token (native).
++    #[state]
++    pub token_id: StateValue<sov_bank::TokenId>,
++
++    /// Bank module to hold/transfer the native token.
++    #[module]
++    pub bank: sov_bank::Bank<S>,
+ }
+ 
+ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
+@@ -119,6 +135,12 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
+             CallMessage::SpendNote { proof, gas } => {
+                 Ok(self.spend_note(proof, gas, context, state)?)
+             }
++            CallMessage::Deposit { amount, rho, recipient, gas } => {
++                Ok(self.deposit(amount, rho, recipient, gas, context, state)?)
++            }
++            CallMessage::Withdraw { proof, to, gas } => {
++                Ok(self.withdraw(proof, to, gas, context, state)?)
++            }
+             CallMessage::UpdateMethodId { new_method_id } => {
+                 Ok(self.update_method_id(new_method_id, context, state)?)
+             }
+diff --git a/crates/module-system/module-implementations/midnight-privacy/src/types.rs b/crates/module-system/module-implementations/midnight-privacy/src/types.rs
+index a1799c2b..98d90399 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/src/types.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/src/types.rs
+@@ -12,8 +12,10 @@ use crate::hash::Hash32;
+ pub struct SpendPublic {
+     /// Anchor root used for membership checks.
+     pub anchor_root: Hash32,
+-    /// Nullifier of the consumed note.
++    /// Nullifier of the consumed note (PRF-based; no position).
+     pub nullifier: Hash32,
++    /// For a single native token, the transparent withdrawal amount authorized by the circuit.
++    pub withdraw_amount: u128,
+ }
+ 
+ /// Witness for a single-input spend (simple demo).
+@@ -21,20 +23,30 @@ pub struct SpendPublic {
+ pub struct SpendWitness {
+     /// Tree depth.
+     pub tree_depth: u8,
+-    /// Domain tag.
++    /// Domain tag (from chain state).
+     pub domain: Hash32,
+     /// Anchor root.
+     pub anchor_root: Hash32,
+ 
+-    /// Note commitment.
+-    pub cm: Hash32,
++    // --- Note opening (private) ---
++    /// Value of the note.
++    pub value: u128,
++    /// Random nonce (used in both commitment and nullifier).
++    pub rho: Hash32,
++    /// Recipient binding.
++    pub recipient: Hash32,
+     /// Secret nf key to derive the nullifier.
+     pub nf_key: Hash32,
+ 
++    // --- Merkle membership ---
+     /// Leaf index.
+     pub pos: u64,
+     /// Merkle path (bottom-up), length == `tree_depth`.
+     pub siblings: Vec<Hash32>,
++
++    // --- Withdrawal binding (public in journal) ---
++    /// Withdrawal amount authorized by this proof.
++    pub withdraw_amount: u128,
+ }
+ 
+ /// A note stored in the commitment tree
+diff --git a/crates/module-system/module-implementations/midnight-privacy/tests/integration/hash_tests.rs b/crates/module-system/module-implementations/midnight-privacy/tests/integration/hash_tests.rs
+index cded9700..aa63eb61 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/tests/integration/hash_tests.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/tests/integration/hash_tests.rs
+@@ -53,20 +53,24 @@ mod tests {
+ 
+     #[test]
+     fn test_nullifier() {
++        // PRF-based nullifier: nf = Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
+         let domain = [1u8; 32];
+         let nf_key = [2u8; 32];
+-        let cm = [3u8; 32];
+-        let pos = 42u64;
++        let rho = [3u8; 32];
+         
+-        let nf1 = nullifier(&domain, &nf_key, &cm, pos);
+-        let nf2 = nullifier(&domain, &nf_key, &cm, pos);
++        let nf1 = nullifier(&domain, &nf_key, &rho);
++        let nf2 = nullifier(&domain, &nf_key, &rho);
+         
+         // Same inputs should produce same nullifier
+         assert_eq!(nf1, nf2);
+         
+-        // Different position should produce different nullifier
+-        let nf3 = nullifier(&domain, &nf_key, &cm, pos + 1);
++        // Different rho should produce different nullifier
++        let rho2 = [4u8; 32];
++        let nf3 = nullifier(&domain, &nf_key, &rho2);
+         assert_ne!(nf1, nf3);
++        
++        // Nullifier is now position-agnostic (no position in the computation)
++        // This is the key property for parallel transaction safety
+     }
+ 
+     #[test]
+diff --git a/crates/module-system/module-implementations/midnight-privacy/tests/integration/ligero_proof_test.rs b/crates/module-system/module-implementations/midnight-privacy/tests/integration/ligero_proof_test.rs
+index 4540b795..3a8db46a 100644
+--- a/crates/module-system/module-implementations/midnight-privacy/tests/integration/ligero_proof_test.rs
++++ b/crates/module-system/module-implementations/midnight-privacy/tests/integration/ligero_proof_test.rs
+@@ -432,22 +432,25 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
+     println!("✓ Merkle path verified (length: {} siblings)", siblings.len());
+     
+     // ---- 4) Derive nullifier for spending ----
+-    println!("\nStep 4: Deriving nullifier...");
++    println!("\nStep 4: Deriving nullifier (PRF-based)...");
+     
+-    let nf = nullifier(&domain, &nf_key, &cm, position);
++    let nf = nullifier(&domain, &nf_key, &rho);
+     println!("✓ Nullifier: {}", hex::encode(nf));
+     
+     // ---- 5) Prepare public output that proof will commit to ----
+     println!("\nStep 5: Preparing spend proof...");
+     
++    let withdraw_amount: u128 = 0; // For this test, no withdrawal
+     let public_output = SpendPublic {
+         anchor_root: anchor,
+         nullifier: nf,
++        withdraw_amount,
+     };
+     
+     println!("Public output (committed by proof):");
+-    println!("  - Anchor root: {}", hex::encode(public_output.anchor_root));
+-    println!("  - Nullifier:   {}", hex::encode(public_output.nullifier));
++    println!("  - Anchor root:      {}", hex::encode(public_output.anchor_root));
++    println!("  - Nullifier:        {}", hex::encode(public_output.nullifier));
++    println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
+     
+     // ---- 6) Generate proof (SIMULATION MODE) ----
+     // NOTE: This runs in simulation mode because we don't have a guest program yet
+@@ -456,8 +459,8 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
+     println!("⚠️  Running in simulation mode - no actual ZK proof generated");
+     println!("⚠️  To generate REAL proofs, implement a guest program that:");
+     println!("    - Verifies: root_from_path(cm, pos, siblings) == anchor");
+-    println!("    - Computes: nullifier(domain, nf_key, cm, pos)");
+-    println!("    - Commits: (anchor_root, nullifier) as public output");
++    println!("    - Computes: nullifier(domain, nf_key, rho) [PRF-based]");
++    println!("    - Commits: (anchor_root, nullifier, withdraw_amount) as public output");
+     
+     // In simulation mode, we just test the proof packaging
+     // This would normally call a guest program that verifies the spend circuit
+@@ -501,10 +504,12 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
+     // Verify the extracted public output matches what we proved
+     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
+     assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
++    assert_eq!(verified_output.withdraw_amount, withdraw_amount, "Withdraw amount mismatch!");
+     
+     println!("✓ Proof verified successfully!");
+-    println!("✓ Extracted anchor root: {}", hex::encode(verified_output.anchor_root));
+-    println!("✓ Extracted nullifier:   {}", hex::encode(verified_output.nullifier));
++    println!("✓ Extracted anchor root:     {}", hex::encode(verified_output.anchor_root));
++    println!("✓ Extracted nullifier:       {}", hex::encode(verified_output.nullifier));
++    println!("✓ Extracted withdraw amount: {}", verified_output.withdraw_amount);
+     
+     // ---- 8) Check nullifier consumption ----
+     println!("\nStep 8: Validating spend conditions...");
+@@ -579,8 +584,8 @@ const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
+ /// 
+ /// The guest program must implement:
+ /// 1. Verify Merkle path: root_from_path(cm, pos, siblings) == anchor
+-/// 2. Derive nullifier: nullifier(domain, nf_key, cm, pos)  
+-/// 3. Commit public output: (anchor_root, nullifier)
++/// 2. Derive nullifier: nullifier(domain, nf_key, rho) [PRF-based, position-agnostic]
++/// 3. Commit public output: (anchor_root, nullifier, withdraw_amount)
+ #[test]
+ #[ignore] // Remove this when guest program is implemented
+ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
+@@ -639,10 +644,10 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
+     assert_eq!(recomputed, anchor, "Merkle path verification failed!");
+     println!("✓ Merkle path verified ({} siblings)", siblings.len());
+     
+-    // ---- 2) Derive nullifier ----
+-    println!("\nStep 2: Deriving nullifier...");
++    // ---- 2) Derive nullifier (PRF-based) ----
++    println!("\nStep 2: Deriving nullifier (PRF-based, no position)...");
+     
+-    let nf = nullifier(&domain, &nf_key, &cm, pos);
++    let nf = nullifier(&domain, &nf_key, &rho);
+     println!("✓ Nullifier: {}", hex32(&nf));
+     
+     // ---- 3) Build JSON config for REAL prover ----
+@@ -754,7 +759,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
+     // Recompute anchor and nullifier locally to confirm they match
+     assert_eq!(anchor, root_from_path(&cm, pos, &siblings, TREE_DEPTH), 
+                "Anchor mismatch!");
+-    assert_eq!(nf, nullifier(&domain, &nf_key, &cm, pos),
++    assert_eq!(nf, nullifier(&domain, &nf_key, &rho),
+                "Nullifier mismatch!");
+     
+     println!("✓ Anchor root matches: {}", hex32(&anchor));
+
+==============================================
+Untracked Files Content
+==============================================
+No untracked files found.
+
+==============================================
+Summary
+==============================================
+Modified files:        8
+Untracked files: 0
+Filtered paths: src tests
+
+File Statistics:
+Total size:    25859 bytes
+Total lines:      620
+Total words:     2818
+Total AI tokens (est): 6464

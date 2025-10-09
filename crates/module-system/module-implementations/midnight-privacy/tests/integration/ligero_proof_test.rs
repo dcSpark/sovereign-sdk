@@ -77,7 +77,7 @@ impl LigeroTestConfig {
         let ligero_dir = repo_root.join("crates/adapters/ligero");
         
         let config = Self {
-            program_path: ligero_dir.join("guest/bins/programs/value_validator.wasm"),
+            program_path: ligero_dir.join("guest/bins/programs/value_validator_rust.wasm"),
             verifier_bin: ligero_dir.join("bins/webgpu_verifier"),
             shader_path: ligero_dir.join("bins/shader"),
             packing: 8192,
@@ -432,22 +432,25 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     println!("✓ Merkle path verified (length: {} siblings)", siblings.len());
     
     // ---- 4) Derive nullifier for spending ----
-    println!("\nStep 4: Deriving nullifier...");
+    println!("\nStep 4: Deriving nullifier (PRF-based)...");
     
-    let nf = nullifier(&domain, &nf_key, &cm, position);
+    let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: {}", hex::encode(nf));
     
     // ---- 5) Prepare public output that proof will commit to ----
     println!("\nStep 5: Preparing spend proof...");
     
+    let withdraw_amount: u128 = 0; // For this test, no withdrawal
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
+        withdraw_amount,
     };
     
     println!("Public output (committed by proof):");
-    println!("  - Anchor root: {}", hex::encode(public_output.anchor_root));
-    println!("  - Nullifier:   {}", hex::encode(public_output.nullifier));
+    println!("  - Anchor root:      {}", hex::encode(public_output.anchor_root));
+    println!("  - Nullifier:        {}", hex::encode(public_output.nullifier));
+    println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
     
     // ---- 6) Generate proof (SIMULATION MODE) ----
     // NOTE: This runs in simulation mode because we don't have a guest program yet
@@ -456,8 +459,8 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     println!("⚠️  Running in simulation mode - no actual ZK proof generated");
     println!("⚠️  To generate REAL proofs, implement a guest program that:");
     println!("    - Verifies: root_from_path(cm, pos, siblings) == anchor");
-    println!("    - Computes: nullifier(domain, nf_key, cm, pos)");
-    println!("    - Commits: (anchor_root, nullifier) as public output");
+    println!("    - Computes: nullifier(domain, nf_key, rho) [PRF-based]");
+    println!("    - Commits: (anchor_root, nullifier, withdraw_amount) as public output");
     
     // In simulation mode, we just test the proof packaging
     // This would normally call a guest program that verifies the spend circuit
@@ -501,10 +504,12 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
     assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.withdraw_amount, withdraw_amount, "Withdraw amount mismatch!");
     
     println!("✓ Proof verified successfully!");
-    println!("✓ Extracted anchor root: {}", hex::encode(verified_output.anchor_root));
-    println!("✓ Extracted nullifier:   {}", hex::encode(verified_output.nullifier));
+    println!("✓ Extracted anchor root:     {}", hex::encode(verified_output.anchor_root));
+    println!("✓ Extracted nullifier:       {}", hex::encode(verified_output.nullifier));
+    println!("✓ Extracted withdraw amount: {}", verified_output.withdraw_amount);
     
     // ---- 8) Check nullifier consumption ----
     println!("\nStep 8: Validating spend conditions...");
@@ -579,8 +584,8 @@ const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
 /// 
 /// The guest program must implement:
 /// 1. Verify Merkle path: root_from_path(cm, pos, siblings) == anchor
-/// 2. Derive nullifier: nullifier(domain, nf_key, cm, pos)  
-/// 3. Commit public output: (anchor_root, nullifier)
+/// 2. Derive nullifier: nullifier(domain, nf_key, rho) [PRF-based, position-agnostic]
+/// 3. Commit public output: (anchor_root, nullifier, withdraw_amount)
 #[test]
 #[ignore] // Remove this when guest program is implemented
 fn test_note_spend_with_real_ligero_proof() -> Result<()> {
@@ -639,10 +644,10 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     assert_eq!(recomputed, anchor, "Merkle path verification failed!");
     println!("✓ Merkle path verified ({} siblings)", siblings.len());
     
-    // ---- 2) Derive nullifier ----
-    println!("\nStep 2: Deriving nullifier...");
+    // ---- 2) Derive nullifier (PRF-based) ----
+    println!("\nStep 2: Deriving nullifier (PRF-based, no position)...");
     
-    let nf = nullifier(&domain, &nf_key, &cm, pos);
+    let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: {}", hex32(&nf));
     
     // ---- 3) Build JSON config for REAL prover ----
@@ -754,7 +759,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // Recompute anchor and nullifier locally to confirm they match
     assert_eq!(anchor, root_from_path(&cm, pos, &siblings, TREE_DEPTH), 
                "Anchor mismatch!");
-    assert_eq!(nf, nullifier(&domain, &nf_key, &cm, pos),
+    assert_eq!(nf, nullifier(&domain, &nf_key, &rho),
                "Nullifier mismatch!");
     
     println!("✓ Anchor root matches: {}", hex32(&anchor));
