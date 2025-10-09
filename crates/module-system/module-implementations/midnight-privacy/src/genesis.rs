@@ -3,15 +3,19 @@ use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
+use crate::merkle::MerkleTree;
 
-/// Initial configuration for sov-value-setter-zk module.
+/// Initial configuration for midnight-privacy module.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq, JsonSchema)]
-#[schemars(bound = "S: Spec", rename = "ValueSetterZkConfig")]
+#[schemars(bound = "S: Spec", rename = "MidnightPrivacyConfig")]
 pub struct ValueSetterZkConfig<S: Spec> {
-    /// Initial value (if any). If not provided, the value will be unset until the first transaction.
-    pub initial_value: Option<u32>,
+    /// Depth of the commitment tree (tree will have 2^depth leaves)
+    pub tree_depth: u8,
     
-    /// Ligetron method ID (code commitment) of the guest program that verifies value constraints.
+    /// Size of the recent roots window (how many recent roots to keep)
+    pub root_window_size: u32,
+    
+    /// Ligero method ID (code commitment) of the guest program that verifies spend proofs.
     /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
     pub method_id: [u8; 32],
     
@@ -32,10 +36,20 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
         
-        // Set initial value if provided
-        if let Some(initial_value) = config.initial_value {
-            self.value.set(&initial_value, state)?;
-        }
+        // Initialize the commitment tree
+        let tree = MerkleTree::new(config.tree_depth);
+        self.commitment_tree.set(&tree, state)?;
+        
+        // Initialize the next position to 0
+        self.next_position.set(&0u64, state)?;
+        
+        // Set the root window size
+        self.root_window_size.set(&config.root_window_size, state)?;
+        
+        // Initialize recent roots with the initial (empty) tree root
+        let initial_root = tree.root();
+        let roots_vec: Vec<[u8; 32]> = vec![initial_root];
+        self.recent_roots.set::<Vec<[u8; 32]>, _>(&roots_vec, state)?;
         
         Ok(())
     }
@@ -56,7 +70,8 @@ mod tests {
         let config = ValueSetterZkConfig::<TestSpec> {
             admin,
             method_id,
-            initial_value: Some(42),
+            tree_depth: 16,
+            root_window_size: 100,
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();

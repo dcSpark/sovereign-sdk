@@ -1,30 +1,47 @@
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-//! This module demonstrates integration of Ligetron ZK proofs with Sovereign SDK.
-//! Users must provide a valid proof alongside the value they wish to set.
+//! This module demonstrates privacy-preserving transactions using Ligero ZK proofs with Sovereign SDK.
+//! It implements a shielded pool with note commitments, nullifiers, and Merkle tree for membership proofs.
 
 mod call;
 mod genesis;
 mod event;
+mod hash;
+mod merkle;
+mod types;
 
-pub use call::*;
+pub use call::CallMessage;
 pub use event::Event;
 pub use genesis::*;
+pub use hash::*;
+pub use merkle::*;
+pub use types::*;
 
 use sov_modules_api::{
-    Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateValue,
-    TxState,
+    Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, 
+    StateMap, StateValue, TxState,
 };
 
-/// ValueSetterZk module: Sets a value only if a valid Ligetron ZK proof is provided.
+/// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
-/// The proof must demonstrate that the value meets certain constraints (enforced by the guest program).
-/// For this implementation, the guest program verifies that the value is within [0, 100].
+/// This module allows users to:
+/// 1. Create note commitments and add them to a Merkle tree
+/// 2. Spend notes by providing ZK proofs that demonstrate:
+///    - Knowledge of a note in the tree
+///    - A valid Merkle path to an anchor root
+///    - Proper nullifier derivation
+///
+/// The nullifier prevents double-spending, and the anchor root window allows
+/// parallel transactions while maintaining security.
 ///
 /// # Module State
-/// - `value`: The current value (u32)
-/// - `method_id`: Ligetron method ID (code commitment) for proof verification
+/// - `commitment_tree`: Merkle tree of note commitments
+/// - `next_position`: Next available position in the tree
+/// - `nullifier_set`: Set of used nullifiers (prevents double-spending)
+/// - `recent_roots`: Recent Merkle roots (anchor window)
+/// - `root_window_size`: Size of the anchor window
+/// - `method_id`: Ligero method ID (code commitment) for proof verification
 /// - `admin`: Administrator who can update the method ID
 ///
 /// # Derives
@@ -36,11 +53,27 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[id]
     pub id: ModuleId,
 
-    /// The stored value. Can only be updated with a valid proof.
+    /// Merkle tree of note commitments.
     #[state]
-    pub value: StateValue<u32>,
+    pub commitment_tree: StateValue<MerkleTree>,
 
-    /// Code commitment (32 bytes) of the Ligetron guest program that verifies value constraints.
+    /// Next available position in the commitment tree.
+    #[state]
+    pub next_position: StateValue<u64>,
+
+    /// Set of used nullifiers (maps nullifier -> true if spent).
+    #[state]
+    pub nullifier_set: StateMap<NullifierKey, bool>,
+
+    /// Recent Merkle roots (circular buffer for anchor window).
+    #[state]
+    pub recent_roots: StateValue<Vec<Hash32>>,
+
+    /// Size of the recent roots window.
+    #[state]
+    pub root_window_size: StateValue<u32>,
+
+    /// Code commitment (32 bytes) of the Ligero guest program that verifies spend proofs.
     /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
     #[state]
     pub method_id: StateValue<[u8; 32]>,
@@ -80,8 +113,11 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
         let state = &mut state_wrapped;
         
         let res = match msg {
-            CallMessage::SetValueWithProof { value, proof, gas } => {
-                Ok(self.set_value_with_proof(value, proof, gas, context, state)?)
+            CallMessage::CreateNote { note, gas } => {
+                Ok(self.create_note(note, gas, context, state)?)
+            }
+            CallMessage::SpendNote { proof, gas } => {
+                Ok(self.spend_note(proof, gas, context, state)?)
             }
             CallMessage::UpdateMethodId { new_method_id } => {
                 Ok(self.update_method_id(new_method_id, context, state)?)

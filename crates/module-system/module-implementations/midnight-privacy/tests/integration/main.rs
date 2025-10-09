@@ -1,3 +1,2 @@
-mod tests;
 mod ligero_proof_test;
-
+mod hash_tests;
