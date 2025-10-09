@@ -3607,6 +3607,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "midnight-privacy",
  "schemars 0.8.22",
  "serde",
  "sov-accounts",
@@ -6996,6 +6997,26 @@ dependencies = [
  "log",
  "objc",
  "paste",
+]
+
+[[package]]
+name = "midnight-privacy"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "borsh",
+ "schemars 0.8.22",
+ "serde",
+ "sha2 0.10.9",
+ "sov-address",
+ "sov-ligero-adapter",
+ "sov-modules-api",
+ "sov-rollup-interface",
+ "sov-state",
+ "sov-test-utils",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
