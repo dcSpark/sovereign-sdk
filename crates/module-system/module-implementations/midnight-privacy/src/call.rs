@@ -125,6 +125,16 @@ pub enum MidnightPrivacyError<S: Spec> {
     /// Amount conversion overflow.
     #[error("Amount {0} does not fit in the bank amount type")]
     AmountOverflow(u128),
+    
+    /// Proof outputs do not match transaction arguments.
+    #[error("Proof outputs do not match transaction arguments")]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    PublicOutputMismatch,
+    
+    /// Value-burning spend attempt (nullifier-only with no outputs or withdrawal).
+    #[error("Cannot consume nullifier without value movement: must either withdraw transparently or create output notes")]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    ValueBurningSpend,
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -294,7 +304,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 || public.nullifier != nullifier
                 || public.withdraw_amount != withdraw_amount
             {
-                anyhow::bail!("Proof outputs do not match transaction arguments");
+                return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
             }
 
             // Now use the PROOF-COMMITTED values (which we've verified match the tx fields)
@@ -355,12 +365,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     
     /// Spend a note by verifying a ZK proof and consuming its nullifier.
     ///
+    /// **DEPRECATED**: This call is intended for shielded-to-shielded transfers where
+    /// the value moves to new output notes. However, the current implementation does not
+    /// track output notes, so this call would burn value. Use `Withdraw` instead to
+    /// move value transparently, or extend this API to include output commitments.
+    ///
     /// The proof must:
     /// 1. Be verifiable against the configured method ID
     /// 2. Commit to a `SpendPublic` struct containing (anchor_root, nullifier, withdraw_amount)
     /// 3. The anchor_root must be in the recent roots window
     /// 4. The nullifier must not have been seen before
-    /// 5. For pure spends with no withdrawal, withdraw_amount should be 0
+    ///
+    /// **VALUE PRESERVATION**: To prevent accidental value burning, this call is currently
+    /// rejected. Use `Withdraw` to move value to a transparent address.
     pub(crate) fn spend_note(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] proof: sov_modules_api::SafeVec<u8, 5_000_000>,
@@ -399,46 +416,36 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
                 .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
             
-            // Check that the anchor root is valid (in recent roots window)
-            if !self.is_valid_anchor(&public.anchor_root, state)? {
-                return Err(MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into());
+            // CRITICAL: Prevent value-burning spends
+            // In a value-preserving shielded pool (like Zcash), consuming a nullifier must
+            // move value somewhere: either to new shielded notes or to transparent withdrawal.
+            // Since this call doesn't track output notes and has no withdrawal, it would burn value.
+            // Reject it to prevent accidental burns. Use `Withdraw` for transparent value movement.
+            if public.withdraw_amount == 0 {
+                return Err(MidnightPrivacyError::<S>::ValueBurningSpend.into());
             }
             
-            // Check that the nullifier hasn't been used
-            let nullifier_key = NullifierKey(public.nullifier);
-            if self.nullifier_set.get(&nullifier_key, state)?.is_some() {
-                return Err(MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into());
-            }
-            
-            // Mark the nullifier as used
-            self.nullifier_set.set(&nullifier_key, &true, state)?;
-            
-            // Emit event
-            self.emit_event(state, Event::NoteSpent {
-                nullifier: public.nullifier,
-                anchor_root: public.anchor_root,
-            });
-            
-            // Note: For pure spends without withdrawal, withdraw_amount should be 0.
-            // If withdraw_amount > 0, this indicates the proof authorizes a withdrawal
-            // but the caller should use the Withdraw call instead.
-            
-            Ok(())
+            // If withdraw_amount > 0, the caller should use the Withdraw call instead
+            // which properly handles the withdrawal and binding
+            return Err(anyhow!(
+                "SpendNote with withdraw_amount > 0 should use Withdraw call instead"
+            ).into());
         }
     }
     
     /// Add a root to the recent roots window (circular buffer).
+    /// Uses VecDeque for O(1) operations at both ends.
     fn add_recent_root(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
         let mut recent_roots = self.recent_roots.get_or_err(state)??;
         let root_window_size = self.root_window_size.get_or_err(state)??;
         
-        // Add to end, remove from front if full
-        recent_roots.push(root);
+        // Add to end, remove from front if full (O(1) with VecDeque)
+        recent_roots.push_back(root);
         if recent_roots.len() > root_window_size as usize {
-            recent_roots.remove(0);
+            recent_roots.pop_front();
         }
         
-        self.recent_roots.set::<Vec<Hash32>, _>(&recent_roots, state)?;
+        self.recent_roots.set(&recent_roots, state)?;
         Ok(())
     }
     

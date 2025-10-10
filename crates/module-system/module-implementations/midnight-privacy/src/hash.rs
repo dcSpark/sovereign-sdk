@@ -7,6 +7,7 @@
 //! Domain separation is achieved by prepending unique domain tags to each input type,
 //! preventing cross-domain collisions and attacks.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::str::FromStr;
 
@@ -41,11 +42,12 @@ impl FromStr for NullifierKey {
     }
 }
 
-use once_cell::sync::Lazy;
-
-/// Global static Poseidon2 hasher instance (deterministic with fixed seed).
-/// Using a static instance avoids repeated allocations and initialization overhead.
-static POSEIDON: Lazy<Poseidon2Core> = Lazy::new(Poseidon2Core::new);
+// Thread-local Poseidon2 hasher instance (deterministic with fixed seed).
+// Using thread-local instances avoids repeated allocations and initialization overhead
+// while ensuring thread-safety without synchronization overhead.
+thread_local! {
+    static POSEIDON: RefCell<Poseidon2Core> = RefCell::new(Poseidon2Core::new());
+}
 
 /// Domain-separated 32-byte Poseidon2 hash.
 /// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V1", "NF_V1").
@@ -58,7 +60,7 @@ pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
         input.extend_from_slice(part);
     }
     
-    POSEIDON.hash_padded(&input)
+    POSEIDON.with(|h| h.borrow().hash_padded(&input))
 }
 
 /// Domain tags as fixed-size arrays (avoids const evaluation issues)
@@ -78,7 +80,7 @@ pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     buf[11..43].copy_from_slice(left);
     buf[43..].copy_from_slice(right);
     
-    POSEIDON.hash_padded(&buf)
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
 /// Compute a note commitment.
@@ -96,7 +98,7 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
     buf[55..87].copy_from_slice(rho);
     buf[87..].copy_from_slice(recipient);
     
-    POSEIDON.hash_padded(&buf)
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
 /// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
@@ -117,7 +119,7 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     buf[41..73].copy_from_slice(nf_key);
     buf[73..].copy_from_slice(rho);
     
-    POSEIDON.hash_padded(&buf)
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
 /// Recompute the Merkle root from a leaf using its authentication path.

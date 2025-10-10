@@ -150,10 +150,18 @@ impl LigeroHost {
 
         tracing::debug!("Running Ligero prover with config: {}", config_json);
 
-        // Run prover in current directory so proof.data is written to CWD
-        // This allows parallel proof generation in worker-specific directories
+        // Create a unique temporary directory for this proof generation
+        // This prevents concurrent proof generations from stomping on each other's proof.data
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temporary directory for Ligero proof generation")?;
+        let temp_path = temp_dir.path();
+
+        tracing::debug!("Using temporary directory for proof: {}", temp_path.display());
+
+        // Run prover with temp directory as current_dir so proof.data is written there
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
+            .current_dir(temp_path)
             .output()
             .context("Failed to execute webgpu_prover")?;
 
@@ -174,11 +182,14 @@ impl LigeroHost {
             anyhow::bail!("Ligero prover did not produce a valid proof");
         }
 
-        // Read the proof from proof.data (in current working directory)
-        let proof_path = PathBuf::from("proof.data");
-        let proof = std::fs::read(&proof_path).context("Failed to read proof.data")?;
+        // Read the proof from proof.data in the temporary directory
+        let proof_path = temp_path.join("proof.data");
+        let proof = std::fs::read(&proof_path)
+            .context("Failed to read proof.data from temporary directory")?;
 
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
+        
+        // temp_dir is automatically cleaned up when it goes out of scope
         Ok(proof)
     }
 

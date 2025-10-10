@@ -18,6 +18,7 @@ pub use hash::*;
 pub use merkle::*;
 pub use types::*;
 
+use std::collections::VecDeque;
 use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, 
     StateMap, StateValue, TxState,
@@ -70,8 +71,9 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     pub nullifier_set: StateMap<NullifierKey, bool>,
 
     /// Recent Merkle roots (circular buffer for anchor window).
+    /// Uses VecDeque for O(1) insertion and removal at both ends.
     #[state]
-    pub recent_roots: StateValue<Vec<Hash32>>,
+    pub recent_roots: StateValue<VecDeque<Hash32>>,
 
     /// Size of the recent roots window.
     #[state]

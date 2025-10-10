@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use anyhow::Result;
 use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
@@ -59,8 +61,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         
         // Initialize recent roots with the initial (empty) tree root
         let initial_root = tree.root();
-        let roots_vec: Vec<[u8; 32]> = vec![initial_root];
-        self.recent_roots.set::<Vec<[u8; 32]>, _>(&roots_vec, state)?;
+        let mut roots_deque = VecDeque::new();
+        roots_deque.push_back(initial_root);
+        self.recent_roots.set(&roots_deque, state)?;
         
         Ok(())
     }
