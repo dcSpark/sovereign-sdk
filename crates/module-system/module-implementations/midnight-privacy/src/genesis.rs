@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
-use crate::hash::Hash32;
+use crate::hash::{Hash32, RootKey};
 use crate::merkle::MerkleTree;
 
 /// Initial configuration for midnight-privacy module.
@@ -64,6 +64,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let mut roots_deque = VecDeque::new();
         roots_deque.push_back(initial_root);
         self.recent_roots.set(&roots_deque, state)?;
+        
+        // Initialize full-history root index (NOMT-backed for permanent storage)
+        // The initial empty-tree root is assigned sequence 0
+        self.root_seq.set(&1u64, state)?; // next seq to use
+        self.all_roots.set(&RootKey(initial_root), &0u64, state)?;
         
         Ok(())
     }

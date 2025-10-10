@@ -48,5 +48,12 @@ pub enum Event {
         /// The anchor root used
         anchor_root: Hash32,
     },
+    /// A Merkle root was recorded in the permanent historical index (NOMT-backed)
+    AnchorRootRecorded {
+        /// The root value
+        root: Hash32,
+        /// Monotonic sequence number (first-seen order)
+        seq: u64,
+    },
 }
 

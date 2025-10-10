@@ -41,8 +41,10 @@ use sov_modules_api::{
 /// - `commitment_tree`: Merkle tree of note commitments
 /// - `next_position`: Next available position in the tree
 /// - `nullifier_set`: Set of used nullifiers (prevents double-spending)
-/// - `recent_roots`: Recent Merkle roots (anchor window)
+/// - `recent_roots`: Recent Merkle roots (anchor window for fast mempool checks)
 /// - `root_window_size`: Size of the anchor window
+/// - `all_roots`: Persistent index of ALL historical roots (NOMT-backed, enables long-range anchors)
+/// - `root_seq`: Monotonic sequence counter for root ordering
 /// - `method_id`: Ligero method ID (code commitment) for proof verification
 /// - `admin`: Administrator who can update the method ID
 /// - `domain`: Domain tag for all note/hash operations
@@ -72,12 +74,25 @@ pub struct ValueMidnightPrivacy<S: Spec> {
 
     /// Recent Merkle roots (circular buffer for anchor window).
     /// Uses VecDeque for O(1) insertion and removal at both ends.
+    /// This provides fast mempool checks for recent transactions.
     #[state]
     pub recent_roots: StateValue<VecDeque<Hash32>>,
 
     /// Size of the recent roots window.
     #[state]
     pub root_window_size: StateValue<u32>,
+
+    /// Persistent index of **all** Merkle roots ever produced by this module.
+    /// The map is NOMT-backed (consensus state), so membership proofs are cheap and permanent.
+    /// This enables long-range anchor validation: any historical root remains valid forever.
+    /// Key: RootKey(root), Value: monotonically increasing sequence number (first-seen order).
+    #[state]
+    pub all_roots: StateMap<RootKey, u64>,
+
+    /// Next sequence number to assign when recording a new root in `all_roots`.
+    /// Increments monotonically for each unique root.
+    #[state]
+    pub root_seq: StateValue<u64>,
 
     /// Code commitment (32 bytes) of the Ligero guest program that verifies spend proofs.
     /// This is the SHA-256 hash of (WASM program bytes || packing parameter).

@@ -42,6 +42,31 @@ impl FromStr for NullifierKey {
     }
 }
 
+/// Wrapper for Merkle roots so we can store membership in StateMap (NOMT-backed).
+/// This enables permanent indexing of all historical roots for long-range anchor validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct RootKey(pub Hash32);
+
+impl fmt::Display for RootKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+impl FromStr for RootKey {
+    type Err = hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s)?;
+        if bytes.len() != 32 {
+            return Err(hex::FromHexError::InvalidStringLength);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(RootKey(arr))
+    }
+}
+
 // Thread-local Poseidon2 hasher instance (deterministic with fixed seed).
 // Using thread-local instances avoids repeated allocations and initialization overhead
 // while ensuring thread-safety without synchronization overhead.

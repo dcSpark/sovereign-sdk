@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use super::ValueMidnightPrivacy;
 use crate::event::Event;
-use crate::hash::{note_commitment, Hash32};
+use crate::hash::{note_commitment, Hash32, RootKey};
 use crate::types::Note;
 
 #[cfg(feature = "native")]
@@ -173,8 +173,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.commitment_tree.set(&tree, state)?;
         self.next_position.set(&(next_position + 1), state)?;
         
-        // Add root to recent roots window
+        // 1) Add root to recent roots window (fast mempool checks)
         self.add_recent_root(new_root, state)?;
+        // 2) Permanently record in NOMT-backed index (full history for long-range anchors)
+        self.record_root_forever(new_root, state)?;
         
         // Emit event
         self.emit_event(state, Event::NoteCreated {
@@ -365,11 +367,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     
     /// Spend a note by verifying a ZK proof and consuming its nullifier.
     ///
-    /// **DEPRECATED**: This call is intended for shielded-to-shielded transfers where
-    /// the value moves to new output notes. However, the current implementation does not
-    /// track output notes, so this call would burn value. Use `Withdraw` instead to
-    /// move value transparently, or extend this API to include output commitments.
-    ///
     /// The proof must:
     /// 1. Be verifiable against the configured method ID
     /// 2. Commit to a `SpendPublic` struct containing (anchor_root, nullifier, withdraw_amount)
@@ -435,6 +432,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     
     /// Add a root to the recent roots window (circular buffer).
     /// Uses VecDeque for O(1) operations at both ends.
+    /// This provides fast mempool checks for recent transactions.
     fn add_recent_root(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
         let mut recent_roots = self.recent_roots.get_or_err(state)??;
         let root_window_size = self.root_window_size.get_or_err(state)??;
@@ -449,11 +447,50 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(())
     }
     
-    /// Check if an anchor root is valid (in the recent roots window).
+    /// Permanently record a root in the full-history NOMT-backed index.
+    /// This enables long-range anchor validation: any historical root remains valid forever.
+    /// Idempotent: if the root already exists, this is a no-op.
+    fn record_root_forever(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
+        // Fast path: already recorded?
+        if self.all_roots.get(&RootKey(root), state)?.is_some() {
+            return Ok(());
+        }
+        
+        // Assign a monotonic sequence number and commit to permanent storage
+        let seq = self.root_seq.get_or_err(state)??;
+        self.all_roots.set(&RootKey(root), &seq, state)?;
+        
+        // Emit event for observability
+        self.emit_event(state, Event::AnchorRootRecorded {
+            root,
+            seq,
+        });
+        
+        // Bump sequence (checked add to be safe against overflow)
+        let next_seq = seq.checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("root_seq overflow: too many unique roots"))?;
+        self.root_seq.set(&next_seq, state)?;
+        
+        Ok(())
+    }
+    
+    /// Check if an anchor root is valid:
+    ///  - first, in the recent roots window (cheap O(n) scan of VecDeque);
+    ///  - else, in the permanent NOMT-backed index (`all_roots`, O(log N) lookup).
+    /// 
+    /// This enables long-range anchors: any historical root remains valid forever,
+    /// aligning with Zcash's design (ZIP-221) where roots are permanently accessible.
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     fn is_valid_anchor(&self, anchor: &Hash32, state: &mut impl TxState<S>) -> Result<bool> {
         let recent_roots = self.recent_roots.get_or_err(state)??;
-        Ok(recent_roots.contains(anchor))
+        
+        // Fast path: check recent window first (common case for active transactions)
+        if recent_roots.contains(anchor) {
+            return Ok(true);
+        }
+        
+        // Fallback: check permanent historical index (enables long-range proofs)
+        Ok(self.all_roots.get(&RootKey(*anchor), state)?.is_some())
     }
     
     /// Update the method ID (admin only).
@@ -480,6 +517,26 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.emit_event(state, Event::MethodIdUpdated { new_method_id });
         
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that RootKey serialization works correctly
+    #[test]
+    fn test_root_key_display_and_parse() {
+        let root = [42u8; 32];
+        let root_key = RootKey(root);
+        
+        // Test Display
+        let display_str = format!("{}", root_key);
+        assert_eq!(display_str, hex::encode(root));
+        
+        // Test FromStr
+        let parsed: RootKey = display_str.parse().unwrap();
+        assert_eq!(parsed, root_key);
     }
 }
 
