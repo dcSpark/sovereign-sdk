@@ -42,6 +42,9 @@ hex = { workspace = true }
 qp-poseidon-core = { version = "0.9.5", features = ["std"] }
 sov-bank = { workspace = true }
 once_cell = { workspace = true }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+sha2 = { workspace = true }
 
 [features]
 default = ["native"]

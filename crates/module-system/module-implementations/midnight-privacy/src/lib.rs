@@ -10,6 +10,7 @@ mod event;
 mod hash;
 mod merkle;
 mod types;
+pub mod viewing;
 
 pub use call::CallMessage;
 pub use event::Event;
@@ -17,6 +18,7 @@ pub use genesis::*;
 pub use hash::*;
 pub use merkle::*;
 pub use types::*;
+pub use viewing::{encrypt_note_for_fvk, decrypt_and_verify_note};
 
 use std::collections::VecDeque;
 use sov_modules_api::{

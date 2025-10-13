@@ -114,7 +114,7 @@ impl OverrideSchema for Note {
 }
 
 // Custom serde module for hex-encoded byte arrays
-mod serde_bytes_as_hex_array {
+pub(crate) mod serde_bytes_as_hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
     
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
@@ -134,6 +134,123 @@ mod serde_bytes_as_hex_array {
             return Err(serde::de::Error::custom("Expected 32 bytes"));
         }
         let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+// --- Viewing key + encrypted note types ---
+
+/// A 32-byte Full Viewing Key (FVK) that allows decrypting notes for auditing.
+/// Share this with a viewer; keep it confidential like any other secret key.
+///
+/// This design follows Zcash's viewing key pattern: viewers can decrypt notes
+/// and recompute the commitment to verify truthfulness against the on-chain commitment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct FullViewingKey(
+    #[serde(with = "serde_bytes_as_hex_array")] pub [u8; 32]
+);
+
+impl JsonSchema for FullViewingKey {
+    fn schema_name() -> String {
+        "FullViewingKey".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+        
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::String.into());
+        obj.format = Some("hex".to_string());
+        
+        Schema::Object(obj)
+    }
+}
+
+impl OverrideSchema for FullViewingKey {
+    type Output = FullViewingKey;
+}
+
+/// AEAD-encrypted note bound to its on-chain commitment.
+/// A viewer uses FVK to decrypt and then recomputes cm to verify truthfulness.
+///
+/// The ciphertext is bound to the commitment via AEAD AAD, preventing "trust me bro"
+/// scenarios. The viewer must recompute the commitment from the decrypted note and
+/// verify it matches the on-chain commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct EncryptedNote {
+    /// The on-chain commitment this ciphertext is bound to (also used as AEAD AAD).
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub cm: Hash32,
+    /// XChaCha20-Poly1305 nonce (24 bytes).
+    #[serde(with = "serde_bytes_as_hex_array_24")]
+    pub nonce: [u8; 24],
+    /// Ciphertext bytes (AEAD).
+    pub ct: sov_modules_api::SafeVec<u8, 8_192>,
+}
+
+impl JsonSchema for EncryptedNote {
+    fn schema_name() -> String {
+        "EncryptedNote".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+        
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::Object.into());
+        
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("cm".to_string(), Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            format: Some("hex".to_string()),
+            ..Default::default()
+        }));
+        properties.insert("nonce".to_string(), Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            format: Some("hex".to_string()),
+            ..Default::default()
+        }));
+        properties.insert("ct".to_string(), Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Array.into()),
+            ..Default::default()
+        }));
+        
+        obj.object = Some(Box::new(ObjectValidation {
+            properties,
+            required: vec!["cm".to_string(), "nonce".to_string(), "ct".to_string()].into_iter().collect(),
+            ..Default::default()
+        }));
+        
+        Schema::Object(obj)
+    }
+}
+
+impl OverrideSchema for EncryptedNote {
+    type Output = EncryptedNote;
+}
+
+// Custom serde module for 24-byte nonce
+mod serde_bytes_as_hex_array_24 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    
+    pub fn serialize<S>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+    
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 24], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 24 {
+            return Err(serde::de::Error::custom("Expected 24 bytes"));
+        }
+        let mut arr = [0u8; 24];
         arr.copy_from_slice(&bytes);
         Ok(arr)
     }

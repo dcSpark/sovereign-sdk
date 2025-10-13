@@ -1,6 +1,7 @@
 use sov_modules_api::macros::serialize;
 
 use crate::hash::Hash32;
+use crate::types::EncryptedNote;
 
 /// Events emitted by the MidnightPrivacy module
 #[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
@@ -54,6 +55,13 @@ pub enum Event {
         root: Hash32,
         /// Monotonic sequence number (first-seen order)
         seq: u64,
+    },
+    /// Ciphertext for viewers holding a Full Viewing Key.
+    /// Viewers will decrypt, recompute the commitment, and compare to `cm`.
+    /// This follows Zcash's viewing key pattern: decrypt → recompute → verify.
+    NoteEncrypted {
+        /// AEAD-encrypted note bound to its commitment
+        enc: EncryptedNote,
     },
 }
 
