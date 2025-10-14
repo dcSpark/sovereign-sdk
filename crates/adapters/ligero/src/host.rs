@@ -65,12 +65,25 @@ impl LigeroHost {
     pub fn new(program_path: &str) -> Self {
         let bins_dir = Self::find_bins_dir();
         // Use absolute path for shader_path to work from any working directory
-        let shader_path = bins_dir
-            .canonicalize()
-            .unwrap_or_else(|_| bins_dir.clone())
-            .join("shader")
-            .to_string_lossy()
-            .to_string();
+        let shader_path = if bins_dir.ends_with("bin") {
+            // If using platform-specific bin directory, shader is at parent level
+            bins_dir
+                .parent()
+                .unwrap_or(&bins_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| bins_dir.parent().unwrap_or(&bins_dir).to_path_buf())
+                .join("shader")
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // If using generic bins directory, shader is at same level
+            bins_dir
+                .canonicalize()
+                .unwrap_or_else(|_| bins_dir.clone())
+                .join("shader")
+                .to_string_lossy()
+                .to_string()
+        };
 
         Self {
             config: LigeroConfig {
@@ -94,7 +107,7 @@ impl LigeroHost {
         // Check for platform-specific binaries first (they take priority)
         #[cfg(target_os = "macos")]
         {
-            let macos_bins = PathBuf::from(manifest_dir).join("bins/macos");
+            let macos_bins = PathBuf::from(manifest_dir).join("bins/macos/bin");
             if macos_bins.join("webgpu_prover").exists() && macos_bins.join("webgpu_verifier").exists() {
                 return macos_bins;
             }
@@ -102,7 +115,7 @@ impl LigeroHost {
 
         #[cfg(target_os = "linux")]
         {
-            let linux_bins = PathBuf::from(manifest_dir).join("bins/linux");
+            let linux_bins = PathBuf::from(manifest_dir).join("bins/linux-amd64/bin");
             if linux_bins.join("webgpu_prover").exists() && linux_bins.join("webgpu_verifier").exists() {
                 return linux_bins;
             }

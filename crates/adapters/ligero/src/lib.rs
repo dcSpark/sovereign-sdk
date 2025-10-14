@@ -611,9 +611,9 @@ mod native {
             Some(current_dir.join("crates/adapters/ligero/guest/bins/webgpu_verifier")),
             // Platform-specific paths
             #[cfg(target_os = "macos")]
-            Some(current_dir.join("crates/adapters/ligero/bins/macos/webgpu_verifier")),
+            Some(current_dir.join("crates/adapters/ligero/bins/macos/bin/webgpu_verifier")),
             #[cfg(target_os = "linux")]
-            Some(current_dir.join("crates/adapters/ligero/bins/linux/webgpu_verifier")),
+            Some(current_dir.join("crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier")),
         ];
 
         for candidate in candidates.into_iter().flatten() {
