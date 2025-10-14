@@ -13,8 +13,8 @@ TEMP_DIR="./proof_fraud_test"
 rm -rf "$TEMP_DIR"
 mkdir -p "$TEMP_DIR"
 
-echo "[1/4] Copying existing proof for value=50..."
-cp tps_test_verifier_temp/value_tx_49.json "$TEMP_DIR/original.json"
+echo "[1/4] Copying existing proof for value=1..."
+cp tps_test_verifier_temp/value_tx_0.json "$TEMP_DIR/original.json"
 echo "      ✓ Proof file copied"
 
 echo ""
@@ -29,7 +29,7 @@ data['set_value_with_proof']['value'] = 40
 with open('./proof_fraud_test/fraud.json', 'w') as f:
     json.dump(data, f)
 print(f"      Modified to claim: 40")
-print(f"      ✓ FRAUD CREATED (proof=50, claim=40)")
+print(f"      ✓ FRAUD CREATED (proof=1, claim=40)")
 PYTHON
 
 echo ""

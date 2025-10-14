@@ -65,12 +65,25 @@ impl LigeroHost {
     pub fn new(program_path: &str) -> Self {
         let bins_dir = Self::find_bins_dir();
         // Use absolute path for shader_path to work from any working directory
-        let shader_path = bins_dir
-            .canonicalize()
-            .unwrap_or_else(|_| bins_dir.clone())
-            .join("shader")
-            .to_string_lossy()
-            .to_string();
+        let shader_path = if bins_dir.ends_with("bin") {
+            // If using platform-specific bin directory, shader is at parent level
+            bins_dir
+                .parent()
+                .unwrap_or(&bins_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| bins_dir.parent().unwrap_or(&bins_dir).to_path_buf())
+                .join("shader")
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // If using generic bins directory, shader is at same level
+            bins_dir
+                .canonicalize()
+                .unwrap_or_else(|_| bins_dir.clone())
+                .join("shader")
+                .to_string_lossy()
+                .to_string()
+        };
 
         Self {
             config: LigeroConfig {
@@ -89,11 +102,28 @@ impl LigeroHost {
 
     /// Find the bins directory
     fn find_bins_dir() -> PathBuf {
-        // Try to find relative to the crate root
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let bins_dir = PathBuf::from(manifest_dir).join("bins");
+        
+        // Check for platform-specific binaries first (they take priority)
+        #[cfg(target_os = "macos")]
+        {
+            let macos_bins = PathBuf::from(manifest_dir).join("bins/macos/bin");
+            if macos_bins.join("webgpu_prover").exists() && macos_bins.join("webgpu_verifier").exists() {
+                return macos_bins;
+            }
+        }
 
-        if bins_dir.exists() {
+        #[cfg(target_os = "linux")]
+        {
+            let linux_bins = PathBuf::from(manifest_dir).join("bins/linux-amd64/bin");
+            if linux_bins.join("webgpu_prover").exists() && linux_bins.join("webgpu_verifier").exists() {
+                return linux_bins;
+            }
+        }
+
+        // Try to find relative to the crate root (generic bins directory)
+        let bins_dir = PathBuf::from(manifest_dir).join("bins");
+        if bins_dir.join("webgpu_prover").exists() && bins_dir.join("webgpu_verifier").exists() {
             return bins_dir;
         }
 
@@ -150,18 +180,14 @@ impl LigeroHost {
 
         tracing::debug!("Running Ligero prover with config: {}", config_json);
 
-        // Create a unique temporary directory for this proof generation
-        // This prevents concurrent proof generations from stomping on each other's proof.data
-        let temp_dir = tempfile::tempdir()
-            .context("Failed to create temporary directory for Ligero proof generation")?;
-        let temp_path = temp_dir.path();
+        // Run prover in current directory so proof.data is written to CWD
+        // This allows parallel proof generation in worker-specific directories
+        tracing::debug!("About to run prover with working directory: {:?}", std::env::current_dir());
+        tracing::debug!("Prover binary: {}", self.prover_bin.display());
+        tracing::debug!("Prover config: {}", config_json);
 
-        tracing::debug!("Using temporary directory for proof: {}", temp_path.display());
-
-        // Run prover with temp directory as current_dir so proof.data is written there
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
-            .current_dir(temp_path)
             .output()
             .context("Failed to execute webgpu_prover")?;
 
@@ -182,14 +208,24 @@ impl LigeroHost {
             anyhow::bail!("Ligero prover did not produce a valid proof");
         }
 
-        // Read the proof from proof.data in the temporary directory
-        let proof_path = temp_path.join("proof.data");
-        let proof = std::fs::read(&proof_path)
-            .context("Failed to read proof.data from temporary directory")?;
+        // Read the proof from proof_data.gz (compressed - this goes into the transaction)
+        let proof_path = PathBuf::from("proof_data.gz");
+        let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
+        
+        tracing::debug!("Reading proof from: {}, size: {} bytes", proof_path.display(), proof.len());
+        tracing::debug!("Current working directory: {:?}", std::env::current_dir());
+        tracing::debug!("Files in current directory: {:?}", std::fs::read_dir(".").unwrap().collect::<Vec<_>>());
+        
+        // This should be compressed gzip data
+        if proof.len() >= 2 && proof[0] == 0x1f && proof[1] == 0x8b {
+            tracing::debug!("✓ Reading compressed proof_data.gz (gzip format)");
+        } else {
+            tracing::warn!("⚠ proof_data.gz does not appear to be gzip format! First bytes: {:02x?}", &proof[..std::cmp::min(10, proof.len())]);
+        }
+        
+        tracing::debug!("First few bytes of read proof: {:?}", &proof[..std::cmp::min(20, proof.len())]);
 
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
-        
-        // temp_dir is automatically cleaned up when it goes out of scope
         Ok(proof)
     }
 
@@ -258,14 +294,20 @@ impl ZkvmHost for LigeroHost {
             tracing::info!("Ligero: Generating proof with webgpu_prover");
             let proof = self.run_prover()?;
             
-            // Include args and private_indices for verification (serialize args as JSON for bincode compat)
+            tracing::debug!("Creating LigeroProofPackage with proof size: {} bytes", proof.len());
+            tracing::debug!("Proof first bytes before packaging: {:?}", &proof[..std::cmp::min(20, proof.len())]);
+            
             let package = LigeroProofPackage {
                 proof,
                 public_output,
                 args_json: serde_json::to_vec(&self.config.args)?,
                 private_indices: self.config.private_indices.clone(),
             };
-            Ok(bincode::serialize(&package)?)
+            
+            let serialized = bincode::serialize(&package)?;
+            tracing::debug!("Serialized package size: {} bytes", serialized.len());
+            
+            Ok(serialized)
         } else {
             tracing::info!("Ligero: Executing without proof generation (simulation mode)");
 

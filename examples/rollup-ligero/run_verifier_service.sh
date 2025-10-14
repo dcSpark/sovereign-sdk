@@ -8,10 +8,24 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Detect platform and set appropriate binary paths
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS
+    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos/bin/webgpu_verifier"
+    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos"
+elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    # Linux
+    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"
+    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64"
+else
+    # Fallback to guest bins for other platforms
+    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
+    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins"
+fi
+
 # Set Ligero verification environment variables
-export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
-export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/value_validator.wasm"
-export LIGERO_SHADER_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/shader"
+export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/programs/value_validator.wasm"
+export LIGERO_SHADER_PATH="$BINS_DIR/shader"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
 # Verify files exist
@@ -27,8 +41,8 @@ if [ ! -f "$LIGERO_PROGRAM_PATH" ]; then
     exit 1
 fi
 
-if [ ! -f "$LIGERO_SHADER_PATH" ]; then
-    echo "❌ Error: shader not found at: $LIGERO_SHADER_PATH"
+if [ ! -d "$LIGERO_SHADER_PATH" ]; then
+    echo "❌ Error: shader directory not found at: $LIGERO_SHADER_PATH"
     echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
     exit 1
 fi
@@ -41,7 +55,7 @@ echo "  LIGERO_PACKING=$LIGERO_PACKING"
 echo ""
 
 # Default values for the verifier service
-METHOD_ID="${METHOD_ID:-0xff8a9b0d64b0781fbcb1810b375aeb24f8b374b584d58ed2a470cafc0c3856c5}"
+METHOD_ID="${METHOD_ID:-0x698c44527e4fa3f934471015da3caa61da1f4e167107dbba9df71a6545396fb3}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 NODE_RPC_URL="${NODE_RPC_URL:-http://127.0.0.1:12346}"
 SIGNING_KEY_PATH="${SIGNING_KEY_PATH:-$WORKSPACE_ROOT/examples/test-data/keys/token_deployer_private_key.json}"

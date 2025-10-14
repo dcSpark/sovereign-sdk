@@ -284,7 +284,7 @@ impl<'de> Visitor<'de> for LigeroCodeCommitmentVisitor {
 /// A Ligero proof package containing both the proof and serialized public output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LigeroProofPackage {
-    /// The raw Ligero proof bytes (from proof.data).
+    /// The compressed Ligero proof bytes (from proof_data.gz - boost serialized + gzipped).
     pub proof: Vec<u8>,
     /// Serialized public output committed by the guest program.
     pub public_output: Vec<u8>,
@@ -309,9 +309,16 @@ impl ZkVerifier for LigeroVerifier {
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
     ) -> Result<T, Self::Error> {
+        tracing::debug!("Deserializing proof package, serialized size: {} bytes", serialized_proof.len());
+        tracing::debug!("First few bytes of serialized proof: {:?}", &serialized_proof[..std::cmp::min(20, serialized_proof.len())]);
+        
         // The proof is a bincode-serialized LigeroProofPackage
         // which contains both the raw proof and the public output
         let package: LigeroProofPackage = bincode::deserialize(serialized_proof)?;
+        
+        tracing::debug!("Deserialized package: proof size: {} bytes, public_output size: {} bytes", 
+                       package.proof.len(), package.public_output.len());
+        tracing::debug!("First few bytes of deserialized proof: {:?}", &package.proof[..std::cmp::min(20, package.proof.len())]);
 
         let public: T = bincode::deserialize(&package.public_output)?;
 
@@ -514,9 +521,24 @@ mod native {
     ) -> Result<()> {
         let temp_dir =
             tempdir().context("Failed to create temporary directory for Ligero verification")?;
-        let proof_path = temp_dir.path().join("proof.data");
+        
+        tracing::debug!("Received proof bytes: size: {} bytes", proof_bytes.len());
+        tracing::debug!("First few bytes of received proof: {:?}", &proof_bytes[..std::cmp::min(20, proof_bytes.len())]);
+        
+        // Expect proof_bytes to be compressed gzip data (boost serialized + gzipped)
+        if proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b {
+            tracing::debug!("✓ Received compressed gzip proof (expected format)");
+        } else {
+            tracing::warn!("⚠ Received proof does not appear to be gzip format! First bytes: {:02x?}", &proof_bytes[..std::cmp::min(10, proof_bytes.len())]);
+        }
+        
+        // Write proof as proof_data.gz (the format verifier expects)
+        let proof_path = temp_dir.path().join("proof_data.gz");
         fs::write(&proof_path, proof_bytes)
-            .context("Failed to write proof.data for Ligero verification")?;
+            .context("Failed to write proof_data.gz for Ligero verification")?;
+        
+        tracing::debug!("Wrote proof to: {}, size: {} bytes", proof_path.display(), proof_bytes.len());
+        tracing::debug!("Temp dir contents: {:?}", fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>());
 
         // Redact private arguments (replace with dummy values)
         for &idx in &private_indices {
@@ -532,6 +554,10 @@ mod native {
         let config = paths.to_config(args, private_indices);
         let config_json =
             serde_json::to_string(&config).context("Failed to serialize Ligero verifier config")?;
+
+        tracing::debug!("Verifier config: {}", config_json);
+        tracing::debug!("Running verifier from directory: {}", temp_dir.path().display());
+        tracing::debug!("Verifier binary: {}", paths.verifier_bin.display());
 
         let output = Command::new(&paths.verifier_bin)
             .arg(&config_json)
@@ -607,6 +633,11 @@ mod native {
                 .and_then(|p| p.parent())
                 .map(|p| p.join("ligero-vm/ligero-prover/bins/webgpu_verifier")),
             Some(current_dir.join("crates/adapters/ligero/guest/bins/webgpu_verifier")),
+            // Platform-specific paths
+            #[cfg(target_os = "macos")]
+            Some(current_dir.join("crates/adapters/ligero/bins/macos/bin/webgpu_verifier")),
+            #[cfg(target_os = "linux")]
+            Some(current_dir.join("crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier")),
         ];
 
         for candidate in candidates.into_iter().flatten() {
