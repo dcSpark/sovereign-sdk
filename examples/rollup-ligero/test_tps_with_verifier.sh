@@ -39,10 +39,12 @@ done
 # Default values
 NUM_TRANSACTIONS=${1:-50}
 VALUE_START=${2:-1}
-CONCURRENT_JOBS=${3:-10}
+CONCURRENT_JOBS=${3:-50}
 MAX_FEE="100000000000"
-VERIFIER_URL="http://127.0.0.1:8080"  # Verifier service, not node!
-NODE_RPC_URL="http://127.0.0.1:12346"   # For reference/health checks
+# VERIFIER_URL="https://ligero-verifier-302883622007.us-central1.run.app"
+# NODE_RPC_URL="https://sovereign-test.shinkai.com"
+VERIFIER_URL="http://127.0.0.1:8080"
+NODE_RPC_URL="http://127.0.0.1:12346"
 ACCOUNT_NICKNAME="DANGER__DO_NOT_USE_WITH_REAL_MONEY"
 
 # Paths (use absolute paths to avoid issues when cd'ing into worker directories)
@@ -84,8 +86,8 @@ if ! curl -s "${VERIFIER_URL}/health" > /dev/null 2>&1; then
     echo -e "${RED}Error: Verifier service not reachable at ${VERIFIER_URL}${NC}"
     echo ""
     echo -e "Please start the verifier service first:"
-    echo -e "  cd crates/utils/sov-proof-verifier-service"
-    echo -e "  cargo run --release"
+    echo -e "  ./run_verifier_service.sh"
+    echo -e "  (or run in background: ./run_verifier_service.sh &)"
     exit 1
 fi
 echo -e "${GREEN}✓ Verifier service is healthy${NC}"
