@@ -139,7 +139,9 @@ fn main() -> Result<()> {
     println!("Code commitment: {}", hex::encode(commitment.encode()));
     if verification_result {
         println!("✓ Proof verification: PASSED");
-        println!("\nYou can now submit a transaction to the value-setter-zk module with this proof!");
+        println!(
+            "\nYou can now submit a transaction to the value-setter-zk module with this proof!"
+        );
     } else {
         println!("⚠️  Proof verification: FAILED (but transaction file created for testing)");
         println!("\nNote: The proof may still work in the actual system - local verification issues are common.");

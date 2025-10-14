@@ -3,7 +3,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sov_rollup_interface::sov_universal_wallet::schema::OverrideSchema;
+use sov_modules_api::macros::UniversalWallet;
 
 use crate::hash::Hash32;
 
@@ -50,7 +50,17 @@ pub struct SpendWitness {
 }
 
 /// A note stored in the commitment tree
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    UniversalWallet,
+)]
 pub struct Note {
     /// Domain tag for the note
     #[serde(with = "serde_bytes_as_hex_array")]
@@ -73,57 +83,71 @@ impl JsonSchema for Note {
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::*;
-        
+
         let mut obj = SchemaObject::default();
         obj.instance_type = Some(InstanceType::Object.into());
-        
+
         let mut properties = std::collections::BTreeMap::new();
-        properties.insert("domain".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            format: Some("hex".to_string()),
-            ..Default::default()
-        }));
-        properties.insert("value".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Integer.into()),
-            ..Default::default()
-        }));
-        properties.insert("rho".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            format: Some("hex".to_string()),
-            ..Default::default()
-        }));
-        properties.insert("recipient".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            format: Some("hex".to_string()),
-            ..Default::default()
-        }));
-        
+        properties.insert(
+            "domain".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "value".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::Integer.into()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "rho".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "recipient".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+
         obj.object = Some(Box::new(ObjectValidation {
             properties,
-            required: vec!["domain".to_string(), "value".to_string(), "rho".to_string(), "recipient".to_string()].into_iter().collect(),
+            required: vec![
+                "domain".to_string(),
+                "value".to_string(),
+                "rho".to_string(),
+                "recipient".to_string(),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         }));
-        
+
         Schema::Object(obj)
     }
-}
-
-// Implement OverrideSchema for Note to make it compatible with UniversalWallet
-impl OverrideSchema for Note {
-    type Output = Note;
 }
 
 // Custom serde module for hex-encoded byte arrays
 pub(crate) mod serde_bytes_as_hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
-    
+
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(bytes))
     }
-    
+
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
@@ -146,10 +170,19 @@ pub(crate) mod serde_bytes_as_hex_array {
 ///
 /// This design follows Zcash's viewing key pattern: viewers can decrypt notes
 /// and recompute the commitment to verify truthfulness against the on-chain commitment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
-pub struct FullViewingKey(
-    #[serde(with = "serde_bytes_as_hex_array")] pub [u8; 32]
-);
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    UniversalWallet,
+)]
+pub struct FullViewingKey(#[serde(with = "serde_bytes_as_hex_array")] pub [u8; 32]);
 
 impl JsonSchema for FullViewingKey {
     fn schema_name() -> String {
@@ -158,17 +191,13 @@ impl JsonSchema for FullViewingKey {
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::*;
-        
+
         let mut obj = SchemaObject::default();
         obj.instance_type = Some(InstanceType::String.into());
         obj.format = Some("hex".to_string());
-        
+
         Schema::Object(obj)
     }
-}
-
-impl OverrideSchema for FullViewingKey {
-    type Output = FullViewingKey;
 }
 
 /// AEAD-encrypted note bound to its on-chain commitment.
@@ -177,7 +206,17 @@ impl OverrideSchema for FullViewingKey {
 /// The ciphertext is bound to the commitment via AEAD AAD, preventing "trust me bro"
 /// scenarios. The viewer must recompute the commitment from the decrypted note and
 /// verify it matches the on-chain commitment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    UniversalWallet,
+)]
 pub struct EncryptedNote {
     /// The on-chain commitment this ciphertext is bound to (also used as AEAD AAD).
     #[serde(with = "serde_bytes_as_hex_array")]
@@ -196,51 +235,58 @@ impl JsonSchema for EncryptedNote {
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::*;
-        
+
         let mut obj = SchemaObject::default();
         obj.instance_type = Some(InstanceType::Object.into());
-        
+
         let mut properties = std::collections::BTreeMap::new();
-        properties.insert("cm".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            format: Some("hex".to_string()),
-            ..Default::default()
-        }));
-        properties.insert("nonce".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            format: Some("hex".to_string()),
-            ..Default::default()
-        }));
-        properties.insert("ct".to_string(), Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Array.into()),
-            ..Default::default()
-        }));
-        
+        properties.insert(
+            "cm".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "nonce".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "ct".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::Array.into()),
+                ..Default::default()
+            }),
+        );
+
         obj.object = Some(Box::new(ObjectValidation {
             properties,
-            required: vec!["cm".to_string(), "nonce".to_string(), "ct".to_string()].into_iter().collect(),
+            required: vec!["cm".to_string(), "nonce".to_string(), "ct".to_string()]
+                .into_iter()
+                .collect(),
             ..Default::default()
         }));
-        
+
         Schema::Object(obj)
     }
-}
-
-impl OverrideSchema for EncryptedNote {
-    type Output = EncryptedNote;
 }
 
 // Custom serde module for 24-byte nonce
 mod serde_bytes_as_hex_array_24 {
     use serde::{Deserialize, Deserializer, Serializer};
-    
+
     pub fn serialize<S>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(bytes))
     }
-    
+
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 24], D::Error>
     where
         D: Deserializer<'de>,
@@ -255,4 +301,3 @@ mod serde_bytes_as_hex_array_24 {
         Ok(arr)
     }
 }
-

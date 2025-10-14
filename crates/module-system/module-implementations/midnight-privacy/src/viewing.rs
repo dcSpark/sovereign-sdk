@@ -28,7 +28,10 @@
 //! because the commitment binds the plaintext to the on-chain state.
 
 use anyhow::{anyhow, Result};
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, XChaCha20Poly1305, Key, XNonce};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    Key, XChaCha20Poly1305, XNonce,
+};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -87,24 +90,27 @@ fn derive_key_and_nonce(fvk: &FullViewingKey, cm: &Hash32) -> (Key, XNonce) {
 /// let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
 /// let enc = encrypt_note_for_fvk(&fvk, &note, &cm)?;
 /// ```
-pub fn encrypt_note_for_fvk(fvk: &FullViewingKey, note: &Note, cm: &Hash32) -> Result<EncryptedNote> {
+pub fn encrypt_note_for_fvk(
+    fvk: &FullViewingKey,
+    note: &Note,
+    cm: &Hash32,
+) -> Result<EncryptedNote> {
     let (key, nonce) = derive_key_and_nonce(fvk, cm);
     let cipher = XChaCha20Poly1305::new(&key);
 
     // Serialize Note with bincode (compact, deterministic)
-    let pt = bincode::serialize(note)
-        .map_err(|e| anyhow!("note serialize: {e}"))?;
+    let pt = bincode::serialize(note).map_err(|e| anyhow!("note serialize: {e}"))?;
 
     // Bind ciphertext to cm via AAD = cm
     let aad = cm;
-    let ct = cipher.encrypt(&nonce, Payload { msg: &pt, aad })
+    let ct = cipher
+        .encrypt(&nonce, Payload { msg: &pt, aad })
         .map_err(|e| anyhow!("encrypt: {e}"))?;
 
     Ok(EncryptedNote {
         cm: *cm,
         nonce: nonce.into(),
-        ct: sov_modules_api::SafeVec::try_from(ct)
-            .map_err(|_| anyhow!("ciphertext too large"))?,
+        ct: sov_modules_api::SafeVec::try_from(ct).map_err(|_| anyhow!("ciphertext too large"))?,
     })
 }
 
@@ -151,13 +157,17 @@ pub fn decrypt_and_verify_note(fvk: &FullViewingKey, enc: &EncryptedNote) -> Res
     let (key, _nonce) = derive_key_and_nonce(fvk, &enc.cm);
     let cipher = XChaCha20Poly1305::new(&key);
 
-    let pt = cipher.decrypt(
-        &XNonce::from(enc.nonce),
-        Payload { msg: &enc.ct, aad: &enc.cm }
-    ).map_err(|e| anyhow!("decrypt: {e}"))?;
+    let pt = cipher
+        .decrypt(
+            &XNonce::from(enc.nonce),
+            Payload {
+                msg: &enc.ct,
+                aad: &enc.cm,
+            },
+        )
+        .map_err(|e| anyhow!("decrypt: {e}"))?;
 
-    let note: Note = bincode::deserialize(&pt)
-        .map_err(|e| anyhow!("note deserialize: {e}"))?;
+    let note: Note = bincode::deserialize(&pt).map_err(|e| anyhow!("note deserialize: {e}"))?;
 
     // "Not a trust me bro": recompute and compare to the on-chain cm
     let cm_recomputed = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
@@ -218,10 +228,10 @@ mod tests {
         let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
 
         let mut enc = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
-        
+
         // Corrupt the commitment
         enc.cm[0] ^= 1;
-        
+
         let result = decrypt_and_verify_note(&fvk, &enc);
         assert!(result.is_err());
     }
@@ -238,10 +248,10 @@ mod tests {
         let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
 
         let mut enc = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
-        
+
         // Corrupt the ciphertext
         enc.ct[0] ^= 1;
-        
+
         let result = decrypt_and_verify_note(&fvk, &enc);
         assert!(result.is_err());
     }
@@ -261,7 +271,7 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        
+
         let cm1 = note_commitment(&note1.domain, note1.value, &note1.rho, &note1.recipient);
         let cm2 = note_commitment(&note2.domain, note2.value, &note2.rho, &note2.recipient);
 
@@ -294,4 +304,3 @@ mod tests {
         assert_eq!(enc1.cm, enc2.cm);
     }
 }
-

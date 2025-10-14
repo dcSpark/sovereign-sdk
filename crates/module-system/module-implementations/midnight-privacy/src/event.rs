@@ -64,4 +64,3 @@ pub enum Event {
         enc: EncryptedNote,
     },
 }
-

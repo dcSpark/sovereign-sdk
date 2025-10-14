@@ -19,7 +19,18 @@ use serde::{Deserialize, Serialize};
 pub type Hash32 = [u8; 32];
 
 /// Wrapper around Hash32 that implements Display and FromStr for use in StateMap
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
 pub struct NullifierKey(pub Hash32);
 
 impl fmt::Display for NullifierKey {
@@ -44,7 +55,18 @@ impl FromStr for NullifierKey {
 
 /// Wrapper for Merkle roots so we can store membership in StateMap (NOMT-backed).
 /// This enables permanent indexing of all historical roots for long-range anchor validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
 pub struct RootKey(pub Hash32);
 
 impl fmt::Display for RootKey {
@@ -84,7 +106,7 @@ pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
     for part in parts {
         input.extend_from_slice(part);
     }
-    
+
     POSEIDON.with(|h| h.borrow().hash_padded(&input))
 }
 
@@ -104,7 +126,7 @@ pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     buf[10] = level;
     buf[11..43].copy_from_slice(left);
     buf[43..].copy_from_slice(right);
-    
+
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
@@ -122,7 +144,7 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
     buf[39..55].copy_from_slice(&v);
     buf[55..87].copy_from_slice(rho);
     buf[87..].copy_from_slice(recipient);
-    
+
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
@@ -143,7 +165,7 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     buf[9..41].copy_from_slice(domain);
     buf[41..73].copy_from_slice(nf_key);
     buf[73..].copy_from_slice(rho);
-    
+
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 

@@ -14,20 +14,20 @@ use crate::merkle::MerkleTree;
 pub struct ValueSetterZkConfig<S: Spec> {
     /// Depth of the commitment tree (tree will have 2^depth leaves)
     pub tree_depth: u8,
-    
+
     /// Size of the recent roots window (how many recent roots to keep)
     pub root_window_size: u32,
-    
+
     /// Ligero method ID (code commitment) of the guest program that verifies spend proofs.
     /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
     pub method_id: [u8; 32],
-    
+
     /// Admin of the module who can update the method ID.
     pub admin: S::Address,
-    
+
     /// Domain tag used in all note/hash derivations
     pub domain: Hash32,
-    
+
     /// Single supported token (native)
     pub token_id: sov_bank::TokenId,
 }
@@ -41,35 +41,35 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ) -> Result<()> {
         // Set the admin
         self.admin.set(&config.admin, state)?;
-        
+
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
-        
+
         // New: bind domain + native token in state
         self.domain.set(&config.domain, state)?;
         self.token_id.set(&config.token_id, state)?;
-        
+
         // Initialize the commitment tree
         let tree = MerkleTree::new(config.tree_depth);
         self.commitment_tree.set(&tree, state)?;
-        
+
         // Initialize the next position to 0
         self.next_position.set(&0u64, state)?;
-        
+
         // Set the root window size
         self.root_window_size.set(&config.root_window_size, state)?;
-        
+
         // Initialize recent roots with the initial (empty) tree root
         let initial_root = tree.root();
         let mut roots_deque = VecDeque::new();
         roots_deque.push_back(initial_root);
         self.recent_roots.set(&roots_deque, state)?;
-        
+
         // Initialize full-history root index (NOMT-backed for permanent storage)
         // The initial empty-tree root is assigned sequence 0
         self.root_seq.set(&1u64, state)?; // next seq to use
         self.all_roots.set(&RootKey(initial_root), &0u64, state)?;
-        
+
         Ok(())
     }
 }
@@ -98,9 +98,7 @@ mod tests {
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();
-        let parsed_config: ValueSetterZkConfig<TestSpec> = 
-            serde_json::from_str(&json_str).unwrap();
+        let parsed_config: ValueSetterZkConfig<TestSpec> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed_config, config);
     }
 }
-

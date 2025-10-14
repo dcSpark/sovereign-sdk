@@ -72,7 +72,7 @@ impl MerkleTree {
     /// This performs exactly `depth` hashes to update the path from leaf to root.
     pub fn set_leaf(&mut self, index: usize, val: Hash32) {
         assert!(index < self.len(), "index {} out of bounds", index);
-        
+
         // Update the leaf
         self.levels[0][index] = val;
 
@@ -80,7 +80,7 @@ impl MerkleTree {
         let mut idx = index;
         for lvl in 0..self.depth as usize {
             let parent = idx / 2;
-            
+
             // Get both children at current level
             let left = self.levels[lvl][parent * 2];
             let right = if parent * 2 + 1 < self.levels[lvl].len() {
@@ -88,7 +88,7 @@ impl MerkleTree {
             } else {
                 [0u8; 32] // right child doesn't exist (shouldn't happen for power-of-2 trees)
             };
-            
+
             // Update parent at next level
             self.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
             idx = parent;
@@ -111,10 +111,10 @@ impl MerkleTree {
     /// No hashing is performed - siblings are read directly from cached levels.
     pub fn open(&self, index: usize) -> Vec<Hash32> {
         assert!(index < self.len(), "index {} out of bounds", index);
-        
+
         let mut idx = index;
         let mut path = Vec::with_capacity(self.depth as usize);
-        
+
         for lvl in 0..self.depth as usize {
             // Get sibling at current level
             let sib_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
@@ -126,9 +126,8 @@ impl MerkleTree {
             path.push(sib);
             idx /= 2;
         }
-        
+
         assert_eq!(path.len(), self.depth as usize);
         path
     }
 }
-

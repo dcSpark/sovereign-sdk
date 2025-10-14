@@ -5,8 +5,8 @@
 //! It implements a shielded pool with note commitments, nullifiers, and Merkle tree for membership proofs.
 
 mod call;
-mod genesis;
 mod event;
+mod genesis;
 mod hash;
 mod merkle;
 mod types;
@@ -18,13 +18,13 @@ pub use genesis::*;
 pub use hash::*;
 pub use merkle::*;
 pub use types::*;
-pub use viewing::{encrypt_note_for_fvk, decrypt_and_verify_note};
+pub use viewing::{decrypt_and_verify_note, encrypt_note_for_fvk};
 
-use std::collections::VecDeque;
 use sov_modules_api::{
-    Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, 
-    StateMap, StateValue, TxState,
+    Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
+    StateValue, TxState,
 };
+use std::collections::VecDeque;
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
@@ -146,7 +146,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
         // Use a revertable state wrapper to ensure atomicity
         let mut state_wrapped = state.to_revertable();
         let state = &mut state_wrapped;
-        
+
         let res = match msg {
             CallMessage::CreateNote { note, gas } => {
                 Ok(self.create_note(note, gas, context, state)?)
@@ -154,20 +154,36 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             CallMessage::SpendNote { proof, gas } => {
                 Ok(self.spend_note(proof, gas, context, state)?)
             }
-            CallMessage::Deposit { amount, rho, recipient, gas } => {
-                Ok(self.deposit(amount, rho, recipient, gas, context, state)?)
-            }
-            CallMessage::Withdraw { proof, anchor_root, nullifier, withdraw_amount, to, gas } => {
-                Ok(self.withdraw(proof, anchor_root, nullifier, withdraw_amount, to, gas, context, state)?)
-            }
+            CallMessage::Deposit {
+                amount,
+                rho,
+                recipient,
+                gas,
+            } => Ok(self.deposit(amount, rho, recipient, gas, context, state)?),
+            CallMessage::Withdraw {
+                proof,
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+                to,
+                gas,
+            } => Ok(self.withdraw(
+                proof,
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+                to,
+                gas,
+                context,
+                state,
+            )?),
             CallMessage::UpdateMethodId { new_method_id } => {
                 Ok(self.update_method_id(new_method_id, context, state)?)
             }
         };
-        
+
         // Commit the state changes if successful
         state_wrapped.commit();
         res
     }
 }
-

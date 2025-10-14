@@ -7,8 +7,8 @@
 //! 4. Detecting non-truthful ciphertexts
 
 use midnight_privacy::{
-    encrypt_note_for_fvk, decrypt_and_verify_note,
-    note_commitment, EncryptedNote, FullViewingKey, Note,
+    decrypt_and_verify_note, encrypt_note_for_fvk, note_commitment, EncryptedNote, FullViewingKey,
+    Note,
 };
 
 #[test]
@@ -212,7 +212,7 @@ fn test_fvk_hex_encoding() {
 
     // Serialize to JSON (should use hex encoding)
     let json = serde_json::to_string(&fvk).unwrap();
-    
+
     // Should be hex-encoded string
     assert!(json.contains("\"2a2a2a2a"));
 
@@ -240,7 +240,7 @@ fn test_deterministic_nonce_derivation() {
 
     // Nonces should be identical (deterministic derivation)
     assert_eq!(enc1.nonce, enc2.nonce);
-    
+
     // Ciphertexts should be identical
     assert_eq!(enc1.ct, enc2.ct);
 }
@@ -291,7 +291,12 @@ fn test_non_truthful_ciphertext_rejected() {
     };
 
     // The on-chain commitment is for the REAL note
-    let real_cm = note_commitment(&real_note.domain, real_note.value, &real_note.rho, &real_note.recipient);
+    let real_cm = note_commitment(
+        &real_note.domain,
+        real_note.value,
+        &real_note.rho,
+        &real_note.recipient,
+    );
 
     // Attacker tries to encrypt the FAKE note with the REAL commitment
     // This would work if we didn't verify...
@@ -299,10 +304,9 @@ fn test_non_truthful_ciphertext_rejected() {
 
     // But when we decrypt and verify, the commitment won't match!
     let result = decrypt_and_verify_note(&fvk, &encrypted);
-    
+
     // Should fail with "commitment mismatch: not truthful"
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("commitment mismatch"));
 }
-

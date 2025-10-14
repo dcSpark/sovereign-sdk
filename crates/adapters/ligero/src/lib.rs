@@ -309,16 +309,28 @@ impl ZkVerifier for LigeroVerifier {
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
     ) -> Result<T, Self::Error> {
-        tracing::debug!("Deserializing proof package, serialized size: {} bytes", serialized_proof.len());
-        tracing::debug!("First few bytes of serialized proof: {:?}", &serialized_proof[..std::cmp::min(20, serialized_proof.len())]);
-        
+        tracing::debug!(
+            "Deserializing proof package, serialized size: {} bytes",
+            serialized_proof.len()
+        );
+        tracing::debug!(
+            "First few bytes of serialized proof: {:?}",
+            &serialized_proof[..std::cmp::min(20, serialized_proof.len())]
+        );
+
         // The proof is a bincode-serialized LigeroProofPackage
         // which contains both the raw proof and the public output
         let package: LigeroProofPackage = bincode::deserialize(serialized_proof)?;
-        
-        tracing::debug!("Deserialized package: proof size: {} bytes, public_output size: {} bytes", 
-                       package.proof.len(), package.public_output.len());
-        tracing::debug!("First few bytes of deserialized proof: {:?}", &package.proof[..std::cmp::min(20, package.proof.len())]);
+
+        tracing::debug!(
+            "Deserialized package: proof size: {} bytes, public_output size: {} bytes",
+            package.proof.len(),
+            package.public_output.len()
+        );
+        tracing::debug!(
+            "First few bytes of deserialized proof: {:?}",
+            &package.proof[..std::cmp::min(20, package.proof.len())]
+        );
 
         let public: T = bincode::deserialize(&package.public_output)?;
 
@@ -335,7 +347,12 @@ impl ZkVerifier for LigeroVerifier {
             native::ensure_code_commitment(&paths, code_commitment)?;
             // Deserialize args from JSON
             let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
-            native::verify_proof(&paths, &package.proof, args, package.private_indices.clone())?;
+            native::verify_proof(
+                &paths,
+                &package.proof,
+                args,
+                package.private_indices.clone(),
+            )?;
         }
 
         #[cfg(not(feature = "native"))]
@@ -475,7 +492,11 @@ mod native {
             })
         }
 
-        pub fn to_config(&self, args: Vec<crate::LigeroArg>, private_indices: Vec<usize>) -> LigeroConfig {
+        pub fn to_config(
+            &self,
+            args: Vec<crate::LigeroArg>,
+            private_indices: Vec<usize>,
+        ) -> LigeroConfig {
             LigeroConfig {
                 program: self.program.to_string_lossy().into_owned(),
                 shader_path: self.shader_path.to_string_lossy().into_owned(),
@@ -521,24 +542,37 @@ mod native {
     ) -> Result<()> {
         let temp_dir =
             tempdir().context("Failed to create temporary directory for Ligero verification")?;
-        
+
         tracing::debug!("Received proof bytes: size: {} bytes", proof_bytes.len());
-        tracing::debug!("First few bytes of received proof: {:?}", &proof_bytes[..std::cmp::min(20, proof_bytes.len())]);
-        
+        tracing::debug!(
+            "First few bytes of received proof: {:?}",
+            &proof_bytes[..std::cmp::min(20, proof_bytes.len())]
+        );
+
         // Expect proof_bytes to be compressed gzip data (boost serialized + gzipped)
         if proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b {
             tracing::debug!("✓ Received compressed gzip proof (expected format)");
         } else {
-            tracing::warn!("⚠ Received proof does not appear to be gzip format! First bytes: {:02x?}", &proof_bytes[..std::cmp::min(10, proof_bytes.len())]);
+            tracing::warn!(
+                "⚠ Received proof does not appear to be gzip format! First bytes: {:02x?}",
+                &proof_bytes[..std::cmp::min(10, proof_bytes.len())]
+            );
         }
-        
+
         // Write proof as proof_data.gz (the format verifier expects)
         let proof_path = temp_dir.path().join("proof_data.gz");
         fs::write(&proof_path, proof_bytes)
             .context("Failed to write proof_data.gz for Ligero verification")?;
-        
-        tracing::debug!("Wrote proof to: {}, size: {} bytes", proof_path.display(), proof_bytes.len());
-        tracing::debug!("Temp dir contents: {:?}", fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>());
+
+        tracing::debug!(
+            "Wrote proof to: {}, size: {} bytes",
+            proof_path.display(),
+            proof_bytes.len()
+        );
+        tracing::debug!(
+            "Temp dir contents: {:?}",
+            fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>()
+        );
 
         // Redact private arguments (replace with dummy values)
         for &idx in &private_indices {
@@ -556,7 +590,10 @@ mod native {
             serde_json::to_string(&config).context("Failed to serialize Ligero verifier config")?;
 
         tracing::debug!("Verifier config: {}", config_json);
-        tracing::debug!("Running verifier from directory: {}", temp_dir.path().display());
+        tracing::debug!(
+            "Running verifier from directory: {}",
+            temp_dir.path().display()
+        );
         tracing::debug!("Verifier binary: {}", paths.verifier_bin.display());
 
         let output = Command::new(&paths.verifier_bin)

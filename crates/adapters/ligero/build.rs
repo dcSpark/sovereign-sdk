@@ -51,7 +51,9 @@ fn main() -> anyhow::Result<()> {
             if raw_sdk_path != default_sdk_path() {
                 println!("cargo:warning=  {}", default_sdk_path().display());
             }
-            println!("cargo:warning=Skip building Ligero guests because SDK artifacts are missing.");
+            println!(
+                "cargo:warning=Skip building Ligero guests because SDK artifacts are missing."
+            );
             println!("cargo:warning=Set LIGERO_SDK_PATH to the Ligero SDK root (containing 'build/libligetron.a').");
             return Ok(());
         }
