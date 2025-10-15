@@ -81,11 +81,23 @@ impl LigeroTestConfig {
 
         let ligero_dir = repo_root.join("crates/adapters/ligero");
 
+        // Detect OS and choose correct binary path
+        let platform_dir = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux-amd64"
+        } else {
+            bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
+        };
+
+        let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
+        let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+
         let config = Self {
             program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
-            prover_bin: ligero_dir.join("bins/webgpu_prover"),
-            verifier_bin: ligero_dir.join("bins/webgpu_verifier"),
-            shader_path: ligero_dir.join("bins/shader"),
+            prover_bin: bin_dir.join("webgpu_prover"),
+            verifier_bin: bin_dir.join("webgpu_verifier"),
+            shader_path: shader_dir,
             packing: 8192,
         };
 
@@ -124,10 +136,10 @@ impl LigeroTestConfig {
         // Skip WebGPU verification in tests that use LigeroHost API
         // The verifier needs arguments + private_indices which LigeroHost doesn't currently track
         // The proof package still contains public_output which gets validated
-        if std::env::var("LIGERO_SKIP_VERIFICATION").is_err() {
-            std::env::set_var("LIGERO_SKIP_VERIFICATION", "1");
-            println!("Set LIGERO_SKIP_VERIFICATION=1 (LigeroHost API limitation)");
-        }
+        // if std::env::var("LIGERO_SKIP_VERIFICATION").is_err() {
+        //     std::env::set_var("LIGERO_SKIP_VERIFICATION", "1");
+        //     println!("Set LIGERO_SKIP_VERIFICATION=1 (LigeroHost API limitation)");
+        // }
 
         Ok(())
     }
@@ -607,14 +619,8 @@ fn hex32(h: &Hash32) -> String {
     hex::encode(h)
 }
 
-/// Helper to get binary path from environment variable
-fn bin_env(key: &str) -> Result<PathBuf> {
-    let val =
-        std::env::var(key).with_context(|| format!("{} environment variable not set", key))?;
-    Ok(PathBuf::from(val))
-}
 
-/// Helper to discover guest program path
+/// Helper to discover guest program path and platform-specific binaries
 fn program_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LIGERO_PROGRAM_PATH") {
         return Ok(PathBuf::from(path));
@@ -632,6 +638,37 @@ fn program_path() -> Result<PathBuf> {
     // For note spending, we'd need a different guest program
     // For now, return the note_spend_guest as the implementation
     Ok(repo_root.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"))
+}
+
+/// Helper to get platform-specific binary paths
+fn get_platform_bin_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .context("Could not find repository root")?;
+
+    let ligero_dir = repo_root.join("crates/adapters/ligero");
+
+    // Detect OS and choose correct binary path
+    let platform_dir = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux-amd64"
+    } else {
+        bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
+    };
+
+    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
+    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+
+    Ok((
+        bin_dir.join("webgpu_prover"),
+        bin_dir.join("webgpu_verifier"),
+        shader_dir,
+    ))
 }
 
 const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
@@ -661,11 +698,27 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     setup_ligero_env().context("Failed to setup Ligero environment")?;
 
-    let prover = bin_env("LIGERO_PROVER_BIN")?;
-    let verifier = bin_env("LIGERO_VERIFIER_BIN")
-        .context("Set LIGERO_VERIFIER_BIN to path of webgpu_verifier binary")?;
-    let shader_path = std::env::var("LIGERO_SHADER_PATH")
-        .context("Set LIGERO_SHADER_PATH to shader directory")?;
+    // Use platform-specific paths or environment overrides
+    let (default_prover, default_verifier, default_shader_path) = get_platform_bin_paths()?;
+    
+    let prover = if let Ok(path) = std::env::var("LIGERO_PROVER_BIN") {
+        PathBuf::from(path)
+    } else {
+        default_prover
+    };
+    
+    let verifier = if let Ok(path) = std::env::var("LIGERO_VERIFIER_BIN") {
+        PathBuf::from(path)
+    } else {
+        default_verifier
+    };
+    
+    let shader_path = if let Ok(path) = std::env::var("LIGERO_SHADER_PATH") {
+        path
+    } else {
+        default_shader_path.to_string_lossy().to_string()
+    };
+    
     let packing: u32 = std::env::var("LIGERO_PACKING")
         .ok()
         .and_then(|s| s.parse().ok())
