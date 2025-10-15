@@ -78,11 +78,10 @@ impl Ligero {
         }
 
         let proof_path = std::env::temp_dir().join(Self::LIGERO_PROOF_FILE_NAME);
+        tracing::info!("generating ligero proof at {}", proof_path.display());
 
         let ligero_program_path = self.ligero_program_path.clone().unwrap();
         let ligero_shader_path = self.ligero_shader_path.clone().unwrap();
-
-        tracing::info!("generating Ligero proof at {}", proof_path.display());
 
         let ligero_argument = LigeroArgument {
             program: ligero_program_path.to_string_lossy().into_owned(),
@@ -112,7 +111,13 @@ impl Ligero {
             .inspect_err(|e| tracing::error!("failed to execute ligero prover: {:?}", e))
             .context("failed to execute ligero prover")?;
 
-        tracing::info!("ligero prover output: {:?}", output);
+        tracing::error!(
+            "ligero prover execution finished with status {:?}",
+            output.status.code()
+        );
+        tracing::error!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        tracing::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -127,12 +132,15 @@ impl Ligero {
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("Final prove result:                  true") {
-            anyhow::bail!("Ligero prover did not produce a valid proof");
+            tracing::error!("ligero prover did not produce a valid proof");
+
+            anyhow::bail!("ligero prover did not produce a valid proof");
         }
 
+        tracing::info!("ligero prover generate sucessfully");
+
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
-        let proof_path = PathBuf::from(Self::LIGERO_PROOF_FILE_NAME);
-        let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
+        let proof = std::fs::read(&proof_path).context("failed to read proof_data.gz")?;
         Ok(proof)
     }
 }
@@ -161,7 +169,7 @@ mod tests {
             ),
             Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/shader")
+                    .join("../adapters/ligero/bins/macos/shader")
                     .canonicalize()
                     .unwrap(),
             ),
