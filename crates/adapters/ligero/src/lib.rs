@@ -575,12 +575,29 @@ mod native {
         );
 
         // Redact private arguments (replace with dummy values)
+        // IMPORTANT: Keep the same argument type and length as the original
+        // (Ligero verifier requires type consistency)
         for &idx in &private_indices {
             if idx > 0 && idx <= args.len() {
                 // 1-based indexing
                 let arg_idx = idx - 1;
-                args[arg_idx] = crate::LigeroArg::Hex {
-                    hex: "00".repeat(32), // Redacted placeholder
+                args[arg_idx] = match &args[arg_idx] {
+                    crate::LigeroArg::String { str: s } => {
+                        // Replace with 'x' repeated to match original length
+                        crate::LigeroArg::String {
+                            str: "x".repeat(s.len()),
+                        }
+                    }
+                    crate::LigeroArg::I64 { .. } => {
+                        // Replace with 0
+                        crate::LigeroArg::I64 { i64: 0 }
+                    }
+                    crate::LigeroArg::Hex { hex: h } => {
+                        // Replace with '0' repeated to match original length
+                        crate::LigeroArg::Hex {
+                            hex: "0".repeat(h.len()),
+                        }
+                    }
                 };
             }
         }

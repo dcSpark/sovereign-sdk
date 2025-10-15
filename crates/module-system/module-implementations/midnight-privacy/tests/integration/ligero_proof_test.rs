@@ -283,12 +283,13 @@ fn test_simple_note_spend() -> Result<()> {
 
     // Calculate private indices (1-based)
     // Arguments: domain(1), value(2), rho(3), recipient(4), nf_key(5), pos(6), depth(7), siblings(8..8+depth), anchor, nullifier, withdraw
+    // Private: value, rho, recipient, nf_key, pos, and all siblings (hidden from verifier)
     let mut private_indices = vec![
-        2, // value - part of note opening
-        3, // rho - note randomness
-        4, // recipient - note binding
+        2, // value - note amount (PRIVATE)
+        3, // rho - note randomness (PRIVATE)
+        4, // recipient - note binding (PRIVATE)
         5, // nf_key - SECRET nullifier key (CRITICAL)
-        6, // pos - position in tree (CRITICAL for privacy)
+        6, // pos - position in tree (CRITICAL for privacy!)
     ];
     // Add all sibling indices (8 through 8+depth-1)
     for i in 0..tree_depth as usize {
@@ -303,12 +304,12 @@ fn test_simple_note_spend() -> Result<()> {
     // Add arguments as hex strings (matching note_spend_guest expectations)
     // Arguments order: domain, value, rho, recipient, nf_key, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount
     host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_hex_arg(value.to_string()); // 2: PRIVATE
+    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
     host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
     host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
     host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_hex_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!)
-    host.add_hex_arg(tree_depth.to_string()); // 7: PUBLIC
+    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
+    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
 
     // Add all siblings (PRIVATE)
     for sibling in &siblings {
@@ -318,7 +319,7 @@ fn test_simple_note_spend() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_hex_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
+    host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC - decimal u128
 
     // Set public output
     host.set_public_output(&public_output)?;
@@ -497,12 +498,13 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     // Calculate private indices (1-based)
     // Arguments: domain(1), value(2), rho(3), recipient(4), nf_key(5), pos(6), depth(7), siblings(8..8+depth), anchor, nullifier, withdraw
+    // Private: value, rho, recipient, nf_key, pos, and all siblings (hidden from verifier)
     let mut private_indices = vec![
-        2, // value - part of note opening
-        3, // rho - note randomness
-        4, // recipient - note binding
+        2, // value - note amount (PRIVATE)
+        3, // rho - note randomness (PRIVATE)
+        4, // recipient - note binding (PRIVATE)
         5, // nf_key - SECRET nullifier key (CRITICAL)
-        6, // pos - position in tree (CRITICAL for privacy)
+        6, // pos - position in tree (CRITICAL for privacy!)
     ];
     // Add all sibling indices (8 through 8+depth-1)
     for i in 0..tree_depth as usize {
@@ -517,12 +519,12 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // Add witness data and public inputs
     // Arguments order: domain, value, rho, recipient, nf_key, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount
     host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_hex_arg(value.to_string()); // 2: PRIVATE
+    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
     host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
     host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
     host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_hex_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!)
-    host.add_hex_arg(tree_depth.to_string()); // 7: PUBLIC
+    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
+    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
 
     // Add all siblings (PRIVATE)
     for sibling in &siblings {
@@ -532,7 +534,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_hex_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
+    host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC - decimal u128
 
     // Set the public output
     host.set_public_output(&public_output)?;
@@ -1044,7 +1046,18 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     let withdraw_amount = 0u128; // This would burn value!
 
     let program_path = config.program_path.to_string_lossy().to_string();
-    let private_indices = vec![3, 4, 5, 6, 7, 8]; // nf_key, pos, siblings
+    // Private: value, rho, recipient, nf_key, pos, and all siblings
+    let depth = siblings.len();
+    let mut private_indices = vec![
+        2, // value
+        3, // rho
+        4, // recipient
+        5, // nf_key
+        6, // pos
+    ];
+    for i in 0..depth {
+        private_indices.push(8 + i); // siblings
+    }
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
@@ -1052,16 +1065,18 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     // Prepare arguments for the guest
     host.add_hex_arg(hex::encode(domain));
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_i64_arg(pos as i64);
-    host.add_i64_arg(value as i64);
+    host.add_str_arg(value.to_string()); // decimal u128
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
+    host.add_hex_arg(hex::encode(nf_key));
+    host.add_str_arg(pos.to_string()); // decimal u64
+    host.add_str_arg((siblings.len() as u32).to_string()); // decimal u32 - depth
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
-    host.add_i64_arg(withdraw_amount as i64); // withdraw_amount = 0
+    host.add_hex_arg(hex::encode(anchor));
+    host.add_hex_arg(hex::encode(nf));
+    host.add_str_arg(withdraw_amount.to_string()); // decimal u128
 
     let public = SpendPublic {
         anchor_root: anchor,
@@ -1152,23 +1167,36 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let withdraw_amount = 500u128;
 
     let program_path = config.program_path.to_string_lossy().to_string();
-    let private_indices = vec![3, 4, 5, 6, 7, 8]; // nf_key, pos, siblings
+    // Private: value, rho, recipient, nf_key, pos, and all siblings
+    let depth = siblings.len();
+    let mut private_indices = vec![
+        2, // value
+        3, // rho
+        4, // recipient
+        5, // nf_key
+        6, // pos
+    ];
+    for i in 0..depth {
+        private_indices.push(8 + i); // siblings
+    }
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
         .with_private_indices(private_indices);
 
     host.add_hex_arg(hex::encode(domain));
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_i64_arg(pos as i64);
-    host.add_i64_arg(value as i64);
+    host.add_str_arg(value.to_string()); // decimal u128
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
+    host.add_hex_arg(hex::encode(nf_key));
+    host.add_str_arg(pos.to_string()); // decimal u64
+    host.add_str_arg((siblings.len() as u32).to_string()); // decimal u32 - depth
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
-    host.add_i64_arg(withdraw_amount as i64);
+    host.add_hex_arg(hex::encode(anchor));
+    host.add_hex_arg(hex::encode(nf));
+    host.add_str_arg(withdraw_amount.to_string()); // decimal u128
 
     let public = SpendPublic {
         anchor_root: anchor,
