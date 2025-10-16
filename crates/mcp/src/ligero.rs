@@ -145,39 +145,13 @@ impl Ligero {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
+    use crate::test_utils::ligero::create_test_ligero;
 
     #[tracing_test::traced_test]
     #[test]
     fn test_generate_proof() {
-        let ligero = Ligero::new(
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/macos/bin/webgpu_prover")
-                    .canonicalize()
-                    .unwrap(),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/macos/bin/webgpu_verifier")
-                    .canonicalize()
-                    .unwrap(),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/macos/shader")
-                    .canonicalize()
-                    .unwrap(),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/programs/value_validator.wasm")
-                    .canonicalize()
-                    .unwrap(),
-            ),
-        );
+        let ligero = create_test_ligero();
 
         let proof = ligero
             .generate_proof(

@@ -4,10 +4,17 @@ use anyhow::{Context, Result};
 use sov_bank::TokenId;
 use sov_modules_api::{Amount, DispatchCall, Spec};
 
+use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
 /// Get the balance for a token ID using the default wallet address
+///
+/// # Parameters
+/// * `provider` - The RPC provider for querying chain state
+/// * `wallet` - The wallet context for address information
+/// * `token_id` - The token ID as a bech32 string
 pub async fn get_default_token_balance<Tx, S>(
+    provider: &Provider,
     wallet: &WalletContext<Tx, S>,
     token_id: &str,
 ) -> Result<(String, Amount)>
@@ -21,14 +28,14 @@ where
         .parse()
         .with_context(|| format!("Invalid token ID format: {}", token_id))?;
 
-    // Get the default address
+    // Get the default address from wallet
     let address_entry = wallet
         .default_address()
         .context("No default address found in wallet")?;
 
-    // Query the balance
-    let balance = wallet
-        .get_default_balance(&token_id_parsed)
+    // Query the balance from provider
+    let balance = provider
+        .get_balance::<S>(&address_entry.address, &token_id_parsed)
         .await
         .with_context(|| {
             format!(

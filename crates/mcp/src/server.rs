@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::ligero::Ligero as LigeroProver;
+use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
 // Define the concrete spec type used by the MCP server
@@ -78,6 +79,7 @@ pub struct GetWalletBalanceResult {
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
+    provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     ligero_prover: Option<Arc<LigeroProver>>,
 }
@@ -85,12 +87,14 @@ pub struct CryptoServer {
 // Generate a ToolRouter over the tool functions in this impl block.
 #[tool_router]
 impl CryptoServer {
-    pub fn with_wallet(
+    pub fn new(
+        provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            provider: Some(provider),
             wallet_context: Some(wallet_context),
             ligero_prover: Some(ligero_prover),
         }
@@ -106,6 +110,14 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<UpdateValueZkRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Check if provider is available
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
         // Check if ligero prover is available
         let ligero = self.ligero_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
@@ -117,7 +129,7 @@ impl CryptoServer {
         // Check if wallet context is available
         let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH and ROLLUP_RPC_URL environment variables.",
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
                 None,
             )
         })?;
@@ -132,6 +144,7 @@ impl CryptoServer {
         // Call the core operation (contains all business logic)
         let operation_result = crate::operations::update_value_zk(
             ligero,
+            provider,
             &*ctx,
             params.new_value,
             chain_id,
@@ -190,10 +203,18 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<GetWalletBalanceRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Check if provider is available
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
         // Check if wallet context is available
         let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH and ROLLUP_RPC_URL environment variables.",
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
                 None,
             )
         })?;
@@ -203,7 +224,7 @@ impl CryptoServer {
 
         // Call the core operation
         let (address, balance) =
-            crate::operations::get_default_token_balance(&*ctx, &params.token_id)
+            crate::operations::get_default_token_balance(provider, &*ctx, &params.token_id)
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 

@@ -12,10 +12,10 @@ use sov_modules_api::Amount;
 use sov_modules_api::capabilities::UniquenessData;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
-use sov_modules_api::transaction::{PriorityFeeBips, Transaction, UnsignedTransaction};
-use sov_modules_stf_blueprint::Runtime as RuntimeTrait;
+use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 
 use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
 // Use the same spec types as the MCP server
@@ -73,7 +73,8 @@ pub struct UpdateValueZkResult {
 ///
 /// # Parameters
 /// * `ligero` - The Ligero proof generator
-/// * `wallet` - The wallet context for signing and submitting
+/// * `provider` - The RPC provider for chain queries and transaction submission
+/// * `wallet` - The wallet context for key management and signing
 /// * `value` - The value to set (must fit in u32 for value-setter-zk module)
 /// * `chain_id` - The chain ID for the transaction
 ///
@@ -81,6 +82,7 @@ pub struct UpdateValueZkResult {
 /// A result containing the transaction hash from the rollup
 pub async fn update_value_zk(
     ligero: &Ligero,
+    provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     value: i64,
     chain_id: u64,
@@ -150,10 +152,14 @@ pub async fn update_value_zk(
     tracing::info!("Created runtime call for value_setter_zk module");
 
     // Step 5: Get nonce for transaction signing
-    let nonce = wallet
-        .get_default_nonce()
+    let public_key = wallet
+        .default_public_key()
+        .context("Failed to get public key from wallet")?;
+
+    let nonce = provider
+        .get_nonce::<McpSpec>(&public_key)
         .await
-        .context("Failed to get nonce from wallet")?;
+        .context("Failed to get nonce from provider")?;
 
     tracing::info!("Got nonce from rollup: {}", nonce);
 
@@ -185,26 +191,16 @@ pub async fn update_value_zk(
 
     tracing::debug!("Created unsigned transaction");
 
-    // Step 7: Load private key and sign the transaction
-    let private_key = wallet
-        .load_default_private_key()
-        .context("Failed to load private key from wallet")?;
+    // Step 7: Sign the transaction using wallet
+    let raw_tx = wallet
+        .sign_transaction::<McpRuntime>(unsigned_tx)
+        .inspect_err(|e| tracing::info!("Failed to sign transaction: {:?}", e))
+        .context("Failed to sign transaction")?;
 
-    let chain_hash = &McpRuntime::CHAIN_HASH;
-    let signed_tx =
-        Transaction::<McpRuntime, McpSpec>::new_signed_tx(&private_key, chain_hash, unsigned_tx);
+    tracing::info!("Transaction signed and serialized: {} bytes", raw_tx.len());
 
-    tracing::debug!("Transaction signed successfully");
-
-    // Step 8: Borsh-serialize the signed transaction
-    let raw_tx =
-        borsh::to_vec(&signed_tx).inspect_err(|e| tracing::info!("Failed to Borsh-serialize signed transaction: {:?}", e)).context("Failed to Borsh-serialize signed transaction")?;
-
-    let transaction_size = raw_tx.len();
-    tracing::info!("Serialized signed transaction: {} bytes", transaction_size);
-
-    // Step 9: Submit transaction to rollup
-    let tx_hash = wallet
+    // Step 8: Submit transaction to rollup via provider
+    let tx_hash = provider
         .submit_transaction(raw_tx.clone())
         .await
         .inspect_err(|e| tracing::info!("Failed to submit transaction to rollup: {:?}", e))
@@ -220,55 +216,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-
-    /// Helper function to get the platform-specific binary directory
-    fn get_platform_bin_dir() -> &'static str {
-        if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux-amd64"
-        } else {
-            panic!("Unsupported platform for Ligero tests");
-        }
-    }
-
-    /// Helper function to create a Ligero instance for testing
-    fn create_test_ligero() -> Ligero {
-        let platform_dir = get_platform_bin_dir();
-
-        Ligero::new(
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join(format!(
-                        "../adapters/ligero/bins/{}/bin/webgpu_prover",
-                        platform_dir
-                    ))
-                    .canonicalize()
-                    .expect("Failed to find prover binary"),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join(format!(
-                        "../adapters/ligero/bins/{}/bin/webgpu_verifier",
-                        platform_dir
-                    ))
-                    .canonicalize()
-                    .expect("Failed to find verifier binary"),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join(format!("../adapters/ligero/bins/{}/shader", platform_dir))
-                    .canonicalize()
-                    .expect("Failed to find shader directory"),
-            ),
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../adapters/ligero/bins/programs/value_validator.wasm")
-                    .canonicalize()
-                    .expect("Failed to find value_validator.wasm"),
-            ),
-        )
-    }
+    use crate::provider::Provider;
+    use crate::test_utils::ligero::create_test_ligero;
 
     #[tokio::test]
     #[tracing_test::traced_test]
@@ -276,33 +225,36 @@ mod tests {
     async fn test_update_value_zk() {
         // This test validates the complete update_value_zk flow
         // To run this test, you need:
-        // 1. A wallet at ~/.sovereign/wallet.json
-        // 2. A running rollup node at http://localhost:12345
+        // 1. A wallet at test-data/wallet_state.json
+        // 2. A running rollup node at http://localhost:12346 (or set ROLLUP_RPC_URL)
         // Run with: cargo test -p mcp test_update_value_zk -- --ignored
 
         let ligero = create_test_ligero();
         let value = 60000i64;
         let chain_id = 4321;
 
-        // Try to load wallet - will fail if not available
+        // Load wallet
         let wallet_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(format!("test-data/wallet_state.json",))
             .canonicalize().unwrap().display().to_string();
 
+        tracing::info!("Loading wallet from: {}", wallet_path);
+        let wallet = WalletContext::<McpRuntime, McpSpec>::load(&wallet_path)
+            .expect("Failed to load wallet - make sure wallet exists");
+
+        // Connect to RPC provider
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
 
-        tracing::info!("Loading wallet from: {}", wallet_path);
         tracing::info!("Connecting to rollup at: {}", rpc_url);
-
-        let wallet = WalletContext::<McpRuntime, McpSpec>::load(&wallet_path, Some(&rpc_url))
+        let provider = Provider::new(&rpc_url)
             .await
-            .expect("Failed to load wallet - make sure wallet exists and RPC is running");
+            .expect("Failed to connect to rollup - make sure RPC is running");
 
         tracing::info!("Calling update_value_zk with value: {}", value);
 
         // Call the actual function
-        let result = update_value_zk(&ligero, &wallet, value, chain_id).await;
+        let result = update_value_zk(&ligero, &provider, &wallet, value, chain_id).await;
 
         // Validate the result
         assert!(

@@ -5,8 +5,12 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod ligero;
 mod operations;
+mod provider;
 mod server;
 mod wallet;
+
+#[cfg(test)]
+mod test_utils;
 
 use std::sync::Arc;
 
@@ -14,6 +18,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::ligero::Ligero;
+use crate::provider::Provider;
 use crate::server::CryptoServer;
 use crate::wallet::WalletContext;
 
@@ -29,30 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
     tracing::info!("[mcp] Loading wallet from: {}", cfg.wallet_path.display());
 
-    // Load wallet context - try to connect to RPC, but don't fail if it's unavailable
-    let ctx = match WalletContext::load(&cfg.wallet_path, Some(cfg.rollup_rpc_url.as_str())).await {
-        Ok(ctx) => {
-            tracing::info!("[mcp] Wallet loaded successfully");
-            tracing::info!("[mcp] Connected to rollup RPC");
-            ctx
-        }
-        Err(e) => {
-            // If RPC connection fails, try loading wallet without RPC
-            if e.to_string().contains("Failed to connect to node") {
-                tracing::info!("[mcp] Warning: Could not connect to rollup RPC: {}", e);
-                tracing::info!("[mcp] Loading wallet without RPC connection...");
-                WalletContext::load(&cfg.wallet_path, None).await?
-            } else {
-                // For other errors (like wallet loading), fail
-                return Err(e.into());
-            }
-        }
-    };
-
-    if let Some(addr) = ctx.default_address() {
+    // Load wallet context (keys and addresses only)
+    let wallet_ctx = WalletContext::load(&cfg.wallet_path)?;
+    if let Some(addr) = wallet_ctx.default_address() {
         tracing::info!("[mcp] Default wallet address: {}", addr.address);
     }
-    let wallet_ctx = Arc::new(RwLock::new(ctx));
+    let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
+
+    // Initialize RPC provider (separate from wallet)
+    tracing::info!("[mcp] Connecting to rollup RPC...");
+    let provider = Provider::new(cfg.rollup_rpc_url.as_str()).await?;
+    tracing::info!("[mcp] Connected to rollup RPC successfully");
+    let provider = Arc::new(provider);
 
     // Initialize Ligero prover
     tracing::info!("[mcp] Initializing Ligero prover");
@@ -78,7 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create streamable HTTP service with local session manager
     let service = StreamableHttpService::new(
         move || {
-            Ok(CryptoServer::with_wallet(
+            Ok(CryptoServer::new(
+                provider.clone(),
                 wallet_ctx.clone(),
                 ligero.clone(),
             ))
