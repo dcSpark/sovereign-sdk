@@ -23,8 +23,9 @@ url = { version = "2", features = ["serde"] }
 axum = "0.8"
 validator = { version = "0.18", features = ["derive"] }
 hex = { workspace = true }
-bincode = { workspace = true }
+bincode.workspace = true
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # Sovereign SDK dependencies for wallet integration
 sov-cli = { workspace = true }
@@ -36,8 +37,14 @@ demo-stf = { workspace = true, features = ["native"] }
 sov-mock-da = { workspace = true, features = ["native"] }
 sov-ligero-adapter = { workspace = true }
 sov-mock-zkvm = { workspace = true }
+base64.workspace = true
+borsh.workspace = true
+sov-value-setter-zk.workspace = true
+sov-modules-stf-blueprint.workspace = true
 
 [dev-dependencies]
+dirs = "6.0.0"
+tokio = { workspace = true, features = ["macros"] }
 tracing-test = { workspace = true }
 
 [lints]

@@ -23,6 +23,7 @@ use sov_modules_api::execution_mode::Native;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::ligero::Ligero as LigeroProver;
 use crate::wallet::WalletContext;
 
 // Define the concrete spec type used by the MCP server
@@ -33,52 +34,18 @@ pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
 // -----------------------------
-// Types for SendTransaction
+// Types for UpdateValueZk
 // -----------------------------
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-#[allow(dead_code)]
-pub struct SendTransactionRequest {
-    /// Destination address (chain-specific format, e.g., EVM hex, etc.)
-    pub to: String,
-    /// Human-readable amount (keep String to avoid float pitfalls; parse in real impl)
-    pub amount: String,
-    /// Optional asset/symbol or contract address (e.g., "ETH", "USDC", "0x...").
-    pub asset: Option<String>,
-    /// Optional network identifier (e.g., "ethereum-mainnet", "solana", "polygon").
-    pub network: Option<String>,
-    /// Optional extra fields you may need (nonce, gas config, memo, etc.)
-    pub nonce: Option<u64>,
-    pub gas_limit: Option<u64>,
-    pub gas_price: Option<String>,
-    pub data: Option<String>,
+pub struct UpdateValueZkRequest {
+    /// The new value to set
+    pub new_value: i64,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct SendTransactionResult {
+pub struct UpdateValueZkResult {
+    /// Transaction hash from the rollup
     pub tx_hash: String,
-    pub network: Option<String>,
-    /// For UX / inspection; add fields as needed later
-    pub submitted: bool,
-    pub note: Option<String>,
-}
-
-// -----------------------------
-// Types for GetBalance
-// -----------------------------
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetBalanceRequest {
-    pub address: String,
-    /// Optional asset/symbol or contract address to query
-    pub asset: Option<String>,
-    pub network: Option<String>,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetBalanceResult {
-    pub address: String,
-    pub asset: String,
-    pub balance: String,
-    pub network: String,
 }
 
 // -----------------------------
@@ -112,58 +79,69 @@ pub struct GetWalletBalanceResult {
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
+    ligero_prover: Option<Arc<LigeroProver>>,
 }
 
 // Generate a ToolRouter over the tool functions in this impl block.
 #[tool_router]
 impl CryptoServer {
-    pub fn with_wallet(wallet_context: Arc<RwLock<McpWalletContext>>) -> Self {
+    pub fn with_wallet(
+        wallet_context: Arc<RwLock<McpWalletContext>>,
+        ligero_prover: Arc<LigeroProver>,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             wallet_context: Some(wallet_context),
+            ligero_prover: Some(ligero_prover),
         }
     }
 
-    /// Broadcast a transaction to the specified network.
-    /// (Boilerplate only — replace the placeholder implementation.)
+    /// Generate a zero-knowledge proof for updating a value.
+    /// This proof demonstrates that the value update is valid without revealing private information.
     #[tool(
-        name = "send_transaction",
-        description = "Broadcast a crypto transaction. Returns a tx hash."
+        name = "update_value_zk",
+        description = "Generate a zero-knowledge proof for updating a value. Returns the proof data."
     )]
-    async fn send_transaction(
+    async fn update_value_zk(
         &self,
-        Parameters(params): Parameters<SendTransactionRequest>,
+        Parameters(params): Parameters<UpdateValueZkRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        // TODO: Implement signing / RPC broadcast here.
-        let result = SendTransactionResult {
-            tx_hash: "0xPLACEHOLDER".to_string(),
-            network: params.network,
-            submitted: true,
-            note: Some("Not yet implemented".to_string()),
-        };
+        // Check if ligero prover is available
+        let ligero = self.ligero_prover.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Ligero prover not configured. Please set LIGERO_PROVER_BINARY_PATH and LIGERO_SHADER_PATH environment variables.",
+                None,
+            )
+        })?;
 
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        // Check if wallet context is available
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH and ROLLUP_RPC_URL environment variables.",
+                None,
+            )
+        })?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
+        // Lock the wallet context for reading
+        let ctx = wallet_ctx.read().await;
 
-    /// Return a balance for an address / asset on a network.
-    /// (Boilerplate only — replace the placeholder implementation.)
-    #[tool(
-        name = "get_balance",
-        description = "Get the balance for an address (optionally for a specific asset)."
-    )]
-    async fn get_balance(
-        &self,
-        Parameters(params): Parameters<GetBalanceRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let result = GetBalanceResult {
-            address: params.address,
-            asset: params.asset.unwrap_or_else(|| "ETH".to_string()),
-            balance: "0".to_string(),
-            network: params
-                .network
-                .unwrap_or_else(|| "ethereum-mainnet".to_string()),
+        // TODO: Get chain_id from somewhere (config, wallet, or runtime)
+        // For now, using a placeholder chain_id
+        let chain_id = 4321; // Placeholder - should come from config
+
+        // Call the core operation (contains all business logic)
+        let operation_result = crate::operations::update_value_zk(
+            ligero,
+            &*ctx,
+            params.new_value,
+            chain_id,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Return the result with just the transaction hash
+        let result = UpdateValueZkResult {
+            tx_hash: operation_result.tx_hash,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

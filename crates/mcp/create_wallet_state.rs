@@ -60,9 +60,9 @@ fn main() -> anyhow::Result<()> {
     let output_path = PathBuf::from("/Users/agallardol/Documents/github/dcpsark-sovereign-sdk/examples/test-data/keys/wallet_state.json");
     std::fs::write(&output_path, serde_json::to_string_pretty(&wallet_state)?)?;
 
-    println!("Wallet state created at: {}", output_path.display());
-    println!("Address: {}", address);
-    println!("Public key: {}", pub_key_hex);
+    tracing::info!!("Wallet state created at: {}", output_path.display());
+    tracing::info!!("Address: {}", address);
+    tracing::info!!("Public key: {}", pub_key_hex);
 
     Ok(())
 }

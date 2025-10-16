@@ -22,7 +22,15 @@ pub struct Config {
 
     /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
     #[validate(custom(function = "validate_file_exists"))]
-    pub zk_program_path: PathBuf,
+    pub ligero_program_path: PathBuf,
+
+    /// Path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH, required)
+    #[validate(custom(function = "validate_file_exists"))]
+    pub ligero_prover_binary_path: PathBuf,
+
+    /// Path to Ligero shader directory (env: LIGERO_SHADER_PATH, required)
+    #[validate(custom(function = "validate_file_exists"))]
+    pub ligero_shader_path: PathBuf,
 }
 
 fn default_server_bind_address() -> String {
@@ -54,7 +62,7 @@ impl Config {
 
         // Validate all fields using the validator derive macro
         if let Err(errors) = cfg.validate() {
-            eprintln!("\nConfiguration validation failed:");
+            tracing::info!("\nConfiguration validation failed:");
             for (field, field_errors) in errors.field_errors() {
                 for error in field_errors {
                     let message = error
@@ -62,10 +70,9 @@ impl Config {
                         .as_ref()
                         .map(|m| m.to_string())
                         .unwrap_or_else(|| format!("Validation error: {}", error.code));
-                    eprintln!("  • {}: {}", field, message);
+                    tracing::info!("  • {}: {}", field, message);
                 }
             }
-            eprintln!();
             anyhow::bail!("Configuration validation failed");
         }
 

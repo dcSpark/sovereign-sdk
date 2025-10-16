@@ -3,7 +3,6 @@
 //! This module provides functionality to generate Ligero proofs that demonstrate
 //! a value is within a valid range without revealing the computation details.
 
-use std::env::temp_dir;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -80,8 +79,8 @@ impl Ligero {
         let proof_path = std::env::temp_dir().join(Self::LIGERO_PROOF_FILE_NAME);
         tracing::info!("generating ligero proof at {}", proof_path.display());
 
-        let ligero_program_path = self.ligero_program_path.clone().unwrap();
-        let ligero_shader_path = self.ligero_shader_path.clone().unwrap();
+        let ligero_program_path = self.ligero_program_path.clone().unwrap().canonicalize().unwrap();
+        let ligero_shader_path = self.ligero_shader_path.clone().unwrap().canonicalize().unwrap();
 
         let ligero_argument = LigeroArgument {
             program: ligero_program_path.to_string_lossy().into_owned(),
@@ -101,22 +100,22 @@ impl Ligero {
         );
         tracing::info!("ligero argument: {}", ligero_argument_json);
 
-        let ligero_prover_binary_path = self.ligero_prover_binary_path.clone().unwrap();
+        let ligero_prover_binary_path = self.ligero_prover_binary_path.clone().unwrap().canonicalize().unwrap();
         let ligero_prover_execution_path = proof_path.parent().unwrap();
 
         let output = Command::new(&ligero_prover_binary_path)
             .current_dir(ligero_prover_execution_path)
             .arg(&ligero_argument_json)
             .output()
-            .inspect_err(|e| tracing::error!("failed to execute ligero prover: {:?}", e))
+            .inspect_err(|e| tracing::info!("failed to execute ligero prover: {:?}", e))
             .context("failed to execute ligero prover")?;
 
-        tracing::error!(
+        tracing::info!(
             "ligero prover execution finished with status {:?}",
             output.status.code()
         );
-        tracing::error!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-        tracing::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        tracing::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        tracing::info!("stderr: {}", String::from_utf8_lossy(&output.stderr));
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -132,12 +131,11 @@ impl Ligero {
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("Final prove result:                  true") {
-            tracing::error!("ligero prover did not produce a valid proof");
-
+            tracing::info!("ligero prover did not produce a valid proof");
             anyhow::bail!("ligero prover did not produce a valid proof");
         }
 
-        tracing::info!("ligero prover generate sucessfully");
+        tracing::info!("ligero prover generated successfully");
 
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
         let proof = std::fs::read(&proof_path).context("failed to read proof_data.gz")?;

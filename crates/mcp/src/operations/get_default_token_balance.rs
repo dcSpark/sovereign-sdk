@@ -1,25 +1,10 @@
-//! Core wallet operations that are independent of MCP protocol.
-//! These functions contain the business logic and are easy to test.
+//! Get the balance for a token ID using the default wallet address
 
 use anyhow::{Context, Result};
 use sov_bank::TokenId;
 use sov_modules_api::{Amount, DispatchCall, Spec};
 
 use crate::wallet::WalletContext;
-
-/// Get the default wallet address as a string
-pub fn get_default_address<Tx, S>(wallet: &WalletContext<Tx, S>) -> Result<String>
-where
-    Tx: DispatchCall,
-    Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
-    S: Spec,
-{
-    let address_entry = wallet
-        .default_address()
-        .context("No default address found in wallet")?;
-
-    Ok(address_entry.address.to_string())
-}
 
 /// Get the balance for a token ID using the default wallet address
 pub async fn get_default_token_balance<Tx, S>(
@@ -57,8 +42,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Tests will go here - these can use mock WalletContext
     // For now, we'll add integration tests that use real wallet files
 }

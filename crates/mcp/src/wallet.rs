@@ -124,6 +124,30 @@ where
     pub fn node_client(&self) -> Option<&NodeClient> {
         self.node_client.as_deref()
     }
+
+    /// Submit a raw transaction to the rollup
+    ///
+    /// This method accepts a borsh-serialized `Transaction` and submits it to the sequencer.
+    /// Returns the transaction hash from the rollup.
+    pub async fn submit_transaction(&self, raw_tx: Vec<u8>) -> Result<String> {
+        let client = self
+            .node_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No node client configured"))?;
+
+        let tx_hashes = client
+            .send_transactions_to_sequencer(vec![raw_tx], false)
+            .await
+            .context("Failed to submit transaction to sequencer")?;
+
+        let tx_hash = tx_hashes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No transaction hash returned from sequencer"))?;
+
+        // Convert TxHash to String (hex format)
+        let bytes: &[u8] = tx_hash.as_ref();
+        Ok(format!("0x{}", hex::encode(bytes)))
+    }
 }
 
 /// Thread-safe wrapper around WalletContext
