@@ -18,6 +18,7 @@ qp-poseidon-core = { version = "0.9.5" }
 anyhow = "1.0"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+qp-poseidon-core = { version = "0.9.5" }
 
 [features]
 native = []

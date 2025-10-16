@@ -16,6 +16,8 @@ pub struct SpendPublic {
     pub nullifier: Hash32,
     /// For a single native token, the transparent withdrawal amount authorized by the circuit.
     pub withdraw_amount: u128,
+    /// Commitments of new shielded outputs (0..=2), in order.
+    pub output_commitments: Vec<Hash32>,
 }
 
 /// Witness for a single-input spend (simple demo).
