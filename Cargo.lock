@@ -12382,6 +12382,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-midnight-da"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "async-trait",
+ "bincode",
+ "borsh",
+ "bytes",
+ "chrono",
+ "criterion",
+ "derive_more 1.0.0",
+ "futures",
+ "hex",
+ "insta",
+ "proptest",
+ "proptest-derive",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "schemars 0.8.22",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sov-midnight-da",
+ "sov-rollup-interface",
+ "sov-test-utils",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "sov-mock-da"
 version = "0.3.0"
 dependencies = [
@@ -12675,10 +12711,13 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "borsh",
+ "chrono",
  "clap",
  "demo-stf",
  "hex",
+ "midnight-privacy",
  "reqwest 0.12.23",
+ "sea-orm",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -12686,7 +12725,7 @@ dependencies = [
  "sov-address",
  "sov-api-spec",
  "sov-ligero-adapter",
- "sov-mock-da",
+ "sov-midnight-da",
  "sov-mock-zkvm",
  "sov-modules-api",
  "sov-modules-stf-blueprint",
@@ -12907,6 +12946,7 @@ dependencies = [
  "sov-kernels",
  "sov-ligero-adapter",
  "sov-metrics",
+ "sov-midnight-da",
  "sov-mock-da",
  "sov-mock-zkvm",
  "sov-modules-api",

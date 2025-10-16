@@ -56,6 +56,7 @@ echo ""
 
 # Default values for the verifier service
 METHOD_ID="${METHOD_ID:-0x698c44527e4fa3f934471015da3caa61da1f4e167107dbba9df71a6545396fb3}"
+MIDNIGHT_METHOD_ID="${MIDNIGHT_METHOD_ID:-0x02af46d4f30776e1d362cc07ac878bf948e840b76786325e3e782c96d3e08b36}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 NODE_RPC_URL="${NODE_RPC_URL:-http://127.0.0.1:12346}"
 SIGNING_KEY_PATH="${SIGNING_KEY_PATH:-$WORKSPACE_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
@@ -86,6 +87,7 @@ echo ""
 # Run the verifier service
 exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
     --method-id "$METHOD_ID" \
+    --midnight-method-id "$MIDNIGHT_METHOD_ID" \
     --bind "$BIND_ADDR" \
     --node-rpc-url "$NODE_RPC_URL" \
     --signing-key-path "$SIGNING_KEY_PATH" \

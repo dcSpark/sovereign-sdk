@@ -7,8 +7,8 @@ use sov_db::ledger_db::LedgerDb;
 use sov_db::storage_manager::NativeStorageManager;
 use sov_ethereum::EthRpcConfig;
 use sov_ligero_adapter::{Ligero, LigeroHost};
-use sov_mock_da::storable::service::StorableMockDaService;
-use sov_mock_da::MockDaSpec;
+use sov_midnight_da::storable::service::StorableMidnightDaService;
+use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::{MockCodeCommitment, MockZkvm, MockZkvmHost};
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::{Native, WitnessGeneration};
@@ -24,14 +24,14 @@ use sov_stf_runner::RollupConfig;
 
 use crate::eth_dev_signer;
 
-/// Rollup with a [`ConfigurableSpec`] with [`MockDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
+/// Rollup with a [`ConfigurableSpec`] with [`MidnightDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
 #[derive(Default)]
 pub struct MockDemoRollup<M> {
     phantom: std::marker::PhantomData<M>,
 }
 
 /// The default spec of the rollup
-pub type MockRollupSpec<M> = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, M>;
+pub type MockRollupSpec<M> = ConfigurableSpec<MidnightDaSpec, Ligero, MockZkvm, MultiAddressEvm, M>;
 
 impl RollupBlueprint<Native> for MockDemoRollup<Native>
 where
@@ -53,10 +53,10 @@ where
 
 #[async_trait]
 impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
-    type DaService = StorableMockDaService;
+    type DaService = StorableMidnightDaService;
 
     type StorageManager =
-        NativeStorageManager<MockDaSpec, <MockRollupSpec<Native> as Spec>::Storage>;
+        NativeStorageManager<MidnightDaSpec, <MockRollupSpec<Native> as Spec>::Storage>;
 
     type ProverService = ParallelProverService<
         <Self::Spec as Spec>::Address,
@@ -123,7 +123,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         rollup_config: &RollupConfig<<Self::Spec as Spec>::Address, Self::DaService>,
         shutdown_receiver: tokio::sync::watch::Receiver<()>,
     ) -> Self::DaService {
-        StorableMockDaService::from_config(rollup_config.da.clone(), shutdown_receiver).await
+        StorableMidnightDaService::from_config(rollup_config.da.clone(), shutdown_receiver).await
     }
 
     async fn create_prover_service(

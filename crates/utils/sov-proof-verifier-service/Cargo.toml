@@ -44,6 +44,15 @@ reqwest = { workspace = true, features = ["json"] }
 # Base64 encoding
 base64 = { workspace = true }
 
+# Database
+chrono = { workspace = true }
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+] }
+
 # Sovereign SDK dependencies
 sov-modules-api = { workspace = true, features = ["native"] }
 sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
@@ -53,8 +62,9 @@ sov-node-client = { workspace = true }
 sov-api-spec = { workspace = true }
 sov-value-setter = { workspace = true, features = ["native"] }
 sov-address = { workspace = true, features = ["native", "evm"] }
-sov-mock-da = { workspace = true, features = ["native"] }
+sov-midnight-da = { workspace = true, features = ["native"] }
 sov-mock-zkvm = { workspace = true, features = ["native"] }
+midnight-privacy = { workspace = true, features = ["native"] }
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }
@@ -64,4 +74,3 @@ clap = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-

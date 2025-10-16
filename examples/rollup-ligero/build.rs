@@ -1,7 +1,7 @@
 use demo_stf::runtime::Runtime;
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
-use sov_mock_da::MockDaSpec;
+use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::execution_mode::Native;
 use sov_zkvm_utils::should_skip_guest_build;
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     type S = sov_modules_api::configurable_spec::ConfigurableSpec<
-        MockDaSpec,
+        MidnightDaSpec,
         Ligero,
         MockZkvm,
         MultiAddressEvm,

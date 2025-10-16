@@ -17,7 +17,7 @@ workspace = true
 const-rollup-config = { path = "../const-rollup-config" }
 sov-address = { workspace = true, features = ["evm"] }
 sov-celestia-adapter = { workspace = true, features = ["native"] }
-sov-mock-da = { workspace = true, features = ["native"] }
+sov-midnight-da = { workspace = true, features = ["native"] }
 sov-rollup-interface = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 sov-metrics = { workspace = true, features = ["native"] }
@@ -85,6 +85,7 @@ sov-modules-api = { workspace = true, features = [
   "test-utils",
 ] }
 sov-mock-da = { workspace = true, features = ["arbitrary"] }
+sov-midnight-da = { workspace = true, features = ["arbitrary"] }
 sov-bank = { workspace = true, features = ["native", "arbitrary"] }
 sov-sequencer-registry = { workspace = true, features = [
   "native",
@@ -110,6 +111,7 @@ sov-modules-api = { workspace = true }
 sov-mock-zkvm = { workspace = true, features = ["native"] }
 sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-mock-da = { workspace = true, features = ["native"] }
+sov-midnight-da = { workspace = true, features = ["native"] }
 demo-stf = { workspace = true, features = ["native"] }
 sov-address = { workspace = true, features = ["evm"] }
 sov-state = { workspace = true, features = ["native"] }
@@ -126,6 +128,7 @@ arbitrary = [
     "sov-state/arbitrary",
     "sov-address/arbitrary",
     "sov-mock-da/arbitrary",
+    "sov-midnight-da/arbitrary",
     "sov-mock-zkvm/arbitrary",
     "sov-celestia-adapter/arbitrary",
     "sov-ligero-adapter/arbitrary",

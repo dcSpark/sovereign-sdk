@@ -13,6 +13,11 @@ use axum::{
 };
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
+use chrono::Utc;
+use sea_orm::{
+    sea_query::OnConflict, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection,
+    EntityTrait,
+};
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
 use sov_ligero_adapter::{Ligero, LigeroCodeCommitment, LigeroVerifier};
@@ -20,26 +25,32 @@ use sov_modules_api::{
     capabilities::UniquenessData,
     configurable_spec::ConfigurableSpec,
     execution_mode::Native,
+    gas::UnlimitedGasMeter,
     transaction::{PriorityFeeBips, Transaction, TxDetails, UnsignedTransaction},
     Amount, DispatchCall, Spec,
 };
 use sov_node_client::NodeClient;
 use sov_rollup_interface::{
     crypto::PrivateKey,
-    zk::{CryptoSpec, ZkVerifier},
+    zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
 };
-use std::{path::Path, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use tracing::{debug, error, info};
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
+use midnight_privacy::{CallMessage as MidnightCallMessage, Hash32 as MidnightHash32, SpendPublic};
 use sov_address::MultiAddressEvm;
-use sov_mock_da::MockDaSpec;
+use sov_midnight_da::storable::{setup_db as setup_midnight_da_db, worker_verified_transactions};
+use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_stf_blueprint::Runtime as RuntimeTrait;
 
 /// The rollup's Spec type (must match rollup-ligero configuration)
-pub type RollupSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+pub type RollupSpec = ConfigurableSpec<MidnightDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+
+type RuntimeCall = <DemoRuntime<RollupSpec> as DispatchCall>::Decodable;
+type DemoTransaction = Transaction<DemoRuntime<RollupSpec>, RollupSpec>;
 
 /// Configuration for the proof verifier service
 #[derive(Debug, Clone)]
@@ -48,12 +59,18 @@ pub struct ServiceConfig {
     pub node_rpc_url: String,
     /// Private key path for signing non-ZK transactions
     pub signing_key_path: String,
-    /// Ligero method ID (code commitment) for proof verification
-    pub method_id: [u8; 32],
+    /// Ligero method ID for value-setter proof verification
+    /// If None, it will be computed from the value_validator.wasm program
+    pub value_setter_method_id: Option<[u8; 32]>,
+    /// Ligero method ID for midnight note_spend_guest proof verification
+    /// If None, it will be computed from the note_spend_guest.wasm program
+    pub midnight_method_id: Option<[u8; 32]>,
     /// Maximum number of concurrent verification tasks
     pub max_concurrent_verifications: usize,
     /// Chain ID for transaction authentication
     pub chain_id: u64,
+    /// Connection string for the shared MockDA database
+    pub da_connection_string: String,
 }
 
 /// Shared application state
@@ -67,10 +84,12 @@ pub struct AppState {
     nonce_counter: Arc<tokio::sync::Mutex<Option<u64>>>,
     /// Cached signing key (loaded once at startup)
     signing_key: Arc<<<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey>,
+    /// Connection to the MockDA database shared with the rollup node
+    da_conn: Arc<DatabaseConnection>,
 }
 
 impl AppState {
-    pub fn new(config: ServiceConfig) -> Result<Self, anyhow::Error> {
+    pub async fn new(mut config: ServiceConfig) -> Result<Self, anyhow::Error> {
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
 
@@ -80,12 +99,56 @@ impl AppState {
 
         info!("✓ Loaded signing key from: {}", config.signing_key_path);
 
+        // Compute value-setter method ID if not provided
+        if config.value_setter_method_id.is_none() {
+            info!("Computing value-setter method ID from value_validator.wasm...");
+            match compute_value_setter_method_id() {
+                Ok(method_id) => {
+                    info!("✓ Value-setter method ID: 0x{}", hex::encode(method_id));
+                    config.value_setter_method_id = Some(method_id);
+                }
+                Err(e) => {
+                    error!("Failed to compute value-setter method ID: {}", e);
+                    info!("Value-setter endpoint will not be available");
+                }
+            }
+        }
+
+        // Compute midnight method ID if not provided
+        if config.midnight_method_id.is_none() {
+            info!("Computing midnight method ID from note_spend_guest.wasm...");
+            match compute_midnight_method_id() {
+                Ok(method_id) => {
+                    info!("✓ Midnight method ID: 0x{}", hex::encode(method_id));
+                    config.midnight_method_id = Some(method_id);
+                }
+                Err(e) => {
+                    error!("Failed to compute midnight method ID: {}", e);
+                    info!("Midnight endpoint will not be available");
+                }
+            }
+        }
+
+        let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
+        connect_opts.max_connections(20).sqlx_logging(false);
+        let da_conn = Database::connect(connect_opts).await.with_context(|| {
+            format!(
+                "Failed to connect to MockDA database at {}",
+                config.da_connection_string
+            )
+        })?;
+        setup_midnight_da_db(&da_conn)
+            .await
+            .context("Failed to initialize MockDA database schema")?;
+        info!("✓ Connected to MockDA database");
+
         Ok(Self {
             config: Arc::new(config),
             node_client,
             verification_semaphore: Arc::new(tokio::sync::Semaphore::new(max_permits)),
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
+            da_conn: Arc::new(da_conn),
         })
     }
 }
@@ -119,6 +182,8 @@ pub struct VerificationMetrics {
     pub deserialize_ms: f64,
     /// Time to parse transaction (ms)
     pub parse_ms: f64,
+    /// Time to verify transaction signature (ms)
+    pub signature_verify_ms: f64,
     /// Time to verify Ligero proof (ms)
     pub proof_verify_ms: f64,
     /// Time to create non-ZK transaction (ms)
@@ -134,6 +199,7 @@ impl Default for VerificationMetrics {
         Self {
             deserialize_ms: 0.0,
             parse_ms: 0.0,
+            signature_verify_ms: 0.0,
             proof_verify_ms: 0.0,
             tx_creation_ms: 0.0,
             node_submit_ms: 0.0,
@@ -180,11 +246,17 @@ pub enum ServiceError {
     #[error("Failed to parse transaction: {0}")]
     ParseError(String),
 
+    #[error("Signature verification failed: {0}")]
+    SignatureError(String),
+
     #[error("Proof verification failed: {0}")]
     ProofError(String),
 
     #[error("Failed to submit to node: {0}")]
     SubmissionError(String),
+
+    #[error("Unsupported transaction: {0}")]
+    UnsupportedCall(String),
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -201,6 +273,10 @@ impl IntoResponse for ServiceError {
                 error!("Parse error: {}", msg);
                 (StatusCode::BAD_REQUEST, msg.clone())
             }
+            ServiceError::SignatureError(msg) => {
+                error!("Signature verification error: {}", msg);
+                (StatusCode::UNAUTHORIZED, msg.clone())
+            }
             ServiceError::ProofError(msg) => {
                 error!("Proof verification error: {}", msg);
                 (StatusCode::UNPROCESSABLE_ENTITY, msg.clone())
@@ -208,6 +284,10 @@ impl IntoResponse for ServiceError {
             ServiceError::SubmissionError(msg) => {
                 error!("Submission error: {}", msg);
                 (StatusCode::BAD_GATEWAY, msg.clone())
+            }
+            ServiceError::UnsupportedCall(msg) => {
+                error!("Unsupported call: {}", msg);
+                (StatusCode::BAD_REQUEST, msg.clone())
             }
             ServiceError::Internal(msg) => {
                 error!("Internal error: {}", msg);
@@ -227,7 +307,8 @@ impl IntoResponse for ServiceError {
 /// Create the Axum router for the service
 pub fn create_router(state: AppState) -> Router {
     Router::new()
-        .route("/verify-and-submit", post(verify_and_submit_handler))
+        .route("/value-setter-zk", post(verify_and_submit_handler))
+        .route("/midnight-privacy", post(verify_and_record_midnight_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
         // Remove default 2MB body limit and set 10MB for large Ligero proofs (~3.2MB each)
@@ -315,6 +396,98 @@ async fn verify_and_submit_handler(
     info!(
         "✓ Successfully processed transaction: value={}, hash={}, total_time={:.2}ms",
         value, tx_hash, metrics.total_ms
+    );
+
+    Ok(Json(VerifyAndSubmitResponse {
+        success: true,
+        tx_hash: Some(tx_hash),
+        error: None,
+        metrics,
+    }))
+}
+
+async fn verify_and_record_midnight_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyAndSubmitRequest>,
+) -> Result<Json<VerifyAndSubmitResponse>, ServiceError> {
+    let start = std::time::Instant::now();
+    let mut metrics = VerificationMetrics::default();
+
+    info!("Received midnight withdrawal verification request");
+
+    let _permit = state
+        .verification_semaphore
+        .acquire()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Semaphore error: {}", e)))?;
+
+    let decode_start = std::time::Instant::now();
+    let tx_bytes = BASE64_STANDARD
+        .decode(&req.body)
+        .map_err(|e| ServiceError::DecodeError(format!("Invalid base64: {}", e)))?;
+    metrics.deserialize_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+    let parse_start = std::time::Instant::now();
+    let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
+        borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
+            ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e))
+        })?;
+    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
+        parse_midnight_withdraw_call(&tx)?;
+    metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+    debug!(
+        "Parsed midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, proof_size={} bytes",
+        hex::encode(nullifier),
+        hex::encode(anchor_root),
+        withdraw_amount,
+        proof_bytes.len()
+    );
+
+    let signature_start = std::time::Instant::now();
+    verify_midnight_transaction_signature(&tx)?;
+    metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
+
+    let proof_start = std::time::Instant::now();
+    let proof_public = verify_midnight_withdraw_proof(
+        state.config.midnight_method_id.as_ref(),
+        &proof_bytes,
+        anchor_root,
+        nullifier,
+        withdraw_amount,
+    )
+    .await?;
+    metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
+
+    let tx_hash = tx.hash().to_string();
+    
+    // Create transaction data without proof bytes
+    let transaction_data = create_transaction_without_proof(&tx)?;
+
+    let persist_start = std::time::Instant::now();
+    store_verified_midnight_transaction(
+        state.da_conn.as_ref(),
+        &tx_hash,
+        &proof_public,
+        true,
+        true,
+        &transaction_data,
+        &req.body, // Full transaction blob (base64)
+    )
+    .await?;
+    metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+    metrics.node_submit_ms = 0.0;
+
+    metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    info!(
+        "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}, total_time={:.2}ms",
+        hex::encode(nullifier),
+        hex::encode(anchor_root),
+        withdraw_amount,
+        recipient,
+        tx_hash,
+        metrics.total_ms
     );
 
     Ok(Json(VerifyAndSubmitResponse {
@@ -436,16 +609,26 @@ async fn verify_ligero_proof(
     value: u32,
     proof: &[u8],
 ) -> Result<(), ServiceError> {
-    let method_id = LigeroCodeCommitment(state.config.method_id);
+    let method_id_bytes = state.config.value_setter_method_id.ok_or_else(|| {
+        ServiceError::Internal(
+            "Value-setter method ID not configured. \
+            The service needs the value_validator.wasm program to compute the method ID."
+                .to_string(),
+        )
+    })?;
+    let method_id = LigeroCodeCommitment(method_id_bytes);
 
     // Spawn blocking task for CPU-intensive proof verification
     let proof = proof.to_vec();
     let result = tokio::task::spawn_blocking(move || {
+        // Set environment variables for value_validator.wasm verification
+        configure_ligero_env_for_value_setter()?;
+        
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
                     "Proof payload is not a LigeroProofPackage ({}). \
-                     Regenerate the proof with the updated tooling.",
+                         Regenerate the proof with the updated tooling.",
                     err
                 ))
             })?;
@@ -557,9 +740,6 @@ fn create_value_setter_tx_bytes(
 
     let value_setter_call = ValueSetterCallMessage::<RollupSpec>::SetValue { value, gas: None };
 
-    // Wrap in Runtime::Call enum (use the generated runtime call type)
-    // The DemoRuntime derives TransactionCallable which provides the Call associated type
-    type RuntimeCall = <DemoRuntime<RollupSpec> as DispatchCall>::Decodable;
     let runtime_call = RuntimeCall::ValueSetter(value_setter_call);
 
     // Create transaction details
@@ -603,13 +783,458 @@ fn create_value_setter_tx_bytes(
     Ok(tx_bytes)
 }
 
-/// Load a private key from file (same format as sov-cli)
+fn parse_midnight_withdraw_call(
+    tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
+) -> Result<
+    (
+        Vec<u8>,
+        MidnightHash32,
+        MidnightHash32,
+        u128,
+        <RollupSpec as Spec>::Address,
+    ),
+    ServiceError,
+> {
+    match tx.runtime_call() {
+        RuntimeCall::MidnightPrivacy(call) => match call.clone() {
+            MidnightCallMessage::Withdraw {
+                proof,
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+                to,
+                ..
+            } => Ok((proof.into(), anchor_root, nullifier, withdraw_amount, to)),
+            other => Err(ServiceError::UnsupportedCall(format!(
+                "Unsupported midnight_privacy call: {other:?}"
+            ))),
+        },
+        other => Err(ServiceError::UnsupportedCall(format!(
+            "Expected midnight_privacy::Withdraw call, got {other:?}"
+        ))),
+    }
+}
+
+fn verify_midnight_transaction_signature(
+    tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
+) -> Result<(), ServiceError> {
+    let mut meter = UnlimitedGasMeter::<RollupSpec>::default();
+    tx.verify(&DemoRuntime::<RollupSpec>::CHAIN_HASH, &mut meter)
+        .map_err(|e| ServiceError::SignatureError(e.to_string()))
+}
+
+async fn verify_midnight_withdraw_proof(
+    method_id_opt: Option<&[u8; 32]>,
+    proof: &[u8],
+    expected_anchor_root: MidnightHash32,
+    expected_nullifier: MidnightHash32,
+    expected_withdraw_amount: u128,
+) -> Result<SpendPublic, ServiceError> {
+    let method_id_bytes = method_id_opt.ok_or_else(|| {
+        ServiceError::Internal(
+            "Midnight method ID not configured. \
+            The service needs the note_spend_guest.wasm program to compute the method ID."
+                .to_string(),
+        )
+    })?;
+    let method_id = LigeroCodeCommitment(*method_id_bytes);
+    let proof_vec = proof.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        // Set environment variables for note_spend_guest.wasm verification
+        configure_ligero_env_for_midnight()?;
+        
+        let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
+            .map_err(|err| {
+                ServiceError::ProofError(format!(
+                    "Proof payload is not a LigeroProofPackage ({}). \
+                     Regenerate the proof with the updated tooling.",
+                    err
+                ))
+            })?;
+
+        debug!(
+            "Midnight proof package decoded: proof_bytes={} public_output_bytes={}",
+            package.proof.len(),
+            package.public_output.len()
+        );
+
+        let public: SpendPublic = LigeroVerifier::verify(&proof_vec, &method_id)
+            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
+
+        if public.anchor_root != expected_anchor_root {
+            return Err(ServiceError::ProofError(format!(
+                "Anchor root mismatch: expected 0x{}, proof 0x{}",
+                hex::encode(expected_anchor_root),
+                hex::encode(public.anchor_root)
+            )));
+        }
+        if public.nullifier != expected_nullifier {
+            return Err(ServiceError::ProofError(format!(
+                "Nullifier mismatch: expected 0x{}, proof 0x{}",
+                hex::encode(expected_nullifier),
+                hex::encode(public.nullifier)
+            )));
+        }
+        if public.withdraw_amount != expected_withdraw_amount {
+            return Err(ServiceError::ProofError(format!(
+                "Withdraw amount mismatch: expected {}, proof {}",
+                expected_withdraw_amount, public.withdraw_amount
+            )));
+        }
+
+        Ok(public)
+    })
+    .await
+    .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+}
+
+/// Create a transaction JSON representation without the proof data
+/// Extracts the runtime call message and replaces proof with "REMOVED"
+fn create_transaction_without_proof(
+    tx: &DemoTransaction,
+) -> Result<String, ServiceError> {
+    // Extract the runtime call and create JSON representation with proof removed
+    match tx.runtime_call() {
+        RuntimeCall::MidnightPrivacy(call) => {
+            let call_json = match call.clone() {
+                MidnightCallMessage::CreateNote { note, gas } => {
+                    serde_json::json!({
+                        "create_note": {
+                            "note": note,
+                            "gas": gas
+                        }
+                    })
+                }
+                MidnightCallMessage::SpendNote { gas, .. } => {
+                    serde_json::json!({
+                        "spend_note": {
+                            "proof": "REMOVED",
+                            "gas": gas
+                        }
+                    })
+                }
+                MidnightCallMessage::Deposit { amount, rho, recipient, gas } => {
+                    serde_json::json!({
+                        "deposit": {
+                            "amount": amount.to_string(),
+                            "rho": hex::encode(rho),
+                            "recipient": format!("{:?}", recipient),
+                            "gas": gas
+                        }
+                    })
+                }
+                MidnightCallMessage::Withdraw {
+                    anchor_root,
+                    nullifier,
+                    withdraw_amount,
+                    to,
+                    gas,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "withdraw": {
+                            "proof": "REMOVED",
+                            "anchor_root": hex::encode(anchor_root),
+                            "nullifier": hex::encode(nullifier),
+                            "withdraw_amount": withdraw_amount.to_string(),
+                            "to": format!("{:?}", to),
+                            "gas": gas
+                        }
+                    })
+                }
+                MidnightCallMessage::UpdateMethodId { new_method_id } => {
+                    serde_json::json!({
+                        "update_method_id": {
+                            "new_method_id": hex::encode(new_method_id)
+                        }
+                    })
+                }
+            };
+            
+            serde_json::to_string(&call_json)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize JSON: {}", e)))
+        }
+        RuntimeCall::ValueSetter(call) => {
+            use sov_value_setter::CallMessage as ValueSetterCallMessage;
+            let call_json = match call.clone() {
+                ValueSetterCallMessage::SetValue { value, gas } => {
+                    serde_json::json!({
+                        "set_value": {
+                            "value": value,
+                            "gas": gas
+                        }
+                    })
+                }
+                ValueSetterCallMessage::SetManyValues(values) => {
+                    serde_json::json!({
+                        "set_many_values": values
+                    })
+                }
+                ValueSetterCallMessage::AssertVisibleSlotNumber { expected_visible_slot_number } => {
+                    serde_json::json!({
+                        "assert_visible_slot_number": {
+                            "expected_visible_slot_number": expected_visible_slot_number
+                        }
+                    })
+                }
+                ValueSetterCallMessage::SetValueAndSleep { value, sleep_millis } => {
+                    serde_json::json!({
+                        "set_value_and_sleep": {
+                            "value": value,
+                            "sleep_millis": sleep_millis
+                        }
+                    })
+                }
+                ValueSetterCallMessage::Panic => {
+                    serde_json::json!({
+                        "panic": {}
+                    })
+                }
+            };
+            
+            serde_json::to_string(&call_json)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize JSON: {}", e)))
+        }
+        other => {
+            // For other call types, provide a basic representation
+            let call_json = serde_json::json!({
+                "type": format!("{:?}", other),
+                "note": "Call data not fully serialized"
+            });
+            serde_json::to_string(&call_json)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize JSON: {}", e)))
+        }
+    }
+}
+
+async fn store_verified_midnight_transaction(
+    conn: &DatabaseConnection,
+    tx_hash: &str,
+    proof_output: &SpendPublic,
+    signature_valid: bool,
+    proof_verified: bool,
+    transaction_data: &str,
+    full_transaction_blob: &str,
+) -> Result<(), ServiceError> {
+    use worker_verified_transactions::{
+        ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
+        TransactionState,
+    };
+
+    // Serialize proof outputs to JSON
+    let proof_outputs_json = serde_json::to_string(proof_output).map_err(|err| {
+        ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
+    })?;
+
+    VerifiedEntity::insert(VerifiedActiveModel {
+        tx_hash: Set(tx_hash.to_owned()),
+        signature_valid: Set(signature_valid),
+        proof_verified: Set(proof_verified),
+        transaction_data: Set(transaction_data.to_owned()),
+        full_transaction_blob: Set(full_transaction_blob.to_owned()),
+        proof_outputs: Set(proof_outputs_json),
+        transaction_state: Set(TransactionState::Pending),
+        sequencer_status: Set(None),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(VerifiedColumn::TxHash)
+            .update_columns([
+                VerifiedColumn::SignatureValid,
+                VerifiedColumn::ProofVerified,
+                VerifiedColumn::TransactionData,
+                VerifiedColumn::FullTransactionBlob,
+                VerifiedColumn::ProofOutputs,
+                VerifiedColumn::TransactionState,
+                VerifiedColumn::SequencerStatus,
+                VerifiedColumn::CreatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec(conn)
+    .await
+    .map_err(|err| {
+        ServiceError::Internal(format!("Failed to store verified transaction: {err}"))
+    })?;
+
+    Ok(())
+}
+
+/// Configure Ligero environment variables for value-setter verification
+fn configure_ligero_env_for_value_setter() -> Result<(), ServiceError> {
+    let current_dir = std::env::current_dir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to get current directory: {}", e)))?;
+    
+    let program_paths = vec![
+        current_dir.join("crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
+        current_dir.join("../crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
+        current_dir.join("../../crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
+    ];
+    
+    let program_path = program_paths
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "Could not find value_validator.wasm. Searched:\n{}",
+                program_paths.iter()
+                    .map(|p| format!("  - {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        })?;
+    
+    // Find shader and verifier binary paths
+    let shader_path = find_ligero_shader_path(&current_dir)?;
+    let verifier_bin = find_ligero_verifier_bin(&current_dir)?;
+    
+    std::env::set_var("LIGERO_PROGRAM_PATH", program_path);
+    std::env::set_var("LIGERO_SHADER_PATH", shader_path);
+    std::env::set_var("LIGERO_VERIFIER_BIN", verifier_bin);
+    std::env::set_var("LIGERO_PACKING", "8192");
+    
+    Ok(())
+}
+
+/// Configure Ligero environment variables for midnight verification
+fn configure_ligero_env_for_midnight() -> Result<(), ServiceError> {
+    let current_dir = std::env::current_dir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to get current directory: {}", e)))?;
+    
+    let program_paths = vec![
+        current_dir.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
+        current_dir.join("../crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
+        current_dir.join("../../crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
+    ];
+    
+    let program_path = program_paths
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "Could not find note_spend_guest.wasm. Searched:\n{}",
+                program_paths.iter()
+                    .map(|p| format!("  - {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        })?;
+    
+    // Find shader and verifier binary paths
+    let shader_path = find_ligero_shader_path(&current_dir)?;
+    let verifier_bin = find_ligero_verifier_bin(&current_dir)?;
+    
+    std::env::set_var("LIGERO_PROGRAM_PATH", program_path);
+    std::env::set_var("LIGERO_SHADER_PATH", shader_path);
+    std::env::set_var("LIGERO_VERIFIER_BIN", verifier_bin);
+    std::env::set_var("LIGERO_PACKING", "8192");
+    
+    Ok(())
+}
+
+/// Find the Ligero shader path
+fn find_ligero_shader_path(current_dir: &Path) -> Result<PathBuf, ServiceError> {
+    let candidates = vec![
+        current_dir.join("crates/adapters/ligero/bins/macos/shader"),
+        current_dir.join("../crates/adapters/ligero/bins/macos/shader"),
+        current_dir.join("../../crates/adapters/ligero/bins/macos/shader"),
+        current_dir.join("crates/adapters/ligero/bins/linux-amd64/shader"),
+    ];
+    
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "Could not find Ligero shader directory. Searched:\n{}",
+                candidates.iter()
+                    .map(|p| format!("  - {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        })
+}
+
+/// Find the Ligero verifier binary
+fn find_ligero_verifier_bin(current_dir: &Path) -> Result<PathBuf, ServiceError> {
+    let candidates = vec![
+        current_dir.join("crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
+        current_dir.join("../crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
+        current_dir.join("../../crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
+        current_dir.join("crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"),
+    ];
+    
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "Could not find Ligero verifier binary. Searched:\n{}",
+                candidates.iter()
+                    .map(|p| format!("  - {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        })
+}
+
+/// Compute the method ID for the value_validator.wasm program
+fn compute_value_setter_method_id() -> Result<[u8; 32]> {
+    compute_method_id_for_program("value_validator.wasm")
+}
+
+/// Compute the method ID for the note_spend_guest.wasm program
+fn compute_midnight_method_id() -> Result<[u8; 32]> {
+    compute_method_id_for_program("note_spend_guest.wasm")
+}
+
+/// Generic function to compute method ID for any guest program
+fn compute_method_id_for_program(program_name: &str) -> Result<[u8; 32]> {
+    let current_dir = std::env::current_dir()?;
+    
+    // Try multiple possible locations
+    let possible_paths = vec![
+        current_dir.join(format!("crates/adapters/ligero/guest/bins/programs/{}", program_name)),
+        current_dir.join(format!("../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
+        current_dir.join(format!("../../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
+    ];
+    
+    let program_path = possible_paths
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not find {}. Searched:\n{}",
+                program_name,
+                possible_paths
+                    .iter()
+                    .map(|p| format!("  - {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })?;
+    
+    let program_str = program_path.to_string_lossy().to_string();
+    let host = <Ligero as Zkvm>::Host::from_args(&program_str);
+    let method_id = host.code_commitment();
+    
+    let encoded = method_id.encode();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&encoded[..32]);
+    Ok(result)
+}
+
 fn load_private_key<P: AsRef<Path>>(
     path: P,
 ) -> Result<<<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey> {
     #[derive(Deserialize)]
     struct PrivateKeyAndAddress<S: Spec> {
         private_key: <S::CryptoSpec as CryptoSpec>::PrivateKey,
+        #[allow(dead_code)]
         address: S::Address,
     }
 
@@ -648,6 +1273,55 @@ async fn submit_to_node(state: &AppState, tx_bytes: Vec<u8>) -> Result<String, S
 mod tests {
     use super::*;
 
+    use sea_orm::{ConnectOptions, Database, EntityTrait};
+    use sov_address::EthereumAddress;
+    use sov_modules_api::transaction::VersionedTx;
+    use sov_modules_api::SafeVec;
+    use std::str::FromStr;
+
+    fn sample_midnight_withdraw_transaction(
+        nonce: u64,
+    ) -> Transaction<DemoRuntime<RollupSpec>, RollupSpec> {
+        let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
+        let anchor_root = [42u8; 32];
+        let nullifier = [7u8; 32];
+        let withdraw_amount = 123_456u128;
+        let to = MultiAddressEvm::Vm(
+            EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
+        );
+        let proof: SafeVec<u8, 5_000_000> =
+            SafeVec::try_from(vec![9u8; 16]).expect("within SafeVec capacity");
+
+        let call = MidnightCallMessage::<RollupSpec>::Withdraw {
+            proof,
+            anchor_root,
+            nullifier,
+            withdraw_amount,
+            to,
+            gas: None,
+        };
+
+        let details = TxDetails {
+            max_fee: Amount::from(100_000_000_000u128),
+            max_priority_fee_bips: PriorityFeeBips(0),
+            gas_limit: None,
+            chain_id: 4321,
+        };
+
+        let runtime_call = RuntimeCall::MidnightPrivacy(call);
+        let unsigned_tx = UnsignedTransaction::new_with_details(
+            runtime_call,
+            UniquenessData::Generation(nonce),
+            details,
+        );
+
+        Transaction::<DemoRuntime<RollupSpec>, RollupSpec>::new_signed_tx(
+            &signing_key,
+            &<DemoRuntime<RollupSpec> as RuntimeTrait<RollupSpec>>::CHAIN_HASH,
+            unsigned_tx,
+        )
+    }
+
     #[test]
     fn test_value_setter_call_serialization() {
         let call = ValueSetterCall::SetValue {
@@ -662,6 +1336,114 @@ mod tests {
         match deserialized {
             ValueSetterCall::SetValue { value, .. } => assert_eq!(value, 42),
             _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_midnight_withdraw_call_roundtrips() {
+        let tx = sample_midnight_withdraw_transaction(0);
+        let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
+            parse_midnight_withdraw_call(&tx).expect("parse succeeds");
+
+        assert_eq!(proof_bytes.len(), 16);
+        assert_eq!(anchor_root, [42u8; 32]);
+        assert_eq!(nullifier, [7u8; 32]);
+        assert_eq!(withdraw_amount, 123_456u128);
+        assert_eq!(
+            recipient,
+            MultiAddressEvm::Vm(
+                EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_verify_midnight_transaction_signature_accepts_valid() {
+        let tx = sample_midnight_withdraw_transaction(5);
+        verify_midnight_transaction_signature(&tx).expect("signature valid");
+    }
+
+    #[test]
+    fn test_verify_midnight_transaction_signature_rejects_tampered() {
+        let mut tx = sample_midnight_withdraw_transaction(7);
+        let VersionedTx::V0(inner) = &mut tx.versioned_tx;
+        if let RuntimeCall::MidnightPrivacy(MidnightCallMessage::Withdraw {
+            ref mut withdraw_amount,
+            ..
+        }) = inner.runtime_call
+        {
+            *withdraw_amount += 1;
+        }
+
+        match verify_midnight_transaction_signature(&tx) {
+            Err(ServiceError::SignatureError(_)) => {}
+            other => panic!("expected signature error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_verified_midnight_transaction_upsert() {
+        let mut opts = ConnectOptions::new("sqlite::memory:".to_string());
+        opts.max_connections(1).sqlx_logging(false);
+        let conn = Database::connect(opts).await.unwrap();
+        setup_midnight_da_db(&conn).await.unwrap();
+
+        let tx = sample_midnight_withdraw_transaction(9);
+        let tx_hash = tx.hash().to_string();
+        let tx_json = serde_json::to_string(&tx).unwrap();
+        let full_blob = "base64encodedtransaction";
+        let mut proof_public = SpendPublic {
+            anchor_root: [1u8; 32],
+            nullifier: [2u8; 32],
+            withdraw_amount: 55,
+            output_commitments: vec![],
+        };
+
+        store_verified_midnight_transaction(&conn, &tx_hash, &proof_public, true, true, &tx_json, full_blob)
+            .await
+            .unwrap();
+
+        proof_public.withdraw_amount = 99;
+        store_verified_midnight_transaction(&conn, &tx_hash, &proof_public, true, true, &tx_json, full_blob)
+            .await
+            .unwrap();
+
+        let stored = worker_verified_transactions::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let record = &stored[0];
+        assert_eq!(record.tx_hash, tx_hash);
+        assert!(record.signature_valid);
+        assert!(record.proof_verified);
+        
+        // Verify proof outputs are stored as JSON
+        let proof_outputs: SpendPublic = serde_json::from_str(&record.proof_outputs).unwrap();
+        assert_eq!(proof_outputs.withdraw_amount, proof_public.withdraw_amount);
+        assert_eq!(proof_outputs.anchor_root, proof_public.anchor_root);
+        assert_eq!(proof_outputs.nullifier, proof_public.nullifier);
+        assert_eq!(record.transaction_data, tx_json);
+    }
+
+    #[tokio::test]
+    async fn test_verify_midnight_withdraw_proof_invalid_payload() {
+        let proof = vec![0u8; 4];
+        let anchor_root = [3u8; 32];
+        let nullifier = [4u8; 32];
+        let withdraw_amount = 77u128;
+
+        match verify_midnight_withdraw_proof(
+            Some([0u8; 32]).as_ref(),
+            &proof,
+            anchor_root,
+            nullifier,
+            withdraw_amount,
+        )
+        .await
+        {
+            Err(ServiceError::ProofError(_)) => {}
+            other => panic!("expected proof error, got {other:?}"),
         }
     }
 }
