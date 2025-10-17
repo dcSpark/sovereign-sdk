@@ -1,0 +1,25 @@
+[package]
+name = "midnight-deposit-generator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "midnight-deposit-generator"
+path = "src/deposit.rs"
+
+[dependencies]
+anyhow = "1.0"
+borsh = { version = "1.5.1", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+
+# Local dependencies
+demo-stf = { path = "../../../examples/demo-stf" }
+midnight-privacy = { path = "../../../crates/module-system/module-implementations/midnight-privacy" }
+sov-cli = { path = "../../../crates/cli" }
+sov-demo-rollup = { path = "../../../examples/demo-rollup" }
+sov-modules-api = { path = "../../../crates/module-system/sov-modules-api" }
+sov-modules-rollup-blueprint = { path = "../../../crates/module-system/sov-modules-rollup-blueprint" }
+sov-test-utils = { path = "../../../crates/test-utils/sov-test-utils" }

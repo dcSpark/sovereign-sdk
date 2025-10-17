@@ -87,6 +87,8 @@ where
     pub value_setter: sov_value_setter::ValueSetter<S>,
     /// The Value Setter ZK module (Ligero proof verification demo).
     pub value_setter_zk: sov_value_setter_zk::ValueSetterZk<S>,
+    /// The Midnight Privacy module (shielded pool with Ligero proofs).
+    pub midnight_privacy: midnight_privacy::ValueMidnightPrivacy<S>,
 }
 
 impl<S> sov_modules_stf_blueprint::Runtime<S> for Runtime<S>

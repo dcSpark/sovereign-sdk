@@ -1,0 +1,32 @@
+[package]
+name = "note-spend-guest"
+version = "0.1.0"
+edition = "2021"
+
+# Exclude from parent workspace
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use qp-poseidon-core directly (matches midnight-privacy exactly)
+# Note: Uses std for qp-poseidon-core compatibility
+qp-poseidon-core = { version = "0.9.5" }
+
+[dev-dependencies]
+anyhow = "1.0"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+qp-poseidon-core = { version = "0.9.5" }
+
+[features]
+native = []
+
+[profile.release]
+opt-level = "s"     # Optimize for size while maintaining performance
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
+strip = true        # Strip symbols
+

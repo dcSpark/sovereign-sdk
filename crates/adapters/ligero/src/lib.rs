@@ -288,6 +288,12 @@ pub struct LigeroProofPackage {
     pub proof: Vec<u8>,
     /// Serialized public output committed by the guest program.
     pub public_output: Vec<u8>,
+    /// Arguments passed to the guest program (JSON-serialized for bincode compatibility).
+    #[cfg(feature = "native")]
+    pub args_json: Vec<u8>,
+    /// Indices of private arguments (1-based).
+    #[cfg(feature = "native")]
+    pub private_indices: Vec<usize>,
 }
 
 /// Verifier for Ligero proofs
@@ -303,16 +309,28 @@ impl ZkVerifier for LigeroVerifier {
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
     ) -> Result<T, Self::Error> {
-        tracing::debug!("Deserializing proof package, serialized size: {} bytes", serialized_proof.len());
-        tracing::debug!("First few bytes of serialized proof: {:?}", &serialized_proof[..std::cmp::min(20, serialized_proof.len())]);
-        
+        tracing::debug!(
+            "Deserializing proof package, serialized size: {} bytes",
+            serialized_proof.len()
+        );
+        tracing::debug!(
+            "First few bytes of serialized proof: {:?}",
+            &serialized_proof[..std::cmp::min(20, serialized_proof.len())]
+        );
+
         // The proof is a bincode-serialized LigeroProofPackage
         // which contains both the raw proof and the public output
         let package: LigeroProofPackage = bincode::deserialize(serialized_proof)?;
-        
-        tracing::debug!("Deserialized package: proof size: {} bytes, public_output size: {} bytes", 
-                       package.proof.len(), package.public_output.len());
-        tracing::debug!("First few bytes of deserialized proof: {:?}", &package.proof[..std::cmp::min(20, package.proof.len())]);
+
+        tracing::debug!(
+            "Deserialized package: proof size: {} bytes, public_output size: {} bytes",
+            package.proof.len(),
+            package.public_output.len()
+        );
+        tracing::debug!(
+            "First few bytes of deserialized proof: {:?}",
+            &package.proof[..std::cmp::min(20, package.proof.len())]
+        );
 
         let public: T = bincode::deserialize(&package.public_output)?;
 
@@ -324,10 +342,21 @@ impl ZkVerifier for LigeroVerifier {
 
         #[cfg(feature = "native")]
         {
-            let paths = native::VerifierPaths::discover()
+            // Automatically discover the correct program based on the code commitment
+            let paths = native::VerifierPaths::discover_with_commitment(Some(code_commitment))
                 .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
+            
+            // Verify the program matches the expected commitment
             native::ensure_code_commitment(&paths, code_commitment)?;
-            native::verify_proof(&paths, &package.proof)?;
+            
+            // Deserialize args from JSON
+            let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
+            native::verify_proof(
+                &paths,
+                &package.proof,
+                args,
+                package.private_indices.clone(),
+            )?;
         }
 
         #[cfg(not(feature = "native"))]
@@ -419,7 +448,14 @@ mod native {
     }
 
     impl VerifierPaths {
+        /// Discover verifier paths using environment variables or auto-detection.
+        /// For backwards compatibility. Prefer `discover_with_commitment` for automatic program selection.
+        #[allow(dead_code)]
         pub fn discover() -> Result<Self> {
+            Self::discover_with_commitment(None)
+        }
+
+        pub fn discover_with_commitment(expected_commitment: Option<&LigeroCodeCommitment>) -> Result<Self> {
             let config = if let Ok(config_path) = std::env::var("LIGERO_CONFIG_PATH") {
                 let config_contents = fs::read_to_string(&config_path)
                     .with_context(|| format!("Failed to read Ligero config at {config_path}"))?;
@@ -427,6 +463,14 @@ mod native {
                     format!("Failed to parse Ligero config JSON from {config_path}")
                 })?
             } else {
+                // If we have an expected commitment, try to find the matching program
+                if let Some(commitment) = expected_commitment {
+                    if let Some(config) = Self::find_program_for_commitment(commitment)? {
+                        return Ok(config);
+                    }
+                }
+
+                // Fallback: use LIGERO_PROGRAM_PATH if set
                 let program = std::env::var("LIGERO_PROGRAM_PATH").context(
                     "LIGERO_PROGRAM_PATH environment variable is required for Ligero verification",
                 )?;
@@ -467,13 +511,96 @@ mod native {
             })
         }
 
-        pub fn to_config(&self) -> LigeroConfig {
+        fn find_program_for_commitment(commitment: &LigeroCodeCommitment) -> Result<Option<Self>> {
+            use sha2::{Digest, Sha256};
+
+            let current_dir = std::env::current_dir()?;
+            let packing: u32 = std::env::var("LIGERO_PACKING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192);
+
+            // List of known programs to try
+            let program_candidates = vec![
+                "note_spend_guest.wasm",
+                "value_validator.wasm",
+            ];
+
+            let base_paths = vec![
+                current_dir.join("crates/adapters/ligero/guest/bins/programs"),
+                current_dir.join("../crates/adapters/ligero/guest/bins/programs"),
+                current_dir.join("../../crates/adapters/ligero/guest/bins/programs"),
+            ];
+
+            for base_path in &base_paths {
+                for program_name in &program_candidates {
+                    let program_path = base_path.join(program_name);
+                    if !program_path.exists() {
+                        continue;
+                    }
+
+                    // Compute the code commitment for this program
+                    if let Ok(wasm_bytes) = fs::read(&program_path) {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&wasm_bytes);
+                        hasher.update(packing.to_le_bytes());
+                        let computed = LigeroCodeCommitment(hasher.finalize().into());
+
+                        if &computed == commitment {
+                            tracing::info!(
+                                "Found matching program for commitment {}: {}",
+                                hex::encode(commitment.0),
+                                program_path.display()
+                            );
+
+                            // Find shader and verifier
+                            let shader_path = std::env::var("LIGERO_SHADER_PATH")
+                                .ok()
+                                .and_then(|p| canonicalize(&p).ok())
+                                .or_else(|| Self::find_shader_path(&current_dir))
+                                .context("Failed to find shader path")?;
+
+                            let verifier_bin = locate_verifier_binary(program_path.parent())
+                                .context("Failed to locate webgpu_verifier binary")?;
+
+                            return Ok(Some(Self {
+                                program: canonicalize(program_path.to_str().context("Invalid path")?)?,
+                                shader_path,
+                                verifier_bin,
+                                packing,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            Ok(None)
+        }
+
+        fn find_shader_path(current_dir: &std::path::Path) -> Option<PathBuf> {
+            let candidates = vec![
+                current_dir.join("crates/adapters/ligero/bins/macos/shader"),
+                current_dir.join("crates/adapters/ligero/bins/linux-amd64/shader"),
+                current_dir.join("../crates/adapters/ligero/bins/macos/shader"),
+                current_dir.join("../crates/adapters/ligero/bins/linux-amd64/shader"),
+            ];
+
+            candidates.into_iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.to_str().and_then(|s| canonicalize(s).ok()))
+        }
+
+        pub fn to_config(
+            &self,
+            args: Vec<crate::LigeroArg>,
+            private_indices: Vec<usize>,
+        ) -> LigeroConfig {
             LigeroConfig {
                 program: self.program.to_string_lossy().into_owned(),
                 shader_path: self.shader_path.to_string_lossy().into_owned(),
                 packing: self.packing,
-                private_indices: Vec::new(),
-                args: Vec::new(),
+                private_indices,
+                args,
             }
         }
     }
@@ -505,34 +632,83 @@ mod native {
         Ok(())
     }
 
-    pub fn verify_proof(paths: &VerifierPaths, proof_bytes: &[u8]) -> Result<()> {
+    pub fn verify_proof(
+        paths: &VerifierPaths,
+        proof_bytes: &[u8],
+        mut args: Vec<crate::LigeroArg>,
+        private_indices: Vec<usize>,
+    ) -> Result<()> {
         let temp_dir =
             tempdir().context("Failed to create temporary directory for Ligero verification")?;
-        
+
         tracing::debug!("Received proof bytes: size: {} bytes", proof_bytes.len());
-        tracing::debug!("First few bytes of received proof: {:?}", &proof_bytes[..std::cmp::min(20, proof_bytes.len())]);
-        
+        tracing::debug!(
+            "First few bytes of received proof: {:?}",
+            &proof_bytes[..std::cmp::min(20, proof_bytes.len())]
+        );
+
         // Expect proof_bytes to be compressed gzip data (boost serialized + gzipped)
         if proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b {
             tracing::debug!("✓ Received compressed gzip proof (expected format)");
         } else {
-            tracing::warn!("⚠ Received proof does not appear to be gzip format! First bytes: {:02x?}", &proof_bytes[..std::cmp::min(10, proof_bytes.len())]);
+            tracing::warn!(
+                "⚠ Received proof does not appear to be gzip format! First bytes: {:02x?}",
+                &proof_bytes[..std::cmp::min(10, proof_bytes.len())]
+            );
         }
-        
+
         // Write proof as proof_data.gz (the format verifier expects)
         let proof_path = temp_dir.path().join("proof_data.gz");
         fs::write(&proof_path, proof_bytes)
             .context("Failed to write proof_data.gz for Ligero verification")?;
-        
-        tracing::debug!("Wrote proof to: {}, size: {} bytes", proof_path.display(), proof_bytes.len());
-        tracing::debug!("Temp dir contents: {:?}", fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>());
 
-        let config = paths.to_config();
+        tracing::debug!(
+            "Wrote proof to: {}, size: {} bytes",
+            proof_path.display(),
+            proof_bytes.len()
+        );
+        tracing::debug!(
+            "Temp dir contents: {:?}",
+            fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>()
+        );
+
+        // Redact private arguments (replace with dummy values)
+        // IMPORTANT: Keep the same argument type and length as the original
+        // (Ligero verifier requires type consistency)
+        for &idx in &private_indices {
+            if idx > 0 && idx <= args.len() {
+                // 1-based indexing
+                let arg_idx = idx - 1;
+                args[arg_idx] = match &args[arg_idx] {
+                    crate::LigeroArg::String { str: s } => {
+                        // Replace with 'x' repeated to match original length
+                        crate::LigeroArg::String {
+                            str: "x".repeat(s.len()),
+                        }
+                    }
+                    crate::LigeroArg::I64 { .. } => {
+                        // Replace with 0
+                        crate::LigeroArg::I64 { i64: 0 }
+                    }
+                    crate::LigeroArg::Hex { hex: h } => {
+                        // Replace with '0' repeated to match original length
+                        crate::LigeroArg::Hex {
+                            hex: "0".repeat(h.len()),
+                        }
+                    }
+                };
+            }
+        }
+
+        let config = paths.to_config(args, private_indices);
         let config_json =
             serde_json::to_string(&config).context("Failed to serialize Ligero verifier config")?;
 
         tracing::debug!("Verifier config: {}", config_json);
-        tracing::debug!("Running verifier from directory: {}", temp_dir.path().display());
+        tracing::debug!(
+            "Running verifier from directory: {}",
+            temp_dir.path().display()
+        );
         tracing::debug!("Verifier binary: {}", paths.verifier_bin.display());
 
         let output = Command::new(&paths.verifier_bin)

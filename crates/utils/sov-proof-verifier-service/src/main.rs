@@ -28,9 +28,13 @@ struct Args {
     )]
     signing_key_path: String,
 
-    /// Ligero method ID (hex-encoded 32 bytes) for proof verification
+    /// Ligero method ID (hex-encoded 32 bytes) for value-setter proof verification
     #[arg(long)]
     method_id: Option<String>,
+
+    /// Ligero method ID (hex-encoded 32 bytes) for midnight proof verification
+    #[arg(long)]
+    midnight_method_id: Option<String>,
 
     /// Chain ID for transaction authentication
     #[arg(long, default_value = "4321")]
@@ -39,6 +43,10 @@ struct Args {
     /// Maximum number of concurrent proof verifications
     #[arg(long, default_value = "10")]
     max_concurrent: usize,
+
+    /// Connection string for the shared MockDA database
+    #[arg(long, default_value = "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc")]
+    da_db: String,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
@@ -56,14 +64,22 @@ async fn main() -> Result<()> {
     info!("Bind address: {}", args.bind);
     info!("Node RPC URL: {}", args.node_rpc_url);
     info!("Max concurrent verifications: {}", args.max_concurrent);
+    info!("MockDA DB: {}", args.da_db);
 
-    // Parse method ID
-    let method_id = if let Some(method_id_hex) = args.method_id {
-        parse_method_id(&method_id_hex)?
+    // Parse optional method ID (will be auto-computed if not provided)
+    let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
+        Some(parse_method_id(&method_id_hex)?)
     } else {
-        // Default method ID (placeholder - should be provided)
-        info!("No method ID provided, using placeholder");
-        [0u8; 32]
+        info!("No value-setter method ID provided, will auto-compute from value_validator.wasm");
+        None
+    };
+
+    // Parse optional midnight method ID (will be auto-computed if not provided)
+    let midnight_method_id = if let Some(method_id_hex) = args.midnight_method_id {
+        Some(parse_method_id(&method_id_hex)?)
+    } else {
+        info!("No midnight method ID provided, will auto-compute from note_spend_guest.wasm");
+        None
     };
 
     info!("Note: Using Runtime's CHAIN_HASH for transaction signing (not CLI parameter)");
@@ -72,13 +88,15 @@ async fn main() -> Result<()> {
     let config = ServiceConfig {
         node_rpc_url: args.node_rpc_url,
         signing_key_path: args.signing_key_path,
-        method_id,
+        value_setter_method_id, // Will be auto-computed from value_validator.wasm if None
+        midnight_method_id, // Will be auto-computed from note_spend_guest.wasm if None
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,
+        da_connection_string: args.da_db,
     };
 
     // Create application state (loads signing key at startup)
-    let state = AppState::new(config)?;
+    let state = AppState::new(config).await?;
 
     // Create router
     let app = create_router(state);
@@ -86,7 +104,8 @@ async fn main() -> Result<()> {
     // Start server
     info!("🚀 Proof verifier service listening on {}", args.bind);
     info!("📝 Endpoints:");
-    info!("  POST {}/verify-and-submit", args.bind);
+    info!("  POST {}/value-setter-zk", args.bind);
+    info!("  POST {}/midnight-privacy", args.bind);
     info!("  GET  {}/health", args.bind);
 
     // Use the Axum server API

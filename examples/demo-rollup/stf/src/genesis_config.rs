@@ -5,6 +5,7 @@
 use std::convert::AsRef;
 use std::path::{Path, PathBuf};
 
+pub use midnight_privacy::ValueSetterZkConfig as MidnightPrivacyConfig;
 use serde::de::DeserializeOwned;
 pub use sov_accounts::{AccountConfig, AccountData};
 use sov_address::{EthereumAddress, FromVmAddress};
@@ -53,6 +54,8 @@ pub struct GenesisPaths {
     pub value_setter_genesis_path: PathBuf,
     /// Value Setter ZK genesis path
     pub value_setter_zk_genesis_path: PathBuf,
+    /// Midnight Privacy genesis path
+    pub midnight_privacy_genesis_path: PathBuf,
 }
 
 impl GenesisPaths {
@@ -75,6 +78,7 @@ impl GenesisPaths {
             access_pattern: dir.as_ref().join("access_pattern.json"),
             value_setter_genesis_path: dir.as_ref().join("value_setter.json"),
             value_setter_zk_genesis_path: dir.as_ref().join("value_setter_zk.json"),
+            midnight_privacy_genesis_path: dir.as_ref().join("midnight_privacy.json"),
         }
     }
 }
@@ -125,6 +129,9 @@ where
     let value_setter_zk_config: ValueSetterZkConfig<S> =
         read_genesis_json(&genesis_paths.value_setter_zk_genesis_path)?;
 
+    let midnight_privacy_config: MidnightPrivacyConfig<S> =
+        read_genesis_json(&genesis_paths.midnight_privacy_genesis_path)?;
+
     Ok(GenesisConfig::new(
         bank_config,
         sequencer_registry_config,
@@ -141,6 +148,7 @@ where
         synthetic_load_config,
         value_setter_config,
         value_setter_zk_config,
+        midnight_privacy_config,
     ))
 }
 

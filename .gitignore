@@ -43,5 +43,9 @@ constants_output.csv
 
 # Temporary test data files
 examples/demo-rollup/tests/resync/data/.tmp*
+crates/module-system/module-implementations/midnight-privacy/proof.data
+crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
+crates/module-system/module-implementations/midnight-privacy/learn.txt
+crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
 
 .env

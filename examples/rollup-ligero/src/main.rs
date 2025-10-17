@@ -6,7 +6,7 @@ use clap::Parser;
 use demo_stf::genesis_config::GenesisPaths;
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
-use sov_mock_da::storable::service::StorableMockDaService;
+use sov_midnight_da::storable::service::StorableMidnightDaService;
 use sov_modules_api::capabilities::RollupHeight;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_rollup_blueprint::logging::initialize_logging;
@@ -127,7 +127,7 @@ async fn new_rollup_with_mock_da(
         "Starting rollup on mock DA with Ligero"
     );
 
-    let rollup_config: RollupConfig<MultiAddressEvm, StorableMockDaService> =
+    let rollup_config: RollupConfig<MultiAddressEvm, StorableMidnightDaService> =
         from_toml_path(rollup_config_path).with_context(|| {
             format!("Failed to read rollup configuration from {rollup_config_path}")
         })?;

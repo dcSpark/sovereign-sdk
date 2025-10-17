@@ -1,0 +1,38 @@
+[package]
+name = "midnight-tx-generator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "midnight-tx-generator"
+path = "src/main.rs"
+
+[[bin]]
+name = "midnight-deposit-generator"
+path = "src/deposit.rs"
+
+[dependencies]
+anyhow = "1.0"
+borsh = { version = "1.3", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+bincode = "1.3"
+rand = "0.8"
+
+# Local dependencies
+sov-modules-api = { path = "../../crates/module-system/sov-modules-api" }
+sov-modules-rollup-blueprint = { path = "../../crates/module-system/sov-modules-rollup-blueprint" }
+sov-cli = { path = "../../crates/module-system/sov-cli" }
+demo-stf = { path = "../../examples/demo-rollup/stf", features = ["native"] }
+sov-demo-rollup = { path = "../../examples/demo-rollup" }
+midnight-privacy = { path = "../../crates/module-system/module-implementations/midnight-privacy", features = ["native"] }
+sov-test-utils = { path = "../../crates/module-system/sov-test-utils" }
+sov-ligero-adapter = { path = "../../crates/adapters/ligero", features = ["native"] }
+sov-rollup-interface = { path = "../../crates/rollup-interface" }
+
+
+[[bin]]
+name = "withdraw-with-tree"
+path = "src/withdraw_with_tree.rs"
