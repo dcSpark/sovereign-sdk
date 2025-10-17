@@ -1,171 +1,392 @@
-# Midnight Transaction Generator
+# Midnight Privacy Transaction Generators
 
-Utility to generate test midnight withdrawal transactions for the proof verifier service.
+Tools for generating and submitting transactions to the Midnight Privacy shielded pool module.
 
 ## Overview
 
-This tool creates borsh-serialized transactions containing `midnight_privacy::CallMessage::Withdraw` that can be sent to the `/midnight/verify-and-submit` endpoint of the proof verifier service.
+This directory contains three transaction generators:
 
-Based on the midnight-privacy integration tests, this generates properly formatted transactions with:
-- Ligero zero-knowledge proofs
-- Anchor root (Merkle root of commitment tree)
-- Nullifier (prevents double-spending)
-- Withdrawal amount
-- Recipient address
+1. **`midnight-deposit-generator`** - Creates deposit transactions to add funds to the shielded pool
+2. **`midnight-tx-generator`** - Creates withdrawal/spend transactions with test parameters
+3. **`withdraw-with-tree`** - Creates withdrawal transactions using real on-chain state
+
+The complete **`deposit_and_withdraw.sh`** script orchestrates a full deposit + withdrawal flow.
+
+## Quick Start
+
+### Complete Deposit + Withdrawal Flow
+
+From the repository root:
+
+```bash
+# Start the rollup (in a separate terminal)
+cd examples/demo-rollup
+cargo run --bin sov-demo-rollup -- \
+  --da-layer mock \
+  --rollup-config-path mock_rollup_config.toml \
+  --genesis-paths examples/test-data/genesis/demo/mock
+
+# Run the complete flow
+./scripts/midnight-tx-generator/deposit_and_withdraw.sh
+```
+
+This will:
+1. ✅ Deposit 100 tokens into the shielded pool (creates a note)
+2. ✅ Generate a real Ligero ZK proof (~3MB, takes 0.3-0.5 seconds)
+3. ✅ Withdraw 50 tokens to a transparent address
+4. ✅ Keep 50 tokens as change in a new shielded note
+
+### Custom Amounts
+
+```bash
+# Deposit 200, withdraw 150, keep 50 shielded
+DEPOSIT_AMOUNT=200 WITHDRAW_AMOUNT=150 ./scripts/midnight-tx-generator/deposit_and_withdraw.sh
+```
 
 ## Building
 
 ```bash
 cd scripts/midnight-tx-generator
-cargo build --release
+SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator --bin midnight-tx-generator
 ```
 
-## Usage
+## Individual Components
 
-### Basic Usage
+### 1. Deposit Generator
 
-Generate a transaction with default test values:
+Creates a transaction that deposits tokens into the shielded pool:
 
 ```bash
-cargo run --release
+cd scripts/midnight-tx-generator
+
+# Generate deposit transaction
+export DEPOSIT_AMOUNT=100
+export NONCE=$(date +%s)
+export PRIVATE_KEY_FILE=../../examples/test-data/keys/tx_signer_private_key.json
+
+./target/debug/midnight-deposit-generator midnight_deposit_tx.bin
+
+# Send to rollup
+curl -X POST http://localhost:12346/sequencer/txs \
+  -H 'Content-Type: application/json' \
+  -d @midnight_deposit_tx.json
 ```
 
-This creates:
-- `midnight_withdraw_tx.bin` - Raw borsh-serialized transaction
-- `midnight_withdraw_tx.json` - JSON payload ready for HTTP POST
+**Outputs:**
+- `midnight_deposit_tx.bin` - Borsh-serialized transaction
+- `midnight_deposit_tx.json` - Base64-encoded JSON payload
+- `midnight_note_details.json` - Note parameters for later withdrawal
 
-### Custom Parameters
+**Note Details:**
+The deposit generator creates a note with random parameters:
+- `rho` - Random nonce (ensures unique nullifier)
+- `recipient` - Random recipient binding
+- `nf_key` - Secret nullifier key (needed for spending)
+- `commitment` - Note commitment hash
+- `domain` - Module domain identifier (`[1u8; 32]`)
 
-All parameters can be customized via environment variables:
+Save `midnight_note_details.json` to spend the note later!
 
-```bash
-export ANCHOR_ROOT="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-export NULLIFIER="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-export WITHDRAW_AMOUNT="1000"
-export RECIPIENT="sov1..."
-export NONCE="42"
-export PROOF_FILE="path/to/proof.bin"
-export PRIVATE_KEY="your_private_key_hex"
+### 2. Test Withdrawal Generator
 
-cargo run --release output_tx.bin
-```
-
-### With Real Proof
-
-To use a real Ligero proof (generated from the midnight-privacy tests):
+Creates a withdrawal transaction using test parameters:
 
 ```bash
-# Generate a proof using the test suite or ligero adapter
-export PROOF_FILE="my_proof.bin"
-cargo run --release
-```
+cd scripts/midnight-tx-generator
 
-### Environment Variables
+# This uses hardcoded test values from integration tests
+./target/debug/midnight-tx-generator midnight_withdraw_tx.bin
 
-- `ANCHOR_ROOT` - Hex-encoded 32-byte Merkle root (default: zeros)
-- `NULLIFIER` - Hex-encoded 32-byte nullifier (default: zeros)
-- `WITHDRAW_AMOUNT` - Amount to withdraw as u128 (default: 500)
-- `RECIPIENT` - Sovereign address to receive funds (default: test address)
-- `NONCE` - Transaction nonce (default: 0)
-- `PROOF_FILE` - Path to proof binary file (default: dummy proof)
-- `PRIVATE_KEY` - Hex-encoded private key (default: test key)
-
-## Sending the Transaction
-
-### Using the JSON file directly
-
-```bash
-curl -X POST http://localhost:8080/midnight/verify-and-submit \
+# Send to rollup
+curl -X POST http://localhost:12346/sequencer/txs \
   -H 'Content-Type: application/json' \
   -d @midnight_withdraw_tx.json
 ```
 
-### Using the helper script
+**Note:** This will likely fail with "Invalid anchor root" because the test note doesn't exist in the rollup's state. Use the complete `deposit_and_withdraw.sh` script instead.
+
+### 3. Complete Flow Script
+
+**`deposit_and_withdraw.sh`** orchestrates the entire privacy flow:
 
 ```bash
-../../send_midnight_tx_simple.sh midnight_withdraw_tx.bin
+cd scripts/midnight-tx-generator
+./deposit_and_withdraw.sh
 ```
 
-### Using the complete workflow script
+**What it does:**
 
-From the repository root:
+1. **Deposit Phase:**
+   - Generates a note with fresh random parameters
+   - Creates a deposit transaction
+   - Sends to sequencer
+   - Extracts the note position and anchor root from the response
+
+2. **Withdrawal Phase:**
+   - Loads note details from `midnight_note_details.json`
+   - Builds a Merkle tree with the note at the correct position
+   - Generates a real Ligero ZK proof (WebGPU-accelerated)
+   - Creates withdrawal transaction
+   - Sends to sequencer
+
+**Environment Variables:**
 
 ```bash
-./generate_and_send_midnight_tx.sh
+DEPOSIT_AMOUNT=100          # Amount to deposit (default: 100)
+WITHDRAW_AMOUNT=50          # Amount to withdraw (default: 50)
+RECIPIENT=sov1v870par...    # Recipient address
+PRIVATE_KEY_FILE=...        # Path to private key JSON
 ```
 
-This script builds the generator, creates a transaction, and sends it in one step.
+## Transaction Structure
 
-## Output Format
+### Deposit Transaction
 
-The generated files contain:
+```rust
+RuntimeCall::MidnightPrivacy(
+    CallMessage::Deposit {
+        amount: u128,
+        rho: Hash32,        // Random nonce
+        recipient: Hash32,  // Random binding
+        gas: Option<Gas>,
+    }
+)
+```
 
-### `.bin` file
-Raw bytes of the borsh-serialized `Transaction<Runtime<TestSpec>, TestSpec>` struct.
+### Withdrawal Transaction
 
-### `.json` file
-JSON payload ready for the API:
+```rust
+RuntimeCall::MidnightPrivacy(
+    CallMessage::Withdraw {
+        proof: Vec<u8>,         // Ligero ZK proof (~3MB compressed)
+        anchor_root: Hash32,    // Merkle root from deposit
+        nullifier: Hash32,      // Prevents double-spending
+        withdraw_amount: u128,  // Amount to transparent address
+        to: Address,            // Recipient
+        gas: Option<Gas>,
+    }
+)
+```
+
+## Ligero ZK Proofs
+
+### Proof Generation
+
+The withdrawal generator uses the Ligero ZK proof system:
+
+- **Program:** `note_spend_guest.wasm` (circuit for note spending)
+- **Prover:** WebGPU-accelerated prover binary
+- **Size:** ~3MB compressed (gzip)
+- **Time:** 0.3-0.5 seconds on modern hardware
+- **Packing:** 8192 (FFT message packing size)
+
+### Code Commitment
+
+The proof is verified against a code commitment (method_id):
+
+```
+method_id = SHA-256(note_spend_guest.wasm || 8192_u32.to_le_bytes())
+          = 02af46d4f30776e1d362cc07ac878bf948e840b76786325e3e782c96d3e08b36
+```
+
+This must match the `method_id` in the module's genesis configuration.
+
+### Circuit Constraints
+
+The ZK circuit proves:
+1. ✅ Knowledge of a valid note (value, rho, recipient, nf_key)
+2. ✅ Note exists in the Merkle tree (valid authentication path)
+3. ✅ Correct nullifier derivation
+4. ✅ Balance equation: `input_value = withdraw_amount + sum(output_values)`
+
+## Privacy Model
+
+### Shielded Pool
+
+- **Notes:** Represent value in the shielded pool
+- **Commitments:** Public note hashes stored in a Merkle tree
+- **Nullifiers:** Prevent double-spending without revealing which note was spent
+- **Zero-Knowledge:** Withdraw without revealing which note or how much remains
+
+### Transaction Flow
+
+```
+Transparent → Shielded (Deposit)
+  - Create note commitment
+  - Add to Merkle tree
+  - No proof required
+
+Shielded → Transparent (Withdraw)
+  - Prove knowledge of note
+  - Reveal nullifier (unique per note)
+  - Create change note (remaining value)
+  - Requires ZK proof
+
+Shielded → Shielded (Transfer)
+  - Spend input note
+  - Create output note(s)
+  - withdraw_amount = 0
+  - Requires ZK proof
+```
+
+## Output Files
+
+### Generated by Deposit
+
+- `midnight_deposit_tx.bin` - Borsh-serialized transaction
+- `midnight_deposit_tx.json` - JSON payload for API
+- `midnight_note_details.json` - Note parameters (SECRET! Contains `nf_key`)
+
+### Generated by Withdrawal
+
+- `midnight_withdraw_tx.bin` - Borsh-serialized transaction
+- `midnight_withdraw_tx.json` - JSON payload for API
+- `proof_data.gz` - Compressed Ligero proof (temporary)
+
+## Security Considerations
+
+### Private Keys
+
+The generators use test keys by default:
+```bash
+PRIVATE_KEY_FILE=../../examples/test-data/keys/tx_signer_private_key.json
+```
+
+**⚠️ For production:** Use secure key management and never commit private keys!
+
+### Note Details
+
+`midnight_note_details.json` contains the **nullifier key** which is the secret required to spend the note:
+
 ```json
 {
-  "body": "<base64-encoded transaction bytes>"
+  "domain": "0101010101...",
+  "amount": 100,
+  "rho": "random...",
+  "recipient": "random...",
+  "commitment": "d8aea9ab...",
+  "nf_key": "SECRET_KEY"  // ⚠️ PRIVATE! Anyone with this can spend the note
 }
 ```
 
-## Integration with Tests
+**Keep this file secure!** It's equivalent to the private key for your shielded funds.
 
-The transaction structure matches exactly what the midnight-privacy integration tests create:
+### Nullifier Reuse
 
-- `crates/module-system/module-implementations/midnight-privacy/tests/integration/ligero_proof_test.rs`
+Each note can only be spent once. The nullifier prevents double-spending:
 
-You can extract proof data from these tests and use it with this generator.
-
-## Example Workflow
-
-```bash
-# 1. Build the generator
-cd scripts/midnight-tx-generator
-cargo build --release
-
-# 2. Generate a test proof (from midnight-privacy tests)
-cd ../../crates/module-system/module-implementations/midnight-privacy
-cargo test test_note_spend_with_real_ligero_proof -- --nocapture
-
-# 3. Copy the proof file and generate transaction
-export PROOF_FILE="/path/to/generated/proof.bin"
-export ANCHOR_ROOT="<actual_anchor_from_test>"
-export NULLIFIER="<actual_nullifier_from_test>"
-export WITHDRAW_AMOUNT="500"
-
-cargo run --release
-
-# 4. Send to verifier
-cd ../../../../
-./send_midnight_tx_simple.sh midnight_withdraw_tx.bin
+```
+nullifier = Hash(domain || nf_key || rho)
 ```
 
-## Expected Behavior
-
-### With Dummy Proof (Default)
-When running with the default dummy proof:
-```
-HTTP Status: 422
-{
-  "error": "Verification failed: io error: unexpected end of file"
-}
-```
-
-This is **expected and correct**:
-- ✅ Signature verification passed (no 401 error)
-- ❌ Proof verification failed because dummy data isn't a valid Ligero proof package
-
-### With Real Proof
-When using a real Ligero proof generated from the midnight-privacy tests, the full verification pipeline should succeed and the transaction will be recorded in the database.
+Once a nullifier is posted on-chain, that note cannot be spent again.
 
 ## Troubleshooting
 
-### Error: "Invalid signature: signature error: Verification equation was not satisfied"
-This means the transaction was signed with the wrong `CHAIN_HASH`. The generator now uses the correct `CHAIN_HASH` from `demo-rollup/autogenerated.rs`, so this should not occur.
+### "Nullifier already spent"
 
-### Error: "Verification failed: io error: unexpected end of file"  
-This is expected when using a dummy proof. Use a real Ligero proof from the midnight-privacy tests to get full verification.
+**Cause:** You're trying to spend the same note twice.
 
+**Solution:** Run the deposit again to create a fresh note with a new nullifier:
+```bash
+./deposit_and_withdraw.sh
+```
+
+Each run creates a note with fresh random `rho` and `nf_key`, giving a unique nullifier.
+
+### "Invalid anchor root"
+
+**Cause:** The Merkle root doesn't match the rollup's tree.
+
+**Solution:** The complete script extracts the anchor root from the deposit response. If testing manually, query the rollup:
+```bash
+# Get current tree state
+curl http://localhost:12346/state/midnight_privacy/current_root
+```
+
+### "Code commitment mismatch"
+
+**Cause:** The proof was generated with a different WASM program than expected.
+
+**Solution:** The verifier now auto-discovers the correct program based on the code commitment in the proof. Ensure:
+1. `note_spend_guest.wasm` exists in `crates/adapters/ligero/guest/bins/programs/`
+2. Rollup genesis has the correct `method_id`: `02af46d4...`
+
+### "Argument list too long" (curl error)
+
+**Cause:** The 3MB transaction is too large for command-line arguments.
+
+**Solution:** The scripts now use `-d @file.json` to read from file instead.
+
+### Proof generation fails
+
+**Cause:** WebGPU prover requires GPU access.
+
+**Solutions:**
+1. Run outside any sandbox that restricts GPU access
+2. Check that shader files exist: `crates/adapters/ligero/bins/*/shader/`
+3. Verify prover binary: `crates/adapters/ligero/bins/*/bin/webgpu_prover`
+
+## Environment Requirements
+
+### Required
+
+- Rust toolchain (for building generators)
+- `jq` (for JSON processing in scripts)
+- `curl` (for sending transactions)
+
+### Optional
+
+- WebGPU-capable GPU (for real proof generation)
+- `LIGERO_PROGRAM_PATH` env var (auto-discovery enabled if not set)
+
+## Integration with Rollup
+
+### Genesis Configuration
+
+The rollup must be initialized with the correct `method_id`:
+
+```json
+{
+  "method_id": [2, 175, 70, 212, 243, 7, 118, 225, ...],
+  "domain": [1, 1, 1, 1, ...],
+  "token_id": { "token_id": 1 }
+}
+```
+
+### Endpoints
+
+- **Sequencer:** `POST http://localhost:12346/sequencer/txs`
+  - Submit transactions to the rollup
+  - Returns transaction receipt with events
+
+- **State Queries:** `GET http://localhost:12346/state/midnight_privacy/{field}`
+  - Query module state (tree size, roots, etc.)
+
+## Development
+
+### Adding New Generators
+
+1. Create new binary in `src/`
+2. Add `[[bin]]` entry to `Cargo.toml`
+3. Build with `SKIP_GUEST_BUILD=1 cargo build --bin your-generator`
+
+### Testing
+
+```bash
+# Run integration tests
+cd ../../crates/module-system/module-implementations/midnight-privacy
+cargo test --features native -- --nocapture
+
+# Test deposit flow
+cd ../../scripts/midnight-tx-generator
+./target/debug/midnight-deposit-generator test_deposit.bin
+```
+
+## References
+
+- **Module Implementation:** `crates/module-system/module-implementations/midnight-privacy/`
+- **Integration Tests:** `crates/module-system/module-implementations/midnight-privacy/tests/integration/`
+- **Ligero Adapter:** `crates/adapters/ligero/`
+- **Guest Circuit:** `crates/adapters/ligero/guest/note-spend-guest/`
+- **Genesis Config:** `examples/test-data/genesis/demo/mock/midnight_privacy.json`

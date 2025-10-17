@@ -1,5 +1,6 @@
 //! Utilities and definitions for the sequencer's REST APIs.
 
+use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use serde_with::serde_as;
 use sov_modules_api::capabilities::TransactionAuthenticator;
 use sov_modules_api::runtime::Runtime;
 use sov_modules_api::{RawTx, RuntimeEventProcessor, RuntimeEventResponse};
+use sov_midnight_da::storable::worker_verified_transactions;
 use sov_rest_utils::{
     errors, preconfigured_router_layers, serve_generic_ws_subscription, ApiResult, FilterQuery,
     PageSelection, PaginatedResponse, Pagination, Path, Query,
@@ -25,6 +27,7 @@ use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::TxHash;
 use tokio::sync::watch::Receiver;
 use tokio_stream::wrappers::BroadcastStream;
+use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter};
 
 use crate::common::{error_not_fully_synced, AcceptedTx, Sequencer};
 use crate::TxStatus;
@@ -63,6 +66,10 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         };
 
         let router = axum::Router::new()
+            .route(
+                "/sequencer/worker_txs/:tx_hash",
+                axum::routing::post(Self::axum_get_worker_tx_data),
+            )
             .route("/sequencer/txs", axum::routing::post(Self::axum_accept_tx))
             .route("/sequencer/ready", axum::routing::get(Self::axum_get_ready))
             .route(
@@ -222,6 +229,39 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         } else {
             Err(errors::not_found_404("Transaction", tx_hash.0))
         }
+    }
+
+    async fn axum_get_worker_tx_data(
+        Path(tx_hash): Path<String>,
+    ) -> ApiResult<WorkerTxData> {
+        let connection_string = match env::var("SOV_WORKER_TX_DB_CONNECTION_STRING") {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(errors::internal_server_error_response_500(
+                    "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set",
+                ))
+            }
+        };
+
+        let db = Database::connect(connection_string)
+            .await
+            .map_err(|err| errors::database_error_response_500(err))?;
+
+        let record = worker_verified_transactions::Entity::find()
+            .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.clone()))
+            .one(&db)
+            .await
+            .map_err(|err| errors::database_error_response_500(err))?;
+
+        let Some(model) = record else {
+            return Err(errors::not_found_404("Worker transaction", tx_hash));
+        };
+
+        Ok(WorkerTxData {
+            transaction_data: model.transaction_data,
+            proof_outputs: model.proof_outputs,
+        }
+        .into())
     }
 
     async fn axum_accept_tx(
@@ -419,6 +459,12 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         };
         Ok(response.into())
     }
+}
+
+#[derive(serde::Serialize)]
+struct WorkerTxData {
+    transaction_data: String,
+    proof_outputs: String,
 }
 
 #[serde_as]

@@ -342,9 +342,13 @@ impl ZkVerifier for LigeroVerifier {
 
         #[cfg(feature = "native")]
         {
-            let paths = native::VerifierPaths::discover()
+            // Automatically discover the correct program based on the code commitment
+            let paths = native::VerifierPaths::discover_with_commitment(Some(code_commitment))
                 .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
+            
+            // Verify the program matches the expected commitment
             native::ensure_code_commitment(&paths, code_commitment)?;
+            
             // Deserialize args from JSON
             let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
             native::verify_proof(
@@ -444,7 +448,14 @@ mod native {
     }
 
     impl VerifierPaths {
+        /// Discover verifier paths using environment variables or auto-detection.
+        /// For backwards compatibility. Prefer `discover_with_commitment` for automatic program selection.
+        #[allow(dead_code)]
         pub fn discover() -> Result<Self> {
+            Self::discover_with_commitment(None)
+        }
+
+        pub fn discover_with_commitment(expected_commitment: Option<&LigeroCodeCommitment>) -> Result<Self> {
             let config = if let Ok(config_path) = std::env::var("LIGERO_CONFIG_PATH") {
                 let config_contents = fs::read_to_string(&config_path)
                     .with_context(|| format!("Failed to read Ligero config at {config_path}"))?;
@@ -452,6 +463,14 @@ mod native {
                     format!("Failed to parse Ligero config JSON from {config_path}")
                 })?
             } else {
+                // If we have an expected commitment, try to find the matching program
+                if let Some(commitment) = expected_commitment {
+                    if let Some(config) = Self::find_program_for_commitment(commitment)? {
+                        return Ok(config);
+                    }
+                }
+
+                // Fallback: use LIGERO_PROGRAM_PATH if set
                 let program = std::env::var("LIGERO_PROGRAM_PATH").context(
                     "LIGERO_PROGRAM_PATH environment variable is required for Ligero verification",
                 )?;
@@ -490,6 +509,85 @@ mod native {
                 verifier_bin,
                 packing: config.packing,
             })
+        }
+
+        fn find_program_for_commitment(commitment: &LigeroCodeCommitment) -> Result<Option<Self>> {
+            use sha2::{Digest, Sha256};
+
+            let current_dir = std::env::current_dir()?;
+            let packing: u32 = std::env::var("LIGERO_PACKING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192);
+
+            // List of known programs to try
+            let program_candidates = vec![
+                "note_spend_guest.wasm",
+                "value_validator.wasm",
+            ];
+
+            let base_paths = vec![
+                current_dir.join("crates/adapters/ligero/guest/bins/programs"),
+                current_dir.join("../crates/adapters/ligero/guest/bins/programs"),
+                current_dir.join("../../crates/adapters/ligero/guest/bins/programs"),
+            ];
+
+            for base_path in &base_paths {
+                for program_name in &program_candidates {
+                    let program_path = base_path.join(program_name);
+                    if !program_path.exists() {
+                        continue;
+                    }
+
+                    // Compute the code commitment for this program
+                    if let Ok(wasm_bytes) = fs::read(&program_path) {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&wasm_bytes);
+                        hasher.update(packing.to_le_bytes());
+                        let computed = LigeroCodeCommitment(hasher.finalize().into());
+
+                        if &computed == commitment {
+                            tracing::info!(
+                                "Found matching program for commitment {}: {}",
+                                hex::encode(commitment.0),
+                                program_path.display()
+                            );
+
+                            // Find shader and verifier
+                            let shader_path = std::env::var("LIGERO_SHADER_PATH")
+                                .ok()
+                                .and_then(|p| canonicalize(&p).ok())
+                                .or_else(|| Self::find_shader_path(&current_dir))
+                                .context("Failed to find shader path")?;
+
+                            let verifier_bin = locate_verifier_binary(program_path.parent())
+                                .context("Failed to locate webgpu_verifier binary")?;
+
+                            return Ok(Some(Self {
+                                program: canonicalize(program_path.to_str().context("Invalid path")?)?,
+                                shader_path,
+                                verifier_bin,
+                                packing,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            Ok(None)
+        }
+
+        fn find_shader_path(current_dir: &std::path::Path) -> Option<PathBuf> {
+            let candidates = vec![
+                current_dir.join("crates/adapters/ligero/bins/macos/shader"),
+                current_dir.join("crates/adapters/ligero/bins/linux-amd64/shader"),
+                current_dir.join("../crates/adapters/ligero/bins/macos/shader"),
+                current_dir.join("../crates/adapters/ligero/bins/linux-amd64/shader"),
+            ];
+
+            candidates.into_iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.to_str().and_then(|s| canonicalize(s).ok()))
         }
 
         pub fn to_config(
