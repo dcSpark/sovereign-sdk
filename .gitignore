@@ -47,3 +47,5 @@ crates/module-system/module-implementations/midnight-privacy/proof.data
 crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
 crates/module-system/module-implementations/midnight-privacy/learn.txt
 crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
+
+.env

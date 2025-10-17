@@ -1,0 +1,15 @@
+{
+  "version": "0.3.0",
+  "unsent_transactions": [],
+  "addresses": {
+    "addresses": [
+      {
+        "address": "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf",
+        "nickname": null,
+        "location": "/Users/agallardol/Documents/github/dcpsark-sovereign-sdk/examples/test-data/keys/token_deployer_private_key.json",
+        "pub_key": "0xf8ad2437a279e1c8932c07358c91dc4fe34864a98c6c25f298e2a0199c1509ff"
+      }
+    ]
+  },
+  "rest_api_url": null
+}
