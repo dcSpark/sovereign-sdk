@@ -1,6 +1,6 @@
 //! Get the default wallet address as a string
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sov_modules_api::{DispatchCall, Spec};
 
 use crate::wallet::WalletContext;
@@ -12,11 +12,8 @@ where
     Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
     S: Spec,
 {
-    let address_entry = wallet
-        .default_address()
-        .context("No default address found in wallet")?;
-
-    Ok(address_entry.address.to_string())
+    let address = wallet.get_address();
+    Ok(address.to_string())
 }
 
 #[cfg(test)]

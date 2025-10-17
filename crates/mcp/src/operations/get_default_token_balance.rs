@@ -29,22 +29,20 @@ where
         .with_context(|| format!("Invalid token ID format: {}", token_id))?;
 
     // Get the default address from wallet
-    let address_entry = wallet
-        .default_address()
-        .context("No default address found in wallet")?;
+    let address = wallet.get_address();
 
     // Query the balance from provider
     let balance = provider
-        .get_balance::<S>(&address_entry.address, &token_id_parsed)
+        .get_balance::<S>(&address, &token_id_parsed)
         .await
         .with_context(|| {
             format!(
                 "Failed to get balance for token {} at address {}",
-                token_id, address_entry.address
+                token_id, address
             )
         })?;
 
-    Ok((address_entry.address.to_string(), balance))
+    Ok((address.to_string(), balance))
 }
 
 #[cfg(test)]

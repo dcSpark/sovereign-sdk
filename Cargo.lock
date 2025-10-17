@@ -3879,6 +3879,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs-next"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4611,7 +4620,7 @@ checksum = "66244a771d9163282646dbeffe0e6eca4dda4146b6498644e678ac6089b11edd"
 dependencies = [
  "cfg-if",
  "const-hex",
- "dirs",
+ "dirs 5.0.1",
  "dunce",
  "ethers-core",
  "glob",
@@ -6976,9 +6985,15 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.4",
+ "base64 0.22.1",
+ "bincode",
+ "borsh",
  "demo-stf",
+ "dirs 6.0.0",
  "dotenvy",
  "envy",
+ "hex",
+ "reqwest 0.12.23",
  "rmcp",
  "serde",
  "serde_json",
@@ -6989,8 +7004,13 @@ dependencies = [
  "sov-mock-da",
  "sov-mock-zkvm",
  "sov-modules-api",
+ "sov-modules-stf-blueprint",
  "sov-node-client",
+ "sov-value-setter-zk",
  "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+ "tracing-test",
  "url",
  "validator",
 ]
@@ -9940,7 +9960,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata 0.19.2",
  "derive_builder",
- "dirs",
+ "dirs 5.0.1",
  "docker-generate",
  "hex",
  "risc0-binfmt",
@@ -13448,7 +13468,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "chrono",
  "clap",
- "dirs",
+ "dirs 5.0.1",
  "sp1-prover",
 ]
 
@@ -13637,7 +13657,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
- "dirs",
+ "dirs 5.0.1",
  "downloader",
  "enum-map",
  "eyre",
@@ -13822,7 +13842,7 @@ dependencies = [
  "aws-sdk-kms",
  "bincode",
  "cfg-if",
- "dirs",
+ "dirs 5.0.1",
  "eventsource-stream",
  "futures",
  "hashbrown 0.14.5",
@@ -14291,7 +14311,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11297baafe5fa0c99d5722458eac6a5e25c01eb1b8e5cd137f54079093daa7a4"
 dependencies = [
- "dirs",
+ "dirs 5.0.1",
  "fs2",
  "hex",
  "once_cell",

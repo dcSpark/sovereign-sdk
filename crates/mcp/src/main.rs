@@ -32,13 +32,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("[mcp] Starting Sovereign SDK MCP Server");
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
-    tracing::info!("[mcp] Loading wallet from: {}", cfg.wallet_path.display());
+    tracing::info!("[mcp] Initializing wallet from private key...");
 
-    // Load wallet context (keys and addresses only)
-    let wallet_ctx = WalletContext::load(&cfg.wallet_path)?;
-    if let Some(addr) = wallet_ctx.default_address() {
-        tracing::info!("[mcp] Default wallet address: {}", addr.address);
-    }
+    // Create wallet from private key hex string (no files needed!)
+    let wallet_ctx = WalletContext::from_private_key_hex(&cfg.wallet_private_key)?;
+    let wallet_address = wallet_ctx.get_address();
+    tracing::info!("[mcp] Wallet address: {}", wallet_address);
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
     // Initialize RPC provider (separate from wallet)

@@ -12,9 +12,10 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub mcp_server_bind_address: String,
 
-    /// Path to wallet state JSON file (env: WALLET_PATH, required)
-    #[validate(custom(function = "validate_file_exists"))]
-    pub wallet_path: PathBuf,
+    /// Wallet private key as hex string (env: WALLET_PRIVATE_KEY, required)
+    /// No files needed! Just provide the private key hex string.
+    #[validate(length(min = 1))]
+    pub wallet_private_key: String,
 
     /// Sovereign SDK rollup RPC endpoint (env: ROLLUP_RPC_URL, required)
     #[validate(custom(function = "validate_http_url"))]
