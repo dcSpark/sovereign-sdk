@@ -31,7 +31,11 @@ pub struct Model {
     /// Whether the transaction signature verified successfully.
     pub signature_valid: bool,
     /// Whether the zero-knowledge proof verified successfully.
-    pub proof_verified: bool,
+    /// - `Some(true)`: has proof and verified correctly
+    /// - `Some(false)`: has proof but verification failed
+    /// - `None`: transaction doesn't have a proof (e.g., deposits)
+    #[sea_orm(nullable)]
+    pub proof_verified: Option<bool>,
     /// JSON representation of the transaction call message with proof replaced by "REMOVED".
     #[sea_orm(column_type = "Text")]
     pub transaction_data: String,

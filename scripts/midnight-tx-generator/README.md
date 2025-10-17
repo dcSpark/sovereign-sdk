@@ -43,6 +43,30 @@ This will:
 DEPOSIT_AMOUNT=200 WITHDRAW_AMOUNT=150 ./scripts/midnight-tx-generator/deposit_and_withdraw.sh
 ```
 
+### With Proof Verifier Service
+
+The script automatically sends transactions to both the sequencer and the proof-verifier service (if running):
+
+```bash
+# Start the proof-verifier service (in a separate terminal)
+cd target/release
+./proof-verifier \
+  --bind 127.0.0.1:8080 \
+  --node-rpc-url http://127.0.0.1:12346 \
+  --signing-key-path ../../examples/test-data/keys/token_deployer_private_key.json \
+  --da-connection-string "postgres://user:password@localhost/midnight_da"
+
+# Run the script (sends to both endpoints automatically)
+./scripts/midnight-tx-generator/deposit_and_withdraw.sh
+```
+
+The script behavior:
+- ✅ Sends deposits to both sequencer and verifier service
+- ✅ Sends withdrawals to both sequencer and verifier service
+- ✅ Verifier verifies withdrawal proofs off-chain and caches results
+- ✅ Verifier stores deposit data for monitoring
+- ✅ Continues even if verifier service is not running
+
 ## Building
 
 ```bash
@@ -132,11 +156,27 @@ cd scripts/midnight-tx-generator
 **Environment Variables:**
 
 ```bash
-DEPOSIT_AMOUNT=100          # Amount to deposit (default: 100)
-WITHDRAW_AMOUNT=50          # Amount to withdraw (default: 50)
-RECIPIENT=sov1v870par...    # Recipient address
-PRIVATE_KEY_FILE=...        # Path to private key JSON
+DEPOSIT_AMOUNT=100              # Amount to deposit (default: 100)
+WITHDRAW_AMOUNT=50              # Amount to withdraw (default: 50)
+RECIPIENT=sov1v870par...        # Recipient address
+PRIVATE_KEY_FILE=...            # Path to private key JSON
+
+# Endpoint configuration
+SEQUENCER_ENDPOINT=...          # Override sequencer URL (default: localhost:12346/sequencer/txs)
+VERIFIER_ENDPOINT=...           # Override verifier URL (default: localhost:8080/midnight-privacy)
 ```
+
+**How Endpoints Work:**
+
+The script sends transactions as follows:
+1. **Deposits** - Both sequencer (primary) and verifier service (secondary)
+   - Sequencer response is used to extract position and anchor root
+   - Verifier service stores deposit data for monitoring
+2. **Withdrawals** - Both sequencer (primary) and verifier service (secondary)
+   - Sequencer response is used to confirm transaction
+   - Verifier service verifies proof off-chain and caches result
+
+If the verifier service is not running, the script continues normally.
 
 ## Transaction Structure
 
@@ -356,12 +396,29 @@ The rollup must be initialized with the correct `method_id`:
 
 ### Endpoints
 
-- **Sequencer:** `POST http://localhost:12346/sequencer/txs`
-  - Submit transactions to the rollup
-  - Returns transaction receipt with events
+The script sends transactions to both endpoints:
 
-- **State Queries:** `GET http://localhost:12346/state/midnight_privacy/{field}`
+#### Primary: Sequencer
+
+- **Endpoint:** `POST http://localhost:12346/sequencer/txs`
+  - Receives transaction directly
+  - Returns transaction receipt with events
+  - Script uses this response to extract position and anchor root
+
+#### Secondary: Verifier Service
+
+- **Endpoint:** `POST http://localhost:8080/midnight-privacy`
+  - Receives both deposit and withdrawal transactions
+  - For **deposits**: Verifies signature and stores data for monitoring
+  - For **withdrawals**: Verifies proofs off-chain and caches results in database
+  - Response is not used by the script
+  - Script continues even if verifier is not running
+
+#### State Queries
+
+- **Module State:** `GET http://localhost:12346/state/midnight_privacy/{field}`
   - Query module state (tree size, roots, etc.)
+  - Example: `/state/midnight_privacy/method_id`
 
 ## Development
 

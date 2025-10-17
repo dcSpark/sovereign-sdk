@@ -413,7 +413,7 @@ async fn verify_and_record_midnight_handler(
     let start = std::time::Instant::now();
     let mut metrics = VerificationMetrics::default();
 
-    info!("Received midnight withdrawal verification request");
+    info!("Received midnight transaction verification request");
 
     let _permit = state
         .verification_semaphore
@@ -432,70 +432,118 @@ async fn verify_and_record_midnight_handler(
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
             ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e))
         })?;
-    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
-        parse_midnight_withdraw_call(&tx)?;
+    
+    let parsed_call = parse_midnight_call(&tx)?;
     metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
-
-    debug!(
-        "Parsed midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, proof_size={} bytes",
-        hex::encode(nullifier),
-        hex::encode(anchor_root),
-        withdraw_amount,
-        proof_bytes.len()
-    );
 
     let signature_start = std::time::Instant::now();
     verify_midnight_transaction_signature(&tx)?;
     metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
 
-    let proof_start = std::time::Instant::now();
-    let proof_public = verify_midnight_withdraw_proof(
-        state.config.midnight_method_id.as_ref(),
-        &proof_bytes,
-        anchor_root,
-        nullifier,
-        withdraw_amount,
-    )
-    .await?;
-    metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
-
     let tx_hash = tx.hash().to_string();
-    
-    // Create transaction data without proof bytes
     let transaction_data = create_transaction_without_proof(&tx)?;
 
-    let persist_start = std::time::Instant::now();
-    store_verified_midnight_transaction(
-        state.da_conn.as_ref(),
-        &tx_hash,
-        &proof_public,
-        true,
-        true,
-        &transaction_data,
-        &req.body, // Full transaction blob (base64)
-    )
-    .await?;
-    metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
-    metrics.node_submit_ms = 0.0;
+    match parsed_call {
+        ParsedMidnightCall::Deposit { amount, rho, recipient } => {
+            // Deposits don't have proofs, so we just verify signature and store
+            debug!(
+                "Parsed midnight deposit: amount={}, rho=0x{}, recipient=0x{}",
+                amount,
+                hex::encode(&rho[..8]),
+                hex::encode(&recipient[..8])
+            );
 
-    metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let persist_start = std::time::Instant::now();
+            store_verified_midnight_transaction(
+                state.da_conn.as_ref(),
+                &tx_hash,
+                None, // No proof outputs for deposits
+                true, // signature_valid
+                None, // proof_verified: NULL (transaction doesn't have a proof)
+                &transaction_data,
+                &req.body,
+            )
+            .await?;
+            metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+            metrics.proof_verify_ms = 0.0;
+            metrics.node_submit_ms = 0.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    info!(
-        "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}, total_time={:.2}ms",
-        hex::encode(nullifier),
-        hex::encode(anchor_root),
-        withdraw_amount,
-        recipient,
-        tx_hash,
-        metrics.total_ms
-    );
+            info!(
+                "✓ Stored verified midnight deposit: amount={}, rho=0x{}, hash={}, total_time={:.2}ms",
+                amount,
+                hex::encode(&rho[..8]),
+                tx_hash,
+                metrics.total_ms
+            );
 
-    Ok(Json(VerifyAndSubmitResponse {
-        success: true,
-        tx_hash: Some(tx_hash),
-        error: None,
-        metrics,
-    }))
+            Ok(Json(VerifyAndSubmitResponse {
+                success: true,
+                tx_hash: Some(tx_hash),
+                error: None,
+                metrics,
+            }))
+        }
+        ParsedMidnightCall::Withdraw {
+            proof,
+            anchor_root,
+            nullifier,
+            withdraw_amount,
+            to,
+        } => {
+            // Withdrawals have proofs that need verification
+            debug!(
+                "Parsed midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, proof_size={} bytes",
+                hex::encode(nullifier),
+                hex::encode(anchor_root),
+                withdraw_amount,
+                proof.len()
+            );
+
+            let proof_start = std::time::Instant::now();
+            let proof_public = verify_midnight_withdraw_proof(
+                state.config.midnight_method_id.as_ref(),
+                &proof,
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+            )
+            .await?;
+            metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
+
+            let persist_start = std::time::Instant::now();
+            store_verified_midnight_transaction(
+                state.da_conn.as_ref(),
+                &tx_hash,
+                Some(&proof_public), // Proof outputs from verification
+                true,                 // signature_valid
+                Some(true),          // proof_verified: true (has proof and verified correctly)
+                &transaction_data,
+                &req.body,
+            )
+            .await?;
+            metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+            metrics.node_submit_ms = 0.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            info!(
+                "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}, total_time={:.2}ms",
+                hex::encode(nullifier),
+                hex::encode(anchor_root),
+                withdraw_amount,
+                to,
+                tx_hash,
+                metrics.total_ms
+            );
+
+            Ok(Json(VerifyAndSubmitResponse {
+                success: true,
+                tx_hash: Some(tx_hash),
+                error: None,
+                metrics,
+            }))
+        }
+    }
 }
 
 /// Parse value-setter-zk transaction to extract value and proof
@@ -783,6 +831,61 @@ fn create_value_setter_tx_bytes(
     Ok(tx_bytes)
 }
 
+/// Parsed midnight transaction data
+enum ParsedMidnightCall {
+    Deposit {
+        amount: u128,
+        rho: MidnightHash32,
+        recipient: MidnightHash32,
+    },
+    Withdraw {
+        proof: Vec<u8>,
+        anchor_root: MidnightHash32,
+        nullifier: MidnightHash32,
+        withdraw_amount: u128,
+        to: <RollupSpec as Spec>::Address,
+    },
+}
+
+fn parse_midnight_call(
+    tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
+) -> Result<ParsedMidnightCall, ServiceError> {
+    match tx.runtime_call() {
+        RuntimeCall::MidnightPrivacy(call) => match call.clone() {
+            MidnightCallMessage::Deposit {
+                amount,
+                rho,
+                recipient,
+                ..
+            } => Ok(ParsedMidnightCall::Deposit {
+                amount,
+                rho,
+                recipient,
+            }),
+            MidnightCallMessage::Withdraw {
+                proof,
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+                to,
+                ..
+            } => Ok(ParsedMidnightCall::Withdraw {
+                proof: proof.into(),
+                anchor_root,
+                nullifier,
+                withdraw_amount,
+                to,
+            }),
+            other => Err(ServiceError::UnsupportedCall(format!(
+                "Unsupported midnight_privacy call: {other:?}"
+            ))),
+        },
+        other => Err(ServiceError::UnsupportedCall(format!(
+            "Expected midnight_privacy call, got {other:?}"
+        ))),
+    }
+}
+
 fn parse_midnight_withdraw_call(
     tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
 ) -> Result<
@@ -795,23 +898,17 @@ fn parse_midnight_withdraw_call(
     ),
     ServiceError,
 > {
-    match tx.runtime_call() {
-        RuntimeCall::MidnightPrivacy(call) => match call.clone() {
-            MidnightCallMessage::Withdraw {
-                proof,
-                anchor_root,
-                nullifier,
-                withdraw_amount,
-                to,
-                ..
-            } => Ok((proof.into(), anchor_root, nullifier, withdraw_amount, to)),
-            other => Err(ServiceError::UnsupportedCall(format!(
-                "Unsupported midnight_privacy call: {other:?}"
-            ))),
-        },
-        other => Err(ServiceError::UnsupportedCall(format!(
-            "Expected midnight_privacy::Withdraw call, got {other:?}"
-        ))),
+    match parse_midnight_call(tx)? {
+        ParsedMidnightCall::Withdraw {
+            proof,
+            anchor_root,
+            nullifier,
+            withdraw_amount,
+            to,
+        } => Ok((proof, anchor_root, nullifier, withdraw_amount, to)),
+        ParsedMidnightCall::Deposit { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got Deposit".to_string(),
+        )),
     }
 }
 
@@ -1011,9 +1108,9 @@ fn create_transaction_without_proof(
 async fn store_verified_midnight_transaction(
     conn: &DatabaseConnection,
     tx_hash: &str,
-    proof_output: &SpendPublic,
+    proof_output: Option<&SpendPublic>,
     signature_valid: bool,
-    proof_verified: bool,
+    proof_verified: Option<bool>,
     transaction_data: &str,
     full_transaction_blob: &str,
 ) -> Result<(), ServiceError> {
@@ -1022,10 +1119,14 @@ async fn store_verified_midnight_transaction(
         TransactionState,
     };
 
-    // Serialize proof outputs to JSON
-    let proof_outputs_json = serde_json::to_string(proof_output).map_err(|err| {
-        ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
-    })?;
+    // Serialize proof outputs to JSON (empty object if no proof)
+    let proof_outputs_json = if let Some(proof) = proof_output {
+        serde_json::to_string(proof).map_err(|err| {
+            ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
+        })?
+    } else {
+        "{}".to_string()
+    };
 
     VerifiedEntity::insert(VerifiedActiveModel {
         tx_hash: Set(tx_hash.to_owned()),
@@ -1399,12 +1500,12 @@ mod tests {
             output_commitments: vec![],
         };
 
-        store_verified_midnight_transaction(&conn, &tx_hash, &proof_public, true, true, &tx_json, full_blob)
+        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob)
             .await
             .unwrap();
 
         proof_public.withdraw_amount = 99;
-        store_verified_midnight_transaction(&conn, &tx_hash, &proof_public, true, true, &tx_json, full_blob)
+        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob)
             .await
             .unwrap();
 
@@ -1416,7 +1517,7 @@ mod tests {
         let record = &stored[0];
         assert_eq!(record.tx_hash, tx_hash);
         assert!(record.signature_valid);
-        assert!(record.proof_verified);
+        assert_eq!(record.proof_verified, Some(true));
         
         // Verify proof outputs are stored as JSON
         let proof_outputs: SpendPublic = serde_json::from_str(&record.proof_outputs).unwrap();
@@ -1424,6 +1525,45 @@ mod tests {
         assert_eq!(proof_outputs.anchor_root, proof_public.anchor_root);
         assert_eq!(proof_outputs.nullifier, proof_public.nullifier);
         assert_eq!(record.transaction_data, tx_json);
+    }
+
+    #[tokio::test]
+    async fn test_store_deposit_transaction_without_proof() {
+        let mut opts = ConnectOptions::new("sqlite::memory:".to_string());
+        opts.max_connections(1).sqlx_logging(false);
+        let conn = Database::connect(opts).await.unwrap();
+        setup_midnight_da_db(&conn).await.unwrap();
+
+        let tx_hash = "0xdeposit123";
+        let transaction_data = r#"{"deposit":{"amount":"100","rho":"0x01...","recipient":"0x02...","gas":null}}"#;
+        let full_blob = "base64encodeddeposittransaction";
+
+        // Store deposit with no proof
+        store_verified_midnight_transaction(
+            &conn,
+            tx_hash,
+            None,       // No proof outputs for deposits
+            true,       // signature_valid
+            None,       // proof_verified: NULL (transaction doesn't have a proof)
+            transaction_data,
+            full_blob,
+        )
+        .await
+        .unwrap();
+
+        let stored = worker_verified_transactions::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        
+        let record = &stored[0];
+        assert_eq!(record.tx_hash, tx_hash);
+        assert!(record.signature_valid, "Signature should be valid");
+        assert_eq!(record.proof_verified, None, "proof_verified should be NULL for deposits");
+        assert_eq!(record.proof_outputs, "{}", "proof_outputs should be empty JSON for deposits");
+        assert_eq!(record.transaction_data, transaction_data);
+        assert_eq!(record.full_transaction_blob, full_blob);
     }
 
     #[tokio::test]
@@ -1570,9 +1710,9 @@ mod tests {
         store_verified_midnight_transaction(
             &conn,
             &tx_hash,
-            &simulated_proof_output,
-            true,  // signature_valid
-            true,  // proof_verified
+            Some(&simulated_proof_output),
+            true,          // signature_valid
+            Some(true),    // proof_verified (has proof and verified)
             &transaction_data,
             &tx_base64, // full transaction blob
         )
@@ -1593,7 +1733,7 @@ mod tests {
         // Verify all fields
         assert_eq!(record.tx_hash, tx_hash, "Transaction hash should match");
         assert!(record.signature_valid, "Signature should be marked valid");
-        assert!(record.proof_verified, "Proof should be marked verified");
+        assert_eq!(record.proof_verified, Some(true), "Proof should be marked verified");
         assert_eq!(record.full_transaction_blob, tx_base64, "Full blob should match");
         
         // Verify proof outputs stored as JSON
@@ -1624,9 +1764,9 @@ mod tests {
         store_verified_midnight_transaction(
             &conn,
             &tx_hash,
-            &updated_proof_output,
+            Some(&updated_proof_output),
             true,
-            true,
+            Some(true),
             &transaction_data,
             &tx_base64,
         )

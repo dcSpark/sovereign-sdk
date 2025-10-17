@@ -17,12 +17,18 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-50}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
+# Endpoints - always send to sequencer (primary) and verifier service (secondary)
+SEQUENCER_ENDPOINT="${SEQUENCER_ENDPOINT:-http://localhost:12346/sequencer/txs}"
+VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
+
 echo -e "${BLUE}=== Midnight Privacy: Deposit + Withdraw Flow ===${NC}\n"
 echo "Parameters:"
 echo "  Deposit: $DEPOSIT_AMOUNT"
 echo "  Withdraw: $WITHDRAW_AMOUNT"
 echo "  Change: $((DEPOSIT_AMOUNT - WITHDRAW_AMOUNT)) (stays shielded)"
 echo "  Nonce: $NONCE"
+echo "  Sequencer: $SEQUENCER_ENDPOINT"
+echo "  Verifier: $VERIFIER_ENDPOINT"
 echo ""
 
 # Build generators if needed
@@ -41,11 +47,11 @@ cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
 
-# Send using file to avoid argument length limits
+# Send deposit to sequencer (primary)
 DEPOSIT_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \
   -d @"$GENERATOR_DIR/midnight_deposit_tx.json" \
-  http://localhost:12346/sequencer/txs)
+  "$SEQUENCER_ENDPOINT")
 
 echo "$DEPOSIT_RESPONSE" | jq '.' 2>/dev/null || echo "$DEPOSIT_RESPONSE"
 
@@ -53,6 +59,12 @@ if echo "$DEPOSIT_RESPONSE" | grep -q '"status":400'; then
     echo -e "${RED}✗ Deposit failed${NC}"
     exit 1
 fi
+
+# Also send deposit to verifier service (for monitoring/caching)
+curl -s -4 -X POST \
+  -H "Content-Type: application/json" \
+  -d @"$GENERATOR_DIR/midnight_deposit_tx.json" \
+  "$VERIFIER_ENDPOINT" > /dev/null 2>&1 &
 
 # Extract position and anchor root from deposit response
 NOTE_POSITION=$(echo "$DEPOSIT_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.position')
@@ -272,11 +284,11 @@ cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/withdraw-with-tree" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
-# Send withdrawal using file (transaction is too large for command line)
+# Send withdrawal to sequencer (primary)
 WITHDRAW_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \
   -d @"$GENERATOR_DIR/midnight_withdraw_tx.json" \
-  http://localhost:12346/sequencer/txs)
+  "$SEQUENCER_ENDPOINT")
 
 echo "$WITHDRAW_RESPONSE" | jq '.' 2>/dev/null || echo "$WITHDRAW_RESPONSE"
 
@@ -284,6 +296,12 @@ if echo "$WITHDRAW_RESPONSE" | grep -q '"status":400'; then
     echo -e "${RED}✗ Withdrawal failed${NC}"
     exit 1
 fi
+
+# Also send withdrawal to verifier service (has proof, verifier supports this)
+curl -s -4 -X POST \
+  -H "Content-Type: application/json" \
+  -d @"$GENERATOR_DIR/midnight_withdraw_tx.json" \
+  "$VERIFIER_ENDPOINT" > /dev/null 2>&1 &
 
 echo -e "${GREEN}✓ Withdrawal sent${NC}\n"
 echo -e "${GREEN}=== Success! ===${NC}"
