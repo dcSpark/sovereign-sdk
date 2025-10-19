@@ -90,4 +90,8 @@ echo ""
 
 # Run the ligero rollup from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
+
+# Create demo_data directory if it doesn't exist (required for SQLite DB)
+mkdir -p demo_data
+
 exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
