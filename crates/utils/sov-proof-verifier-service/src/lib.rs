@@ -1018,28 +1018,27 @@ fn create_transaction_without_proof(
     match tx.runtime_call() {
         RuntimeCall::MidnightPrivacy(call) => {
             let call_json = match call.clone() {
-                MidnightCallMessage::CreateNote { note, gas } => {
-                    serde_json::json!({
-                        "create_note": {
-                            "note": note,
-                            "gas": gas
-                        }
-                    })
-                }
-                MidnightCallMessage::SpendNote { gas, .. } => {
-                    serde_json::json!({
-                        "spend_note": {
-                            "proof": "REMOVED",
-                            "gas": gas
-                        }
-                    })
-                }
                 MidnightCallMessage::Deposit { amount, rho, recipient, gas } => {
                     serde_json::json!({
                         "deposit": {
                             "amount": amount.to_string(),
                             "rho": hex::encode(rho),
                             "recipient": format!("{:?}", recipient),
+                            "gas": gas
+                        }
+                    })
+                }
+                MidnightCallMessage::Transfer {
+                    anchor_root,
+                    nullifier,
+                    gas,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "transfer": {
+                            "proof": "REMOVED",
+                            "anchor_root": hex::encode(anchor_root),
+                            "nullifier": hex::encode(nullifier),
                             "gas": gas
                         }
                     })

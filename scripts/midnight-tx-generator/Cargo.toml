@@ -26,7 +26,7 @@ sov-modules-api = { path = "../../crates/module-system/sov-modules-api" }
 sov-modules-rollup-blueprint = { path = "../../crates/module-system/sov-modules-rollup-blueprint" }
 sov-cli = { path = "../../crates/module-system/sov-cli" }
 demo-stf = { path = "../../examples/demo-rollup/stf", features = ["native"] }
-sov-demo-rollup = { path = "../../examples/demo-rollup" }
+sov-rollup-ligero = { path = "../../examples/rollup-ligero" }
 midnight-privacy = { path = "../../crates/module-system/module-implementations/midnight-privacy", features = ["native"] }
 sov-test-utils = { path = "../../crates/module-system/sov-test-utils" }
 sov-ligero-adapter = { path = "../../crates/adapters/ligero", features = ["native"] }
@@ -36,3 +36,11 @@ sov-rollup-interface = { path = "../../crates/rollup-interface" }
 [[bin]]
 name = "withdraw-with-tree"
 path = "src/withdraw_with_tree.rs"
+
+[[bin]]
+name = "transfer-generator"
+path = "/tmp/transfer_generator.rs"
+
+[[bin]]
+name = "withdraw-generator"
+path = "/tmp/withdraw_generator.rs"

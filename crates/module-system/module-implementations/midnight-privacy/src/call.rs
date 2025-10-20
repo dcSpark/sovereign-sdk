@@ -5,11 +5,11 @@ use schemars::JsonSchema;
 use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
 use thiserror::Error;
+use tracing::{debug, info};
 
 use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
 use crate::event::Event;
 use crate::hash::{note_commitment, Hash32, RootKey};
-use crate::types::Note;
 
 #[cfg(feature = "native")]
 use anyhow::anyhow;
@@ -26,29 +26,10 @@ use crate::types::SpendPublic;
 #[schemars(bound = "S::Gas: ::schemars::JsonSchema", rename = "CallMessage")]
 #[serde(rename_all = "snake_case")]
 pub enum CallMessage<S: Spec> {
-    /// Create a new note commitment and add it to the tree.
-    CreateNote {
-        /// The note to create
-        note: Note,
-        /// Gas to charge. Don't charge gas if None.
-        gas: Option<S::Gas>,
-    },
-
-    /// Spend a note by providing a ZK proof and consuming its nullifier.
-    /// The proof must demonstrate:
-    /// 1. Knowledge of a note commitment in the tree
-    /// 2. A valid Merkle path from the note to an anchor root
-    /// 3. Proper nullifier derivation
-    SpendNote {
-        /// Serialized Ligero proof package (bincode-encoded)
-        /// Note: Ligero proofs are typically 2-4MB in size
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
-        /// Gas to charge. Don't charge gas if None.
-        gas: Option<S::Gas>,
-    },
-
-    /// Deposit tokens into the pool and create a note commitment.
-    /// Moves `amount` of the native token from sender into the pool.
+    /// Deposit: Put money INTO the privacy pool (Transparent → Shielded).
+    ///
+    /// Moves `amount` of the native token from sender into the shielded pool,
+    /// creating a single note commitment.
     Deposit {
         /// Amount to deposit
         amount: u128,
@@ -60,16 +41,64 @@ pub enum CallMessage<S: Spec> {
         gas: Option<S::Gas>,
     },
 
-    /// Withdraw tokens from the pool after verifying a ZK proof.
-    /// The proof must bind the withdrawal amount to prevent draining attacks.
+    /// Transfer: Move money WITHIN the privacy pool (Shielded → Shielded).
     ///
-    /// SECURITY: anchor_root, nullifier, and withdraw_amount are passed as explicit
-    /// transaction fields (NOT extracted from public_output) and are validated by the guest.
+    /// This is the pure privacy-preserving transaction that atomically:
+    /// 1. Verifies a ZK proof
+    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 3. Creates output note commitments from the proof
+    ///
+    /// The proof demonstrates:
+    /// - Knowledge of a note in the tree (via Merkle path)
+    /// - Proper nullifier derivation
+    /// - Value conservation: input_value = sum(output_values)
+    ///
+    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// (NOT extracted from public_output) and are validated by the guest.
     /// This prevents public-output tampering attacks.
+    ///
+    /// # Examples
+    ///
+    /// - Split 1000 → 600 + 400 (two outputs)
+    /// - Consolidate multiple notes into one
+    /// - Send shielded payment to another recipient
+    Transfer {
+        /// Serialized Ligero proof package (bincode-encoded)
+        /// Note: Ligero proofs are typically 2-4MB in size
+        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        /// Anchor root that the proof is bound to (must be valid historical root)
+        anchor_root: Hash32,
+        /// Nullifier that the proof derives (must be fresh)
+        nullifier: Hash32,
+        /// Gas to charge. Don't charge gas if None.
+        gas: Option<S::Gas>,
+    },
+
+    /// Withdraw: Take money OUT of the privacy pool (Shielded → Transparent).
+    ///
+    /// This call atomically:
+    /// 1. Verifies a ZK proof
+    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 3. Creates output note commitments from the proof (for change/split)
+    /// 4. Transfers transparent tokens to the recipient
+    ///
+    /// The proof demonstrates:
+    /// - Knowledge of a note in the tree
+    /// - Proper nullifier derivation
+    /// - Value conservation: input_value = sum(output_values) + withdraw_amount
+    ///
+    /// SECURITY: anchor_root, nullifier, and withdraw_amount are explicit transaction
+    /// fields validated by the guest to prevent tampering.
+    ///
+    /// # Examples
+    ///
+    /// - Full withdrawal: Input 1000 → Withdraw 1000 (no outputs)
+    /// - Partial withdrawal: Input 1000 → Withdraw 600 + Change 400 (one output)
     Withdraw {
         /// Serialized Ligero proof package (bincode-encoded)
+        /// Note: Ligero proofs are typically 2-4MB in size
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
-        /// Anchor root that the proof is bound to (must be in recent roots window)
+        /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
         /// Nullifier that the proof derives (must be fresh)
         nullifier: Hash32,
@@ -131,108 +160,35 @@ pub enum MidnightPrivacyError<S: Spec> {
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     PublicOutputMismatch,
 
-    /// Value-burning spend attempt (nullifier-only with no outputs or withdrawal).
-    #[error("Cannot consume nullifier without value movement: must either withdraw transparently or create output notes")]
-    #[cfg_attr(not(feature = "native"), allow(dead_code))]
-    ValueBurningSpend,
+    /// Number of output commitments in proof exceeds maximum allowed
+    #[error("Too many output commitments: {0} (max: {1})")]
+    TooManyOutputs(usize, usize),
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
-    #[cfg(feature = "native")]
-    fn apply_verified_withdraw(
+    /// Internal helper: Add a single commitment to the tree.
+    /// Used by deposit() and transfer() to append note commitments.
+    fn add_commitment(
         &mut self,
-        public: &SpendPublic,
-        anchor_root: Hash32,
-        nullifier: Hash32,
-        withdraw_amount: u128,
-        to: S::Address,
-        st: &mut impl TxState<S>,
-    ) -> Result<()> {
-        if public.anchor_root != anchor_root
-            || public.nullifier != nullifier
-            || public.withdraw_amount != withdraw_amount
-        {
-            return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
-        }
-
-        if !self.is_valid_anchor(&public.anchor_root, st)? {
-            return Err(MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into());
-        }
-
-        let nk = NullifierKey(public.nullifier);
-        if self.nullifier_set.get(&nk, st)?.is_some() {
-            return Err(MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into());
-        }
-        self.nullifier_set.set(&nk, &true, st)?;
-
-        use sov_bank::IntoPayable;
-        let token_id = self.token_id.get_or_err(st)??;
-
-        let amount_u64: u64 = public
-            .withdraw_amount
-            .try_into()
-            .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
-        let bank_amount = sov_bank::Amount::from(amount_u64);
-
-        let coins = sov_bank::Coins {
-            amount: bank_amount,
-            token_id,
-        };
-        self.bank
-            .transfer_from(self.id.to_payable(), &to, coins, st)?;
-
-        self.emit_event(
-            st,
-            Event::NoteSpent {
-                nullifier: public.nullifier,
-                anchor_root: public.anchor_root,
-            },
-        );
-        self.emit_event(
-            st,
-            Event::PoolWithdraw {
-                amount: public.withdraw_amount,
-                nullifier: public.nullifier,
-                anchor_root: public.anchor_root,
-            },
-        );
-
-        Ok(())
-    }
-    /// Create a new note commitment and add it to the Merkle tree.
-    pub(crate) fn create_note(
-        &mut self,
-        mut note: Note,
-        gas: Option<S::Gas>,
-        _context: &Context<S>,
+        commitment: Hash32,
         state: &mut impl TxState<S>,
-    ) -> Result<()> {
-        // Charge gas first
-        let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
-        state.charge_gas(&gas)?;
-
-        // Force the note domain to match configured domain (defense-in-depth)
-        note.domain = self.domain.get_or_err(state)??;
-
+    ) -> Result<(u64, Hash32)> {
         // Get current tree and position
         let mut tree = self.commitment_tree.get_or_err(state)??;
-        let next_position = self.next_position.get_or_err(state)??;
+        let position = self.next_position.get_or_err(state)??;
 
         // Check if tree is full
-        if next_position >= tree.len() as u64 {
+        if position >= tree.len() as u64 {
             return Err(MidnightPrivacyError::<S>::TreeFull(tree.len()).into());
         }
 
-        // Compute note commitment
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
-
         // Add to tree
-        tree.set_leaf(next_position as usize, cm);
+        tree.set_leaf(position as usize, commitment);
         let new_root = tree.root();
 
         // Update state
         self.commitment_tree.set(&tree, state)?;
-        self.next_position.set(&(next_position + 1), state)?;
+        self.next_position.set(&(position + 1), state)?;
 
         // 1) Add root to recent roots window (fast mempool checks)
         self.add_recent_root(new_root, state)?;
@@ -243,13 +199,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.emit_event(
             state,
             Event::NoteCreated {
-                commitment: cm,
-                position: next_position,
+                commitment,
+                position,
                 new_root,
             },
         );
 
-        Ok(())
+        Ok((position, new_root))
     }
 
     /// Deposit: transfer tokens into the pool, append commitment, update root window.
@@ -281,25 +237,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.bank
             .transfer_from(ctx.sender(), self.id.to_payable(), coins, st)?;
 
-        // Build note using the configured domain
+        // Compute commitment and add to tree
         let domain = self.domain.get_or_err(st)??;
-        let note = Note {
-            domain,
-            value: amount,
-            rho,
-            recipient,
-        };
-
-        // Reuse create_note to append to the tree + emit events
-        self.create_note(note, Some(gas), ctx, st)?;
+        let cm = note_commitment(&domain, amount, &rho, &recipient);
+        let (position, new_root) = self.add_commitment(cm, st)?;
 
         // Emit explicit pool deposit event
-        let cm = note_commitment(&domain, amount, &rho, &recipient);
-        let next_pos = self.next_position.get_or_err(st)??;
-        let position = next_pos.saturating_sub(1);
-        let tree = self.commitment_tree.get_or_err(st)??;
-        let new_root = tree.root();
-
         self.emit_event(
             st,
             Event::PoolDeposit {
@@ -313,13 +256,119 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(())
     }
 
-    /// Withdraw: verify proof, consume nullifier, and transfer native token out.
+    /// Transfer: Move money WITHIN the privacy pool (pure shielded transaction).
     ///
-    /// SECURITY NOTE (Option A - explicit transaction fields):
-    /// The anchor_root, nullifier, and withdraw_amount are taken from TRANSACTION ARGUMENTS,
-    /// not from the proof's public_output. The guest program verifies these values match its
-    /// computations. This prevents "unbound journal" attacks where an attacker could tamper
-    /// with public_output while keeping a valid proof.
+    /// This method atomically:
+    /// 1. Verifies a ZK proof
+    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 3. Creates output note commitments from the proof
+    ///
+    /// All value stays shielded. For transparent withdrawals, use `withdraw()`.
+    ///
+    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// and validated against the proof to prevent tampering.
+    pub(crate) fn transfer(
+        &mut self,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        gas: Option<S::Gas>,
+        _ctx: &Context<S>,
+        st: &mut impl TxState<S>,
+    ) -> Result<()> {
+        let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
+        st.charge_gas(&gas)?;
+
+        #[cfg(not(feature = "native"))]
+        {
+            anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
+        }
+
+        #[cfg(feature = "native")]
+        {
+            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+
+            let method_id_bytes = self
+                .method_id
+                .get(st)?
+                .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
+
+            let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
+                .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
+
+            // Verify the proof and extract public output
+            let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
+                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+
+            // SECURITY: Bind transaction fields to proof-committed values
+            if public.anchor_root != anchor_root || public.nullifier != nullifier {
+                return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+            }
+
+            // Ensure this is a pure shielded transfer (no withdrawal)
+            if public.withdraw_amount != 0 {
+                return Err(anyhow!(
+                    "Transfer must have withdraw_amount = 0. Use Withdraw call for transparent outputs."
+                )
+                .into());
+            }
+
+            // Limit outputs to prevent DoS
+            const MAX_OUTPUTS: usize = 16;
+            if public.output_commitments.len() > MAX_OUTPUTS {
+                return Err(MidnightPrivacyError::<S>::TooManyOutputs(
+                    public.output_commitments.len(),
+                    MAX_OUTPUTS,
+                )
+                .into());
+            }
+
+            // 1) Validate anchor root
+            if !self.is_valid_anchor(&public.anchor_root, st)? {
+                return Err(
+                    MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into(),
+                );
+            }
+
+            // 2) Consume nullifier
+            let nk = NullifierKey(public.nullifier);
+            if self.nullifier_set.get(&nk, st)?.is_some() {
+                return Err(
+                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
+                );
+            }
+            self.nullifier_set.set(&nk, &true, st)?;
+
+            // 3) Add all output commitments to the tree
+            for cm in &public.output_commitments {
+                let (_pos, _root) = self.add_commitment(*cm, st)?;
+            }
+
+            // Emit spent event
+            self.emit_event(
+                st,
+                Event::NoteSpent {
+                    nullifier: public.nullifier,
+                    anchor_root: public.anchor_root,
+                },
+            );
+
+            Ok(())
+        }
+    }
+
+    /// Withdraw: Take money OUT of the privacy pool (shielded → transparent).
+    ///
+    /// This method atomically:
+    /// 1. Verifies a ZK proof
+    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 3. Creates output note commitments from the proof (for change)
+    /// 4. Transfers transparent tokens to the recipient
+    ///
+    /// SECURITY: anchor_root, nullifier, and withdraw_amount are explicit transaction
+    /// fields validated against the proof to prevent tampering.
     pub(crate) fn withdraw(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
@@ -335,7 +384,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         st.charge_gas(&gas)?;
 
-        // Verify proof and validate explicit transaction fields
         #[cfg(not(feature = "native"))]
         {
             anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
@@ -346,16 +394,25 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
-            if let Some(public) = ctx.get_sender_credential::<PreVerifiedWithdrawCredential>() {
-                self.apply_verified_withdraw(
-                    &public.0,
-                    anchor_root,
-                    nullifier,
-                    withdraw_amount,
-                    to,
-                    st,
-                )
+            let credential_check_start = std::time::Instant::now();
+            let ctx_public = ctx
+                .get_sender_credential::<PreVerifiedWithdrawCredential>()
+                .map(|cred| cred.0.clone());
+            let cached_public = crate::get_pre_verified_spend(&nullifier);
+            let has_credential = ctx_public.is_some() || cached_public.is_some();
+            let credential_check_duration = credential_check_start.elapsed();
+            debug!(
+                credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
+                has_credential = ?has_credential,
+                "Withdraw: checked for pre-verified credential"
+            );
+
+            let public = if let Some(public) = ctx_public.or(cached_public) {
+                info!("Using pre-verified credential path (skipping Ligero proof verification)");
+                public
             } else {
+                info!("No pre-verified credential, performing full Ligero proof verification");
+
                 let method_id_bytes = self
                     .method_id
                     .get(st)?
@@ -364,87 +421,94 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                     .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-                let public: SpendPublic =
-                    LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
-                        MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
-                    })?;
+                LigeroVerifier::verify(&proof, &method_id)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+            };
 
-                self.apply_verified_withdraw(
-                    &public,
-                    anchor_root,
-                    nullifier,
-                    withdraw_amount,
-                    to,
-                    st,
+            // SECURITY: Bind transaction fields to proof-committed values
+            if public.anchor_root != anchor_root
+                || public.nullifier != nullifier
+                || public.withdraw_amount != withdraw_amount
+            {
+                return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+            }
+
+            // Ensure there's actually a withdrawal
+            if withdraw_amount == 0 {
+                return Err(anyhow!(
+                    "Withdraw must have withdraw_amount > 0. Use Transfer call for pure shielded transactions."
                 )
+                .into());
             }
-        }
-    }
 
-    /// Spend a note by verifying a ZK proof and consuming its nullifier.
-    ///
-    /// The proof must:
-    /// 1. Be verifiable against the configured method ID
-    /// 2. Commit to a `SpendPublic` struct containing (anchor_root, nullifier, withdraw_amount)
-    /// 3. The anchor_root must be in the recent roots window
-    /// 4. The nullifier must not have been seen before
-    ///
-    /// **VALUE PRESERVATION**: To prevent accidental value burning, this call is currently
-    /// rejected. Use `Withdraw` to move value to a transparent address.
-    pub(crate) fn spend_note(
-        &mut self,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
-        gas: Option<S::Gas>,
-        _context: &Context<S>,
-        state: &mut impl TxState<S>,
-    ) -> Result<()> {
-        // Charge gas first
-        let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
-        state.charge_gas(&gas)?;
+            // Limit outputs to prevent DoS
+            const MAX_OUTPUTS: usize = 16;
+            if public.output_commitments.len() > MAX_OUTPUTS {
+                return Err(MidnightPrivacyError::<S>::TooManyOutputs(
+                    public.output_commitments.len(),
+                    MAX_OUTPUTS,
+                )
+                .into());
+            }
 
-        // In non-native mode (e.g., inside a zkVM), we can't verify Ligero proofs
-        #[cfg(not(feature = "native"))]
-        {
-            anyhow::bail!(
-                "Ligero proof verification is only supported in native mode. \
-                 The midnight-privacy module cannot be used inside a zkVM."
+            // 1) Validate anchor root
+            if !self.is_valid_anchor(&public.anchor_root, st)? {
+                return Err(
+                    MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into(),
+                );
+            }
+
+            // 2) Consume nullifier
+            let nk = NullifierKey(public.nullifier);
+            if self.nullifier_set.get(&nk, st)?.is_some() {
+                return Err(
+                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
+                );
+            }
+            self.nullifier_set.set(&nk, &true, st)?;
+
+            // 3) Add all output commitments to the tree (for change/split)
+            for cm in &public.output_commitments {
+                let (_pos, _root) = self.add_commitment(*cm, st)?;
+            }
+
+            // 4) Transfer transparent tokens
+            use sov_bank::IntoPayable;
+            let token_id = self.token_id.get_or_err(st)??;
+
+            let amount_u64: u64 = public
+                .withdraw_amount
+                .try_into()
+                .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
+            let bank_amount = sov_bank::Amount::from(amount_u64);
+
+            let coins = sov_bank::Coins {
+                amount: bank_amount,
+                token_id,
+            };
+
+            self.bank
+                .transfer_from(self.id.to_payable(), &to, coins, st)?;
+
+            // Emit events
+            self.emit_event(
+                st,
+                Event::NoteSpent {
+                    nullifier: public.nullifier,
+                    anchor_root: public.anchor_root,
+                },
             );
-        }
 
-        // Verify the proof using LigeroVerifier
-        #[cfg(feature = "native")]
-        {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+            self.emit_event(
+                st,
+                Event::PoolWithdraw {
+                    amount: public.withdraw_amount,
+                    nullifier: public.nullifier,
+                    anchor_root: public.anchor_root,
+                },
+            );
 
-            // Get the configured method ID from state
-            let method_id_bytes = self
-                .method_id
-                .get(state)?
-                .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
-
-            let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
-
-            let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
-
-            // CRITICAL: Prevent value-burning spends
-            // In a value-preserving shielded pool (like Zcash), consuming a nullifier must
-            // move value somewhere: either to new shielded notes or to transparent withdrawal.
-            // Since this call doesn't track output notes and has no withdrawal, it would burn value.
-            // Reject it to prevent accidental burns. Use `Withdraw` for transparent value movement.
-            if public.withdraw_amount == 0 {
-                return Err(MidnightPrivacyError::<S>::ValueBurningSpend.into());
-            }
-
-            // If withdraw_amount > 0, the caller should use the Withdraw call instead
-            // which properly handles the withdrawal and binding
-            return Err(anyhow!(
-                "SpendNote with withdraw_amount > 0 should use Withdraw call instead"
-            )
-            .into());
+            Ok(())
         }
     }
 
