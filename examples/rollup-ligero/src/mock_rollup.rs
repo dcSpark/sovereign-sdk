@@ -82,9 +82,16 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         shutdown_receiver: tokio::sync::watch::Receiver<()>,
         ledger_db: &LedgerDb,
         sequencer: &SequencerCreationReceipt<Self::Spec>,
-        _da_service: &Self::DaService,
+        da_service: &Self::DaService,
         rollup_config: &RollupConfig<<Self::Spec as Spec>::Address, Self::DaService>,
     ) -> anyhow::Result<NodeEndpoints> {
+        // Initialize the midnight-privacy module's proof cache with the DA database connection
+        // This enables the sequencer to skip expensive Ligero proof verification for transactions
+        // that have already been verified by the sov-proof-verifier-service
+        let da_db = da_service.get_db_connection().await;
+        midnight_privacy::set_proof_cache_db(da_db);
+        tracing::info!("✓ Initialized midnight-privacy proof cache with DA database connection");
+
         sov_modules_rollup_blueprint::register_endpoints::<Self, Native>(
             state_update_receiver.clone(),
             sync_status_receiver,

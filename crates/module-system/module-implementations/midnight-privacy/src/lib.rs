@@ -26,6 +26,34 @@ use sov_modules_api::{
 };
 use std::collections::VecDeque;
 
+#[cfg(feature = "native")]
+use std::sync::{Arc, RwLock};
+
+#[cfg(feature = "native")]
+use once_cell::sync::Lazy;
+
+/// Global database connection for proof caching.
+/// This is set by the sequencer at startup and accessed by the midnight-privacy module
+/// to check for cached proof verifications before running expensive Ligero verification.
+#[cfg(feature = "native")]
+static PROOF_CACHE_DB: Lazy<RwLock<Option<Arc<sea_orm::DatabaseConnection>>>> =
+    Lazy::new(|| RwLock::new(None));
+
+/// Set the global database connection for proof caching.
+/// This should be called by the sequencer during initialization.
+#[cfg(feature = "native")]
+pub fn set_proof_cache_db(db: Arc<sea_orm::DatabaseConnection>) {
+    if let Ok(mut lock) = PROOF_CACHE_DB.write() {
+        *lock = Some(db);
+    }
+}
+
+/// Get a clone of the global database connection for proof caching, if available.
+#[cfg(feature = "native")]
+pub fn get_proof_cache_db() -> Option<Arc<sea_orm::DatabaseConnection>> {
+    PROOF_CACHE_DB.read().ok()?.clone()
+}
+
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
 /// This module allows users to:

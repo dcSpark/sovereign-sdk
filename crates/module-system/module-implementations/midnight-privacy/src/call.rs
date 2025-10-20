@@ -20,6 +20,7 @@ use crate::hash::NullifierKey;
 #[cfg(feature = "native")]
 use crate::types::SpendPublic;
 
+
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
 #[serialize(Borsh, Serde)]
@@ -138,6 +139,46 @@ pub enum MidnightPrivacyError<S: Spec> {
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
+    /// Check if the current transaction has a cached proof verification in the database.
+    /// Returns the cached `SpendPublic` output if found and verified successfully.
+    /// 
+    /// This function blocks on async database operations using tokio::task::block_in_place.
+    #[cfg(feature = "native")]
+    fn check_cached_proof_verification(&self, ctx: &Context<S>) -> Option<SpendPublic> {
+        use sov_midnight_da::storable::worker_verified_transactions;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        // Get tx_hash from context
+        let tx_hash = ctx.tx_hash()?;
+        // Strip the 0x prefix to match the format stored in the database
+        let tx_hash_str = tx_hash.to_string().trim_start_matches("0x").to_string();
+
+        // Get database connection from global static
+        let db = crate::get_proof_cache_db()?;
+
+        // Query the database (blocking on async operation)
+        let cached: worker_verified_transactions::Model = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                worker_verified_transactions::Entity::find()
+                    .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash_str))
+                    .one(db.as_ref())
+                    .await
+            })
+        }).ok()??;
+
+        // Only use cache if proof was verified successfully
+        let is_verified: Option<bool> = cached.proof_verified;
+        if is_verified != Some(true) {
+            return None;
+        }
+
+        // Deserialize the cached proof outputs
+        let proof_outputs_str: &str = &cached.proof_outputs;
+        let spend_public: SpendPublic = serde_json::from_str(proof_outputs_str).ok()?;
+
+        Some(spend_public)
+    }
+
     /// Create a new note commitment and add it to the Merkle tree.
     pub(crate) fn create_note(
         &mut self,
@@ -268,7 +309,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
         gas: Option<S::Gas>,
-        _ctx: &Context<S>,
+        ctx: &Context<S>,
         st: &mut impl TxState<S>,
     ) -> Result<()> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
@@ -293,9 +334,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                 .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-            // Verify the proof and extract the proof-committed public output
-            let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+            // Try to load cached proof verification from database (if available)
+            let public: SpendPublic = if let Some(cached_public) = self.check_cached_proof_verification(ctx) {
+                tracing::info!("✓ Using cached proof verification for withdraw (skipped ~300ms Ligero verification)");
+                cached_public
+            } else {
+                // No cache hit - perform full Ligero proof verification
+                tracing::info!("Cache miss - performing full Ligero proof verification");
+                LigeroVerifier::verify(&proof, &method_id)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+            };
 
             // CRITICAL SECURITY: Bind transaction fields to proof-committed values
             // The proof commits to specific (anchor_root, nullifier, withdraw_amount).

@@ -37,6 +37,7 @@ sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-sequencer = { workspace = true }
 full-node-configs = { workspace = true }
 sov-state = { workspace = true, features = ["native"] }
+midnight-privacy = { workspace = true, features = ["native"] }
 
 demo-stf = { workspace = true, features = ["native"] }
 

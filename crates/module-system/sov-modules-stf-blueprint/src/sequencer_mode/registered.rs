@@ -194,6 +194,9 @@ where
         }
     };
 
+    // Set the transaction hash in the context for proof caching
+    ctx.set_tx_hash(raw_tx_hash);
+
     match injected_control_flow.pre_flight(runtime, &ctx, &message) {
         TxControlFlow::ContinueProcessing(_) => {}
         TxControlFlow::IgnoreTx => {

@@ -34,6 +34,7 @@ sov-rollup-interface = { workspace = true }
 sov-ligero-adapter = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 borsh = { workspace = true, features = ["rc"] }
 sov-state = { workspace = true }
@@ -45,6 +46,12 @@ once_cell = { workspace = true }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 hkdf = "0.12"
 sha2 = { workspace = true }
+tracing = { workspace = true }
+
+# Dependencies for proof caching (only with "native" feature)
+sov-midnight-da = { workspace = true, features = ["native"], optional = true }
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"], optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
 default = ["native"]
@@ -53,6 +60,9 @@ native = [
     "sov-rollup-interface/native",
     "sov-state/native",
     "sov-address/native",
-    "sov-ligero-adapter/native"
+    "sov-ligero-adapter/native",
+    "dep:sov-midnight-da",
+    "dep:sea-orm",
+    "dep:tokio"
 ]
 

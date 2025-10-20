@@ -157,6 +157,13 @@ impl StorableMidnightDaService {
         self.send_transaction_success.store(true, Ordering::Relaxed);
     }
 
+    /// Returns the database connection from the underlying DA layer.
+    /// This is used for proof caching in the midnight-privacy module.
+    pub async fn get_db_connection(&self) -> Arc<sea_orm::DatabaseConnection> {
+        let da_layer = self.da_layer.read().await;
+        Arc::new(da_layer.get_db_connection().clone())
+    }
+
     /// Suspend blob submission in the mock DA.
     pub async fn set_blob_submission_pause(&self) {
         let (sender, _) = watch::channel(());

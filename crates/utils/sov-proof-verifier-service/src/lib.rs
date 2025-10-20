@@ -440,7 +440,13 @@ async fn verify_and_record_midnight_handler(
     verify_midnight_transaction_signature(&tx)?;
     metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
 
-    let tx_hash = tx.hash().to_string();
+    // Compute tx_hash the same way the sequencer does: hash the raw transaction bytes
+    let tx_hash = {
+        use sov_modules_api::digest::Digest;
+        let hash = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::Hasher::digest(&tx_bytes);
+        hex::encode(hash)
+    };
+    
     let transaction_data = create_transaction_without_proof(&tx)?;
 
     match parsed_call {

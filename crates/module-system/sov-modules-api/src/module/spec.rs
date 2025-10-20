@@ -8,7 +8,7 @@ use sov_rollup_interface::crypto::{CredentialId, Signature};
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::optimistic::Attestation;
 use sov_rollup_interface::zk::{CryptoSpec, StateTransitionPublicData, Zkvm};
-use sov_rollup_interface::BasicAddress;
+use sov_rollup_interface::{BasicAddress, TxHash};
 use sov_state::{Storage, StorageProof};
 
 use crate::gas::Gas;
@@ -162,6 +162,8 @@ pub struct Context<S: Spec> {
     sequencer_da_address: <S::Da as DaSpec>::Address,
     /// The rollup address that pays the gas fees for the transaction.
     gas_refund_recipient: S::Address,
+    /// The hash of the current transaction (for proof caching).
+    tx_hash: Option<TxHash>,
 }
 
 impl<S: Spec> Context<S> {
@@ -188,6 +190,16 @@ impl<S: Spec> Context<S> {
     /// Updates the rollup address which will receive any gas refund from the transaction.
     pub fn set_gas_refund_recipient(&mut self, recipient: S::Address) {
         self.gas_refund_recipient = recipient;
+    }
+
+    /// Returns the transaction hash, if available.
+    pub fn tx_hash(&self) -> Option<&TxHash> {
+        self.tx_hash.as_ref()
+    }
+
+    /// Sets the transaction hash.
+    pub fn set_tx_hash(&mut self, tx_hash: TxHash) {
+        self.tx_hash = Some(tx_hash);
     }
 
     /// Constructs a new Context with the provided sender as the payer.
@@ -220,6 +232,7 @@ impl<S: Spec> Context<S> {
             sequencer,
             sequencer_da_address,
             gas_refund_recipient: payer,
+            tx_hash: None,
         }
     }
 

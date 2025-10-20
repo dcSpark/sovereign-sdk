@@ -40,26 +40,17 @@ fn main() -> Result<()> {
     let nonce: u64 = std::env::var("NONCE")?.parse()?;
     let recipient_addr: String = std::env::var("RECIPIENT")?;
     
-    // Get the actual anchor root from the deposit response
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("ANCHOR_ROOT")?)?;
     let anchor: Hash32 = anchor_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
     
-    // Compute the note commitment
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let nf = nullifier(&domain, &nf_key, &rho);
     
-    // Build a Merkle tree with the note at the actual position
-    // and get the authentication path
     use midnight_privacy::MerkleTree;
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
     tree.set_leaf(position as usize, cm);
     let siblings = tree.open(position as usize);
-    
-    println!("Note commitment: 0x{}", hex::encode(&cm[..8]));
-    println!("Position: {}", position);
-    println!("Anchor root (from deposit): 0x{}", hex::encode(&anchor[..8]));
-    println!("Nullifier: 0x{}", hex::encode(&nf[..8]));
     
     let change_value = value - withdraw_amount;
     let out_rho: Hash32 = rand::thread_rng().gen();
@@ -108,9 +99,7 @@ fn main() -> Result<()> {
     
     host.set_public_output(&public_output)?;
     
-    println!("Generating proof...");
     let proof_bytes = host.run(true)?;
-    println!("✓ Proof: {} bytes", proof_bytes.len());
     
     let recipient_parsed: <DemoRollupSpec as Spec>::Address = recipient_addr.parse()?;
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> = 
@@ -140,6 +129,5 @@ fn main() -> Result<()> {
     fs::write("midnight_withdraw_tx.json", 
         serde_json::to_string_pretty(&serde_json::json!({"body": tx_base64}))?)?;
     
-    println!("✓ Transaction: {} bytes", tx_bytes.len());
     Ok(())
 }

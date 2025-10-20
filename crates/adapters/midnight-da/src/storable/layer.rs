@@ -368,6 +368,12 @@ impl StorableMidnightDaLayer {
         self.randomizer.take()
     }
 
+    /// Returns a reference to the database connection.
+    /// This is used for proof caching in the midnight-privacy module.
+    pub fn get_db_connection(&self) -> &DatabaseConnection {
+        &self.conn
+    }
+
     /// Passed `height` becomes new head height.
     /// All previously submitted blobs above passed height are removed
     /// Newly submitted blobs will be included in `height + 1`.

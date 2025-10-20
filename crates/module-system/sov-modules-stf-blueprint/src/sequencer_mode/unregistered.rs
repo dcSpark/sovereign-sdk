@@ -46,6 +46,9 @@ pub fn process_unauthorized_tx<S: Spec, R: Runtime<S>>(
         }
     };
 
+    // Set the transaction hash in the context for proof caching
+    ctx.set_tx_hash(raw_tx_hash);
+
     // Check that the transaction isn't a duplicate
     if let Err(e) = runtime.transaction_authorizer().check_uniqueness(
         &auth_data,

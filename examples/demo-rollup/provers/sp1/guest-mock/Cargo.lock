@@ -3242,6 +3242,7 @@ dependencies = [
  "qp-poseidon-core",
  "schemars 0.8.21",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sov-bank",
  "sov-ligero-adapter",
@@ -3249,6 +3250,7 @@ dependencies = [
  "sov-rollup-interface",
  "sov-state",
  "thiserror 1.0.64",
+ "tracing",
 ]
 
 [[package]]
