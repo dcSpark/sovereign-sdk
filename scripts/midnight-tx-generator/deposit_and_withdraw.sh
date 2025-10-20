@@ -288,19 +288,6 @@ cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/withdraw-with-tree" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
-# Send withdrawal to sequencer (primary)
-# WITHDRAW_RESPONSE=$(curl -s -4 -X POST \
-#   -H "Content-Type: application/json" \
-#   -d @"$GENERATOR_DIR/midnight_withdraw_tx.json" \
-#   "$SEQUENCER_ENDPOINT")
-
-# echo "$WITHDRAW_RESPONSE" | jq '.' 2>/dev/null || echo "$WITHDRAW_RESPONSE"
-
-# if echo "$WITHDRAW_RESPONSE" | grep -q '"status":400'; then
-#     echo -e "${RED}✗ Withdrawal failed${NC}"
-#     exit 1
-# fi
-
 # Send withdrawal to proof verifier (which forwards to sequencer)
 WITHDRAW_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \

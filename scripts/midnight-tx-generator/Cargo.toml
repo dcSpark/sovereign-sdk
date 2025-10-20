@@ -37,6 +37,8 @@ sov-rollup-interface = { path = "../../crates/rollup-interface" }
 name = "withdraw-with-tree"
 path = "src/withdraw_with_tree.rs"
 
+
+
 [[bin]]
 name = "transfer-generator"
 path = "/tmp/transfer_generator.rs"
