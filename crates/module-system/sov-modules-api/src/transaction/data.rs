@@ -152,6 +152,18 @@ impl Credentials {
         }
     }
 
+    /// Returns a new [`Credentials`] containing the existing credentials plus the provided one.
+    pub fn insert<T>(&self, credential: T) -> Self
+    where
+        T: core::any::Any,
+    {
+        let mut map = (*self.credentials).clone();
+        map.insert(core::any::TypeId::of::<T>(), Rc::new(credential));
+        Self {
+            credentials: Rc::new(map),
+        }
+    }
+
     /// Returns the relevant credential.
     #[must_use]
     pub fn get<T>(&self) -> Option<&T>

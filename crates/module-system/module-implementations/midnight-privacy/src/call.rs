@@ -6,7 +6,7 @@ use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
 use thiserror::Error;
 
-use super::ValueMidnightPrivacy;
+use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
 use crate::event::Event;
 use crate::hash::{note_commitment, Hash32, RootKey};
 use crate::types::Note;
@@ -138,6 +138,67 @@ pub enum MidnightPrivacyError<S: Spec> {
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
+    #[cfg(feature = "native")]
+    fn apply_verified_withdraw(
+        &mut self,
+        public: &SpendPublic,
+        anchor_root: Hash32,
+        nullifier: Hash32,
+        withdraw_amount: u128,
+        to: S::Address,
+        st: &mut impl TxState<S>,
+    ) -> Result<()> {
+        if public.anchor_root != anchor_root
+            || public.nullifier != nullifier
+            || public.withdraw_amount != withdraw_amount
+        {
+            return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+        }
+
+        if !self.is_valid_anchor(&public.anchor_root, st)? {
+            return Err(MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into());
+        }
+
+        let nk = NullifierKey(public.nullifier);
+        if self.nullifier_set.get(&nk, st)?.is_some() {
+            return Err(MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into());
+        }
+        self.nullifier_set.set(&nk, &true, st)?;
+
+        use sov_bank::IntoPayable;
+        let token_id = self.token_id.get_or_err(st)??;
+
+        let amount_u64: u64 = public
+            .withdraw_amount
+            .try_into()
+            .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
+        let bank_amount = sov_bank::Amount::from(amount_u64);
+
+        let coins = sov_bank::Coins {
+            amount: bank_amount,
+            token_id,
+        };
+        self.bank
+            .transfer_from(self.id.to_payable(), &to, coins, st)?;
+
+        self.emit_event(
+            st,
+            Event::NoteSpent {
+                nullifier: public.nullifier,
+                anchor_root: public.anchor_root,
+            },
+        );
+        self.emit_event(
+            st,
+            Event::PoolWithdraw {
+                amount: public.withdraw_amount,
+                nullifier: public.nullifier,
+                anchor_root: public.anchor_root,
+            },
+        );
+
+        Ok(())
+    }
     /// Create a new note commitment and add it to the Merkle tree.
     pub(crate) fn create_note(
         &mut self,
@@ -268,7 +329,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
         gas: Option<S::Gas>,
-        _ctx: &Context<S>,
+        ctx: &Context<S>,
         st: &mut impl TxState<S>,
     ) -> Result<()> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
@@ -285,84 +346,38 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
-            let method_id_bytes = self
-                .method_id
-                .get(st)?
-                .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
+            if let Some(public) = ctx.get_sender_credential::<PreVerifiedWithdrawCredential>() {
+                self.apply_verified_withdraw(
+                    &public.0,
+                    anchor_root,
+                    nullifier,
+                    withdraw_amount,
+                    to,
+                    st,
+                )
+            } else {
+                let method_id_bytes = self
+                    .method_id
+                    .get(st)?
+                    .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
 
-            let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
+                let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
+                    .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-            // Verify the proof and extract the proof-committed public output
-            let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+                let public: SpendPublic =
+                    LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
+                        MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
+                    })?;
 
-            // CRITICAL SECURITY: Bind transaction fields to proof-committed values
-            // The proof commits to specific (anchor_root, nullifier, withdraw_amount).
-            // We must verify the transaction fields match what the proof committed to,
-            // otherwise an attacker could provide a valid proof for (A, B, C) but
-            // submit transaction fields (X, Y, Z) and we'd accept them.
-            if public.anchor_root != anchor_root
-                || public.nullifier != nullifier
-                || public.withdraw_amount != withdraw_amount
-            {
-                return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+                self.apply_verified_withdraw(
+                    &public,
+                    anchor_root,
+                    nullifier,
+                    withdraw_amount,
+                    to,
+                    st,
+                )
             }
-
-            // Now use the PROOF-COMMITTED values (which we've verified match the tx fields)
-            // for all state changes. This ensures cryptographic binding.
-
-            // 1) Anchor must be valid
-            if !self.is_valid_anchor(&public.anchor_root, st)? {
-                return Err(
-                    MidnightPrivacyError::<S>::InvalidAnchorRoot(public.anchor_root).into(),
-                );
-            }
-
-            // 2) Nullifier must be fresh
-            let nk = NullifierKey(public.nullifier);
-            if self.nullifier_set.get(&nk, st)?.is_some() {
-                return Err(
-                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
-                );
-            }
-            self.nullifier_set.set(&nk, &true, st)?;
-
-            // 3) Transfer authorized amount
-            use sov_bank::IntoPayable;
-            let token_id = self.token_id.get_or_err(st)??;
-
-            let amount_u64: u64 = public
-                .withdraw_amount
-                .try_into()
-                .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(public.withdraw_amount))?;
-            let bank_amount = sov_bank::Amount::from(amount_u64);
-
-            let coins = sov_bank::Coins {
-                amount: bank_amount,
-                token_id,
-            };
-            self.bank
-                .transfer_from(self.id.to_payable(), &to, coins, st)?;
-
-            // Emit events (using proof-committed values)
-            self.emit_event(
-                st,
-                Event::NoteSpent {
-                    nullifier: public.nullifier,
-                    anchor_root: public.anchor_root,
-                },
-            );
-            self.emit_event(
-                st,
-                Event::PoolWithdraw {
-                    amount: public.withdraw_amount,
-                    nullifier: public.nullifier,
-                    anchor_root: public.anchor_root,
-                },
-            );
-
-            Ok(())
         }
     }
 

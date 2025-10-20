@@ -7135,6 +7135,7 @@ dependencies = [
  "sov-test-utils",
  "tempfile",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -13136,6 +13137,7 @@ dependencies = [
  "futures",
  "hex",
  "jsonrpsee",
+ "midnight-privacy",
  "mini-moka",
  "num_cpus",
  "openapiv3",

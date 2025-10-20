@@ -9,6 +9,7 @@ mod event;
 mod genesis;
 mod hash;
 mod merkle;
+mod preverified;
 mod types;
 pub mod viewing;
 
@@ -17,6 +18,7 @@ pub use event::Event;
 pub use genesis::*;
 pub use hash::*;
 pub use merkle::*;
+pub use preverified::{cache_pre_verified_spend, clear_pre_verified_spend, get_pre_verified_spend};
 pub use types::*;
 pub use viewing::{decrypt_and_verify_note, encrypt_note_for_fvk};
 
@@ -25,6 +27,10 @@ use sov_modules_api::{
     StateValue, TxState,
 };
 use std::collections::VecDeque;
+
+/// Marker credential carrying the proof outputs for pre-verified withdrawals.
+#[derive(Clone)]
+pub struct PreVerifiedWithdrawCredential(pub SpendPublic);
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///

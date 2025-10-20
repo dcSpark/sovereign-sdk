@@ -15,8 +15,8 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection,
-    EntityTrait,
+    sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
+    Database, DatabaseConnection, EntityTrait, QueryFilter,
 };
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
@@ -78,6 +78,7 @@ pub struct ServiceConfig {
 pub struct AppState {
     config: Arc<ServiceConfig>,
     node_client: NodeClient,
+    http_client: reqwest::Client,
     /// Semaphore to limit concurrent verifications
     verification_semaphore: Arc<tokio::sync::Semaphore>,
     /// Local nonce counter (synchronized across all requests)
@@ -145,6 +146,7 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             node_client,
+            http_client: reqwest::Client::new(),
             verification_semaphore: Arc::new(tokio::sync::Semaphore::new(max_permits)),
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
@@ -168,6 +170,9 @@ pub struct VerifyAndSubmitResponse {
     /// Transaction hash (if successful)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
+    /// Raw sequencer response (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequencer_response: Option<serde_json::Value>,
     /// Error message (if failed)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -401,6 +406,7 @@ async fn verify_and_submit_handler(
     Ok(Json(VerifyAndSubmitResponse {
         success: true,
         tx_hash: Some(tx_hash),
+        sequencer_response: None,
         error: None,
         metrics,
     }))
@@ -466,21 +472,30 @@ async fn verify_and_record_midnight_handler(
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             metrics.proof_verify_ms = 0.0;
-            metrics.node_submit_ms = 0.0;
-            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
             info!(
-                "✓ Stored verified midnight deposit: amount={}, rho=0x{}, hash={}, total_time={:.2}ms",
+                "✓ Stored verified midnight deposit: amount={}, rho=0x{}, hash={}",
                 amount,
                 hex::encode(&rho[..8]),
-                tx_hash,
-                metrics.total_ms
+                tx_hash
             );
 
+            let sequencer_start = std::time::Instant::now();
+            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let error_message = if submission.accepted {
+                None
+            } else {
+                Some(submission.log_message.clone())
+            };
+
             Ok(Json(VerifyAndSubmitResponse {
-                success: true,
+                success: submission.accepted,
                 tx_hash: Some(tx_hash),
-                error: None,
+                sequencer_response: submission.response_json.clone(),
+                error: error_message,
                 metrics,
             }))
         }
@@ -523,23 +538,31 @@ async fn verify_and_record_midnight_handler(
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
-            metrics.node_submit_ms = 0.0;
-            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
             info!(
-                "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}, total_time={:.2}ms",
+                "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}",
                 hex::encode(nullifier),
                 hex::encode(anchor_root),
                 withdraw_amount,
                 to,
-                tx_hash,
-                metrics.total_ms
+                tx_hash
             );
 
+            let sequencer_start = std::time::Instant::now();
+            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let error_message = if submission.accepted {
+                None
+            } else {
+                Some(submission.log_message.clone())
+            };
+
             Ok(Json(VerifyAndSubmitResponse {
-                success: true,
+                success: submission.accepted,
                 tx_hash: Some(tx_hash),
-                error: None,
+                sequencer_response: submission.response_json.clone(),
+                error: error_message,
                 metrics,
             }))
         }
@@ -1161,6 +1184,124 @@ async fn store_verified_midnight_transaction(
     })?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct SequencerSubmissionOutcome {
+    accepted: bool,
+    status_code: Option<u16>,
+    raw_response: Option<String>,
+    response_json: Option<serde_json::Value>,
+    log_message: String,
+}
+
+async fn submit_worker_tx_to_sequencer(
+    state: &AppState,
+    tx_hash: &str,
+) -> Result<SequencerSubmissionOutcome, ServiceError> {
+    use worker_verified_transactions::{
+        ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
+        TransactionState,
+    };
+
+    let url = format!("{}/sequencer/worker_txs/{}", state.node_client.base_url, tx_hash);
+    let http_result = state.http_client.post(&url).send().await;
+
+    let outcome = match http_result {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.map_err(|err| {
+                ServiceError::Internal(format!("Failed to read sequencer response: {err}"))
+            })?;
+
+            let parsed_json = serde_json::from_str(&body).ok();
+
+            if status.is_success() {
+                SequencerSubmissionOutcome {
+                    accepted: true,
+                    status_code: Some(status.as_u16()),
+                    raw_response: Some(body.clone()),
+                    response_json: parsed_json,
+                    log_message: body,
+                }
+            } else {
+                let body_value =
+                    parsed_json.unwrap_or_else(|| serde_json::Value::String(body.clone()));
+                let response_value = serde_json::json!({
+                    "status": status.as_u16(),
+                    "body": body_value,
+                });
+                let payload = response_value.to_string();
+
+                SequencerSubmissionOutcome {
+                    accepted: false,
+                    status_code: Some(status.as_u16()),
+                    raw_response: Some(payload),
+                    response_json: Some(response_value),
+                    log_message: body,
+                }
+            }
+        }
+        Err(err) => {
+            let message = format!("Failed to reach sequencer endpoint: {err}");
+            let json_value = serde_json::json!({ "error": message });
+            SequencerSubmissionOutcome {
+                accepted: false,
+                status_code: None,
+                raw_response: Some(json_value.to_string()),
+                response_json: Some(json_value),
+                log_message: message,
+            }
+        }
+    };
+
+    let record = VerifiedEntity::find()
+        .filter(VerifiedColumn::TxHash.eq(tx_hash))
+        .one(state.da_conn.as_ref())
+        .await
+        .map_err(|err| {
+            ServiceError::Internal(format!(
+                "Failed to fetch worker transaction {tx_hash} before sequencer submission: {err}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ServiceError::Internal(format!(
+                "Worker transaction {tx_hash} not found after persisting"
+            ))
+        })?;
+
+    let mut active_model: VerifiedActiveModel = record.into();
+    active_model.transaction_state = Set(if outcome.accepted {
+        TransactionState::Accepted
+    } else {
+        TransactionState::Rejected
+    });
+    active_model.sequencer_status = Set(outcome.raw_response.clone());
+    active_model
+        .update(state.da_conn.as_ref())
+        .await
+        .map_err(|err| {
+            ServiceError::Internal(format!(
+                "Failed to update worker transaction {tx_hash} after sequencer submission: {err}"
+            ))
+        })?;
+
+    if outcome.accepted {
+        info!("✓ Sequencer accepted worker transaction {}", tx_hash);
+    } else {
+        let status_display = outcome
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "network_error".to_string());
+        error!(
+            tx_hash,
+            status = status_display.as_str(),
+            "Sequencer rejected worker transaction: {}",
+            outcome.log_message
+        );
+    }
+
+    Ok(outcome)
 }
 
 /// Configure Ligero environment variables for value-setter verification
