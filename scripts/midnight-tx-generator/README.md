@@ -193,21 +193,16 @@ RuntimeCall::MidnightPrivacy(
 )
 ```
 
-### Transfer Transaction
-
-The unified privacy-preserving transaction that supports:
-- Pure shielded transfers (output notes only)
-- Partial withdrawals (outputs + transparent withdrawal)
-- Full withdrawals (transparent only)
+### Withdrawal Transaction
 
 ```rust
 RuntimeCall::MidnightPrivacy(
-    CallMessage::Transfer {
-        proof: Vec<u8>,            // Ligero ZK proof (~3MB compressed)
-        anchor_root: Hash32,       // Merkle root from deposit
-        nullifier: Hash32,         // Prevents double-spending
-        withdraw_amount: u128,     // Amount to transparent address (0 for pure shielded)
-        to: Option<Address>,       // Recipient (None if withdraw_amount = 0)
+    CallMessage::Withdraw {
+        proof: Vec<u8>,         // Ligero ZK proof (~3MB compressed)
+        anchor_root: Hash32,    // Merkle root from deposit
+        nullifier: Hash32,      // Prevents double-spending
+        withdraw_amount: u128,  // Amount to transparent address
+        to: Address,            // Recipient
         gas: Option<Gas>,
     }
 )

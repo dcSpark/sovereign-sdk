@@ -242,6 +242,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let cm = note_commitment(&domain, amount, &rho, &recipient);
         let (position, new_root) = self.add_commitment(cm, st)?;
 
+        // Update deposit statistics
+        let total_deposited = self.total_deposited.get(st)?.unwrap_or(0);
+        self.total_deposited.set(&(total_deposited + amount), st)?;
+        
+        let deposit_count = self.deposit_count.get(st)?.unwrap_or(0);
+        self.deposit_count.set(&(deposit_count + 1), st)?;
+
         // Emit explicit pool deposit event
         self.emit_event(
             st,
@@ -498,6 +505,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                     anchor_root: public.anchor_root,
                 },
             );
+
+            // Update withdrawal statistics
+            let total_withdrawn = self.total_withdrawn.get(st)?.unwrap_or(0);
+            self.total_withdrawn.set(&(total_withdrawn + public.withdraw_amount), st)?;
+            
+            let withdraw_count = self.withdraw_count.get(st)?.unwrap_or(0);
+            self.withdraw_count.set(&(withdraw_count + 1), st)?;
 
             self.emit_event(
                 st,

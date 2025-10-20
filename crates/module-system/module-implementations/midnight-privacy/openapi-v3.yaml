@@ -1,0 +1,395 @@
+openapi: "3.0.2"
+info:
+  title: MidnightPrivacy Module API
+  description: |
+    Privacy-preserving shielded pool REST API using Ligero ZK proofs.
+    
+    This API provides query endpoints for the MidnightPrivacy module, which implements
+    a Zcash-style shielded pool with:
+    - Note commitments and nullifiers
+    - Merkle tree for membership proofs
+    - ZK proof verification
+    
+    All endpoints maintain privacy by only exposing cryptographic commitments,
+    not the underlying note values or owners.
+  version: 0.3.0
+  contact:
+    name: Sovereign SDK
+    url: https://github.com/Sovereign-Labs/sovereign-sdk
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: http://localhost:12346
+    description: Local development server
+  - url: https://your-rollup-domain.com
+    description: Production server (replace with your actual domain)
+
+tags:
+  - name: nullifiers
+    description: Query nullifier spend status
+  - name: tree
+    description: Merkle tree state queries
+  - name: notes
+    description: Note commitment queries
+  - name: roots
+    description: Anchor root queries
+  - name: stats
+    description: Module statistics
+
+paths:
+  /modules/midnight-privacy/nullifiers/{nullifier_hex}:
+    get:
+      tags:
+        - nullifiers
+      summary: Check if a nullifier has been spent
+      description: |
+        Returns whether a specific nullifier has been used (spent) or not.
+        Nullifiers prevent double-spending in the shielded pool.
+      operationId: checkNullifier
+      parameters:
+        - name: nullifier_hex
+          in: path
+          required: true
+          description: 32-byte nullifier as hex string (64 characters)
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+            example: cbd2aaa38e38d2531234567890abcdef1234567890abcdef1234567890abcdef
+      responses:
+        '200':
+          description: Nullifier status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullifierResponse'
+        '400':
+          description: Invalid nullifier format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Nullifier not found
+
+  /modules/midnight-privacy/tree/state:
+    get:
+      tags:
+        - tree
+      summary: Get current Merkle tree state
+      description: |
+        Returns the current state of the note commitment Merkle tree,
+        including the root, next available position, and tree depth.
+      operationId: getTreeState
+      responses:
+        '200':
+          description: Tree state retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeStateResponse'
+        '404':
+          description: Tree not initialized
+
+  /modules/midnight-privacy/notes:
+    get:
+      tags:
+        - notes
+      summary: List all note commitments
+      description: |
+        Returns a paginated list of all note commitments in the tree.
+        Commitments are cryptographic hashes that hide note values and owners.
+        
+        By default, returns oldest notes first. Use `reverse=true` for most recent first.
+      operationId: listNotes
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results to return (max 1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of notes to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: reverse
+          in: query
+          required: false
+          description: Return most recent notes first
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Notes retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotesListResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Tree not initialized
+
+  /modules/midnight-privacy/roots/recent:
+    get:
+      tags:
+        - roots
+      summary: Get recent anchor roots
+      description: |
+        Returns the recent Merkle roots window (anchor window).
+        These roots are valid for use as anchor points in ZK proofs.
+        
+        The window size determines how many historical roots remain valid.
+      operationId: getRecentRoots
+      responses:
+        '200':
+          description: Recent roots retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RootsResponse'
+        '404':
+          description: Roots not initialized
+
+  /modules/midnight-privacy/stats:
+    get:
+      tags:
+        - stats
+      summary: Get module statistics
+      description: |
+        Returns aggregate statistics about the privacy pool:
+        - Total number of notes created (deposits + outputs)
+        - Total number of unique roots recorded
+        
+        These statistics don't reveal any private information about individual transactions.
+      operationId: getStats
+      responses:
+        '200':
+          description: Statistics retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+
+components:
+  schemas:
+    NullifierResponse:
+      type: object
+      required:
+        - nullifier
+        - is_spent
+      properties:
+        nullifier:
+          type: array
+          description: 32-byte nullifier
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+        is_spent:
+          type: boolean
+          description: Whether the nullifier has been spent
+      example:
+        nullifier: [203, 210, 170, 163, 142, 56, 210, 83, 18, 52, 86, 120, 144, 171, 205, 239, 18, 52, 86, 120, 144, 171, 205, 239, 18, 52, 86, 120, 144, 171, 205, 239]
+        is_spent: true
+
+    TreeStateResponse:
+      type: object
+      required:
+        - root
+        - next_position
+        - depth
+      properties:
+        root:
+          type: array
+          description: Current Merkle root (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+        next_position:
+          type: integer
+          format: uint64
+          description: Next available leaf position in the tree
+        depth:
+          type: integer
+          format: uint8
+          description: Tree depth (number of levels)
+      example:
+        root: [100, 164, 103, 104, 197, 95, 135, 91, 122, 86, 140, 88, 29, 21, 235, 210, 209, 77, 56, 168, 1, 247, 255, 9, 56, 103, 211, 66, 59, 168, 230, 13]
+        next_position: 42
+        depth: 16
+
+    NoteInfoResponse:
+      type: object
+      required:
+        - position
+        - commitment
+      properties:
+        position:
+          type: integer
+          format: uint64
+          description: Position in the Merkle tree
+        commitment:
+          type: array
+          description: Note commitment (32-byte hash)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+      example:
+        position: 0
+        commitment: [212, 212, 118, 1, 20, 170, 18, 175, 90, 212, 61, 14, 98, 89, 229, 23, 91, 30, 36, 12, 176, 116, 129, 135, 46, 134, 137, 117, 244, 142, 216, 115]
+
+    NotesListResponse:
+      type: object
+      required:
+        - notes
+        - count
+        - current_root
+      properties:
+        notes:
+          type: array
+          description: List of note commitments
+          items:
+            $ref: '#/components/schemas/NoteInfoResponse'
+        count:
+          type: integer
+          format: uint64
+          description: Total number of notes in the tree
+        current_root:
+          type: array
+          description: Current Merkle root (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+      example:
+        notes:
+          - position: 0
+            commitment: [212, 212, 118, 1, 20, 170, 18, 175, 90, 212, 61, 14, 98, 89, 229, 23, 91, 30, 36, 12, 176, 116, 129, 135, 46, 134, 137, 117, 244, 142, 216, 115]
+          - position: 1
+            commitment: [65, 147, 148, 110, 118, 95, 251, 231, 208, 28, 185, 223, 133, 51, 178, 45, 132, 11, 51, 183, 208, 28, 185, 223, 133, 51, 178, 45, 132, 11, 51, 183]
+        count: 42
+        current_root: [100, 164, 103, 104, 197, 95, 135, 91, 122, 86, 140, 88, 29, 21, 235, 210, 209, 77, 56, 168, 1, 247, 255, 9, 56, 103, 211, 66, 59, 168, 230, 13]
+
+    RootsResponse:
+      type: object
+      required:
+        - recent_roots
+        - window_size
+      properties:
+        recent_roots:
+          type: array
+          description: Recent Merkle roots (anchor window)
+          items:
+            type: array
+            items:
+              type: integer
+              format: uint8
+            minItems: 32
+            maxItems: 32
+        window_size:
+          type: integer
+          format: uint32
+          description: Size of the anchor window
+      example:
+        recent_roots:
+          - [100, 164, 103, 104, 197, 95, 135, 91, 122, 86, 140, 88, 29, 21, 235, 210, 209, 77, 56, 168, 1, 247, 255, 9, 56, 103, 211, 66, 59, 168, 230, 13]
+          - [215, 225, 188, 132, 190, 233, 208, 248, 49, 211, 198, 181, 185, 167, 199, 62, 243, 231, 98, 71, 113, 50, 84, 72, 124, 19, 95, 62, 94, 139, 31, 70]
+        window_size: 100
+
+    StatsResponse:
+      type: object
+      required:
+        - total_notes
+        - total_roots_recorded
+        - total_deposited
+        - deposit_count
+        - total_withdrawn
+        - withdraw_count
+        - pool_balance
+        - nullifiers_spent
+      properties:
+        total_notes:
+          type: integer
+          format: uint64
+          description: Total number of notes created (deposits + transfer outputs)
+        total_roots_recorded:
+          type: integer
+          format: uint64
+          description: Total number of unique roots in historical index
+        total_deposited:
+          type: integer
+          format: uint128
+          description: Total amount deposited into the shielded pool (transparent → shielded)
+        deposit_count:
+          type: integer
+          format: uint64
+          description: Total number of deposit transactions
+        total_withdrawn:
+          type: integer
+          format: uint128
+          description: Total amount withdrawn from the shielded pool (shielded → transparent)
+        withdraw_count:
+          type: integer
+          format: uint64
+          description: Total number of withdrawal transactions
+        pool_balance:
+          type: integer
+          format: uint128
+          description: Current shielded pool balance (total_deposited - total_withdrawn)
+        nullifiers_spent:
+          type: integer
+          format: uint64
+          description: Number of spent nullifiers (notes that have been consumed)
+      example:
+        total_notes: 42
+        total_roots_recorded: 42
+        total_deposited: 10000
+        deposit_count: 5
+        total_withdrawn: 3000
+        withdraw_count: 2
+        pool_balance: 7000
+        nullifiers_spent: 7
+
+    Error:
+      type: object
+      required:
+        - status
+        - message
+      properties:
+        status:
+          type: integer
+          description: HTTP status code
+        message:
+          type: string
+          description: Error message
+        details:
+          type: object
+          description: Additional error details
+          additionalProperties: true
+      example:
+        status: 400
+        message: Invalid hex string
+        details:
+          error: "Hex decoding failed"
+

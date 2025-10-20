@@ -29,7 +29,7 @@ sov-rest-utils = { workspace = true }
 sov-rollup-interface = { workspace = true, features = ["native"] }
 tokio = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+utoipa-swagger-ui = { workspace = true, features = ["axum", "debug-embed"] }
 openapiv3 = { workspace = true }
 
 [dev-dependencies]

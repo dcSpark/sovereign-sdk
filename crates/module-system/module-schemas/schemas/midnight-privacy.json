@@ -1,0 +1,259 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CallMessage",
+  "description": "Available call messages for the `MidnightPrivacy` module.",
+  "oneOf": [
+    {
+      "description": "Deposit: Put money INTO the privacy pool (Transparent → Shielded).\n\nMoves `amount` of the native token from sender into the shielded pool, creating a single note commitment.",
+      "type": "object",
+      "required": [
+        "deposit"
+      ],
+      "properties": {
+        "deposit": {
+          "type": "object",
+          "required": [
+            "amount",
+            "recipient",
+            "rho"
+          ],
+          "properties": {
+            "amount": {
+              "description": "Amount to deposit",
+              "type": "integer",
+              "format": "uint128",
+              "minimum": 0.0
+            },
+            "gas": {
+              "description": "Gas to charge. Don't charge gas if None.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GasUnit(2)"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recipient": {
+              "description": "Recipient binding",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "rho": {
+              "description": "Random nonce for the note",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Transfer: Move money WITHIN the privacy pool (Shielded → Shielded).\n\nThis is the pure privacy-preserving transaction that atomically: 1. Verifies a ZK proof 2. Consumes the input note's nullifier (prevents double-spending) 3. Creates output note commitments from the proof\n\nThe proof demonstrates: - Knowledge of a note in the tree (via Merkle path) - Proper nullifier derivation - Value conservation: input_value = sum(output_values)\n\nSECURITY: anchor_root and nullifier are passed as explicit transaction fields (NOT extracted from public_output) and are validated by the guest. This prevents public-output tampering attacks.\n\n# Examples\n\n- Split 1000 → 600 + 400 (two outputs) - Consolidate multiple notes into one - Send shielded payment to another recipient",
+      "type": "object",
+      "required": [
+        "transfer"
+      ],
+      "properties": {
+        "transfer": {
+          "type": "object",
+          "required": [
+            "anchor_root",
+            "nullifier",
+            "proof"
+          ],
+          "properties": {
+            "anchor_root": {
+              "description": "Anchor root that the proof is bound to (must be valid historical root)",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "gas": {
+              "description": "Gas to charge. Don't charge gas if None.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GasUnit(2)"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nullifier": {
+              "description": "Nullifier that the proof derives (must be fresh)",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "proof": {
+              "description": "Serialized Ligero proof package (bincode-encoded) Note: Ligero proofs are typically 2-4MB in size",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SafeVec_5000000_of_uint8"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Withdraw: Take money OUT of the privacy pool (Shielded → Transparent).\n\nThis call atomically: 1. Verifies a ZK proof 2. Consumes the input note's nullifier (prevents double-spending) 3. Creates output note commitments from the proof (for change/split) 4. Transfers transparent tokens to the recipient\n\nThe proof demonstrates: - Knowledge of a note in the tree - Proper nullifier derivation - Value conservation: input_value = sum(output_values) + withdraw_amount\n\nSECURITY: anchor_root, nullifier, and withdraw_amount are explicit transaction fields validated by the guest to prevent tampering.\n\n# Examples\n\n- Full withdrawal: Input 1000 → Withdraw 1000 (no outputs) - Partial withdrawal: Input 1000 → Withdraw 600 + Change 400 (one output)",
+      "type": "object",
+      "required": [
+        "withdraw"
+      ],
+      "properties": {
+        "withdraw": {
+          "type": "object",
+          "required": [
+            "anchor_root",
+            "nullifier",
+            "proof",
+            "to",
+            "withdraw_amount"
+          ],
+          "properties": {
+            "anchor_root": {
+              "description": "Anchor root that the proof is bound to (must be valid historical root)",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "gas": {
+              "description": "Gas to charge. Don't charge gas if None.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GasUnit(2)"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nullifier": {
+              "description": "Nullifier that the proof derives (must be fresh)",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "proof": {
+              "description": "Serialized Ligero proof package (bincode-encoded) Note: Ligero proofs are typically 2-4MB in size",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SafeVec_5000000_of_uint8"
+                }
+              ]
+            },
+            "to": {
+              "description": "Recipient address for the withdrawn tokens",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Address"
+                }
+              ]
+            },
+            "withdraw_amount": {
+              "description": "Withdrawal amount authorized by the proof",
+              "type": "integer",
+              "format": "uint128",
+              "minimum": 0.0
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Update the method ID (admin only). This allows upgrading the guest program used for proof verification.",
+      "type": "object",
+      "required": [
+        "update_method_id"
+      ],
+      "properties": {
+        "update_method_id": {
+          "type": "object",
+          "required": [
+            "new_method_id"
+          ],
+          "properties": {
+            "new_method_id": {
+              "description": "The new method ID (32-byte SHA-256 hash)",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "Address": {
+      "description": "Address",
+      "type": "string",
+      "pattern": "^sov1[a-zA-Z0-9]+$"
+    },
+    "GasUnit(2)": {
+      "description": "GasUnit is an array of size 2",
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "maxItems": 2,
+      "minItems": 2
+    },
+    "SafeVec_5000000_of_uint8": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "minimum": 0.0
+      },
+      "maxItems": 5000000,
+      "minItems": 0
+    }
+  }
+}

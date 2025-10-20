@@ -53,7 +53,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-stream = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7"] }
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+utoipa-swagger-ui = { workspace = true, features = ["axum", "debug-embed"] }
 openapiv3 = { workspace = true }
 backon = { workspace = true }
 flume = { workspace = true }

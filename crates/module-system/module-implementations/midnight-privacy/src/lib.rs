@@ -12,6 +12,8 @@ mod merkle;
 mod preverified;
 mod types;
 pub mod viewing;
+#[cfg(feature = "native")]
+mod query;
 
 pub use call::CallMessage;
 pub use event::Event;
@@ -21,6 +23,9 @@ pub use merkle::*;
 pub use preverified::{cache_pre_verified_spend, clear_pre_verified_spend, get_pre_verified_spend};
 pub use types::*;
 pub use viewing::{decrypt_and_verify_note, encrypt_note_for_fvk};
+
+#[cfg(feature = "native")]
+pub use query::*;
 
 use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
@@ -133,6 +138,22 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Single supported token (native).
     #[state]
     pub token_id: StateValue<sov_bank::TokenId>,
+
+    /// Total amount deposited into the pool (transparent → shielded).
+    #[state]
+    pub total_deposited: StateValue<u128>,
+
+    /// Total number of deposits.
+    #[state]
+    pub deposit_count: StateValue<u64>,
+
+    /// Total amount withdrawn from the pool (shielded → transparent).
+    #[state]
+    pub total_withdrawn: StateValue<u128>,
+
+    /// Total number of withdrawals.
+    #[state]
+    pub withdraw_count: StateValue<u64>,
 
     /// Bank module to hold/transfer the native token.
     #[module]

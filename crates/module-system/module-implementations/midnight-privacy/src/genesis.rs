@@ -70,6 +70,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.root_seq.set(&1u64, state)?; // next seq to use
         self.all_roots.set(&RootKey(initial_root), &0u64, state)?;
 
+        // Initialize statistics counters
+        self.total_deposited.set(&0u128, state)?;
+        self.deposit_count.set(&0u64, state)?;
+        self.total_withdrawn.set(&0u128, state)?;
+        self.withdraw_count.set(&0u64, state)?;
+
         Ok(())
     }
 }

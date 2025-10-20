@@ -12612,6 +12612,7 @@ name = "sov-module-schemas"
 version = "0.3.0"
 dependencies = [
  "full-node-configs",
+ "midnight-privacy",
  "schemars 0.8.22",
  "serde_json",
  "sov-accounts",
