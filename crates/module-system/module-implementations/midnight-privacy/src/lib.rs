@@ -28,13 +28,28 @@ use std::collections::VecDeque;
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
-/// This module allows users to:
-/// 1. Deposit tokens into the pool and create note commitments
-/// 2. Spend notes by providing ZK proofs that demonstrate:
-///    - Knowledge of a note in the tree
-///    - A valid Merkle path to an anchor root
-///    - Proper nullifier derivation
-/// 3. Withdraw tokens from the pool with proof-bound amounts
+/// This module provides three core operations for a Zcash-style shielded pool:
+///
+/// 1. **Deposit**: Put money INTO the pool (Transparent → Shielded)
+///    - Transfers transparent tokens from sender
+///    - Creates a note commitment in the tree
+///
+/// 2. **Transfer**: Move money WITHIN the pool (Shielded → Shielded)
+///    - Verifies ZK proof
+///    - Consumes input note by nullifier
+///    - Creates output note commitments (pure privacy)
+///    - All value stays shielded
+///
+/// 3. **Withdraw**: Take money OUT of the pool (Shielded → Transparent)
+///    - Verifies ZK proof
+///    - Consumes input note by nullifier
+///    - Creates output commitments (for change)
+///    - Transfers transparent tokens to recipient
+///
+/// The ZK proofs demonstrate:
+/// - Knowledge of a note in the Merkle tree (via authentication path)
+/// - Proper nullifier derivation (prevents double-spending)
+/// - Value conservation: input_value = sum(output_values) + withdraw_amount
 ///
 /// The nullifier prevents double-spending, and the anchor root window allows
 /// parallel transactions while maintaining security.
@@ -148,18 +163,18 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
         let state = &mut state_wrapped;
 
         let res = match msg {
-            CallMessage::CreateNote { note, gas } => {
-                Ok(self.create_note(note, gas, context, state)?)
-            }
-            CallMessage::SpendNote { proof, gas } => {
-                Ok(self.spend_note(proof, gas, context, state)?)
-            }
             CallMessage::Deposit {
                 amount,
                 rho,
                 recipient,
                 gas,
             } => Ok(self.deposit(amount, rho, recipient, gas, context, state)?),
+            CallMessage::Transfer {
+                proof,
+                anchor_root,
+                nullifier,
+                gas,
+            } => Ok(self.transfer(proof, anchor_root, nullifier, gas, context, state)?),
             CallMessage::Withdraw {
                 proof,
                 anchor_root,
