@@ -114,7 +114,7 @@ use midnight_privacy::{note_commitment, nullifier, CallMessage, Hash32, SpendPub
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_demo_rollup::MockDemoRollup;
+use sov_rollup_ligero::MockDemoRollup;
 use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
