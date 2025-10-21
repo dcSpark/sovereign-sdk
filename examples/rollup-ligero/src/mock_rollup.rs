@@ -85,6 +85,12 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         _da_service: &Self::DaService,
         rollup_config: &RollupConfig<<Self::Spec as Spec>::Address, Self::DaService>,
     ) -> anyhow::Result<NodeEndpoints> {
+        // Ensure the worker_txs endpoint always uses the rollup-config connection string.
+        // This avoids relying on external environment setup.
+        std::env::set_var(
+            "SOV_WORKER_TX_DB_CONNECTION_STRING",
+            rollup_config.da.connection_string.clone(),
+        );
         sov_modules_rollup_blueprint::register_endpoints::<Self, Native>(
             state_update_receiver.clone(),
             sync_status_receiver,
@@ -162,4 +168,6 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
     ) -> anyhow::Result<Self::ProofSender> {
         Ok(Self::ProofSender::new(sequence_number_provider))
     }
+
+    // We rely on the default create_sequencer; the worker DB is injected via env above.
 }

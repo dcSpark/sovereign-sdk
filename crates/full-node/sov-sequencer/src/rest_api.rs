@@ -364,9 +364,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
             let tx_with_hash = result.map_err(|e| {
                 crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-                if let Some(nullifier) = &withdraw_nullifier_opt {
-                    midnight_privacy::clear_pre_verified_spend(nullifier);
-                }
+                // Do not clear the pre-verified spend here; allow STF to consume it.
                 if e.status.is_server_error() {
                     tracing::error!(error = ?e, "Error accepting optimized pre-authenticated transaction");
                 }
@@ -376,9 +374,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             let tx_hash_final = tx_with_hash.tx_hash;
             let confirmation = tx_with_hash.confirmation;
             crate::common::remove_pre_verified_withdraw(&tx_hash_final);
-            if let Some(nullifier) = &withdraw_nullifier_opt {
-                midnight_privacy::clear_pre_verified_spend(nullifier);
-            }
+            // Do not clear the pre-verified spend here; allow STF to consume it.
 
             return Ok(TxInfoWithConfirmation {
                 id: tx_hash_final,
@@ -467,9 +463,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
             let tx_with_hash = result.map_err(|e| {
                 crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-                if let Some(nullifier) = &withdraw_nullifier_opt {
-                    midnight_privacy::clear_pre_verified_spend(nullifier);
-                }
+                // Do not clear the pre-verified spend here; allow STF to consume it.
                 if e.status.is_server_error() {
                     tracing::error!(error = ?e, "Error accepting pre-authenticated transaction");
                 }
@@ -479,9 +473,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             let tx_hash_final = tx_with_hash.tx_hash;
             let confirmation = tx_with_hash.confirmation;
             crate::common::remove_pre_verified_withdraw(&tx_hash_final);
-            if let Some(nullifier) = &withdraw_nullifier_opt {
-                midnight_privacy::clear_pre_verified_spend(nullifier);
-            }
+            // Do not clear the pre-verified spend here; allow STF to consume it.
 
             return Ok(TxInfoWithConfirmation {
                 id: tx_hash_final,
@@ -638,9 +630,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             Err(e) => {
                 crate::common::clear_tx_pre_authenticated(&tx_hash);
                 crate::common::remove_pre_verified_withdraw(&tx_hash);
-                if let Some(nullifier) = &withdraw_nullifier {
-                    midnight_privacy::clear_pre_verified_spend(nullifier);
-                }
+                // Do not clear the pre-verified spend here; allow STF to consume it.
                 if e.status.is_server_error() {
                     tracing::error!(error = ?e, "Error accepting worker transaction");
                 }
@@ -670,17 +660,13 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         if let Err(err) = active_model.update(&db).await {
             crate::common::clear_tx_pre_authenticated(&tx_hash_value);
             crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-            if let Some(nullifier) = &withdraw_nullifier {
-                midnight_privacy::clear_pre_verified_spend(nullifier);
-            }
+            // Do not clear the pre-verified spend here; allow STF to consume it.
             return Err(errors::database_error_response_500(err));
         }
 
         crate::common::clear_tx_pre_authenticated(&tx_hash_value);
         crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-        if let Some(nullifier) = &withdraw_nullifier {
-            midnight_privacy::clear_pre_verified_spend(nullifier);
-        }
+        // Do not clear the pre-verified spend here; allow STF to consume it.
 
         Ok(response_payload.into())
     }

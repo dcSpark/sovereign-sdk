@@ -20,11 +20,6 @@ run:
 	@echo "Starting rollup-ligero with Ligero zkVM..."
 	SOV_PROVER_MODE=prove ../../target/debug/sov-rollup-ligero
 
-## Run in prove mode (requires Ligero SDK and Emscripten)
-run-prove:
-	@echo "Starting rollup-ligero in prove mode..."
-	SOV_PROVER_MODE=prove ../../target/debug/sov-rollup-ligero
-
 ## Clean build artifacts and data
 clean:
 	@echo "Cleaning rollup-ligero artifacts..."
@@ -36,6 +31,7 @@ clean:
 	@if [ -f "$(SOV_CLI_REL_PATH)" ]; then \
 		$(SOV_CLI_REL_PATH) transactions clean || true; \
 	fi
+	mkdir -p demo_data
 
 ## Run tests
 test:

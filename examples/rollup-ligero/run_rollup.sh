@@ -94,7 +94,4 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create demo_data directory if it doesn't exist (required for SQLite DB)
 mkdir -p demo_data
 
-# export SOV_WORKER_TX_DB_CONNECTION_STRING="sqlite://demo_data/da.sqlite?mode=rwc"
-export SOV_WORKER_TX_DB_CONNECTION_STRING="sqlite://$WORKSPACE_ROOT/examples/rollup-ligero/demo_data/da.sqlite?mode=rwc"
-
 exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
