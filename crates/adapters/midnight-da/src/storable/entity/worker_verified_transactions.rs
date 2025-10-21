@@ -45,6 +45,25 @@ pub struct Model {
     /// JSON-serialized proof outputs (e.g., anchor_root, nullifier, withdraw_amount).
     #[sea_orm(column_type = "Text")]
     pub proof_outputs: String,
+    /// Borsh-serialized public key (hex string) - for pre-authenticated path
+    #[sea_orm(column_type = "Text", nullable)]
+    pub pub_key_hex: Option<String>,
+    /// Borsh-serialized signature (hex string) - for pre-authenticated path
+    #[sea_orm(column_type = "Text", nullable)]
+    pub signature_hex: Option<String>,
+    /// Borsh-serialized uniqueness data (hex string) - for pre-authenticated path
+    #[sea_orm(column_type = "Text", nullable)]
+    pub uniqueness_hex: Option<String>,
+    /// Borsh-serialized transaction details (hex string) - for pre-authenticated path
+    #[sea_orm(column_type = "Text", nullable)]
+    pub details_hex: Option<String>,
+    /// Borsh-serialized runtime call message (hex string) - for pre-authenticated path
+    #[sea_orm(column_type = "Text", nullable)]
+    pub runtime_call_hex: Option<String>,
+    /// Fully serialized transaction (base64) - optimized pre-authenticated path
+    /// Contains the complete borsh-serialized Transaction, ready to wrap and authenticate
+    #[sea_orm(column_type = "Text", nullable)]
+    pub serialized_tx_base64: Option<String>,
     /// Current state of the transaction in the processing pipeline.
     pub transaction_state: TransactionState,
     /// Response from the sequencer after processing (JSON or error message).

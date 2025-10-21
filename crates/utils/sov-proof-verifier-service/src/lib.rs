@@ -465,6 +465,8 @@ async fn verify_and_record_midnight_handler(
             );
 
             let persist_start = std::time::Instant::now();
+            // Extract pre-authenticated data for optimized sequencer processing
+            let pre_auth_data = extract_pre_authenticated_data(&tx).ok();
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -473,6 +475,7 @@ async fn verify_and_record_midnight_handler(
                 None, // proof_verified: NULL (transaction doesn't have a proof)
                 &transaction_data,
                 &req.body,
+                pre_auth_data,
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -532,6 +535,8 @@ async fn verify_and_record_midnight_handler(
             metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
 
             let persist_start = std::time::Instant::now();
+            // Extract pre-authenticated data for optimized sequencer processing
+            let pre_auth_data = extract_pre_authenticated_data(&tx).ok();
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -540,6 +545,7 @@ async fn verify_and_record_midnight_handler(
                 Some(true),          // proof_verified: true (has proof and verified correctly)
                 &transaction_data,
                 &req.body,
+                pre_auth_data,
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -1132,6 +1138,56 @@ fn create_transaction_without_proof(
     }
 }
 
+/// Extract pre-authenticated transaction components to avoid re-processing the 3MB blob
+/// All components are borsh-serialized and hex-encoded for reliable reconstruction
+fn extract_pre_authenticated_data(
+    tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
+) -> Result<(String, String, String, String, String, String), ServiceError> {
+    use sov_modules_api::transaction::{VersionedTx, Version0};
+    
+    match &tx.versioned_tx {
+        VersionedTx::V0(v0) => {
+            // Serialize all components as borsh bytes then hex encode
+            // This ensures we can reliably reconstruct them without type issues
+            let pub_key_hex = hex::encode(
+                &borsh::to_vec(&v0.pub_key)
+                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize public key: {}", e)))?
+            );
+            
+            let signature_hex = hex::encode(
+                &borsh::to_vec(&v0.signature)
+                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize signature: {}", e)))?
+            );
+            
+            let uniqueness_hex = hex::encode(
+                &borsh::to_vec(&v0.uniqueness)
+                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize uniqueness: {}", e)))?
+            );
+            
+            let details_hex = hex::encode(
+                &borsh::to_vec(&v0.details)
+                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize details: {}", e)))?
+            );
+            
+            let runtime_call_hex = hex::encode(
+                &borsh::to_vec(&v0.runtime_call)
+                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize runtime_call: {}", e)))?
+            );
+            
+            // OPTIMIZATION: Serialize the complete transaction once and store as base64
+            // This avoids deserialize + reconstruct overhead in the sequencer (saves ~12-15ms)
+            // NOTE: We MUST keep the full transaction with proof intact for signature validity.
+            // The signature is cryptographically bound to the entire transaction content.
+            // The sequencer will skip verification but needs the complete transaction for execution.
+            let serialized_tx_bytes = borsh::to_vec(tx)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize transaction: {}", e)))?;
+            let serialized_tx_base64 = base64::engine::general_purpose::STANDARD.encode(&serialized_tx_bytes);
+            
+            Ok((pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64))
+        }
+    }
+}
+
 async fn store_verified_midnight_transaction(
     conn: &DatabaseConnection,
     tx_hash: &str,
@@ -1140,6 +1196,7 @@ async fn store_verified_midnight_transaction(
     proof_verified: Option<bool>,
     transaction_data: &str,
     full_transaction_blob: &str,
+    pre_auth_data: Option<(String, String, String, String, String, String)>,
 ) -> Result<(), ServiceError> {
     use worker_verified_transactions::{
         ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
@@ -1155,6 +1212,12 @@ async fn store_verified_midnight_transaction(
         "{}".to_string()
     };
 
+    // Extract pre-authenticated data if available
+    let (pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64) = match pre_auth_data {
+        Some((pk, sig, uq, det, rt, ser_tx)) => (Set(Some(pk)), Set(Some(sig)), Set(Some(uq)), Set(Some(det)), Set(Some(rt)), Set(Some(ser_tx))),
+        None => (Set(None), Set(None), Set(None), Set(None), Set(None), Set(None)),
+    };
+
     VerifiedEntity::insert(VerifiedActiveModel {
         tx_hash: Set(tx_hash.to_owned()),
         signature_valid: Set(signature_valid),
@@ -1162,6 +1225,12 @@ async fn store_verified_midnight_transaction(
         transaction_data: Set(transaction_data.to_owned()),
         full_transaction_blob: Set(full_transaction_blob.to_owned()),
         proof_outputs: Set(proof_outputs_json),
+        pub_key_hex,
+        signature_hex,
+        uniqueness_hex,
+        details_hex,
+        runtime_call_hex,
+        serialized_tx_base64,
         transaction_state: Set(TransactionState::Pending),
         sequencer_status: Set(None),
         created_at: Set(Utc::now()),
@@ -1175,6 +1244,12 @@ async fn store_verified_midnight_transaction(
                 VerifiedColumn::TransactionData,
                 VerifiedColumn::FullTransactionBlob,
                 VerifiedColumn::ProofOutputs,
+                VerifiedColumn::PubKeyHex,
+                VerifiedColumn::SignatureHex,
+                VerifiedColumn::UniquenessHex,
+                VerifiedColumn::DetailsHex,
+                VerifiedColumn::RuntimeCallHex,
+                VerifiedColumn::SerializedTxBase64,
                 VerifiedColumn::TransactionState,
                 VerifiedColumn::SequencerStatus,
                 VerifiedColumn::CreatedAt,
@@ -1645,12 +1720,12 @@ mod tests {
             output_commitments: vec![],
         };
 
-        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob)
+        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
             .await
             .unwrap();
 
         proof_public.withdraw_amount = 99;
-        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob)
+        store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
             .await
             .unwrap();
 
@@ -1692,6 +1767,7 @@ mod tests {
             None,       // proof_verified: NULL (transaction doesn't have a proof)
             transaction_data,
             full_blob,
+            None,       // No pre-auth data in test
         )
         .await
         .unwrap();
@@ -1860,6 +1936,7 @@ mod tests {
             Some(true),    // proof_verified (has proof and verified)
             &transaction_data,
             &tx_base64, // full transaction blob
+            None,          // No pre-auth data in test
         )
         .await
         .expect("Should store to database");
@@ -1914,6 +1991,7 @@ mod tests {
             Some(true),
             &transaction_data,
             &tx_base64,
+            None,  // No pre-auth data in test
         )
         .await
         .expect("Should update existing record");
