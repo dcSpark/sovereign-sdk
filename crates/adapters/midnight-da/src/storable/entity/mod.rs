@@ -39,6 +39,7 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
         .if_not_exists()
         .to_owned();
     db.execute(builder.build(&verified_tx_idx)).await?;
+
     if let DbBackend::Sqlite = db.get_database_backend() {
         db.execute(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
