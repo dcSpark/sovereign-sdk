@@ -1161,7 +1161,8 @@ where
         })?;
 
         let raw_tx = RawTx::new(serialized);
-        let baked_tx = Rt::Auth::encode_with_standard_auth(raw_tx);
+        // Use pre-authenticated encoding so runtime uses original hash and skips sig verification
+        let baked_tx = Rt::Auth::encode_with_pre_authenticated(raw_tx, tx_hash);
         
         let reconstruct_ms = reconstruct_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1288,7 +1289,8 @@ where
         // Wrap and authenticate - no deserialization or reconstruction needed
         let wrap_start = std::time::Instant::now();
         let raw_tx = RawTx::new(serialized);
-        let baked_tx = Rt::Auth::encode_with_standard_auth(raw_tx);
+        // Use pre-authenticated encoding so runtime uses original hash and skips sig verification
+        let baked_tx = Rt::Auth::encode_with_pre_authenticated(raw_tx, tx_hash);
         let wrap_ms = wrap_start.elapsed().as_secs_f64() * 1000.0;
 
         // Submit directly to the state updator

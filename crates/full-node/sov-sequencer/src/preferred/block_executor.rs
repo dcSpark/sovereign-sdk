@@ -292,8 +292,11 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             panic!("Accepting a transaction, yet there's no in-progress batch. This is a bug in the sequencer, please report it.");
         };
 
-        let call = Rt::Auth::decode_serialized_tx(&baked_tx.tx)?;
-        let call = Rt::wrap_call(call);
+        // Best-effort decode for error reporting only. Do not fail tx acceptance
+        // on decode issues; the executor will perform canonical decoding.
+        let call_for_errors = Rt::Auth::decode_serialized_tx(&baked_tx.tx)
+            .ok()
+            .map(Rt::wrap_call);
 
         if let Err(TrySendError::Full(_)) = task_state.tx_sender.try_send(baked_tx) {
             return Err(RollupBlockExecutorError::Overloaded);
@@ -310,9 +313,12 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             tx_changes,
             remaining_slot_gas,
             execution_time_micros,
-        } = result.map_err(|reason| RollupBlockExecutorError::Rejected {
-            reason,
-            call: call_message_repr::<Rt>(&call),
+        } = result.map_err(|reason| {
+            let call_repr = call_for_errors
+                .as_ref()
+                .map(|c| call_message_repr::<Rt>(c))
+                .unwrap_or_else(|| "<undecoded>".to_string());
+            RollupBlockExecutorError::Rejected { reason, call: call_repr }
         })?;
 
         if !receipt.receipt.is_successful() {

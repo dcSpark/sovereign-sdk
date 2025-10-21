@@ -150,6 +150,8 @@ where
         match auth_data {
             EvmAuthenticatorInput::Evm(call) => Self::Decodable::Evm(call),
             EvmAuthenticatorInput::Standard(call) => call,
+            // Pre-authenticated standard txs decode to the same runtime call
+            EvmAuthenticatorInput::StandardPreAuthenticated(call, _original_hash) => call,
         }
     }
 

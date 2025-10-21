@@ -465,8 +465,8 @@ async fn verify_and_record_midnight_handler(
             );
 
             let persist_start = std::time::Instant::now();
-            // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = extract_pre_authenticated_data(&tx).ok();
+            // Deposits don't need pre-authenticated optimization (no proof to strip)
+            // Use standard path for deposits
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -475,7 +475,7 @@ async fn verify_and_record_midnight_handler(
                 None, // proof_verified: NULL (transaction doesn't have a proof)
                 &transaction_data,
                 &req.body,
-                pre_auth_data,
+                None, // No pre-auth data - deposits use standard path
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -536,7 +536,16 @@ async fn verify_and_record_midnight_handler(
 
             let persist_start = std::time::Instant::now();
             // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = extract_pre_authenticated_data(&tx).ok();
+            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+                Ok(data) => {
+                    info!("✓ Extracted pre-authenticated data for withdraw (includes lightweight tx without proof)");
+                    Some(data)
+                }
+                Err(e) => {
+                    error!("⚠️  Failed to extract pre-authenticated data for withdraw: {e}");
+                    None
+                }
+            };
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -1174,14 +1183,87 @@ fn extract_pre_authenticated_data(
                     .map_err(|e| ServiceError::Internal(format!("Failed to serialize runtime_call: {}", e)))?
             );
             
-            // OPTIMIZATION: Serialize the complete transaction once and store as base64
-            // This avoids deserialize + reconstruct overhead in the sequencer (saves ~12-15ms)
-            // NOTE: We MUST keep the full transaction with proof intact for signature validity.
-            // The signature is cryptographically bound to the entire transaction content.
-            // The sequencer will skip verification but needs the complete transaction for execution.
-            let serialized_tx_bytes = borsh::to_vec(tx)
-                .map_err(|e| ServiceError::Internal(format!("Failed to serialize transaction: {}", e)))?;
-            let serialized_tx_base64 = base64::engine::general_purpose::STANDARD.encode(&serialized_tx_bytes);
+            // OPTIMIZATION: Create a lightweight transaction WITHOUT the proof for pre-authenticated path
+            // 
+            // SECURITY MODEL:
+            // 1. Worker verifies signature on FULL transaction (with 3MB proof) ✓
+            // 2. Worker verifies the Ligero proof itself ✓
+            // 3. Worker computes hash of FULL transaction (this is what signature was computed over)
+            // 4. Worker creates LIGHTWEIGHT transaction (proof stripped, saves ~3MB transfer)
+            // 5. Worker stores: lightweight_tx + original_hash + proof_outputs
+            // 6. Sequencer receives: lightweight_tx + original_hash
+            // 7. Sequencer uses PreAuthenticated wrapper with original_hash
+            // 8. STF uses the provided hash (NO recalculation) and skips signature verification
+            // 
+            // The signature is cryptographically bound to the FULL transaction content,
+            // but we don't need to verify it again since the worker already did.
+            // The STF just needs to know the correct hash for tracking purposes.
+            
+            let lightweight_runtime_call = {
+                use demo_stf::runtime::RuntimeCall;
+                use midnight_privacy::CallMessage;
+                use sov_modules_api::SafeVec;
+                
+                match &v0.runtime_call {
+                    RuntimeCall::MidnightPrivacy(midnight_call) => {
+                        match midnight_call {
+                            CallMessage::Withdraw { proof: _, anchor_root, nullifier, withdraw_amount, to, gas } => {
+                                // Create withdraw call with EMPTY proof (already verified by worker)
+                                RuntimeCall::MidnightPrivacy(CallMessage::Withdraw {
+                                    proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
+                                    anchor_root: *anchor_root,
+                                    nullifier: *nullifier,
+                                    withdraw_amount: *withdraw_amount,
+                                    to: to.clone(),
+                                    gas: gas.clone(),
+                                })
+                            }
+                            CallMessage::Transfer { proof: _, anchor_root, nullifier, gas } => {
+                                // Create transfer call with EMPTY proof (already verified by worker)
+                                RuntimeCall::MidnightPrivacy(CallMessage::Transfer {
+                                    proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
+                                    anchor_root: *anchor_root,
+                                    nullifier: *nullifier,
+                                    gas: gas.clone(),
+                                })
+                            }
+                            _ => {
+                                // For non-proof calls (deposits, etc), keep as-is
+                                v0.runtime_call.clone()
+                            }
+                        }
+                    }
+                    _ => v0.runtime_call.clone()
+                }
+            };
+            
+            // Create lightweight transaction (proof stripped, saves ~3MB)
+            let lightweight_tx = Transaction::<DemoRuntime<RollupSpec>, RollupSpec> {
+                versioned_tx: VersionedTx::V0(Version0 {
+                    signature: v0.signature.clone(),
+                    pub_key: v0.pub_key.clone(),
+                    runtime_call: lightweight_runtime_call,
+                    uniqueness: v0.uniqueness.clone(),
+                    details: v0.details.clone(),
+                }),
+            };
+            
+            // Serialize the LIGHTWEIGHT transaction (proof stripped, saves ~3MB)
+            let lightweight_tx_bytes = borsh::to_vec(&lightweight_tx)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize lightweight transaction: {}", e)))?;
+            let serialized_tx_base64 = base64::engine::general_purpose::STANDARD.encode(&lightweight_tx_bytes);
+            
+            // Compute size savings
+            let full_tx_bytes = borsh::to_vec(tx)
+                .map_err(|e| ServiceError::Internal(format!("Failed to serialize full transaction: {}", e)))?;
+            let bytes_saved = full_tx_bytes.len() - lightweight_tx_bytes.len();
+            
+            info!(
+                "✓ Created lightweight pre-authenticated transaction: {} bytes (original: {} bytes, saved: {} bytes)",
+                lightweight_tx_bytes.len(),
+                full_tx_bytes.len(),
+                bytes_saved
+            );
             
             Ok((pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64))
         }
