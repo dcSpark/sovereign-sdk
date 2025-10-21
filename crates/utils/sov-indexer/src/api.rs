@@ -3,8 +3,7 @@ use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoRespon
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
-use sea_orm::sea_query::JoinType;
+use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 use crate::index_db as idx;
 
@@ -66,7 +65,7 @@ async fn list_wallet_txs_inner(address: String, q: ListQuery, state: AppState) -
         .order_by_desc(idx::involvement::Column::Id);
 
     if let Some(ref t) = q.r#type { query = query.filter(idx::Column::Kind.eq(t.clone())); }
-    if let (Some(ts), Some(id)) = (cursor_ts, cursor_id) {
+    if let (Some(_ts), Some(id)) = (cursor_ts, cursor_id) {
         // Since we didn't manually join events here, we paginate only by involvement.id.
         // events.created_at is still returned via the related entity for the cursor we emit.
         let cond = Condition::any().add(idx::involvement::Column::Id.lt(id));

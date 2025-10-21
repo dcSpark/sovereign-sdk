@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sea_orm::{entity::prelude::*, sea_query::{Index, IndexCreateStatement, OnConflict}, Schema, DatabaseConnection, DbBackend, ActiveModelTrait, Set};
+use sea_orm::{entity::prelude::*, sea_query::{Index, IndexCreateStatement, OnConflict}, Schema, DatabaseConnection, Set};
 use chrono::{DateTime, Utc};
 use crate::index_db as idx;
 
