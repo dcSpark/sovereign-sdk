@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(api::AppState { db: idx_db.clone() });
 
     let addr: SocketAddr = bind_addr.parse()?;
-    info!("wallet-indexer listening on {}", addr);
+    info!("sov-indexer listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

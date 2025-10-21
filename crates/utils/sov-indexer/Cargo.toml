@@ -1,5 +1,5 @@
 [package]
-name = "sov-wallet-indexer"
+name = "sov-indexer"
 version = "0.1.0"
 edition = "2021"
 
