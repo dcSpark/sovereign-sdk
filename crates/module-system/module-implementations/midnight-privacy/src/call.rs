@@ -305,9 +305,29 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                 .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-            // Verify the proof and extract public output
-            let public: SpendPublic = LigeroVerifier::verify(&proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+            // Try to use pre-verified credential (preferred fast path)
+            let credential_check_start = std::time::Instant::now();
+            let ctx_public = _ctx
+                .get_sender_credential::<PreVerifiedWithdrawCredential>()
+                .map(|cred| cred.0.clone());
+            let cached_public = crate::get_pre_verified_spend(&nullifier);
+            let has_credential = ctx_public.is_some() || cached_public.is_some();
+            let credential_check_duration = credential_check_start.elapsed();
+            debug!(
+                credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
+                has_credential = ?has_credential,
+                "Transfer: checked for pre-verified credential"
+            );
+
+            let public = if let Some(public) = ctx_public.or(cached_public) {
+                info!("Using pre-verified credential path (skipping Ligero proof verification)");
+                public
+            } else {
+                info!("No pre-verified credential, performing full Ligero proof verification");
+                // Verify the proof and extract public output
+                LigeroVerifier::verify(&proof, &method_id)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+            };
 
             // SECURITY: Bind transaction fields to proof-committed values
             if public.anchor_root != anchor_root || public.nullifier != nullifier {

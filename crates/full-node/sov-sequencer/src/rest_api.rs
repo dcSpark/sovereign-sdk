@@ -293,6 +293,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         // Define WorkerTxIntent enum for both paths
         enum WorkerTxIntent {
             Deposit,
+            Transfer { proof_outputs: SpendPublic },
             Withdraw { proof_outputs: SpendPublic },
         }
 
@@ -304,7 +305,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             // Track nullifier for cleanup
             let mut withdraw_nullifier_opt: Option<midnight_privacy::Hash32> = None;
             
-            // Extract proof outputs for withdraw transactions
+            // Extract proof outputs for withdraw/transfer transactions
             let worker_tx_intent = if transaction_data
                 .get("withdraw")
                 .and_then(|v| v.as_object())
@@ -323,6 +324,20 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 
                 WorkerTxIntent::Withdraw { proof_outputs }
             } else if transaction_data
+                .get("transfer")
+                .and_then(|v| v.as_object())
+                .is_some()
+            {
+                let proof_outputs: SpendPublic =
+                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
+                        errors::bad_request_400("Failed to parse proof outputs", err)
+                    })?;
+                // Store nullifier for cleanup
+                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
+                // Cache the pre-verified proof for midnight-privacy module
+                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
+                WorkerTxIntent::Transfer { proof_outputs }
+            } else if transaction_data
                 .get("deposit")
                 .and_then(|v| v.as_object())
                 .is_some()
@@ -331,13 +346,27 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             } else {
                 return Err(errors::bad_request_400(
                     "Unsupported transaction",
-                    "Only deposit or withdraw transactions can use this endpoint",
+                    "Only deposit, transfer or withdraw transactions can use this endpoint",
                 ));
             };
 
             // Use the OPTIMIZED path - decode serialized transaction directly
             let result = match worker_tx_intent {
                 WorkerTxIntent::Withdraw { proof_outputs } => {
+                    let proof_outputs_clone = proof_outputs.clone();
+                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
+                    let sequencer = state.sequencer.clone();
+                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
+                        sequencer
+                            .accept_serialized_pre_authenticated_tx(
+                                serialized_tx_base64.clone(),
+                                tx_hash_value,
+                            )
+                            .await
+                    })
+                    .await
+                }
+                WorkerTxIntent::Transfer { proof_outputs } => {
                     let proof_outputs_clone = proof_outputs.clone();
                     crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
                     let sequencer = state.sequencer.clone();
@@ -394,7 +423,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             // Track nullifier for cleanup
             let mut withdraw_nullifier_opt: Option<midnight_privacy::Hash32> = None;
             
-            // Extract proof outputs for withdraw transactions
+            // Extract proof outputs for withdraw/transfer transactions
             let worker_tx_intent = if transaction_data
                 .get("withdraw")
                 .and_then(|v| v.as_object())
@@ -414,6 +443,20 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 
                 WorkerTxIntent::Withdraw { proof_outputs }
             } else if transaction_data
+                .get("transfer")
+                .and_then(|v| v.as_object())
+                .is_some()
+            {
+                let proof_outputs: SpendPublic =
+                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
+                        errors::bad_request_400("Failed to parse proof outputs", err)
+                    })?;
+                // Store nullifier for cleanup
+                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
+                // Cache the pre-verified proof for midnight-privacy module
+                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
+                WorkerTxIntent::Transfer { proof_outputs }
+            } else if transaction_data
                 .get("deposit")
                 .and_then(|v| v.as_object())
                 .is_some()
@@ -422,13 +465,31 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             } else {
                 return Err(errors::bad_request_400(
                     "Unsupported transaction",
-                    "Only deposit or withdraw transactions can use this endpoint",
+                    "Only deposit, transfer or withdraw transactions can use this endpoint",
                 ));
             };
 
             // Use the pre-authenticated path - no blob transfer, no signature verification
             let result = match worker_tx_intent {
                 WorkerTxIntent::Withdraw { proof_outputs } => {
+                    let proof_outputs_clone = proof_outputs.clone();
+                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
+                    let sequencer = state.sequencer.clone();
+                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
+                        sequencer
+                            .accept_pre_authenticated_tx(
+                                pub_key_hex.clone(),
+                                signature_hex.clone(),
+                                uniqueness_hex.clone(),
+                                details_hex.clone(),
+                                runtime_call_hex.clone(),
+                                tx_hash_value,
+                            )
+                            .await
+                    })
+                    .await
+                }
+                WorkerTxIntent::Transfer { proof_outputs } => {
                     let proof_outputs_clone = proof_outputs.clone();
                     crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
                     let sequencer = state.sequencer.clone();
@@ -563,6 +624,68 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             withdraw_nullifier = Some(nullifier_array);
 
             WorkerTxIntent::Withdraw { proof_outputs }
+        } else if let Some(transfer) =
+            transaction_data.get("transfer").and_then(|v| v.as_object())
+        {
+            let anchor_root_hex = transfer
+                .get("anchor_root")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing anchor_root")
+                })?;
+            let anchor_root_vec = Vec::from_hex(anchor_root_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid anchor_root hex", err))?;
+            let anchor_root_array: [u8; 32] = anchor_root_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
+
+            let nullifier_hex = transfer
+                .get("nullifier")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                })?;
+            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
+            let nullifier_array: [u8; 32] = nullifier_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+
+            let proof_outputs_str = model.proof_outputs.trim();
+            if proof_outputs_str.is_empty() || proof_outputs_str == "{}" {
+                return Err(errors::bad_request_400(
+                    "Proof outputs missing",
+                    "Transfer-like transaction requires proof outputs",
+                ));
+            }
+
+            let proof_outputs: SpendPublic = serde_json::from_str(proof_outputs_str)
+                .map_err(|err| errors::bad_request_400("Invalid proof_outputs JSON", err))?;
+
+            if proof_outputs.anchor_root != anchor_root_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "anchor_root does not match",
+                ));
+            }
+            if proof_outputs.nullifier != nullifier_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "nullifier does not match",
+                ));
+            }
+            // For transfers, withdraw_amount must be 0
+            if proof_outputs.withdraw_amount != 0 {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "withdraw_amount must be 0 for transfers",
+                ));
+            }
+
+            midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
+            withdraw_nullifier = Some(nullifier_array);
+
+            WorkerTxIntent::Transfer { proof_outputs }
         } else if transaction_data
             .get("deposit")
             .and_then(|v| v.as_object())
@@ -579,7 +702,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         } else {
             return Err(errors::bad_request_400(
                 "Unsupported transaction",
-                "Only deposit or withdraw transactions can use this endpoint",
+                "Only deposit, transfer or withdraw transactions can use this endpoint",
             ));
         };
 
@@ -609,6 +732,19 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 let baked_tx = baked_tx
                     .take()
                     .expect("baked transaction should be available for withdraw");
+                let tx_hash_clone = tx_hash.clone();
+                crate::common::with_pre_verified_withdraw(proof_outputs, async move {
+                    sequencer.accept_worker_verified_tx(baked_tx, tx_hash_clone, true).await
+                })
+                .await
+            }
+            WorkerTxIntent::Transfer { proof_outputs } => {
+                let proof_outputs_clone = proof_outputs.clone();
+                crate::common::cache_pre_verified_withdraw(tx_hash.clone(), proof_outputs_clone);
+                let sequencer = state.sequencer.clone();
+                let baked_tx = baked_tx
+                    .take()
+                    .expect("baked transaction should be available for transfer");
                 let tx_hash_clone = tx_hash.clone();
                 crate::common::with_pre_verified_withdraw(proof_outputs, async move {
                     sequencer.accept_worker_verified_tx(baked_tx, tx_hash_clone, true).await

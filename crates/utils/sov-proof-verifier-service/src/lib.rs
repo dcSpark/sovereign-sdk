@@ -507,6 +507,82 @@ async fn verify_and_record_midnight_handler(
                 metrics,
             }))
         }
+        ParsedMidnightCall::Transfer {
+            proof,
+            anchor_root,
+            nullifier,
+        } => {
+            // Transfers have proofs but zero withdraw amount; outputs contain new commitments
+            debug!(
+                "Parsed midnight transfer: nullifier=0x{}, anchor_root=0x{}, proof_size={} bytes",
+                hex::encode(nullifier),
+                hex::encode(anchor_root),
+                proof.len()
+            );
+
+            let proof_start = std::time::Instant::now();
+            // For transfers, expected withdraw_amount is 0
+            let proof_public = verify_midnight_withdraw_proof(
+                state.config.midnight_method_id.as_ref(),
+                &proof,
+                anchor_root,
+                nullifier,
+                0u128,
+            )
+            .await?;
+            metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
+
+            let persist_start = std::time::Instant::now();
+            // Extract pre-authenticated data for optimized sequencer processing
+            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+                Ok(data) => {
+                    info!("✓ Extracted pre-authenticated data for transfer (includes lightweight tx without proof)");
+                    Some(data)
+                }
+                Err(e) => {
+                    error!("⚠️  Failed to extract pre-authenticated data for transfer: {e}");
+                    None
+                }
+            };
+
+            store_verified_midnight_transaction(
+                state.da_conn.as_ref(),
+                &tx_hash,
+                Some(&proof_public), // Proof outputs from verification
+                true,                 // signature_valid
+                Some(true),          // proof_verified: true
+                &transaction_data,
+                &req.body,
+                pre_auth_data,
+            )
+            .await?;
+            metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+            info!(
+                "✓ Stored verified midnight transfer: nullifier=0x{}, anchor_root=0x{}, hash={}",
+                hex::encode(nullifier),
+                hex::encode(anchor_root),
+                tx_hash
+            );
+
+            let sequencer_start = std::time::Instant::now();
+            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let error_message = if submission.accepted {
+                None
+            } else {
+                Some(submission.log_message.clone())
+            };
+
+            Ok(Json(VerifyAndSubmitResponse {
+                success: submission.accepted,
+                tx_hash: Some(tx_hash),
+                sequencer_response: submission.response_json.clone(),
+                error: error_message,
+                metrics,
+            }))
+        }
         ParsedMidnightCall::Withdraw {
             proof,
             anchor_root,
@@ -881,6 +957,11 @@ enum ParsedMidnightCall {
         rho: MidnightHash32,
         recipient: MidnightHash32,
     },
+    Transfer {
+        proof: Vec<u8>,
+        anchor_root: MidnightHash32,
+        nullifier: MidnightHash32,
+    },
     Withdraw {
         proof: Vec<u8>,
         anchor_root: MidnightHash32,
@@ -904,6 +985,16 @@ fn parse_midnight_call(
                 amount,
                 rho,
                 recipient,
+            }),
+            MidnightCallMessage::Transfer {
+                proof,
+                anchor_root,
+                nullifier,
+                ..
+            } => Ok(ParsedMidnightCall::Transfer {
+                proof: proof.into(),
+                anchor_root,
+                nullifier,
             }),
             MidnightCallMessage::Withdraw {
                 proof,
@@ -951,6 +1042,9 @@ fn parse_midnight_withdraw_call(
         } => Ok((proof, anchor_root, nullifier, withdraw_amount, to)),
         ParsedMidnightCall::Deposit { .. } => Err(ServiceError::UnsupportedCall(
             "Expected Withdraw call, got Deposit".to_string(),
+        )),
+        ParsedMidnightCall::Transfer { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got Transfer".to_string(),
         )),
     }
 }

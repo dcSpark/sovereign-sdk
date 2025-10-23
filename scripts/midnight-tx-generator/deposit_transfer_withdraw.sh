@@ -19,8 +19,7 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-200}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
-# Endpoints - always send to sequencer (primary) and verifier service (secondary)
-SEQUENCER_ENDPOINT="${SEQUENCER_ENDPOINT:-http://localhost:12346/sequencer/txs}"
+# Endpoint - always send to worker (proof verifier service which forwards to sequencer)
 VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
 
 echo -e "${BLUE}=== Midnight Privacy: Full Lifecycle Demo ===${NC}\n"
@@ -31,8 +30,7 @@ echo "  3. Withdraw $WITHDRAW_AMOUNT from first output (shielded → transparent
 echo ""
 echo "Parameters:"
 echo "  Nonce: $NONCE"
-echo "  Sequencer: $SEQUENCER_ENDPOINT"
-echo "  Verifier: $VERIFIER_ENDPOINT"
+echo "  Worker:    $VERIFIER_ENDPOINT"
 echo ""
 
 # Build generators if needed
@@ -53,28 +51,29 @@ cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
 
-# Send deposit to sequencer
+# Send deposit to verifier service (it forwards to sequencer)
 DEPOSIT_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \
   -d @"$GENERATOR_DIR/midnight_deposit_tx.json" \
-  "$SEQUENCER_ENDPOINT")
+  "$VERIFIER_ENDPOINT")
 
 echo "$DEPOSIT_RESPONSE" | jq '.' 2>/dev/null || echo "$DEPOSIT_RESPONSE"
 
-if echo "$DEPOSIT_RESPONSE" | grep -q '"status":400'; then
+DEPOSIT_SUCCESS=$(echo "$DEPOSIT_RESPONSE" | jq -r '.success // empty')
+if [ "$DEPOSIT_SUCCESS" != "true" ]; then
     echo -e "${RED}✗ Deposit failed${NC}"
     exit 1
 fi
 
-# Also send to verifier service
-curl -s -4 -X POST \
-  -H "Content-Type: application/json" \
-  -d @"$GENERATOR_DIR/midnight_deposit_tx.json" \
-  "$VERIFIER_ENDPOINT" > /dev/null 2>&1 &
+SEQUENCER_RESPONSE=$(echo "$DEPOSIT_RESPONSE" | jq -c '.sequencer_response // empty')
+if [ -z "$SEQUENCER_RESPONSE" ] || [ "$SEQUENCER_RESPONSE" = "null" ]; then
+    echo -e "${RED}✗ Sequencer response missing from deposit result${NC}"
+    exit 1
+fi
 
 # Extract position and anchor root
-NOTE_POSITION=$(echo "$DEPOSIT_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.position')
-ANCHOR_ROOT=$(echo "$DEPOSIT_RESPONSE" | jq -c '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.new_root')
+NOTE_POSITION=$(echo "$SEQUENCER_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.position')
+ANCHOR_ROOT=$(echo "$SEQUENCER_RESPONSE" | jq -c '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.new_root')
 
 if [ -z "$NOTE_POSITION" ] || [ "$NOTE_POSITION" = "null" ]; then
     echo -e "${RED}✗ Failed to extract note position${NC}"
@@ -298,27 +297,28 @@ export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 
 "$GENERATOR_DIR/target/debug/transfer-generator" 2>&1 | tee /tmp/transfer.log
 
-# Send transfer to sequencer
+# Send transfer to verifier service (it forwards to sequencer)
 TRANSFER_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \
   -d @"$GENERATOR_DIR/midnight_transfer_tx.json" \
-  "$SEQUENCER_ENDPOINT")
+  "$VERIFIER_ENDPOINT")
 
 echo "$TRANSFER_RESPONSE" | jq '.' 2>/dev/null || echo "$TRANSFER_RESPONSE"
 
-if echo "$TRANSFER_RESPONSE" | grep -q '"status":400'; then
+TRANSFER_SUCCESS=$(echo "$TRANSFER_RESPONSE" | jq -r '.success // empty')
+if [ "$TRANSFER_SUCCESS" != "true" ]; then
     echo -e "${RED}✗ Transfer failed${NC}"
     exit 1
 fi
 
-# Also send to verifier service
-curl -s -4 -X POST \
-  -H "Content-Type: application/json" \
-  -d @"$GENERATOR_DIR/midnight_transfer_tx.json" \
-  "$VERIFIER_ENDPOINT" > /dev/null 2>&1 &
+SEQUENCER_TRANSFER_RESPONSE=$(echo "$TRANSFER_RESPONSE" | jq -c '.sequencer_response // empty')
+if [ -z "$SEQUENCER_TRANSFER_RESPONSE" ] || [ "$SEQUENCER_TRANSFER_RESPONSE" = "null" ]; then
+    echo -e "${RED}✗ Sequencer response missing from transfer result${NC}"
+    exit 1
+fi
 
 # Extract new positions from transfer response
-TRANSFER_EVENTS=$(echo "$TRANSFER_RESPONSE" | jq -c '[.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated")]')
+TRANSFER_EVENTS=$(echo "$SEQUENCER_TRANSFER_RESPONSE" | jq -c '[.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated")]')
 OUT1_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[0].value.note_created.position')
 OUT2_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[1].value.note_created.position')
 TRANSFER_ROOT=$(echo "$TRANSFER_EVENTS" | jq -c '.[1].value.note_created.new_root')
@@ -525,26 +525,27 @@ export LIGERO_PROGRAM_PATH LIGERO_PACKING
 
 "$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
 
-# Send withdrawal to sequencer
+# Send withdrawal to verifier service (it forwards to sequencer)
 WITHDRAW_RESPONSE=$(curl -s -4 -X POST \
   -H "Content-Type: application/json" \
   -d @"$GENERATOR_DIR/midnight_withdraw_tx.json" \
-  "$SEQUENCER_ENDPOINT")
+  "$VERIFIER_ENDPOINT")
 
 echo "$WITHDRAW_RESPONSE" | jq '.' 2>/dev/null || echo "$WITHDRAW_RESPONSE"
 
-if echo "$WITHDRAW_RESPONSE" | grep -q '"status":400'; then
+WITHDRAW_SUCCESS=$(echo "$WITHDRAW_RESPONSE" | jq -r '.success // empty')
+if [ "$WITHDRAW_SUCCESS" != "true" ]; then
     echo -e "${RED}✗ Withdrawal failed${NC}"
     exit 1
 fi
 
-# Also send to verifier service
-curl -s -4 -X POST \
-  -H "Content-Type: application/json" \
-  -d @"$GENERATOR_DIR/midnight_withdraw_tx.json" \
-  "$VERIFIER_ENDPOINT" > /dev/null 2>&1 &
+SEQUENCER_WITHDRAW_RESPONSE=$(echo "$WITHDRAW_RESPONSE" | jq -c '.sequencer_response // empty')
+if [ -z "$SEQUENCER_WITHDRAW_RESPONSE" ] || [ "$SEQUENCER_WITHDRAW_RESPONSE" = "null" ]; then
+    echo -e "${RED}✗ Sequencer response missing from withdraw result${NC}"
+    exit 1
+fi
 
-CHANGE_POSITION=$(echo "$WITHDRAW_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated") | .value.note_created.position')
+CHANGE_POSITION=$(echo "$SEQUENCER_WITHDRAW_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated") | .value.note_created.position')
 
 echo -e "${GREEN}✓ Withdrawal successful${NC}"
 echo "  Consumed: Note@pos$OUT1_POSITION ($TRANSFER_OUT1 tokens)"
@@ -569,4 +570,3 @@ echo "  • Transparent balance: +$WITHDRAW_AMOUNT tokens (withdrawn)"
 echo "  • Shielded pool: Note@pos$OUT2_POSITION($TRANSFER_OUT2) + Note@pos$CHANGE_POSITION($((TRANSFER_OUT1 - WITHDRAW_AMOUNT))) = $((TRANSFER_OUT2 + TRANSFER_OUT1 - WITHDRAW_AMOUNT)) tokens"
 echo ""
 echo -e "${GREEN}✓ All transactions successful!${NC}"
-
