@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine;
 use borsh;
 use hex;
@@ -11,7 +11,7 @@ use sov_rollup_ligero::MockDemoRollup;
 use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
-use sov_modules_api::{CryptoSpec, PrivateKey, Spec};
+use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_test_utils::default_test_signed_transaction;

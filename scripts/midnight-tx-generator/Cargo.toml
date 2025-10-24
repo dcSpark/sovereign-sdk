@@ -31,6 +31,9 @@ midnight-privacy = { path = "../../crates/module-system/module-implementations/m
 sov-test-utils = { path = "../../crates/module-system/sov-test-utils" }
 sov-ligero-adapter = { path = "../../crates/adapters/ligero", features = ["native"] }
 sov-rollup-interface = { path = "../../crates/rollup-interface" }
+sov-node-client = { path = "../../crates/utils/sov-node-client" }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 
 [[bin]]
@@ -44,3 +47,7 @@ path = "src/transfer_generator.rs"
 [[bin]]
 name = "withdraw-generator"
 path = "src/withdraw_generator.rs"
+
+[[bin]]
+name = "fetch-nonce"
+path = "src/fetch_nonce.rs"
