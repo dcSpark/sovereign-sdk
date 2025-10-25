@@ -1208,6 +1208,7 @@ where
     pub(crate) async fn start(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(msg) = self.message_receiver.recv().await {
+                // TODO(Nico): here we can expand it to do multiple messages in parallel.
                 if let Err(e) = self.handle_next_message(msg).await {
                     match e {
                         SequencerStateUpdatorError::Shutdown => {

@@ -16,7 +16,7 @@ pub mod viewing;
 mod query;
 
 pub use call::CallMessage;
-pub use event::Event;
+pub use event::{CommitmentPos, Event};
 pub use genesis::*;
 pub use hash::*;
 pub use merkle::*;
@@ -155,6 +155,10 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[state]
     pub withdraw_count: StateValue<u64>,
 
+    /// Total number of **spent nullifiers** (both transfers and withdrawals).
+    #[state]
+    pub spent_nullifier_count: StateValue<u64>,
+
     /// Bank module to hold/transfer the native token.
     #[module]
     pub bank: sov_bank::Bank<S>,
@@ -194,20 +198,23 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 amount,
                 rho,
                 recipient,
+                view_fvks,
                 gas,
-            } => Ok(self.deposit(amount, rho, recipient, gas, context, state)?),
+            } => Ok(self.deposit(amount, rho, recipient, view_fvks, gas, context, state)?),
             CallMessage::Transfer {
                 proof,
                 anchor_root,
                 nullifier,
+                view_ciphertexts,
                 gas,
-            } => Ok(self.transfer(proof, anchor_root, nullifier, gas, context, state)?),
+            } => Ok(self.transfer(proof, anchor_root, nullifier, view_ciphertexts, gas, context, state)?),
             CallMessage::Withdraw {
                 proof,
                 anchor_root,
                 nullifier,
                 withdraw_amount,
                 to,
+                view_ciphertexts,
                 gas,
             } => Ok(self.withdraw(
                 proof,
@@ -215,6 +222,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 nullifier,
                 withdraw_amount,
                 to,
+                view_ciphertexts,
                 gas,
                 context,
                 state,
