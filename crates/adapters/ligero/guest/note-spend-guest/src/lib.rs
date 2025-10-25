@@ -164,10 +164,73 @@ fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u32) -> H
     cur
 }
 
-const MAX_ARGS: usize = 256;
-const MAX_BUF: usize = 64 * 1024;
+// === Level B: Viewer Attestation Functions ===
+
+/// Compute FVK commitment: H("FVK_COMMIT_V1" || fvk)
+#[inline(always)]
+fn fvk_commit(fvk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
+}
+
+/// Derive per-note viewing key: H("VIEW_KDF_V1" || fvk || cm)
+#[inline(always)]
+fn view_kdf(fvk: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_KDF_V1", &[fvk, cm])
+}
+
+/// Produce the i-th 32-byte stream block for key k using Poseidon2.
+/// (i is a u32 counter, LE-encoded)
+#[inline(always)]
+fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    let c = ctr.to_le_bytes();
+    poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &c])
+}
+
+/// SNARK-friendly deterministic encryption: XOR plaintext with Poseidon-based keystream.
+/// `pt` and `ct_out` must have equal length.
+fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
+    debug_assert_eq!(pt.len(), ct_out.len());
+    let mut ctr = 0u32;
+    let mut off = 0usize;
+    while off < pt.len() {
+        let ks = stream_block(k, ctr);
+        ctr = ctr.wrapping_add(1);
+
+        let take = core::cmp::min(32, pt.len() - off);
+        for i in 0..take {
+            ct_out[off + i] = pt[off + i] ^ ks[i];
+        }
+        off += take;
+    }
+}
+
+/// Compute ciphertext hash: H("CT_HASH_V1" || ct)
+#[inline(always)]
+fn ct_hash(ct: &[u8]) -> Hash32 {
+    poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
+}
+
+/// Compute viewing MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
+#[inline(always)]
+fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_MAC_V1", &[k, cm, ct_h])
+}
+
+/// Deterministic serialization of a Note plaintext used for encryption:
+/// [ domain(32) | value_le_16 | rho(32) | recipient(32) ] => 112 bytes
+fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32, out: &mut [u8; 112]) {
+    out[0..32].copy_from_slice(domain);
+    out[32..48].copy_from_slice(&value.to_le_bytes());
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+}
+
+const MAX_ARGS: usize = 512;
+const MAX_BUF: usize = 128 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_OUTS: usize = 2;
+const MAX_VIEWERS: usize = 8;
+const NOTE_PLAIN_LEN: usize = 112; // 32 + 16 + 32 + 32
 
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
@@ -241,9 +304,23 @@ pub unsafe extern "C" fn _start() -> ! {
     if n_out_u32 as usize > MAX_OUTS { proc_exit(71); }
     let n_out = n_out_u32 as usize;
 
-    // argc check once we know n_out (argc includes argv[0])
-    let expected_argc = 12u32 + depth_u32 + 4u32 * n_out_u32;
-    if argc != expected_argc { proc_exit(71); }
+    // Expected argc without viewers
+    let expected_base = 12u32 + depth_u32 + 4u32 * n_out_u32;
+    
+    // Must have at least the base args
+    if argc < expected_base { proc_exit(71); }
+
+    // Store output data for viewer encryption
+    struct OutPlain {
+        v: u128,
+        rho: Hash32,
+        rcp: Hash32,
+        cm: Hash32,
+    }
+    let mut outs: [OutPlain; MAX_OUTS] = [
+        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+    ];
 
     // Parse & verify outputs
     let mut out_sum: u128 = 0;
@@ -270,6 +347,9 @@ pub unsafe extern "C" fn _start() -> ! {
 
         let cm_cmp = note_commitment(&domain, vj, &rho_j, &rcp_j);
         assert_one(eq_bytes(&cm_cmp, &cm_arg) as i32);
+
+        // Store output data for later viewer encryption
+        outs[j] = OutPlain { v: vj, rho: rho_j, rcp: rcp_j, cm: cm_arg };
     }
 
     // Compute input note commitment and anchor
@@ -284,6 +364,83 @@ pub unsafe extern "C" fn _start() -> ! {
     // Balance: input value must equal withdraw + sum(outputs)
     let rhs = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| proc_exit(71));
     assert_one((value == rhs) as i32);
+
+    // --- Level B: Viewer Attestations ---
+    // If viewers are declared, verify ct_hash + mac for each (output, viewer)
+
+    let base_after_outs = expected_base as usize;
+
+    // If we have exactly the base args, no viewer attestations
+    if argc == expected_base {
+        proc_exit(0);
+    }
+
+    // Otherwise argc > expected_base, so we must have viewer attestations
+    let n = read_cstr(ptrs[base_after_outs] as *const u8, &mut tmp);
+    let n_viewers: usize = {
+        let v = parse_u64_dec(&tmp[..n]).unwrap_or_else(|| proc_exit(71)) as usize;
+        if v > MAX_VIEWERS { proc_exit(71); }
+        v
+    };
+
+    // Expected argc with viewer attestations:
+    //   expected_base + 1 (m_viewers)
+    //   + m_viewers * ( 1 public fvk_commit + 1 private fvk + 2*n_out public digests )
+    let extra_per_viewer = 1 + 1 + 2 * n_out;
+    let expected_argc_b = expected_base + 1u32 + (n_viewers as u32) * (extra_per_viewer as u32);
+    if argc != expected_argc_b { proc_exit(71); }
+
+    let mut arg_idx = base_after_outs + 1; // start right after m_viewers
+
+    // Work buffer for note plaintext and ciphertext
+    let mut pt_buf = [0u8; NOTE_PLAIN_LEN];
+    let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
+
+    for _i in 0..n_viewers {
+        // 1) Public fvk_commitment
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        let fvk_commit_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // 2) Private fvk
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        let fvk = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // Check binding H(fvk) == fvk_commitment (public)
+        let fvk_c = fvk_commit(&fvk);
+        assert_one(eq_bytes(&fvk_c, &fvk_commit_arg) as i32);
+
+        // 3) For each output, compute ct_hash + mac and compare to public args
+        for j in 0..n_out {
+            let outp = &outs[j];
+
+            // Serialize plaintext
+            encode_note_plain(&domain, outp.v, &outp.rho, &outp.rcp, &mut pt_buf);
+
+            // Key from (fvk, cm_j)
+            let k = view_kdf(&fvk, &outp.cm);
+
+            // Encrypt deterministically
+            stream_xor_encrypt(&k, &pt_buf, &mut ct_buf);
+
+            // Compute digests
+            let ct_h = ct_hash(&ct_buf);
+            let macv = view_mac(&k, &outp.cm, &ct_h);
+
+            // Parse and assert ct_hash (PUBLIC)
+            let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+            let ct_hash_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+            arg_idx += 1;
+            assert_one(eq_bytes(&ct_h, &ct_hash_arg) as i32);
+
+            // Parse and assert mac (PUBLIC)
+            let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+            let mac_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+            arg_idx += 1;
+            assert_one(eq_bytes(&macv, &mac_arg) as i32);
+        }
+    }
 
     proc_exit(0)
 }

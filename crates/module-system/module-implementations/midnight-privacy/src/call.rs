@@ -7,10 +7,12 @@ use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
 use sov_modules_api::VersionReader;
 use thiserror::Error;
 use tracing::{debug, info};
+use std::collections::HashSet;
 
 use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
-use crate::event::Event;
+use crate::event::{CommitmentPos, Event};
 use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
+use crate::types::{EncryptedNote, FullViewingKey};
 
 #[cfg(feature = "native")]
 use anyhow::anyhow;
@@ -35,6 +37,9 @@ pub enum CallMessage<S: Spec> {
         rho: Hash32,
         /// Recipient binding
         recipient: Hash32,
+        /// Optional list of Full Viewing Keys to emit encrypted payloads for this deposit note.
+        /// For each FVK, the module will encrypt the note and emit `NoteEncrypted`.
+        view_fvks: Option<Vec<FullViewingKey>>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
@@ -68,6 +73,9 @@ pub enum CallMessage<S: Spec> {
         anchor_root: Hash32,
         /// Nullifier that the proof derives (must be fresh)
         nullifier: Hash32,
+        /// Optional viewer ciphertexts (created off-chain by the prover).
+        /// Each EncryptedNote must have `enc.cm` equal to one of the produced output commitments.
+        view_ciphertexts: Option<Vec<EncryptedNote>>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
@@ -104,6 +112,9 @@ pub enum CallMessage<S: Spec> {
         withdraw_amount: u128,
         /// Recipient address for the withdrawn tokens
         to: S::Address,
+        /// Optional viewer ciphertexts (created off-chain by the prover).
+        /// Each EncryptedNote must have `enc.cm` equal to one of the produced *change* outputs.
+        view_ciphertexts: Option<Vec<EncryptedNote>>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
@@ -225,6 +236,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         amount: u128,
         rho: Hash32,
         recipient: Hash32,
+        view_fvks: Option<Vec<FullViewingKey>>,
         gas: Option<S::Gas>,
         ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -252,6 +264,24 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let domain = self.domain.get_or_err(st)??;
         let cm = note_commitment(&domain, amount, &rho, &recipient);
         let (position, new_root) = self.add_commitment(cm, st)?;
+
+        // Optional: emit viewer ciphertexts for the deposit note
+        if let Some(fvks) = view_fvks {
+            // Cap to avoid event spam
+            const MAX_VIEW_CT: usize = 8;
+            let fvks = fvks.into_iter().take(MAX_VIEW_CT);
+            let note = crate::types::Note {
+                domain,
+                value: amount,
+                rho,
+                recipient,
+            };
+            for fvk in fvks {
+                let enc = crate::viewing::encrypt_note_for_fvk(&fvk, &note, &cm)
+                    .map_err(|e| anyhow::anyhow!("viewer encrypt (deposit): {e}"))?;
+                self.emit_event(st, Event::NoteEncrypted { enc });
+            }
+        }
 
         // Update deposit statistics
         let total_deposited = self.total_deposited.get(st)?.unwrap_or(0);
@@ -291,6 +321,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+        view_ciphertexts: Option<Vec<EncryptedNote>>,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -358,12 +390,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 .into());
             }
 
-            // Limit outputs to prevent DoS
-            const MAX_OUTPUTS: usize = 16;
-            if public.output_commitments.len() > MAX_OUTPUTS {
+            // Limit outputs to at most 2 (per requirements)
+            const MAX_OUTPUTS_TRANSFER: usize = 2;
+            if public.output_commitments.len() > MAX_OUTPUTS_TRANSFER {
                 return Err(MidnightPrivacyError::<S>::TooManyOutputs(
                     public.output_commitments.len(),
-                    MAX_OUTPUTS,
+                    MAX_OUTPUTS_TRANSFER,
                 )
                 .into());
             }
@@ -383,11 +415,26 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
             self.nullifier_set.set(&nk, &true, st)?;
+            // Stats: bump spent nullifier count
+            let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
+            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+            // Cleanup any cached pre-verified entry
+            crate::clear_pre_verified_spend(&public.nullifier);
 
-            // 3) Add all output commitments to the tree
+            // 3) Add all output commitments to the tree (track pos + final root)
+            let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
+            let mut final_root: Option<Hash32> = None;
             for cm in &public.output_commitments {
-                let (_pos, _root) = self.add_commitment(*cm, st)?;
+                let (pos, root) = self.add_commitment(*cm, st)?;
+                outputs.push(CommitmentPos { commitment: *cm, position: pos });
+                final_root = Some(root);
             }
+            let new_root = if let Some(r) = final_root {
+                r
+            } else {
+                // No outputs: root unchanged
+                self.commitment_tree.get_or_err(st)??.root()
+            };
 
             // Emit spent event
             self.emit_event(
@@ -395,6 +442,86 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 Event::NoteSpent {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
+                },
+            );
+
+            // Level B: Viewer attestation verification
+            if let Some(vcs) = view_ciphertexts {
+                use crate::viewing::ct_hash as compute_ct_hash;
+                
+                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
+                let outputs_set: HashSet<Hash32> =
+                    outputs.iter().map(|o| o.commitment).collect();
+
+                // Require Level B attestations when ciphertexts are present
+                let attestations = public.view_attestations.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level B required: proof must include view_attestations when view_ciphertexts are present"
+                    )
+                })?;
+
+                // Build attestation lookup: (cm, fvk_commitment) -> (ct_hash, mac)
+                let mut att_map: std::collections::HashMap<(Hash32, Hash32), (Hash32, Hash32)> =
+                    std::collections::HashMap::new();
+                for att in attestations {
+                    att_map.insert((att.cm, att.fvk_commitment), (att.ct_hash, att.mac));
+                }
+
+                for enc in vcs.into_iter().take(MAX_VIEW_CT) {
+                    // 1. Check cm is in outputs
+                    if !outputs_set.contains(&enc.cm) {
+                        return Err(anyhow::anyhow!(
+                            "viewer ciphertext cm does not match any transfer outputs"
+                        )
+                        .into());
+                    }
+
+                    // 2. Check (cm, fvk_commitment) exists in attestations
+                    let key = (enc.cm, enc.fvk_commitment);
+                    let (expected_ct_hash, expected_mac) = att_map.get(&key).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "viewer ciphertext (cm={}, fvk_commitment={}) not attested by proof",
+                            hex::encode(enc.cm),
+                            hex::encode(enc.fvk_commitment)
+                        )
+                    })?;
+
+                    // 3. Recompute ct_hash from actual ciphertext bytes
+                    let ct_h = compute_ct_hash(&enc.ct);
+
+                    // 4. Verify ct_hash matches proof attestation
+                    if &ct_h != expected_ct_hash {
+                        return Err(anyhow::anyhow!(
+                            "ct_hash mismatch: computed {} != proof {}",
+                            hex::encode(ct_h),
+                            hex::encode(expected_ct_hash)
+                        )
+                        .into());
+                    }
+
+                    // 5. Verify mac matches proof attestation
+                    if &enc.mac != expected_mac {
+                        return Err(anyhow::anyhow!(
+                            "mac mismatch: tx {} != proof {}",
+                            hex::encode(enc.mac),
+                            hex::encode(expected_mac)
+                        )
+                        .into());
+                    }
+
+                    // All checks passed: emit event
+                    self.emit_event(st, Event::NoteEncrypted { enc });
+                }
+            }
+
+            // Aggregate event for client convenience
+            self.emit_event(
+                st,
+                Event::PoolTransfer {
+                    nullifier: public.nullifier,
+                    anchor_root: public.anchor_root,
+                    outputs,
+                    new_root,
                 },
             );
 
@@ -420,6 +547,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+        view_ciphertexts: Option<Vec<EncryptedNote>>,
         gas: Option<S::Gas>,
         ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -485,12 +614,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 .into());
             }
 
-            // Limit outputs to prevent DoS
-            const MAX_OUTPUTS: usize = 16;
-            if public.output_commitments.len() > MAX_OUTPUTS {
+            // Limit change outputs to at most 1 (per requirements)
+            const MAX_OUTPUTS_WITHDRAW: usize = 1;
+            if public.output_commitments.len() > MAX_OUTPUTS_WITHDRAW {
                 return Err(MidnightPrivacyError::<S>::TooManyOutputs(
                     public.output_commitments.len(),
-                    MAX_OUTPUTS,
+                    MAX_OUTPUTS_WITHDRAW,
                 )
                 .into());
             }
@@ -510,11 +639,26 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
             self.nullifier_set.set(&nk, &true, st)?;
+            // Stats: bump spent nullifier count
+            let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
+            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+            // Cleanup cached pre-verified entry
+            crate::clear_pre_verified_spend(&public.nullifier);
 
-            // 3) Add all output commitments to the tree (for change/split)
+            // 3) Add change outputs (track pos + final root)
+            let mut change_outputs: Vec<CommitmentPos> =
+                Vec::with_capacity(public.output_commitments.len());
+            let mut final_root: Option<Hash32> = None;
             for cm in &public.output_commitments {
-                let (_pos, _root) = self.add_commitment(*cm, st)?;
+                let (pos, root) = self.add_commitment(*cm, st)?;
+                change_outputs.push(CommitmentPos { commitment: *cm, position: pos });
+                final_root = Some(root);
             }
+            let new_root = if let Some(r) = final_root {
+                r
+            } else {
+                self.commitment_tree.get_or_err(st)??.root()
+            };
 
             // 4) Transfer transparent tokens
             use sov_bank::IntoPayable;
@@ -550,12 +694,83 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let withdraw_count = self.withdraw_count.get(st)?.unwrap_or(0);
             self.withdraw_count.set(&(withdraw_count + 1), st)?;
 
+            // Level B: Viewer attestation verification for change outputs
+            if let Some(vcs) = view_ciphertexts {
+                use crate::viewing::ct_hash as compute_ct_hash;
+                
+                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
+                let outputs_set: HashSet<Hash32> =
+                    change_outputs.iter().map(|o| o.commitment).collect();
+
+                // Require Level B attestations when ciphertexts are present
+                let attestations = public.view_attestations.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Level B required: proof must include view_attestations when view_ciphertexts are present"
+                    )
+                })?;
+
+                // Build attestation lookup: (cm, fvk_commitment) -> (ct_hash, mac)
+                let mut att_map: std::collections::HashMap<(Hash32, Hash32), (Hash32, Hash32)> =
+                    std::collections::HashMap::new();
+                for att in attestations {
+                    att_map.insert((att.cm, att.fvk_commitment), (att.ct_hash, att.mac));
+                }
+
+                for enc in vcs.into_iter().take(MAX_VIEW_CT) {
+                    // 1. Check cm is in change outputs
+                    if !outputs_set.contains(&enc.cm) {
+                        return Err(anyhow::anyhow!(
+                            "viewer ciphertext cm does not match any withdraw change outputs"
+                        )
+                        .into());
+                    }
+
+                    // 2. Check (cm, fvk_commitment) exists in attestations
+                    let key = (enc.cm, enc.fvk_commitment);
+                    let (expected_ct_hash, expected_mac) = att_map.get(&key).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "viewer ciphertext (cm={}, fvk_commitment={}) not attested by proof",
+                            hex::encode(enc.cm),
+                            hex::encode(enc.fvk_commitment)
+                        )
+                    })?;
+
+                    // 3. Recompute ct_hash from actual ciphertext bytes
+                    let ct_h = compute_ct_hash(&enc.ct);
+
+                    // 4. Verify ct_hash matches proof attestation
+                    if &ct_h != expected_ct_hash {
+                        return Err(anyhow::anyhow!(
+                            "ct_hash mismatch: computed {} != proof {}",
+                            hex::encode(ct_h),
+                            hex::encode(expected_ct_hash)
+                        )
+                        .into());
+                    }
+
+                    // 5. Verify mac matches proof attestation
+                    if &enc.mac != expected_mac {
+                        return Err(anyhow::anyhow!(
+                            "mac mismatch: tx {} != proof {}",
+                            hex::encode(enc.mac),
+                            hex::encode(expected_mac)
+                        )
+                        .into());
+                    }
+
+                    // All checks passed: emit event
+                    self.emit_event(st, Event::NoteEncrypted { enc });
+                }
+            }
+
             self.emit_event(
                 st,
                 Event::PoolWithdraw {
                     amount: public.withdraw_amount,
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
+                    change: change_outputs,
+                    new_root,
                 },
             );
 

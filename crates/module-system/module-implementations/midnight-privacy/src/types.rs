@@ -18,6 +18,22 @@ pub struct SpendPublic {
     pub withdraw_amount: u128,
     /// Commitments of new shielded outputs (0..=2), in order.
     pub output_commitments: Vec<Hash32>,
+    /// Optional viewer attestations (Level B): binds ciphertexts to proof outputs
+    pub view_attestations: Option<Vec<ViewAttestation>>,
+}
+
+/// A single viewer attestation binding (output_cm, viewer_fvk_commitment, ct_hash, mac).
+/// The guest produces these inside the circuit; the module verifies them on-chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ViewAttestation {
+    /// Output commitment this attestation is bound to
+    pub cm: Hash32,
+    /// FVK commitment: H("FVK_COMMIT_V1" || fvk)
+    pub fvk_commitment: Hash32,
+    /// Hash of the deterministic ciphertext: H("CT_HASH_V1" || ct)
+    pub ct_hash: Hash32,
+    /// MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
+    pub mac: Hash32,
 }
 
 /// Witness for a single-input spend (simple demo).
@@ -205,9 +221,8 @@ impl JsonSchema for FullViewingKey {
 /// AEAD-encrypted note bound to its on-chain commitment.
 /// A viewer uses FVK to decrypt and then recomputes cm to verify truthfulness.
 ///
-/// The ciphertext is bound to the commitment via AEAD AAD, preventing "trust me bro"
-/// scenarios. The viewer must recompute the commitment from the decrypted note and
-/// verify it matches the on-chain commitment.
+/// Level B: The ciphertext is bound via proof-generated ct_hash and mac, which the
+/// module verifies on-chain against the actual ciphertext bytes.
 #[derive(
     Debug,
     Clone,
@@ -220,14 +235,20 @@ impl JsonSchema for FullViewingKey {
     UniversalWallet,
 )]
 pub struct EncryptedNote {
-    /// The on-chain commitment this ciphertext is bound to (also used as AEAD AAD).
+    /// The on-chain commitment this ciphertext is bound to.
     #[serde(with = "serde_bytes_as_hex_array")]
     pub cm: Hash32,
-    /// XChaCha20-Poly1305 nonce (24 bytes).
+    /// XChaCha20-Poly1305 nonce (24 bytes) - kept for backward compat.
     #[serde(with = "serde_bytes_as_hex_array_24")]
     pub nonce: [u8; 24],
-    /// Ciphertext bytes (AEAD).
+    /// Ciphertext bytes (Poseidon-stream XOR for Level B, or XChaCha for legacy).
     pub ct: sov_modules_api::SafeVec<u8, 8_192>,
+    /// FVK commitment: H("FVK_COMMIT_V1" || fvk) - binds viewer to ciphertext.
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub fvk_commitment: Hash32,
+    /// MAC: H("VIEW_MAC_V1" || k || cm || ct_hash) - Level B attestation.
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub mac: Hash32,
 }
 
 impl JsonSchema for EncryptedNote {
@@ -265,12 +286,34 @@ impl JsonSchema for EncryptedNote {
                 ..Default::default()
             }),
         );
+        properties.insert(
+            "fvk_commitment".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "mac".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
 
         obj.object = Some(Box::new(ObjectValidation {
             properties,
-            required: vec!["cm".to_string(), "nonce".to_string(), "ct".to_string()]
-                .into_iter()
-                .collect(),
+            required: vec![
+                "cm".to_string(),
+                "nonce".to_string(),
+                "ct".to_string(),
+                "fvk_commitment".to_string(),
+                "mac".to_string(),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         }));
 
