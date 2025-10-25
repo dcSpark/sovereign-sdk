@@ -1,7 +1,26 @@
 use sov_modules_api::macros::serialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::hash::Hash32;
 use crate::types::EncryptedNote;
+
+/// A (commitment, position) pair used by aggregate events.
+#[derive(
+    Debug,
+    PartialEq,
+    Clone,
+    schemars::JsonSchema,
+    serde::Serialize,
+    serde::Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+pub struct CommitmentPos {
+    /// The note commitment
+    pub commitment: Hash32,
+    /// Position in the tree
+    pub position: u64,
+}
 
 /// Events emitted by the MidnightPrivacy module
 #[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
@@ -40,6 +59,17 @@ pub enum Event {
         /// New Merkle root
         new_root: Hash32,
     },
+    /// Shielded → Shielded transfer (pure privacy), aggregating the outputs.
+    PoolTransfer {
+        /// The nullifier that was spent
+        nullifier: Hash32,
+        /// The anchor root used
+        anchor_root: Hash32,
+        /// Output notes (commitment + position) added by this transfer
+        outputs: Vec<CommitmentPos>,
+        /// Final Merkle root after all outputs were appended
+        new_root: Hash32,
+    },
     /// Tokens were withdrawn from the pool after consuming a nullifier
     PoolWithdraw {
         /// Amount withdrawn
@@ -48,6 +78,10 @@ pub enum Event {
         nullifier: Hash32,
         /// The anchor root used
         anchor_root: Hash32,
+        /// Change outputs created (often 0 or 1)
+        change: Vec<CommitmentPos>,
+        /// Final Merkle root after appending any change
+        new_root: Hash32,
     },
     /// A Merkle root was recorded in the permanent historical index (NOMT-backed)
     AnchorRootRecorded {

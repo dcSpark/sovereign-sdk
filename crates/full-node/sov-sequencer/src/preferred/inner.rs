@@ -1289,6 +1289,7 @@ where
                             return;
                         };
 
+                        // TODO(Nico): here we can expand it to do multiple messages in parallel.
                         if let Err(e) = self.handle_next_message(msg).await {
                             match e {
                                 SequencerStateUpdatorError::Shutdown => {

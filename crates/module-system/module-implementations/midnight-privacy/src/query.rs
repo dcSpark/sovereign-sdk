@@ -309,12 +309,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Calculate pool balance (deposits - withdrawals)
         let pool_balance = total_deposited.saturating_sub(total_withdrawn);
 
-        // Note: Counting spent nullifiers requires iterating through all entries
-        // This is currently not supported efficiently via StateMap API
-        // For production, consider maintaining a nullifier_count state variable
-        // For now, we use withdraw_count as a proxy since withdrawals also spend nullifiers
-        // (This doesn't include pure transfers which also spend nullifiers)
-        let nullifiers_spent = withdraw_count;
+        // Accurate count maintained on spend (transfer or withdraw)
+        let nullifiers_spent = state
+            .spent_nullifier_count
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or(0);
         
         Ok(StatsResponse {
             total_notes: next_position,
