@@ -32,6 +32,7 @@ use sov_modules_api::{
 use sov_node_client::NodeClient;
 use sov_rollup_interface::{
     crypto::PrivateKey,
+    crypto::PublicKey,
     zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
 };
 use std::{
@@ -1757,6 +1758,21 @@ pub async fn store_verified_midnight_transaction(
         Some((pk, sig, uq, det, rt, ser_tx)) => (Set(Some(pk)), Set(Some(sig)), Set(Some(uq)), Set(Some(det)), Set(Some(rt)), Set(Some(ser_tx))),
         None => (Set(None), Set(None), Set(None), Set(None), Set(None), Set(None)),
     };
+    // Derive sender address from the full transaction blob (base64-encoded borsh Transaction)
+    let sender_str = (|| -> Result<String, ServiceError> {
+        let raw = BASE64_STANDARD
+            .decode(full_transaction_blob.as_bytes())
+            .map_err(|e| ServiceError::Internal(format!("Failed to decode base64 tx blob: {e}")))?;
+        let tx: DemoTransaction = borsh::BorshDeserialize::try_from_slice(&raw)
+            .map_err(|e| ServiceError::Internal(format!("Failed to parse tx blob: {e}")))?;
+        let sender_addr: <RollupSpec as Spec>::Address = match &tx.versioned_tx {
+            sov_modules_api::transaction::VersionedTx::V0(inner) => {
+                let cred = inner.pub_key.credential_id();
+                cred.into()
+            }
+        };
+        Ok(sender_addr.to_string())
+    })()?;
 
     VerifiedEntity::insert(VerifiedActiveModel {
         tx_hash: Set(tx_hash.to_owned()),
@@ -1772,6 +1788,7 @@ pub async fn store_verified_midnight_transaction(
         serialized_tx_base64,
         transaction_state: Set(TransactionState::Pending),
         sequencer_status: Set(None),
+        sender: Set(sender_str),
         created_at: Set(Utc::now()),
         ..Default::default()
     })
@@ -1790,6 +1807,7 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::SerializedTxBase64,
                 VerifiedColumn::TransactionState,
                 VerifiedColumn::SequencerStatus,
+                VerifiedColumn::Sender,
                 VerifiedColumn::CreatedAt,
             ])
             .to_owned(),
