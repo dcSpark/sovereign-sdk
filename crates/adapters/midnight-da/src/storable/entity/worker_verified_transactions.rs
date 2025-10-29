@@ -64,6 +64,9 @@ pub struct Model {
     /// Contains the complete borsh-serialized Transaction, ready to wrap and authenticate
     #[sea_orm(column_type = "Text", nullable)]
     pub serialized_tx_base64: Option<String>,
+    /// L2 sender address (canonical string), derived from the transaction's public key.
+    #[sea_orm(column_type = "String(StringLen::None)")]
+    pub sender: String,
     /// Current state of the transaction in the processing pipeline.
     pub transaction_state: TransactionState,
     /// Response from the sequencer after processing (JSON or error message).
