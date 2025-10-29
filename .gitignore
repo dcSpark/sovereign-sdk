@@ -51,3 +51,5 @@ crates/module-system/module-implementations/midnight-privacy/proof_data.gz
 .env
 
 .env
+crates/full-node/sov-sequencer/proof_data.gz
+crates/full-node/sov-sequencer/test_output.log

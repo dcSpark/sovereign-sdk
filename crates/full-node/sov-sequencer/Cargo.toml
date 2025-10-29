@@ -46,7 +46,7 @@ sov-modules-api = { workspace = true, features = ["native"] }
 sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
 sov-state = { workspace = true }
 sov-db = { workspace = true }
-sov-midnight-da = { workspace = true, features = ["native"] }
+sov-midnight-da = { workspace = true, features = ["native", "arbitrary"] }
 midnight-privacy = { workspace = true, features = ["native"] }
 strum = { workspace = true }
 tracing = { workspace = true }
@@ -86,6 +86,8 @@ tempfile = { workspace = true }
 test-strategy = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 sov-transaction-generator = { workspace = true }
+sov-ligero-adapter = { workspace = true, features = ["native"] }
+sha2 = { workspace = true }
 
 [features]
 default = []

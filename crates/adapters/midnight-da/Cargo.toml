@@ -73,9 +73,7 @@ arbitrary = [
     "chrono?/arbitrary",
     "dep:proptest",
     "dep:proptest-derive",
-    "sov-midnight-da/arbitrary",
     "sov-rollup-interface/arbitrary",
-    "sov-test-utils/arbitrary"
 ]
 native = [
     "dep:chrono",
