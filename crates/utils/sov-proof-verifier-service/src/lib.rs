@@ -466,8 +466,19 @@ async fn verify_and_record_midnight_handler(
             );
 
             let persist_start = std::time::Instant::now();
-            // Deposits don't need pre-authenticated optimization (no proof to strip)
-            // Use standard path for deposits
+            // Deposits don't include proofs, but we can still leverage the pre-authenticated path
+            // to avoid recomputing signatures on the sequencer. If extraction fails, fall back.
+            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+                Ok(data) => {
+                    info!("✓ Extracted pre-authenticated data for deposit (signature already verified)");
+                    Some(data)
+                }
+                Err(e) => {
+                    error!("⚠️  Failed to extract pre-authenticated data for deposit: {e}");
+                    None
+                }
+            };
+
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -476,7 +487,7 @@ async fn verify_and_record_midnight_handler(
                 None, // proof_verified: NULL (transaction doesn't have a proof)
                 &transaction_data,
                 &req.body,
-                None, // No pre-auth data - deposits use standard path
+                pre_auth_data,
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -1133,12 +1144,19 @@ fn create_transaction_without_proof(
     match tx.runtime_call() {
         RuntimeCall::MidnightPrivacy(call) => {
             let call_json = match call.clone() {
-                MidnightCallMessage::Deposit { amount, rho, recipient, gas } => {
+                MidnightCallMessage::Deposit {
+                    amount,
+                    rho,
+                    recipient,
+                    view_fvks,
+                    gas,
+                } => {
                     serde_json::json!({
                         "deposit": {
                             "amount": amount.to_string(),
                             "rho": hex::encode(rho),
                             "recipient": format!("{:?}", recipient),
+                            "view_fvks": view_fvks,
                             "gas": gas
                         }
                     })
@@ -1146,6 +1164,7 @@ fn create_transaction_without_proof(
                 MidnightCallMessage::Transfer {
                     anchor_root,
                     nullifier,
+                    view_ciphertexts,
                     gas,
                     ..
                 } => {
@@ -1154,6 +1173,7 @@ fn create_transaction_without_proof(
                             "proof": "REMOVED",
                             "anchor_root": hex::encode(anchor_root),
                             "nullifier": hex::encode(nullifier),
+                            "view_ciphertexts": view_ciphertexts,
                             "gas": gas
                         }
                     })
@@ -1163,6 +1183,7 @@ fn create_transaction_without_proof(
                     nullifier,
                     withdraw_amount,
                     to,
+                    view_ciphertexts,
                     gas,
                     ..
                 } => {
@@ -1173,6 +1194,7 @@ fn create_transaction_without_proof(
                             "nullifier": hex::encode(nullifier),
                             "withdraw_amount": withdraw_amount.to_string(),
                             "to": to.to_string(),
+                            "view_ciphertexts": view_ciphertexts,
                             "gas": gas
                         }
                     })
@@ -1302,7 +1324,7 @@ fn extract_pre_authenticated_data(
                 match &v0.runtime_call {
                     RuntimeCall::MidnightPrivacy(midnight_call) => {
                         match midnight_call {
-                            CallMessage::Withdraw { proof: _, anchor_root, nullifier, withdraw_amount, to, gas } => {
+                            CallMessage::Withdraw { proof: _, anchor_root, nullifier, withdraw_amount, to, view_ciphertexts, gas } => {
                                 // Create withdraw call with EMPTY proof (already verified by worker)
                                 RuntimeCall::MidnightPrivacy(CallMessage::Withdraw {
                                     proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
@@ -1310,15 +1332,17 @@ fn extract_pre_authenticated_data(
                                     nullifier: *nullifier,
                                     withdraw_amount: *withdraw_amount,
                                     to: to.clone(),
+                                    view_ciphertexts: view_ciphertexts.clone(),
                                     gas: gas.clone(),
                                 })
                             }
-                            CallMessage::Transfer { proof: _, anchor_root, nullifier, gas } => {
+                            CallMessage::Transfer { proof: _, anchor_root, nullifier, view_ciphertexts, gas } => {
                                 // Create transfer call with EMPTY proof (already verified by worker)
                                 RuntimeCall::MidnightPrivacy(CallMessage::Transfer {
                                     proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
                                     anchor_root: *anchor_root,
                                     nullifier: *nullifier,
+                                    view_ciphertexts: view_ciphertexts.clone(),
                                     gas: gas.clone(),
                                 })
                             }

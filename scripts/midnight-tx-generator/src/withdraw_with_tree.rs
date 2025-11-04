@@ -71,6 +71,7 @@ fn main() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
     
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
@@ -119,16 +120,15 @@ fn main() -> Result<()> {
     let proof_safe = proof_bytes.try_into()
         .map_err(|_| anyhow::anyhow!("Proof too large"))?;
     
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Withdraw {
-            proof: proof_safe,
-            anchor_root: anchor,
-            nullifier: nf,
-            withdraw_amount,
-            to: recipient_parsed,
-            gas: None,
-        }
-    );
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Withdraw {
+        proof: proof_safe,
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount,
+        to: recipient_parsed,
+        view_ciphertexts: None,
+        gas: None,
+    });
     
     let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
         default_test_signed_transaction(&key_data.private_key, &msg, nonce, &CHAIN_HASH);

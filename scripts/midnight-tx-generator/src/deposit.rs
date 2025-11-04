@@ -5,12 +5,13 @@
 use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use midnight_privacy::{note_commitment, CallMessage, Hash32};
+use midnight_privacy::{note_commitment, CallMessage, FullViewingKey, Hash32};
 use rand;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_rollup_ligero::MockDemoRollup;
 use sov_modules_api::execution_mode::Native;
+use sov_modules_api::gas::UnlimitedGasMeter;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::{CryptoSpec, PrivateKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
@@ -27,6 +28,44 @@ mod demo_generated {
 }
 
 const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
+
+fn parse_viewer_fvks_from_env() -> Result<Option<Vec<FullViewingKey>>> {
+    let raw = match std::env::var("VIEWER_FVKS") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fvks = Vec::new();
+    for token in trimmed.split(|c| matches!(c, ',' | ';' | ' ' | '\n' | '\t')) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let clean = token.strip_prefix("0x").unwrap_or(token);
+        let bytes = hex::decode(clean).with_context(|| {
+            format!("Viewer FVK \"{}\" is not valid hex (expected 64 hex chars)", token)
+        })?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "Viewer FVK \"{}\" must decode to exactly 32 bytes (64 hex chars)",
+                token
+            )
+        })?;
+        fvks.push(FullViewingKey(arr));
+    }
+
+    if fvks.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(fvks))
+    }
+}
 
 fn main() -> Result<()> {
     println!("=== Midnight Deposit Transaction Generator ===\n");
@@ -51,9 +90,24 @@ fn main() -> Result<()> {
         .parse()
         .context("Invalid NONCE")?;
 
+    let viewer_fvks = parse_viewer_fvks_from_env()?;
+    let viewer_fvks_hex: Option<Vec<String>> = viewer_fvks
+        .as_ref()
+        .map(|fvks| fvks.iter().map(|fvk| hex::encode(fvk.0)).collect());
+
     println!("Configuration:");
     println!("  Deposit amount: {}", amount);
     println!("  Nonce: {}\n", nonce);
+    match &viewer_fvks_hex {
+        Some(list) => {
+            println!("  Viewer FVKs ({}):", list.len());
+            for (idx, hex) in list.iter().enumerate() {
+                println!("    [{}] 0x{}", idx, hex);
+            }
+        }
+        None => println!("  Viewer FVKs: (none)"),
+    }
+    println!();
 
     // Use fresh random parameters to avoid nullifier collisions
     let domain: Hash32 = [1u8; 32];  // Keep domain consistent
@@ -79,7 +133,8 @@ fn main() -> Result<()> {
         "rho": hex::encode(rho),
         "recipient": hex::encode(recipient),
         "commitment": hex::encode(cm),
-        "nf_key": hex::encode(nf_key)  // The secret key for nullifier derivation
+        "nf_key": hex::encode(nf_key),  // The secret key for nullifier derivation
+        "viewer_fvks": viewer_fvks_hex,
     });
     
     let note_file = PathBuf::from("midnight_note_details.json");
@@ -103,18 +158,26 @@ fn main() -> Result<()> {
     // Build the deposit transaction
     println!("Building deposit transaction...");
     
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Deposit {
-            amount,
-            rho,
-            recipient,
-            gas: None,
-        }
-    );
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Deposit {
+        amount,
+        rho,
+        recipient,
+        view_fvks: viewer_fvks.clone(),
+        gas: None,
+    });
 
     let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
         default_test_signed_transaction(&private_key, &msg, nonce, &CHAIN_HASH);
     
+    {
+        let mut meter = UnlimitedGasMeter::<DemoRollupSpec>::default();
+        tx.verify(&CHAIN_HASH, &mut meter)
+            .context("Self-check failed: deposit signature didn't verify")?;
+    }
+
+    let sov_modules_api::transaction::VersionedTx::V0(inner) = &tx.versioned_tx;
+    println!("  ✓ Chain ID: {}", inner.details.chain_id);
+
     let tx_hash = tx.hash();
     println!("  ✓ Transaction hash: {}\n", tx_hash);
 
@@ -128,6 +191,15 @@ fn main() -> Result<()> {
     // Write to file
     fs::write(&output_file, &tx_bytes)
         .context("Failed to write transaction file")?;
+    
+    // Sanity check: round-trip deserialize and verify signature matches
+    let round_trip: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
+        borsh::BorshDeserialize::try_from_slice(&tx_bytes)
+            .context("Round-trip deserialize failed")?;
+    let mut round_meter = UnlimitedGasMeter::<DemoRollupSpec>::default();
+    round_trip
+        .verify(&CHAIN_HASH, &mut round_meter)
+        .context("Round-trip signature verification failed")?;
     
     println!("✓ Wrote transaction to: {}\n", output_file.display());
 

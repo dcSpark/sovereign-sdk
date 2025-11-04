@@ -43,6 +43,10 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-200}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
+# Optional viewer full viewing keys (comma-separated hex). Default demo key emits encrypted note payloads.
+DEFAULT_VIEW_FVK="0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+VIEWER_FVKS="${VIEWER_FVKS:-$DEFAULT_VIEW_FVK}"
+
 # Endpoint - always send to worker (proof verifier service which forwards to sequencer)
 VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
 
@@ -55,6 +59,7 @@ echo ""
 echo "Parameters:"
 echo "  Nonce: $NONCE"
 echo "  Worker:    $VERIFIER_ENDPOINT"
+echo "  Viewer FVKs: $VIEWER_FVKS"
 echo ""
 
 # Build generators if needed
@@ -70,7 +75,7 @@ fi
 # STEP 1: DEPOSIT - Put money INTO the privacy pool
 #############################################################################
 echo -e "${YELLOW}━━━ Step 1: Deposit ($DEPOSIT_AMOUNT tokens) ━━━${NC}"
-export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE
+export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE VIEWER_FVKS
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
@@ -175,7 +180,19 @@ fi
 TRANSFER_EVENTS=$(echo "$SEQUENCER_TRANSFER_RESPONSE" | jq -c '[.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated")]')
 OUT1_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[0].value.note_created.position')
 OUT2_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[1].value.note_created.position')
-TRANSFER_ROOT=$(echo "$TRANSFER_EVENTS" | jq -c '.[1].value.note_created.new_root')
+
+# Anchor root for the first output (the one we withdraw later)
+TRANSFER_ROOT=$(echo "$TRANSFER_EVENTS" | jq --arg pos "$OUT1_POSITION" -c '
+    map(.value.note_created)
+    | map(select(.position == ($pos | tonumber)))
+    | first
+    | .new_root
+')
+
+if [ -z "$TRANSFER_ROOT" ] || [ "$TRANSFER_ROOT" = "null" ]; then
+    echo -e "${RED}✗ Failed to match transfer output commitment when extracting anchor root${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}✓ Transfer successful${NC}"
 echo "  Consumed: Note@pos$NOTE_POSITION ($DEPOSIT_AMOUNT tokens)"

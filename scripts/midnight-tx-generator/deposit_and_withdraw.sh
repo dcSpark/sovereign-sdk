@@ -41,6 +41,10 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-50}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
+# Optional viewer full viewing keys (comma-separated hex). Default demo key emits encrypted note payloads.
+DEFAULT_VIEW_FVK="0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+VIEWER_FVKS="${VIEWER_FVKS:-$DEFAULT_VIEW_FVK}"
+
 # Endpoint - proof verifier service orchestrates sequencer submissions
 VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
 
@@ -51,6 +55,7 @@ echo "  Withdraw: $WITHDRAW_AMOUNT"
 echo "  Change: $((DEPOSIT_AMOUNT - WITHDRAW_AMOUNT)) (stays shielded)"
 echo "  Nonce: $NONCE"
 echo "  Proof Verifier: $VERIFIER_ENDPOINT"
+echo "  Viewer FVKs: $VIEWER_FVKS"
 echo ""
 
 # Build generators if needed
@@ -62,7 +67,7 @@ echo ""
 
 # Step 1: Generate and send deposit
 echo -e "${YELLOW}Step 1: Deposit${NC}"
-export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE
+export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE VIEWER_FVKS
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
