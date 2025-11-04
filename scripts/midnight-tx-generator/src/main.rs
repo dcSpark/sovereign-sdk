@@ -135,6 +135,7 @@ fn main() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
     
     println!("Step 2: Generating proof (exactly like test)...");
@@ -206,16 +207,15 @@ fn main() -> Result<()> {
     let proof_safe_vec = proof_bytes.try_into()
         .map_err(|_| anyhow::anyhow!("Proof too large"))?;
     
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Withdraw {
-            proof: proof_safe_vec,
-            anchor_root: anchor,
-            nullifier: nf,
-            withdraw_amount,
-            to: recipient,
-            gas: None,
-        }
-    );
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Withdraw {
+        proof: proof_safe_vec,
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount,
+        to: recipient,
+        view_ciphertexts: None,
+        gas: None,
+    });
 
     let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
         default_test_signed_transaction(&private_key, &msg, nonce, &CHAIN_HASH);
