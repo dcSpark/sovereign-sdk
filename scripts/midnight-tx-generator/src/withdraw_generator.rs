@@ -65,6 +65,7 @@ fn main() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_change],
+        view_attestations: None,
     };
     
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
@@ -117,16 +118,15 @@ fn main() -> Result<()> {
     let recipient_parsed = recipient_addr.parse()
         .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
     
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Withdraw {
-            proof: proof_safe,
-            anchor_root: anchor,
-            nullifier: nf,
-            withdraw_amount,
-            to: recipient_parsed,
-            gas: None,
-        }
-    );
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Withdraw {
+        proof: proof_safe,
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount,
+        to: recipient_parsed,
+        view_ciphertexts: None,
+        gas: None,
+    });
     
     let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
         default_test_signed_transaction(&key_data.private_key, &msg, nonce, &CHAIN_HASH);
