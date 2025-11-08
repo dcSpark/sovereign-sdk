@@ -92,22 +92,23 @@ fn setup_ligero_env() -> Result<(String, [u8; 32])> {
 async fn create_test_sequencer_with_batch_size(
     method_id: [u8; 32],
     max_batch_size: usize,
-) -> (TestRollup<TestBlueprint>, TestUser<TestSpec>) {
+) -> (TestRollup<TestBlueprint>, TestUser<TestSpec>, TestUser<TestSpec>) {
     let genesis_config =
-        HighLevelOptimisticGenesisConfig::<TestSpec>::generate().add_accounts_with_default_balance(1);
-    let admin = genesis_config.additional_accounts()[0].clone();
+        HighLevelOptimisticGenesisConfig::<TestSpec>::generate().add_accounts_with_default_balance(2);
+    let admin1 = genesis_config.additional_accounts()[0].clone();
+    let admin2 = genesis_config.additional_accounts()[1].clone();
 
     let rt_genesis_config = <RT as Runtime<TestSpec>>::GenesisConfig::from_minimal_config(
         genesis_config.into(),
         ValueSetterConfig {
-            admin: admin.address(),
+            admin: admin1.address(),
         },
         PaymasterConfig::default(),
         ValueSetterZkConfig {
             tree_depth: 20,
             root_window_size: 100,
             method_id,
-            admin: admin.address(),
+            admin: admin1.address(),
             domain: [1u8; 32],
             token_id: config_gas_token_id(),
             gas_per_output_append: None,
@@ -156,7 +157,7 @@ async fn create_test_sequencer_with_batch_size(
     .await
     .unwrap();
 
-    (rollup, admin)
+    (rollup, admin1, admin2)
 }
 
 /// Helper to create a deposit transaction
@@ -213,7 +214,7 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
 
     // Create sequencer with larger batch size to accommodate ~3MB ZK proofs
     // Each proof is about 3MB, so we need at least 10MB for multiple transactions
-    let (rollup, admin) = create_test_sequencer_with_batch_size(method_id, 10 * 1024 * 1024).await; // 10MB
+    let (rollup, admin1, admin2) = create_test_sequencer_with_batch_size(method_id, 10 * 1024 * 1024).await; // 10MB
     let rollup = Arc::new(rollup);
 
     // Produce a DA block so the sequencer has a finalized slot
@@ -225,8 +226,12 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
     let mut local_tree = MerkleTree::new(20); // depth 20
     let mut expected_commitments = Vec::new();
 
-    // ========== Block 1: Submit 2 deposits ==========
-    println!("Block 1: Submitting 2 deposits...");
+    // ========== Block 1: Submit 2 deposits IN PARALLEL ==========
+    println!("Block 1: Submitting 2 deposits in parallel...");
+    
+    let mut deposit_handles = vec![];
+    let mut expected_deposits = vec![];
+    
     for i in 0..2u8 {
         let rho = [i + 10; 32];
         let recipient = [i + 20; 32];
@@ -234,24 +239,42 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
 
         // Calculate expected commitment
         let expected_cm = note_commitment(&domain, amount, &rho, &recipient);
-        expected_commitments.push(expected_cm);
+        expected_deposits.push((i, expected_cm, amount));
 
-        // Create and submit deposit transaction
-        let tx = create_deposit_tx(&admin, amount, rho, recipient, i as u64);
+        // Use different accounts for each deposit to enable parallel processing
+        let signer = if i == 0 { admin1.clone() } else { admin2.clone() };
 
-        let result = rollup
-            .api_client()
-            .accept_tx(&AcceptTxBody {
-                body: BASE64_STANDARD.encode(&tx),
-            })
-            .await;
+        // Create deposit transaction
+        let tx = create_deposit_tx(&signer, amount, rho, recipient, 0); // Both accounts start at nonce 0
 
+        let rollup_clone = rollup.clone();
+        let handle = tokio::spawn(async move {
+            let result = rollup_clone
+                .api_client()
+                .accept_tx(&AcceptTxBody {
+                    body: BASE64_STANDARD.encode(&tx),
+                })
+                .await;
+            (i, result)
+        });
+        
+        deposit_handles.push(handle);
+    }
+
+    println!("  📤 {} deposits submitted simultaneously", deposit_handles.len());
+
+    // Wait for all deposits and update local tree
+    for handle in deposit_handles {
+        let (i, result) = handle.await.unwrap();
+        let (_, expected_cm, amount) = expected_deposits[i as usize];
+        
         if let Err(e) = &result {
             panic!("Deposit {} should be accepted, but got error: {:?}", i, e);
         }
 
         // Update local tree
         local_tree.set_leaf(i as usize, expected_cm);
+        expected_commitments.push(expected_cm);
 
         println!("  ✓ Deposit {} submitted (amount: {}, expected position: {})", i, amount, i);
         println!("    Commitment: {}", hex::encode(expected_cm));
@@ -401,10 +424,16 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
         }
     }
     
-    // Submit the transfer transactions
+    // Submit the Block 2 transfer transactions IN PARALLEL
+    println!("\n📤 Submitting Block 2 transfers in parallel...");
+    let mut submission_handles = vec![];
+
     for (i, (proof_data, anchor, nf, cm_out1, cm_out2)) in transfer_proofs.into_iter().enumerate() {
         let proof_safe = proof_data.try_into()
             .expect("Proof too large");
+        
+        // Use different accounts for each transfer to enable true parallel execution
+        let signer = if i == 0 { admin1.clone() } else { admin2.clone() };
         
         let midnight_call = <RT as DispatchCall>::Decodable::MidnightPrivacy(
             MidnightCallMessage::Transfer {
@@ -417,32 +446,53 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
         );
         
         let tx = default_test_signed_transaction::<RT, TestSpec>(
-            &admin.private_key,
+            &signer.private_key,
             &midnight_call,
-            (2 + i) as u64, // nonce continues after deposits
+            1, // nonce 1 for both accounts (after their deposits)
             &<RT as Runtime<TestSpec>>::CHAIN_HASH,
         );
         
         let raw_tx = RawTx::new(borsh::to_vec(&tx).unwrap());
         
-        let result = rollup
-            .api_client()
-            .accept_tx(&AcceptTxBody {
-                body: BASE64_STANDARD.encode(&raw_tx),
-            })
-            .await;
+        // Clone rollup Arc for the async task
+        let rollup_clone = rollup.clone();
+        let tx_idx = i;
         
-        if let Err(e) = &result {
-            println!("    ⚠️  Transfer {} failed to submit: {:?}", i, e);
-        } else {
-            println!("  ✓ Transfer {} submitted", i);
-            
-            // Update local tree with new outputs
-            let next_pos = expected_commitments.len();
-            local_tree.set_leaf(next_pos, cm_out1);
-            local_tree.set_leaf(next_pos + 1, cm_out2);
-            expected_commitments.push(cm_out1);
-            expected_commitments.push(cm_out2);
+        // Spawn parallel submission - don't await yet!
+        let handle = tokio::spawn(async move {
+            let result = rollup_clone
+                .api_client()
+                .accept_tx(&AcceptTxBody {
+                    body: BASE64_STANDARD.encode(&raw_tx),
+                })
+                .await;
+            (tx_idx, result, cm_out1, cm_out2)
+        });
+        
+        submission_handles.push(handle);
+    }
+
+    println!("  📤 {} transactions submitted simultaneously", submission_handles.len());
+
+    // Now await all results
+    for handle in submission_handles {
+        let (tx_idx, result, cm_out1, cm_out2) = handle.await.unwrap();
+        
+        match result {
+            Ok(_) => {
+                println!("  ✓ Transfer {} succeeded", tx_idx);
+                
+                // Update local tree with new outputs
+                let next_pos = expected_commitments.len();
+                local_tree.set_leaf(next_pos, cm_out1);
+                local_tree.set_leaf(next_pos + 1, cm_out2);
+                expected_commitments.push(cm_out1);
+                expected_commitments.push(cm_out2);
+            }
+            Err(e) => {
+                println!("    ⚠️  Transfer {} FAILED: {:?}", tx_idx, e);
+                println!("    ⚠️  This may indicate OCC conflict on shared pending_log!");
+            }
         }
     }
 
@@ -585,10 +635,16 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
         }
     }
     
-    // Submit the Block 3 transfer transactions
+    // Submit the Block 3 transfer transactions IN PARALLEL
+    println!("\n📤 Submitting Block 3 transfers in parallel...");
+    let mut submission_handles = vec![];
+
     for (i, (proof_data, anchor, nf, cm_out1, cm_out2)) in transfer_proofs_block3.into_iter().enumerate() {
         let proof_safe = proof_data.try_into()
             .expect("Proof too large");
+        
+        // Use different accounts for each transfer to enable true parallel execution
+        let signer = if i == 0 { admin1.clone() } else { admin2.clone() };
         
         let midnight_call = <RT as DispatchCall>::Decodable::MidnightPrivacy(
             MidnightCallMessage::Transfer {
@@ -601,32 +657,54 @@ async fn test_batched_merkle_appends_with_deposits() -> Result<()> {
         );
         
         let tx = default_test_signed_transaction::<RT, TestSpec>(
-            &admin.private_key,
+            &signer.private_key,
             &midnight_call,
-            (4 + i) as u64, // nonce continues after Block 2's transfers
+            2, // nonce 2 for both accounts (after deposit + first transfer)
             &<RT as Runtime<TestSpec>>::CHAIN_HASH,
         );
         
         let raw_tx = RawTx::new(borsh::to_vec(&tx).unwrap());
         
-        let result = rollup
-            .api_client()
-            .accept_tx(&AcceptTxBody {
-                body: BASE64_STANDARD.encode(&raw_tx),
-            })
-            .await;
+        // Clone rollup Arc for the async task
+        let rollup_clone = rollup.clone();
+        let tx_idx = i;
         
-        if let Err(e) = &result {
-            println!("    ⚠️  Transfer {} failed to submit: {:?}", i, e);
-        } else {
-            println!("  ✓ Transfer {} submitted successfully!", i);
-            
-            // Update local tree with new outputs
-            let next_pos = expected_commitments.len();
-            local_tree.set_leaf(next_pos, cm_out1);
-            local_tree.set_leaf(next_pos + 1, cm_out2);
-            expected_commitments.push(cm_out1);
-            expected_commitments.push(cm_out2);
+        // Spawn parallel submission - don't await yet!
+        let handle = tokio::spawn(async move {
+            let result = rollup_clone
+                .api_client()
+                .accept_tx(&AcceptTxBody {
+                    body: BASE64_STANDARD.encode(&raw_tx),
+                })
+                .await;
+            (tx_idx, result, cm_out1, cm_out2)
+        });
+        
+        submission_handles.push(handle);
+    }
+
+    println!("  📤 {} transactions submitted simultaneously", submission_handles.len());
+
+    // Now await all results
+    for handle in submission_handles {
+        let (tx_idx, result, cm_out1, cm_out2) = handle.await.unwrap();
+        
+        match result {
+            Ok(_) => {
+                println!("  ✓ Transfer {} succeeded", tx_idx);
+                
+                // Update local tree with new outputs
+                let next_pos = expected_commitments.len();
+                local_tree.set_leaf(next_pos, cm_out1);
+                local_tree.set_leaf(next_pos + 1, cm_out2);
+                expected_commitments.push(cm_out1);
+                expected_commitments.push(cm_out2);
+            }
+            Err(e) => {
+                println!("    ⚠️  Transfer {} FAILED: {:?}", tx_idx, e);
+                println!("    ⚠️  This may indicate OCC conflict on shared pending_log!");
+                // With OCC conflicts on shared pending_log, you might see failures here!
+            }
         }
     }
 

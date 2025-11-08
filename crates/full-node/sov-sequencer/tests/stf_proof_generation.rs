@@ -167,6 +167,7 @@ async fn create_test_sequencer_with_batch_size(
             admin: admin.address(),
             domain: [0u8; 32],
             token_id: config_gas_token_id(),
+            gas_per_output_append: None,
         },
     );
 
