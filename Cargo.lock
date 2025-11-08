@@ -13166,6 +13166,7 @@ dependencies = [
  "rand 0.8.5",
  "reltester",
  "rockbound",
+ "rustc-hash 2.1.1",
  "schemars 0.8.22",
  "sea-orm",
  "serde",

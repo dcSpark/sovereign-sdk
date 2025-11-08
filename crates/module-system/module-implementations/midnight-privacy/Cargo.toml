@@ -17,15 +17,15 @@ workspace = true
 [dev-dependencies]
 sov-address = { workspace = true }
 tempfile = { workspace = true }
-sov-modules-api = { workspace = true, features = ["native"] }
-sov-test-utils = { workspace = true }
-sov-state = { workspace = true, features = ["native"] }
+sov-modules-api = { workspace = true, features = ["native", "arbitrary"] }
+sov-test-utils = { workspace = true, features = ["arbitrary"] }
+sov-state = { workspace = true, features = ["native", "arbitrary"] }
 sha2 = { workspace = true }
 sov-ligero-adapter = { workspace = true, features = ["native"] }
-sov-rollup-interface = { workspace = true, features = ["native"] }
+sov-rollup-interface = { workspace = true, features = ["native", "arbitrary"] }
 hex = { workspace = true }
 serde_json = { workspace = true }
-sov-bank = { workspace = true, features = ["native", "test-utils"] }
+sov-bank = { workspace = true, features = ["native", "test-utils", "arbitrary"] }
 
 [dependencies]
 anyhow = { workspace = true }
@@ -55,4 +55,10 @@ native = [
     "sov-state/native",
     "sov-address/native",
     "sov-ligero-adapter/native"
+]
+arbitrary = [
+    "sov-modules-api/arbitrary",
+    "sov-rollup-interface/arbitrary",
+    "sov-state/arbitrary",
+    "sov-bank/arbitrary"
 ]

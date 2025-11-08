@@ -23,7 +23,7 @@ use crate::common::sender_is_allowed;
 pub enum MaybeAsyncBatch<S: Spec> {
     /// The batch is streamed from a channel.
     Async {
-        txs_receiver: Receiver<FullyBakedTxWithMaybeChangeSet>,
+        txs_receiver: Receiver<FullyBakedTxWithMaybeChangeSet<S>>,
         responder: AsyncBatchResponder<S>,
         setup_sender: Option<oneshot::Sender<ChangeSet>>,
         address: S::Address,
@@ -37,7 +37,7 @@ pub enum MaybeAsyncBatch<S: Spec> {
 impl<S: Spec> MaybeAsyncBatch<S> {
     /// Create a new batch with a receiver for transactions.
     pub fn new_async(
-        txs_receiver: Receiver<FullyBakedTxWithMaybeChangeSet>,
+        txs_receiver: Receiver<FullyBakedTxWithMaybeChangeSet<S>>,
         setup_sender: oneshot::Sender<ChangeSet>,
         result_channel: Sender<Result<ExecutedTxResponse<S>, RejectReason>>,
         tx_profit_threshold: u128,

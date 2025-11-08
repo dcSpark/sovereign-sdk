@@ -1,20 +1,23 @@
 use std::fmt::Debug;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use schemars::JsonSchema;
 use sov_modules_api::macros::{serialize, UniversalWallet};
-use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
+use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState, StateReaderAndWriter};
+// no additional imports
 use thiserror::Error;
 use tracing::{debug, info};
 use std::collections::HashSet;
 
 use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
-use crate::event::{CommitmentPos, Event};
+use crate::event::Event;
 use crate::hash::{note_commitment, Hash32, RootKey};
 use crate::types::{EncryptedNote, FullViewingKey};
+// NEW
+use crate::pending::PendingOutput;
+use sov_rollup_interface::common::HexHash;
 
-#[cfg(feature = "native")]
-use anyhow::anyhow;
+// anyhow is used unconditionally for error construction
 
 #[cfg(feature = "native")]
 use crate::hash::NullifierKey;
@@ -174,8 +177,109 @@ pub enum MidnightPrivacyError<S: Spec> {
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
-    /// Internal helper: Add a single commitment to the tree.
-    /// Used by deposit() and transfer() to append note commitments.
+    // --- NEW: append helper ---
+    // Note: legacy queue_output using shared `pending_log` removed in favor of per-tx outbox.
+
+    /// Queue an output commitment keyed by a per-transaction identifier to avoid shared writes.
+    fn queue_output_by_txid(
+        &mut self,
+        txid: HexHash,
+        cm: Hash32,
+        st: &mut impl TxState<S>,
+    ) -> Result<()> {
+        let mut outbox = self
+            .pending_by_tx
+            .get(&txid, st)?
+            .unwrap_or_else(|| Vec::new());
+        outbox.push(PendingOutput { cm });
+        self.pending_by_tx.set(&txid, &outbox, st)?;
+
+        self.emit_event(st, Event::NoteQueued { commitment: cm });
+        Ok(())
+    }
+
+    // --- NEW: epilogue ---
+    /// Implementation of apply_pending without requiring TxState-specific capabilities.
+    pub(crate) fn apply_pending_inner<WS>(&mut self, st: &mut WS) -> Result<()>
+    where
+        WS: StateReaderAndWriter<sov_state::namespaces::User>,
+    {
+        // Apply per-tx outboxes strictly according to block order; if no order, do nothing.
+        let tx_count = self.block_tx_order.len(st)?;
+        if tx_count == 0 {
+            return Ok(());
+        }
+
+        let mut tree = self.commitment_tree.get_or_err(st)??;
+        let mut pos = self.next_position.get_or_err(st)??;
+        let mut agg_stats = crate::PendingStats::default();
+
+        for i in 0..tx_count {
+            let Some(txid) = self.block_tx_order.get(i, st)? else { continue };
+            if let Some(outbox) = self.pending_by_tx.get(&txid, st)? {
+                for PendingOutput { cm } in &outbox {
+                    if (pos as usize) >= tree.len() {
+                        return Err(MidnightPrivacyError::<S>::TreeFull(tree.len()).into());
+                    }
+                    tree.set_leaf(pos as usize, *cm);
+                    pos += 1;
+                }
+
+                // cleanup
+                self.pending_by_tx.delete(&txid, st)?;
+            }
+
+            // fold stats for this tx, if present
+            if let Some(ps) = self.pending_stats_by_tx.get(&txid, st)? {
+                agg_stats.deposits += ps.deposits;
+                agg_stats.deposited_amt = agg_stats.deposited_amt.saturating_add(ps.deposited_amt);
+                agg_stats.withdraws += ps.withdraws;
+                agg_stats.withdrawn_amt =
+                    agg_stats.withdrawn_amt.saturating_add(ps.withdrawn_amt);
+                agg_stats.spent_nullifiers += ps.spent_nullifiers;
+                self.pending_stats_by_tx.delete(&txid, st)?;
+            }
+        }
+
+        self.next_position.set(&pos, st)?;
+        let new_root = tree.root();
+        self.commitment_tree.set(&tree, st)?;
+        self.add_recent_root(new_root, st)?;
+        self.record_root_forever(new_root, st)?;
+
+        // Note: no events here; hook path cannot emit. Call path emits after invoking inner.
+
+        // Update global counters once
+        if agg_stats.deposits != 0 {
+            let c = self.deposit_count.get(st)?.unwrap_or(0);
+            self.deposit_count.set(&(c + agg_stats.deposits), st)?;
+        }
+        if agg_stats.deposited_amt != 0 {
+            let t = self.total_deposited.get(st)?.unwrap_or(0);
+            self.total_deposited.set(&(t + agg_stats.deposited_amt), st)?;
+        }
+        if agg_stats.withdraws != 0 {
+            let c = self.withdraw_count.get(st)?.unwrap_or(0);
+            self.withdraw_count.set(&(c + agg_stats.withdraws), st)?;
+        }
+        if agg_stats.withdrawn_amt != 0 {
+            let t = self.total_withdrawn.get(st)?.unwrap_or(0);
+            self.total_withdrawn.set(&(t + agg_stats.withdrawn_amt), st)?;
+        }
+        if agg_stats.spent_nullifiers != 0 {
+            let c = self.spent_nullifier_count.get(st)?.unwrap_or(0);
+            self.spent_nullifier_count.set(&(c + agg_stats.spent_nullifiers), st)?;
+        }
+
+        // Clear block order vector robustly
+        self.block_tx_order.clear(st)?;
+
+        Ok(())
+    }
+
+    /// Legacy helper: direct per-tx tree append.
+    /// Not used in deferred mode. Keep for migration tests or delete.
+    #[allow(dead_code)]
     fn add_commitment(
         &mut self,
         commitment: Hash32,
@@ -217,6 +321,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     }
 
     /// Deposit: transfer tokens into the pool, append commitment, update root window.
+    /// Deposit: now queues the commitment; Merkle updates happen in epilogue.
     pub(crate) fn deposit(
         &mut self,
         amount: u128,
@@ -230,62 +335,47 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         st.charge_gas(&gas)?;
 
-        // Convert amount into the bank's amount type (u64 -> Amount)
+        // Bank transfer unchanged
+        use sov_bank::IntoPayable;
         let amount_u64: u64 = amount
             .try_into()
             .map_err(|_| MidnightPrivacyError::<S>::AmountOverflow(amount))?;
-        let bank_amount = sov_bank::Amount::from(amount_u64);
-
-        // Pull native token from sender into module account
-        use sov_bank::IntoPayable;
         let token_id = self.token_id.get_or_err(st)??;
-        let coins = sov_bank::Coins {
-            amount: bank_amount,
-            token_id,
-        };
-        self.bank
-            .transfer_from(ctx.sender(), self.id.to_payable(), coins, st)?;
+        self.bank.transfer_from(
+            ctx.sender(),
+            self.id.to_payable(),
+            sov_bank::Coins { amount: sov_bank::Amount::from(amount_u64), token_id },
+            st,
+        )?;
 
-        // Compute commitment and add to tree
+        // Compute commitment and queue
         let domain = self.domain.get_or_err(st)??;
         let cm = note_commitment(&domain, amount, &rho, &recipient);
-        let (position, new_root) = self.add_commitment(cm, st)?;
+        let txid = ctx.tx_hash();
+        self.queue_output_by_txid(txid, cm, st)?;
 
-        // Optional: emit viewer ciphertexts for the deposit note
+        // Optional viewer ciphertexts unchanged
         if let Some(fvks) = view_fvks {
-            // Cap to avoid event spam
             const MAX_VIEW_CT: usize = 8;
-            let fvks = fvks.into_iter().take(MAX_VIEW_CT);
-            let note = crate::types::Note {
-                domain,
-                value: amount,
-                rho,
-                recipient,
-            };
-            for fvk in fvks {
+            let note = crate::types::Note { domain, value: amount, rho, recipient };
+            for fvk in fvks.into_iter().take(MAX_VIEW_CT) {
                 let enc = crate::viewing::encrypt_note_for_fvk(&fvk, &note, &cm)
                     .map_err(|e| anyhow::anyhow!("viewer encrypt (deposit): {e}"))?;
                 self.emit_event(st, Event::NoteEncrypted { enc });
             }
         }
 
-        // Update deposit statistics
-        let total_deposited = self.total_deposited.get(st)?.unwrap_or(0);
-        self.total_deposited.set(&(total_deposited + amount), st)?;
-        
-        let deposit_count = self.deposit_count.get(st)?.unwrap_or(0);
-        self.deposit_count.set(&(deposit_count + 1), st)?;
+        // Per-tx stats
+        let mut ps = self
+            .pending_stats_by_tx
+            .get(&txid, st)?
+            .unwrap_or_default();
+        ps.deposits += 1;
+        ps.deposited_amt = ps.deposited_amt.saturating_add(amount);
+        self.pending_stats_by_tx.set(&txid, &ps, st)?;
 
-        // Emit explicit pool deposit event
-        self.emit_event(
-            st,
-            Event::PoolDeposit {
-                amount,
-                commitment: cm,
-                position,
-                new_root,
-            },
-        );
+        // Non-positional deposit event
+        self.emit_event(st, Event::PoolDeposit { amount, commitment: cm });
 
         Ok(())
     }
@@ -310,7 +400,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         view_ciphertexts: Option<Vec<EncryptedNote>>,
         gas: Option<S::Gas>,
-        _ctx: &Context<S>,
+        ctx: &Context<S>,
         st: &mut impl TxState<S>,
     ) -> Result<()> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
@@ -336,7 +426,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
             // Try to use pre-verified credential (preferred fast path)
             let credential_check_start = std::time::Instant::now();
-            let ctx_public = _ctx
+            let ctx_public = ctx
                 .get_sender_credential::<PreVerifiedWithdrawCredential>()
                 .map(|cred| cred.0.clone());
             let cached_public = crate::get_pre_verified_spend(&nullifier);
@@ -396,26 +486,21 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
             self.nullifier_set.set(&nk, &true, st)?;
-            // Stats: bump spent nullifier count
-            let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
-            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+            // Per-tx stats: bump spent nullifier count
+            let txid = ctx.tx_hash();
+            let mut ps = self
+                .pending_stats_by_tx
+                .get(&txid, st)?
+                .unwrap_or_default();
+            ps.spent_nullifiers += 1;
+            self.pending_stats_by_tx.set(&txid, &ps, st)?;
             // Cleanup any cached pre-verified entry
             crate::clear_pre_verified_spend(&public.nullifier);
 
-            // 3) Add all output commitments to the tree (track pos + final root)
-            let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
-            let mut final_root: Option<Hash32> = None;
+            // 3) Queue outputs; positions are assigned in the epilogue
             for cm in &public.output_commitments {
-                let (pos, root) = self.add_commitment(*cm, st)?;
-                outputs.push(CommitmentPos { commitment: *cm, position: pos });
-                final_root = Some(root);
+                self.queue_output_by_txid(txid, *cm, st)?;
             }
-            let new_root = if let Some(r) = final_root {
-                r
-            } else {
-                // No outputs: root unchanged
-                self.commitment_tree.get_or_err(st)??.root()
-            };
 
             // Emit spent event
             self.emit_event(
@@ -430,9 +515,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
                 
-                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
+                const MAX_VIEW_CT: usize = 16;
                 let outputs_set: HashSet<Hash32> =
-                    outputs.iter().map(|o| o.commitment).collect();
+                    public.output_commitments.iter().copied().collect();
 
                 // Require Level B attestations when ciphertexts are present
                 let attestations = public.view_attestations.as_ref().ok_or_else(|| {
@@ -495,14 +580,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 }
             }
 
-            // Aggregate event for client convenience
+            // Aggregate, non-positional
             self.emit_event(
                 st,
                 Event::PoolTransfer {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
-                    outputs,
-                    new_root,
+                    outputs: public.output_commitments.clone(),
                 },
             );
 
@@ -619,26 +703,21 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
             self.nullifier_set.set(&nk, &true, st)?;
-            // Stats: bump spent nullifier count
-            let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
-            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+            // Per-tx stats: bump spent nullifier count
+            let txid = ctx.tx_hash();
+            let mut ps = self
+                .pending_stats_by_tx
+                .get(&txid, st)?
+                .unwrap_or_default();
+            ps.spent_nullifiers += 1;
+            self.pending_stats_by_tx.set(&txid, &ps, st)?;
             // Cleanup cached pre-verified entry
             crate::clear_pre_verified_spend(&public.nullifier);
 
-            // 3) Add change outputs (track pos + final root)
-            let mut change_outputs: Vec<CommitmentPos> =
-                Vec::with_capacity(public.output_commitments.len());
-            let mut final_root: Option<Hash32> = None;
+            // 3) Queue change outputs; positions assigned in epilogue
             for cm in &public.output_commitments {
-                let (pos, root) = self.add_commitment(*cm, st)?;
-                change_outputs.push(CommitmentPos { commitment: *cm, position: pos });
-                final_root = Some(root);
+                self.queue_output_by_txid(txid, *cm, st)?;
             }
-            let new_root = if let Some(r) = final_root {
-                r
-            } else {
-                self.commitment_tree.get_or_err(st)??.root()
-            };
 
             // 4) Transfer transparent tokens
             use sov_bank::IntoPayable;
@@ -667,20 +746,23 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 },
             );
 
-            // Update withdrawal statistics
-            let total_withdrawn = self.total_withdrawn.get(st)?.unwrap_or(0);
-            self.total_withdrawn.set(&(total_withdrawn + public.withdraw_amount), st)?;
-            
-            let withdraw_count = self.withdraw_count.get(st)?.unwrap_or(0);
-            self.withdraw_count.set(&(withdraw_count + 1), st)?;
+            // Per-tx withdrawal statistics
+            let mut psw = self
+                .pending_stats_by_tx
+                .get(&txid, st)?
+                .unwrap_or_default();
+            psw.withdraws += 1;
+            psw.withdrawn_amt =
+                psw.withdrawn_amt.saturating_add(public.withdraw_amount);
+            self.pending_stats_by_tx.set(&txid, &psw, st)?;
 
             // Level B: Viewer attestation verification for change outputs
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
                 
-                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
+                const MAX_VIEW_CT: usize = 16;
                 let outputs_set: HashSet<Hash32> =
-                    change_outputs.iter().map(|o| o.commitment).collect();
+                    public.output_commitments.iter().copied().collect();
 
                 // Require Level B attestations when ciphertexts are present
                 let attestations = public.view_attestations.as_ref().ok_or_else(|| {
@@ -743,14 +825,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 }
             }
 
+            // Aggregate, non-positional
             self.emit_event(
                 st,
                 Event::PoolWithdraw {
                     amount: public.withdraw_amount,
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
-                    change: change_outputs,
-                    new_root,
+                    change: public.output_commitments.clone(),
                 },
             );
 
@@ -761,7 +843,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// Add a root to the recent roots window (circular buffer).
     /// Uses VecDeque for O(1) operations at both ends.
     /// This provides fast mempool checks for recent transactions.
-    fn add_recent_root(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
+    pub(crate) fn add_recent_root<RW>(&mut self, root: Hash32, state: &mut RW) -> Result<()>
+    where
+        RW: StateReaderAndWriter<sov_state::namespaces::User>,
+    {
         let mut recent_roots = self.recent_roots.get_or_err(state)??;
         let root_window_size = self.root_window_size.get_or_err(state)??;
 
@@ -778,7 +863,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// Permanently record a root in the full-history NOMT-backed index.
     /// This enables long-range anchor validation: any historical root remains valid forever.
     /// Idempotent: if the root already exists, this is a no-op.
-    fn record_root_forever(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
+    pub(crate) fn record_root_forever<RW>(&mut self, root: Hash32, state: &mut RW) -> Result<()>
+    where
+        RW: StateReaderAndWriter<sov_state::namespaces::User>,
+    {
         // Fast path: already recorded?
         if self.all_roots.get(&RootKey(root), state)?.is_some() {
             return Ok(());
@@ -787,9 +875,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Assign a monotonic sequence number and commit to permanent storage
         let seq = self.root_seq.get_or_err(state)??;
         self.all_roots.set(&RootKey(root), &seq, state)?;
-
-        // Emit event for observability
-        self.emit_event(state, Event::AnchorRootRecorded { root, seq });
 
         // Bump sequence (checked add to be safe against overflow)
         let next_seq = seq

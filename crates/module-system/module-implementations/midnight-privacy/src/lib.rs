@@ -8,12 +8,15 @@ mod call;
 mod event;
 mod genesis;
 mod hash;
+mod hooks;
 mod merkle;
 mod preverified;
 mod types;
 pub mod viewing;
 #[cfg(feature = "native")]
 mod query;
+mod pending;
+pub use pending::PendingOutput;
 
 pub use call::CallMessage;
 pub use event::{CommitmentPos, Event};
@@ -29,9 +32,11 @@ pub use query::*;
 
 use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
-    StateValue, TxState,
+    StateValue, StateVec, TxState,
 };
 use std::collections::VecDeque;
+use borsh::{BorshDeserialize, BorshSerialize};
+use sov_rollup_interface::common::HexHash;
 
 /// Marker credential carrying the proof outputs for pre-verified withdrawals.
 #[derive(Clone)]
@@ -162,6 +167,38 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Bank module to hold/transfer the native token.
     #[module]
     pub bank: sov_bank::Bank<S>,
+
+    /// Gas charged per output appended during epilogue.
+    #[state]
+    pub gas_per_output_append: StateValue<S::Gas>,
+
+    // --- New parallel-safe pending structures ---
+    /// Per-transaction outbox of pending outputs. Keyed by tx hash.
+    #[state]
+    pub pending_by_tx: StateMap<HexHash, Vec<PendingOutput>>,
+
+    /// Canonical order of txids within the block. Filled by sequencer and consumed in epilogue.
+    #[state]
+    pub block_tx_order: StateVec<HexHash>,
+
+    /// Per-tx pending stats to avoid shared counters during tx execution.
+    #[state]
+    pub pending_stats_by_tx: StateMap<HexHash, PendingStats>,
+}
+
+/// Per-transaction deltas for global counters.
+#[derive(Default, Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PendingStats {
+    /// Number of deposits performed by the tx.
+    pub deposits: u64,
+    /// Sum of amounts deposited by the tx.
+    pub deposited_amt: u128,
+    /// Number of withdrawals performed by the tx.
+    pub withdraws: u64,
+    /// Sum of amounts withdrawn by the tx.
+    pub withdrawn_amt: u128,
+    /// Number of spent nullifiers recorded by the tx (transfer/withdraw).
+    pub spent_nullifiers: u64,
 }
 
 impl<S: Spec> Module for ValueMidnightPrivacy<S> {

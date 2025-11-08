@@ -609,7 +609,9 @@ where
     #[tracing::instrument(skip_all, level = "trace")]
     async fn close_current_batch(&mut self) {
         // Terminate the batch.
+        eprintln!("🔶 close_current_batch: About to call end_rollup_block");
         self.executor.end_rollup_block().await;
+        eprintln!("🔶 close_current_batch: Finished end_rollup_block");
         self.batch_size_tracker = BatchSizeTracker::new(self.seq_config.max_batch_size_bytes);
         let checkpoint = self
             .executor

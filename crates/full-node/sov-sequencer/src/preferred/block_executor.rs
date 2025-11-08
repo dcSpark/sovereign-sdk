@@ -146,6 +146,8 @@ where
     id: Uuid,
     startup_transaction_cache_writer: Option<TxResultWriter<S, Rt>>,
     pub(super) uncommitted_changes: SequencerStateChanges<Hasher<S>>,
+    /// Per-batch set of committed state keys for OCC conflict detection
+    committed_writes: rustc_hash::FxHashSet<crate::preferred::cache_warm_up_executor::StateKey>,
     phantom: PhantomData<Rt>,
 }
 
@@ -220,6 +222,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             shutdown_sender,
             startup_transaction_cache_writer: tx_cache_writer,
             uncommitted_changes,
+            committed_writes: Default::default(),
             phantom: PhantomData,
         }
     }
@@ -258,7 +261,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn apply_tx_to_in_progress_batch(
         &mut self,
-        baked_tx: FullyBakedTxWithMaybeChangeSet,
+        baked_tx: FullyBakedTxWithMaybeChangeSet<S>,
     ) -> Result<(AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet), RollupBlockExecutorError<S>> {
         let result = self.apply_tx_to_in_progress_batch_inner(baked_tx).await;
 
@@ -283,7 +286,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
 
     async fn apply_tx_to_in_progress_batch_inner(
         &mut self,
-        baked_tx: FullyBakedTxWithMaybeChangeSet,
+        mut baked_tx: FullyBakedTxWithMaybeChangeSet<S>,
     ) -> Result<
         (TransactionReceipt<S>, <S as Spec>::Gas, u64, TxChangeSet),
         RollupBlockExecutorError<S>,
@@ -426,7 +429,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             "Re-applying state changes for the soft-confirmed transaction"
         );
 
-        let tx = FullyBakedTxWithMaybeChangeSet::new(tx);
+        let tx = FullyBakedTxWithMaybeChangeSet::<S>::new(tx);
         match self.apply_tx_to_in_progress_batch(tx).await {
             Ok((output, _tx_changes)) => {
                 if tx_hash != output.accepted_tx.tx_hash {
@@ -486,6 +489,9 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             %start_block_data.visible_increase,
             "Beginning new rollup block and spawning background loop"
         );
+        
+        // Clear committed writes for new batch
+        self.committed_writes.clear();
 
         self.populate_state_roots(&start_block_data.node_state_root)
             .await;
@@ -695,7 +701,6 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     pub async fn end_rollup_block(&mut self) {
         trace!("Ending rollup block");
 
-        let rollup_height = self.checkpoint.rollup_height_to_access();
         let (batch_receipts, new_checkpoint) = self
             .rollup_block_task_state
             .take()
@@ -719,9 +724,13 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             accepted_txs_by_batch.push(accepted_txs);
         }
 
+        // Compute and label the root for the *new* rollup height we just reached.
+        let new_rollup_height = new_checkpoint.rollup_height_to_access();
+        let new_max_slot_number = new_checkpoint.max_allowed_slot_number_to_access();
+        eprintln!("🔷 end_rollup_block: Ending rollup block at NEW height {} (max_slot: {})", new_rollup_height, new_max_slot_number);
         trace!(
             executor_id = %self.id,
-            %rollup_height,
+            %new_rollup_height,
             "Sending state root computation request to background task");
         let (response_channel, response_receiver) = oneshot::channel();
         self.state_root_responses.push_back(response_receiver);
@@ -733,8 +742,8 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 raw_state_changes: changes.clone(),
                 uncommitted_changes: self.uncommitted_changes.clone(),
                 storage: self.checkpoint.storage().clone(),
-                rollup_height,
-                max_slot_number: self.checkpoint.max_allowed_slot_number_to_access(),
+                rollup_height: new_rollup_height,
+                max_slot_number: new_max_slot_number,
                 response_channel,
             })
             .await
@@ -751,14 +760,14 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             Box::new(self.uncommitted_changes.clone()),
         );
 
-        trace!(%rollup_height, "Successfully ended rollup block");
+        trace!(%new_rollup_height, "Successfully ended rollup block");
     }
 }
 
 #[derive(Debug)]
 struct BackgroundTaskState<S: Spec> {
     handle: JoinHandle<BlockExecutionOutput<S>>,
-    tx_sender: mpsc::Sender<FullyBakedTxWithMaybeChangeSet>,
+    tx_sender: mpsc::Sender<FullyBakedTxWithMaybeChangeSet<S>>,
     result_receiver: mpsc::Receiver<Result<ExecutedTxResponse<S>, RejectReason>>,
 }
 
@@ -778,7 +787,7 @@ struct RollupBlockTaskContext<S: Spec> {
     visible_increase: VisibleSlotNumberIncrease,
     // Channels
     // --------
-    tx_receiver: mpsc::Receiver<FullyBakedTxWithMaybeChangeSet>,
+    tx_receiver: mpsc::Receiver<FullyBakedTxWithMaybeChangeSet<S>>,
     setup_sender: oneshot::Sender<ChangeSet>,
     result_sender: mpsc::Sender<Result<ExecutedTxResponse<S>, RejectReason>>,
     shutdown_notifier: mpsc::Sender<()>,

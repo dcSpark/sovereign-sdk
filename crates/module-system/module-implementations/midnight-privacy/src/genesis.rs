@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use anyhow::Result;
 use schemars::JsonSchema;
-use sov_modules_api::{GenesisState, Spec};
+use sov_modules_api::{Gas, GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
 use crate::hash::{Hash32, RootKey};
@@ -30,6 +30,9 @@ pub struct ValueSetterZkConfig<S: Spec> {
 
     /// Single supported token (native)
     pub token_id: sov_bank::TokenId,
+
+    /// Gas charged per output appended during epilogue (optional, default zero)
+    pub gas_per_output_append: Option<S::Gas>,
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -77,6 +80,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.withdraw_count.set(&0u64, state)?;
         self.spent_nullifier_count.set(&0u64, state)?;
 
+        // Gas for epilogue appends
+        let per = config.gas_per_output_append.clone().unwrap_or(<S::Gas as Gas>::zero());
+        self.gas_per_output_append.set(&per, state)?;
+
+        // Initialize new parallel-safe pending structures: StateVec and StateMap are empty by default.
+
         Ok(())
     }
 }
@@ -102,6 +111,7 @@ mod tests {
             root_window_size: 100,
             domain,
             token_id,
+            gas_per_output_append: None,
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();
