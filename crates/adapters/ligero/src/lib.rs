@@ -334,7 +334,27 @@ impl ZkVerifier for LigeroVerifier {
 
         let public: T = bincode::deserialize(&package.public_output)?;
 
-        // Check if LIGERO_SKIP_VERIFICATION env var is set (for testing)
+        // Test helper: optional mocked verification path with configurable delay.
+        // If LIGERO_MOCK_VERIFY is set to a truthy value, we simulate verification by
+        // sleeping for LIGERO_MOCK_DELAY_MS (default 500ms) and returning success.
+        if std::env::var("LIGERO_MOCK_VERIFY")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false)
+        {
+            let delay_ms: u64 = std::env::var("LIGERO_MOCK_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(500);
+            tracing::info!(
+                delay_ms,
+                "Ligero: Mock verification enabled (LIGERO_MOCK_VERIFY); simulating delay then returning success"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            return Ok(public);
+        }
+
+        // Backwards-compatible test helper: if LIGERO_SKIP_VERIFICATION is set, return immediately
         if std::env::var("LIGERO_SKIP_VERIFICATION").is_ok() {
             tracing::debug!("Ligero: Skipping verification (LIGERO_SKIP_VERIFICATION set)");
             return Ok(public);

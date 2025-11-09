@@ -893,6 +893,20 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// aligning with Zcash's design (ZIP-221) where roots are permanently accessible.
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     fn is_valid_anchor(&self, anchor: &Hash32, state: &mut impl TxState<S>) -> Result<bool> {
+        // Test helper: allow bypassing anchor validation when mocking verification in e2e tests.
+        // Either explicit module flag or the Ligero mock flag will short-circuit to true.
+        let mock_anchor_ok = std::env::var("MIDNIGHT_PRIVACY_MOCK_ANCHOR")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false)
+            || std::env::var("LIGERO_MOCK_VERIFY")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+                .unwrap_or(false);
+        if mock_anchor_ok {
+            return Ok(true);
+        }
+
         let recent_roots = self.recent_roots.get_or_err(state)??;
 
         // Fast path: check recent window first (common case for active transactions)

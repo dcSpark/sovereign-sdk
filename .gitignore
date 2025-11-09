@@ -53,3 +53,7 @@ crates/module-system/module-implementations/midnight-privacy/proof_data.gz
 .env
 crates/full-node/sov-sequencer/proof_data.gz
 crates/full-node/sov-sequencer/test_output.log
+diff_parallel.txt
+midnight_privacy.txt
+new_privacy_debug.txt
+parallel_debug.txt

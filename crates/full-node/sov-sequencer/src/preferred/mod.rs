@@ -10,6 +10,8 @@ mod inner;
 mod preferred_blob_sender;
 mod replica;
 mod side_effects;
+mod spec_exec;
+mod static_parallel;
 mod state_root_compute;
 mod transaction_subscriptions;
 mod update_state;
@@ -1258,6 +1260,7 @@ where
         result
     }
 
+    // Note(Nico): Guilles work
     #[tracing::instrument(skip_all, level = "trace", fields(tx_hash = %tx_hash))]
     async fn accept_serialized_pre_authenticated_tx(
         &self,
