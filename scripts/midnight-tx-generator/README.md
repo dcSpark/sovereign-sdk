@@ -226,7 +226,7 @@ The proof is verified against a code commitment (method_id):
 
 ```
 method_id = SHA-256(note_spend_guest.wasm || 8192_u32.to_le_bytes())
-          = 02af46d4f30776e1d362cc07ac878bf948e840b76786325e3e782c96d3e08b36
+          = bce1e44666ad07922b363c2505731596975b8aac8923412b4b6071edf4210af5
 ```
 
 This must match the `method_id` in the module's genesis configuration.
