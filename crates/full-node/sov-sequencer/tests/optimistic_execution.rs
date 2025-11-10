@@ -646,12 +646,18 @@ async fn test_process_midnight_privacy_with_parallel_proofs() {
                 // Setup Ligero host for proof generation
                 let mut private_indices = vec![2, 3, 4, 5, 6];
                 for j in 0..tree_depth as usize { 
-                    private_indices.push(8 + j);
+                    private_indices.push(7 + j);
                 }
-                let base = 12 + tree_depth as usize;
-                for j in 0..6 { 
-                    private_indices.push(base + j);
-                }
+                let out0_base = 11 + tree_depth as usize;
+                let out1_base = out0_base + 4;
+                private_indices.extend_from_slice(&[
+                    out0_base + 0, // out0 value
+                    out0_base + 1, // out0 rho
+                    out0_base + 2, // out0 recipient
+                    out1_base + 0, // out1 value
+                    out1_base + 1, // out1 rho
+                    out1_base + 2, // out1 recipient
+                ]);
                 
                 let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
                     .with_private_indices(private_indices);

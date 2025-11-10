@@ -66,6 +66,7 @@ rand = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 reltester = { workspace = true }
+reqwest = { workspace = true }
 rockbound = { workspace = true }
 sov-chain-state = { workspace = true }
 sov-stf-runner = { workspace = true }
@@ -87,6 +88,7 @@ test-strategy = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 sov-transaction-generator = { workspace = true }
 sov-ligero-adapter = { workspace = true, features = ["native"] }
+sov-proof-verifier-service = { path = "../../utils/sov-proof-verifier-service" }
 sha2 = { workspace = true }
 
 [features]
