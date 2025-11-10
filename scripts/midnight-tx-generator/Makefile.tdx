@@ -1,0 +1,46 @@
+# Makefile for TDX Quote Generator
+#
+# Builds a CLI tool that uses Intel's libtdx-attest library
+
+CC = gcc
+CFLAGS = -Wall -O2
+LDFLAGS = -ltdx_attest
+
+TARGET = tdx_quote_gen
+SOURCE = tdx_quote_gen.c
+
+# Default target
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	@echo "Compiling TDX quote generator..."
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+	@echo "✓ Built: $(TARGET)"
+	@echo ""
+	@echo "Test with:"
+	@echo "  echo '0000000000000000000000000000000000000000000000000000000000000000' | xxd -r -p > test_reportdata.bin"
+	@echo "  sudo ./$(TARGET) test_reportdata.bin test_quote.dat"
+
+# Install to /usr/local/bin (optional)
+install: $(TARGET)
+	@echo "Installing $(TARGET) to /usr/local/bin..."
+	sudo cp $(TARGET) /usr/local/bin/
+	sudo chmod +x /usr/local/bin/$(TARGET)
+	@echo "✓ Installed: /usr/local/bin/$(TARGET)"
+
+# Clean build artifacts
+clean:
+	rm -f $(TARGET) *.o
+	@echo "✓ Cleaned build artifacts"
+
+# Test the tool
+test: $(TARGET)
+	@echo "Testing TDX quote generation..."
+	@echo "0000000000000000000000000000000000000000000000000000000000000000" | xxd -r -p > test_reportdata.bin
+	sudo ./$(TARGET) test_reportdata.bin test_quote.dat
+	@ls -lh test_quote.dat
+	@rm -f test_reportdata.bin test_quote.dat
+	@echo "✓ Test complete"
+
+.PHONY: all install clean test
+

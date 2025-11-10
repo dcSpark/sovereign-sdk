@@ -48,6 +48,10 @@ crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
 crates/module-system/module-implementations/midnight-privacy/learn.txt
 crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
 crates/module-system/module-implementations/midnight-privacy/proof_data.gz
+
+# Midnight transaction generator temporary files
+scripts/midnight-tx-generator/.last_nonce*
+scripts/midnight-tx-generator/.direct_timings
 .env
 
 .env
