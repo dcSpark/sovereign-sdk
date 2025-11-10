@@ -43,6 +43,7 @@ pub struct Ligero {
     ligero_verifier_binary_path: Option<PathBuf>,
     ligero_shader_path: Option<PathBuf>,
     ligero_program_path: Option<PathBuf>,
+    proof_dir_id: Option<String>,
 }
 
 impl Ligero {
@@ -59,7 +60,15 @@ impl Ligero {
             ligero_verifier_binary_path,
             ligero_shader_path,
             ligero_program_path,
+            proof_dir_id: None,
         }
+    }
+
+    /// Set a custom identifier for the proof directory (for deterministic paths)
+    /// This is useful for debugging and ensures proof directories have meaningful names
+    #[allow(dead_code)]
+    pub fn set_proof_dir_id(&mut self, id: String) {
+        self.proof_dir_id = Some(id);
     }
 
     pub fn generate_proof(
@@ -76,7 +85,24 @@ impl Ligero {
             anyhow::bail!("ligero prover binary path, shader path, and program path are required");
         }
 
-        let proof_path = std::env::temp_dir().join(Self::LIGERO_PROOF_FILE_NAME);
+        // Create a deterministic directory for this proof in the project's proof_outputs folder
+        // Use custom ID if provided, otherwise fall back to thread ID for uniqueness
+        let dir_name = if let Some(ref id) = self.proof_dir_id {
+            format!("ligero_proof_{}", id)
+        } else {
+            format!("ligero_proof_{:?}", std::thread::current().id())
+        };
+        
+        // Use project-relative path instead of /tmp/
+        let proof_outputs_base = std::env::current_dir()
+            .context("Failed to get current directory")?
+            .join("proof_outputs");
+        
+        let unique_proof_dir = proof_outputs_base.join(dir_name);
+        std::fs::create_dir_all(&unique_proof_dir)
+            .context("Failed to create unique proof directory")?;
+
+        let proof_path = unique_proof_dir.join(Self::LIGERO_PROOF_FILE_NAME);
         tracing::info!("generating ligero proof at {}", proof_path.display());
 
         let ligero_program_path = self.ligero_program_path.clone().unwrap().canonicalize().unwrap();
@@ -101,10 +127,9 @@ impl Ligero {
         tracing::info!("ligero argument: {}", ligero_argument_json);
 
         let ligero_prover_binary_path = self.ligero_prover_binary_path.clone().unwrap().canonicalize().unwrap();
-        let ligero_prover_execution_path = proof_path.parent().unwrap();
 
         let output = Command::new(&ligero_prover_binary_path)
-            .current_dir(ligero_prover_execution_path)
+            .current_dir(&unique_proof_dir)
             .arg(&ligero_argument_json)
             .output()
             .inspect_err(|e| tracing::info!("failed to execute ligero prover: {:?}", e))
@@ -120,6 +145,8 @@ impl Ligero {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            // Clean up the temporary directory on failure
+            let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!(
                 "ligero prover failed with status {:?}\nstdout: {}\nstderr: {}",
                 output.status.code(),
@@ -132,6 +159,8 @@ impl Ligero {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("Final prove result:                  true") {
             tracing::info!("ligero prover did not produce a valid proof");
+            // Clean up the temporary directory on failure
+            let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!("ligero prover did not produce a valid proof");
         }
 
@@ -139,6 +168,12 @@ impl Ligero {
 
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
         let proof = std::fs::read(&proof_path).context("failed to read proof_data.gz")?;
+        
+        // Clean up the temporary directory after reading the proof
+        if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
+            tracing::warn!("Failed to clean up temporary proof directory: {}", e);
+        }
+        
         Ok(proof)
     }
 }

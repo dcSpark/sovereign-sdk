@@ -58,6 +58,7 @@ pub struct LigeroHost {
     verifier_bin: PathBuf,
     bins_dir: PathBuf,
     public_output: Option<Vec<u8>>,
+    proof_dir_id: Option<String>,
 }
 
 impl LigeroHost {
@@ -97,6 +98,7 @@ impl LigeroHost {
             verifier_bin: bins_dir.join("webgpu_verifier"),
             bins_dir,
             public_output: None,
+            proof_dir_id: None,
         }
     }
 
@@ -147,6 +149,18 @@ impl LigeroHost {
         self
     }
 
+    /// Set a custom identifier for the proof directory (for deterministic paths)
+    /// This is useful for debugging and ensures proof directories have meaningful names
+    pub fn with_proof_dir_id(mut self, id: String) -> Self {
+        self.proof_dir_id = Some(id);
+        self
+    }
+
+    /// Set a custom identifier for the proof directory (mutable version)
+    pub fn set_proof_dir_id(&mut self, id: String) {
+        self.proof_dir_id = Some(id);
+    }
+
     /// Record the public output that will be embedded in the proof package.
     ///
     /// The value is serialized using `bincode` so the verifier can recover it.
@@ -184,23 +198,41 @@ impl LigeroHost {
 
         tracing::debug!("Running Ligero prover with config: {}", config_json);
 
-        // Run prover in current directory so proof.data is written to CWD
-        // This allows parallel proof generation in worker-specific directories
+        // Create a deterministic directory for this proof in the project's proof_outputs folder
+        // Use custom ID if provided, otherwise fall back to thread ID for uniqueness
+        let dir_name = if let Some(ref id) = self.proof_dir_id {
+            format!("ligero_proof_{}", id)
+        } else {
+            format!("ligero_proof_{:?}", std::thread::current().id())
+        };
+        
+        // Use project-relative path instead of /tmp/
+        let proof_outputs_base = std::env::current_dir()
+            .context("Failed to get current directory")?
+            .join("proof_outputs");
+        
+        let unique_proof_dir = proof_outputs_base.join(dir_name);
+        std::fs::create_dir_all(&unique_proof_dir)
+            .context("Failed to create unique proof directory")?;
+
         tracing::debug!(
             "About to run prover with working directory: {:?}",
-            std::env::current_dir()
+            unique_proof_dir
         );
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
 
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
+            .current_dir(&unique_proof_dir)
             .output()
             .context("Failed to execute webgpu_prover")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            // Clean up the temporary directory on failure
+            let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!(
                 "Ligero prover failed with status {:?}\nstdout: {}\nstderr: {}",
                 output.status.code(),
@@ -212,22 +244,19 @@ impl LigeroHost {
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.contains("Final prove result:                  true") {
+            // Clean up the temporary directory on failure
+            let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!("Ligero prover did not produce a valid proof");
         }
 
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
-        let proof_path = PathBuf::from("proof_data.gz");
+        let proof_path = unique_proof_dir.join("proof_data.gz");
         let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
 
         tracing::debug!(
             "Reading proof from: {}, size: {} bytes",
             proof_path.display(),
             proof.len()
-        );
-        tracing::debug!("Current working directory: {:?}", std::env::current_dir());
-        tracing::debug!(
-            "Files in current directory: {:?}",
-            std::fs::read_dir(".").unwrap().collect::<Vec<_>>()
         );
 
         // This should be compressed gzip data
@@ -246,6 +275,12 @@ impl LigeroHost {
         );
 
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
+        
+        // Clean up the temporary directory after reading the proof
+        if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
+            tracing::warn!("Failed to clean up temporary proof directory: {}", e);
+        }
+        
         Ok(proof)
     }
 

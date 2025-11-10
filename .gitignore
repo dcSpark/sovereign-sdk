@@ -48,6 +48,8 @@ crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
 crates/module-system/module-implementations/midnight-privacy/learn.txt
 crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
 crates/module-system/module-implementations/midnight-privacy/proof_data.gz
+proof_data.gz
+proof_outputs/
 .env
 
 .env
