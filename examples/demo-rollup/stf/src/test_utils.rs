@@ -61,10 +61,21 @@ where
             paymaster: paymaster_config,
             synthetic_load: (),
             access_pattern: access_pattern_config,
+            value_setter: sov_value_setter::ValueSetterConfig {
+                admin: admin_address.clone(),
+            },
             value_setter_zk: sov_value_setter_zk::ValueSetterZkConfig {
                 initial_value: Some(0),
                 method_id: [0; 32],
+                admin: admin_address.clone(),
+            },
+            midnight_privacy: midnight_privacy::ValueSetterZkConfig {
+                tree_depth: 32,
+                root_window_size: 100,
+                method_id: [0; 32],
                 admin: admin_address,
+                domain: [0; 32],
+                token_id: sov_bank::TokenId::from([0; 32]),
             },
         }
     }
