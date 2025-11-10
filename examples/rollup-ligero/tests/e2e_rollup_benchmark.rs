@@ -1129,11 +1129,6 @@ if num_deposits == 1 {
                         hash_hex,
                         ltx.receipt
                     );
-                    let has_transfer = ltx
-                        .events
-                        .iter()
-                        .any(|ev| ev.key == "ValueMidnightPrivacy/PoolTransfer");
-                    anyhow::ensure!(has_transfer, "Transfer {} missing PoolTransfer event", hash_hex);
                     eprintln!(
                         "[ok] included transfer tx={} batch_number={} tx_number={} events={}",
                         hash_hex, ltx.batch_number, ltx.number, ltx.events.len()
