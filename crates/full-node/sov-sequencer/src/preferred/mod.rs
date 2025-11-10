@@ -37,8 +37,9 @@ use sov_modules_api::macros::config_value;
 use sov_modules_api::rest::utils::ErrorObject;
 use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::{
-    ApiTxEffect, FullyBakedTx, RawTx, RejectReason, Runtime, RuntimeEventProcessor, 
-    RuntimeEventResponse, Spec, StateCheckpoint, StateUpdateInfo, VersionReader, VisibleSlotNumber, *,
+    ApiTxEffect, FullyBakedTx, RawTx, RejectReason, Runtime, RuntimeEventProcessor,
+    RuntimeEventResponse, Spec, StateCheckpoint, StateUpdateInfo, VersionReader, VisibleSlotNumber,
+    *,
 };
 use sov_rest_utils::errors::internal_server_error_500;
 use sov_rest_utils::errors::{database_error_500, sequencer_overloaded_503};
@@ -959,7 +960,12 @@ where
         // Directly submit to the state updator
         let res = match self
             .synchronized_state_updator
-            .accept_tx_msg(&baked_tx, tx_hash, original_tx_queue_id, "accept_worker_verified_tx")
+            .accept_tx_msg(
+                &baked_tx,
+                tx_hash,
+                original_tx_queue_id,
+                "accept_worker_verified_tx",
+            )
             .await
         {
             Ok(inner_res) => inner_res,
@@ -1043,8 +1049,8 @@ where
         runtime_call_hex: String,
         tx_hash: TxHash,
     ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject> {
-        use sov_modules_api::transaction::{Transaction, VersionedTx, Version0};
-        
+        use sov_modules_api::transaction::{Transaction, Version0, VersionedTx};
+
         if self.shutdown_receiver.has_changed().unwrap_or(true) {
             tracing::info!("The sequencer is shutting down. Cannot accept transactions");
             return Err(shut_down_error());
@@ -1056,86 +1062,66 @@ where
 
         // Deserialize the pre-authenticated components from borsh-hex
         let deserialize_start = std::time::Instant::now();
-        let pub_key_bytes = hex::decode(&pub_key_hex).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Invalid public key hex".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
-        })?;
-        
-        let pub_key = borsh::from_slice(&pub_key_bytes).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to deserialize public key".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let pub_key_bytes = hex::decode(&pub_key_hex).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid public key hex".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
 
-        let signature_bytes = hex::decode(&signature_hex).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Invalid signature hex".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
-        })?;
-        
-        let signature = borsh::from_slice(&signature_bytes).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to deserialize signature".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let pub_key = borsh::from_slice(&pub_key_bytes).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Failed to deserialize public key".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
 
-        let uniqueness_bytes = hex::decode(&uniqueness_hex).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Invalid uniqueness hex".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
-        })?;
-        
-        let uniqueness = borsh::from_slice(&uniqueness_bytes).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to deserialize uniqueness".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let signature_bytes = hex::decode(&signature_hex).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid signature hex".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
 
-        let details_bytes = hex::decode(&details_hex).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Invalid details hex".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
-        })?;
-        
-        let details = borsh::from_slice(&details_bytes).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to deserialize details".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let signature = borsh::from_slice(&signature_bytes).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Failed to deserialize signature".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
 
-        let runtime_call_bytes = hex::decode(&runtime_call_hex).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Invalid runtime call hex".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let uniqueness_bytes = hex::decode(&uniqueness_hex).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid uniqueness hex".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
-        
-        let runtime_call = borsh::from_slice(&runtime_call_bytes).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to deserialize runtime call".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+
+        let uniqueness = borsh::from_slice(&uniqueness_bytes).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Failed to deserialize uniqueness".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
-        
+
+        let details_bytes = hex::decode(&details_hex).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid details hex".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
+        })?;
+
+        let details = borsh::from_slice(&details_bytes).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Failed to deserialize details".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
+        })?;
+
+        let runtime_call_bytes = hex::decode(&runtime_call_hex).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid runtime call hex".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
+        })?;
+
+        let runtime_call = borsh::from_slice(&runtime_call_bytes).map_err(|e| ErrorObject {
+            status: StatusCode::BAD_REQUEST,
+            message: "Failed to deserialize runtime call".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
+        })?;
+
         let deserialize_ms = deserialize_start.elapsed().as_secs_f64() * 1000.0;
 
         // Reconstruct the transaction from pre-authenticated components
@@ -1152,18 +1138,16 @@ where
         };
 
         // Serialize to create FullyBakedTx
-        let serialized = borsh::to_vec(&transaction).map_err(|e| {
-            ErrorObject {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "Failed to serialize transaction".to_string(),
-                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-            }
+        let serialized = borsh::to_vec(&transaction).map_err(|e| ErrorObject {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Failed to serialize transaction".to_string(),
+            details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
         })?;
 
         let raw_tx = RawTx::new(serialized);
         // Use pre-authenticated encoding so runtime uses original hash and skips sig verification
         let baked_tx = Rt::Auth::encode_with_pre_authenticated(raw_tx, tx_hash);
-        
+
         let reconstruct_ms = reconstruct_start.elapsed().as_secs_f64() * 1000.0;
 
         // Skip delay logic - pre-authenticated transactions are already validated
@@ -1171,7 +1155,12 @@ where
         let submit_start = std::time::Instant::now();
         let res = match self
             .synchronized_state_updator
-            .accept_tx_msg(&baked_tx, tx_hash, original_tx_queue_id, "accept_pre_authenticated_tx")
+            .accept_tx_msg(
+                &baked_tx,
+                tx_hash,
+                original_tx_queue_id,
+                "accept_pre_authenticated_tx",
+            )
             .await
         {
             Ok(inner_res) => inner_res,
@@ -1184,7 +1173,7 @@ where
                 ));
             }
         };
-        
+
         let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
 
         let await_start = std::time::Instant::now();
@@ -1199,31 +1188,23 @@ where
                     batch_creation_error,
                     nb_of_concurrent_blob_submissions,
                 } => match batch_creation_error {
-                    BatchCreationError::NoFinalizedSlotAvailable => {
-                        Err(sequencer_overloaded_503())
-                    }
-                    BatchCreationError::BlobSenderBusy => {
-                        Err(error_not_fully_synced(
-                            SequencerNotReadyDetails::WaitingOnBlobSender {
-                                max_concurrent_blobs: self.config.max_concurrent_blobs,
-                                nb_of_blobs_in_flight: nb_of_concurrent_blob_submissions,
-                            },
-                        ))
-                    }
-                    BatchCreationError::DatabaseError(e) => {
-                        Err(database_error_500(e))
-                    }
+                    BatchCreationError::NoFinalizedSlotAvailable => Err(sequencer_overloaded_503()),
+                    BatchCreationError::BlobSenderBusy => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::WaitingOnBlobSender {
+                            max_concurrent_blobs: self.config.max_concurrent_blobs,
+                            nb_of_blobs_in_flight: nb_of_concurrent_blob_submissions,
+                        },
+                    )),
+                    BatchCreationError::DatabaseError(e) => Err(database_error_500(e)),
                     BatchCreationError::PreferredSequencerAtStopHeight {
                         height_to_stop_at,
                         current_height,
-                    } => {
-                        Err(error_not_fully_synced(
-                            SequencerNotReadyDetails::PreferredSequencerAtStopHeight {
-                                height_to_stop_at,
-                                current_height,
-                            },
-                        ))
-                    }
+                    } => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::PreferredSequencerAtStopHeight {
+                            height_to_stop_at,
+                            current_height,
+                        },
+                    )),
                 },
                 AcceptTxError::TxTooBig {
                     current_batch_size,
@@ -1236,15 +1217,17 @@ where
                 AcceptTxError::ExecutorError(err) => {
                     Err(RollupBlockExecutorError::into_http_error(err))
                 }
-                AcceptTxError::Shutdown => {
-                    Err(shut_down_error())
-                }
-            }
+                AcceptTxError::Shutdown => Err(shut_down_error()),
+            },
         };
-        
+
         let await_ms = await_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        
+        let stf_execution_ms = result
+            .as_ref()
+            .ok()
+            .map(|accepted| accepted.confirmation.stf_execution_time_micros as f64 / 1000.0);
+
         tracing::info!(
             %tx_hash,
             deserialize_ms = format!("{:.2}", deserialize_ms),
@@ -1252,9 +1235,12 @@ where
             submit_ms = format!("{:.2}", submit_ms),
             await_ms = format!("{:.2}", await_ms),
             total_ms = format!("{:.2}", total_ms),
+            stf_execution_ms = stf_execution_ms
+                .map(|ms| format!("{:.2}", ms))
+                .unwrap_or_else(|| "n/a".to_string()),
             "⏱️  PreferredSequencer::accept_pre_authenticated_tx breakdown"
         );
-        
+
         result
     }
 
@@ -1277,12 +1263,10 @@ where
         let decode_start = std::time::Instant::now();
         let serialized = base64::engine::general_purpose::STANDARD
             .decode(serialized_tx_base64.as_bytes())
-            .map_err(|e| {
-                ErrorObject {
-                    status: StatusCode::BAD_REQUEST,
-                    message: "Invalid base64 serialized transaction".to_string(),
-                    details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
-                }
+            .map_err(|e| ErrorObject {
+                status: StatusCode::BAD_REQUEST,
+                message: "Invalid base64 serialized transaction".to_string(),
+                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
             })?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1297,7 +1281,12 @@ where
         let submit_start = std::time::Instant::now();
         let res = match self
             .synchronized_state_updator
-            .accept_tx_msg(&baked_tx, tx_hash, original_tx_queue_id, "accept_serialized_pre_authenticated_tx")
+            .accept_tx_msg(
+                &baked_tx,
+                tx_hash,
+                original_tx_queue_id,
+                "accept_serialized_pre_authenticated_tx",
+            )
             .await
         {
             Ok(inner_res) => inner_res,
@@ -1324,52 +1313,42 @@ where
                     batch_creation_error,
                     nb_of_concurrent_blob_submissions,
                 } => match batch_creation_error {
-                    BatchCreationError::NoFinalizedSlotAvailable => {
-                        Err(sequencer_overloaded_503())
-                    }
-                    BatchCreationError::BlobSenderBusy => {
-                        Err(error_not_fully_synced(
-                            SequencerNotReadyDetails::WaitingOnBlobSender {
-                                max_concurrent_blobs: self.config.max_concurrent_blobs,
-                                nb_of_blobs_in_flight: nb_of_concurrent_blob_submissions,
-                            },
-                        ))
-                    }
-                    BatchCreationError::DatabaseError(e) => {
-                        Err(database_error_500(e))
-                    }
+                    BatchCreationError::NoFinalizedSlotAvailable => Err(sequencer_overloaded_503()),
+                    BatchCreationError::BlobSenderBusy => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::WaitingOnBlobSender {
+                            max_concurrent_blobs: self.config.max_concurrent_blobs,
+                            nb_of_blobs_in_flight: nb_of_concurrent_blob_submissions,
+                        },
+                    )),
+                    BatchCreationError::DatabaseError(e) => Err(database_error_500(e)),
                     BatchCreationError::PreferredSequencerAtStopHeight {
                         height_to_stop_at,
                         current_height,
-                    } => {
-                        Err(error_not_fully_synced(
-                            SequencerNotReadyDetails::PreferredSequencerAtStopHeight {
-                                height_to_stop_at,
-                                current_height,
-                            },
-                        ))
-                    }
+                    } => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::PreferredSequencerAtStopHeight {
+                            height_to_stop_at,
+                            current_height,
+                        },
+                    )),
                 },
                 AcceptTxError::TxTooBig {
                     current_batch_size,
                     max_batch_size,
-                } => Err(err_cant_fit_tx(
-                    current_batch_size,
-                    max_batch_size,
-                    0,
-                )),
+                } => Err(err_cant_fit_tx(current_batch_size, max_batch_size, 0)),
                 AcceptTxError::ExecutorError(err) => {
                     Err(RollupBlockExecutorError::into_http_error(err))
                 }
-                AcceptTxError::Shutdown => {
-                    Err(shut_down_error())
-                }
-            }
+                AcceptTxError::Shutdown => Err(shut_down_error()),
+            },
         };
-        
+
         let await_ms = await_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        
+        let stf_execution_ms = result
+            .as_ref()
+            .ok()
+            .map(|accepted| accepted.confirmation.stf_execution_time_micros as f64 / 1000.0);
+
         tracing::info!(
             %tx_hash,
             decode_ms = format!("{:.2}", decode_ms),
@@ -1377,9 +1356,12 @@ where
             submit_ms = format!("{:.2}", submit_ms),
             await_ms = format!("{:.2}", await_ms),
             total_ms = format!("{:.2}", total_ms),
+            stf_execution_ms = stf_execution_ms
+                .map(|ms| format!("{:.2}", ms))
+                .unwrap_or_else(|| "n/a".to_string()),
             "⏱️  PreferredSequencer::accept_serialized_pre_authenticated_tx breakdown (OPTIMIZED PATH)"
         );
-        
+
         result
     }
 
@@ -1452,6 +1434,8 @@ where
     events: Vec<RuntimeEventResponse<<Rt as RuntimeEventProcessor>::RuntimeEvent>>,
     receipt: ApiTxEffect<TxReceiptContents<S>>,
     tx_number: u64,
+    #[serde(default)]
+    stf_execution_time_micros: u64,
 }
 
 fn get_next_sequence_number_according_to_node<S, Rt>(
