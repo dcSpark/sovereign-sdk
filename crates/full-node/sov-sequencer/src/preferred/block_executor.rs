@@ -719,9 +719,14 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             accepted_txs_by_batch.push(accepted_txs);
         }
 
+        // Compute and label the root for the *new* rollup height we just reached.
+        let new_rollup_height = new_checkpoint.rollup_height_to_access();
+        let new_max_slot_number = new_checkpoint.max_allowed_slot_number_to_access();
+
         trace!(
             executor_id = %self.id,
             %rollup_height,
+            %new_rollup_height,
             "Sending state root computation request to background task");
         let (response_channel, response_receiver) = oneshot::channel();
         self.state_root_responses.push_back(response_receiver);
@@ -733,8 +738,8 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 raw_state_changes: changes.clone(),
                 uncommitted_changes: self.uncommitted_changes.clone(),
                 storage: self.checkpoint.storage().clone(),
-                rollup_height,
-                max_slot_number: self.checkpoint.max_allowed_slot_number_to_access(),
+                rollup_height: new_rollup_height,
+                max_slot_number: new_max_slot_number,
                 response_channel,
             })
             .await
@@ -751,7 +756,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             Box::new(self.uncommitted_changes.clone()),
         );
 
-        trace!(%rollup_height, "Successfully ended rollup block");
+        trace!(%new_rollup_height, "Successfully ended rollup block");
     }
 }
 

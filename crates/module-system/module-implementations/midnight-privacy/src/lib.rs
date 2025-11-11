@@ -31,7 +31,12 @@ use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
     StateValue, TxState,
 };
+use sov_modules_api::hooks::BlockHooks;
+use sov_modules_api::VersionReader;
+use sov_modules_api::capabilities::RollupHeight;
 use std::collections::VecDeque;
+
+pub use crate::hash::{Hash32, RootKey, PendingRootKey};
 
 /// Marker credential carrying the proof outputs for pre-verified withdrawals.
 #[derive(Clone)]
@@ -155,6 +160,21 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[state]
     pub withdraw_count: StateValue<u64>,
 
+    /// Indexed pending roots: (rollup_height, idx) -> root.
+    /// Each block appends roots with sequential indices, avoiding VecDeque rewrite overhead.
+    /// For thousands of txs per block, this is O(1) per append vs O(n) for VecDeque serialization.
+    /// 
+    /// ASSUMPTION: rollup_height_to_access() is stable throughout block execution (start to end_hook).
+    /// DANGER: Stale entries from abandoned blocks (crashes/reverts) accumulate but are harmless
+    /// (never read, don't affect correctness, minimal state cost). Cleanup not implemented.
+    #[state]
+    pub pending_roots_indexed: StateMap<PendingRootKey, Hash32>,
+
+    /// Per-height counter: how many roots are pending for each height.
+    /// Used to know how many indices to iterate when flushing.
+    #[state]
+    pub pending_roots_count: StateMap<RollupHeight, u32>,
+
     /// Bank module to hold/transfer the native token.
     #[module]
     pub bank: sov_bank::Bank<S>,
@@ -163,7 +183,7 @@ pub struct ValueMidnightPrivacy<S: Spec> {
 impl<S: Spec> Module for ValueMidnightPrivacy<S> {
     type Spec = S;
 
-    type Config = ValueSetterZkConfig<S>;
+    type Config = MidnightPrivacyConfig<S>;
 
     type CallMessage = CallMessage<S>;
 
@@ -227,5 +247,34 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
         // Commit the state changes if successful
         state_wrapped.commit();
         res
+    }
+}
+
+/// Implement BlockHooks to flush pending roots at the end of each block.
+/// This enables true parallelism within blocks by deferring root publication
+/// until all transactions have been executed.
+impl<S: Spec> BlockHooks for ValueMidnightPrivacy<S> {
+    type Spec = S;
+
+    fn begin_rollup_block_hook(
+        &mut self,
+        _visible_hash: &<<Self::Spec as Spec>::Storage as sov_modules_api::Storage>::Root,
+        state: &mut sov_modules_api::StateCheckpoint<Self::Spec>,
+    ) {
+        // CRITICAL: Reset counter for current height. Defensive against:
+        // - Block re-execution after crash/revert (prevents double-flush)
+        // - State replay from checkpoint (clears stale pending count)
+        // NOTE: Only resets CURRENT height. Stale indexed entries from abandoned heights
+        // remain in state (harmless but wastes space). Periodic cleanup not implemented.
+        let height = state.rollup_height_to_access();
+        let _ = self.pending_roots_count.set(&height, &0u32, state);
+    }
+
+    fn end_rollup_block_hook(&mut self, state: &mut sov_modules_api::StateCheckpoint<Self::Spec>) {
+        // Flush all pending roots into recent_roots and all_roots
+        // This should never fail in normal operation
+        if let Err(e) = self.end_block_flush(state) {
+            panic!("FATAL: MidnightPrivacy end_block_flush failed: {}", e);
+        }
     }
 }

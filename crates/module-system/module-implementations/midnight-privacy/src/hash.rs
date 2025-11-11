@@ -89,6 +89,51 @@ impl FromStr for RootKey {
     }
 }
 
+/// Composite key for pending roots: (rollup_height, idx).
+/// This allows O(1) append operations per root, avoiding VecDeque serialization overhead.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct PendingRootKey {
+    /// Rollup height this root was created in
+    pub height: u64,
+    /// Sequential index within the block
+    pub idx: u32,
+}
+
+impl fmt::Display for PendingRootKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, self.idx)
+    }
+}
+
+impl FromStr for PendingRootKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_idx".to_string());
+        }
+        let height = parts[0]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse height: {}", e))?;
+        let idx = parts[1]
+            .parse::<u32>()
+            .map_err(|e| format!("Failed to parse idx: {}", e))?;
+        Ok(PendingRootKey { height, idx })
+    }
+}
+
 // Thread-local Poseidon2 hasher instance (deterministic with fixed seed).
 // Using thread-local instances avoids repeated allocations and initialization overhead
 // while ensuring thread-safety without synchronization overhead.

@@ -11,7 +11,7 @@ use crate::merkle::MerkleTree;
 /// Initial configuration for midnight-privacy module.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq, JsonSchema)]
 #[schemars(bound = "S: Spec", rename = "MidnightPrivacyConfig")]
-pub struct ValueSetterZkConfig<S: Spec> {
+pub struct MidnightPrivacyConfig<S: Spec> {
     /// Depth of the commitment tree (tree will have 2^depth leaves)
     pub tree_depth: u8,
 
@@ -76,6 +76,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.total_withdrawn.set(&0u128, state)?;
         self.withdraw_count.set(&0u64, state)?;
 
+        // Initialize indexed pending roots counter for genesis height (no roots yet)
+        // Note: StateMap doesn't require explicit initialization, but we set 0 for clarity
+        // let height = state.rollup_height_to_access(); // Would be RollupHeight::GENESIS
+        // self.pending_roots_count.set(&height, &0u32, state)?;
+
         Ok(())
     }
 }
@@ -86,7 +91,7 @@ mod tests {
     use sov_modules_api::Spec;
     use sov_test_utils::TestSpec;
 
-    use crate::ValueSetterZkConfig;
+    use crate::MidnightPrivacyConfig;
 
     #[test]
     fn test_config_serialization() {
@@ -94,7 +99,7 @@ mod tests {
         let method_id = [0u8; 32];
         let domain = [0u8; 32];
         let token_id = sov_bank::TokenId::generate::<TestSpec>("test_token");
-        let config = ValueSetterZkConfig::<TestSpec> {
+        let config = MidnightPrivacyConfig::<TestSpec> {
             admin,
             method_id,
             tree_depth: 16,
@@ -104,7 +109,7 @@ mod tests {
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();
-        let parsed_config: ValueSetterZkConfig<TestSpec> = serde_json::from_str(&json_str).unwrap();
+        let parsed_config: MidnightPrivacyConfig<TestSpec> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed_config, config);
     }
 }

@@ -26,6 +26,8 @@ sov-rollup-interface = { workspace = true, features = ["native"] }
 hex = { workspace = true }
 serde_json = { workspace = true }
 sov-bank = { workspace = true, features = ["native", "test-utils"] }
+sov-kernels = { workspace = true }
+sov-mock-da = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }

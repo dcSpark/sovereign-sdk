@@ -40,7 +40,7 @@ fn main() -> io::Result<()> {
     store_genesis_config_json_schema::<sov_sequencer_registry::SequencerConfig<S>>(
         "sov-sequencer-registry.json",
     )?;
-    store_genesis_config_json_schema::<midnight_privacy::ValueSetterZkConfig<S>>(
+    store_genesis_config_json_schema::<midnight_privacy::MidnightPrivacyConfig<S>>(
         "midnight-privacy.json",
     )?;
 
