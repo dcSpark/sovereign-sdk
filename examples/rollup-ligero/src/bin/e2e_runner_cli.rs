@@ -15,6 +15,15 @@ struct Cli {
     /// Number of deposits/transfers to submit.
     #[arg(long)]
     num_deposits: Option<usize>,
+    /// Enable proof caching (disabled by default)
+    #[arg(long)]
+    cache: bool,
+    /// Directory to store cached proofs (default: proof_cache)
+    #[arg(long)]
+    cache_dir: Option<String>,
+    /// Enable local proof verification (disabled by default)
+    #[arg(long)]
+    verify: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -29,6 +38,15 @@ async fn main() -> Result<()> {
     }
     if let Some(verifier) = cli.verifier_url {
         config.external_verifier_url = Some(verifier);
+    }
+    if cli.cache {
+        config.use_proof_cache = true;
+    }
+    if let Some(dir) = cli.cache_dir {
+        config.proof_cache_dir = dir.into();
+    }
+    if cli.verify {
+        config.skip_verify = false;
     }
     run(config).await
 }

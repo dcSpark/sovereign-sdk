@@ -20,6 +20,8 @@ Options:
   --verifier-url <url>     Proof verifier endpoint (default: http://127.0.0.1:8080)
   --num-deposits <n>       Number of deposits/transfers to submit (default: 10)
   --threads <n>            Tokio worker + blocking threads to use (default: detected CPU count)
+  --cache                  Enable proof caching (disabled by default)
+  --verify                 Enable local proof verification (disabled by default)
   --debug                  Run tests without --release
   --release                Force --release (default)
   -h, --help               Show this help
@@ -29,6 +31,8 @@ EOF
 NODE_URL="$NODE_URL_DEFAULT"
 VERIFIER_URL="$VERIFIER_URL_DEFAULT"
 NUM_DEPOSITS="$NUM_DEPOSITS_DEFAULT"
+USE_CACHE=0
+USE_VERIFY=0
 
 while (($#)); do
     case "$1" in
@@ -40,6 +44,10 @@ while (($#)); do
             NUM_DEPOSITS="$2"; shift 2;;
         --threads)
             TOKIO_THREADS="$2"; shift 2;;
+        --cache)
+            USE_CACHE=1; shift;;
+        --verify)
+            USE_VERIFY=1; shift;;
         --debug)
             RUN_RELEASE=0; shift;;
         --release)
@@ -73,6 +81,8 @@ echo "  Node URL:      $NODE_URL"
 echo "  Verifier URL:  $VERIFIER_URL"
 echo "  Deposits:      $NUM_DEPOSITS"
 echo "  Tokio threads: $TOKIO_THREADS"
+echo "  Proof cache:   $(if [[ "$USE_CACHE" -eq 1 ]]; then echo "enabled"; else echo "disabled"; fi)"
+echo "  Verification:  $(if [[ "$USE_VERIFY" -eq 1 ]]; then echo "enabled"; else echo "disabled"; fi)"
 echo ""
 
 cd "$REPO_ROOT"
@@ -82,6 +92,12 @@ if [[ "$RUN_RELEASE" -eq 1 ]]; then
     CARGO_CMD+=(--release)
 fi
 CLI_ARGS=(--node-url "$NODE_URL" --verifier-url "$VERIFIER_URL" --num-deposits "$NUM_DEPOSITS")
+if [[ "$USE_CACHE" -eq 1 ]]; then
+    CLI_ARGS+=(--cache)
+fi
+if [[ "$USE_VERIFY" -eq 1 ]]; then
+    CLI_ARGS+=(--verify)
+fi
 CLI_ARGS+=("${EXTRA_RUN_ARGS[@]}")
 CARGO_CMD+=(--)
 CARGO_CMD+=("${CLI_ARGS[@]}")

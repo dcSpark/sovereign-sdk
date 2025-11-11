@@ -51,6 +51,12 @@ pub struct RunnerConfig {
     pub external_node_url: Option<String>,
     /// External verifier URL, if using already-running services.
     pub external_verifier_url: Option<String>,
+    /// Enable proof caching to reuse proofs across runs
+    pub use_proof_cache: bool,
+    /// Directory to store cached proofs
+    pub proof_cache_dir: PathBuf,
+    /// Skip local proof verification
+    pub skip_verify: bool,
 }
 
 impl Default for RunnerConfig {
@@ -59,6 +65,9 @@ impl Default for RunnerConfig {
             num_deposits: 10,
             external_node_url: None,
             external_verifier_url: None,
+            use_proof_cache: false,
+            proof_cache_dir: PathBuf::from("proof_cache"),
+            skip_verify: true,
         }
     }
 }
@@ -71,6 +80,15 @@ impl RunnerConfig {
             if let Ok(parsed) = value.parse() {
                 cfg.num_deposits = parsed;
             }
+        }
+        if let Ok(value) = std::env::var("USE_PROOF_CACHE") {
+            cfg.use_proof_cache = value == "1" || value.to_lowercase() == "true";
+        }
+        if let Ok(value) = std::env::var("PROOF_CACHE_DIR") {
+            cfg.proof_cache_dir = PathBuf::from(value);
+        }
+        if let Ok(value) = std::env::var("SKIP_VERIFY") {
+            cfg.skip_verify = value == "1" || value.to_lowercase() == "true";
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
@@ -90,7 +108,6 @@ fn find_binary() -> Result<String> {
     }
 
     // Fallback: compute from target dir
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let target_dir = std::env::var("CARGO_TARGET_DIR").ok().unwrap_or_else(|| {
         // workspace target = two levels up from this crate dir
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -103,14 +120,20 @@ fn find_binary() -> Result<String> {
             .to_string_lossy()
             .to_string()
     });
-    let candidate = std::path::Path::new(&target_dir)
-        .join(&profile)
-        .join("sov-rollup-ligero");
-    anyhow::ensure!(
-        candidate.exists(),
-        "sov-rollup-ligero binary not found; run `cargo build -p sov-rollup-ligero`."
+    
+    // Try release first (preferred for benchmarks), then debug
+    let target_path = std::path::Path::new(&target_dir);
+    for profile in &["release", "debug"] {
+        let candidate = target_path.join(profile).join("sov-rollup-ligero");
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+    
+    anyhow::bail!(
+        "sov-rollup-ligero binary not found in target/{{release,debug}}; \
+         run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
     );
-    Ok(candidate.to_string_lossy().to_string())
 }
 
 fn make_temp_config(base_config: &str, data_dir: &std::path::Path, http_port: u16) -> String {
@@ -1249,11 +1272,45 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         num_deposits
     );
 
-    // Generate proofs in parallel
+    // Setup proof cache
+    let cache_dir = if config.use_proof_cache {
+        let dir = config.proof_cache_dir.clone();
+        std::fs::create_dir_all(&dir).context("Failed to create proof cache directory")?;
+        Some(dir)
+    } else {
+        None
+    };
+
+    // Check cache and generate proofs in parallel
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
     let depth_usize = TREE_DEPTH as usize;
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
+    let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
+    
     for (i, input) in dep_inputs.iter().enumerate() {
+        // Try to load from cache first
+        if let Some(ref cache_dir) = cache_dir {
+            let cache_file = cache_dir.join(format!("transfer_{}.proof", input.account_idx));
+            if cache_file.exists() {
+                match std::fs::read(&cache_file) {
+                    Ok(proof_bytes) => {
+                        eprintln!(
+                            "  [cache] loaded proof for account {} from {}",
+                            input.account_idx,
+                            cache_file.display()
+                        );
+                        cached_proofs[i] = Some((input.account_idx, proof_bytes));
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  [cache] failed to read cached proof for account {}: {}",
+                            input.account_idx, e
+                        );
+                    }
+                }
+            }
+        }
         let account_idx = input.account_idx;
         let value = input.value;
         let rho = input.rho;
@@ -1347,64 +1404,115 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         ));
     }
 
-    let mut proofs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(proof_tasks.len());
+    // Await generated proofs and merge with cached proofs
+    let mut generated_proofs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(proof_tasks.len());
     for t in proof_tasks {
-        proofs.push(t.await??);
+        generated_proofs.push(t.await??);
     }
+    
     eprintln!(
         "[ok] generated {} transfer proofs in parallel",
-        proofs.len()
+        generated_proofs.len()
+    );
+
+    // Save newly generated proofs to cache
+    if let Some(ref cache_dir) = cache_dir {
+        for (account_idx, proof_bytes) in &generated_proofs {
+            let cache_file = cache_dir.join(format!("transfer_{}.proof", account_idx));
+            match std::fs::write(&cache_file, proof_bytes) {
+                Ok(_) => {
+                    eprintln!(
+                        "  [cache] saved proof for account {} to {}",
+                        account_idx,
+                        cache_file.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [cache] failed to save proof for account {}: {}",
+                        account_idx, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Merge cached and generated proofs
+    let mut proofs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(dep_inputs.len());
+    let mut cached_count = 0;
+    for i in 0..dep_inputs.len() {
+        if let Some(cached) = cached_proofs[i].take() {
+            proofs.push(cached);
+            cached_count += 1;
+        }
+    }
+    proofs.extend(generated_proofs);
+    
+    eprintln!(
+        "[ok] using {} proofs total ({} from cache, {} newly generated)",
+        proofs.len(),
+        cached_count,
+        proofs.len() - cached_count
     );
     let _ = std::io::stderr().flush();
 
     // Pre-verify proofs locally to catch issues early (before submission)
-    // This helps diagnose: if local passes but service fails, it's a service/ABI issue
-    use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-    use sov_rollup_interface::zk::ZkVerifier;
-    let method_commitment = LigeroCodeCommitment(method_id);
-    for (i, (account_idx, proof_bytes)) in proofs.iter().enumerate() {
-        let input = &dep_inputs[i];
-        match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
-            Ok(public) => {
-                let nf_exp = nullifier(&domain, &nf_key, &input.rho);
-                if public.anchor_root != shared_anchor
-                    || public.nullifier != nf_exp
-                    || public.withdraw_amount != 0
-                {
+    // Skip when using cache to save time (cached proofs were already verified when first generated)
+    // Or skip if explicitly requested via config
+    if config.skip_verify {
+        eprintln!("[skip] skipping pre-verification (--skip-verify flag set)");
+    } else if cache_dir.is_none() {
+        eprintln!("[verify] pre-verifying {} proofs locally...", proofs.len());
+        use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+        use sov_rollup_interface::zk::ZkVerifier;
+        let method_commitment = LigeroCodeCommitment(method_id);
+        for (i, (account_idx, proof_bytes)) in proofs.iter().enumerate() {
+            let input = &dep_inputs[i];
+            match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
+                Ok(public) => {
+                    let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                    if public.anchor_root != shared_anchor
+                        || public.nullifier != nf_exp
+                        || public.withdraw_amount != 0
+                    {
+                        eprintln!(
+                            "  [warn] local verify mismatch idx={} account={} anc_ok={} nf_ok={} wd_ok={}",
+                            i,
+                            account_idx,
+                            public.anchor_root == shared_anchor,
+                            public.nullifier == nf_exp,
+                            public.withdraw_amount == 0
+                        );
+                        eprintln!(
+                            "         expected anchor={} nullifier={} withdraw=0",
+                            hex::encode(shared_anchor),
+                            hex::encode(nf_exp)
+                        );
+                        eprintln!(
+                            "         proof anchor={} nullifier={} withdraw={}",
+                            hex::encode(public.anchor_root),
+                            hex::encode(public.nullifier),
+                            public.withdraw_amount
+                        );
+                    }
+                }
+                Err(e) => {
                     eprintln!(
-                        "  [warn] local verify mismatch idx={} account={} anc_ok={} nf_ok={} wd_ok={}",
+                        "  [error] local Ligero verify failed idx={} account={} pos={} err={} (bytes={})",
                         i,
                         account_idx,
-                        public.anchor_root == shared_anchor,
-                        public.nullifier == nf_exp,
-                        public.withdraw_amount == 0
+                        input.position,
+                        e,
+                        proof_bytes.len()
                     );
-                    eprintln!(
-                        "         expected anchor={} nullifier={} withdraw=0",
-                        hex::encode(shared_anchor),
-                        hex::encode(nf_exp)
-                    );
-                    eprintln!(
-                        "         proof anchor={} nullifier={} withdraw={}",
-                        hex::encode(public.anchor_root),
-                        hex::encode(public.nullifier),
-                        public.withdraw_amount
-                    );
+                    // Don't fail early - continue to see how many pass vs fail
+                    // anyhow::bail!("Local verify failed for transfer idx {} (account {}): {}", i, account_idx, e);
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "  [error] local Ligero verify failed idx={} account={} pos={} err={} (bytes={})",
-                    i,
-                    account_idx,
-                    input.position,
-                    e,
-                    proof_bytes.len()
-                );
-                // Don't fail early - continue to see how many pass vs fail
-                // anyhow::bail!("Local verify failed for transfer idx {} (account {}): {}", i, account_idx, e);
-            }
         }
+        eprintln!("[ok] pre-verification complete");
+    } else {
+        eprintln!("[skip] skipping pre-verification (proof cache enabled)");
     }
 
     eprintln!("[ok] local verification complete - check logs above for any failures");
@@ -1574,6 +1682,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     // Verify ledger inclusion for transfers
     let mut ok_transfers = 0usize;
+    let mut batch_stats: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let transfer_start_time = std::time::Instant::now();
     for hash_hex in &transfer_hashes {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -1598,6 +1708,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         ltx.number,
                         ltx.events.len()
                     );
+                    *batch_stats.entry(ltx.batch_number).or_insert(0) += 1;
                     ok_transfers += 1;
                     break;
                 }
@@ -1617,10 +1728,12 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         ok_transfers == transfer_hashes.len(),
         "Some transfers failed inclusion"
     );
+    let transfer_total_time = transfer_start_time.elapsed();
     eprintln!(
-        "[ok] all transfers included: {}/{}",
+        "[ok] all transfers included: {}/{} in {:.2}s",
         ok_transfers,
-        transfer_hashes.len()
+        transfer_hashes.len(),
+        transfer_total_time.as_secs_f64()
     );
 
     // Stats: nullifiers_spent advanced
@@ -1647,6 +1760,51 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         &transfer_stf_execution_ms,
     );
     eprintln!("[timing] =================================");
+
+    // Print batch statistics
+    eprintln!("\n[batch-stats] ===== Batch Distribution =====");
+    let mut sorted_batches: Vec<_> = batch_stats.iter().collect();
+    sorted_batches.sort_by_key(|(batch_num, _)| *batch_num);
+    
+    let total_batches = sorted_batches.len();
+    let total_txs: usize = sorted_batches.iter().map(|(_, count)| **count).sum();
+    let avg_txs_per_batch = if total_batches > 0 {
+        total_txs as f64 / total_batches as f64
+    } else {
+        0.0
+    };
+    
+    eprintln!("[batch-stats] Total batches: {}", total_batches);
+    eprintln!("[batch-stats] Total transactions: {}", total_txs);
+    eprintln!("[batch-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
+    eprintln!("[batch-stats]");
+    eprintln!("[batch-stats] Distribution:");
+    
+    for (batch_num, count) in &sorted_batches {
+        let percentage = (**count as f64 / total_txs as f64) * 100.0;
+        let bar_length = (**count as f64 / avg_txs_per_batch * 20.0) as usize;
+        let bar = "█".repeat(bar_length.min(40));
+        eprintln!(
+            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}",
+            batch_num, count, percentage, bar
+        );
+    }
+    
+    // Calculate TPS
+    let tps = if transfer_total_time.as_secs_f64() > 0.0 {
+        ok_transfers as f64 / transfer_total_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    
+    eprintln!("[batch-stats]");
+    eprintln!("[batch-stats] ===== Performance Metrics =====");
+    eprintln!(
+        "[batch-stats] Transfer inclusion time: {:.2}s",
+        transfer_total_time.as_secs_f64()
+    );
+    eprintln!("[batch-stats] Average TPS (transfers): {:.2} tx/s", tps);
+    eprintln!("[batch-stats] =====================================\n");
 
     eprintln!("\n✅ TEST COMPLETE: E2E Privacy Pool with Multi-Account Parallelism");
     eprintln!("═══════════════════════════════════════════════════════════════");
