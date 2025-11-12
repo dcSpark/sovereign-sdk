@@ -16,11 +16,15 @@ use sov_modules_api::StateUpdateInfo;
 use sov_modules_api::TxChangeSet;
 use sov_modules_api::{FullyBakedTx, Runtime, RuntimeEventProcessor};
 use std::io::Write;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+/// Global counter to track how many workers are actively processing transactions.
+/// This helps prove parallelization by showing multiple workers active simultaneously.
+static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 // Channel size for parallel transaction processing.
 // This should be large enough to accommodate multiple transactions being processed simultaneously
@@ -347,42 +351,85 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                         };
 
                         if !is_started {
-                            tracing::warn!(
+                            tracing::debug!(
                                 worker_id,
                                 tx_hash = %request.tx_hash,
-                                "Parallel worker received tx before batch started, ignoring"
+                                "Parallel worker received tx before batch start; waiting for start notification"
                             );
-                            // Send an error back? For now, just drop it
-                            continue;
+
+                            // Wait until the batch start notification arrives (or shutdown)
+                            loop {
+                                tokio::select! {
+                                    _ = start_block_notification_receiver.changed() => {
+                                        let notify_opt = start_block_notification_receiver.borrow().clone();
+                                        if let Some(notify) = notify_opt {
+                                            // Restart executor with new state and mark as started
+                                            let _ = executor.shutdown().await;
+                                            Self::start_block(notify, &mut executor).await;
+                                            is_started = true;
+                                            txs_processed = 0;
+                                            break;
+                                        }
+                                    }
+                                    _ = shutdown_receiver.changed() => {
+                                        tracing::info!(worker_id, "Parallel worker shutting down while waiting for start");
+                                        return;
+                                    }
+                                }
+                            }
                         }
 
-                        eprintln!("[PARALLEL] Processing transaction in parallel: {}", request.tx_hash);
+                        let start_time = std::time::Instant::now();
+                        let start_timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros();
+
+                        // Increment active workers counter to track concurrency
+                        let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
+
+                        eprintln!(
+                            "[PARALLEL][Worker {}] ▶ START TX {} at t={}µs | Active workers: {}", 
+                            worker_id, 
+                            request.tx_hash,
+                            start_timestamp,
+                            active_count
+                        );
 
                         tracing::trace!(
                             worker_id,
                             tx_hash = %request.tx_hash,
                             queue_id = request.original_tx_queue_id,
+                            start_timestamp,
+                            active_workers = active_count,
                             "Processing transaction in parallel"
                         );
-
-                        let start_time = std::time::Instant::now();
 
                         // Process the transaction using our executor
                         use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
                         let baked_tx = FullyBakedTxWithMaybeChangeSet::new(request.tx);
                         let result = executor.apply_tx_to_in_progress_batch(baked_tx).await;
 
+                        // Decrement active workers counter
+                        let active_count_after = ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst) - 1;
+
                         match result {
                             Ok((accepted_tx_with_budget, tx_changes)) => {
                                 let elapsed = start_time.elapsed();
+                                let end_timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_micros();
                                 txs_processed += 1;
 
                                 eprintln!(
-                                    "[Worker {}] TX {} processed in {:.2}ms ({} µs)",
+                                    "[PARALLEL][Worker {}] ✓ END TX {} at t={}µs (took {:.2}ms / {} µs) | Active workers: {}",
                                     worker_id,
                                     request.tx_hash,
+                                    end_timestamp,
                                     elapsed.as_secs_f64() * 1000.0,
-                                    elapsed.as_micros()
+                                    elapsed.as_micros(),
+                                    active_count_after
                                 );
 
                                 tracing::debug!(
@@ -476,4 +523,3 @@ impl Metric for ParallelTxExecutorMetrics {
         )
     }
 }
-
