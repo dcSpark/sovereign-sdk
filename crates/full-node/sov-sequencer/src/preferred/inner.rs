@@ -1344,6 +1344,7 @@ where
                 original_tx_queue_id,
                 reason,
             } => {
+                let start = std::time::Instant::now();
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1356,6 +1357,8 @@ where
                 }
 
                 self.send_response(resp, ret, "accept_tx").await;
+                let elapsed = start.elapsed();
+                eprintln!("[ACCEPT TX] AcceptTx message processing took {:?}", elapsed);
             }
             Message::LatestSlotNumber { resp, reason } => {
                 let ret = self.process_latest_slot_number(reason).await;
@@ -1437,9 +1440,11 @@ where
                 tx_len,
                 reason,
             } => {
-                eprintln!("Received ParallelTxCompleted message");
+                let start = std::time::Instant::now();
                 self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
                     .await;
+                let elapsed = start.elapsed();
+                eprintln!("[PARALLEL TX COMPLETED] ParallelTxCompleted message processing took {:?}", elapsed);
             }
         }
 
