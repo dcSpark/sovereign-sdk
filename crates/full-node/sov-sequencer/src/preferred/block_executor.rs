@@ -629,32 +629,26 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         }
     }
 
-    /// Adopt a pre-executed tx from a parallel worker: apply its change set to the main
-    /// checkpoint, assign canonical numbers, and return the accepted tx with budget info.
-    pub fn adopt_parallel_receipt(
+    /// Commit a pre-executed tx by delivering its TxChangeSet to the background task.
+    /// Preserves gas accounting, numbering, and checkpoint consistency.
+    pub async fn accept_precomputed_tx(
         &mut self,
-        receipt: TransactionReceipt<S>,
+        tx: FullyBakedTx,
         tx_changes: TxChangeSet,
-        execution_time_micros: u64,
-        remaining_slot_gas: <S as Spec>::Gas,
-    ) -> (AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet)
+    ) -> Result<(AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet), RollupBlockExecutorError<S>>
     where
         Rt: RuntimeEventProcessor,
     {
-        // Apply state updates computed by the worker
-        self.checkpoint.apply_tx_changes(tx_changes.clone());
+        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
+        use tokio::sync::oneshot;
 
-        // Assign canonical event and tx numbering
-        let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
-
-        (
-            AcceptedTxWithBudgetInfo {
-                accepted_tx,
-                remaining_slot_gas,
-                execution_time_micros,
-            },
-            tx_changes,
-        )
+        let (sender, receiver) = oneshot::channel();
+        let baked = FullyBakedTxWithMaybeChangeSet {
+            tx,
+            receiver: Some(receiver),
+        };
+        let _ = sender.send(tx_changes);
+        self.apply_tx_to_in_progress_batch(baked).await
     }
 
     fn update_kernel_with_user_state_root(&mut self) {

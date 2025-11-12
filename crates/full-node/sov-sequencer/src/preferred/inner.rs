@@ -1885,24 +1885,39 @@ where
             return;
         }
 
-        let ParallelizedResponse {
-            tx_hash,
-            receipt,
-            tx_changes,
-            remaining_slot_gas,
-            execution_time_micros,
-            ..
-        } = parallel_response;
+        let ParallelizedResponse { tx_hash, receipt, tx_changes, .. } = parallel_response;
 
-        // Adopt the worker’s result without re-executing on the main executor
-        let adopt_start = std::time::Instant::now();
-        let (accepted_with_budget_main, tx_changes_main) = inner.executor.adopt_parallel_receipt(
-            receipt,
-            tx_changes,
-            execution_time_micros,
-            remaining_slot_gas,
-        );
-        let adopt_time = adopt_start.elapsed();
+        // Rebuild the tx body from the worker’s receipt and commit via background task.
+        let tx = FullyBakedTx {
+            data: receipt
+                .body_to_save
+                .clone()
+                .expect("Transaction receipts must contain bodies with sov-modules-stf-blueprint"),
+        };
+
+        let commit_start = std::time::Instant::now();
+        let (accepted_with_budget_main, tx_changes_main) = match inner
+            .executor
+            .accept_precomputed_tx(tx, tx_changes)
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::debug!(%tx_hash, %err, "Main executor failed to commit precomputed tx; dropping");
+                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
+                eprintln!(
+                    "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (error in accept_precomputed_tx)",
+                    fn_start.elapsed().as_secs_f64() * 1000.0
+                );
+                return;
+            }
+        };
+        let commit_time = commit_start.elapsed();
 
         // Update batch metrics and publish
         let batch_metrics_start = std::time::Instant::now();
@@ -1933,21 +1948,22 @@ where
         }
         let waiter_bridge_time = waiter_bridge_start.elapsed();
 
+        // Decrement before attempting to close; the closer early-returns when pending > 0
+        if inner.pending_parallel_count > 0 {
+            inner.pending_parallel_count -= 1;
+        }
+
         let close_batch_start = std::time::Instant::now();
         inner
             .close_batch_if_nearly_full(&accepted_with_budget_main.remaining_slot_gas)
             .await;
         let close_batch_time = close_batch_start.elapsed();
 
-        if inner.pending_parallel_count > 0 {
-            inner.pending_parallel_count -= 1;
-        }
-
         let total_time = fn_start.elapsed();
         eprintln!(
-            "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms | adopt_parallel_receipt={:.3}ms | send_accept_tx={:.3}ms | close_batch_if_nearly_full={:.3}ms | batch_metrics={:.3}ms | waiter_bridge={:.3}ms",
+            "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms | accept_precomputed_tx={:.3}ms | send_accept_tx={:.3}ms | close_batch_if_nearly_full={:.3}ms | batch_metrics={:.3}ms | waiter_bridge={:.3}ms",
             total_time.as_secs_f64() * 1000.0,
-            adopt_time.as_secs_f64() * 1000.0,
+            commit_time.as_secs_f64() * 1000.0,
             send_accept_time.as_secs_f64() * 1000.0,
             close_batch_time.as_secs_f64() * 1000.0,
             batch_metrics_time.as_secs_f64() * 1000.0,
