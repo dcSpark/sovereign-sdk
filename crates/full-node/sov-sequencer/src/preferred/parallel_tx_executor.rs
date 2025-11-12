@@ -247,24 +247,21 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
             }
         };
 
-        if num_workers == 0 {
-            tracing::info!(
-                "Parallel transaction executor disabled (num_parallel_tx_workers = 0)"
-            );
+        // Ensure at least 1 worker to prevent hangs when transactions are enqueued
+        let num_workers = num_workers.max(1);
+
+        let config_source = if std::env::var("SOV_PARALLEL_TX_WORKERS").is_ok() {
+            "environment"
         } else {
-            let config_source = if std::env::var("SOV_PARALLEL_TX_WORKERS").is_ok() {
-                "environment"
-            } else {
-                "config"
-            };
-            
-            tracing::info!(
-                num_workers,
-                source = config_source,
-                channel_size = PARALLEL_TX_CHANNEL_SIZE,
-                "Starting parallel transaction executor worker pool"
-            );
-        }
+            "config"
+        };
+        
+        tracing::info!(
+            num_workers,
+            source = config_source,
+            channel_size = PARALLEL_TX_CHANNEL_SIZE,
+            "Starting parallel transaction executor worker pool"
+        );
 
         let mut handles = Vec::new();
         for worker_id in 0..num_workers {
