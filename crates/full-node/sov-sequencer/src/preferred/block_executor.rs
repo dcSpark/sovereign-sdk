@@ -264,7 +264,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
 
         match result {
             Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes)) => {
-                let accepted_tx = self.process_tx_receipt(&receipt);
+                let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
                 if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
                     writer.insert(accepted_tx.clone()).await;
                 }
@@ -318,7 +318,10 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 .as_ref()
                 .map(|c| call_message_repr::<Rt>(c))
                 .unwrap_or_else(|| "<undecoded>".to_string());
-            RollupBlockExecutorError::Rejected { reason, call: call_repr }
+            RollupBlockExecutorError::Rejected {
+                reason,
+                call: call_repr,
+            }
         })?;
 
         if !receipt.receipt.is_successful() {
@@ -568,6 +571,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     fn process_tx_receipt(
         &mut self,
         tx_receipt: &TransactionReceipt<S>,
+        execution_time_micros: Option<u64>,
     ) -> AcceptedTx<Confirmation<S, Rt>> {
         let tx_number = self.next_tx_number;
         let events = tx_receipt
@@ -595,6 +599,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 events,
                 receipt: tx_receipt.receipt.clone().into(),
                 tx_number,
+                stf_execution_time_micros: execution_time_micros.unwrap_or_default(),
             },
         }
     }
@@ -713,7 +718,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             }
             let mut accepted_txs = Vec::with_capacity(batch_receipt.tx_receipts.len());
             for tx_receipt in batch_receipt.tx_receipts {
-                let accepted_tx = self.process_tx_receipt(&tx_receipt);
+                let accepted_tx = self.process_tx_receipt(&tx_receipt, None);
                 accepted_txs.push(accepted_tx);
             }
             accepted_txs_by_batch.push(accepted_txs);

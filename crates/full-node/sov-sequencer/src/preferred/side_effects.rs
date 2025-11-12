@@ -311,6 +311,7 @@ mod tests {
                 },
             },
             tx_number: number,
+            stf_execution_time_micros: 0,
         };
         ExecutorEvent::AcceptedTx(AcceptedTxEventContents {
             accepted_tx: AcceptedTx {

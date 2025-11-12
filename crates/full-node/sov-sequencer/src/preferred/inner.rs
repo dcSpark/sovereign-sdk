@@ -21,6 +21,7 @@ use sov_state::{NativeStorage, Storage};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use std::collections::HashMap;
 
 use super::batch_size_tracker::BatchSizeTracker;
 use crate::metrics::{
@@ -47,7 +48,6 @@ use borsh::BorshDeserialize;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
 use sov_modules_api::capabilities::TransactionAuthenticator;
-use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
 
 /// These two constants are used to calculate the comfortable batch size limit.
 /// Currently, this is 99% of the hard limit. After the comfortable limit is reached,
@@ -105,6 +105,9 @@ where
     tx_cache_writer: TxResultWriter<S, Rt>,
     cache_warm_up_executor: CacheWarmUpExecutor<S>,
     parallel_tx_executor: ParallelTxExecutor<S, Rt>,
+    // Parallel in-flight tracking and HTTP waiters
+    pending_parallel_count: usize,
+    pending_http_waiters: HashMap<TxHash, oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>>,
 }
 
 // We submit metrics when this guard is dropped.
@@ -523,6 +526,14 @@ where
 
     /// Closes the current batch if it is nearly full (by gas limit) or has reached the target batch execution time.
     async fn close_batch_if_nearly_full(&mut self, remaining_slot_gas: &<S as GasSpec>::Gas) {
+        // Keep the batch open while parallel txs are in-flight
+        if self.pending_parallel_count > 0 {
+            tracing::trace!(
+                pending = %self.pending_parallel_count,
+                "Deferring batch close due to pending parallel txs"
+            );
+            return;
+        }
         // Check if we're close to the gas limit and close the batch if we are.
         let mut comfortable_gas_limit = <S as GasSpec>::initial_gas_limit();
         comfortable_gas_limit
@@ -607,7 +618,15 @@ where
             return;
         }
 
-        self.close_current_batch().await;
+        // Do not close if parallel txs are pending
+        if self.pending_parallel_count == 0 {
+            self.close_current_batch().await;
+        } else {
+            tracing::trace!(
+                pending = %self.pending_parallel_count,
+                "Skipping auto close; parallel txs pending"
+            );
+        }
     }
 
     /// Closes the current batch.
@@ -902,6 +921,8 @@ where
         tx_cache_writer,
         cache_warm_up_executor,
         parallel_tx_executor,
+        pending_parallel_count: 0,
+        pending_http_waiters: HashMap::new(),
     };
 
     let channel_size = Arc::new(AtomicU32::new(0));
@@ -1760,34 +1781,12 @@ where
                 message_sender,
             ) {
                 eprintln!("[PARALLEL] Transaction sent to parallel executor: {}", tx_hash);
-                
-                // Create and immediately populate a channel for instant HTTP response
-                let (immediate_tx, immediate_rx) = oneshot::channel();
-                let instant_response = AcceptedTx {
-                    tx: baked_tx.clone(),
-                    tx_hash,
-                    confirmation: Confirmation {
-                        events: vec![],
-                        receipt: sov_modules_api::ApiTxEffect::Successful {
-                            data: sov_modules_api::SuccessfulTxContents {
-                                gas_used: sov_modules_api::Gas::zero(),
-                            },
-                        },
-                        tx_number: 0,
-                    },
-                };
-                let _ = immediate_tx.send(instant_response);
-                
-                let total_fn_elapsed = fn_start_time.elapsed();
-                eprintln!(
-                    "[TIMING] ⚡ process_accept_tx RETURNED IMMEDIATELY for midnight privacy tx {} in {:.2}ms ({} µs)",
-                    tx_hash,
-                    total_fn_elapsed.as_secs_f64() * 1000.0,
-                    total_fn_elapsed.as_micros()
-                );
-                
-                // Return receiver that already has the value - no blocking!
-                return Ok(immediate_rx);
+
+                // Register an HTTP waiter and keep the batch open while in-flight
+                inner.pending_parallel_count += 1;
+                let (http_tx, http_rx) = oneshot::channel();
+                inner.pending_http_waiters.insert(tx_hash, http_tx);
+                return Ok(http_rx);
             } else {
                 eprintln!("[PARALLEL] Failed to send to parallel executor for {}, falling back to sequential", tx_hash);
                 // Fall through to sequential processing
@@ -1843,26 +1842,26 @@ where
     ) {
         let mut inner = self.get_inner_with_timing(reason).await;
 
-        // If no batch is in progress, create one
-        // This happens when the batch closed before the parallel tx completed
+        // If no batch is in progress, drop and fail any waiter
         if !inner.executor.has_in_progress_batch() {
-            tracing::debug!(
+            tracing::warn!(
                 tx_hash = %parallel_response.tx_hash,
-                "No in-progress batch when handling ParallelTxCompleted; creating new batch"
+                "No in-progress batch when handling ParallelTxCompleted; dropping"
             );
-            
-            // Create a new batch to hold this completion
-            if let Err(batch_creation_error) = inner
-                .try_to_create_and_start_batch_if_none_in_progress(false)
-                .await
+            if let Some(waiter) = inner
+                .pending_http_waiters
+                .remove(&parallel_response.tx_hash)
             {
                 tracing::warn!(
                     tx_hash = %parallel_response.tx_hash,
-                    ?batch_creation_error,
-                    "Failed to create batch for parallel tx completion; dropping"
+                    "Dropping waiter due to missing batch"
                 );
-                return;
+                drop(waiter);
             }
+            if inner.pending_parallel_count > 0 {
+                inner.pending_parallel_count -= 1;
+            }
+            return;
         }
 
         use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
@@ -1892,6 +1891,12 @@ where
             Ok(res) => res,
             Err(err) => {
                 tracing::debug!(%tx_hash, %err, "Main executor failed to apply parallel tx; dropping");
+                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
                 return;
             }
         };
@@ -1901,23 +1906,31 @@ where
             .batch_size_tracker
             .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
 
-        inner
+        let rx = inner
             .executor_events_sender
             .send_accept_tx(
-                accepted_with_budget_main.accepted_tx,
+                accepted_with_budget_main.accepted_tx.clone(),
                 tx_changes_main,
                 sequence_number,
             )
             .await;
 
+        // Bridge to HTTP waiter without blocking the message loop
+        if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+            tokio::spawn(async move {
+                if let Ok(accepted) = rx.await {
+                    let _ = waiter.send(accepted);
+                }
+            });
+        }
+
         inner
             .close_batch_if_nearly_full(&accepted_with_budget_main.remaining_slot_gas)
             .await;
 
-        eprintln!(
-            "[PARALLEL] Completed processing parallel tx: {} with canonical numbering",
-            tx_hash
-        );
+        if inner.pending_parallel_count > 0 {
+            inner.pending_parallel_count -= 1;
+        }
     }
 
     async fn process_new_storage(&mut self, info: StateUpdateInfo<S::Storage>) {

@@ -60,3 +60,5 @@ midnight_privacy.txt
 diff_parallel.txt
 PARALLEL_TX_EXECUTOR_GUIDE.md
 crates/full-node/sov-sequencer/test_output.log
+proof_cache/
+.env

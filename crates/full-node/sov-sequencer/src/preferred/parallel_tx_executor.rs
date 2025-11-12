@@ -190,21 +190,57 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
         let (start_block_notification_sender, start_block_notification_receiver) =
             tokio::sync::watch::channel(None);
 
-        // Determine the number of workers:
-        // - If num_parallel_tx_workers is None or 0, use the number of CPU cores
-        // - Otherwise, use the configured value
-        let configured_workers = seq_config
-            .sequencer_kind_config
-            .num_parallel_tx_workers
-            .unwrap_or(0);
-        
-        let num_workers = if configured_workers == 0 {
-            // Default to number of available CPU cores
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        } else {
-            configured_workers
+        // Determine the number of workers with priority order:
+        // 1. Environment variable SOV_PARALLEL_TX_WORKERS (if set)
+        // 2. Config value num_parallel_tx_workers (if set and non-zero)
+        // 3. Default to number of CPU cores
+        let num_workers = match std::env::var("SOV_PARALLEL_TX_WORKERS") {
+            Ok(env_value) => {
+                match env_value.parse::<usize>() {
+                    Ok(n) => {
+                        tracing::info!(
+                            workers = n,
+                            "Using SOV_PARALLEL_TX_WORKERS from environment variable"
+                        );
+                        n
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            value = %env_value,
+                            "Invalid SOV_PARALLEL_TX_WORKERS value, falling back to config or CPU cores"
+                        );
+                        // Fall through to config-based logic
+                        let configured_workers = seq_config
+                            .sequencer_kind_config
+                            .num_parallel_tx_workers
+                            .unwrap_or(0);
+                        
+                        if configured_workers == 0 {
+                            std::thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(1)
+                        } else {
+                            configured_workers
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // No environment variable set, use config value
+                let configured_workers = seq_config
+                    .sequencer_kind_config
+                    .num_parallel_tx_workers
+                    .unwrap_or(0);
+                
+                if configured_workers == 0 {
+                    // Default to number of available CPU cores
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                } else {
+                    configured_workers
+                }
+            }
         };
 
         if num_workers == 0 {
@@ -212,9 +248,15 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                 "Parallel transaction executor disabled (num_parallel_tx_workers = 0)"
             );
         } else {
+            let config_source = if std::env::var("SOV_PARALLEL_TX_WORKERS").is_ok() {
+                "environment"
+            } else {
+                "config"
+            };
+            
             tracing::info!(
                 num_workers,
-                configured = configured_workers,
+                source = config_source,
                 channel_size = PARALLEL_TX_CHANNEL_SIZE,
                 "Starting parallel transaction executor worker pool"
             );

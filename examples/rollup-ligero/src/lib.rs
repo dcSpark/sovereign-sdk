@@ -12,6 +12,9 @@ mod mock_rollup;
 
 pub use mock_rollup::*;
 
+/// Utilities for running the Midnight privacy E2E benchmark.
+pub mod e2e_runner;
+
 mod zk;
 pub use zk::*;
 
