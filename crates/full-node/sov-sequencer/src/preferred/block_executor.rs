@@ -281,6 +281,31 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         }
     }
 
+    /// Execute a tx and return the raw receipt + change set without constructing an AcceptedTx.
+    /// This is used by parallel workers to avoid double work; the main thread will adopt the
+    /// result and assign canonical numbering.
+    pub async fn execute_tx_return_receipt(
+        &mut self,
+        baked_tx: FullyBakedTxWithMaybeChangeSet,
+    ) -> Result<
+        (
+            TransactionReceipt<S>,
+            TxChangeSet,
+            <S as Spec>::Gas,
+            u64,
+        ),
+        RollupBlockExecutorError<S>,
+    > {
+        let (receipt, remaining_slot_gas, execution_time_micros, tx_changes) =
+            self.apply_tx_to_in_progress_batch_inner(baked_tx).await?;
+        Ok((
+            receipt,
+            tx_changes,
+            remaining_slot_gas,
+            execution_time_micros,
+        ))
+    }
+
     async fn apply_tx_to_in_progress_batch_inner(
         &mut self,
         baked_tx: FullyBakedTxWithMaybeChangeSet,
@@ -602,6 +627,34 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 stf_execution_time_micros: execution_time_micros.unwrap_or_default(),
             },
         }
+    }
+
+    /// Adopt a pre-executed tx from a parallel worker: apply its change set to the main
+    /// checkpoint, assign canonical numbers, and return the accepted tx with budget info.
+    pub fn adopt_parallel_receipt(
+        &mut self,
+        receipt: TransactionReceipt<S>,
+        tx_changes: TxChangeSet,
+        execution_time_micros: u64,
+        remaining_slot_gas: <S as Spec>::Gas,
+    ) -> (AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet)
+    where
+        Rt: RuntimeEventProcessor,
+    {
+        // Apply state updates computed by the worker
+        self.checkpoint.apply_tx_changes(tx_changes.clone());
+
+        // Assign canonical event and tx numbering
+        let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
+
+        (
+            AcceptedTxWithBudgetInfo {
+                accepted_tx,
+                remaining_slot_gas,
+                execution_time_micros,
+            },
+            tx_changes,
+        )
     }
 
     fn update_kernel_with_user_state_root(&mut self) {

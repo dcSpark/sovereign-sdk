@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use crate::preferred::batch_size_tracker::BatchSizeTracker;
-use crate::preferred::block_executor::{AcceptedTxWithBudgetInfo};
 use crate::preferred::cache_warm_up_executor::StartBlockNotification;
 use crate::preferred::executor_events::ExecutorEventsSender;
 use crate::preferred::{Confirmation, PreferredSequencerConfig};
@@ -14,6 +13,7 @@ use sov_modules_api::{ApiTxEffect, GasSpec, SuccessfulTxContents};
 use sov_modules_api::Spec;
 use sov_modules_api::StateUpdateInfo;
 use sov_modules_api::TxChangeSet;
+use sov_modules_api::TransactionReceipt;
 use sov_modules_api::{FullyBakedTx, Runtime, RuntimeEventProcessor};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -33,13 +33,17 @@ const PARALLEL_TX_CHANNEL_SIZE: usize = 64;
 
 /// Result of parallel transaction execution that will be sent back to the main sequencer.
 /// Contains all the information needed to finalize the transaction without re-executing it.
-pub struct ParallelizedResponse<S: Spec, Rt: Runtime<S>> {
+pub struct ParallelizedResponse<S: Spec> {
     /// The original transaction hash for identification
     pub tx_hash: TxHash,
-    /// The fully processed transaction with budget information
-    pub accepted_tx_with_budget: AcceptedTxWithBudgetInfo<S, Rt>,
+    /// Raw receipt produced by the parallel worker
+    pub receipt: TransactionReceipt<S>,
     /// The state changes produced by this transaction
     pub tx_changes: TxChangeSet,
+    /// Remaining slot gas after execution
+    pub remaining_slot_gas: <S as Spec>::Gas,
+    /// Execution time in microseconds
+    pub execution_time_micros: u64,
     /// Original transaction queue ID for ordering
     pub original_tx_queue_id: u64,
 }
@@ -405,13 +409,13 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                         // Process the transaction using our executor
                         use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
                         let baked_tx = FullyBakedTxWithMaybeChangeSet::new(request.tx);
-                        let result = executor.apply_tx_to_in_progress_batch(baked_tx).await;
+                        let result = executor.execute_tx_return_receipt(baked_tx).await;
 
                         // Decrement active workers counter
                         let active_count_after = ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst) - 1;
 
                         match result {
-                            Ok((accepted_tx_with_budget, tx_changes)) => {
+                            Ok((receipt, tx_changes, remaining_slot_gas, execution_time_micros)) => {
                                 let elapsed = start_time.elapsed();
                                 let end_timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -438,10 +442,12 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     "Transaction processed successfully in parallel"
                                 );
 
-                                let parallel_response = ParallelizedResponse {
+                                let parallel_response = ParallelizedResponse::<S> {
                                     tx_hash: request.tx_hash,
-                                    accepted_tx_with_budget,
+                                    receipt,
                                     tx_changes,
+                                    remaining_slot_gas,
+                                    execution_time_micros,
                                     original_tx_queue_id: request.original_tx_queue_id,
                                 };
 

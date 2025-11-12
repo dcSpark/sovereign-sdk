@@ -833,7 +833,7 @@ pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
         info: StateUpdateInfo<S::Storage>,
     },
     ParallelTxCompleted {
-        parallel_response: ParallelizedResponse<S, Rt>,
+        parallel_response: ParallelizedResponse<S>,
         sequence_number: SequenceNumber,
         tx_len: usize,
         reason: &'static str,
@@ -1854,11 +1854,12 @@ where
 
     async fn process_parallel_tx_completed(
         &mut self,
-        parallel_response: ParallelizedResponse<S, Rt>,
+        parallel_response: ParallelizedResponse<S>,
         sequence_number: SequenceNumber,
         tx_len: usize,
         reason: &'static str,
     ) {
+        let fn_start = std::time::Instant::now();
         let mut inner = self.get_inner_with_timing(reason).await;
 
         // If no batch is in progress, drop and fail any waiter
@@ -1880,51 +1881,37 @@ where
             if inner.pending_parallel_count > 0 {
                 inner.pending_parallel_count -= 1;
             }
+            eprintln!("[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (early return - no batch)", fn_start.elapsed().as_secs_f64() * 1000.0);
             return;
         }
 
-        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
-        use tokio::sync::oneshot;
-
         let ParallelizedResponse {
             tx_hash,
-            accepted_tx_with_budget,
+            receipt,
             tx_changes,
+            remaining_slot_gas,
+            execution_time_micros,
             ..
         } = parallel_response;
 
-        // Re-apply into the main executor with the worker-computed change set,
-        // so tx_number/event numbering and checkpoint advance are consistent.
-        let (sender, receiver) = oneshot::channel();
-        let baked_for_main = FullyBakedTxWithMaybeChangeSet {
-            tx: accepted_tx_with_budget.accepted_tx.tx.clone(),
-            receiver: Some(receiver),
-        };
-        let _ = sender.send(tx_changes.clone());
+        // Adopt the worker’s result without re-executing on the main executor
+        let adopt_start = std::time::Instant::now();
+        let (accepted_with_budget_main, tx_changes_main) = inner.executor.adopt_parallel_receipt(
+            receipt,
+            tx_changes,
+            execution_time_micros,
+            remaining_slot_gas,
+        );
+        let adopt_time = adopt_start.elapsed();
 
-        let (accepted_with_budget_main, tx_changes_main) = match inner
-            .executor
-            .apply_tx_to_in_progress_batch(baked_for_main)
-            .await
-        {
-            Ok(res) => res,
-            Err(err) => {
-                tracing::debug!(%tx_hash, %err, "Main executor failed to apply parallel tx; dropping");
-                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
-                    drop(waiter);
-                }
-                if inner.pending_parallel_count > 0 {
-                    inner.pending_parallel_count -= 1;
-                }
-                return;
-            }
-        };
-
-        // Update batch metrics and publish using the MAIN accepted tx
+        // Update batch metrics and publish
+        let batch_metrics_start = std::time::Instant::now();
         inner
             .batch_size_tracker
             .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+        let batch_metrics_time = batch_metrics_start.elapsed();
 
+        let send_accept_start = std::time::Instant::now();
         let rx = inner
             .executor_events_sender
             .send_accept_tx(
@@ -1933,8 +1920,10 @@ where
                 sequence_number,
             )
             .await;
+        let send_accept_time = send_accept_start.elapsed();
 
         // Bridge to HTTP waiter without blocking the message loop
+        let waiter_bridge_start = std::time::Instant::now();
         if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
             tokio::spawn(async move {
                 if let Ok(accepted) = rx.await {
@@ -1942,14 +1931,28 @@ where
                 }
             });
         }
+        let waiter_bridge_time = waiter_bridge_start.elapsed();
 
+        let close_batch_start = std::time::Instant::now();
         inner
             .close_batch_if_nearly_full(&accepted_with_budget_main.remaining_slot_gas)
             .await;
+        let close_batch_time = close_batch_start.elapsed();
 
         if inner.pending_parallel_count > 0 {
             inner.pending_parallel_count -= 1;
         }
+
+        let total_time = fn_start.elapsed();
+        eprintln!(
+            "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms | adopt_parallel_receipt={:.3}ms | send_accept_tx={:.3}ms | close_batch_if_nearly_full={:.3}ms | batch_metrics={:.3}ms | waiter_bridge={:.3}ms",
+            total_time.as_secs_f64() * 1000.0,
+            adopt_time.as_secs_f64() * 1000.0,
+            send_accept_time.as_secs_f64() * 1000.0,
+            close_batch_time.as_secs_f64() * 1000.0,
+            batch_metrics_time.as_secs_f64() * 1000.0,
+            waiter_bridge_time.as_secs_f64() * 1000.0
+        );
     }
 
     async fn process_new_storage(&mut self, info: StateUpdateInfo<S::Storage>) {
