@@ -1,8 +1,10 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use crate::MockDemoRollup;
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
@@ -10,17 +12,17 @@ use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
 };
 use num_cpus;
+use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
-use sov_modules_api::gas::UnlimitedGasMeter;
+use sov_modules_api::gas::{GasArray, UnlimitedGasMeter};
 use sov_modules_api::transaction::Transaction;
-use sov_modules_api::PublicKey;
+use sov_modules_api::{PublicKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
-use crate::MockDemoRollup;
 
 // Proof verifier service (runs alongside the node)
 use sov_proof_verifier_service::{create_router, AppState, RollupSpec, ServiceConfig};
@@ -128,7 +130,7 @@ fn find_binary() -> Result<String> {
             .to_string_lossy()
             .to_string()
     });
-    
+
     // Try release first (preferred for benchmarks), then debug
     let target_path = std::path::Path::new(&target_dir);
     for profile in &["release", "debug"] {
@@ -137,7 +139,7 @@ fn find_binary() -> Result<String> {
             return Ok(candidate.to_string_lossy().to_string());
         }
     }
-    
+
     anyhow::bail!(
         "sov-rollup-ligero binary not found in target/{{release,debug}}; \
          run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
@@ -493,26 +495,35 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "[setup] Loading {} pre-funded accounts from genesis",
         num_deposits
     );
-    
+
     // Load the generated keypairs file
     let keypairs_path = crate_dir
         .parent()
         .unwrap() // examples/
         .join("test-data/genesis/demo/mock/generated_keypairs.json");
-    
+
     if !keypairs_path.exists() {
         anyhow::bail!(
             "Generated keypairs file not found at {}. Please run: cargo run --bin generate-genesis-keys",
             keypairs_path.display()
         );
     }
-    
-    let keypairs_json = std::fs::read_to_string(&keypairs_path)
-        .with_context(|| format!("Failed to read keypairs file at {}", keypairs_path.display()))?;
-    
-    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = serde_json::from_str(&keypairs_json)
-        .with_context(|| format!("Failed to parse keypairs file at {}", keypairs_path.display()))?;
-    
+
+    let keypairs_json = std::fs::read_to_string(&keypairs_path).with_context(|| {
+        format!(
+            "Failed to read keypairs file at {}",
+            keypairs_path.display()
+        )
+    })?;
+
+    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        serde_json::from_str(&keypairs_json).with_context(|| {
+            format!(
+                "Failed to parse keypairs file at {}",
+                keypairs_path.display()
+            )
+        })?;
+
     if all_keypairs.len() < num_deposits {
         anyhow::bail!(
             "Not enough keypairs in genesis file. Need {}, but only {} available. Please regenerate with more accounts.",
@@ -520,10 +531,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             all_keypairs.len()
         );
     }
-    
+
     // Take the first num_deposits accounts
-    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = all_keypairs.into_iter().take(num_deposits).collect();
-    
+    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        all_keypairs.into_iter().take(num_deposits).collect();
+
     eprintln!(
         "\n✅✅✅ [setup] Loaded {} pre-funded accounts from genesis! ✅✅✅",
         accounts.len()
@@ -678,9 +690,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             }
 
             // Normal JSON response
-            let parsed: VerifierSubmitResponse = serde_json::from_str(&text).with_context(|| {
-                format!("{} #{} invalid JSON: {}", label, idx, text)
-            })?;
+            let parsed: VerifierSubmitResponse = serde_json::from_str(&text)
+                .with_context(|| format!("{} #{} invalid JSON: {}", label, idx, text))?;
 
             // If sequencer reported Syncing through the verifier (success=false but error present), retry
             if !parsed.success {
@@ -925,7 +936,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Verify each tx is included in the ledger (i.e., appears in a slot/batch)
     // and count how many deposit txs were included.
     let mut included_deposits = 0usize;
-    use std::collections::HashMap;
+    let mut deposit_batch_stats: HashMap<u64, usize> = HashMap::new();
+    let deposit_start_time = std::time::Instant::now();
     let mut deposit_cm_by_hash: HashMap<String, [u8; 32]> = HashMap::new();
     for (deposit_idx, hash_hex) in tx_hashes_hex.iter().enumerate() {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1000,6 +1012,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         }
                     }
                     // Positive confirmation log for successful inclusion
+                    *deposit_batch_stats.entry(ltx.batch_number).or_insert(0) += 1;
                     eprintln!(
                         "[ok] included deposit tx={} batch_number={} tx_number={} events={}",
                         hash_hex,
@@ -1027,6 +1040,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         num_deposits,
         included_deposits
     );
+    let deposit_total_time = deposit_start_time.elapsed();
     eprintln!(
         "[ok] all deposits included: {}/{}",
         included_deposits, num_deposits
@@ -1317,7 +1331,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let depth_usize = TREE_DEPTH as usize;
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
     let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
-    
+
     // Create semaphore to limit concurrent proof generation
     let max_concurrent = config.max_concurrent_proofs;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
@@ -1325,7 +1339,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "  [proof] limiting concurrent proof generation to {} tasks",
         max_concurrent
     );
-    
+
     for (i, input) in dep_inputs.iter().enumerate() {
         // Try to load from cache first
         if let Some(ref cache_dir) = cache_dir {
@@ -1442,7 +1456,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 hex::encode(cm_out)
             );
                 Ok((account_idx, proof_data))
-            }).await.expect("spawn_blocking join failed")
+            })
+            .await
+            .expect("spawn_blocking join failed")
         }));
     }
 
@@ -1451,7 +1467,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     for t in proof_tasks {
         generated_proofs.push(t.await??);
     }
-    
+
     eprintln!(
         "[ok] generated {} transfer proofs in parallel",
         generated_proofs.len()
@@ -1489,7 +1505,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
     proofs.extend(generated_proofs);
-    
+
     eprintln!(
         "[ok] using {} proofs total ({} from cache, {} newly generated)",
         proofs.len(),
@@ -1625,8 +1641,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     let _ = std::io::stderr().flush();
 
-    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<(usize, VerifierSubmitResponse, f64)>>>
-        = Vec::with_capacity(num_transfers);
+    let mut handles: Vec<
+        tokio::task::JoinHandle<anyhow::Result<(usize, VerifierSubmitResponse, f64)>>,
+    > = Vec::with_capacity(num_transfers);
     for (idx, body_b64) in transfer_txs_b64.into_iter().enumerate() {
         let http_cl = http.clone();
         let verifier_url_cl = verifier_url.clone();
@@ -1788,11 +1805,95 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     eprintln!("[timing] =================================");
 
+    // Deposit batch summary
+    eprintln!("\n[deposit-stats] ===== Batch Distribution =====");
+    let mut sorted_deposit_batches: Vec<_> = deposit_batch_stats.iter().collect();
+    sorted_deposit_batches.sort_by_key(|(batch_num, _)| *batch_num);
+    let deposit_total_batches = sorted_deposit_batches.len();
+    let deposit_total_txs: usize = sorted_deposit_batches
+        .iter()
+        .map(|(_, count)| **count)
+        .sum();
+    let deposit_avg_txs_per_batch = if deposit_total_batches > 0 {
+        deposit_total_txs as f64 / deposit_total_batches as f64
+    } else {
+        0.0
+    };
+    eprintln!("[deposit-stats] Total batches: {}", deposit_total_batches);
+    eprintln!("[deposit-stats] Total transactions: {}", deposit_total_txs);
+    eprintln!(
+        "[deposit-stats] Average txs/batch: {:.2}",
+        deposit_avg_txs_per_batch
+    );
+    eprintln!("[deposit-stats]");
+    eprintln!("[deposit-stats] Distribution:");
+    let deposit_batch_ids: BTreeSet<u64> = sorted_deposit_batches
+        .iter()
+        .map(|(batch, _)| **batch)
+        .collect();
+    let deposit_gas_usage = match collect_batch_gas_stats(&client, &deposit_batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[deposit-gas] Failed to collect gas statistics from ledger: {err:?}. Skipping gas summary."
+            );
+            HashMap::new()
+        }
+    };
+    for (batch_num, count) in &sorted_deposit_batches {
+        let percentage = if deposit_total_txs > 0 {
+            (**count as f64 / deposit_total_txs as f64) * 100.0
+        } else {
+            0.0
+        };
+        let bar_length = if deposit_avg_txs_per_batch > 0.0 {
+            (**count as f64 / deposit_avg_txs_per_batch * 20.0) as usize
+        } else {
+            0
+        };
+        let bar = "█".repeat(bar_length.min(40));
+        let gas_suffix = deposit_gas_usage
+            .get(batch_num)
+            .map(|gas| format!(" gas={}", format_gas(gas)))
+            .unwrap_or_default();
+        eprintln!(
+            "[deposit-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}",
+            batch_num, count, percentage, bar, gas_suffix
+        );
+    }
+    if !deposit_gas_usage.is_empty() {
+        eprintln!("\n[deposit-gas] ===== Batch Gas Usage =====");
+        for batch_id in &deposit_batch_ids {
+            if let Some(gas) = deposit_gas_usage.get(batch_id) {
+                eprintln!("[deposit-gas]   Batch {:3}: {}", batch_id, format_gas(gas));
+            }
+        }
+        if let Some(total_gas) = sum_gas(deposit_gas_usage.values()) {
+            eprintln!("[deposit-gas]   Total: {}", format_gas(&total_gas));
+        }
+    }
+    let deposit_tps = if deposit_total_time.as_secs_f64() > 0.0 {
+        included_deposits as f64 / deposit_total_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    eprintln!("[deposit-stats]");
+    eprintln!("[deposit-stats] ===== Performance Metrics =====");
+    eprintln!(
+        "[deposit-stats] Deposit inclusion time: {:.2}s",
+        deposit_total_time.as_secs_f64()
+    );
+    eprintln!(
+        "[deposit-stats] Average TPS (deposits): {:.2} tx/s",
+        deposit_tps
+    );
+    eprintln!("[deposit-stats] =====================================");
+
     // Print batch statistics
     eprintln!("\n[batch-stats] ===== Batch Distribution =====");
     let mut sorted_batches: Vec<_> = batch_stats.iter().collect();
     sorted_batches.sort_by_key(|(batch_num, _)| *batch_num);
-    
+
     let total_batches = sorted_batches.len();
     let total_txs: usize = sorted_batches.iter().map(|(_, count)| **count).sum();
     let avg_txs_per_batch = if total_batches > 0 {
@@ -1800,30 +1901,58 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     } else {
         0.0
     };
-    
+    let batch_ids: BTreeSet<u64> = sorted_batches.iter().map(|(batch, _)| **batch).collect();
+    let batch_gas_usage = match collect_batch_gas_stats(&client, &batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[gas] Failed to collect gas statistics from ledger: {err:?}. Skipping gas summary."
+            );
+            HashMap::new()
+        }
+    };
+
     eprintln!("[batch-stats] Total batches: {}", total_batches);
     eprintln!("[batch-stats] Total transactions: {}", total_txs);
     eprintln!("[batch-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
     eprintln!("[batch-stats]");
     eprintln!("[batch-stats] Distribution:");
-    
+
     for (batch_num, count) in &sorted_batches {
         let percentage = (**count as f64 / total_txs as f64) * 100.0;
         let bar_length = (**count as f64 / avg_txs_per_batch * 20.0) as usize;
         let bar = "█".repeat(bar_length.min(40));
+        let gas_suffix = batch_gas_usage
+            .get(batch_num)
+            .map(|gas| format!(" gas={}", format_gas(gas)))
+            .unwrap_or_default();
         eprintln!(
-            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}",
-            batch_num, count, percentage, bar
+            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}",
+            batch_num, count, percentage, bar, gas_suffix
         );
     }
-    
+
+    // if !batch_gas_usage.is_empty() {
+    //     eprintln!("\n[gas] ===== Batch Gas Usage =====");
+    //     for batch_id in &batch_ids {
+    //         if let Some(gas) = batch_gas_usage.get(batch_id) {
+    //             eprintln!("[gas]   Batch {:3}: {}", batch_id, format_gas(gas));
+    //         }
+    //     }
+    //     if let Some(total_gas) = sum_gas(batch_gas_usage.values()) {
+    //         eprintln!("[gas]   Total: {}", format_gas(&total_gas));
+    //     }
+    // } else {
+    //     eprintln!("\n[gas] (No batch gas data was returned; ensure the ledger endpoint exposes batch receipts.)");
+    // }
+
     // Calculate TPS
     let tps = if transfer_total_time.as_secs_f64() > 0.0 {
         ok_transfers as f64 / transfer_total_time.as_secs_f64()
     } else {
         0.0
     };
-    
+
     eprintln!("[batch-stats]");
     eprintln!("[batch-stats] ===== Performance Metrics =====");
     eprintln!(
@@ -1857,4 +1986,120 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     env.shutdown();
 
     Ok(())
+}
+
+type DemoGas = <DemoRollupSpec as Spec>::Gas;
+
+async fn collect_batch_gas_stats(
+    client: &NodeClient,
+    batch_ids: &BTreeSet<u64>,
+) -> Result<HashMap<u64, DemoGas>> {
+    let mut per_batch = HashMap::new();
+
+    for batch_id in batch_ids {
+        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
+        match client
+            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
+            .await
+        {
+            Ok(batch) => match decode_batch_gas(&batch.receipt) {
+                Ok(Some(gas)) => {
+                    per_batch.insert(*batch_id, gas);
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[gas] Batch {} did not expose gas data in its receipt payload",
+                        batch_id
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[gas] Failed to parse gas data for batch {}: {err:?}",
+                        batch_id
+                    );
+                }
+            },
+            Err(err) => {
+                eprintln!(
+                    "[gas] Failed to fetch batch {} from ledger: {err:?}",
+                    batch_id
+                );
+            }
+        }
+    }
+
+    Ok(per_batch)
+}
+
+fn decode_batch_gas(receipt: &api_types::AnyJsonValue) -> Result<Option<DemoGas>> {
+    let value = any_json_to_value(receipt);
+    if let Some(obj) = value.as_object() {
+        if let Some(gas_value) = obj.get("gas_used") {
+            return Ok(Some(gas_from_array(gas_value)?));
+        }
+    }
+    Ok(None)
+}
+
+fn any_json_to_value(value: &api_types::AnyJsonValue) -> JsonValue {
+    match value {
+        api_types::AnyJsonValue::String(s) => JsonValue::String(s.clone()),
+        api_types::AnyJsonValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        api_types::AnyJsonValue::Boolean(b) => JsonValue::Bool(*b),
+        api_types::AnyJsonValue::Array(values) => JsonValue::Array(values.clone()),
+        api_types::AnyJsonValue::Object(map) => JsonValue::Object(map.clone()),
+    }
+}
+
+fn gas_from_array(value: &JsonValue) -> Result<DemoGas> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("gas_used must be an array"))?;
+    let mut limbs = Vec::with_capacity(array.len());
+    for item in array {
+        if let Some(num) = item.as_u64() {
+            limbs.push(num);
+        } else if let Some(text) = item.as_str() {
+            limbs.push(text.parse::<u64>().context("Failed to parse gas limb")?);
+        } else {
+            bail!("gas limb must be a number");
+        }
+    }
+    DemoGas::try_from(limbs).context("Failed to construct gas value")
+}
+
+fn add_gas(target: &mut DemoGas, value: &DemoGas) -> Result<()> {
+    *target = target
+        .checked_combine(value)
+        .ok_or_else(|| anyhow::anyhow!("Gas addition overflowed"))?;
+    Ok(())
+}
+
+fn zero_gas() -> DemoGas {
+    <DemoGas as GasArray>::ZEROED
+}
+
+fn sum_gas<'a, I>(iter: I) -> Option<DemoGas>
+where
+    I: Iterator<Item = &'a DemoGas>,
+{
+    let mut total = zero_gas();
+    let mut seen = false;
+    for gas in iter {
+        if add_gas(&mut total, gas).is_ok() {
+            seen = true;
+        }
+    }
+    if seen {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn format_gas(gas: &DemoGas) -> String {
+    let limbs: Vec<String> = gas.as_ref().iter().map(|v| v.to_string()).collect();
+    format!("[{}]", limbs.join(", "))
 }
