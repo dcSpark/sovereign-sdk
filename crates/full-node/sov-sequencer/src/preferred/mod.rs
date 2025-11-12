@@ -7,6 +7,7 @@ mod cache_warm_up_executor;
 mod db;
 mod executor_events;
 mod inner;
+mod parallel_tx_executor;
 mod preferred_blob_sender;
 mod replica;
 mod side_effects;
@@ -16,6 +17,7 @@ mod update_state;
 
 use crate::preferred::block_executor::RollupBlockExecutorConfig;
 use crate::preferred::cache_warm_up_executor::CacheWarmUpExecutor;
+use crate::preferred::parallel_tx_executor::ParallelTxExecutor;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use base64::Engine;
@@ -237,6 +239,18 @@ where
             handles.push(worker);
         }
 
+        let (parallel_tx_executor, parallel_workers): (ParallelTxExecutor<S, Rt>, _) =
+            ParallelTxExecutor::spawn_execution_task(
+                latest_state_update.clone(),
+                rollup_exec_config.clone(),
+                config.clone(),
+            )
+            .await;
+
+        for worker in parallel_workers {
+            handles.push(worker);
+        }
+
         let tx_queue_id = Arc::new(AtomicU64::new(0));
         let (synchronized_state, synchronized_state_updator) = create(
             api_ledger_db.clone(),
@@ -253,6 +267,7 @@ where
             rollup_exec_config.clone(),
             cached_txs.write_handle(),
             cache_warm_up_executor.clone(),
+            parallel_tx_executor.clone(),
         );
 
         let synchronized_state_task = synchronized_state.start().await;
@@ -1258,6 +1273,7 @@ where
         result
     }
 
+    // Mark(Nico)
     #[tracing::instrument(skip_all, level = "trace", fields(tx_hash = %tx_hash))]
     async fn accept_serialized_pre_authenticated_tx(
         &self,

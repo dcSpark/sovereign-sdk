@@ -53,3 +53,10 @@ proof_outputs/
 .env
 
 .env
+parallel_debug.txt
+parallel_debug.txt
+new_privacy_debug.txt
+midnight_privacy.txt
+diff_parallel.txt
+PARALLEL_TX_EXECUTOR_GUIDE.md
+crates/full-node/sov-sequencer/test_output.log

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::preferred::block_executor::StartBlockData;
 use crate::preferred::cache_warm_up_executor::{CacheWarmUpExecutor, StartBlockNotification};
+use crate::preferred::parallel_tx_executor::{ParallelTxExecutor, ParallelizedResponse};
 use crate::preferred::RollupBlockExecutorConfig;
 use anyhow::anyhow;
 use sov_blob_sender::BlobInternalId;
@@ -41,6 +42,12 @@ use crate::preferred::{
     PreferredSequencerReadBatch, TxResultWriter,
 };
 use crate::{SequencerConfig, SequencerNotReadyDetails, SlotNumber, TxHash};
+
+use borsh::BorshDeserialize;
+use sov_modules_api::transaction::Transaction;
+use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
+use sov_modules_api::capabilities::TransactionAuthenticator;
+use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
 
 /// These two constants are used to calculate the comfortable batch size limit.
 /// Currently, this is 99% of the hard limit. After the comfortable limit is reached,
@@ -97,6 +104,7 @@ where
     rollup_exec_config: RollupBlockExecutorConfig<S>,
     tx_cache_writer: TxResultWriter<S, Rt>,
     cache_warm_up_executor: CacheWarmUpExecutor<S>,
+    parallel_tx_executor: ParallelTxExecutor<S, Rt>,
 }
 
 // We submit metrics when this guard is dropped.
@@ -298,6 +306,9 @@ where
         };
 
         self.cache_warm_up_executor
+            .send_batch_start_notification(notification.clone());
+
+        self.parallel_tx_executor
             .send_batch_start_notification(notification);
 
         self.executor_events_sender
@@ -719,7 +730,7 @@ where
     }
 }
 
-enum Message<S: Spec, Rt: Runtime<S>> {
+pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
     NextSequenceNumber {
         resp: oneshot::Sender<SequenceNumber>,
         reason: &'static str,
@@ -802,6 +813,12 @@ enum Message<S: Spec, Rt: Runtime<S>> {
     SimpleStateUpdate {
         info: StateUpdateInfo<S::Storage>,
     },
+    ParallelTxCompleted {
+        parallel_response: ParallelizedResponse<S, Rt>,
+        sequence_number: SequenceNumber,
+        tx_len: usize,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -842,6 +859,7 @@ pub(crate) fn create<S, Rt>(
     rollup_exec_config: RollupBlockExecutorConfig<S>,
     tx_cache_writer: TxResultWriter<S, Rt>,
     cache_warm_up_executor: CacheWarmUpExecutor<S>,
+    parallel_tx_executor: ParallelTxExecutor<S, Rt>,
 ) -> (
     SynchronizedSequencerState<S, Rt>,
     SequencerStateUpdator<S, Rt>,
@@ -883,6 +901,7 @@ where
         rollup_exec_config,
         tx_cache_writer,
         cache_warm_up_executor,
+        parallel_tx_executor,
     };
 
     let channel_size = Arc::new(AtomicU32::new(0));
@@ -891,6 +910,7 @@ where
             inner,
             channel_size: channel_size.clone(),
             message_receiver,
+            message_sender: message_sender.clone(),
         },
         SequencerStateUpdator {
             message_sender,
@@ -1192,6 +1212,7 @@ where
     inner: Inner<S, Rt>,
     channel_size: Arc<AtomicU32>,
     message_receiver: mpsc::Receiver<Message<S, Rt>>,
+    message_sender: mpsc::Sender<Message<S, Rt>>,
 }
 
 impl<S, Rt> SynchronizedSequencerState<S, Rt>
@@ -1368,6 +1389,16 @@ where
             }
             Message::SimpleStateUpdate { info } => {
                 self.process_new_storage(info).await;
+            }
+            Message::ParallelTxCompleted {
+                parallel_response,
+                sequence_number,
+                tx_len,
+                reason,
+            } => {
+                eprintln!("Received ParallelTxCompleted message");
+                self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
+                    .await;
             }
         }
 
@@ -1606,6 +1637,11 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+        let fn_start_time = std::time::Instant::now();
+        
+        // Clone message_sender before getting the inner guard to avoid borrow conflicts
+        let message_sender = self.message_sender.clone();
+        
         let mut inner = self.get_inner_with_timing(reason).await;
 
         // If the sequencer had to give out 503s at any point during the time we were waiting for the lock, we need to return a 503 - otherwise
@@ -1657,6 +1693,7 @@ where
             batch_size_tracker,
             executor_events_sender,
             cache_warm_up_executor,
+            parallel_tx_executor,
             ..
         } = &mut *inner;
 
@@ -1668,6 +1705,96 @@ where
             });
         }
 
+        // Try parallel processing for midnight privacy module transactions
+        // baked_tx.data contains an authenticator wrapper; unwrap it to get the RawTx first
+        let detection_start = std::time::Instant::now();
+        let is_midnight_privacy_tx = {
+            // Preferred: use the runtime's authenticator to decode and wrap the call
+            if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
+                let runtime_call = Rt::wrap_call(decoded);
+                let debug_str = format!("{:?}", runtime_call);
+                let variant_name = debug_str.split('(').next().unwrap_or("");
+                eprintln!("Runtime call variant: {}", variant_name);
+                variant_name == "MidnightPrivacy"
+            } else {
+                // Fallback: try generic AuthenticatorInput and parse the RawTx directly
+                match AuthenticatorInput::try_from_slice(&baked_tx.data) {
+                    Ok(auth_input) => {
+                        let raw = match auth_input {
+                            AuthenticatorInput::Standard(raw_tx) => raw_tx.data,
+                            AuthenticatorInput::PreAuthenticated(raw_tx, _) => raw_tx.data,
+                        };
+                        match Transaction::<Rt, S>::try_from_slice(raw.as_slice()) {
+                            Ok(tx) => {
+                                let runtime_call = tx.runtime_call();
+                                let debug_str = format!("{:?}", runtime_call);
+                                let variant_name = debug_str.split('(').next().unwrap_or("");
+                                eprintln!("Runtime call variant: {}", variant_name);
+                                variant_name == "MidnightPrivacy"
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to deserialize Transaction from RawTx (fallback): {:?}", e);
+                                false
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[detect] Failed to parse authenticator input in fallback: {:?}", err);
+                        false
+                    }
+                }
+            }
+        };
+        let detection_elapsed = detection_start.elapsed();
+        
+        eprintln!("Is midnight privacy tx: {} (detection took {:?})", is_midnight_privacy_tx, detection_elapsed);
+        
+        if is_midnight_privacy_tx {
+            // Send to parallel executor - worker will send result directly to message loop
+            if parallel_tx_executor.send_tx(
+                baked_tx.clone(),
+                tx_hash,
+                original_tx_queue_id,
+                sequence_number,
+                tx_len,
+                message_sender,
+            ) {
+                eprintln!("[PARALLEL] Transaction sent to parallel executor: {}", tx_hash);
+                
+                // Create and immediately populate a channel for instant HTTP response
+                let (immediate_tx, immediate_rx) = oneshot::channel();
+                let instant_response = AcceptedTx {
+                    tx: baked_tx.clone(),
+                    tx_hash,
+                    confirmation: Confirmation {
+                        events: vec![],
+                        receipt: sov_modules_api::ApiTxEffect::Successful {
+                            data: sov_modules_api::SuccessfulTxContents {
+                                gas_used: sov_modules_api::Gas::zero(),
+                            },
+                        },
+                        tx_number: 0,
+                    },
+                };
+                let _ = immediate_tx.send(instant_response);
+                
+                let total_fn_elapsed = fn_start_time.elapsed();
+                eprintln!(
+                    "[TIMING] ⚡ process_accept_tx RETURNED IMMEDIATELY for midnight privacy tx {} in {:.2}ms ({} µs)",
+                    tx_hash,
+                    total_fn_elapsed.as_secs_f64() * 1000.0,
+                    total_fn_elapsed.as_micros()
+                );
+                
+                // Return receiver that already has the value - no blocking!
+                return Ok(immediate_rx);
+            } else {
+                eprintln!("[PARALLEL] Failed to send to parallel executor for {}, falling back to sequential", tx_hash);
+                // Fall through to sequential processing
+            }
+        }
+
+        // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
         let baked_tx = cache_warm_up_executor.send_tx(baked_tx.clone());
         let apply_tx_res = executor.apply_tx_to_in_progress_batch(baked_tx).await;
 
@@ -1705,6 +1832,92 @@ where
     async fn process_latest_slot_number(&mut self, reason: &'static str) -> SlotNumber {
         let inner = self.get_inner_with_timing(reason).await;
         inner.latest_info.slot_number
+    }
+
+    async fn process_parallel_tx_completed(
+        &mut self,
+        parallel_response: ParallelizedResponse<S, Rt>,
+        sequence_number: SequenceNumber,
+        tx_len: usize,
+        reason: &'static str,
+    ) {
+        let mut inner = self.get_inner_with_timing(reason).await;
+
+        // If no batch is in progress, create one
+        // This happens when the batch closed before the parallel tx completed
+        if !inner.executor.has_in_progress_batch() {
+            tracing::debug!(
+                tx_hash = %parallel_response.tx_hash,
+                "No in-progress batch when handling ParallelTxCompleted; creating new batch"
+            );
+            
+            // Create a new batch to hold this completion
+            if let Err(batch_creation_error) = inner
+                .try_to_create_and_start_batch_if_none_in_progress(false)
+                .await
+            {
+                tracing::warn!(
+                    tx_hash = %parallel_response.tx_hash,
+                    ?batch_creation_error,
+                    "Failed to create batch for parallel tx completion; dropping"
+                );
+                return;
+            }
+        }
+
+        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
+        use tokio::sync::oneshot;
+
+        let ParallelizedResponse {
+            tx_hash,
+            accepted_tx_with_budget,
+            tx_changes,
+            ..
+        } = parallel_response;
+
+        // Re-apply into the main executor with the worker-computed change set,
+        // so tx_number/event numbering and checkpoint advance are consistent.
+        let (sender, receiver) = oneshot::channel();
+        let baked_for_main = FullyBakedTxWithMaybeChangeSet {
+            tx: accepted_tx_with_budget.accepted_tx.tx.clone(),
+            receiver: Some(receiver),
+        };
+        let _ = sender.send(tx_changes.clone());
+
+        let (accepted_with_budget_main, tx_changes_main) = match inner
+            .executor
+            .apply_tx_to_in_progress_batch(baked_for_main)
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::debug!(%tx_hash, %err, "Main executor failed to apply parallel tx; dropping");
+                return;
+            }
+        };
+
+        // Update batch metrics and publish using the MAIN accepted tx
+        inner
+            .batch_size_tracker
+            .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+
+        inner
+            .executor_events_sender
+            .send_accept_tx(
+                accepted_with_budget_main.accepted_tx,
+                tx_changes_main,
+                sequence_number,
+            )
+            .await;
+
+        inner
+            .close_batch_if_nearly_full(&accepted_with_budget_main.remaining_slot_gas)
+            .await;
+
+        eprintln!(
+            "[PARALLEL] Completed processing parallel tx: {} with canonical numbering",
+            tx_hash
+        );
     }
 
     async fn process_new_storage(&mut self, info: StateUpdateInfo<S::Storage>) {

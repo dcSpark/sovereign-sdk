@@ -136,6 +136,20 @@ async fn e2e_rollup_benchmark() -> Result<()> {
         .spawn()
         .context("Failed to spawn sov-rollup-ligero")?;
 
+
+    if std::env::var("WAIT_FOR_DEBUGGER").is_ok() {
+        // DEBUGGING: Print PID and wait for debugger attach
+        eprintln!("\n🔍 DEBUG MODE: Rollup process spawned with PID: {}", child.id());
+        eprintln!("🔍 To attach debugger:");
+        eprintln!("   1. Set breakpoints in sequencer code");
+        eprintln!("   2. Run 'Attach to sov-rollup-ligero process' debug config");
+        eprintln!("   3. Press Enter here to continue...\n");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        eprintln!("🔍 Continuing test execution...\n");
+    }
+
     // Ensure child is killed on panic/return
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
