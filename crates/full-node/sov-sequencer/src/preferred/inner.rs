@@ -55,10 +55,9 @@ use sov_modules_api::capabilities::TransactionAuthenticator;
 const COMFORTABLE_SIZE_LIMIT_MULTIPLIER: u64 = 99;
 const COMFORTABLE_SIZE_LIMIT_DIVISOR: u64 = 100;
 
-/// These two constants are used to calculate the comfortable gas limit.
-/// Currently, this is 95% of the initial gas limit. After the comfortable limit is reached,
-/// the sequencer will close and publish the current batch.
-const COMFORTABLE_GAS_LIMIT_MULTIPLIER: u64 = 19;
+/// These two constants are used to calculate the remaining-gas threshold to close a batch.
+/// We close when roughly 5% of the initial gas remains (i.e., ~95% used).
+const COMFORTABLE_GAS_LIMIT_MULTIPLIER: u64 = 1;
 const COMFORTABLE_GAS_LIMIT_DIVISOR: u64 = 20;
 
 const METRICS_BATCH_SIZE: usize = 32;
@@ -534,9 +533,9 @@ where
             );
             return;
         }
-        // Check if we're close to the gas limit and close the batch if we are.
-        let mut comfortable_gas_limit = <S as GasSpec>::initial_gas_limit();
-        comfortable_gas_limit
+        // Check if remaining gas is below the threshold and close the batch if it is.
+        let mut close_when_remaining = <S as GasSpec>::initial_gas_limit();
+        close_when_remaining
             .scalar_division(COMFORTABLE_GAS_LIMIT_DIVISOR)
             .checked_scalar_product(COMFORTABLE_GAS_LIMIT_MULTIPLIER)
             .unwrap_or_else(|| {
@@ -544,9 +543,20 @@ where
                     "Cannot overflow after dividing by {COMFORTABLE_GAS_LIMIT_DIVISOR} and multiplying by {COMFORTABLE_GAS_LIMIT_MULTIPLIER}",
                 )
             });
-        let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&comfortable_gas_limit);
+        // Temporary debug to observe gas threshold behavior during load
+        eprintln!(
+            "[GAS CHECK] gas-based close check: remaining_slot_gas={:?} close_when_remaining={:?}",
+            remaining_slot_gas,
+            close_when_remaining
+        );
+        let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&close_when_remaining);
         if close_to_gas_limit {
-            tracing::debug!(%comfortable_gas_limit, %remaining_slot_gas, "Closing and publishing current batch because we're close to the gas limit");
+            tracing::debug!(close_when_remaining = %close_when_remaining, %remaining_slot_gas, "Closing and publishing current batch because remaining gas is below threshold");
+            eprintln!(
+                "[BATCH CLOSE] reason=gas remaining_slot_gas={:?} threshold={:?}",
+                remaining_slot_gas,
+                close_when_remaining
+            );
             self.close_current_batch().await;
         }
 
@@ -555,6 +565,11 @@ where
 
         if current_batch_execution_time_micros > self.batch_execution_time_limit_micros {
             tracing::debug!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Closing and publishing current batch because we've reached the batch execution time cap");
+            eprintln!(
+                "[BATCH CLOSE] reason=time current_us={} limit_us={}",
+                current_batch_execution_time_micros,
+                self.batch_execution_time_limit_micros
+            );
             self.close_current_batch().await;
         } else {
             tracing::trace!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Batch execution time is within comfortable range, not closing batch");
@@ -570,6 +585,11 @@ where
             });
         if (self.batch_size_tracker.current_batch_size as u64) > comfortable_size_limit {
             tracing::debug!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Closing and publishing current batch because we're close to the size limit");
+            eprintln!(
+                "[BATCH CLOSE] reason=size current_bytes={} limit_bytes={}",
+                self.batch_size_tracker.current_batch_size,
+                comfortable_size_limit
+            );
             self.close_current_batch().await;
         } else {
             tracing::trace!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Batch size is within comfortable range, not closing batch");
