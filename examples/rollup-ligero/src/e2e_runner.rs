@@ -802,6 +802,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let mut deposit_http_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_node_submit_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_stf_execution_ms: Vec<f64> = Vec::with_capacity(num_deposits);
+    // Track per-tx execution time (micros) keyed by tx hash for per-batch aggregation
+    let mut deposit_exec_time_by_hash_micros: HashMap<String, u64> = HashMap::new();
     let mut transfer_stf_execution_ms: Vec<f64> = Vec::new();
     let mut transfer_http_timings: Vec<f64> = Vec::new();
     let mut transfer_node_submit_timings: Vec<f64> = Vec::new();
@@ -873,6 +875,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 }
                 if let Some(ms) = stf_execution_ms {
                     deposit_stf_execution_ms.push(ms);
+                    if let Some(hx) = parsed.tx_hash.as_ref() {
+                        // store micros to match internal tracker units
+                        let micros = (ms * 1000.0) as u64;
+                        deposit_exec_time_by_hash_micros.insert(hx.clone(), micros);
+                    }
                 }
                 if has_seq_resp && stf_execution_ms.is_none() {
                     if let Some(resp) = parsed.sequencer_response.as_ref() {
@@ -937,6 +944,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // and count how many deposit txs were included.
     let mut included_deposits = 0usize;
     let mut deposit_batch_stats: HashMap<u64, usize> = HashMap::new();
+    let mut deposit_hash_to_batch: HashMap<String, u64> = HashMap::new();
     let deposit_start_time = std::time::Instant::now();
     let mut deposit_cm_by_hash: HashMap<String, [u8; 32]> = HashMap::new();
     for (deposit_idx, hash_hex) in tx_hashes_hex.iter().enumerate() {
@@ -1020,6 +1028,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         ltx.number,
                         ltx.events.len()
                     );
+                    deposit_hash_to_batch.insert(hash_hex.clone(), ltx.batch_number);
                     included_deposits += 1;
                     break;
                 }
@@ -1666,6 +1675,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     }
 
     let mut transfer_hashes: Vec<String> = Vec::new();
+    // Track per-tx execution time (micros) keyed by tx hash for per-batch aggregation
+    let mut transfer_exec_time_by_hash_micros: HashMap<String, u64> = HashMap::new();
     for h in handles {
         let (idx, parsed, http_elapsed_ms) = h.await.expect("join transfer submit task")?;
         let display_idx = idx + 1;
@@ -1709,6 +1720,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 "  [transfers] transfer #{} accepted with hash: {}",
                 display_idx, hx
             );
+            if let Some(ms) = stf_execution_ms {
+                transfer_exec_time_by_hash_micros.insert(hx.clone(), (ms * 1000.0) as u64);
+            }
             transfer_hashes.push(hx);
         } else {
             anyhow::bail!(
@@ -1727,6 +1741,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Verify ledger inclusion for transfers
     let mut ok_transfers = 0usize;
     let mut batch_stats: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut transfer_hash_to_batch: HashMap<String, u64> = HashMap::new();
     let transfer_start_time = std::time::Instant::now();
     for hash_hex in &transfer_hashes {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1753,6 +1768,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         ltx.events.len()
                     );
                     *batch_stats.entry(ltx.batch_number).or_insert(0) += 1;
+                    transfer_hash_to_batch.insert(hash_hex.clone(), ltx.batch_number);
                     ok_transfers += 1;
                     break;
                 }
@@ -1840,6 +1856,23 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             HashMap::new()
         }
     };
+    // Collect batch byte sizes
+    let deposit_batch_sizes = match collect_batch_sizes(&client, &deposit_batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[deposit-bytes] Failed to collect batch sizes from ledger: {err:?}. Skipping size summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Aggregate per-batch execution time from tx-level metrics we observed at submission
+    let mut deposit_batch_exec_micros: HashMap<u64, u64> = HashMap::new();
+    for (tx_hash, batch_id) in &deposit_hash_to_batch {
+        if let Some(micros) = deposit_exec_time_by_hash_micros.get(tx_hash) {
+            *deposit_batch_exec_micros.entry(*batch_id).or_insert(0) += *micros;
+        }
+    }
     for (batch_num, count) in &sorted_deposit_batches {
         let percentage = if deposit_total_txs > 0 {
             (**count as f64 / deposit_total_txs as f64) * 100.0
@@ -1856,9 +1889,18 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .get(batch_num)
             .map(|gas| format!(" gas={}", format_gas(gas)))
             .unwrap_or_default();
+        let size_suffix = deposit_batch_sizes
+            .get(batch_num)
+            .map(|bytes| format!(" size={}B", bytes))
+            .unwrap_or_default();
+        let exec_suffix = deposit_batch_exec_micros
+            .get(batch_num)
+            .map(|micros| format!(" exec={:.3}ms", (*micros as f64) / 1000.0))
+            .unwrap_or_default();
+        let meta_suffix = format!("{}{}", exec_suffix, size_suffix);
         eprintln!(
-            "[deposit-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}",
-            batch_num, count, percentage, bar, gas_suffix
+            "[deposit-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
+            batch_num, count, percentage, bar, gas_suffix, meta_suffix
         );
     }
     if !deposit_gas_usage.is_empty() {
@@ -1911,6 +1953,23 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             HashMap::new()
         }
     };
+    // Collect batch sizes
+    let batch_sizes = match collect_batch_sizes(&client, &batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[bytes] Failed to collect batch sizes from ledger: {err:?}. Skipping size summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Aggregate per-batch execution times from transfer submissions
+    let mut transfer_batch_exec_micros: HashMap<u64, u64> = HashMap::new();
+    for (tx_hash, batch_id) in &transfer_hash_to_batch {
+        if let Some(micros) = transfer_exec_time_by_hash_micros.get(tx_hash) {
+            *transfer_batch_exec_micros.entry(*batch_id).or_insert(0) += *micros;
+        }
+    }
 
     eprintln!("[batch-stats] Total batches: {}", total_batches);
     eprintln!("[batch-stats] Total transactions: {}", total_txs);
@@ -1926,9 +1985,18 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .get(batch_num)
             .map(|gas| format!(" gas={}", format_gas(gas)))
             .unwrap_or_default();
+        let size_suffix = batch_sizes
+            .get(batch_num)
+            .map(|bytes| format!(" size={}B", bytes))
+            .unwrap_or_default();
+        let exec_suffix = transfer_batch_exec_micros
+            .get(batch_num)
+            .map(|micros| format!(" exec={:.3}ms", (*micros as f64) / 1000.0))
+            .unwrap_or_default();
+        let meta_suffix = format!("{}{}", exec_suffix, size_suffix);
         eprintln!(
-            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}",
-            batch_num, count, percentage, bar, gas_suffix
+            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
+            batch_num, count, percentage, bar, gas_suffix, meta_suffix
         );
     }
 
@@ -2039,6 +2107,40 @@ fn decode_batch_gas(receipt: &api_types::AnyJsonValue) -> Result<Option<DemoGas>
         }
     }
     Ok(None)
+}
+
+// Compute serialized batch size as enforced by BatchSizeTracker:
+// size = 8 (sequence_number) + 1 (visible_slots_to_advance) + 4 (tx vec len)
+//      + sum_over_txs(4 (borsh vec elem overhead) + tx_body.len())
+async fn collect_batch_sizes(
+    client: &NodeClient,
+    batch_ids: &BTreeSet<u64>,
+) -> Result<HashMap<u64, usize>> {
+    let mut per_batch = HashMap::new();
+    for batch_id in batch_ids {
+        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
+        match client
+            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
+            .await
+        {
+            Ok(batch) => {
+                let mut total: usize = 8 + 1 + 4; // overhead
+                // Generated type exposes `txs` as a Vec; it may be empty when children are not included
+                for tx in &batch.txs {
+                    // borsh vec element overhead (4 bytes) + body bytes
+                    total += 4 + tx.body.len();
+                }
+                per_batch.insert(*batch_id, total);
+            }
+            Err(err) => {
+                eprintln!(
+                    "[bytes] Failed to fetch batch {} from ledger: {err:?}",
+                    batch_id
+                );
+            }
+        }
+    }
+    Ok(per_batch)
 }
 
 fn any_json_to_value(value: &api_types::AnyJsonValue) -> JsonValue {
