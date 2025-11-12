@@ -79,5 +79,7 @@ batch_execution_time_limit_millis = 800
 # This warms up caches so the main transaction executor can run with ready-to-use data.
 # This variable determines the number of worker threads.
 num_cache_warmup_workers = 10
+# Parallel workers for Midnight Privacy Transactions
+num_parallel_tx_workers = 12
 [sequencer.extension]
 max_log_limit = 20000
