@@ -63,7 +63,8 @@ max_number_of_transitions_in_memory = 30
 [sequencer]
 blob_processing_timeout_secs = 3000
 # Increased to 500MB to support large ZK proofs (e.g. Ligero proofs are ~3.2MB)
-max_batch_size_bytes = 524288000
+# Increased to 3GB so ~300 Ligero transfers (≈10MB each) can fit into one batch.
+max_batch_size_bytes = 6221225472
 max_concurrent_blobs = 1024
 max_allowed_node_distance_behind = 10
 rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"

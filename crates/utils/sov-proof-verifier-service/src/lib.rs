@@ -96,6 +96,29 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(mut config: ServiceConfig) -> Result<Self, anyhow::Error> {
+        // Allow skipping cryptographic verification via env var.
+        // If any of these env vars are truthy, set LIGERO_SKIP_VERIFICATION=1 so
+        // sov_ligero_adapter::LigeroVerifier returns the public output without verifying.
+        fn env_truthy(name: &str) -> bool {
+            std::env::var(name)
+                .ok()
+                .map(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "yes" || v == "on"
+                })
+                .unwrap_or(false)
+        }
+        if env_truthy("SOV_PROOF_VERIFIER_SKIP_VERIFY")
+            || env_truthy("SKIP_VERIFY")
+            || env_truthy("LIGERO_SKIP_VERIFICATION")
+        {
+            // Ensure the adapter sees this flag
+            std::env::set_var("LIGERO_SKIP_VERIFICATION", "1");
+            info!(
+                "Proof verification skipping is ENABLED (env var set) — returning public outputs without verification"
+            );
+        }
+
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
 
