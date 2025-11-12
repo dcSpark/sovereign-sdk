@@ -543,10 +543,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         .await
         .unwrap_or_default();
 
-    #[derive(serde::Serialize)]
-    struct Body<'a> {
-        body: &'a str,
-    }
+    // No explicit request body struct; use inline JSON in requests.
 
     #[derive(Debug, Clone, serde::Deserialize)]
     struct VerifierMetrics {
@@ -629,6 +626,69 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     .map(|ms| format!("{:.3} ms", ms))
                     .unwrap_or_else(|| "n/a".to_string()),
             );
+        }
+    }
+
+    async fn submit_to_verifier_with_sync_retry(
+        client: &reqwest::Client,
+        verifier_url: &str,
+        body_b64: &str,
+        label: &str,
+        idx: usize,
+    ) -> anyhow::Result<(VerifierSubmitResponse, f64)> {
+        let mut backoff = Duration::from_millis(50);
+        let max_backoff = Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let submit_start = std::time::Instant::now();
+            let resp = client
+                .post(format!("{}/midnight-privacy", verifier_url))
+                .json(&serde_json::json!({"body": body_b64}))
+                .send()
+                .await
+                .with_context(|| format!("{} #{} request failed", label, idx))?;
+            let http_elapsed_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .with_context(|| format!("{} #{} failed to read response body", label, idx))?;
+
+            // If verifier itself errors (e.g., 503), consider retry
+            if status.as_u16() == 503 && text.contains("Syncing") {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "{} #{} retried but node still Syncing (HTTP 503): {}",
+                        label,
+                        idx,
+                        text
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+                continue;
+            }
+
+            // Normal JSON response
+            let parsed: VerifierSubmitResponse = serde_json::from_str(&text).with_context(|| {
+                format!("{} #{} invalid JSON: {}", label, idx, text)
+            })?;
+
+            // If sequencer reported Syncing through the verifier (success=false but error present), retry
+            if !parsed.success {
+                let syncing = parsed
+                    .error
+                    .as_deref()
+                    .map(|e| e.contains("\"Syncing\"") || e.contains("fell out of sync"))
+                    .unwrap_or(false);
+                if syncing && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+                    continue;
+                }
+            }
+
+            return Ok((parsed, http_elapsed_ms));
         }
     }
 
@@ -769,86 +829,49 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
         // Submit to the verifier service (preferred) with fallback to sequencer direct
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
-        let submit_start = std::time::Instant::now();
-        let service_response = http
-            .post(format!("{}/midnight-privacy", verifier_url))
-            .json(&Body { body: &tx_b64 })
-            .send()
-            .await;
+        // Submissions may hit temporary Syncing; use retry helper below.
         let mut submitted_via_verifier = false;
-        match service_response {
-            Ok(resp) => {
-                let http_elapsed_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
-                let status = resp.status();
-                match resp.text().await {
-                    Ok(body_text) => {
-                        if status.is_success() {
-                            match serde_json::from_str::<VerifierSubmitResponse>(&body_text) {
-                                Ok(parsed) => {
-                                    let has_seq_resp = parsed.sequencer_response.is_some();
-                                    let stf_execution_ms = parsed
-                                        .sequencer_response
-                                        .as_ref()
-                                        .and_then(extract_stf_execution_ms);
-                                    log_submission_timing(
-                                        "deposit",
-                                        i + 1,
-                                        http_elapsed_ms,
-                                        parsed.metrics.as_ref(),
-                                        has_seq_resp,
-                                        stf_execution_ms,
-                                    );
-                                    deposit_http_timings.push(http_elapsed_ms);
-                                    if let Some(m) = parsed.metrics.as_ref() {
-                                        deposit_node_submit_timings.push(m.node_submit_ms);
-                                    }
-                                    if let Some(ms) = stf_execution_ms {
-                                        deposit_stf_execution_ms.push(ms);
-                                    }
-                                    if has_seq_resp && stf_execution_ms.is_none() {
-                                        if let Some(resp) = parsed.sequencer_response.as_ref() {
-                                            eprintln!(
-                                                "  [timing][deposit #{:02}] warning: STF metric missing in sequencer response: {}",
-                                                i + 1,
-                                                serde_json::to_string(resp).unwrap_or_default()
-                                            );
-                                        }
-                                    }
-                                    if parsed.success {
-                                        submitted_via_verifier = true;
-                                    } else {
-                                        eprintln!(
-                                            "  [deposits] verifier reported failure for deposit #{}: {:?}",
-                                            i + 1,
-                                            parsed.error
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "  [deposits] failed to decode verifier response for deposit #{}: {} (body={})",
-                                        i + 1,
-                                        err,
-                                        body_text
-                                    );
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "  [deposits] verifier returned HTTP {} for deposit #{}: {}",
-                                status,
-                                i + 1,
-                                body_text
-                            );
-                        }
-                    }
-                    Err(err) => {
+        match submit_to_verifier_with_sync_retry(&http, &verifier_url, &tx_b64, "deposit", i + 1)
+            .await
+        {
+            Ok((parsed, http_elapsed_ms)) => {
+                let has_seq_resp = parsed.sequencer_response.is_some();
+                let stf_execution_ms = parsed
+                    .sequencer_response
+                    .as_ref()
+                    .and_then(extract_stf_execution_ms);
+                log_submission_timing(
+                    "deposit",
+                    i + 1,
+                    http_elapsed_ms,
+                    parsed.metrics.as_ref(),
+                    has_seq_resp,
+                    stf_execution_ms,
+                );
+                deposit_http_timings.push(http_elapsed_ms);
+                if let Some(m) = parsed.metrics.as_ref() {
+                    deposit_node_submit_timings.push(m.node_submit_ms);
+                }
+                if let Some(ms) = stf_execution_ms {
+                    deposit_stf_execution_ms.push(ms);
+                }
+                if has_seq_resp && stf_execution_ms.is_none() {
+                    if let Some(resp) = parsed.sequencer_response.as_ref() {
                         eprintln!(
-                            "  [deposits] failed to read verifier response body for deposit #{}: {}",
+                            "  [timing][deposit #{:02}] warning: STF metric missing in sequencer response: {}",
                             i + 1,
-                            err
+                            serde_json::to_string(resp).unwrap_or_default()
                         );
                     }
+                }
+                if parsed.success {
+                    submitted_via_verifier = true;
+                } else {
+                    eprintln!(
+                        "  [deposits] verifier reported failure for deposit #{}: {:?}",
+                        i + 1,
+                        parsed.error
+                    );
                 }
             }
             Err(err) => {
@@ -1583,7 +1606,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     let _ = std::io::stderr().flush();
 
-    let mut handles = Vec::with_capacity(num_transfers);
+    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<(usize, VerifierSubmitResponse, f64)>>>
+        = Vec::with_capacity(num_transfers);
     for (idx, body_b64) in transfer_txs_b64.into_iter().enumerate() {
         let http_cl = http.clone();
         let verifier_url_cl = verifier_url.clone();
@@ -1593,30 +1617,14 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 "  [transfers] submitting transfer #{} to verifier...",
                 display_idx
             );
-            let submit_start = std::time::Instant::now();
-            let resp = http_cl
-                .post(format!("{}/midnight-privacy", verifier_url_cl))
-                .json(&serde_json::json!({"body": body_b64}))
-                .send()
-                .await
-                .with_context(|| format!("transfer #{} request failed", display_idx))?;
-            let http_elapsed_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
-            let status = resp.status();
-            let body_text = resp.text().await.with_context(|| {
-                format!("transfer #{} failed to read response body", display_idx)
-            })?;
-            if !status.is_success() {
-                anyhow::bail!(
-                    "transfer #{} verifier returned status {}: {}",
-                    display_idx,
-                    status,
-                    body_text
-                );
-            }
-            let parsed: VerifierSubmitResponse =
-                serde_json::from_str(&body_text).with_context(|| {
-                    format!("transfer #{} invalid JSON: {}", display_idx, body_text)
-                })?;
+            let (parsed, http_elapsed_ms) = submit_to_verifier_with_sync_retry(
+                &http_cl,
+                &verifier_url_cl,
+                &body_b64,
+                "transfer",
+                display_idx,
+            )
+            .await?;
             Ok((idx, parsed, http_elapsed_ms))
         }));
     }

@@ -1588,7 +1588,13 @@ where
                 PreferredSeqOperation::WaitForNodeResyncToTip
             }
             (false, false, false, _, _) => {
-                let should_flush_tx_cache = is_startup || is_resync || is_recover;
+                // Only flush the tx cache when not actively producing a batch or holding
+                // pending parallel completions, to avoid reordering panics in the
+                // transaction_subscriptions cache during mid-batch sync transitions.
+                let should_flush_tx_cache =
+                    (is_startup || is_resync || is_recover)
+                        && !inner.executor.has_in_progress_batch()
+                        && inner.pending_parallel_count == 0;
 
                 // We only need to replay the transactions in the edge cases where the event/tx cache needs repopulating.
                 // In all other cases, we can just accept the new storage and move on.
@@ -1673,13 +1679,26 @@ where
             return Err(AcceptTxError::SequencerOverloaded503);
         }
 
-        inner
+        // Allow accepting into an already-open batch even if node is temporarily syncing.
+        // This prevents mid-batch 503s when the DA node drifts but we can still finish the batch.
+        match inner
             .check_readiness(
                 inner.seq_config.max_concurrent_blobs,
                 inner.stop_at_rollup_height,
             )
             .await
-            .map_err(AcceptTxError::NotFullySynced)?;
+        {
+            Ok(()) => {}
+            Err(SequencerNotReadyDetails::Syncing { .. })
+                if inner.executor.has_in_progress_batch() =>
+            {
+                tracing::debug!(
+                    %tx_hash,
+                    "Node syncing but batch open; accepting tx into current batch"
+                );
+            }
+            Err(e) => return Err(AcceptTxError::NotFullySynced(e)),
+        }
 
         if let Err(batch_creation_error) = inner
             .try_to_create_and_start_batch_if_none_in_progress(false)
