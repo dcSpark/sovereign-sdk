@@ -57,6 +57,8 @@ pub struct RunnerConfig {
     pub proof_cache_dir: PathBuf,
     /// Skip local proof verification
     pub skip_verify: bool,
+    /// Maximum number of concurrent proof generations (default: num_cpus)
+    pub max_concurrent_proofs: usize,
 }
 
 impl Default for RunnerConfig {
@@ -68,6 +70,7 @@ impl Default for RunnerConfig {
             use_proof_cache: false,
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
+            max_concurrent_proofs: num_cpus::get(),
         }
     }
 }
@@ -89,6 +92,11 @@ impl RunnerConfig {
         }
         if let Ok(value) = std::env::var("SKIP_VERIFY") {
             cfg.skip_verify = value == "1" || value.to_lowercase() == "true";
+        }
+        if let Ok(value) = std::env::var("MAX_CONCURRENT_PROOFS") {
+            if let Ok(parsed) = value.parse() {
+                cfg.max_concurrent_proofs = parsed;
+            }
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
@@ -1281,11 +1289,19 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         None
     };
 
-    // Check cache and generate proofs in parallel
+    // Check cache and generate proofs in parallel (with concurrency limit)
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
     let depth_usize = TREE_DEPTH as usize;
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
     let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
+    
+    // Create semaphore to limit concurrent proof generation
+    let max_concurrent = config.max_concurrent_proofs;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    eprintln!(
+        "  [proof] limiting concurrent proof generation to {} tasks",
+        max_concurrent
+    );
     
     for (i, input) in dep_inputs.iter().enumerate() {
         // Try to load from cache first
@@ -1318,8 +1334,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
-        proof_tasks.push(tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(usize, Vec<u8>)> {
+        let sem = semaphore.clone();
+        proof_tasks.push(tokio::spawn(async move {
+            // Acquire semaphore permit to limit concurrency
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
                 eprintln!(
                     "  [proof] gen_proof idx={} account={} pos={} value={} sib_len={} anchor={}",
                     i,
@@ -1400,8 +1419,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 hex::encode(cm_out)
             );
                 Ok((account_idx, proof_data))
-            },
-        ));
+            }).await.expect("spawn_blocking join failed")
+        }));
     }
 
     // Await generated proofs and merge with cached proofs
