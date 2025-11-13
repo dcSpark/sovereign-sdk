@@ -397,6 +397,8 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
         let st = state.clone();
         let txh = model.tx_hash.clone();
         handles.push(tokio::spawn(async move {
+            // Add 1 ms delay before submission
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             let res = submit_worker_tx_to_sequencer(&st, &txh).await;
             (txh, res)
         }));

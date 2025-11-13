@@ -70,14 +70,14 @@ pub struct RunnerConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            num_deposits: 10,
+            num_deposits: 100,
             external_node_url: None,
             external_verifier_url: None,
             use_proof_cache: false,
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
             max_concurrent_proofs: num_cpus::get(),
-            defer_sequencer_submission: false,
+            defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
         }
     }
@@ -746,7 +746,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         if !status.is_success() {
             anyhow::bail!("flush endpoint returned {}: {}", status, body);
         }
-        eprintln!("[flush] result: {}", body);
+        eprintln!("[flush] Flushed queued worker transactions to sequencer");
         Ok(())
     }
 
@@ -1203,10 +1203,29 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .await
             .context("Failed to query tree state for proofs")?;
 
-        notes_resp = client
-            .query_rest_endpoint("/modules/midnight-privacy/notes?limit=10000")
-            .await
-            .context("Failed to query notes")?;
+        // Fetch all notes using pagination (API caps at 1000 per request)
+        let mut all_notes = Vec::new();
+        let batch_size = 1000;
+        let mut offset = 0;
+        
+        loop {
+            let batch_resp: NotesResp = client
+                .query_rest_endpoint(&format!("/modules/midnight-privacy/notes?limit={}&offset={}", batch_size, offset))
+                .await
+                .context("Failed to query notes batch")?;
+            
+            let batch_len = batch_resp.notes.len();
+            all_notes.extend(batch_resp.notes);
+            
+            // If we got fewer notes than requested, we've reached the end
+            if batch_len < batch_size {
+                break;
+            }
+            
+            offset += batch_size;
+        }
+        
+        notes_resp = NotesResp { notes: all_notes };
 
         eprintln!(
             "  [proof] Tree state: next_position={}, notes_count={}, root={}",
@@ -1961,36 +1980,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             batch_num, count, percentage, bar, gas_suffix, meta_suffix
         );
     }
-    if !deposit_gas_usage.is_empty() {
-        eprintln!("\n[deposit-gas] ===== Batch Gas Usage =====");
-        for batch_id in &deposit_batch_ids {
-            if let Some(gas) = deposit_gas_usage.get(batch_id) {
-                eprintln!("[deposit-gas]   Batch {:3}: {}", batch_id, format_gas(gas));
-            }
-        }
-        if let Some(total_gas) = sum_gas(deposit_gas_usage.values()) {
-            eprintln!("[deposit-gas]   Total: {}", format_gas(&total_gas));
-        }
-    }
-    let deposit_tps = if deposit_total_time.as_secs_f64() > 0.0 {
-        included_deposits as f64 / deposit_total_time.as_secs_f64()
-    } else {
-        0.0
-    };
-    eprintln!("[deposit-stats]");
-    eprintln!("[deposit-stats] ===== Performance Metrics =====");
-    eprintln!(
-        "[deposit-stats] Deposit inclusion time: {:.2}s",
-        deposit_total_time.as_secs_f64()
-    );
-    eprintln!(
-        "[deposit-stats] Average TPS (deposits): {:.2} tx/s",
-        deposit_tps
-    );
-    eprintln!("[deposit-stats] =====================================");
 
     // Print batch statistics
-    eprintln!("\n[batch-stats] ===== Batch Distribution =====");
+    eprintln!("\n[transfer-stats] ===== Batch Distribution =====");
     let mut sorted_batches: Vec<_> = batch_stats.iter().collect();
     sorted_batches.sort_by_key(|(batch_num, _)| *batch_num);
 
@@ -2029,11 +2021,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
 
-    eprintln!("[batch-stats] Total batches: {}", total_batches);
-    eprintln!("[batch-stats] Total transactions: {}", total_txs);
-    eprintln!("[batch-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
-    eprintln!("[batch-stats]");
-    eprintln!("[batch-stats] Distribution:");
+    eprintln!("[transfer-stats] Total batches: {}", total_batches);
+    eprintln!("[transfer-stats] Total transactions: {}", total_txs);
+    eprintln!("[transfer-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
+    eprintln!("[transfer-stats]");
+    eprintln!("[transfer-stats] Distribution:");
 
     for (batch_num, count) in &sorted_batches {
         let percentage = (**count as f64 / total_txs as f64) * 100.0;
@@ -2053,40 +2045,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .unwrap_or_default();
         let meta_suffix = format!("{}{}", exec_suffix, size_suffix);
         eprintln!(
-            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
+            "[transfer-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
             batch_num, count, percentage, bar, gas_suffix, meta_suffix
         );
     }
-
-    // if !batch_gas_usage.is_empty() {
-    //     eprintln!("\n[gas] ===== Batch Gas Usage =====");
-    //     for batch_id in &batch_ids {
-    //         if let Some(gas) = batch_gas_usage.get(batch_id) {
-    //             eprintln!("[gas]   Batch {:3}: {}", batch_id, format_gas(gas));
-    //         }
-    //     }
-    //     if let Some(total_gas) = sum_gas(batch_gas_usage.values()) {
-    //         eprintln!("[gas]   Total: {}", format_gas(&total_gas));
-    //     }
-    // } else {
-    //     eprintln!("\n[gas] (No batch gas data was returned; ensure the ledger endpoint exposes batch receipts.)");
-    // }
-
-    // Calculate TPS
-    let tps = if transfer_total_time.as_secs_f64() > 0.0 {
-        ok_transfers as f64 / transfer_total_time.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    eprintln!("[batch-stats]");
-    eprintln!("[batch-stats] ===== Performance Metrics =====");
-    eprintln!(
-        "[batch-stats] Transfer inclusion time: {:.2}s",
-        transfer_total_time.as_secs_f64()
-    );
-    eprintln!("[batch-stats] Average TPS (transfers): {:.2} tx/s", tps);
-    eprintln!("[batch-stats] =====================================\n");
 
     eprintln!("\n✅ TEST COMPLETE: E2E Privacy Pool with Multi-Account Parallelism");
     eprintln!("═══════════════════════════════════════════════════════════════");
@@ -2102,10 +2064,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "  Transfers: {} (one per account with nonce 1)",
         ok_transfers
     );
-    eprintln!("  ✓ Each account operates independently - no nonce conflicts!");
-    eprintln!("  ✓ Transfers can execute in parallel in the sequencer");
-    eprintln!("  ✓ All ZK proofs generated and verified successfully");
-    eprintln!("  ✓ All transactions confirmed on-chain with correct events");
     eprintln!("═══════════════════════════════════════════════════════════════\n");
 
     // Cleanup process
@@ -2228,35 +2186,6 @@ fn gas_from_array(value: &JsonValue) -> Result<DemoGas> {
         }
     }
     DemoGas::try_from(limbs).context("Failed to construct gas value")
-}
-
-fn add_gas(target: &mut DemoGas, value: &DemoGas) -> Result<()> {
-    *target = target
-        .checked_combine(value)
-        .ok_or_else(|| anyhow::anyhow!("Gas addition overflowed"))?;
-    Ok(())
-}
-
-fn zero_gas() -> DemoGas {
-    <DemoGas as GasArray>::ZEROED
-}
-
-fn sum_gas<'a, I>(iter: I) -> Option<DemoGas>
-where
-    I: Iterator<Item = &'a DemoGas>,
-{
-    let mut total = zero_gas();
-    let mut seen = false;
-    for gas in iter {
-        if add_gas(&mut total, gas).is_ok() {
-            seen = true;
-        }
-    }
-    if seen {
-        Some(total)
-    } else {
-        None
-    }
 }
 
 fn format_gas(gas: &DemoGas) -> String {
