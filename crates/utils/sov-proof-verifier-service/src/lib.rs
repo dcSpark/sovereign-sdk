@@ -76,6 +76,9 @@ pub struct ServiceConfig {
     pub chain_id: u64,
     /// Connection string for the shared MockDA database
     pub da_connection_string: String,
+    /// If true, do NOT submit to sequencer immediately; queue and wait for an explicit flush.
+    /// Useful for benchmarks to remove the worker bottleneck and release all txs at once.
+    pub defer_sequencer_submission: bool,
 }
 
 /// Shared application state
@@ -342,6 +345,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/value-setter-zk", post(verify_and_submit_handler))
         .route("/midnight-privacy", post(verify_and_record_midnight_handler))
+        .route("/midnight-privacy/flush", post(flush_pending_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
         // Remove default 2MB body limit and set 10MB for large Ligero proofs (~3.2MB each)
@@ -365,6 +369,78 @@ async fn health_check() -> impl IntoResponse {
         "status": "healthy",
         "service": "proof-verifier",
     }))
+}
+
+/// Flush all pending worker-verified transactions to the sequencer in parallel
+async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ServiceError> {
+    use worker_verified_transactions::{Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState};
+
+    // Fetch list of pending tx hashes
+    let pending = VerifiedEntity::find()
+        .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
+        .all(state.da_conn.as_ref())
+        .await
+        .map_err(|err| ServiceError::Internal(format!("Failed to list pending worker transactions: {err}")))?;
+
+    let total = pending.len();
+    if total == 0 {
+        return Ok(Json(serde_json::json!({
+            "flushed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "results": []
+        })));
+    }
+
+    let mut handles = Vec::with_capacity(total);
+    for model in pending {
+        let st = state.clone();
+        let txh = model.tx_hash.clone();
+        handles.push(tokio::spawn(async move {
+            let res = submit_worker_tx_to_sequencer(&st, &txh).await;
+            (txh, res)
+        }));
+    }
+
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut results = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok((txh, Ok(outcome))) => {
+                if outcome.accepted { accepted += 1; } else { rejected += 1; }
+                results.push(serde_json::json!({
+                    "tx_hash": txh,
+                    "accepted": outcome.accepted,
+                    "status": outcome.status_code,
+                    "response": outcome.response_json,
+                }));
+            }
+            Ok((txh, Err(err))) => {
+                rejected += 1;
+                results.push(serde_json::json!({
+                    "tx_hash": txh,
+                    "accepted": false,
+                    "error": format!("{}", err),
+                }));
+            }
+            Err(join_err) => {
+                rejected += 1;
+                results.push(serde_json::json!({
+                    "tx_hash": null,
+                    "accepted": false,
+                    "error": format!("join error: {}", join_err),
+                }));
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "flushed": total,
+        "accepted": accepted,
+        "rejected": rejected,
+        "results": results,
+    })))
 }
 
 /// Main handler for verify-and-submit endpoint
@@ -511,24 +587,37 @@ async fn verify_and_record_midnight_handler(
                 tx_hash
             );
 
-            let sequencer_start = std::time::Instant::now();
-            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
-            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
-            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            let error_message = if submission.accepted {
-                None
+            if state.config.defer_sequencer_submission {
+                // Do not submit now; queued in DB
+                metrics.node_submit_ms = 0.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: None,
+                    error: None,
+                    metrics,
+                }))
             } else {
-                Some(submission.log_message.clone())
-            };
+                let sequencer_start = std::time::Instant::now();
+                let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+                metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            Ok(Json(VerifyAndSubmitResponse {
-                success: submission.accepted,
-                tx_hash: Some(tx_hash),
-                sequencer_response: submission.response_json.clone(),
-                error: error_message,
-                metrics,
-            }))
+                let error_message = if submission.accepted {
+                    None
+                } else {
+                    Some(submission.log_message.clone())
+                };
+
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: submission.accepted,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: submission.response_json.clone(),
+                    error: error_message,
+                    metrics,
+                }))
+            }
         }
         ParsedMidnightCall::Transfer {
             proof,
@@ -587,24 +676,37 @@ async fn verify_and_record_midnight_handler(
                 tx_hash
             );
 
-            let sequencer_start = std::time::Instant::now();
-            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
-            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
-            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            let error_message = if submission.accepted {
-                None
+            if state.config.defer_sequencer_submission {
+                // Do not submit now; queued in DB
+                metrics.node_submit_ms = 0.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: None,
+                    error: None,
+                    metrics,
+                }))
             } else {
-                Some(submission.log_message.clone())
-            };
+                let sequencer_start = std::time::Instant::now();
+                let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+                metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            Ok(Json(VerifyAndSubmitResponse {
-                success: submission.accepted,
-                tx_hash: Some(tx_hash),
-                sequencer_response: submission.response_json.clone(),
-                error: error_message,
-                metrics,
-            }))
+                let error_message = if submission.accepted {
+                    None
+                } else {
+                    Some(submission.log_message.clone())
+                };
+
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: submission.accepted,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: submission.response_json.clone(),
+                    error: error_message,
+                    metrics,
+                }))
+            }
         }
         ParsedMidnightCall::Withdraw {
             proof,
@@ -666,24 +768,37 @@ async fn verify_and_record_midnight_handler(
                 tx_hash
             );
 
-            let sequencer_start = std::time::Instant::now();
-            let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
-            metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
-            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            let error_message = if submission.accepted {
-                None
+            if state.config.defer_sequencer_submission {
+                // Do not submit now; queued in DB
+                metrics.node_submit_ms = 0.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: None,
+                    error: None,
+                    metrics,
+                }))
             } else {
-                Some(submission.log_message.clone())
-            };
+                let sequencer_start = std::time::Instant::now();
+                let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
+                metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            Ok(Json(VerifyAndSubmitResponse {
-                success: submission.accepted,
-                tx_hash: Some(tx_hash),
-                sequencer_response: submission.response_json.clone(),
-                error: error_message,
-                metrics,
-            }))
+                let error_message = if submission.accepted {
+                    None
+                } else {
+                    Some(submission.log_message.clone())
+                };
+
+                Ok(Json(VerifyAndSubmitResponse {
+                    success: submission.accepted,
+                    tx_hash: Some(tx_hash),
+                    sequencer_response: submission.response_json.clone(),
+                    error: error_message,
+                    metrics,
+                }))
+            }
         }
     }
 }
