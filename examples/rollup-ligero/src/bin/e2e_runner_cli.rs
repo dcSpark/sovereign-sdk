@@ -24,6 +24,9 @@ struct Cli {
     /// Enable local proof verification (disabled by default)
     #[arg(long)]
     verify: bool,
+    /// Queue verifier submissions and flush to sequencer in batches (test mode)
+    #[arg(long)]
+    batch_submit: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -47,6 +50,9 @@ async fn main() -> Result<()> {
     }
     if cli.verify {
         config.skip_verify = false;
+    }
+    if cli.batch_submit {
+        config.defer_sequencer_submission = true;
     }
     run(config).await
 }

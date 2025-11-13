@@ -61,6 +61,8 @@ pub struct RunnerConfig {
     pub skip_verify: bool,
     /// Maximum number of concurrent proof generations (default: num_cpus)
     pub max_concurrent_proofs: usize,
+    /// If true, verifier will queue worker submissions and we will flush them in batches.
+    pub defer_sequencer_submission: bool,
 }
 
 impl Default for RunnerConfig {
@@ -73,6 +75,7 @@ impl Default for RunnerConfig {
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
             max_concurrent_proofs: num_cpus::get(),
+            defer_sequencer_submission: false,
         }
     }
 }
@@ -99,6 +102,13 @@ impl RunnerConfig {
             if let Ok(parsed) = value.parse() {
                 cfg.max_concurrent_proofs = parsed;
             }
+        }
+        // Allow enabling batch/queued submission mode via env
+        if let Ok(value) = std::env::var("DEFER_SEQUENCER_SUBMISSION")
+            .or_else(|_| std::env::var("E2E_VERIFIER_DEFER"))
+            .or_else(|_| std::env::var("VERIFIER_DEFER_SEQUENCER"))
+        {
+            cfg.defer_sequencer_submission = value == "1" || value.to_lowercase() == "true";
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
@@ -321,6 +331,7 @@ async fn start_local_verifier(
     method_id: [u8; 32],
     da_connection_string: &str,
     max_concurrent_verifications: usize,
+    defer_sequencer_submission: bool,
 ) -> Result<String> {
     use sov_rollup_interface::crypto::PrivateKey as _;
 
@@ -346,6 +357,7 @@ async fn start_local_verifier(
         max_concurrent_verifications,
         chain_id: 1,
         da_connection_string: da_connection_string.to_string(),
+        defer_sequencer_submission,
     };
     let state = AppState::new(verifier_cfg)
         .await
@@ -483,6 +495,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             method_id,
             &da_connection_string,
             verifier_parallelism,
+            config.defer_sequencer_submission,
         )
         .await?
     };
@@ -562,11 +575,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         .query_rest_endpoint("/modules/midnight-privacy/stats")
         .await
         .unwrap_or_default();
-
-    #[derive(serde::Serialize)]
-    struct Body<'a> {
-        body: &'a str,
-    }
 
     #[derive(Debug, Clone, serde::Deserialize)]
     struct VerifierMetrics {
@@ -712,6 +720,22 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
             return Ok((parsed, http_elapsed_ms));
         }
+    }
+
+    async fn flush_verifier_queue(http: &reqwest::Client, verifier_url: &str) -> anyhow::Result<()> {
+        eprintln!("[flush] Flushing queued worker transactions to sequencer...");
+        let resp = http
+            .post(format!("{}/midnight-privacy/flush", verifier_url))
+            .send()
+            .await
+            .context("flush request failed")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_else(|_| "".to_string());
+        if !status.is_success() {
+            anyhow::bail!("flush endpoint returned {}: {}", status, body);
+        }
+        eprintln!("[flush] result: {}", body);
+        Ok(())
     }
 
     fn extract_stf_execution_ms(value: &serde_json::Value) -> Option<f64> {
@@ -933,6 +957,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         );
         deposit_secrets.push((i, tx_hash_str.clone(), amount, rho, recipient));
         tx_hashes_hex.push(tx_hash_str);
+    }
+
+    // If we deferred sequencer submission in the verifier, flush deposits now
+    if config.defer_sequencer_submission {
+        eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
+        sleep(Duration::from_secs(5)).await;        
+        flush_verifier_queue(&http, &verifier_url).await?;
     }
 
     // Debug: fetch tx receipt for the last deposit and print
@@ -1755,6 +1786,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         transfer_hashes.len()
     );
     let _ = std::io::stderr().flush();
+
+    // If we deferred sequencer submission in the verifier, flush all transfers now in one burst
+    if config.defer_sequencer_submission {
+        eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
+        sleep(Duration::from_secs(5)).await;
+        flush_verifier_queue(&http, &verifier_url).await?;
+    }
 
     // Verify ledger inclusion for transfers
     let mut ok_transfers = 0usize;

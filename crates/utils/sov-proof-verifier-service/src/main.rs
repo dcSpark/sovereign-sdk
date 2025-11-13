@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,
         da_connection_string: args.da_db,
+        defer_sequencer_submission: false,
     };
 
     // Create application state (loads signing key at startup)
