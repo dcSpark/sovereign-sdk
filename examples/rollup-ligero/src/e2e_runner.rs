@@ -1,8 +1,10 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use crate::MockDemoRollup;
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
@@ -10,17 +12,17 @@ use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
 };
 use num_cpus;
+use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
-use sov_modules_api::gas::UnlimitedGasMeter;
+use sov_modules_api::gas::{GasArray, UnlimitedGasMeter};
 use sov_modules_api::transaction::Transaction;
-use sov_modules_api::PublicKey;
+use sov_modules_api::{PublicKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
-use crate::MockDemoRollup;
 
 // Proof verifier service (runs alongside the node)
 use sov_proof_verifier_service::{create_router, AppState, RollupSpec, ServiceConfig};
@@ -59,18 +61,24 @@ pub struct RunnerConfig {
     pub skip_verify: bool,
     /// Maximum number of concurrent proof generations (default: num_cpus)
     pub max_concurrent_proofs: usize,
+    /// If true, verifier will queue worker submissions and we will flush them in batches.
+    pub defer_sequencer_submission: bool,
+    /// Optional delay (ms) between submitting transfer requests to the verifier to avoid OS/socket overloads.
+    pub transfer_submit_delay_ms: u64,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            num_deposits: 10,
+            num_deposits: 100,
             external_node_url: None,
             external_verifier_url: None,
             use_proof_cache: false,
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
             max_concurrent_proofs: num_cpus::get(),
+            defer_sequencer_submission: true,
+            transfer_submit_delay_ms: 10,
         }
     }
 }
@@ -96,6 +104,20 @@ impl RunnerConfig {
         if let Ok(value) = std::env::var("MAX_CONCURRENT_PROOFS") {
             if let Ok(parsed) = value.parse() {
                 cfg.max_concurrent_proofs = parsed;
+            }
+        }
+        // Allow enabling batch/queued submission mode via env
+        if let Ok(value) = std::env::var("DEFER_SEQUENCER_SUBMISSION")
+            .or_else(|_| std::env::var("E2E_VERIFIER_DEFER"))
+            .or_else(|_| std::env::var("VERIFIER_DEFER_SEQUENCER"))
+        {
+            cfg.defer_sequencer_submission = value == "1" || value.to_lowercase() == "true";
+        }
+        if let Ok(value) = std::env::var("TRANSFER_SUBMIT_DELAY_MS")
+            .or_else(|_| std::env::var("E2E_TRANSFER_DELAY_MS"))
+        {
+            if let Ok(parsed) = value.parse() {
+                cfg.transfer_submit_delay_ms = parsed;
             }
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
@@ -128,7 +150,7 @@ fn find_binary() -> Result<String> {
             .to_string_lossy()
             .to_string()
     });
-    
+
     // Try release first (preferred for benchmarks), then debug
     let target_path = std::path::Path::new(&target_dir);
     for profile in &["release", "debug"] {
@@ -137,7 +159,7 @@ fn find_binary() -> Result<String> {
             return Ok(candidate.to_string_lossy().to_string());
         }
     }
-    
+
     anyhow::bail!(
         "sov-rollup-ligero binary not found in target/{{release,debug}}; \
          run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
@@ -319,6 +341,7 @@ async fn start_local_verifier(
     method_id: [u8; 32],
     da_connection_string: &str,
     max_concurrent_verifications: usize,
+    defer_sequencer_submission: bool,
 ) -> Result<String> {
     use sov_rollup_interface::crypto::PrivateKey as _;
 
@@ -344,6 +367,7 @@ async fn start_local_verifier(
         max_concurrent_verifications,
         chain_id: 1,
         da_connection_string: da_connection_string.to_string(),
+        defer_sequencer_submission,
     };
     let state = AppState::new(verifier_cfg)
         .await
@@ -481,6 +505,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             method_id,
             &da_connection_string,
             verifier_parallelism,
+            config.defer_sequencer_submission,
         )
         .await?
     };
@@ -493,26 +518,35 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "[setup] Loading {} pre-funded accounts from genesis",
         num_deposits
     );
-    
+
     // Load the generated keypairs file
     let keypairs_path = crate_dir
         .parent()
         .unwrap() // examples/
         .join("test-data/genesis/demo/mock/generated_keypairs.json");
-    
+
     if !keypairs_path.exists() {
         anyhow::bail!(
             "Generated keypairs file not found at {}. Please run: cargo run --bin generate-genesis-keys",
             keypairs_path.display()
         );
     }
-    
-    let keypairs_json = std::fs::read_to_string(&keypairs_path)
-        .with_context(|| format!("Failed to read keypairs file at {}", keypairs_path.display()))?;
-    
-    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = serde_json::from_str(&keypairs_json)
-        .with_context(|| format!("Failed to parse keypairs file at {}", keypairs_path.display()))?;
-    
+
+    let keypairs_json = std::fs::read_to_string(&keypairs_path).with_context(|| {
+        format!(
+            "Failed to read keypairs file at {}",
+            keypairs_path.display()
+        )
+    })?;
+
+    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        serde_json::from_str(&keypairs_json).with_context(|| {
+            format!(
+                "Failed to parse keypairs file at {}",
+                keypairs_path.display()
+            )
+        })?;
+
     if all_keypairs.len() < num_deposits {
         anyhow::bail!(
             "Not enough keypairs in genesis file. Need {}, but only {} available. Please regenerate with more accounts.",
@@ -520,10 +554,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             all_keypairs.len()
         );
     }
-    
+
     // Take the first num_deposits accounts
-    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = all_keypairs.into_iter().take(num_deposits).collect();
-    
+    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        all_keypairs.into_iter().take(num_deposits).collect();
+
     eprintln!(
         "\n✅✅✅ [setup] Loaded {} pre-funded accounts from genesis! ✅✅✅",
         accounts.len()
@@ -550,8 +585,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         .query_rest_endpoint("/modules/midnight-privacy/stats")
         .await
         .unwrap_or_default();
-
-    // No explicit request body struct; use inline JSON in requests.
 
     #[derive(Debug, Clone, serde::Deserialize)]
     struct VerifierMetrics {
@@ -678,9 +711,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             }
 
             // Normal JSON response
-            let parsed: VerifierSubmitResponse = serde_json::from_str(&text).with_context(|| {
-                format!("{} #{} invalid JSON: {}", label, idx, text)
-            })?;
+            let parsed: VerifierSubmitResponse = serde_json::from_str(&text)
+                .with_context(|| format!("{} #{} invalid JSON: {}", label, idx, text))?;
 
             // If sequencer reported Syncing through the verifier (success=false but error present), retry
             if !parsed.success {
@@ -698,6 +730,22 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
             return Ok((parsed, http_elapsed_ms));
         }
+    }
+
+    async fn flush_verifier_queue(http: &reqwest::Client, verifier_url: &str) -> anyhow::Result<()> {
+        eprintln!("[flush] Flushing queued worker transactions to sequencer...");
+        let resp = http
+            .post(format!("{}/midnight-privacy/flush", verifier_url))
+            .send()
+            .await
+            .context("flush request failed")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_else(|_| "".to_string());
+        if !status.is_success() {
+            anyhow::bail!("flush endpoint returned {}: {}", status, body);
+        }
+        eprintln!("[flush] Flushed queued worker transactions to sequencer");
+        Ok(())
     }
 
     fn extract_stf_execution_ms(value: &serde_json::Value) -> Option<f64> {
@@ -791,6 +839,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let mut deposit_http_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_node_submit_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_stf_execution_ms: Vec<f64> = Vec::with_capacity(num_deposits);
+    // Track per-tx execution time (micros) keyed by tx hash for per-batch aggregation
+    let mut deposit_exec_time_by_hash_micros: HashMap<String, u64> = HashMap::new();
     let mut transfer_stf_execution_ms: Vec<f64> = Vec::new();
     let mut transfer_http_timings: Vec<f64> = Vec::new();
     let mut transfer_node_submit_timings: Vec<f64> = Vec::new();
@@ -837,7 +887,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
         // Submit to the verifier service (preferred) with fallback to sequencer direct
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
-        // Submissions may hit temporary Syncing; use retry helper below.
         let mut submitted_via_verifier = false;
         match submit_to_verifier_with_sync_retry(&http, &verifier_url, &tx_b64, "deposit", i + 1)
             .await
@@ -862,6 +911,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 }
                 if let Some(ms) = stf_execution_ms {
                     deposit_stf_execution_ms.push(ms);
+                    if let Some(hx) = parsed.tx_hash.as_ref() {
+                        // store micros to match internal tracker units
+                        let micros = (ms * 1000.0) as u64;
+                        deposit_exec_time_by_hash_micros.insert(hx.clone(), micros);
+                    }
                 }
                 if has_seq_resp && stf_execution_ms.is_none() {
                     if let Some(resp) = parsed.sequencer_response.as_ref() {
@@ -915,6 +969,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         tx_hashes_hex.push(tx_hash_str);
     }
 
+    // If we deferred sequencer submission in the verifier, flush deposits now
+    if config.defer_sequencer_submission {
+        eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
+        sleep(Duration::from_secs(5)).await;        
+        flush_verifier_queue(&http, &verifier_url).await?;
+    }
+
     // Debug: fetch tx receipt for the last deposit and print
     let receipt_json = client
         .http_get(&format!("/sequencer/txs/{}", tx_hashes_hex.last().unwrap()))
@@ -925,7 +986,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Verify each tx is included in the ledger (i.e., appears in a slot/batch)
     // and count how many deposit txs were included.
     let mut included_deposits = 0usize;
-    use std::collections::HashMap;
+    let mut deposit_batch_stats: HashMap<u64, usize> = HashMap::new();
+    let mut deposit_hash_to_batch: HashMap<String, u64> = HashMap::new();
+    let deposit_start_time = std::time::Instant::now();
     let mut deposit_cm_by_hash: HashMap<String, [u8; 32]> = HashMap::new();
     for (deposit_idx, hash_hex) in tx_hashes_hex.iter().enumerate() {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1000,6 +1063,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         }
                     }
                     // Positive confirmation log for successful inclusion
+                    *deposit_batch_stats.entry(ltx.batch_number).or_insert(0) += 1;
                     eprintln!(
                         "[ok] included deposit tx={} batch_number={} tx_number={} events={}",
                         hash_hex,
@@ -1007,6 +1071,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         ltx.number,
                         ltx.events.len()
                     );
+                    deposit_hash_to_batch.insert(hash_hex.clone(), ltx.batch_number);
                     included_deposits += 1;
                     break;
                 }
@@ -1027,6 +1092,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         num_deposits,
         included_deposits
     );
+    let deposit_total_time = deposit_start_time.elapsed();
     eprintln!(
         "[ok] all deposits included: {}/{}",
         included_deposits, num_deposits
@@ -1134,10 +1200,29 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .await
             .context("Failed to query tree state for proofs")?;
 
-        notes_resp = client
-            .query_rest_endpoint("/modules/midnight-privacy/notes?limit=10000")
-            .await
-            .context("Failed to query notes")?;
+        // Fetch all notes using pagination (API caps at 1000 per request)
+        let mut all_notes = Vec::new();
+        let batch_size = 1000;
+        let mut offset = 0;
+        
+        loop {
+            let batch_resp: NotesResp = client
+                .query_rest_endpoint(&format!("/modules/midnight-privacy/notes?limit={}&offset={}", batch_size, offset))
+                .await
+                .context("Failed to query notes batch")?;
+            
+            let batch_len = batch_resp.notes.len();
+            all_notes.extend(batch_resp.notes);
+            
+            // If we got fewer notes than requested, we've reached the end
+            if batch_len < batch_size {
+                break;
+            }
+            
+            offset += batch_size;
+        }
+        
+        notes_resp = NotesResp { notes: all_notes };
 
         eprintln!(
             "  [proof] Tree state: next_position={}, notes_count={}, root={}",
@@ -1317,7 +1402,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let depth_usize = TREE_DEPTH as usize;
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
     let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
-    
+
     // Create semaphore to limit concurrent proof generation
     let max_concurrent = config.max_concurrent_proofs;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
@@ -1325,7 +1410,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "  [proof] limiting concurrent proof generation to {} tasks",
         max_concurrent
     );
-    
+
     for (i, input) in dep_inputs.iter().enumerate() {
         // Try to load from cache first
         if let Some(ref cache_dir) = cache_dir {
@@ -1442,7 +1527,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 hex::encode(cm_out)
             );
                 Ok((account_idx, proof_data))
-            }).await.expect("spawn_blocking join failed")
+            })
+            .await
+            .expect("spawn_blocking join failed")
         }));
     }
 
@@ -1451,7 +1538,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     for t in proof_tasks {
         generated_proofs.push(t.await??);
     }
-    
+
     eprintln!(
         "[ok] generated {} transfer proofs in parallel",
         generated_proofs.len()
@@ -1489,7 +1576,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
     proofs.extend(generated_proofs);
-    
+
     eprintln!(
         "[ok] using {} proofs total ({} from cache, {} newly generated)",
         proofs.len(),
@@ -1625,8 +1712,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     let _ = std::io::stderr().flush();
 
-    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<(usize, VerifierSubmitResponse, f64)>>>
-        = Vec::with_capacity(num_transfers);
+    let mut handles: Vec<
+        tokio::task::JoinHandle<anyhow::Result<(usize, VerifierSubmitResponse, f64)>>,
+    > = Vec::with_capacity(num_transfers);
     for (idx, body_b64) in transfer_txs_b64.into_iter().enumerate() {
         let http_cl = http.clone();
         let verifier_url_cl = verifier_url.clone();
@@ -1646,9 +1734,16 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .await?;
             Ok((idx, parsed, http_elapsed_ms))
         }));
+
+        // Throttle spawning to avoid exhausting socket buffers (e.g., macOS ENOBUFS os error 55)
+        if config.transfer_submit_delay_ms > 0 {
+            sleep(Duration::from_millis(config.transfer_submit_delay_ms)).await;
+        }
     }
 
     let mut transfer_hashes: Vec<String> = Vec::new();
+    // Track per-tx execution time (micros) keyed by tx hash for per-batch aggregation
+    let mut transfer_exec_time_by_hash_micros: HashMap<String, u64> = HashMap::new();
     for h in handles {
         let (idx, parsed, http_elapsed_ms) = h.await.expect("join transfer submit task")?;
         let display_idx = idx + 1;
@@ -1692,6 +1787,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 "  [transfers] transfer #{} accepted with hash: {}",
                 display_idx, hx
             );
+            if let Some(ms) = stf_execution_ms {
+                transfer_exec_time_by_hash_micros.insert(hx.clone(), (ms * 1000.0) as u64);
+            }
             transfer_hashes.push(hx);
         } else {
             anyhow::bail!(
@@ -1707,9 +1805,17 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     let _ = std::io::stderr().flush();
 
+    // If we deferred sequencer submission in the verifier, flush all transfers now in one burst
+    if config.defer_sequencer_submission {
+        eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
+        sleep(Duration::from_secs(5)).await;
+        flush_verifier_queue(&http, &verifier_url).await?;
+    }
+
     // Verify ledger inclusion for transfers
     let mut ok_transfers = 0usize;
     let mut batch_stats: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut transfer_hash_to_batch: HashMap<String, u64> = HashMap::new();
     let transfer_start_time = std::time::Instant::now();
     for hash_hex in &transfer_hashes {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1736,6 +1842,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         ltx.events.len()
                     );
                     *batch_stats.entry(ltx.batch_number).or_insert(0) += 1;
+                    transfer_hash_to_batch.insert(hash_hex.clone(), ltx.batch_number);
                     ok_transfers += 1;
                     break;
                 }
@@ -1788,11 +1895,94 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
     eprintln!("[timing] =================================");
 
+    // Deposit batch summary
+    eprintln!("\n[deposit-stats] ===== Batch Distribution =====");
+    let mut sorted_deposit_batches: Vec<_> = deposit_batch_stats.iter().collect();
+    sorted_deposit_batches.sort_by_key(|(batch_num, _)| *batch_num);
+    let deposit_total_batches = sorted_deposit_batches.len();
+    let deposit_total_txs: usize = sorted_deposit_batches
+        .iter()
+        .map(|(_, count)| **count)
+        .sum();
+    let deposit_avg_txs_per_batch = if deposit_total_batches > 0 {
+        deposit_total_txs as f64 / deposit_total_batches as f64
+    } else {
+        0.0
+    };
+    eprintln!("[deposit-stats] Total batches: {}", deposit_total_batches);
+    eprintln!("[deposit-stats] Total transactions: {}", deposit_total_txs);
+    eprintln!(
+        "[deposit-stats] Average txs/batch: {:.2}",
+        deposit_avg_txs_per_batch
+    );
+    eprintln!("[deposit-stats]");
+    eprintln!("[deposit-stats] Distribution:");
+    let deposit_batch_ids: BTreeSet<u64> = sorted_deposit_batches
+        .iter()
+        .map(|(batch, _)| **batch)
+        .collect();
+    let deposit_gas_usage = match collect_batch_gas_stats(&client, &deposit_batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[deposit-gas] Failed to collect gas statistics from ledger: {err:?}. Skipping gas summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Collect batch byte sizes
+    let deposit_batch_sizes = match collect_batch_sizes(&client, &deposit_batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[deposit-bytes] Failed to collect batch sizes from ledger: {err:?}. Skipping size summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Aggregate per-batch execution time from tx-level metrics we observed at submission
+    let mut deposit_batch_exec_micros: HashMap<u64, u64> = HashMap::new();
+    for (tx_hash, batch_id) in &deposit_hash_to_batch {
+        if let Some(micros) = deposit_exec_time_by_hash_micros.get(tx_hash) {
+            *deposit_batch_exec_micros.entry(*batch_id).or_insert(0) += *micros;
+        }
+    }
+    for (batch_num, count) in &sorted_deposit_batches {
+        let percentage = if deposit_total_txs > 0 {
+            (**count as f64 / deposit_total_txs as f64) * 100.0
+        } else {
+            0.0
+        };
+        let bar_length = if deposit_avg_txs_per_batch > 0.0 {
+            (**count as f64 / deposit_avg_txs_per_batch * 20.0) as usize
+        } else {
+            0
+        };
+        let bar = "█".repeat(bar_length.min(40));
+        let gas_suffix = deposit_gas_usage
+            .get(batch_num)
+            .map(|gas| format!(" gas={}", format_gas(gas)))
+            .unwrap_or_default();
+        let size_suffix = deposit_batch_sizes
+            .get(batch_num)
+            .map(|bytes| format!(" size={}B", bytes))
+            .unwrap_or_default();
+        let exec_suffix = deposit_batch_exec_micros
+            .get(batch_num)
+            .map(|micros| format!(" exec={:.3}ms", (*micros as f64) / 1000.0))
+            .unwrap_or_default();
+        let meta_suffix = format!("{}{}", exec_suffix, size_suffix);
+        eprintln!(
+            "[deposit-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
+            batch_num, count, percentage, bar, gas_suffix, meta_suffix
+        );
+    }
+
     // Print batch statistics
-    eprintln!("\n[batch-stats] ===== Batch Distribution =====");
+    eprintln!("\n[transfer-stats] ===== Batch Distribution =====");
     let mut sorted_batches: Vec<_> = batch_stats.iter().collect();
     sorted_batches.sort_by_key(|(batch_num, _)| *batch_num);
-    
+
     let total_batches = sorted_batches.len();
     let total_txs: usize = sorted_batches.iter().map(|(_, count)| **count).sum();
     let avg_txs_per_batch = if total_batches > 0 {
@@ -1800,38 +1990,62 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     } else {
         0.0
     };
-    
-    eprintln!("[batch-stats] Total batches: {}", total_batches);
-    eprintln!("[batch-stats] Total transactions: {}", total_txs);
-    eprintln!("[batch-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
-    eprintln!("[batch-stats]");
-    eprintln!("[batch-stats] Distribution:");
-    
+    let batch_ids: BTreeSet<u64> = sorted_batches.iter().map(|(batch, _)| **batch).collect();
+    let batch_gas_usage = match collect_batch_gas_stats(&client, &batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[gas] Failed to collect gas statistics from ledger: {err:?}. Skipping gas summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Collect batch sizes
+    let batch_sizes = match collect_batch_sizes(&client, &batch_ids).await {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "[bytes] Failed to collect batch sizes from ledger: {err:?}. Skipping size summary."
+            );
+            HashMap::new()
+        }
+    };
+    // Aggregate per-batch execution times from transfer submissions
+    let mut transfer_batch_exec_micros: HashMap<u64, u64> = HashMap::new();
+    for (tx_hash, batch_id) in &transfer_hash_to_batch {
+        if let Some(micros) = transfer_exec_time_by_hash_micros.get(tx_hash) {
+            *transfer_batch_exec_micros.entry(*batch_id).or_insert(0) += *micros;
+        }
+    }
+
+    eprintln!("[transfer-stats] Total batches: {}", total_batches);
+    eprintln!("[transfer-stats] Total transactions: {}", total_txs);
+    eprintln!("[transfer-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
+    eprintln!("[transfer-stats]");
+    eprintln!("[transfer-stats] Distribution:");
+
     for (batch_num, count) in &sorted_batches {
         let percentage = (**count as f64 / total_txs as f64) * 100.0;
         let bar_length = (**count as f64 / avg_txs_per_batch * 20.0) as usize;
         let bar = "█".repeat(bar_length.min(40));
+        let gas_suffix = batch_gas_usage
+            .get(batch_num)
+            .map(|gas| format!(" gas={}", format_gas(gas)))
+            .unwrap_or_default();
+        let size_suffix = batch_sizes
+            .get(batch_num)
+            .map(|bytes| format!(" size={}B", bytes))
+            .unwrap_or_default();
+        let exec_suffix = transfer_batch_exec_micros
+            .get(batch_num)
+            .map(|micros| format!(" exec={:.3}ms", (*micros as f64) / 1000.0))
+            .unwrap_or_default();
+        let meta_suffix = format!("{}{}", exec_suffix, size_suffix);
         eprintln!(
-            "[batch-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}",
-            batch_num, count, percentage, bar
+            "[transfer-stats]   Batch {:3}: {:3} txs ({:5.1}%) {}{}{}",
+            batch_num, count, percentage, bar, gas_suffix, meta_suffix
         );
     }
-    
-    // Calculate TPS
-    let tps = if transfer_total_time.as_secs_f64() > 0.0 {
-        ok_transfers as f64 / transfer_total_time.as_secs_f64()
-    } else {
-        0.0
-    };
-    
-    eprintln!("[batch-stats]");
-    eprintln!("[batch-stats] ===== Performance Metrics =====");
-    eprintln!(
-        "[batch-stats] Transfer inclusion time: {:.2}s",
-        transfer_total_time.as_secs_f64()
-    );
-    eprintln!("[batch-stats] Average TPS (transfers): {:.2} tx/s", tps);
-    eprintln!("[batch-stats] =====================================\n");
 
     eprintln!("\n✅ TEST COMPLETE: E2E Privacy Pool with Multi-Account Parallelism");
     eprintln!("═══════════════════════════════════════════════════════════════");
@@ -1847,14 +2061,131 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "  Transfers: {} (one per account with nonce 1)",
         ok_transfers
     );
-    eprintln!("  ✓ Each account operates independently - no nonce conflicts!");
-    eprintln!("  ✓ Transfers can execute in parallel in the sequencer");
-    eprintln!("  ✓ All ZK proofs generated and verified successfully");
-    eprintln!("  ✓ All transactions confirmed on-chain with correct events");
     eprintln!("═══════════════════════════════════════════════════════════════\n");
 
     // Cleanup process
     env.shutdown();
 
     Ok(())
+}
+
+type DemoGas = <DemoRollupSpec as Spec>::Gas;
+
+async fn collect_batch_gas_stats(
+    client: &NodeClient,
+    batch_ids: &BTreeSet<u64>,
+) -> Result<HashMap<u64, DemoGas>> {
+    let mut per_batch = HashMap::new();
+
+    for batch_id in batch_ids {
+        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
+        match client
+            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
+            .await
+        {
+            Ok(batch) => match decode_batch_gas(&batch.receipt) {
+                Ok(Some(gas)) => {
+                    per_batch.insert(*batch_id, gas);
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[gas] Batch {} did not expose gas data in its receipt payload",
+                        batch_id
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[gas] Failed to parse gas data for batch {}: {err:?}",
+                        batch_id
+                    );
+                }
+            },
+            Err(err) => {
+                eprintln!(
+                    "[gas] Failed to fetch batch {} from ledger: {err:?}",
+                    batch_id
+                );
+            }
+        }
+    }
+
+    Ok(per_batch)
+}
+
+fn decode_batch_gas(receipt: &api_types::AnyJsonValue) -> Result<Option<DemoGas>> {
+    let value = any_json_to_value(receipt);
+    if let Some(obj) = value.as_object() {
+        if let Some(gas_value) = obj.get("gas_used") {
+            return Ok(Some(gas_from_array(gas_value)?));
+        }
+    }
+    Ok(None)
+}
+
+// Compute serialized batch size as enforced by BatchSizeTracker:
+// size = 8 (sequence_number) + 1 (visible_slots_to_advance) + 4 (tx vec len)
+//      + sum_over_txs(4 (borsh vec elem overhead) + tx_body.len())
+async fn collect_batch_sizes(
+    client: &NodeClient,
+    batch_ids: &BTreeSet<u64>,
+) -> Result<HashMap<u64, usize>> {
+    let mut per_batch = HashMap::new();
+    for batch_id in batch_ids {
+        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
+        match client
+            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
+            .await
+        {
+            Ok(batch) => {
+                let mut total: usize = 8 + 1 + 4; // overhead
+                // Generated type exposes `txs` as a Vec; it may be empty when children are not included
+                for tx in &batch.txs {
+                    // borsh vec element overhead (4 bytes) + body bytes
+                    total += 4 + tx.body.len();
+                }
+                per_batch.insert(*batch_id, total);
+            }
+            Err(err) => {
+                eprintln!(
+                    "[bytes] Failed to fetch batch {} from ledger: {err:?}",
+                    batch_id
+                );
+            }
+        }
+    }
+    Ok(per_batch)
+}
+
+fn any_json_to_value(value: &api_types::AnyJsonValue) -> JsonValue {
+    match value {
+        api_types::AnyJsonValue::String(s) => JsonValue::String(s.clone()),
+        api_types::AnyJsonValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        api_types::AnyJsonValue::Boolean(b) => JsonValue::Bool(*b),
+        api_types::AnyJsonValue::Array(values) => JsonValue::Array(values.clone()),
+        api_types::AnyJsonValue::Object(map) => JsonValue::Object(map.clone()),
+    }
+}
+
+fn gas_from_array(value: &JsonValue) -> Result<DemoGas> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("gas_used must be an array"))?;
+    let mut limbs = Vec::with_capacity(array.len());
+    for item in array {
+        if let Some(num) = item.as_u64() {
+            limbs.push(num);
+        } else if let Some(text) = item.as_str() {
+            limbs.push(text.parse::<u64>().context("Failed to parse gas limb")?);
+        } else {
+            bail!("gas limb must be a number");
+        }
+    }
+    DemoGas::try_from(limbs).context("Failed to construct gas value")
+}
+
+fn format_gas(gas: &DemoGas) -> String {
+    let limbs: Vec<String> = gas.as_ref().iter().map(|v| v.to_string()).collect();
+    format!("[{}]", limbs.join(", "))
 }

@@ -63,7 +63,7 @@ fn generate_deterministic_keypair(index: usize) -> Result<PrivateKeyAndAddress<D
 }
 
 fn main() -> Result<()> {
-    let num_accounts = 1000;
+    let num_accounts = 5000;
     let balance_per_account = "10000000000000"; // 10 trillion (enough for many transactions)
     
     println!("Generating {} deterministic accounts...", num_accounts);

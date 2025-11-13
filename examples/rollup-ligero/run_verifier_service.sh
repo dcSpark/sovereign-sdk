@@ -67,8 +67,22 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
 # Optional: Skip verification for testing
 if [ -n "$SKIP_VERIFICATION" ]; then
     export LIGERO_SKIP_VERIFICATION=1
+fi
+if [ -n "$LIGERO_SKIP_VERIFICATION" ]; then
     echo "⚠️  LIGERO_SKIP_VERIFICATION is set - proofs will NOT be verified!"
     echo ""
+fi
+
+# Optional: Defer sequencer submission (queued mode)
+DEFER_FLAG=""
+if [ -n "$DEFER_SEQUENCER_SUBMISSION" ]; then
+    # Lowercase in a POSIX-compatible way (bash 3 compatible)
+    DSS_LC=$(printf "%s" "$DEFER_SEQUENCER_SUBMISSION" | tr '[:upper:]' '[:lower:]')
+    case "$DSS_LC" in
+        1|true|yes|on)
+            DEFER_FLAG="--defer-submission"
+            ;;
+    esac
 fi
 
 # Build the verifier service
@@ -93,5 +107,5 @@ exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
     --signing-key-path "$SIGNING_KEY_PATH" \
     --chain-id "$CHAIN_ID" \
     --log-level "$LOG_LEVEL" \
-    --max-concurrent "$MAX_CONCURRENT"
-
+    --max-concurrent "$MAX_CONCURRENT" \
+    $DEFER_FLAG
