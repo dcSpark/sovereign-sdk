@@ -48,6 +48,11 @@ struct Args {
     #[arg(long, default_value = "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc")]
     da_db: String,
 
+    /// When set, the service will queue worker-verified txs instead of immediately submitting
+    /// them to the sequencer. Use the /midnight-privacy/flush endpoint to release queued txs.
+    #[arg(long, default_value_t = false)]
+    defer_submission: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -65,6 +70,7 @@ async fn main() -> Result<()> {
     info!("Node RPC URL: {}", args.node_rpc_url);
     info!("Max concurrent verifications: {}", args.max_concurrent);
     info!("MockDA DB: {}", args.da_db);
+    info!("Defer submission: {}", args.defer_submission);
 
     // Parse optional method ID (will be auto-computed if not provided)
     let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
@@ -93,7 +99,7 @@ async fn main() -> Result<()> {
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,
         da_connection_string: args.da_db,
-        defer_sequencer_submission: false,
+        defer_sequencer_submission: args.defer_submission,
     };
 
     // Create application state (loads signing key at startup)

@@ -27,6 +27,9 @@ struct Cli {
     /// Queue verifier submissions and flush to sequencer in batches (test mode)
     #[arg(long)]
     batch_submit: bool,
+    /// Delay (ms) between transfer submissions to the verifier
+    #[arg(long)]
+    transfer_delay_ms: Option<u64>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -53,6 +56,9 @@ async fn main() -> Result<()> {
     }
     if cli.batch_submit {
         config.defer_sequencer_submission = true;
+    }
+    if let Some(ms) = cli.transfer_delay_ms {
+        config.transfer_submit_delay_ms = ms;
     }
     run(config).await
 }

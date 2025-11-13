@@ -63,6 +63,8 @@ pub struct RunnerConfig {
     pub max_concurrent_proofs: usize,
     /// If true, verifier will queue worker submissions and we will flush them in batches.
     pub defer_sequencer_submission: bool,
+    /// Optional delay (ms) between submitting transfer requests to the verifier to avoid OS/socket overloads.
+    pub transfer_submit_delay_ms: u64,
 }
 
 impl Default for RunnerConfig {
@@ -76,6 +78,7 @@ impl Default for RunnerConfig {
             skip_verify: true,
             max_concurrent_proofs: num_cpus::get(),
             defer_sequencer_submission: false,
+            transfer_submit_delay_ms: 10,
         }
     }
 }
@@ -109,6 +112,13 @@ impl RunnerConfig {
             .or_else(|_| std::env::var("VERIFIER_DEFER_SEQUENCER"))
         {
             cfg.defer_sequencer_submission = value == "1" || value.to_lowercase() == "true";
+        }
+        if let Ok(value) = std::env::var("TRANSFER_SUBMIT_DELAY_MS")
+            .or_else(|_| std::env::var("E2E_TRANSFER_DELAY_MS"))
+        {
+            if let Ok(parsed) = value.parse() {
+                cfg.transfer_submit_delay_ms = parsed;
+            }
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
@@ -1721,6 +1731,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 })?;
             Ok((idx, parsed, http_elapsed_ms))
         }));
+
+        // Throttle spawning to avoid exhausting socket buffers (e.g., macOS ENOBUFS os error 55)
+        if config.transfer_submit_delay_ms > 0 {
+            sleep(Duration::from_millis(config.transfer_submit_delay_ms)).await;
+        }
     }
 
     let mut transfer_hashes: Vec<String> = Vec::new();
