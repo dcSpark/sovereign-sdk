@@ -162,7 +162,30 @@ impl AppState {
         }
 
         let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
-        connect_opts.max_connections(20).sqlx_logging(false);
+        
+        // Optimize connection pool for SQLite (same as midnight-da layer)
+        // - Reduced max_connections for SQLite (single-writer limitation)
+        // - Added timeouts to prevent connection pool exhaustion
+        let max_connections = if config.da_connection_string.starts_with("sqlite:") {
+            10 // Conservative for SQLite with WAL mode
+        } else {
+            20 // PostgreSQL can handle more
+        };
+        
+        connect_opts
+            .max_connections(max_connections)
+            .min_connections(1)
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .max_lifetime(std::time::Duration::from_secs(1800))
+            .sqlx_logging(false);
+        
+        info!(
+            "Verifier service connecting to database with {} max connections",
+            max_connections
+        );
+        
         let da_conn = Database::connect(connect_opts).await.with_context(|| {
             format!(
                 "Failed to connect to MockDA database at {}",
