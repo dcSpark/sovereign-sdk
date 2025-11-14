@@ -39,6 +39,13 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
         .if_not_exists()
         .to_owned();
     db.execute(builder.build(&verified_tx_idx)).await?;
+    let verified_tx_state_idx: IndexCreateStatement = Index::create()
+        .name("idx-worker_verified_transactions-transaction_state")
+        .table(worker_verified_transactions::Entity)
+        .col(worker_verified_transactions::Column::TransactionState)
+        .if_not_exists()
+        .to_owned();
+    db.execute(builder.build(&verified_tx_state_idx)).await?;
     if let DbBackend::Sqlite = db.get_database_backend() {
         // Enable WAL mode for better concurrency
         db.execute(sea_orm::Statement::from_string(

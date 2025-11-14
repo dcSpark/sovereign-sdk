@@ -1268,16 +1268,33 @@ where
     }
 
     pub(crate) async fn start(mut self) -> JoinHandle<()> {
+        // Clone the global shutdown receiver so we can terminate even if
+        // some senders to `message_receiver` stay alive.
+        let mut shutdown_rx = self.inner.shutdown_receiver.clone();
         tokio::spawn(async move {
-            while let Some(msg) = self.message_receiver.recv().await {
-                if let Err(e) = self.handle_next_message(msg).await {
-                    match e {
-                        SequencerStateUpdatorError::Shutdown => {
+            loop {
+                tokio::select! {
+                    // Global shutdown: exit the message loop even if the channel is still open.
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!("SynchronizedSequencerState: Global shutdown signal received, exiting message loop");
+                        return;
+                    }
+                    maybe_msg = self.message_receiver.recv() => {
+                        let Some(msg) = maybe_msg else {
+                            tracing::info!("SynchronizedSequencerState: Message channel closed, exiting");
                             return;
-                        }
-                        SequencerStateUpdatorError::Unexpected => {
-                            self.inner.shutdown_sender.send(()).unwrap();
-                            panic!("The sequencer experienced an unexpected error and cannot accept transactions! See logs for more details.");
+                        };
+
+                        if let Err(e) = self.handle_next_message(msg).await {
+                            match e {
+                                SequencerStateUpdatorError::Shutdown => {
+                                    return;
+                                }
+                                SequencerStateUpdatorError::Unexpected => {
+                                    self.inner.shutdown_sender.send(()).unwrap();
+                                    panic!("The sequencer experienced an unexpected error and cannot accept transactions! See logs for more details.");
+                                }
+                            }
                         }
                     }
                 }
