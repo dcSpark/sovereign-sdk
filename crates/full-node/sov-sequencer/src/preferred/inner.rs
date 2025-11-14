@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::preferred::block_executor::StartBlockData;
 use crate::preferred::cache_warm_up_executor::{CacheWarmUpExecutor, StartBlockNotification};
+use crate::preferred::parallel_tx_executor::{ParallelTxExecutor, ParallelizedResponse};
 use crate::preferred::RollupBlockExecutorConfig;
 use anyhow::anyhow;
 use sov_blob_sender::BlobInternalId;
@@ -20,6 +21,7 @@ use sov_state::{NativeStorage, Storage};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use std::collections::HashMap;
 
 use super::batch_size_tracker::BatchSizeTracker;
 use crate::metrics::{
@@ -42,16 +44,20 @@ use crate::preferred::{
 };
 use crate::{SequencerConfig, SequencerNotReadyDetails, SlotNumber, TxHash};
 
+use borsh::BorshDeserialize;
+use sov_modules_api::transaction::Transaction;
+use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
+use sov_modules_api::capabilities::TransactionAuthenticator;
+
 /// These two constants are used to calculate the comfortable batch size limit.
 /// Currently, this is 99% of the hard limit. After the comfortable limit is reached,
 /// the sequencer will close and publish the current batch.
 const COMFORTABLE_SIZE_LIMIT_MULTIPLIER: u64 = 99;
 const COMFORTABLE_SIZE_LIMIT_DIVISOR: u64 = 100;
 
-/// These two constants are used to calculate the comfortable gas limit.
-/// Currently, this is 95% of the initial gas limit. After the comfortable limit is reached,
-/// the sequencer will close and publish the current batch.
-const COMFORTABLE_GAS_LIMIT_MULTIPLIER: u64 = 19;
+/// These two constants are used to calculate the remaining-gas threshold to close a batch.
+/// We close when roughly 5% of the initial gas remains (i.e., ~95% used).
+const COMFORTABLE_GAS_LIMIT_MULTIPLIER: u64 = 1;
 const COMFORTABLE_GAS_LIMIT_DIVISOR: u64 = 20;
 
 const METRICS_BATCH_SIZE: usize = 32;
@@ -97,6 +103,10 @@ where
     rollup_exec_config: RollupBlockExecutorConfig<S>,
     tx_cache_writer: TxResultWriter<S, Rt>,
     cache_warm_up_executor: CacheWarmUpExecutor<S>,
+    parallel_tx_executor: ParallelTxExecutor<S, Rt>,
+    // Parallel in-flight tracking and HTTP waiters
+    pending_parallel_count: usize,
+    pending_http_waiters: HashMap<TxHash, oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>>,
 }
 
 // We submit metrics when this guard is dropped.
@@ -298,6 +308,9 @@ where
         };
 
         self.cache_warm_up_executor
+            .send_batch_start_notification(notification.clone());
+
+        self.parallel_tx_executor
             .send_batch_start_notification(notification);
 
         self.executor_events_sender
@@ -512,9 +525,17 @@ where
 
     /// Closes the current batch if it is nearly full (by gas limit) or has reached the target batch execution time.
     async fn close_batch_if_nearly_full(&mut self, remaining_slot_gas: &<S as GasSpec>::Gas) {
-        // Check if we're close to the gas limit and close the batch if we are.
-        let mut comfortable_gas_limit = <S as GasSpec>::initial_gas_limit();
-        comfortable_gas_limit
+        // Keep the batch open while parallel txs are in-flight
+        if self.pending_parallel_count > 0 {
+            tracing::trace!(
+                pending = %self.pending_parallel_count,
+                "Deferring batch close due to pending parallel txs"
+            );
+            return;
+        }
+        // Check if remaining gas is below the threshold and close the batch if it is.
+        let mut close_when_remaining = <S as GasSpec>::initial_gas_limit();
+        close_when_remaining
             .scalar_division(COMFORTABLE_GAS_LIMIT_DIVISOR)
             .checked_scalar_product(COMFORTABLE_GAS_LIMIT_MULTIPLIER)
             .unwrap_or_else(|| {
@@ -522,9 +543,20 @@ where
                     "Cannot overflow after dividing by {COMFORTABLE_GAS_LIMIT_DIVISOR} and multiplying by {COMFORTABLE_GAS_LIMIT_MULTIPLIER}",
                 )
             });
-        let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&comfortable_gas_limit);
+        // Temporary debug to observe gas threshold behavior during load
+        eprintln!(
+            "[GAS CHECK] gas-based close check: remaining_slot_gas={:?} close_when_remaining={:?}",
+            remaining_slot_gas,
+            close_when_remaining
+        );
+        let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&close_when_remaining);
         if close_to_gas_limit {
-            tracing::debug!(%comfortable_gas_limit, %remaining_slot_gas, "Closing and publishing current batch because we're close to the gas limit");
+            tracing::debug!(close_when_remaining = %close_when_remaining, %remaining_slot_gas, "Closing and publishing current batch because remaining gas is below threshold");
+            eprintln!(
+                "[BATCH CLOSE] reason=gas remaining_slot_gas={:?} threshold={:?}",
+                remaining_slot_gas,
+                close_when_remaining
+            );
             self.close_current_batch().await;
         }
 
@@ -533,6 +565,11 @@ where
 
         if current_batch_execution_time_micros > self.batch_execution_time_limit_micros {
             tracing::debug!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Closing and publishing current batch because we've reached the batch execution time cap");
+            eprintln!(
+                "[BATCH CLOSE] reason=time current_us={} limit_us={}",
+                current_batch_execution_time_micros,
+                self.batch_execution_time_limit_micros
+            );
             self.close_current_batch().await;
         } else {
             tracing::trace!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Batch execution time is within comfortable range, not closing batch");
@@ -548,6 +585,11 @@ where
             });
         if (self.batch_size_tracker.current_batch_size as u64) > comfortable_size_limit {
             tracing::debug!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Closing and publishing current batch because we're close to the size limit");
+            eprintln!(
+                "[BATCH CLOSE] reason=size current_bytes={} limit_bytes={}",
+                self.batch_size_tracker.current_batch_size,
+                comfortable_size_limit
+            );
             self.close_current_batch().await;
         } else {
             tracing::trace!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Batch size is within comfortable range, not closing batch");
@@ -596,7 +638,15 @@ where
             return;
         }
 
-        self.close_current_batch().await;
+        // Do not close if parallel txs are pending
+        if self.pending_parallel_count == 0 {
+            self.close_current_batch().await;
+        } else {
+            tracing::trace!(
+                pending = %self.pending_parallel_count,
+                "Skipping auto close; parallel txs pending"
+            );
+        }
     }
 
     /// Closes the current batch.
@@ -719,7 +769,7 @@ where
     }
 }
 
-enum Message<S: Spec, Rt: Runtime<S>> {
+pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
     NextSequenceNumber {
         resp: oneshot::Sender<SequenceNumber>,
         reason: &'static str,
@@ -802,6 +852,16 @@ enum Message<S: Spec, Rt: Runtime<S>> {
     SimpleStateUpdate {
         info: StateUpdateInfo<S::Storage>,
     },
+    ParallelTxCompleted {
+        parallel_response: ParallelizedResponse<S>,
+        sequence_number: SequenceNumber,
+        tx_len: usize,
+        reason: &'static str,
+    },
+    ParallelTxFailed {
+        tx_hash: TxHash,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -842,6 +902,7 @@ pub(crate) fn create<S, Rt>(
     rollup_exec_config: RollupBlockExecutorConfig<S>,
     tx_cache_writer: TxResultWriter<S, Rt>,
     cache_warm_up_executor: CacheWarmUpExecutor<S>,
+    parallel_tx_executor: ParallelTxExecutor<S, Rt>,
 ) -> (
     SynchronizedSequencerState<S, Rt>,
     SequencerStateUpdator<S, Rt>,
@@ -883,6 +944,9 @@ where
         rollup_exec_config,
         tx_cache_writer,
         cache_warm_up_executor,
+        parallel_tx_executor,
+        pending_parallel_count: 0,
+        pending_http_waiters: HashMap::new(),
     };
 
     let channel_size = Arc::new(AtomicU32::new(0));
@@ -891,6 +955,7 @@ where
             inner,
             channel_size: channel_size.clone(),
             message_receiver,
+            message_sender: message_sender.clone(),
         },
         SequencerStateUpdator {
             message_sender,
@@ -1192,6 +1257,7 @@ where
     inner: Inner<S, Rt>,
     channel_size: Arc<AtomicU32>,
     message_receiver: mpsc::Receiver<Message<S, Rt>>,
+    message_sender: mpsc::Sender<Message<S, Rt>>,
 }
 
 impl<S, Rt> SynchronizedSequencerState<S, Rt>
@@ -1206,16 +1272,33 @@ where
     }
 
     pub(crate) async fn start(mut self) -> JoinHandle<()> {
+        // Clone the global shutdown receiver so we can terminate even if
+        // some senders to `message_receiver` stay alive.
+        let mut shutdown_rx = self.inner.shutdown_receiver.clone();
         tokio::spawn(async move {
-            while let Some(msg) = self.message_receiver.recv().await {
-                if let Err(e) = self.handle_next_message(msg).await {
-                    match e {
-                        SequencerStateUpdatorError::Shutdown => {
+            loop {
+                tokio::select! {
+                    // Global shutdown: exit the message loop even if the channel is still open.
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!("SynchronizedSequencerState: Global shutdown signal received, exiting message loop");
+                        return;
+                    }
+                    maybe_msg = self.message_receiver.recv() => {
+                        let Some(msg) = maybe_msg else {
+                            tracing::info!("SynchronizedSequencerState: Message channel closed, exiting");
                             return;
-                        }
-                        SequencerStateUpdatorError::Unexpected => {
-                            self.inner.shutdown_sender.send(()).unwrap();
-                            panic!("The sequencer experienced an unexpected error and cannot accept transactions! See logs for more details.");
+                        };
+
+                        if let Err(e) = self.handle_next_message(msg).await {
+                            match e {
+                                SequencerStateUpdatorError::Shutdown => {
+                                    return;
+                                }
+                                SequencerStateUpdatorError::Unexpected => {
+                                    self.inner.shutdown_sender.send(()).unwrap();
+                                    panic!("The sequencer experienced an unexpected error and cannot accept transactions! See logs for more details.");
+                                }
+                            }
                         }
                     }
                 }
@@ -1282,6 +1365,7 @@ where
                 original_tx_queue_id,
                 reason,
             } => {
+                let start = std::time::Instant::now();
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1294,6 +1378,8 @@ where
                 }
 
                 self.send_response(resp, ret, "accept_tx").await;
+                let elapsed = start.elapsed();
+                eprintln!("[ACCEPT TX] AcceptTx message processing took {:?}", elapsed);
             }
             Message::LatestSlotNumber { resp, reason } => {
                 let ret = self.process_latest_slot_number(reason).await;
@@ -1368,6 +1454,33 @@ where
             }
             Message::SimpleStateUpdate { info } => {
                 self.process_new_storage(info).await;
+            }
+            Message::ParallelTxCompleted {
+                parallel_response,
+                sequence_number,
+                tx_len,
+                reason,
+            } => {
+                let start = std::time::Instant::now();
+                self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
+                    .await;
+                let elapsed = start.elapsed();
+                eprintln!("[PARALLEL TX COMPLETED] ParallelTxCompleted message processing took {:?}", elapsed);
+            }
+            Message::ParallelTxFailed { tx_hash, reason } => {
+                // Best-effort cleanup of HTTP waiter and parallel count so the caller doesn't hang forever.
+                let mut inner = self.get_inner_with_timing(reason).await;
+                tracing::warn!(
+                    %tx_hash,
+                    "Parallel worker reported failure; cleaning up pending waiter"
+                );
+                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+                    // Dropping the sender will cause the HTTP-side oneshot to error, surfacing as a 500.
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
             }
         }
 
@@ -1536,7 +1649,13 @@ where
                 PreferredSeqOperation::WaitForNodeResyncToTip
             }
             (false, false, false, _, _) => {
-                let should_flush_tx_cache = is_startup || is_resync || is_recover;
+                // Only flush the tx cache when not actively producing a batch or holding
+                // pending parallel completions, to avoid reordering panics in the
+                // transaction_subscriptions cache during mid-batch sync transitions.
+                let should_flush_tx_cache =
+                    (is_startup || is_resync || is_recover)
+                        && !inner.executor.has_in_progress_batch()
+                        && inner.pending_parallel_count == 0;
 
                 // We only need to replay the transactions in the edge cases where the event/tx cache needs repopulating.
                 // In all other cases, we can just accept the new storage and move on.
@@ -1606,6 +1725,11 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+        let fn_start_time = std::time::Instant::now();
+        
+        // Clone message_sender before getting the inner guard to avoid borrow conflicts
+        let message_sender = self.message_sender.clone();
+        
         let mut inner = self.get_inner_with_timing(reason).await;
 
         // If the sequencer had to give out 503s at any point during the time we were waiting for the lock, we need to return a 503 - otherwise
@@ -1616,13 +1740,26 @@ where
             return Err(AcceptTxError::SequencerOverloaded503);
         }
 
-        inner
+        // Allow accepting into an already-open batch even if node is temporarily syncing.
+        // This prevents mid-batch 503s when the DA node drifts but we can still finish the batch.
+        match inner
             .check_readiness(
                 inner.seq_config.max_concurrent_blobs,
                 inner.stop_at_rollup_height,
             )
             .await
-            .map_err(AcceptTxError::NotFullySynced)?;
+        {
+            Ok(()) => {}
+            Err(SequencerNotReadyDetails::Syncing { .. })
+                if inner.executor.has_in_progress_batch() =>
+            {
+                tracing::debug!(
+                    %tx_hash,
+                    "Node syncing but batch open; accepting tx into current batch"
+                );
+            }
+            Err(e) => return Err(AcceptTxError::NotFullySynced(e)),
+        }
 
         if let Err(batch_creation_error) = inner
             .try_to_create_and_start_batch_if_none_in_progress(false)
@@ -1657,6 +1794,7 @@ where
             batch_size_tracker,
             executor_events_sender,
             cache_warm_up_executor,
+            parallel_tx_executor,
             ..
         } = &mut *inner;
 
@@ -1668,6 +1806,74 @@ where
             });
         }
 
+        // Try parallel processing for midnight privacy module transactions
+        // baked_tx.data contains an authenticator wrapper; unwrap it to get the RawTx first
+        let detection_start = std::time::Instant::now();
+        let is_midnight_privacy_tx = {
+            // Preferred: use the runtime's authenticator to decode and wrap the call
+            if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
+                let runtime_call = Rt::wrap_call(decoded);
+                let debug_str = format!("{:?}", runtime_call);
+                let variant_name = debug_str.split('(').next().unwrap_or("");
+                eprintln!("Runtime call variant: {}", variant_name);
+                variant_name == "MidnightPrivacy"
+            } else {
+                // Fallback: try generic AuthenticatorInput and parse the RawTx directly
+                match AuthenticatorInput::try_from_slice(&baked_tx.data) {
+                    Ok(auth_input) => {
+                        let raw = match auth_input {
+                            AuthenticatorInput::Standard(raw_tx) => raw_tx.data,
+                            AuthenticatorInput::PreAuthenticated(raw_tx, _) => raw_tx.data,
+                        };
+                        match Transaction::<Rt, S>::try_from_slice(raw.as_slice()) {
+                            Ok(tx) => {
+                                let runtime_call = tx.runtime_call();
+                                let debug_str = format!("{:?}", runtime_call);
+                                let variant_name = debug_str.split('(').next().unwrap_or("");
+                                eprintln!("Runtime call variant: {}", variant_name);
+                                variant_name == "MidnightPrivacy"
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to deserialize Transaction from RawTx (fallback): {:?}", e);
+                                false
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[detect] Failed to parse authenticator input in fallback: {:?}", err);
+                        false
+                    }
+                }
+            }
+        };
+        let detection_elapsed = detection_start.elapsed();
+        
+        eprintln!("Is midnight privacy tx: {} (detection took {:?})", is_midnight_privacy_tx, detection_elapsed);
+        
+        if is_midnight_privacy_tx {
+            // Send to parallel executor - worker will send result directly to message loop
+            if parallel_tx_executor.send_tx(
+                baked_tx.clone(),
+                tx_hash,
+                original_tx_queue_id,
+                sequence_number,
+                tx_len,
+                message_sender,
+            ) {
+                eprintln!("[PARALLEL] Transaction sent to parallel executor: {}", tx_hash);
+
+                // Register an HTTP waiter and keep the batch open while in-flight
+                inner.pending_parallel_count += 1;
+                let (http_tx, http_rx) = oneshot::channel();
+                inner.pending_http_waiters.insert(tx_hash, http_tx);
+                return Ok(http_rx);
+            } else {
+                eprintln!("[PARALLEL] Failed to send to parallel executor for {}, falling back to sequential", tx_hash);
+                // Fall through to sequential processing
+            }
+        }
+
+        // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
         let baked_tx = cache_warm_up_executor.send_tx(baked_tx.clone());
         let apply_tx_res = executor.apply_tx_to_in_progress_batch(baked_tx).await;
 
@@ -1705,6 +1911,125 @@ where
     async fn process_latest_slot_number(&mut self, reason: &'static str) -> SlotNumber {
         let inner = self.get_inner_with_timing(reason).await;
         inner.latest_info.slot_number
+    }
+
+    async fn process_parallel_tx_completed(
+        &mut self,
+        parallel_response: ParallelizedResponse<S>,
+        sequence_number: SequenceNumber,
+        tx_len: usize,
+        reason: &'static str,
+    ) {
+        let fn_start = std::time::Instant::now();
+        let mut inner = self.get_inner_with_timing(reason).await;
+
+        // If no batch is in progress, drop and fail any waiter
+        if !inner.executor.has_in_progress_batch() {
+            tracing::warn!(
+                tx_hash = %parallel_response.tx_hash,
+                "No in-progress batch when handling ParallelTxCompleted; dropping"
+            );
+            if let Some(waiter) = inner
+                .pending_http_waiters
+                .remove(&parallel_response.tx_hash)
+            {
+                tracing::warn!(
+                    tx_hash = %parallel_response.tx_hash,
+                    "Dropping waiter due to missing batch"
+                );
+                drop(waiter);
+            }
+            if inner.pending_parallel_count > 0 {
+                inner.pending_parallel_count -= 1;
+            }
+            eprintln!("[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (early return - no batch)", fn_start.elapsed().as_secs_f64() * 1000.0);
+            return;
+        }
+
+        let ParallelizedResponse { tx_hash, receipt, tx_changes, .. } = parallel_response;
+
+        // Rebuild the tx body from the worker’s receipt and commit via background task.
+        let tx = FullyBakedTx {
+            data: receipt
+                .body_to_save
+                .clone()
+                .expect("Transaction receipts must contain bodies with sov-modules-stf-blueprint"),
+        };
+
+        let commit_start = std::time::Instant::now();
+        let (accepted_with_budget_main, tx_changes_main) = match inner
+            .executor
+            .accept_precomputed_tx(tx, tx_changes)
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::debug!(%tx_hash, %err, "Main executor failed to commit precomputed tx; dropping");
+                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
+                eprintln!(
+                    "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (error in accept_precomputed_tx)",
+                    fn_start.elapsed().as_secs_f64() * 1000.0
+                );
+                return;
+            }
+        };
+        let commit_time = commit_start.elapsed();
+
+        // Update batch metrics and publish
+        let batch_metrics_start = std::time::Instant::now();
+        inner
+            .batch_size_tracker
+            .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+        let batch_metrics_time = batch_metrics_start.elapsed();
+
+        let send_accept_start = std::time::Instant::now();
+        let rx = inner
+            .executor_events_sender
+            .send_accept_tx(
+                accepted_with_budget_main.accepted_tx.clone(),
+                tx_changes_main,
+                sequence_number,
+            )
+            .await;
+        let send_accept_time = send_accept_start.elapsed();
+
+        // Bridge to HTTP waiter without blocking the message loop
+        let waiter_bridge_start = std::time::Instant::now();
+        if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+            tokio::spawn(async move {
+                if let Ok(accepted) = rx.await {
+                    let _ = waiter.send(accepted);
+                }
+            });
+        }
+        let waiter_bridge_time = waiter_bridge_start.elapsed();
+
+        // Decrement before attempting to close; the closer early-returns when pending > 0
+        if inner.pending_parallel_count > 0 {
+            inner.pending_parallel_count -= 1;
+        }
+
+        let close_batch_start = std::time::Instant::now();
+        inner
+            .close_batch_if_nearly_full(&accepted_with_budget_main.remaining_slot_gas)
+            .await;
+        let close_batch_time = close_batch_start.elapsed();
+
+        let total_time = fn_start.elapsed();
+        eprintln!(
+            "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms | accept_precomputed_tx={:.3}ms | send_accept_tx={:.3}ms | close_batch_if_nearly_full={:.3}ms | batch_metrics={:.3}ms | waiter_bridge={:.3}ms",
+            total_time.as_secs_f64() * 1000.0,
+            commit_time.as_secs_f64() * 1000.0,
+            send_accept_time.as_secs_f64() * 1000.0,
+            close_batch_time.as_secs_f64() * 1000.0,
+            batch_metrics_time.as_secs_f64() * 1000.0,
+            waiter_bridge_time.as_secs_f64() * 1000.0
+        );
     }
 
     async fn process_new_storage(&mut self, info: StateUpdateInfo<S::Storage>) {

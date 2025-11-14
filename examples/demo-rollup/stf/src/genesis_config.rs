@@ -5,7 +5,7 @@
 use std::convert::AsRef;
 use std::path::{Path, PathBuf};
 
-pub use midnight_privacy::ValueSetterZkConfig as MidnightPrivacyConfig;
+pub use midnight_privacy::MidnightPrivacyConfig as MidnightPrivacyConfig;
 use serde::de::DeserializeOwned;
 pub use sov_accounts::{AccountConfig, AccountData};
 use sov_address::{EthereumAddress, FromVmAddress};

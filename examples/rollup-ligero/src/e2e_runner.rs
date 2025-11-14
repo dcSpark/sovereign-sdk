@@ -1724,30 +1724,14 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 "  [transfers] submitting transfer #{} to verifier...",
                 display_idx
             );
-            let submit_start = std::time::Instant::now();
-            let resp = http_cl
-                .post(format!("{}/midnight-privacy", verifier_url_cl))
-                .json(&serde_json::json!({"body": body_b64}))
-                .send()
-                .await
-                .with_context(|| format!("transfer #{} request failed", display_idx))?;
-            let http_elapsed_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
-            let status = resp.status();
-            let body_text = resp.text().await.with_context(|| {
-                format!("transfer #{} failed to read response body", display_idx)
-            })?;
-            if !status.is_success() {
-                anyhow::bail!(
-                    "transfer #{} verifier returned status {}: {}",
-                    display_idx,
-                    status,
-                    body_text
-                );
-            }
-            let parsed: VerifierSubmitResponse =
-                serde_json::from_str(&body_text).with_context(|| {
-                    format!("transfer #{} invalid JSON: {}", display_idx, body_text)
-                })?;
+            let (parsed, http_elapsed_ms) = submit_to_verifier_with_sync_retry(
+                &http_cl,
+                &verifier_url_cl,
+                &body_b64,
+                "transfer",
+                display_idx,
+            )
+            .await?;
             Ok((idx, parsed, http_elapsed_ms))
         }));
 

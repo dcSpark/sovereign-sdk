@@ -112,6 +112,11 @@ struct NotesResp {
     notes: Vec<NoteInfo>,
 }
 
+#[derive(Deserialize, Clone)]
+struct RootsResp {
+    recent_roots: Vec<Hash32>,
+}
+
 #[derive(Clone, Debug)]
 struct CycleSummary {
     num_transfers: usize,
@@ -244,7 +249,7 @@ async fn main() -> Result<()> {
     let mut total_included: usize = 0;
     let mut total_batches: BTreeMap<u64, usize> = BTreeMap::new();
 
-    let mut shutdown = tokio::signal::ctrl_c();
+    let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     loop {
@@ -530,8 +535,17 @@ async fn perform_transfer_cycle(
         }
     }
 
+    let roots_state: RootsResp = client
+        .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
+        .await
+        .context("Failed to query recent roots")?;
+
     let mut anchor_root = [0u8; 32];
-    anchor_root.copy_from_slice(&state.root);
+    if let Some(last_root) = roots_state.recent_roots.last() {
+        anchor_root = *last_root;
+    } else {
+        anchor_root.copy_from_slice(&state.root);
+    }
 
     #[derive(Clone)]
     struct TransferInput {

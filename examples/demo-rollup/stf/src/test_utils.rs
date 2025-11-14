@@ -69,7 +69,7 @@ where
                 method_id: [0; 32],
                 admin: admin_address.clone(),
             },
-            midnight_privacy: midnight_privacy::ValueSetterZkConfig {
+            midnight_privacy: midnight_privacy::MidnightPrivacyConfig {
                 tree_depth: 32,
                 root_window_size: 100,
                 method_id: [0; 32],

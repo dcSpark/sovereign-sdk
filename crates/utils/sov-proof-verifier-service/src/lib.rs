@@ -414,15 +414,22 @@ async fn health_check() -> impl IntoResponse {
 /// Flush all pending worker-verified transactions to the sequencer in parallel
 async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ServiceError> {
     use worker_verified_transactions::{Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState};
+    use sea_orm::QuerySelect;
 
-    // Fetch list of pending tx hashes
-    let pending = VerifiedEntity::find()
+    // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
+    let pending_tx_hashes: Vec<String> = VerifiedEntity::find()
+        .select_only()
+        .column(VerifiedColumn::TxHash)
         .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
+        .into_tuple::<(String,)>()
         .all(state.da_conn.as_ref())
         .await
-        .map_err(|err| ServiceError::Internal(format!("Failed to list pending worker transactions: {err}")))?;
+        .map_err(|err| ServiceError::Internal(format!("Failed to list pending worker transactions: {err}")))?
+        .into_iter()
+        .map(|(txh,)| txh)
+        .collect();
 
-    let total = pending.len();
+    let total = pending_tx_hashes.len();
     if total == 0 {
         return Ok(Json(serde_json::json!({
             "flushed": 0,
@@ -433,9 +440,8 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     }
 
     let mut handles = Vec::with_capacity(total);
-    for model in pending {
+    for txh in pending_tx_hashes {
         let st = state.clone();
-        let txh = model.tx_hash.clone();
         handles.push(tokio::spawn(async move {
             // Add 1 ms delay before submission
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;

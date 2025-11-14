@@ -4,21 +4,19 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
+use sov_modules_api::VersionReader;
 use thiserror::Error;
 use tracing::{debug, info};
 
 use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
 use crate::event::Event;
-use crate::hash::{note_commitment, Hash32, RootKey};
+use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
 
 #[cfg(feature = "native")]
 use anyhow::anyhow;
 
 #[cfg(feature = "native")]
 use crate::hash::NullifierKey;
-
-#[cfg(feature = "native")]
-use crate::types::SpendPublic;
 
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
@@ -190,10 +188,23 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.commitment_tree.set(&tree, state)?;
         self.next_position.set(&(position + 1), state)?;
 
-        // 1) Add root to recent roots window (fast mempool checks)
-        self.add_recent_root(new_root, state)?;
-        // 2) Permanently record in NOMT-backed index (full history for long-range anchors)
-        self.record_root_forever(new_root, state)?;
+        // DEFERRED: Queue root for end-of-block flush instead of making it visible immediately.
+        // This allows true parallelism within a block since roots aren't contended.
+        // Same-block anchors naturally fail since roots aren't in recent_roots/all_roots yet.
+        // INDEXED APPEND: O(1) state write per root, scales to thousands of txs per block.
+        // REQUIRES: rollup_height_to_access() is stable during entire block execution.
+        let current_height = state.rollup_height_to_access();
+        let idx = self
+            .pending_roots_count
+            .get(&current_height, state)?
+            .unwrap_or(0);
+        let key = PendingRootKey {
+            height: current_height.get(),
+            idx,
+        };
+        self.pending_roots_indexed.set(&key, &new_root, state)?;
+        self.pending_roots_count
+            .set(&current_height, &(idx + 1), state)?;
 
         // Emit event
         self.emit_event(
@@ -546,48 +557,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         }
     }
 
-    /// Add a root to the recent roots window (circular buffer).
-    /// Uses VecDeque for O(1) operations at both ends.
-    /// This provides fast mempool checks for recent transactions.
-    fn add_recent_root(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
-        let mut recent_roots = self.recent_roots.get_or_err(state)??;
-        let root_window_size = self.root_window_size.get_or_err(state)??;
-
-        // Add to end, remove from front if full (O(1) with VecDeque)
-        recent_roots.push_back(root);
-        if recent_roots.len() > root_window_size as usize {
-            recent_roots.pop_front();
-        }
-
-        self.recent_roots.set(&recent_roots, state)?;
-        Ok(())
-    }
-
-    /// Permanently record a root in the full-history NOMT-backed index.
-    /// This enables long-range anchor validation: any historical root remains valid forever.
-    /// Idempotent: if the root already exists, this is a no-op.
-    fn record_root_forever(&mut self, root: Hash32, state: &mut impl TxState<S>) -> Result<()> {
-        // Fast path: already recorded?
-        if self.all_roots.get(&RootKey(root), state)?.is_some() {
-            return Ok(());
-        }
-
-        // Assign a monotonic sequence number and commit to permanent storage
-        let seq = self.root_seq.get_or_err(state)??;
-        self.all_roots.set(&RootKey(root), &seq, state)?;
-
-        // Emit event for observability
-        self.emit_event(state, Event::AnchorRootRecorded { root, seq });
-
-        // Bump sequence (checked add to be safe against overflow)
-        let next_seq = seq
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("root_seq overflow: too many unique roots"))?;
-        self.root_seq.set(&next_seq, state)?;
-
-        Ok(())
-    }
-
     /// Check if an anchor root is valid:
     ///  - first, in the recent roots window (cheap O(n) scan of VecDeque);
     ///  - else, in the permanent NOMT-backed index (`all_roots`, O(log N) lookup).
@@ -605,6 +574,95 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Fallback: check permanent historical index (enables long-range proofs)
         Ok(self.all_roots.get(&RootKey(*anchor), state)?.is_some())
+    }
+
+    /// End-of-block flush: Drain ONLY the current block's pending roots into recent_roots and all_roots.
+    /// Called automatically by BlockHooks at the end of each block after all transactions.
+    /// This makes all roots from the block visible for anchor validation in future blocks.
+    ///
+    /// SCOPE: Flushes only pending_roots_indexed[(current_height, 0..count)]. Other heights ignored.
+    /// INVARIANT: begin_rollup_block_hook resets count to 0 for current height at block start.
+    /// DANGER: Indexed entries from abandoned blocks (crashes/reverts) remain in state forever
+    /// but are harmless—they're never read, don't affect validation, cause minimal state bloat.
+    ///
+    /// Idempotent: safe to call multiple times (subsequent calls are no-ops if count is 0).
+    ///
+    /// Note: This should NOT be exposed as a transaction call - it must only run at block boundaries
+    /// to maintain parallelism guarantees. Tests can call this directly or via end_rollup_block_hook.
+    pub fn end_block_flush(
+        &mut self,
+        st: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> anyhow::Result<()> {
+        // Fetch count for the CURRENT rollup height only.
+        // Other heights (e.g., from abandoned blocks) are deliberately ignored.
+        let current_height = st.rollup_height_to_access();
+        let count = self
+            .pending_roots_count
+            .get(&current_height, st)?
+            .unwrap_or(0);
+
+        // Iterate through indexed roots and apply each one
+        for idx in 0..count {
+            let key = PendingRootKey {
+                height: current_height.get(),
+                idx,
+            };
+            let root = self.pending_roots_indexed.get(&key, st)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing indexed root at ({}, {}). State corruption detected.",
+                    current_height,
+                    idx
+                )
+            })?;
+            self.add_recent_root_direct(root, st)?;
+            self.record_root_forever_direct(root, st)?;
+        }
+
+        // Reset count for this height (effectively "clears" the pending roots for this block)
+        // Note: We don't delete the indexed entries to save gas. They're never read again since
+        // count is reset, and new blocks use different heights. Cleanup could be added if needed.
+        self.pending_roots_count
+            .set(&current_height, &0u32, st)?;
+
+        Ok(())
+    }
+
+    /// Helper: Add a root to the recent roots window (for StateCheckpoint).
+    fn add_recent_root_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+        let mut recent_roots = self.recent_roots.get_or_err(state)??;
+        let root_window_size = self.root_window_size.get_or_err(state)??;
+
+        recent_roots.push_back(root);
+        if recent_roots.len() > root_window_size as usize {
+            recent_roots.pop_front();
+        }
+
+        self.recent_roots.set(&recent_roots, state)?;
+        Ok(())
+    }
+
+    /// Helper: Record a root in the full-history index (for StateCheckpoint).
+    /// Note: This version doesn't emit events since StateCheckpoint doesn't implement EventContainer.
+    fn record_root_forever_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+        // Fast path: already recorded?
+        if self.all_roots.get(&RootKey(root), state)?.is_some() {
+            return Ok(());
+        }
+
+        // Assign a monotonic sequence number and commit to permanent storage
+        let seq = self.root_seq.get_or_err(state)??;
+        self.all_roots.set(&RootKey(root), &seq, state)?;
+
+        // Note: We don't emit events here because StateCheckpoint doesn't implement EventContainer.
+        // Events for these roots were already emitted when the commitment was added in add_commitment.
+
+        // Bump sequence (checked add to be safe against overflow)
+        let next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("root_seq overflow: too many unique roots"))?;
+        self.root_seq.set(&next_seq, state)?;
+
+        Ok(())
     }
 
     /// Update the method ID (admin only).
