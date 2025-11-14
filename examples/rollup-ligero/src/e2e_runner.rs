@@ -16,7 +16,7 @@ use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
-use sov_modules_api::gas::{GasArray, UnlimitedGasMeter};
+use sov_modules_api::gas::UnlimitedGasMeter;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::{PublicKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
@@ -1092,7 +1092,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         num_deposits,
         included_deposits
     );
-    let deposit_total_time = deposit_start_time.elapsed();
+    let _deposit_total_time = deposit_start_time.elapsed();
     eprintln!(
         "[ok] all deposits included: {}/{}",
         included_deposits, num_deposits
