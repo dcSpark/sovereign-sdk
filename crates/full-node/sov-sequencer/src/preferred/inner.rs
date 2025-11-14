@@ -858,6 +858,10 @@ pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
         tx_len: usize,
         reason: &'static str,
     },
+    ParallelTxFailed {
+        tx_hash: TxHash,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -1462,6 +1466,21 @@ where
                     .await;
                 let elapsed = start.elapsed();
                 eprintln!("[PARALLEL TX COMPLETED] ParallelTxCompleted message processing took {:?}", elapsed);
+            }
+            Message::ParallelTxFailed { tx_hash, reason } => {
+                // Best-effort cleanup of HTTP waiter and parallel count so the caller doesn't hang forever.
+                let mut inner = self.get_inner_with_timing(reason).await;
+                tracing::warn!(
+                    %tx_hash,
+                    "Parallel worker reported failure; cleaning up pending waiter"
+                );
+                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+                    // Dropping the sender will cause the HTTP-side oneshot to error, surfacing as a 500.
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
             }
         }
 

@@ -469,16 +469,30 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     );
                                 }
                             }
-                            Err(err) => {
-                                tracing::debug!(
-                                    worker_id,
-                                    tx_hash = %request.tx_hash,
-                                    %err,
-                                    "Parallel worker failed to execute transaction"
-                                );
-                                // Don't send anything back, transaction will timeout or be retried
-                                continue;
-                            }
+            Err(err) => {
+                tracing::debug!(
+                    worker_id,
+                    tx_hash = %request.tx_hash,
+                    %err,
+                    "Parallel worker failed to execute transaction"
+                );
+                // Notify the main sequencer so it can clean up the HTTP waiter
+                // and decrement the in-flight parallel counter, instead of
+                // leaving the request hanging indefinitely.
+                let fail_msg = crate::preferred::inner::Message::ParallelTxFailed {
+                    tx_hash: request.tx_hash,
+                    reason: "parallel_tx_failed",
+                };
+                if let Err(send_err) = request.message_sender.send(fail_msg).await {
+                    tracing::debug!(
+                        worker_id,
+                        tx_hash = %request.tx_hash,
+                        "Failed to send ParallelTxFailed message (likely shutdown): {:?}",
+                        send_err
+                    );
+                }
+                continue;
+            }
                         }
                     }
 
