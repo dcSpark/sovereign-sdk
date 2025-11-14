@@ -34,6 +34,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 serde_with = { workspace = true, features = ["base64"] }
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
 sov-blob-sender = { workspace = true }
 sov-blob-storage = { workspace = true, features = ["native"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate"] }
@@ -45,12 +46,14 @@ sov-modules-api = { workspace = true, features = ["native"] }
 sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
 sov-state = { workspace = true }
 sov-db = { workspace = true }
+sov-midnight-da = { workspace = true, features = ["native"] }
+midnight-privacy = { workspace = true, features = ["native"] }
 strum = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-stream = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7"] }
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+utoipa-swagger-ui = { workspace = true, features = ["axum", "debug-embed"] }
 openapiv3 = { workspace = true }
 backon = { workspace = true }
 flume = { workspace = true }

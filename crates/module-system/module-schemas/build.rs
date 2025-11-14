@@ -24,6 +24,9 @@ fn main() -> io::Result<()> {
     store_module_call_json_schema::<sov_sequencer_registry::SequencerRegistry<S>>(
         "sov-sequencer-registry.json",
     )?;
+    store_module_call_json_schema::<midnight_privacy::ValueMidnightPrivacy<S>>(
+        "midnight-privacy.json",
+    )?;
 
     // Schemas for genesis configs.
     store_genesis_config_json_schema::<sov_bank::BankConfig<S>>("sov-bank.json")?;
@@ -36,6 +39,9 @@ fn main() -> io::Result<()> {
     )?;
     store_genesis_config_json_schema::<sov_sequencer_registry::SequencerConfig<S>>(
         "sov-sequencer-registry.json",
+    )?;
+    store_genesis_config_json_schema::<midnight_privacy::MidnightPrivacyConfig<S>>(
+        "midnight-privacy.json",
     )?;
 
     // Rollup configuration schema.

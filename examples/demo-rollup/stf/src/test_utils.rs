@@ -39,6 +39,14 @@ where
         paymaster_config: <Paymaster<S> as Genesis>::Config,
         access_pattern_config: <AccessPattern<S> as Genesis>::Config,
     ) -> Self {
+        // Extract admin address before moving sequencer_registry
+        let admin_address = minimal_config
+            .config
+            .sequencer_registry
+            .sequencer_config
+            .seq_rollup_address
+            .clone();
+
         Self {
             sequencer_registry: minimal_config.config.sequencer_registry,
             bank: minimal_config.config.bank,
@@ -53,6 +61,22 @@ where
             paymaster: paymaster_config,
             synthetic_load: (),
             access_pattern: access_pattern_config,
+            value_setter: sov_value_setter::ValueSetterConfig {
+                admin: admin_address.clone(),
+            },
+            value_setter_zk: sov_value_setter_zk::ValueSetterZkConfig {
+                initial_value: Some(0),
+                method_id: [0; 32],
+                admin: admin_address.clone(),
+            },
+            midnight_privacy: midnight_privacy::MidnightPrivacyConfig {
+                tree_depth: 32,
+                root_window_size: 100,
+                method_id: [0; 32],
+                admin: admin_address,
+                domain: [0; 32],
+                token_id: sov_bank::TokenId::from([0; 32]),
+            },
         }
     }
 }

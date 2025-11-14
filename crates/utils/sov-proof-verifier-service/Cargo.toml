@@ -1,0 +1,76 @@
+[package]
+name = "sov-proof-verifier-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sovereign Labs <info@sovereign.xyz>"]
+license = "MIT OR Apache-2.0"
+description = "Off-chain parallel proof verification service for Ligero rollup"
+
+[[bin]]
+name = "proof-verifier"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Web framework
+axum = { workspace = true, features = ["tokio", "http1", "http2"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "cors"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_bytes = "0.11"
+borsh = { workspace = true }
+bincode = { workspace = true }
+
+# Crypto
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true, features = ["json"] }
+
+# Base64 encoding
+base64 = { workspace = true }
+
+# Database
+chrono = { workspace = true }
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+] }
+
+# Sovereign SDK dependencies
+sov-modules-api = { workspace = true, features = ["native"] }
+sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
+sov-ligero-adapter = { workspace = true, features = ["native"] }
+sov-rollup-interface = { workspace = true }
+sov-node-client = { workspace = true }
+sov-api-spec = { workspace = true }
+sov-value-setter = { workspace = true, features = ["native"] }
+sov-address = { workspace = true, features = ["native", "evm"] }
+sov-midnight-da = { workspace = true, features = ["native"] }
+sov-mock-zkvm = { workspace = true, features = ["native"] }
+midnight-privacy = { workspace = true, features = ["native"] }
+
+# Runtime type for transaction signing
+demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }
+
+# CLI args
+clap = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
