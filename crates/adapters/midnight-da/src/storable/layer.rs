@@ -6,8 +6,9 @@ use rand::prelude::{SliceRandom, SmallRng};
 use rand::{Rng, SeedableRng};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, ConnectOptions,
 };
+use std::str::FromStr;
 use sha2::Digest;
 use sov_rollup_interface::common::{HexHash, HexString};
 use tokio::sync::{broadcast, watch};
@@ -45,34 +46,46 @@ impl StorableMidnightDaLayer {
         connection_string: &str,
         blocks_to_finality: u32,
     ) -> anyhow::Result<Self> {
-        let mut opts = sea_orm::ConnectOptions::new(connection_string);
-
-        // Optimize connection pool for SQLite:
-        // - Reduced max_connections from 50 to 10 for SQLite (single-writer limitation)
-        // - For SQLite with WAL mode, 1 writer + multiple readers is optimal
-        // - More connections just increase contention without improving throughput
-        let max_connections = if connection_string.starts_with("sqlite:") {
-            10 // Conservative for SQLite
+        // For SQLite, we need to build SqliteConnectOptions with busy_timeout
+        // For other databases, use standard ConnectOptions
+        let conn: DatabaseConnection = if connection_string.starts_with("sqlite:") {
+            use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+            
+            // Parse connection string and set busy_timeout
+            let sqlite_opts = SqliteConnectOptions::from_str(connection_string)?
+                .busy_timeout(std::time::Duration::from_millis(30000)); // 30 seconds
+            
+            // Create pool with optimized settings for SQLite
+            let pool = SqlitePoolOptions::new()
+                .max_connections(10) // Conservative for SQLite (single-writer)
+                .min_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(Some(std::time::Duration::from_secs(300)))
+                .max_lifetime(Some(std::time::Duration::from_secs(1800)))
+                .connect_with(sqlite_opts)
+                .await?;
+            
+            tracing::info!(
+                "Initializing SQLite database connection pool (max_connections=10, busy_timeout=30s)"
+            );
+            
+            DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
-            50 // PostgreSQL can handle more
+            // PostgreSQL or other databases
+            let mut opts = ConnectOptions::new(connection_string);
+            
+            opts.max_connections(50)
+                .min_connections(1)
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(std::time::Duration::from_secs(300))
+                .max_lifetime(std::time::Duration::from_secs(1800))
+                .sqlx_logging_level(tracing::log::LevelFilter::Trace);
+            
+            tracing::info!("Initializing PostgreSQL database connection pool (max_connections=50)");
+            
+            Database::connect(opts).await?
         };
-        
-        opts.max_connections(max_connections)
-            .min_connections(1)
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .acquire_timeout(std::time::Duration::from_secs(30))
-            .idle_timeout(std::time::Duration::from_secs(300))
-            .max_lifetime(std::time::Duration::from_secs(1800));
-        
-        opts.sqlx_logging_level(tracing::log::LevelFilter::Trace);
-        
-        tracing::info!(
-            max_connections,
-            "Initializing database connection pool for {}",
-            if connection_string.starts_with("sqlite:") { "SQLite" } else { "PostgreSQL" }
-        );
-
-        let conn: DatabaseConnection = Database::connect(opts).await?;
 
         entity::setup_db(&conn).await?;
         let last_seen_block = entity::query_last_saved_block(&conn).await?;
