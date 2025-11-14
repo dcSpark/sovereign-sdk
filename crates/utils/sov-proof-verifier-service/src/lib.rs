@@ -161,41 +161,58 @@ impl AppState {
             }
         }
 
-        let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
-        
-        // Optimize connection pool for SQLite (same as midnight-da layer)
-        // - Reduced max_connections for SQLite (single-writer limitation)
-        // - Added timeouts to prevent connection pool exhaustion
-        let max_connections = if config.da_connection_string.starts_with("sqlite:") {
-            10 // Conservative for SQLite with WAL mode
+        // For SQLite, we need to build SqliteConnectOptions with busy_timeout
+        // For other databases, use standard ConnectOptions
+        let da_conn = if config.da_connection_string.starts_with("sqlite:") {
+            use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+            use std::str::FromStr;
+            
+            // Parse connection string and set busy_timeout
+            let sqlite_opts = SqliteConnectOptions::from_str(&config.da_connection_string)
+                .with_context(|| format!("Failed to parse SQLite connection string: {}", config.da_connection_string))?
+                .busy_timeout(std::time::Duration::from_millis(30000)); // 30 seconds
+            
+            // Create pool with optimized settings for SQLite
+            let pool = SqlitePoolOptions::new()
+                .max_connections(10) // Conservative for SQLite (single-writer)
+                .min_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(Some(std::time::Duration::from_secs(300)))
+                .max_lifetime(Some(std::time::Duration::from_secs(1800)))
+                .connect_with(sqlite_opts)
+                .await
+                .with_context(|| format!("Failed to connect to SQLite database at {}", config.da_connection_string))?;
+            
+            info!("Verifier service connected to SQLite database (max_connections=10, busy_timeout=30s)");
+            
+            DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
-            20 // PostgreSQL can handle more
+            // PostgreSQL or other databases
+            let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
+            
+            connect_opts
+                .max_connections(20)
+                .min_connections(1)
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(std::time::Duration::from_secs(300))
+                .max_lifetime(std::time::Duration::from_secs(1800))
+                .sqlx_logging(false);
+            
+            info!("Verifier service connecting to PostgreSQL database (max_connections=20)");
+            
+            Database::connect(connect_opts).await.with_context(|| {
+                format!(
+                    "Failed to connect to PostgreSQL database at {}",
+                    config.da_connection_string
+                )
+            })?
         };
-        
-        connect_opts
-            .max_connections(max_connections)
-            .min_connections(1)
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .acquire_timeout(std::time::Duration::from_secs(30))
-            .idle_timeout(std::time::Duration::from_secs(300))
-            .max_lifetime(std::time::Duration::from_secs(1800))
-            .sqlx_logging(false);
-        
-        info!(
-            "Verifier service connecting to database with {} max connections",
-            max_connections
-        );
-        
-        let da_conn = Database::connect(connect_opts).await.with_context(|| {
-            format!(
-                "Failed to connect to MockDA database at {}",
-                config.da_connection_string
-            )
-        })?;
         setup_midnight_da_db(&da_conn)
             .await
             .context("Failed to initialize MockDA database schema")?;
-        info!("✓ Connected to MockDA database");
+        
+        info!("✓ Connected to MockDA database (busy_timeout applied per-connection)");
 
         Ok(Self {
             config: Arc::new(config),
