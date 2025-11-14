@@ -157,3 +157,7 @@ path = "src/main.rs"
 [[bin]]
 name = "generate-genesis-keys"
 path = "src/bin/generate_genesis_keys.rs"
+
+[[bin]]
+name = "continuous-transfers"
+path = "src/bin/continuous_transfers.rs"
