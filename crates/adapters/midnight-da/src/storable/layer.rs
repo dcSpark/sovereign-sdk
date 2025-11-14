@@ -47,8 +47,30 @@ impl StorableMidnightDaLayer {
     ) -> anyhow::Result<Self> {
         let mut opts = sea_orm::ConnectOptions::new(connection_string);
 
-        opts.max_connections(50);
+        // Optimize connection pool for SQLite:
+        // - Reduced max_connections from 50 to 10 for SQLite (single-writer limitation)
+        // - For SQLite with WAL mode, 1 writer + multiple readers is optimal
+        // - More connections just increase contention without improving throughput
+        let max_connections = if connection_string.starts_with("sqlite:") {
+            10 // Conservative for SQLite
+        } else {
+            50 // PostgreSQL can handle more
+        };
+        
+        opts.max_connections(max_connections)
+            .min_connections(1)
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .max_lifetime(std::time::Duration::from_secs(1800));
+        
         opts.sqlx_logging_level(tracing::log::LevelFilter::Trace);
+        
+        tracing::info!(
+            max_connections,
+            "Initializing database connection pool for {}",
+            if connection_string.starts_with("sqlite:") { "SQLite" } else { "PostgreSQL" }
+        );
 
         let conn: DatabaseConnection = Database::connect(opts).await?;
 

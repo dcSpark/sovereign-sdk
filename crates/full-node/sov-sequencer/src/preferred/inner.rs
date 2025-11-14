@@ -62,7 +62,7 @@ const COMFORTABLE_GAS_LIMIT_DIVISOR: u64 = 20;
 
 const METRICS_BATCH_SIZE: usize = 32;
 
-const CHANNEL_SIZE: usize = 128;
+const CHANNEL_SIZE: usize = 2048;
 
 type AcceptTxRet<S, Rt> =
     Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>;
