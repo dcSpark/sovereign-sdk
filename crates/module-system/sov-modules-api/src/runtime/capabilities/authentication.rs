@@ -93,21 +93,6 @@ pub trait TransactionAuthenticator<S: Spec> {
     fn encode_with_standard_auth(tx: RawTx) -> FullyBakedTx {
         Self::encode_authenticator_input(&Self::add_standard_auth(tx))
     }
-    
-    /// Encode a pre-authenticated transaction (skips signature verification during execution).
-    ///
-    /// # Parameters
-    /// * `tx` - The transaction bytes (may have proof stripped for efficiency)
-    /// * `original_hash` - The hash computed over the ORIGINAL full transaction (with proof)
-    ///
-    /// # Security
-    /// Only use this for transactions from trusted worker services that have already
-    /// performed full verification (signature + proof) off-chain.
-    #[must_use]
-    fn encode_with_pre_authenticated(tx: RawTx, original_hash: TxHash) -> FullyBakedTx {
-        let input = AuthenticatorInput::PreAuthenticated(tx, original_hash);
-        FullyBakedTx::new(borsh::to_vec(&input).unwrap())
-    }
 }
 
 /// See [`RollupAuthenticator`].
@@ -119,20 +104,6 @@ pub enum AuthenticatorInput {
     /// a `struct` to allow for future transaction types in a
     /// backwards-compatible way.
     Standard(RawTx),
-    
-    /// A pre-authenticated transaction from a worker service.
-    ///
-    /// These transactions have already been verified off-chain (signature + proof)
-    /// and should skip authentication checks for performance. The sequencer
-    /// trusts the worker's verification.
-    ///
-    /// The tuple contains:
-    /// - `RawTx`: The transaction bytes (may have proof stripped for efficiency)
-    /// - `TxHash`: The ORIGINAL hash (computed over the full transaction with proof)
-    ///
-    /// SECURITY: Only use this variant for transactions from trusted worker services
-    /// that have performed full verification (signature + proof) off-chain.
-    PreAuthenticated(RawTx, TxHash),
 }
 
 /// Canonical implementation of [`TransactionAuthenticator`].
@@ -149,24 +120,10 @@ where
 
     #[cfg(feature = "native")]
     fn decode_serialized_tx(tx: &FullyBakedTx) -> Result<Self::Decodable, FatalError> {
-        // Use streaming Borsh deserialize to avoid "Not all bytes read" errors when
-        // there are harmless trailing bytes (e.g., transport glue). This mirrors how
-        // transactions are parsed during execution and is more robust.
-        let mut buf: &[u8] = &tx.data;
-        let input: AuthenticatorInput = borsh::BorshDeserialize::deserialize(&mut buf)
+        let AuthenticatorInput::Standard(tx) = borsh::from_slice(&tx.data)
             .map_err(|e| FatalError::DeserializationFailed(e.to_string()))?;
-        if !buf.is_empty() {
-            // Log and ignore any leftover bytes after the authenticator input.
-            // This can happen if upstream attached non-critical padding/metadata.
-            tracing::debug!(remaining = buf.len(), "decode_serialized_tx: trailing bytes after AuthenticatorInput; ignoring");
-        }
 
-        let raw_tx = match input {
-            AuthenticatorInput::Standard(tx) => tx,
-            AuthenticatorInput::PreAuthenticated(tx, _hash) => tx,
-        };
-
-        capabilities::decode_sov_tx::<S, Rt>(&raw_tx.data)
+        capabilities::decode_sov_tx::<S, Rt>(&tx.data)
     }
 
     fn authenticate<Accessor: ProvableStateReader<sov_state::User, Spec = S>>(
@@ -176,74 +133,28 @@ where
         capabilities::AuthenticationOutput<S, Self::Decodable>,
         capabilities::AuthenticationError,
     > {
-        tracing::error!("🔴 RollupAuthenticator::authenticate called! tx.data len={}", tx.data.len());
-        
-        // Streamed deserialize avoids strict EOF check which can trigger
-        // "Not all bytes read" on benign trailing bytes. We ignore leftovers.
-        let mut buf: &[u8] = &tx.data;
-        let input: AuthenticatorInput = borsh::BorshDeserialize::deserialize(&mut buf)
-            .map_err(|e| {
-                tracing::error!("🔴 Failed to deserialize AuthenticatorInput: {}", e);
-                capabilities::fatal_deserialization_error::<_, S, _>(&tx.data, e, pre_exec_ws)
-            })?;
-        if !buf.is_empty() {
-            tracing::debug!(remaining = buf.len(), "authenticate: trailing bytes after AuthenticatorInput; ignoring");
-        }
+        let AuthenticatorInput::Standard(input) = borsh::from_slice(&tx.data).map_err(|e| {
+            capabilities::fatal_deserialization_error::<_, S, _>(&tx.data, e, pre_exec_ws)
+        })?;
 
-        match input {
-            AuthenticatorInput::Standard(raw_tx) => {
-                tracing::error!("🔵 Using STANDARD path (full signature verification) raw_tx len={}", raw_tx.data.len());
-                // Standard path: full authentication with signature verification
-                crate::capabilities::authenticate::<_, S, Rt>(&raw_tx.data, &Rt::CHAIN_HASH, pre_exec_ws)
-            }
-            AuthenticatorInput::PreAuthenticated(raw_tx, original_hash) => {
-                tracing::error!("🟢 Using PRE-AUTHENTICATED path (skip signature verification) original_hash={} raw_tx len={}", original_hash, raw_tx.data.len());
-                // Pre-authenticated path: skip signature verification, use original hash
-                // The original_hash was computed over the FULL transaction (with proof)
-                // The raw_tx may have the proof stripped for efficiency
-                crate::capabilities::authenticate_pre_verified::<_, S, Rt>(
-                    &raw_tx.data,
-                    original_hash,
-                    &Rt::CHAIN_HASH,
-                    pre_exec_ws
-                )
-            }
-        }
+        crate::capabilities::authenticate::<_, S, Rt>(&input.data, &Rt::CHAIN_HASH, pre_exec_ws)
     }
 
     #[cfg(feature = "native")]
     fn compute_tx_hash(tx: &FullyBakedTx) -> anyhow::Result<TxHash> {
-        let mut buf: &[u8] = &tx.data;
-        let input: AuthenticatorInput = borsh::BorshDeserialize::deserialize(&mut buf)?;
-        match input {
-            AuthenticatorInput::Standard(raw_tx) => {
-                Ok(calculate_hash::<S>(&raw_tx.data))
-            }
-            AuthenticatorInput::PreAuthenticated(_raw_tx, original_hash) => {
-                // For pre-authenticated transactions, return the original hash
-                // (computed over the full transaction with proof)
-                Ok(original_hash)
-            }
-        }
+        let AuthenticatorInput::Standard(input) = borsh::from_slice(&tx.data)?;
+        Ok(calculate_hash::<S>(&input.data))
     }
 
     fn authenticate_unregistered<Accessor: ProvableStateReader<sov_state::User, Spec = S>>(
         batch: &BatchFromUnregisteredSequencer,
         pre_exec_ws: &mut Accessor,
     ) -> Result<AuthenticationOutput<S, Self::Decodable>, UnregisteredAuthenticationError> {
-        let input: AuthenticatorInput = borsh::from_slice(&batch.tx.data)
+        let AuthenticatorInput::Standard(input) = borsh::from_slice(&batch.tx.data)
             .map_err(|_| UnregisteredAuthenticationError::InvalidAuthenticationDiscriminant)?;
 
-        let raw_tx = match input {
-            AuthenticatorInput::Standard(tx) => tx,
-            // Unregistered sequencers cannot use pre-authenticated path
-            AuthenticatorInput::PreAuthenticated(_, _) => {
-                return Err(UnregisteredAuthenticationError::InvalidAuthenticationDiscriminant);
-            }
-        };
-
         Ok(crate::capabilities::authenticate::<_, S, Rt>(
-            &raw_tx.data,
+            &input.data,
             &Rt::CHAIN_HASH,
             pre_exec_ws,
         )?)
@@ -430,109 +341,6 @@ pub fn verify_and_decode_tx<S: Spec, D: DispatchCall<Spec = S>>(
             Ok((tx_and_raw_hash, authorization_data, runtime_call))
         }
     }
-}
-
-/// Authenticate and decode pre-verified transaction (SKIP signature verification).
-///
-/// This function is used for transactions that have already been verified by a trusted
-/// worker service. It skips signature verification to improve performance while still
-/// performing all other authentication steps.
-///
-/// # Security
-/// Only use this for transactions from trusted worker services that have already
-/// performed full verification (signature + proof) off-chain.
-///
-/// # Errors
-/// Returns an error if gas runs out at any point, if deserialization or hashing fails, or if the
-/// chain ID is invalid.
-pub fn verify_and_decode_tx_skip_sig<S: Spec, D: DispatchCall<Spec = S>>(
-    raw_tx_hash: TxHash,
-    tx: Transaction<D, S>,
-    _chain_hash: &[u8; 32],
-    meter: &mut impl GasMeter<Spec = S>,
-) -> Result<AuthenticationOutput<S, D::Decodable>, AuthenticationError> {
-    match &tx.versioned_tx {
-        VersionedTx::V0(tx_v0) => {
-            verify_chain_id(&tx_v0.details, raw_tx_hash)?;
-            // SKIP: verify_signature - worker already verified
-            let authorization_data = extract_authorization_data::<S, D>(tx_v0, raw_tx_hash, meter)?;
-
-            let runtime_call = tx_v0.runtime_call.clone();
-            let tx_and_raw_hash = AuthenticatedTransactionAndRawHash {
-                raw_tx_hash,
-                authenticated_tx: tx_v0.details.clone().into(),
-            };
-
-            Ok((tx_and_raw_hash, authorization_data, runtime_call))
-        }
-    }
-}
-
-/// Authenticate pre-verified raw sov-transaction (SKIP signature verification and hash computation).
-///
-/// This function is used for transactions that have already been verified by a trusted
-/// worker service. It uses the provided original hash (computed over the full transaction
-/// with proof) instead of recomputing it, which allows the transaction bytes to be modified
-/// (e.g., proof stripped) without affecting the hash.
-///
-/// # Parameters
-/// * `raw_tx` - The transaction bytes (may have proof stripped for efficiency)
-/// * `original_hash` - The hash computed over the ORIGINAL full transaction (with proof)
-/// * `chain_hash` - The chain hash for validation
-/// * `state` - The state accessor for gas metering
-///
-/// # Security
-/// Only use this for transactions from trusted worker services that have already
-/// performed full verification (signature + proof) off-chain and provided the correct
-/// original hash.
-///
-/// # Errors
-/// Returns an error if gas runs out at any point, if deserialization fails, or if the
-/// chain ID is invalid.
-pub fn authenticate_pre_verified<
-    Accessor: ProvableStateReader<User, Spec = S>,
-    S: Spec,
-    D: DispatchCall<Spec = S>,
->(
-    mut raw_tx: &[u8],
-    original_hash: TxHash,
-    chain_hash: &[u8; 32],
-    state: &mut Accessor,
-) -> Result<AuthenticationOutput<S, D::Decodable>, AuthenticationError> {
-    // Use the original hash provided by the worker (computed over the full transaction with proof)
-    // DO NOT recompute the hash - the transaction bytes may have been modified (proof stripped)
-    let raw_tx_hash = original_hash;
-
-    tracing::debug!(
-        "authenticate_pre_verified: raw_tx length={}, original_hash={}",
-        raw_tx.len(),
-        raw_tx_hash
-    );
-
-    let tx =
-        match <Transaction<D, S> as MeteredBorshDeserialize<S>>::deserialize(&mut raw_tx, state) {
-            Ok(ok) => {
-                tracing::debug!(
-                    "authenticate_pre_verified: deserialized successfully, remaining bytes={}",
-                    raw_tx.len()
-                );
-                ok
-            },
-
-            Err(MeteredBorshDeserializeError::GasError(e)) => {
-                return Err(AuthenticationError::OutOfGas(format!(
-                    "Transaction deserialization run out of gas {e}, tx hash {raw_tx_hash}"
-                )))
-            }
-            Err(MeteredBorshDeserializeError::IOError(e)) => {
-                return Err(AuthenticationError::FatalError(
-                    FatalError::DeserializationFailed(e.to_string()),
-                    raw_tx_hash,
-                ));
-            }
-        };
-
-    verify_and_decode_tx_skip_sig::<S, D>(raw_tx_hash, tx, chain_hash, state)
 }
 
 /// Authenticate raw sov-transaction.

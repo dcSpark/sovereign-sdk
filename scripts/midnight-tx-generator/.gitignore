@@ -1,6 +1,0 @@
-target/
-Cargo.lock
-*.bin
-*.json
-proof_data.gz
-!Cargo.json

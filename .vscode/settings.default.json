@@ -1,25 +1,11 @@
 {
-  "terminal.integrated.env.osx": {
-    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
-  },
-  "terminal.integrated.inheritEnv": true,
-  "terminal.integrated.defaultProfile.osx": "zsh",
-  "terminal.integrated.profiles.osx": {
-    "zsh": {
-      "path": "/bin/zsh",
-      "args": ["-l"]
-    }
-  },
   "rust-analyzer.cargo.targetDir": true,
   "rust-analyzer.cargo.extraEnv": {
     "SKIP_GUEST_BUILD": "1",
     "SP1_SKIP_PROGRAM_BUILD": "1"
   },
-  "rust-analyzer.runnables.extraEnv": {
-    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
-  },
   "rust-analyzer.check.overrideCommand": [
-    "${env:HOME}/.cargo/bin/cargo",
+    "cargo",
     "check",
     "--message-format=json",
     "--profile",
@@ -28,13 +14,13 @@
     "--all-features"
   ],
   "rust-analyzer.cargo.buildScripts.overrideCommand": [
-    "${env:HOME}/.cargo/bin/cargo",
+    "cargo",
     "check",
     "--quiet",
     "--message-format=json",
     "--keep-going"
   ],
-  "rust-analyzer.rustfmt.overrideCommand": ["${env:HOME}/.cargo/bin/rustfmt", "+nightly", "--edition=2024", "--config-path=${workspaceFolder}/rustfmt.nightly.toml"],
+  "rust-analyzer.rustfmt.overrideCommand": ["rustfmt", "+nightly", "--edition=2024", "--config-path=${workspaceFolder}/rustfmt.nightly.toml"],
   "json.schemas": [
     {
       "fileMatch": ["bank.json"],

@@ -256,7 +256,6 @@ impl<S: Spec, Rt: Runtime<S>> TransactionCache<S, Rt> {
                     .expect("TxResponse::events cannot be None when query mode is Full"),
                 receipt: tx.receipt.into(),
                 tx_number,
-                stf_execution_time_micros: 0,
             },
         }))
     }
@@ -397,7 +396,6 @@ impl<S: Spec, Rt: Runtime<S>> AcceptedTxStream<S, Rt> {
                         .expect("TxResponse::events cannot be None when query mode is Full"),
                     receipt: tx.receipt.into(),
                     tx_number: starting_from + idx as u64,
-                    stf_execution_time_micros: 0,
                 },
             });
         let num_txs_from_cache = txs_from_cache.len();
@@ -518,7 +516,6 @@ mod tests {
                     },
                 },
                 tx_number,
-                stf_execution_time_micros: 0,
             },
         }
     }

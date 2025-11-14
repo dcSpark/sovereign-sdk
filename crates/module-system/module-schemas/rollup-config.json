@@ -363,16 +363,6 @@
           "format": "uint",
           "minimum": 0.0
         },
-        "num_parallel_tx_workers": {
-          "description": "The number of workers for parallel transaction processing (specifically for midnight privacy txs). When set to 0 or None, parallel processing is disabled and all txs are processed sequentially.",
-          "default": null,
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0.0
-        },
         "postgres_connection_string": {
           "description": "Optional. When present, Postgres will be used as a database instead of RocksDB.",
           "default": null,
