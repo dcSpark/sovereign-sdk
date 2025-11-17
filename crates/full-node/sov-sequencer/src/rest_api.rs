@@ -1,6 +1,5 @@
 //! Utilities and definitions for the sequencer's REST APIs.
 
-use base64::Engine;
 use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -243,8 +242,8 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
     /// This endpoint handles transactions that have been verified off-chain by the worker
     /// (proof verifier service). Key optimizations:
     ///
-    /// 1. **Avoids reading large proof blob**: Uses `lightweight_transaction_blob` column
-    ///    instead of `full_transaction_blob` (which contains ~3MB Ligero proof)
+    /// 1. **Avoids reading large proof blob**: Uses the optimized pre-authenticated
+    ///    `serialized_tx_base64` column (no full proof blob in DB)
     /// 2. **Uses pre-computed hash**: Reads `tx_hash` from database instead of recomputing
     /// 3. **Specialized accept path**: Calls `accept_serialized_pre_authenticated_tx` which skips
     ///    decoding the large proof blob and re-authentication since verification is already done

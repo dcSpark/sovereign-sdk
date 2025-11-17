@@ -210,7 +210,6 @@ async fn test_store_deposit_transaction_without_proof() {
     assert_eq!(record.proof_verified, None, "proof_verified should be NULL for deposits");
     assert_eq!(record.proof_outputs, "{}", "proof_outputs should be empty JSON for deposits");
     assert_eq!(record.transaction_data, transaction_data);
-    assert_eq!(record.full_transaction_blob, full_blob);
 }
 
 #[tokio::test]
@@ -382,7 +381,6 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     assert_eq!(record.tx_hash, tx_hash, "Transaction hash should match");
     assert!(record.signature_valid, "Signature should be marked valid");
     assert_eq!(record.proof_verified, Some(true), "Proof should be marked verified");
-    assert_eq!(record.full_transaction_blob, tx_base64, "Full blob should match");
     
     // Verify proof outputs stored as JSON
     let stored_proof_output: SpendPublic = serde_json::from_str(&record.proof_outputs)
@@ -444,4 +442,3 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     println!("  ✓ Database upsert/idempotency");
     println!();
 }
-
