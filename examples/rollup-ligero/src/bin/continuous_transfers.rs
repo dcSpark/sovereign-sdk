@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use chrono::{DateTime, Local};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -45,10 +47,8 @@ struct ContinuousConfig {
 
 impl ContinuousConfig {
     fn from_env() -> Result<Self> {
-        let num_wallets = std::env::var("NUM_WALLETS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
+        // Number of wallets will be provided interactively at startup.
+        let num_wallets = 0usize;
 
         let initial_deposit = std::env::var("INITIAL_DEPOSIT")
             .ok()
@@ -56,15 +56,14 @@ impl ContinuousConfig {
             .unwrap_or(true);
 
         let per_tx_delay_ms = std::env::var("PER_TX_DELAY_MS")
-            .or_else(|_| std::env::var("E2E_TRANSFER_DELAY_MS"))
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(5);
 
         let cycle_delay_ms = std::env::var("CYCLE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000);
+            .unwrap_or(250);
 
         let external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
@@ -181,7 +180,36 @@ fn wait_for_c_to_continue(prompt: &str) -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let config = ContinuousConfig::from_env()?;
+    let mut config = ContinuousConfig::from_env()?;
+
+    // Prompt the user for the number of wallets if not set.
+    if config.num_wallets == 0 {
+        use std::io::{self, Write};
+
+        loop {
+            eprint!("[config] Enter number of wallets: ");
+            io::stdout().flush().ok();
+
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("Failed to read number of wallets from stdin")?;
+
+            let trimmed = input.trim();
+            match trimmed.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    config.num_wallets = n;
+                    break;
+                }
+                _ => {
+                    eprintln!(
+                        "Invalid number of wallets '{}', please enter a positive integer.",
+                        trimmed
+                    );
+                }
+            }
+        }
+    }
 
     eprintln!(
         "[config] wallets={} initial_deposit={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
@@ -374,35 +402,29 @@ async fn main() -> Result<()> {
             ) => res?,
         };
 
-        eprintln!(
-            "[cycle] Inclusion: {}/{} transfers included",
-            summary.num_included, summary.num_transfers
-        );
-        for (block_number, count) in &summary.batches {
-            eprintln!("[cycle]   Block number {}: {} transfers", block_number, count);
-        }
-
         total_transfers += summary.num_transfers; total_included += summary.num_included;
         for (block_number, count) in summary.batches {
             *total_batches.entry(block_number).or_insert(0) += count;
         }
 
-        eprintln!(
-            "[cycle] Worker breakdown: total_ms={:.2} proof_ms={:.2} db_ms={:.2} sequencer_submit_ms={:.2}",
-            summary.avg_worker_ms,
-            summary.avg_worker_proof_ms,
-            summary.avg_worker_db_ms,
-            summary.avg_sequencer_ms
-        );
-        eprintln!(
-            "[cycle] Sequencer breakdown: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
-            summary.avg_sequencer_ms,
-            summary.avg_seq_decode_ms,
-            summary.avg_seq_wrap_ms,
-            summary.avg_seq_submit_ms,
-            summary.avg_seq_await_ms,
-            summary.avg_seq_stf_ms,
-        );
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "[cycle] Worker breakdown: total_ms={:.2} proof_ms={:.2} db_ms={:.2} sequencer_submit_ms={:.2}",
+                summary.avg_worker_ms,
+                summary.avg_worker_proof_ms,
+                summary.avg_worker_db_ms,
+                summary.avg_sequencer_ms
+            );
+            eprintln!(
+                "[cycle] Sequencer breakdown: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
+                summary.avg_sequencer_ms,
+                summary.avg_seq_decode_ms,
+                summary.avg_seq_wrap_ms,
+                summary.avg_seq_submit_ms,
+                summary.avg_seq_await_ms,
+                summary.avg_seq_stf_ms,
+            );
+        }
 
         // Accumulate global timing metrics, weighted by number of transfers
         total_worker_ms += summary.avg_worker_ms * summary.num_transfers as f64;
@@ -1030,7 +1052,7 @@ async fn perform_transfer_cycle(
         transfer_submit_ms
     );
     // Interactive gate before flushing to the sequencer.
-    wait_for_c_to_continue("[cycle] Ready to flush to sequencer.").ok();
+    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.").ok();
     let flush_start = Instant::now();
     let resp = http
         .post(format!(
@@ -1039,12 +1061,12 @@ async fn perform_transfer_cycle(
         ))
         .send()
         .await
-        .context("flush request failed")?;
+        .context("Submit to sequencer request failed")?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         bail!(
-            "flush endpoint returned status {}: {}",
+            "Submit to sequencer endpoint returned status {}: {}",
             status, body
         );
     }
@@ -1085,9 +1107,9 @@ async fn perform_transfer_cycle(
     }
 
     let flush: FlushSummary = serde_json::from_str(&body)
-        .context("Failed to parse flush JSON response")?;
+        .context("Failed to parse submit to sequencer JSON response")?;
     eprintln!(
-        "[cycle] Flush complete. flushed={} accepted={} rejected={} flush_latency_ms={:.2}",
+        "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
         flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
     );
 
@@ -1131,6 +1153,12 @@ async fn perform_transfer_cycle(
     let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
     let mut num_included = 0usize;
     let num_transfers = transfer_hashes.len();
+    let mut first_included_at: Option<Instant> = None;
+    let mut last_included_at: Option<Instant> = None;
+    let mut first_included_wall: Option<SystemTime> = None;
+    let mut last_included_wall: Option<SystemTime> = None;
+    let mut first_batch_number: Option<u64> = None;
+    let mut last_batch_number: Option<u64> = None;
 
     // Aggregate worker / sequencer timing for this cycle
     let mut worker_sum_ms = 0.0f64;
@@ -1162,7 +1190,18 @@ async fn perform_transfer_cycle(
                         hash_hex,
                         ltx.receipt
                     );
-                    *batches.entry(ltx.batch_number).or_insert(0) += 1;
+                    let now_instant = Instant::now();
+                    let now_wall = SystemTime::now();
+                    let batch_number = ltx.batch_number;
+                    if first_included_at.is_none() {
+                        first_included_at = Some(now_instant);
+                        first_included_wall = Some(now_wall);
+                        first_batch_number = Some(batch_number);
+                    }
+                    last_included_at = Some(now_instant);
+                    last_included_wall = Some(now_wall);
+                    last_batch_number = Some(batch_number);
+                    *batches.entry(batch_number).or_insert(0) += 1;
                     num_included += 1;
                     break;
                 }
@@ -1177,6 +1216,66 @@ async fn perform_transfer_cycle(
                     sleep(Duration::from_millis(100)).await;
                 }
             }
+        }
+    }
+
+    // Summarize when the first and last txs were observed in the ledger.
+    if let (
+        Some(first_instant),
+        Some(last_instant),
+        Some(first_wall),
+        Some(last_wall),
+        Some(first_block),
+        Some(last_block),
+    ) = (
+        first_included_at,
+        last_included_at,
+        first_included_wall,
+        last_included_wall,
+        first_batch_number,
+        last_batch_number,
+    ) {
+        let span_ms = last_instant
+            .duration_since(first_instant)
+            .as_secs_f64()
+            * 1000.0;
+
+        fn format_time_hhmmss_millis(ts: SystemTime) -> String {
+            match ts.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(dur) => {
+                    DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
+                        .map(|dt| dt.with_timezone(&Local))
+                        .unwrap_or_else(Local::now)
+                        .format("%Y-%m-%d %H:%M:%S%.3f")
+                        .to_string()
+                }
+                Err(_) => "invalid-system-time".to_string(),
+            }
+        }
+
+        let first_ts = format_time_hhmmss_millis(first_wall);
+        let last_ts = format_time_hhmmss_millis(last_wall);
+        eprintln!(
+            "[cycle] first tx included in block {} at {}",
+            first_block, first_ts
+        );
+        eprintln!(
+            "[cycle] last tx included in block {} at {}",
+            last_block, last_ts
+        );
+        eprintln!(
+            "[cycle] total span: {:.2} ms, {} blocks, {} total txs",
+            span_ms, batches.len(), num_included
+        );
+        
+        // Per-block statistics
+        const BLOCK_TIME_MS: f64 = 1000.0;
+        for (block_num, tx_count) in &batches {
+            let tps = *tx_count as f64 / BLOCK_TIME_MS * 1000.0;
+            eprintln!(
+                "[cycle] block {} generated with {} txs ({:.2} tps)",
+                block_num, tx_count, tps
+            );
         }
     }
 

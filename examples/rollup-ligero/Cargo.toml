@@ -45,6 +45,7 @@ ligero = { path = "./provers/ligero" }
 borsh = { workspace = true, features = ["bytes", "derive"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 axum = { workspace = true, default-features = false }
 jsonrpsee = { workspace = true, features = [
   "http-client",

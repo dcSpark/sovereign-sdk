@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
-futures = { workspace = true }
 
 # Web framework
 axum = { workspace = true, features = ["tokio", "http1", "http2"] }
@@ -49,6 +48,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { version = "1.1", default-features = false, features = [
     "sqlx-sqlite",
+    "sqlx-postgres",
     "runtime-tokio-rustls",
     "macros",
     "with-chrono",
