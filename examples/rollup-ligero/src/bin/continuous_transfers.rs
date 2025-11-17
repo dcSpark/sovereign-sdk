@@ -29,6 +29,7 @@ type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 const TREE_DEPTH: u8 = 16;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const NF_KEY: [u8; 32] = [4u8; 32];
+const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
@@ -39,6 +40,7 @@ struct ContinuousConfig {
     external_node_url: String,
     external_verifier_url: String,
     max_concurrent_proofs: usize,
+    detailed_wallet_logs: bool,
 }
 
 impl ContinuousConfig {
@@ -74,6 +76,11 @@ impl ContinuousConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(num_cpus::get);
 
+        let detailed_wallet_logs = std::env::var("DETAILED_WALLET_LOGS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Ok(Self {
             num_wallets,
             initial_deposit,
@@ -82,6 +89,7 @@ impl ContinuousConfig {
             external_node_url,
             external_verifier_url,
             max_concurrent_proofs,
+            detailed_wallet_logs,
         })
     }
 }
@@ -241,6 +249,7 @@ async fn main() -> Result<()> {
     }
 
     let node_base_url = config.external_node_url.clone();
+    let wallet_setup_start = Instant::now();
     let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
     for i in 0..config.num_wallets {
         let account = all_keypairs[i].clone();
@@ -253,10 +262,12 @@ async fn main() -> Result<()> {
                 )
             })?;
 
-        eprintln!(
-            "[setup] wallet {} address={} starting_nonce={}",
-            i, account.address, nonce
-        );
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "[setup] wallet {} address={} starting_nonce={}",
+                i, account.address, nonce
+            );
+        }
 
         wallets.push(WalletState {
             account,
@@ -266,6 +277,7 @@ async fn main() -> Result<()> {
             recipient: [0u8; 32],
         });
     }
+    let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
 
     // Optional initial deposits to create notes for each wallet
     if config.initial_deposit {
@@ -273,14 +285,31 @@ async fn main() -> Result<()> {
             "\n[setup] Performing initial deposits for {} wallets...",
             wallets.len()
         );
+        let deposit_start = Instant::now();
         perform_initial_deposits(
             &client,
             &http,
             &mut wallets,
             &chain_hash,
             config.per_tx_delay_ms,
+            config.detailed_wallet_logs,
         )
         .await?;
+        let deposit_ms = deposit_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_setup_ms = wallet_setup_ms + deposit_ms;
+        eprintln!(
+            "[setup] setup {} wallets in {:.2} ms",
+            config.num_wallets, wallet_setup_ms
+        );
+        eprintln!(
+            "[setup] deposited {} tokens in each wallet in {:.2} ms",
+            INITIAL_DEPOSIT_AMOUNT, deposit_ms
+        );
+        eprintln!(
+            "[setup] total time for initial setup (wallets + deposits): {:.2} ms",
+            total_setup_ms
+        );
     } else {
         bail!(
             "initial_deposit=false is not yet supported (script needs note secrets to spend). Enable INITIAL_DEPOSIT=1."
@@ -349,25 +378,24 @@ async fn main() -> Result<()> {
             "[cycle] Inclusion: {}/{} transfers included",
             summary.num_included, summary.num_transfers
         );
-        for (batch, count) in &summary.batches {
-            eprintln!("[cycle]   Batch {}: {} txs", batch, count);
+        for (block_number, count) in &summary.batches {
+            eprintln!("[cycle]   Block number {}: {} transfers", block_number, count);
         }
 
-        total_transfers += summary.num_transfers;
-        total_included += summary.num_included;
-        for (batch, count) in summary.batches {
-            *total_batches.entry(batch).or_insert(0) += count;
+        total_transfers += summary.num_transfers; total_included += summary.num_included;
+        for (block_number, count) in summary.batches {
+            *total_batches.entry(block_number).or_insert(0) += count;
         }
 
         eprintln!(
-            "[cycle] Timings: avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_ms={:.2}",
+            "[cycle] Worker breakdown: total_ms={:.2} proof_ms={:.2} db_ms={:.2} sequencer_submit_ms={:.2}",
             summary.avg_worker_ms,
             summary.avg_worker_proof_ms,
             summary.avg_worker_db_ms,
             summary.avg_sequencer_ms
         );
         eprintln!(
-            "[cycle] Sequencer breakdown: total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={:.2}",
+            "[cycle] Sequencer breakdown: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
             summary.avg_sequencer_ms,
             summary.avg_seq_decode_ms,
             summary.avg_seq_wrap_ms,
@@ -491,14 +519,14 @@ fn log_final_summary(
         0.0
     };
     eprintln!(
-        "[final-summary] avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_ms={:.2}",
+        "[final-summary] avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_submit_ms={:.2}",
         global_worker_avg,
         global_worker_proof_avg,
         global_worker_db_avg,
         global_sequencer_avg
     );
     eprintln!(
-        "[final-summary] sequencer_breakdown_ms: total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={:.2}",
+        "[final-summary] sequencer_breakdown_ms: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
         global_sequencer_avg,
         global_seq_decode_avg,
         global_seq_wrap_avg,
@@ -506,11 +534,11 @@ fn log_final_summary(
         global_seq_await_avg,
         global_seq_stf_avg,
     );
-    eprintln!("[final-summary] Batch distribution across all cycles:");
-    for (batch, count) in total_batches {
+    eprintln!("[final-summary] Block number distribution across all cycles:");
+    for (block_number, count) in total_batches {
         eprintln!(
-            "[final-summary]   Batch {:3}: {:3} txs",
-            batch, count
+            "[final-summary]   Block number {:3}: {:3} transfers",
+            block_number, count
         );
     }
     eprintln!("[final-summary] =================================\n");
@@ -558,9 +586,10 @@ async fn perform_initial_deposits(
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
     per_tx_delay_ms: u64,
+    detailed_wallet_logs: bool,
 ) -> Result<()> {
     for (i, wallet) in wallets.iter_mut().enumerate() {
-        let amount: u128 = 100;
+        let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
         let recipient: Hash32 = rand::random();
 
@@ -587,10 +616,12 @@ async fn perform_initial_deposits(
 
         let api_url = &client.base_url;
         let url = format!("{}/sequencer/txs", api_url.trim_end_matches('/'));
-        eprintln!(
-            "[deposit] wallet={} nonce={} amount={} url={}",
-            i, wallet.nonce, amount, url
-        );
+        if detailed_wallet_logs {
+            eprintln!(
+                "[deposit] wallet={} nonce={} amount={} url={}",
+                i, wallet.nonce, amount, url
+            );
+        }
 
         let resp = http
             .post(&url)
@@ -791,6 +822,7 @@ async fn perform_transfer_cycle(
         inputs.len(),
         config.max_concurrent_proofs
     );
+    let proof_generation_start = Instant::now();
 
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 
@@ -872,14 +904,17 @@ async fn perform_transfer_cycle(
         proofs.push(t.await??);
     }
 
+    let proof_generation_ms = proof_generation_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[cycle] Generated {} transfer proofs (one per wallet)",
-        proofs.len()
+        "[cycle] proof generation: generated {} transfer proofs (one per wallet) in {:.2} ms",
+        proofs.len(),
+        proof_generation_ms
     );
 
     // Build and send transfer transactions to verifier (deferred submission)
     let mut transfer_txs_b64: Vec<(usize, String)> = Vec::with_capacity(proofs.len());
     let mut transfer_hashes: Vec<String> = Vec::with_capacity(proofs.len());
+    let transfer_submit_start = Instant::now();
     for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
         let wallet = &mut wallets[wallet_idx];
 
@@ -909,14 +944,16 @@ async fn perform_transfer_cycle(
         let tx_hash = tx.hash().to_string();
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
 
-        eprintln!(
-            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
-            wallet_idx,
-            i + 1,
-            wallet.nonce,
-            tx_hash,
-            hex::encode(&nf[..8])
-        );
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
+                wallet_idx,
+                i + 1,
+                wallet.nonce,
+                tx_hash,
+                hex::encode(&nf[..8])
+            );
+        }
 
         transfer_hashes.push(tx_hash);
         wallet.nonce += 1;
@@ -966,25 +1003,32 @@ async fn perform_transfer_cycle(
         let m = vresp.metrics.clone();
         worker_metrics_by_hash.insert(worker_hash.clone(), m.clone());
 
-        eprintln!(
-            "    [timing][worker] wallet={} idx_in_cycle={} deserialize={:.2}ms parse={:.2}ms sig={:.2}ms proof={:.2}ms db={:.2}ms submit={:.2}ms total={:.2}ms",
-            wallet_idx,
-            display_idx,
-            m.deserialize_ms,
-            m.parse_ms,
-            m.signature_verify_ms,
-            m.proof_verify_ms,
-            m.tx_creation_ms,
-            m.node_submit_ms,
-            m.total_ms
-        );
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "    [timing][worker] wallet={} idx_in_cycle={} deserialize={:.2}ms parse={:.2}ms sig={:.2}ms proof={:.2}ms db={:.2}ms submit={:.2}ms total={:.2}ms",
+                wallet_idx,
+                display_idx,
+                m.deserialize_ms,
+                m.parse_ms,
+                m.signature_verify_ms,
+                m.proof_verify_ms,
+                m.tx_creation_ms,
+                m.node_submit_ms,
+                m.total_ms
+            );
+        }
 
         if config.per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(config.per_tx_delay_ms)).await;
         }
     }
 
-    eprintln!("[cycle] All transfers submitted to verifier.");
+    let transfer_submit_ms = transfer_submit_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[cycle] submitted {} transfers to verifier in {:.2} ms",
+        transfer_hashes.len(),
+        transfer_submit_ms
+    );
     // Interactive gate before flushing to the sequencer.
     wait_for_c_to_continue("[cycle] Ready to flush to sequencer.").ok();
     let flush_start = Instant::now();
@@ -1057,23 +1101,27 @@ async fn perform_transfer_cycle(
                     .stf_execution_ms
                     .map(|v| format!("{:.2}", v))
                     .unwrap_or_else(|| "n/a".to_string());
-                eprintln!(
-                    "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
-                    hash,
-                    b.total_ms,
-                    b.decode_ms,
-                    b.wrap_ms,
-                    b.submit_ms,
-                    b.await_ms,
-                    stf_str,
-                );
+                if config.detailed_wallet_logs {
+                    eprintln!(
+                        "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
+                        hash,
+                        b.total_ms,
+                        b.decode_ms,
+                        b.wrap_ms,
+                        b.submit_ms,
+                        b.await_ms,
+                        stf_str,
+                    );
+                }
                 sequencer_times_ms.insert(hash.clone(), b.total_ms);
                 sequencer_metrics_by_hash.insert(hash, b);
             } else if let Some(ms) = entry.sequencer_ms {
-                eprintln!(
-                    "    [timing][sequencer] tx={} total_ms={:.2}",
-                    hash, ms
-                );
+                if config.detailed_wallet_logs {
+                    eprintln!(
+                        "    [timing][sequencer] tx={} total_ms={:.2}",
+                        hash, ms
+                    );
+                }
                 sequencer_times_ms.insert(hash, ms);
             }
         }
