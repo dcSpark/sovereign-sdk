@@ -113,6 +113,29 @@ struct NotesResp {
 }
 
 #[derive(Deserialize, Clone)]
+struct VerifierMetrics {
+    deserialize_ms: f64,
+    parse_ms: f64,
+    signature_verify_ms: f64,
+    proof_verify_ms: f64,
+    tx_creation_ms: f64,
+    node_submit_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Deserialize)]
+struct VerifierResponse {
+    #[allow(dead_code)]
+    success: bool,
+    tx_hash: Option<String>,
+    #[allow(dead_code)]
+    sequencer_response: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    error: Option<String>,
+    metrics: VerifierMetrics,
+}
+
+#[derive(Deserialize, Clone)]
 struct RootsResp {
     recent_roots: Vec<Hash32>,
 }
@@ -122,6 +145,33 @@ struct CycleSummary {
     num_transfers: usize,
     num_included: usize,
     batches: BTreeMap<u64, usize>,
+    avg_worker_ms: f64,
+    avg_sequencer_ms: f64,
+    avg_worker_proof_ms: f64,
+    avg_worker_db_ms: f64,
+    avg_seq_decode_ms: f64,
+    avg_seq_wrap_ms: f64,
+    avg_seq_submit_ms: f64,
+    avg_seq_await_ms: f64,
+    avg_seq_stf_ms: f64,
+}
+
+fn wait_for_c_to_continue(prompt: &str) -> Result<()> {
+    use std::io::{Read, Write};
+
+    eprintln!("{}", prompt);
+    eprint!("Press 'c' then Enter to continue: ");
+    std::io::stdout().flush().ok();
+
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .context("Failed to read from stdin")?;
+
+    if !buf.trim().eq_ignore_ascii_case("c") {
+        eprintln!("Input was not 'c'; continuing anyway.");
+    }
+    Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -248,6 +298,17 @@ async fn main() -> Result<()> {
     let mut total_transfers: usize = 0;
     let mut total_included: usize = 0;
     let mut total_batches: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut total_worker_ms: f64 = 0.0;
+    let mut total_worker_proof_ms: f64 = 0.0;
+    let mut total_worker_db_ms: f64 = 0.0;
+    let mut total_worker_samples: usize = 0;
+    let mut total_sequencer_ms: f64 = 0.0;
+    let mut total_sequencer_samples: usize = 0;
+    let mut total_seq_decode_ms: f64 = 0.0;
+    let mut total_seq_wrap_ms: f64 = 0.0;
+    let mut total_seq_submit_ms: f64 = 0.0;
+    let mut total_seq_await_ms: f64 = 0.0;
+    let mut total_seq_stf_ms: f64 = 0.0;
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -258,7 +319,23 @@ async fn main() -> Result<()> {
 
         let summary = tokio::select! {
             _ = &mut shutdown => {
-                log_final_summary(cycle_idx - 1, total_transfers, total_included, &total_batches);
+                log_final_summary(
+                    cycle_idx - 1,
+                    total_transfers,
+                    total_included,
+                    &total_batches,
+                    total_worker_ms,
+                    total_worker_proof_ms,
+                    total_worker_db_ms,
+                    total_worker_samples,
+                    total_sequencer_ms,
+                    total_sequencer_samples,
+                    total_seq_decode_ms,
+                    total_seq_wrap_ms,
+                    total_seq_submit_ms,
+                    total_seq_await_ms,
+                    total_seq_stf_ms,
+                );
                 return Ok(());
             }
             res = perform_transfer_cycle(
@@ -286,18 +363,62 @@ async fn main() -> Result<()> {
         }
 
         eprintln!(
+            "[cycle] Timings: avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_ms={:.2}",
+            summary.avg_worker_ms,
+            summary.avg_worker_proof_ms,
+            summary.avg_worker_db_ms,
+            summary.avg_sequencer_ms
+        );
+        eprintln!(
+            "[cycle] Sequencer breakdown: total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={:.2}",
+            summary.avg_sequencer_ms,
+            summary.avg_seq_decode_ms,
+            summary.avg_seq_wrap_ms,
+            summary.avg_seq_submit_ms,
+            summary.avg_seq_await_ms,
+            summary.avg_seq_stf_ms,
+        );
+
+        // Accumulate global timing metrics, weighted by number of transfers
+        total_worker_ms += summary.avg_worker_ms * summary.num_transfers as f64;
+        total_worker_proof_ms += summary.avg_worker_proof_ms * summary.num_transfers as f64;
+        total_worker_db_ms += summary.avg_worker_db_ms * summary.num_transfers as f64;
+        total_worker_samples += summary.num_transfers;
+        total_sequencer_ms += summary.avg_sequencer_ms * summary.num_transfers as f64;
+        total_sequencer_samples += summary.num_transfers;
+        total_seq_decode_ms += summary.avg_seq_decode_ms * summary.num_transfers as f64;
+        total_seq_wrap_ms += summary.avg_seq_wrap_ms * summary.num_transfers as f64;
+        total_seq_submit_ms += summary.avg_seq_submit_ms * summary.num_transfers as f64;
+        total_seq_await_ms += summary.avg_seq_await_ms * summary.num_transfers as f64;
+        total_seq_stf_ms += summary.avg_seq_stf_ms * summary.num_transfers as f64;
+
+        eprintln!(
             "[summary] so far: cycles={} transfers={} included={}",
             cycle_idx, total_transfers, total_included
         );
 
-        eprintln!(
-            "[cycle] Sleeping {} ms before next cycle...",
-            config.cycle_delay_ms
-        );
+        // Interactive gate after each cycle summary.
+        wait_for_c_to_continue("[cycle] Cycle summary complete.").ok();
 
         tokio::select! {
             _ = &mut shutdown => {
-                log_final_summary(cycle_idx, total_transfers, total_included, &total_batches);
+                log_final_summary(
+                    cycle_idx,
+                    total_transfers,
+                    total_included,
+                    &total_batches,
+                    total_worker_ms,
+                    total_worker_proof_ms,
+                    total_worker_db_ms,
+                    total_worker_samples,
+                    total_sequencer_ms,
+                    total_sequencer_samples,
+                    total_seq_decode_ms,
+                    total_seq_wrap_ms,
+                    total_seq_submit_ms,
+                    total_seq_await_ms,
+                    total_seq_stf_ms,
+                );
                 return Ok(());
             }
             _ = sleep(Duration::from_millis(config.cycle_delay_ms)) => {}
@@ -310,11 +431,83 @@ fn log_final_summary(
     total_transfers: usize,
     total_included: usize,
     total_batches: &BTreeMap<u64, usize>,
+    total_worker_ms: f64,
+    total_worker_proof_ms: f64,
+    total_worker_db_ms: f64,
+    total_worker_samples: usize,
+    total_sequencer_ms: f64,
+    total_sequencer_samples: usize,
+    total_seq_decode_ms: f64,
+    total_seq_wrap_ms: f64,
+    total_seq_submit_ms: f64,
+    total_seq_await_ms: f64,
+    total_seq_stf_ms: f64,
 ) {
     eprintln!("\n[final-summary] =================================");
     eprintln!(
         "[final-summary] cycles={} total_transfers={} total_included={}",
         cycles, total_transfers, total_included
+    );
+    let global_worker_avg = if total_worker_samples > 0 {
+        total_worker_ms / total_worker_samples as f64
+    } else {
+        0.0
+    };
+    let global_sequencer_avg = if total_sequencer_samples > 0 {
+        total_sequencer_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_seq_decode_avg = if total_sequencer_samples > 0 {
+        total_seq_decode_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_seq_wrap_avg = if total_sequencer_samples > 0 {
+        total_seq_wrap_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_seq_submit_avg = if total_sequencer_samples > 0 {
+        total_seq_submit_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_seq_await_avg = if total_sequencer_samples > 0 {
+        total_seq_await_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_seq_stf_avg = if total_sequencer_samples > 0 {
+        total_seq_stf_ms / total_sequencer_samples as f64
+    } else {
+        0.0
+    };
+    let global_worker_proof_avg = if total_worker_samples > 0 {
+        total_worker_proof_ms / total_worker_samples as f64
+    } else {
+        0.0
+    };
+    let global_worker_db_avg = if total_worker_samples > 0 {
+        total_worker_db_ms / total_worker_samples as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[final-summary] avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_ms={:.2}",
+        global_worker_avg,
+        global_worker_proof_avg,
+        global_worker_db_avg,
+        global_sequencer_avg
+    );
+    eprintln!(
+        "[final-summary] sequencer_breakdown_ms: total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={:.2}",
+        global_sequencer_avg,
+        global_seq_decode_avg,
+        global_seq_wrap_avg,
+        global_seq_submit_avg,
+        global_seq_await_avg,
+        global_seq_stf_avg,
     );
     eprintln!("[final-summary] Batch distribution across all cycles:");
     for (batch, count) in total_batches {
@@ -584,6 +777,15 @@ async fn perform_transfer_cycle(
             num_transfers: 0,
             num_included: 0,
             batches: BTreeMap::new(),
+            avg_worker_ms: 0.0,
+            avg_sequencer_ms: 0.0,
+            avg_worker_proof_ms: 0.0,
+            avg_worker_db_ms: 0.0,
+            avg_seq_decode_ms: 0.0,
+            avg_seq_wrap_ms: 0.0,
+            avg_seq_submit_ms: 0.0,
+            avg_seq_await_ms: 0.0,
+            avg_seq_stf_ms: 0.0,
         });
     }
 
@@ -732,7 +934,10 @@ async fn perform_transfer_cycle(
         transfer_txs_b64.len()
     );
 
-    for (idx, (_wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
+    // Track per-tx worker processing metrics (from verifier)
+    let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
+
+    for (idx, (wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
         let display_idx = idx + 1;
         let resp = http
             .post(format!(
@@ -753,12 +958,39 @@ async fn perform_transfer_cycle(
             );
         }
 
+        // Parse verifier response to extract per-tx metrics
+        let vresp: VerifierResponse = serde_json::from_str(&body).context(format!(
+            "transfer #{}: failed to parse verifier JSON response",
+            display_idx
+        ))?;
+        let worker_hash = vresp
+            .tx_hash
+            .unwrap_or_else(|| transfer_hashes[idx].clone());
+        let m = vresp.metrics.clone();
+        worker_metrics_by_hash.insert(worker_hash.clone(), m.clone());
+
+        eprintln!(
+            "    [timing][worker] wallet={} idx_in_cycle={} deserialize={:.2}ms parse={:.2}ms sig={:.2}ms proof={:.2}ms db={:.2}ms submit={:.2}ms total={:.2}ms",
+            wallet_idx,
+            display_idx,
+            m.deserialize_ms,
+            m.parse_ms,
+            m.signature_verify_ms,
+            m.proof_verify_ms,
+            m.tx_creation_ms,
+            m.node_submit_ms,
+            m.total_ms
+        );
+
         if config.per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(config.per_tx_delay_ms)).await;
         }
     }
 
-    eprintln!("[cycle] All transfers submitted to verifier; flushing to sequencer...");
+    eprintln!("[cycle] All transfers submitted to verifier.");
+    // Interactive gate before flushing to the sequencer.
+    wait_for_c_to_continue("[cycle] Ready to flush to sequencer.").ok();
+    let flush_start = Instant::now();
     let resp = http
         .post(format!(
             "{}/midnight-privacy/flush",
@@ -775,12 +1007,98 @@ async fn perform_transfer_cycle(
             status, body
         );
     }
-    eprintln!("[cycle] Flush complete.");
+    let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
 
-    // After flush, verify inclusion and collect per-batch statistics
+    #[derive(Deserialize, Clone)]
+    struct SeqBreakdown {
+        decode_ms: f64,
+        wrap_ms: f64,
+        submit_ms: f64,
+        await_ms: f64,
+        total_ms: f64,
+        #[serde(default)]
+        stf_execution_ms: Option<f64>,
+    }
+
+    #[derive(Deserialize)]
+    struct FlushResultEntry {
+        tx_hash: Option<String>,
+        #[allow(dead_code)]
+        accepted: bool,
+        #[allow(dead_code)]
+        status: Option<u16>,
+        #[allow(dead_code)]
+        response: Option<serde_json::Value>,
+        #[allow(dead_code)]
+        error: Option<String>,
+        sequencer_ms: Option<f64>,
+        sequencer_breakdown: Option<SeqBreakdown>,
+    }
+
+    #[derive(Deserialize)]
+    struct FlushSummary {
+        flushed: usize,
+        accepted: usize,
+        rejected: usize,
+        results: Vec<FlushResultEntry>,
+    }
+
+    let flush: FlushSummary = serde_json::from_str(&body)
+        .context("Failed to parse flush JSON response")?;
+    eprintln!(
+        "[cycle] Flush complete. flushed={} accepted={} rejected={} flush_latency_ms={:.2}",
+        flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
+    );
+
+    // Track per-tx sequencer times and breakdown for this cycle
+    let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
+    let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
+    for entry in flush.results {
+        if let Some(hash) = entry.tx_hash {
+            if let Some(b) = entry.sequencer_breakdown {
+                let stf_str = b
+                    .stf_execution_ms
+                    .map(|v| format!("{:.2}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
+                eprintln!(
+                    "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
+                    hash,
+                    b.total_ms,
+                    b.decode_ms,
+                    b.wrap_ms,
+                    b.submit_ms,
+                    b.await_ms,
+                    stf_str,
+                );
+                sequencer_times_ms.insert(hash.clone(), b.total_ms);
+                sequencer_metrics_by_hash.insert(hash, b);
+            } else if let Some(ms) = entry.sequencer_ms {
+                eprintln!(
+                    "    [timing][sequencer] tx={} total_ms={:.2}",
+                    hash, ms
+                );
+                sequencer_times_ms.insert(hash, ms);
+            }
+        }
+    }
+
+    // After flush, verify inclusion and collect per-batch statistics and timing
     let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
     let mut num_included = 0usize;
     let num_transfers = transfer_hashes.len();
+
+    // Aggregate worker / sequencer timing for this cycle
+    let mut worker_sum_ms = 0.0f64;
+    let mut worker_count = 0usize;
+    let mut worker_proof_sum_ms = 0.0f64;
+    let mut worker_db_sum_ms = 0.0f64;
+    let mut sequencer_sum_ms = 0.0f64;
+    let mut sequencer_count = 0usize;
+    let mut seq_decode_sum_ms = 0.0f64;
+    let mut seq_wrap_sum_ms = 0.0f64;
+    let mut seq_submit_sum_ms = 0.0f64;
+    let mut seq_await_sum_ms = 0.0f64;
+    let mut seq_stf_sum_ms = 0.0f64;
 
     for hash_hex in &transfer_hashes {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -817,9 +1135,89 @@ async fn perform_transfer_cycle(
         }
     }
 
+    // Aggregate timing only for transfers we attempted this cycle
+    for hash in &transfer_hashes {
+        if let Some(m) = worker_metrics_by_hash.get(hash) {
+            worker_sum_ms += m.total_ms;
+            worker_proof_sum_ms += m.proof_verify_ms;
+            worker_db_sum_ms += m.tx_creation_ms;
+            worker_count += 1;
+        }
+        if let Some(b) = sequencer_metrics_by_hash.get(hash) {
+            sequencer_sum_ms += b.total_ms;
+            seq_decode_sum_ms += b.decode_ms;
+            seq_wrap_sum_ms += b.wrap_ms;
+            seq_submit_sum_ms += b.submit_ms;
+            seq_await_sum_ms += b.await_ms;
+            if let Some(stf) = b.stf_execution_ms {
+                seq_stf_sum_ms += stf;
+            }
+            sequencer_count += 1;
+        } else if let Some(ms) = sequencer_times_ms.get(hash) {
+            // Only total_ms is available (older sequencer)
+            sequencer_sum_ms += *ms;
+            sequencer_count += 1;
+        }
+    }
+
+    let avg_worker_ms = if worker_count > 0 {
+        worker_sum_ms / worker_count as f64
+    } else {
+        0.0
+    };
+    let avg_worker_proof_ms = if worker_count > 0 {
+        worker_proof_sum_ms / worker_count as f64
+    } else {
+        0.0
+    };
+    let avg_worker_db_ms = if worker_count > 0 {
+        worker_db_sum_ms / worker_count as f64
+    } else {
+        0.0
+    };
+    let avg_sequencer_ms = if sequencer_count > 0 {
+        sequencer_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+    let avg_seq_decode_ms = if sequencer_count > 0 {
+        seq_decode_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+    let avg_seq_wrap_ms = if sequencer_count > 0 {
+        seq_wrap_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+    let avg_seq_submit_ms = if sequencer_count > 0 {
+        seq_submit_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+    let avg_seq_await_ms = if sequencer_count > 0 {
+        seq_await_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+    let avg_seq_stf_ms = if sequencer_count > 0 {
+        seq_stf_sum_ms / sequencer_count as f64
+    } else {
+        0.0
+    };
+
     Ok(CycleSummary {
         num_transfers,
         num_included,
         batches,
+        avg_worker_ms,
+        avg_sequencer_ms,
+        avg_worker_proof_ms,
+        avg_worker_db_ms,
+        avg_seq_decode_ms,
+        avg_seq_wrap_ms,
+        avg_seq_submit_ms,
+        avg_seq_await_ms,
+        avg_seq_stf_ms,
     })
 }

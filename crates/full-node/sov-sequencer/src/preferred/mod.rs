@@ -65,9 +65,9 @@ use tracing::{debug, error, info, trace};
 use transaction_subscriptions::TransactionCache;
 
 use crate::common::{
-    error_not_fully_synced, generic_accept_tx_error, loop_send_tx_notifications, poll_state_update,
-    AcceptedTx, Sequencer, SequencerEventStream, StateUpdateError, StateUpdateNotification,
-    WithCachedTxHashes,
+    cache_sequencer_metrics, error_not_fully_synced, generic_accept_tx_error,
+    loop_send_tx_notifications, poll_state_update, AcceptedTx, Sequencer, SequencerEventStream,
+    SequencerMetrics, StateUpdateError, StateUpdateNotification, WithCachedTxHashes,
 };
 use crate::metrics::{track_in_progress_batch_size, PreferredSequencerFetchBatchesToReplayMetrics};
 use crate::preferred::block_executor::{RollupBlockExecutor, RollupBlockExecutorError};
@@ -973,6 +973,8 @@ where
 
         // Skip transaction decoding and delay logic - worker has already validated
         // Directly submit to the state updator
+        let start = std::time::Instant::now();
+        let submit_start = std::time::Instant::now();
         let res = match self
             .synchronized_state_updator
             .accept_tx_msg(
@@ -993,15 +995,17 @@ where
                 ));
             }
         };
+        let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
 
-        match res {
+        let await_start = std::time::Instant::now();
+        let result = match res {
             Ok(rx) => rx.await.map_err(database_error_500),
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => {
                     return Err(sequencer_overloaded_503());
                 }
                 AcceptTxError::NotFullySynced(details) => {
-                    return Err(error_not_fully_synced(details))
+                    return Err(error_not_fully_synced(details));
                 }
                 AcceptTxError::BatchError {
                     batch_creation_error,
@@ -1041,7 +1045,7 @@ where
                         current_batch_size,
                         max_batch_size,
                         baked_tx.data.len(),
-                    ))
+                    ));
                 }
                 AcceptTxError::ExecutorError(err) => {
                     return Err(RollupBlockExecutorError::into_http_error(err));
@@ -1051,7 +1055,41 @@ where
                     return Err(shut_down_error());
                 }
             },
+        };
+
+        let await_ms = await_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let stf_execution_ms = result
+            .as_ref()
+            .ok()
+            .map(|accepted| accepted.confirmation.stf_execution_time_micros as f64 / 1000.0);
+
+        tracing::info!(
+            %tx_hash,
+            decode_ms = "0.00",
+            wrap_ms = "0.00",
+            submit_ms = format!("{:.2}", submit_ms),
+            await_ms = format!("{:.2}", await_ms),
+            total_ms = format!("{:.2}", total_ms),
+            stf_execution_ms = stf_execution_ms
+                .map(|ms| format!("{:.2}", ms))
+                .unwrap_or_else(|| "n/a".to_string()),
+            "⏱️  PreferredSequencer::accept_worker_verified_tx breakdown (LIGHTWEIGHT PATH)"
+        );
+
+        if result.is_ok() {
+            let metrics = SequencerMetrics {
+                decode_ms: 0.0,
+                wrap_ms: 0.0,
+                submit_ms,
+                await_ms,
+                total_ms,
+                stf_execution_ms,
+            };
+            cache_sequencer_metrics(tx_hash, metrics);
         }
+
+        result
     }
 
     #[tracing::instrument(skip_all, level = "trace", fields(tx_hash = %tx_hash))]
@@ -1256,6 +1294,18 @@ where
             "⏱️  PreferredSequencer::accept_pre_authenticated_tx breakdown"
         );
 
+        if result.is_ok() {
+            let metrics = SequencerMetrics {
+                decode_ms: deserialize_ms,
+                wrap_ms: reconstruct_ms,
+                submit_ms,
+                await_ms,
+                total_ms,
+                stf_execution_ms,
+            };
+            cache_sequencer_metrics(tx_hash, metrics);
+        }
+
         result
     }
 
@@ -1377,6 +1427,18 @@ where
                 .unwrap_or_else(|| "n/a".to_string()),
             "⏱️  PreferredSequencer::accept_serialized_pre_authenticated_tx breakdown (OPTIMIZED PATH)"
         );
+
+        if result.is_ok() {
+            let metrics = SequencerMetrics {
+                decode_ms,
+                wrap_ms,
+                submit_ms,
+                await_ms,
+                total_ms,
+                stf_execution_ms,
+            };
+            cache_sequencer_metrics(tx_hash, metrics);
+        }
 
         result
     }

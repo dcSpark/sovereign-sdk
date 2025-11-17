@@ -34,7 +34,9 @@ use sov_rollup_interface::TxHash;
 use tokio::sync::watch::Receiver;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::common::{error_not_fully_synced, AcceptedTx, Sequencer};
+use crate::common::{
+    error_not_fully_synced, take_sequencer_metrics, AcceptedTx, Sequencer, SequencerMetrics,
+};
 use crate::TxStatus;
 
 /// [`StartFrom`] is used as a query parameter for the txs subscription
@@ -244,8 +246,8 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
     /// 1. **Avoids reading large proof blob**: Uses `lightweight_transaction_blob` column
     ///    instead of `full_transaction_blob` (which contains ~3MB Ligero proof)
     /// 2. **Uses pre-computed hash**: Reads `tx_hash` from database instead of recomputing
-    /// 3. **Specialized accept path**: Calls `accept_worker_verified_tx` which skips
-    ///    transaction decoding and delay logic since verification is already done
+    /// 3. **Specialized accept path**: Calls `accept_serialized_pre_authenticated_tx` which skips
+    ///    decoding the large proof blob and re-authentication since verification is already done
     ///
     /// The proof outputs are cached for the runtime to use during execution, allowing
     /// the transaction to execute without re-verifying the proof.
@@ -290,267 +292,25 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             .map_err(|_| errors::bad_request_400("Invalid tx_hash length", "Expected 32 bytes"))?;
         let tx_hash_value = TxHash::from(tx_hash_array);
 
-        // Define WorkerTxIntent enum for both paths
+        // Require the optimized serialized pre-auth path; do not fall back to other paths.
+        let serialized_tx_base64 = match &model.serialized_tx_base64 {
+            Some(v) => v,
+            None => {
+                return Err(errors::bad_request_400(
+                    "Missing serialized_tx_base64",
+                    "Worker-verified transaction must include serialized_tx_base64 for optimized sequencer path",
+                ))
+            }
+        };
+
+        tracing::info!(%tx_hash_value, "Using OPTIMIZED pre-authenticated path (serialized tx, no blob, no auth)");
+
+        // Decide intent based on parsed transaction data and proof outputs.
         enum WorkerTxIntent {
             Deposit,
             Transfer { proof_outputs: SpendPublic },
             Withdraw { proof_outputs: SpendPublic },
         }
-
-        // OPTIMIZATION: Check if we have the fully serialized transaction (fastest path)
-        // This avoids deserialization + reconstruction overhead (~12-15ms saved)
-        if let Some(serialized_tx_base64) = &model.serialized_tx_base64 {
-            tracing::info!(%tx_hash_value, "Using OPTIMIZED pre-authenticated path (serialized tx, no blob, no auth)");
-            
-            // Track nullifier for cleanup
-            let mut withdraw_nullifier_opt: Option<midnight_privacy::Hash32> = None;
-            
-            // Extract proof outputs for withdraw/transfer transactions
-            let worker_tx_intent = if transaction_data
-                .get("withdraw")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                let proof_outputs: SpendPublic =
-                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
-                        errors::bad_request_400("Failed to parse proof outputs", err)
-                    })?;
-                
-                // Store nullifier for cleanup
-                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
-                
-                // Cache the pre-verified proof for midnight-privacy module
-                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-                
-                WorkerTxIntent::Withdraw { proof_outputs }
-            } else if transaction_data
-                .get("transfer")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                let proof_outputs: SpendPublic =
-                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
-                        errors::bad_request_400("Failed to parse proof outputs", err)
-                    })?;
-                // Store nullifier for cleanup
-                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
-                // Cache the pre-verified proof for midnight-privacy module
-                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-                WorkerTxIntent::Transfer { proof_outputs }
-            } else if transaction_data
-                .get("deposit")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                WorkerTxIntent::Deposit
-            } else {
-                return Err(errors::bad_request_400(
-                    "Unsupported transaction",
-                    "Only deposit, transfer or withdraw transactions can use this endpoint",
-                ));
-            };
-
-            // Use the OPTIMIZED path - decode serialized transaction directly
-            let result = match worker_tx_intent {
-                WorkerTxIntent::Withdraw { proof_outputs } => {
-                    let proof_outputs_clone = proof_outputs.clone();
-                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
-                    let sequencer = state.sequencer.clone();
-                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                        sequencer
-                            .accept_serialized_pre_authenticated_tx(
-                                serialized_tx_base64.clone(),
-                                tx_hash_value,
-                            )
-                            .await
-                    })
-                    .await
-                }
-                WorkerTxIntent::Transfer { proof_outputs } => {
-                    let proof_outputs_clone = proof_outputs.clone();
-                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
-                    let sequencer = state.sequencer.clone();
-                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                        sequencer
-                            .accept_serialized_pre_authenticated_tx(
-                                serialized_tx_base64.clone(),
-                                tx_hash_value,
-                            )
-                            .await
-                    })
-                    .await
-                }
-                WorkerTxIntent::Deposit => {
-                    state
-                        .sequencer
-                        .accept_serialized_pre_authenticated_tx(
-                            serialized_tx_base64.clone(),
-                            tx_hash_value,
-                        )
-                        .await
-                }
-            };
-
-            let tx_with_hash = result.map_err(|e| {
-                crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-                // Do not clear the pre-verified spend here; allow STF to consume it.
-                if e.status.is_server_error() {
-                    tracing::error!(error = ?e, "Error accepting optimized pre-authenticated transaction");
-                }
-                IntoResponse::into_response(e)
-            })?;
-
-            let tx_hash_final = tx_with_hash.tx_hash;
-            let confirmation = tx_with_hash.confirmation;
-            crate::common::remove_pre_verified_withdraw(&tx_hash_final);
-            // Do not clear the pre-verified spend here; allow STF to consume it.
-
-            return Ok(TxInfoWithConfirmation {
-                id: tx_hash_final,
-                confirmation,
-                status: TxStatus::Submitted,
-            }
-            .into());
-        }
-        
-        // FALLBACK: Check if we have pre-authenticated component data (original path)
-        // This path reconstructs the transaction from components
-        if let (Some(pub_key_hex), Some(signature_hex), Some(uniqueness_hex), Some(details_hex), Some(runtime_call_hex)) = 
-            (&model.pub_key_hex, &model.signature_hex, &model.uniqueness_hex, &model.details_hex, &model.runtime_call_hex) {
-            
-            tracing::info!(%tx_hash_value, "Using pre-authenticated path with component reconstruction (no blob, no auth)");
-            
-            // Track nullifier for cleanup
-            let mut withdraw_nullifier_opt: Option<midnight_privacy::Hash32> = None;
-            
-            // Extract proof outputs for withdraw/transfer transactions
-            let worker_tx_intent = if transaction_data
-                .get("withdraw")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                let proof_outputs: SpendPublic =
-                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
-                        errors::bad_request_400("Failed to parse proof outputs", err)
-                    })?;
-                
-                // Store nullifier for cleanup
-                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
-                
-                // Cache the pre-verified proof for midnight-privacy module
-                // This prevents re-verification during execution
-                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-                
-                WorkerTxIntent::Withdraw { proof_outputs }
-            } else if transaction_data
-                .get("transfer")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                let proof_outputs: SpendPublic =
-                    serde_json::from_str(&model.proof_outputs).map_err(|err| {
-                        errors::bad_request_400("Failed to parse proof outputs", err)
-                    })?;
-                // Store nullifier for cleanup
-                withdraw_nullifier_opt = Some(proof_outputs.nullifier);
-                // Cache the pre-verified proof for midnight-privacy module
-                midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-                WorkerTxIntent::Transfer { proof_outputs }
-            } else if transaction_data
-                .get("deposit")
-                .and_then(|v| v.as_object())
-                .is_some()
-            {
-                WorkerTxIntent::Deposit
-            } else {
-                return Err(errors::bad_request_400(
-                    "Unsupported transaction",
-                    "Only deposit, transfer or withdraw transactions can use this endpoint",
-                ));
-            };
-
-            // Use the pre-authenticated path - no blob transfer, no signature verification
-            let result = match worker_tx_intent {
-                WorkerTxIntent::Withdraw { proof_outputs } => {
-                    let proof_outputs_clone = proof_outputs.clone();
-                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
-                    let sequencer = state.sequencer.clone();
-                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                        sequencer
-                            .accept_pre_authenticated_tx(
-                                pub_key_hex.clone(),
-                                signature_hex.clone(),
-                                uniqueness_hex.clone(),
-                                details_hex.clone(),
-                                runtime_call_hex.clone(),
-                                tx_hash_value,
-                            )
-                            .await
-                    })
-                    .await
-                }
-                WorkerTxIntent::Transfer { proof_outputs } => {
-                    let proof_outputs_clone = proof_outputs.clone();
-                    crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
-                    let sequencer = state.sequencer.clone();
-                    crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                        sequencer
-                            .accept_pre_authenticated_tx(
-                                pub_key_hex.clone(),
-                                signature_hex.clone(),
-                                uniqueness_hex.clone(),
-                                details_hex.clone(),
-                                runtime_call_hex.clone(),
-                                tx_hash_value,
-                            )
-                            .await
-                    })
-                    .await
-                }
-                WorkerTxIntent::Deposit => {
-                    state
-                        .sequencer
-                        .accept_pre_authenticated_tx(
-                            pub_key_hex.clone(),
-                            signature_hex.clone(),
-                            uniqueness_hex.clone(),
-                            details_hex.clone(),
-                            runtime_call_hex.clone(),
-                            tx_hash_value,
-                        )
-                        .await
-                }
-            };
-
-            let tx_with_hash = result.map_err(|e| {
-                crate::common::remove_pre_verified_withdraw(&tx_hash_value);
-                // Do not clear the pre-verified spend here; allow STF to consume it.
-                if e.status.is_server_error() {
-                    tracing::error!(error = ?e, "Error accepting pre-authenticated transaction");
-                }
-                IntoResponse::into_response(e)
-            })?;
-
-            let tx_hash_final = tx_with_hash.tx_hash;
-            let confirmation = tx_with_hash.confirmation;
-            crate::common::remove_pre_verified_withdraw(&tx_hash_final);
-            // Do not clear the pre-verified spend here; allow STF to consume it.
-
-            return Ok(TxInfoWithConfirmation {
-                id: tx_hash_final,
-                confirmation,
-                status: TxStatus::Submitted,
-            }
-            .into());
-        }
-
-        // Fallback: use full transaction blob (for transactions without pre-authenticated data)
-        tracing::info!(%tx_hash_value, "Using full blob path (pre-authenticated data not available)");
-        let raw_tx_bytes = base64::engine::general_purpose::STANDARD
-            .decode(model.full_transaction_blob.as_bytes())
-            .map_err(|err| errors::bad_request_400("Invalid base64 transaction blob", err))?;
-
-        let mut withdraw_nullifier: Option<midnight_privacy::Hash32> = None;
 
         let worker_tx_intent = if let Some(withdraw) =
             transaction_data.get("withdraw").and_then(|v| v.as_object())
@@ -621,8 +381,6 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
 
             midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-            withdraw_nullifier = Some(nullifier_array);
-
             WorkerTxIntent::Withdraw { proof_outputs }
         } else if let Some(transfer) =
             transaction_data.get("transfer").and_then(|v| v.as_object())
@@ -683,8 +441,6 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
 
             midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
-            withdraw_nullifier = Some(nullifier_array);
-
             WorkerTxIntent::Transfer { proof_outputs }
         } else if transaction_data
             .get("deposit")
@@ -706,66 +462,52 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             ));
         };
 
-        let raw_tx = RawTx::new(raw_tx_bytes);
-        let baked_tx = <<Seq::Rt as Runtime<Seq::Spec>>::Auth as TransactionAuthenticator<
-            Seq::Spec,
-        >>::encode_with_standard_auth(raw_tx);
-
-        // Parse the pre-computed tx_hash from the database (stored as hex string with "0x" prefix)
-        let tx_hash_hex = model.tx_hash.trim_start_matches("0x");
-        let tx_hash_bytes = Vec::from_hex(tx_hash_hex)
-            .map_err(|err| errors::bad_request_400("Invalid tx_hash in database", err))?;
-        let tx_hash_array: [u8; 32] = tx_hash_bytes
-            .try_into()
-            .map_err(|_| errors::bad_request_400("Invalid tx_hash length", "Expected 32 bytes"))?;
-        let tx_hash = TxHash::from(tx_hash_array);
-
-        // Mark transaction as pre-authenticated to skip signature verification
-        crate::common::mark_tx_pre_authenticated(tx_hash);
-
-        let mut baked_tx = Some(baked_tx);
+        // Use the OPTIMIZED path - decode serialized transaction directly
         let result = match worker_tx_intent {
             WorkerTxIntent::Withdraw { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_withdraw(tx_hash.clone(), proof_outputs_clone);
+                crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
                 let sequencer = state.sequencer.clone();
-                let baked_tx = baked_tx
-                    .take()
-                    .expect("baked transaction should be available for withdraw");
-                let tx_hash_clone = tx_hash.clone();
                 crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                    sequencer.accept_worker_verified_tx(baked_tx, tx_hash_clone, true).await
+                    sequencer
+                        .accept_serialized_pre_authenticated_tx(
+                            serialized_tx_base64.clone(),
+                            tx_hash_value,
+                        )
+                        .await
                 })
                 .await
             }
             WorkerTxIntent::Transfer { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_withdraw(tx_hash.clone(), proof_outputs_clone);
+                crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
                 let sequencer = state.sequencer.clone();
-                let baked_tx = baked_tx
-                    .take()
-                    .expect("baked transaction should be available for transfer");
-                let tx_hash_clone = tx_hash.clone();
                 crate::common::with_pre_verified_withdraw(proof_outputs, async move {
-                    sequencer.accept_worker_verified_tx(baked_tx, tx_hash_clone, true).await
+                    sequencer
+                        .accept_serialized_pre_authenticated_tx(
+                            serialized_tx_base64.clone(),
+                            tx_hash_value,
+                        )
+                        .await
                 })
                 .await
             }
             WorkerTxIntent::Deposit => {
                 let sequencer = state.sequencer.clone();
-                let baked_tx = baked_tx
-                    .take()
-                    .expect("baked transaction should be available for deposit");
-                let tx_hash_clone = tx_hash.clone();
-                sequencer.accept_worker_verified_tx(baked_tx, tx_hash_clone, false).await
+                sequencer
+                    .accept_serialized_pre_authenticated_tx(
+                        serialized_tx_base64.clone(),
+                        tx_hash_value,
+                    )
+                    .await
             }
         };
 
         let tx_with_hash = match result {
             Ok(res) => res,
             Err(e) => {
-                crate::common::clear_tx_pre_authenticated(&tx_hash);
-                crate::common::remove_pre_verified_withdraw(&tx_hash);
+                crate::common::clear_tx_pre_authenticated(&tx_hash_value);
+                crate::common::remove_pre_verified_withdraw(&tx_hash_value);
                 // Do not clear the pre-verified spend here; allow STF to consume it.
                 if e.status.is_server_error() {
                     tracing::error!(error = ?e, "Error accepting worker transaction");
@@ -776,10 +518,12 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
         let tx_hash_value = tx_with_hash.tx_hash.clone();
         let confirmation = tx_with_hash.confirmation;
+        let sequencer_metrics = take_sequencer_metrics(&tx_hash_value);
         let response_payload = TxInfoWithConfirmation {
             id: tx_hash_value.clone(),
             confirmation,
             status: TxStatus::Submitted,
+            sequencer_metrics,
         };
 
         let serialized_response = serde_json::to_string(&response_payload).map_err(|err| {
@@ -837,6 +581,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             id: tx_with_hash.tx_hash,
             confirmation: tx_with_hash.confirmation,
             status: TxStatus::Submitted,
+            sequencer_metrics: None,
         }
         .into())
     }
@@ -1036,6 +781,9 @@ pub struct TxInfoWithConfirmation<DaTransactionId, Confirmation> {
     pub confirmation: Confirmation,
     #[serde(flatten)]
     pub status: TxStatus<DaTransactionId>,
+    /// Optional sequencer timing metrics for this transaction (when available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequencer_metrics: Option<SequencerMetrics>,
 }
 
 /// An accepted transaction, with the transaction body and confirmation data.

@@ -40,7 +40,7 @@ struct Args {
     #[arg(long, default_value = "4321")]
     chain_id: u64,
 
-    /// Maximum number of concurrent proof verifications
+    /// Maximum number of concurrent proof verifications (DEPRECATED - no longer used)
     #[arg(long, default_value = "10")]
     max_concurrent: usize,
 
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     info!("Starting proof verifier service");
     info!("Bind address: {}", args.bind);
     info!("Node RPC URL: {}", args.node_rpc_url);
-    info!("Max concurrent verifications: {}", args.max_concurrent);
+    info!("Proof verifications spawn dedicated OS threads (unlimited parallelism)");
     info!("MockDA DB: {}", args.da_db);
     info!("Defer submission: {}", args.defer_submission);
 

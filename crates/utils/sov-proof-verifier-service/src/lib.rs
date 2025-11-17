@@ -14,6 +14,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
+use futures::future::join_all;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
     Database, DatabaseConnection, EntityTrait, QueryFilter,
@@ -35,7 +36,7 @@ use sov_rollup_interface::{
     zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
 };
 use std::{path::{Path, PathBuf}, sync::Arc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
@@ -70,7 +71,8 @@ pub struct ServiceConfig {
     /// Ligero method ID for midnight note_spend_guest proof verification
     /// If None, it will be computed from the note_spend_guest.wasm program
     pub midnight_method_id: Option<[u8; 32]>,
-    /// Maximum number of concurrent verification tasks
+    /// Maximum number of concurrent verification tasks (DEPRECATED - no longer used)
+    /// Verifications now run fully in parallel without artificial limits
     pub max_concurrent_verifications: usize,
     /// Chain ID for transaction authentication
     pub chain_id: u64,
@@ -87,14 +89,14 @@ pub struct AppState {
     config: Arc<ServiceConfig>,
     node_client: NodeClient,
     http_client: reqwest::Client,
-    /// Semaphore to limit concurrent verifications
-    verification_semaphore: Arc<tokio::sync::Semaphore>,
     /// Local nonce counter (synchronized across all requests)
     nonce_counter: Arc<tokio::sync::Mutex<Option<u64>>>,
     /// Cached signing key (loaded once at startup)
     signing_key: Arc<<<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey>,
     /// Connection to the MockDA database shared with the rollup node
     da_conn: Arc<DatabaseConnection>,
+    /// Cached Ligero environment (set once at startup to avoid repeated filesystem lookups)
+    _ligero_env_configured: (),
 }
 
 impl AppState {
@@ -122,7 +124,6 @@ impl AppState {
             );
         }
 
-        let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
 
         // Load signing key once at startup
@@ -214,14 +215,20 @@ impl AppState {
         
         info!("✓ Connected to MockDA database (busy_timeout applied per-connection)");
 
+        // Configure Ligero environment ONCE at startup to avoid repeated filesystem lookups
+        // and unsafe concurrent env var modifications
+        configure_ligero_env_for_value_setter().context("Failed to configure Ligero env for value-setter")?;
+        configure_ligero_env_for_midnight().context("Failed to configure Ligero env for midnight")?;
+        info!("✓ Configured Ligero environment variables");
+
         Ok(Self {
             config: Arc::new(config),
             node_client,
             http_client: reqwest::Client::new(),
-            verification_semaphore: Arc::new(tokio::sync::Semaphore::new(max_permits)),
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
             da_conn: Arc::new(da_conn),
+            _ligero_env_configured: (),
         })
     }
 }
@@ -453,8 +460,12 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut results = Vec::new();
-    for h in handles {
-        match h.await {
+    
+    // Await all handles in parallel
+    let all_results = join_all(handles).await;
+    
+    for outcome in all_results {
+        match outcome {
             Ok((txh, Ok(outcome))) => {
                 if outcome.accepted { accepted += 1; } else { rejected += 1; }
                 results.push(serde_json::json!({
@@ -462,6 +473,9 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
                     "accepted": outcome.accepted,
                     "status": outcome.status_code,
                     "response": outcome.response_json,
+                    // Prefer internal sequencer processing time if available; fall back to HTTP latency.
+                    "sequencer_ms": outcome.internal_ms.unwrap_or(outcome.latency_ms),
+                    "sequencer_breakdown": outcome.internal_breakdown,
                 }));
             }
             Ok((txh, Err(err))) => {
@@ -500,15 +514,6 @@ async fn verify_and_submit_handler(
     let mut metrics = VerificationMetrics::default();
 
     info!("Received verification request");
-
-    // Acquire semaphore permit to limit concurrent verifications
-    let _permit = state
-        .verification_semaphore
-        .acquire()
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Semaphore error: {}", e)))?;
-
-    debug!("Acquired verification permit, starting processing");
 
     // Step 1: Decode the base64 transaction bytes
     let decode_start = std::time::Instant::now();
@@ -573,12 +578,6 @@ async fn verify_and_record_midnight_handler(
 
     info!("Received midnight transaction verification request");
 
-    let _permit = state
-        .verification_semaphore
-        .acquire()
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Semaphore error: {}", e)))?;
-
     let decode_start = std::time::Instant::now();
     let tx_bytes = BASE64_STANDARD
         .decode(&req.body)
@@ -614,17 +613,26 @@ async fn verify_and_record_midnight_handler(
             let persist_start = std::time::Instant::now();
             // Deposits don't need pre-authenticated optimization (no proof to strip)
             // Use standard path for deposits
-            store_verified_midnight_transaction(
-                state.da_conn.as_ref(),
-                &tx_hash,
-                None, // No proof outputs for deposits
-                true, // signature_valid
-                None, // proof_verified: NULL (transaction doesn't have a proof)
-                &transaction_data,
-                &req.body,
-                None, // No pre-auth data - deposits use standard path
-            )
-            .await?;
+            
+            // Spawn database write in background to avoid serialization bottleneck
+            let conn = state.da_conn.clone();
+            let tx_hash_clone = tx_hash.clone();
+            let transaction_data_clone = transaction_data.clone();
+            let body_clone = req.body.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store_verified_midnight_transaction(
+                    conn.as_ref(),
+                    &tx_hash_clone,
+                    None, // No proof outputs for deposits
+                    true, // signature_valid
+                    None, // proof_verified: NULL (transaction doesn't have a proof)
+                    &transaction_data_clone,
+                    &body_clone,
+                    None, // No pre-auth data - deposits use standard path
+                ).await {
+                    error!("Failed to store verified transaction {}: {}", tx_hash_clone, e);
+                }
+            });
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             metrics.proof_verify_ms = 0.0;
 
@@ -705,17 +713,25 @@ async fn verify_and_record_midnight_handler(
                 }
             };
 
-            store_verified_midnight_transaction(
-                state.da_conn.as_ref(),
-                &tx_hash,
-                Some(&proof_public), // Proof outputs from verification
-                true,                 // signature_valid
-                Some(true),          // proof_verified: true
-                &transaction_data,
-                &req.body,
-                pre_auth_data,
-            )
-            .await?;
+            // Spawn database write in background to avoid serialization bottleneck
+            let conn = state.da_conn.clone();
+            let tx_hash_clone = tx_hash.clone();
+            let transaction_data_clone = transaction_data.clone();
+            let body_clone = req.body.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store_verified_midnight_transaction(
+                    conn.as_ref(),
+                    &tx_hash_clone,
+                    Some(&proof_public),
+                    true,
+                    Some(true),
+                    &transaction_data_clone,
+                    &body_clone,
+                    pre_auth_data,
+                ).await {
+                    error!("Failed to store verified transaction {}: {}", tx_hash_clone, e);
+                }
+            });
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             info!(
                 "✓ Stored verified midnight transfer: nullifier=0x{}, anchor_root=0x{}, hash={}",
@@ -795,17 +811,26 @@ async fn verify_and_record_midnight_handler(
                     None
                 }
             };
-            store_verified_midnight_transaction(
-                state.da_conn.as_ref(),
-                &tx_hash,
-                Some(&proof_public), // Proof outputs from verification
-                true,                 // signature_valid
-                Some(true),          // proof_verified: true (has proof and verified correctly)
-                &transaction_data,
-                &req.body,
-                pre_auth_data,
-            )
-            .await?;
+            
+            // Spawn database write in background to avoid serialization bottleneck
+            let conn = state.da_conn.clone();
+            let tx_hash_clone = tx_hash.clone();
+            let transaction_data_clone = transaction_data.clone();
+            let body_clone = req.body.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store_verified_midnight_transaction(
+                    conn.as_ref(),
+                    &tx_hash_clone,
+                    Some(&proof_public),
+                    true,
+                    Some(true),
+                    &transaction_data_clone,
+                    &body_clone,
+                    pre_auth_data,
+                ).await {
+                    error!("Failed to store verified transaction {}: {}", tx_hash_clone, e);
+                }
+            });
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             info!(
                 "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}",
@@ -971,11 +996,14 @@ async fn verify_ligero_proof(
     })?;
     let method_id = LigeroCodeCommitment(method_id_bytes);
 
-    // Spawn blocking task for CPU-intensive proof verification
+    // Spawn a real OS thread for CPU-intensive synchronous work
+    // This bypasses Tokio's worker thread pool entirely
     let proof = proof.to_vec();
-    let result = tokio::task::spawn_blocking(move || {
-        // Set environment variables for value_validator.wasm verification
-        configure_ligero_env_for_value_setter()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), ServiceError> {
+            // Environment variables already configured at startup, no need to set them here
         
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
             .map_err(|err| {
@@ -996,20 +1024,24 @@ async fn verify_ligero_proof(
         let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
             .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
 
-        // Check that the public output matches the claimed value
-        if public.value != value {
-            return Err(ServiceError::ProofError(format!(
-                "Value mismatch: claimed={}, verified={}",
-                value, public.value
-            )));
-        }
+            // Check that the public output matches the claimed value
+            if public.value != value {
+                return Err(ServiceError::ProofError(format!(
+                    "Value mismatch: claimed={}, verified={}",
+                    value, public.value
+                )));
+            }
 
-        Ok(())
-    })
-    .await
-    .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?;
+            Ok(())
+        })();
+        
+        // Send result back through channel (ignore send errors if receiver dropped)
+        let _ = tx.send(result);
+    });
 
-    result
+    // Wait for thread to complete
+    rx.await
+        .map_err(|_| ServiceError::Internal("Verification thread panicked".to_string()))?
 }
 
 /// Create and sign a non-ZK value-setter transaction
@@ -1260,9 +1292,13 @@ pub async fn verify_midnight_withdraw_proof(
     let method_id = LigeroCodeCommitment(*method_id_bytes);
     let proof_vec = proof.to_vec();
 
-    tokio::task::spawn_blocking(move || {
-        // Set environment variables for note_spend_guest.wasm verification
-        configure_ligero_env_for_midnight()?;
+    // Spawn a real OS thread for CPU-intensive synchronous work
+    // This bypasses Tokio's worker thread pool entirely
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    std::thread::spawn(move || {
+        let result = (|| -> Result<SpendPublic, ServiceError> {
+            // Environment variables already configured at startup, no need to set them here
         
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
             .map_err(|err| {
@@ -1296,17 +1332,23 @@ pub async fn verify_midnight_withdraw_proof(
                 hex::encode(public.nullifier)
             )));
         }
-        if public.withdraw_amount != expected_withdraw_amount {
-            return Err(ServiceError::ProofError(format!(
-                "Withdraw amount mismatch: expected {}, proof {}",
-                expected_withdraw_amount, public.withdraw_amount
-            )));
-        }
+            if public.withdraw_amount != expected_withdraw_amount {
+                return Err(ServiceError::ProofError(format!(
+                    "Withdraw amount mismatch: expected {}, proof {}",
+                    expected_withdraw_amount, public.withdraw_amount
+                )));
+            }
 
-        Ok(public)
-    })
-    .await
-    .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+            Ok(public)
+        })();
+        
+        // Send result back through channel (ignore send errors if receiver dropped)
+        let _ = tx.send(result);
+    });
+
+    // Wait for thread to complete
+    rx.await
+        .map_err(|_| ServiceError::Internal("Verification thread panicked".to_string()))?
 }
 
 /// Create a transaction JSON representation without the proof data
@@ -1627,6 +1669,18 @@ pub async fn store_verified_midnight_transaction(
     Ok(())
 }
 
+/// Detailed per-transaction timing metrics reported by the sequencer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SequencerInternalMetrics {
+    decode_ms: f64,
+    wrap_ms: f64,
+    submit_ms: f64,
+    await_ms: f64,
+    total_ms: f64,
+    #[serde(default)]
+    stf_execution_ms: Option<f64>,
+}
+
 #[derive(Debug)]
 struct SequencerSubmissionOutcome {
     accepted: bool,
@@ -1634,6 +1688,12 @@ struct SequencerSubmissionOutcome {
     raw_response: Option<String>,
     response_json: Option<serde_json::Value>,
     log_message: String,
+    /// End-to-end HTTP latency to the sequencer (ms)
+    latency_ms: f64,
+    /// Sequencer-reported internal total processing time for this tx (ms), if provided.
+    internal_ms: Option<f64>,
+    /// Optional detailed timing breakdown reported by the sequencer, if available.
+    internal_breakdown: Option<SequencerInternalMetrics>,
 }
 
 async fn submit_worker_tx_to_sequencer(
@@ -1646,6 +1706,7 @@ async fn submit_worker_tx_to_sequencer(
     };
 
     let url = format!("{}/sequencer/worker_txs/{}", state.node_client.base_url, tx_hash);
+    let start = std::time::Instant::now();
     let http_result = state.http_client.post(&url).send().await;
 
     let outcome = match http_result {
@@ -1655,7 +1716,30 @@ async fn submit_worker_tx_to_sequencer(
                 ServiceError::Internal(format!("Failed to read sequencer response: {err}"))
             })?;
 
-            let parsed_json = serde_json::from_str(&body).ok();
+            let parsed_json = serde_json::from_str::<serde_json::Value>(&body).ok();
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Try to extract internal sequencer metrics from the JSON payload, if present.
+            let (internal_ms, internal_breakdown) = if let Some(metrics_value) = parsed_json
+                .as_ref()
+                .and_then(|v| v.get("sequencer_metrics"))
+            {
+                match serde_json::from_value::<SequencerInternalMetrics>(metrics_value.clone()) {
+                    Ok(metrics) => (Some(metrics.total_ms), Some(metrics)),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Failed to parse detailed sequencer_metrics; falling back to total_ms only"
+                        );
+                        let total_only = metrics_value
+                            .get("total_ms")
+                            .and_then(|v| v.as_f64());
+                        (total_only, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
 
             if status.is_success() {
                 SequencerSubmissionOutcome {
@@ -1664,10 +1748,13 @@ async fn submit_worker_tx_to_sequencer(
                     raw_response: Some(body.clone()),
                     response_json: parsed_json,
                     log_message: body,
+                    latency_ms,
+                    internal_ms,
+                    internal_breakdown,
                 }
             } else {
                 let body_value =
-                    parsed_json.unwrap_or_else(|| serde_json::Value::String(body.clone()));
+                    parsed_json.clone().unwrap_or_else(|| serde_json::Value::String(body.clone()));
                 let response_value = serde_json::json!({
                     "status": status.as_u16(),
                     "body": body_value,
@@ -1680,6 +1767,9 @@ async fn submit_worker_tx_to_sequencer(
                     raw_response: Some(payload),
                     response_json: Some(response_value),
                     log_message: body,
+                    latency_ms,
+                    internal_ms,
+                    internal_breakdown,
                 }
             }
         }
@@ -1692,6 +1782,9 @@ async fn submit_worker_tx_to_sequencer(
                 raw_response: Some(json_value.to_string()),
                 response_json: Some(json_value),
                 log_message: message,
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
+                internal_ms: None,
+                internal_breakdown: None,
             }
         }
     };

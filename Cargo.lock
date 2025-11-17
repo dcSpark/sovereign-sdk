@@ -12850,6 +12850,7 @@ dependencies = [
  "chrono",
  "clap",
  "demo-stf",
+ "futures",
  "hex",
  "midnight-privacy",
  "reqwest 0.12.23",

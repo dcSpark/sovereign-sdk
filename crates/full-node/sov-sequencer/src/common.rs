@@ -37,6 +37,7 @@ fn get_pre_auth_cache() -> &'static StdMutex<std::collections::HashSet<TxHash>> 
 }
 
 /// Mark a transaction as pre-authenticated (signature already verified by worker)
+#[allow(dead_code)]
 pub fn mark_tx_pre_authenticated(tx_hash: TxHash) {
     let cache = get_pre_auth_cache();
     if let Ok(mut set) = cache.lock() {
@@ -112,6 +113,33 @@ pub(crate) fn take_pre_verified_withdraw() -> Option<SpendPublic> {
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
+}
+
+/// Detailed per-transaction timing metrics for the sequencer.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SequencerMetrics {
+    pub decode_ms: f64,
+    pub wrap_ms: f64,
+    pub submit_ms: f64,
+    pub await_ms: f64,
+    pub total_ms: f64,
+    pub stf_execution_ms: Option<f64>,
+}
+
+// Global cache of per-transaction sequencer metrics keyed by tx hash.
+static SEQUENCER_METRICS: OnceLock<StdMutex<HashMap<TxHash, SequencerMetrics>>> =
+    OnceLock::new();
+
+fn sequencer_metrics_map() -> &'static StdMutex<HashMap<TxHash, SequencerMetrics>> {
+    SEQUENCER_METRICS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn cache_sequencer_metrics(tx_hash: TxHash, metrics: SequencerMetrics) {
+    let _ = sequencer_metrics_map().lock().unwrap().insert(tx_hash, metrics);
+}
+
+pub(crate) fn take_sequencer_metrics(tx_hash: &TxHash) -> Option<SequencerMetrics> {
+    sequencer_metrics_map().lock().unwrap().remove(tx_hash)
 }
 
 #[cfg(feature = "native")]
