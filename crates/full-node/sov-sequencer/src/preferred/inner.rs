@@ -1366,6 +1366,7 @@ where
                 reason,
             } => {
                 let start = std::time::Instant::now();
+                info!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1379,7 +1380,8 @@ where
 
                 self.send_response(resp, ret, "accept_tx").await;
                 let elapsed = start.elapsed();
-                eprintln!("[ACCEPT TX] AcceptTx message processing took {:?}", elapsed);
+                let end = std::time::Instant::now();
+                info!("[ACCEPT TX] Ending AcceptTx message processing for tx_hash={} at {:?}, total duration: {:?}", tx_hash, end, elapsed);
             }
             Message::LatestSlotNumber { resp, reason } => {
                 let ret = self.process_latest_slot_number(reason).await;
@@ -1462,10 +1464,24 @@ where
                 reason,
             } => {
                 let start = std::time::Instant::now();
+                let tx_hash = parallel_response.tx_hash;
+                debug!(
+                    "[PARALLEL TX COMPLETED] Starting ParallelTxCompleted message processing for tx_hash={} sequence_number={} at {:?}",
+                    tx_hash,
+                    sequence_number,
+                    start
+                );
                 self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
                     .await;
                 let elapsed = start.elapsed();
-                eprintln!("[PARALLEL TX COMPLETED] ParallelTxCompleted message processing took {:?}", elapsed);
+                let end = std::time::Instant::now();
+                debug!(
+                    "[PARALLEL TX COMPLETED] Ending ParallelTxCompleted message processing for tx_hash={} sequence_number={} at {:?}, total duration: {:?}",
+                    tx_hash,
+                    sequence_number,
+                    end,
+                    elapsed
+                );
             }
             Message::ParallelTxFailed { tx_hash, reason } => {
                 // Best-effort cleanup of HTTP waiter and parallel count so the caller doesn't hang forever.
