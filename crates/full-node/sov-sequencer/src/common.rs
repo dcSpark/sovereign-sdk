@@ -246,63 +246,6 @@ pub trait Sequencer: Send + Sync + 'static {
         tx: FullyBakedTx,
     ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject>;
 
-    /// Specialized method for accepting pre-verified worker transactions.
-    /// This method works with lightweight transaction data reconstructed from database
-    /// columns (transaction_data and proof_outputs), avoiding the need to process
-    /// the large (~3MB) proof blob stored in full_transaction_blob.
-    ///
-    /// # Arguments
-    /// * `lightweight_tx` - Transaction reconstructed without the large proof
-    /// * `tx_hash` - Pre-computed transaction hash
-    /// * `is_withdraw` - Whether this is a withdraw transaction (affects caching)
-    ///
-    /// Default implementation falls back to regular accept_tx.
-    async fn accept_worker_verified_tx(
-        &self,
-        lightweight_tx: FullyBakedTx,
-        tx_hash: TxHash,
-        is_withdraw: bool,
-    ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject> {
-        // Default implementation: just use regular accept_tx
-        let _ = (tx_hash, is_withdraw); // Suppress unused warnings
-        self.accept_tx(lightweight_tx).await
-    }
-
-    /// Accepts a pre-authenticated worker transaction, bypassing deserialization and authentication.
-    /// This is the most optimized path, saving ~60ms per transaction by avoiding:
-    /// - Transfer of 3MB Ligero proof blob
-    /// - Deserialization of 3MB Ligero proof (~3ms)
-    /// - Parsing transaction structure (~4ms)
-    /// - Signature verification (~5.7ms for large payloads)
-    ///
-    /// # Arguments
-    /// * `pub_key_hex` - Borsh-serialized public key (hex encoded)
-    /// * `signature_hex` - Borsh-serialized signature (hex encoded)
-    /// * `uniqueness_hex` - Borsh-serialized uniqueness data (hex encoded)
-    /// * `details_hex` - Borsh-serialized transaction details (hex encoded)
-    /// * `runtime_call_hex` - Borsh-serialized runtime call message (hex encoded)
-    /// * `tx_hash` - Pre-computed transaction hash
-    ///
-    /// Default implementation returns an error (not implemented).
-    async fn accept_pre_authenticated_tx(
-        &self,
-        pub_key_hex: String,
-        signature_hex: String,
-        uniqueness_hex: String,
-        details_hex: String,
-        runtime_call_hex: String,
-        tx_hash: TxHash,
-    ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject> {
-        let _ = (pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, tx_hash);
-        Err(ErrorObject {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: "Not Implemented".to_string(),
-            details: json_obj!({
-                "error": "accept_pre_authenticated_tx is not implemented for this sequencer"
-            }),
-        })
-    }
-
     /// OPTIMIZED: Accept a pre-authenticated transaction from serialized bytes (base64 encoded).
     /// This is the fastest path - avoids component deserialization and reconstruction.
     /// Saves ~12-15ms compared to accept_pre_authenticated_tx.

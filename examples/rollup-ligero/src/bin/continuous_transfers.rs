@@ -157,10 +157,10 @@ struct CycleSummary {
 }
 
 fn wait_for_c_to_continue(prompt: &str) -> Result<()> {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     eprintln!("{}", prompt);
-    eprint!("Press 'c' then Enter to continue: ");
+    eprint!("Press Enter to continue...");
     std::io::stdout().flush().ok();
 
     let mut buf = String::new();
@@ -168,9 +168,6 @@ fn wait_for_c_to_continue(prompt: &str) -> Result<()> {
         .read_line(&mut buf)
         .context("Failed to read from stdin")?;
 
-    if !buf.trim().eq_ignore_ascii_case("c") {
-        eprintln!("Input was not 'c'; continuing anyway.");
-    }
     Ok(())
 }
 
