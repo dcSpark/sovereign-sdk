@@ -1741,11 +1741,61 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
-        let fn_start_time = std::time::Instant::now();
-        
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
         let message_sender = self.message_sender.clone();
-        
+
+        // Perform MidnightPrivacy detection outside of the inner lock to avoid
+        // holding the critical section longer than necessary.
+        let detection_start = std::time::Instant::now();
+        let is_midnight_privacy_tx = {
+            // Preferred: use the runtime's authenticator to decode and wrap the call
+            if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
+                let runtime_call = Rt::wrap_call(decoded);
+                let debug_str = format!("{:?}", runtime_call);
+                let variant_name = debug_str.split('(').next().unwrap_or("");
+                eprintln!("Runtime call variant: {}", variant_name);
+                variant_name == "MidnightPrivacy"
+            } else {
+                // Fallback: try generic AuthenticatorInput and parse the RawTx directly
+                match AuthenticatorInput::try_from_slice(&baked_tx.data) {
+                    Ok(auth_input) => {
+                        let raw = match auth_input {
+                            AuthenticatorInput::Standard(raw_tx) => raw_tx.data,
+                            AuthenticatorInput::PreAuthenticated(raw_tx, _) => raw_tx.data,
+                        };
+                        match Transaction::<Rt, S>::try_from_slice(raw.as_slice()) {
+                            Ok(tx) => {
+                                let runtime_call = tx.runtime_call();
+                                let debug_str = format!("{:?}", runtime_call);
+                                let variant_name = debug_str.split('(').next().unwrap_or("");
+                                eprintln!("Runtime call variant: {}", variant_name);
+                                variant_name == "MidnightPrivacy"
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to deserialize Transaction from RawTx (fallback): {:?}",
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[detect] Failed to parse authenticator input in fallback: {:?}",
+                            err
+                        );
+                        false
+                    }
+                }
+            }
+        };
+        let detection_elapsed = detection_start.elapsed();
+        eprintln!(
+            "Is midnight privacy tx: {} (detection took {:?})",
+            is_midnight_privacy_tx, detection_elapsed
+        );
+
         let mut inner = self.get_inner_with_timing(reason).await;
 
         // If the sequencer had to give out 503s at any point during the time we were waiting for the lock, we need to return a 503 - otherwise
@@ -1822,50 +1872,6 @@ where
             });
         }
 
-        // Try parallel processing for midnight privacy module transactions
-        // baked_tx.data contains an authenticator wrapper; unwrap it to get the RawTx first
-        let detection_start = std::time::Instant::now();
-        let is_midnight_privacy_tx = {
-            // Preferred: use the runtime's authenticator to decode and wrap the call
-            if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
-                let runtime_call = Rt::wrap_call(decoded);
-                let debug_str = format!("{:?}", runtime_call);
-                let variant_name = debug_str.split('(').next().unwrap_or("");
-                eprintln!("Runtime call variant: {}", variant_name);
-                variant_name == "MidnightPrivacy"
-            } else {
-                // Fallback: try generic AuthenticatorInput and parse the RawTx directly
-                match AuthenticatorInput::try_from_slice(&baked_tx.data) {
-                    Ok(auth_input) => {
-                        let raw = match auth_input {
-                            AuthenticatorInput::Standard(raw_tx) => raw_tx.data,
-                            AuthenticatorInput::PreAuthenticated(raw_tx, _) => raw_tx.data,
-                        };
-                        match Transaction::<Rt, S>::try_from_slice(raw.as_slice()) {
-                            Ok(tx) => {
-                                let runtime_call = tx.runtime_call();
-                                let debug_str = format!("{:?}", runtime_call);
-                                let variant_name = debug_str.split('(').next().unwrap_or("");
-                                eprintln!("Runtime call variant: {}", variant_name);
-                                variant_name == "MidnightPrivacy"
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to deserialize Transaction from RawTx (fallback): {:?}", e);
-                                false
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("[detect] Failed to parse authenticator input in fallback: {:?}", err);
-                        false
-                    }
-                }
-            }
-        };
-        let detection_elapsed = detection_start.elapsed();
-        
-        eprintln!("Is midnight privacy tx: {} (detection took {:?})", is_midnight_privacy_tx, detection_elapsed);
-        
         if is_midnight_privacy_tx {
             // Send to parallel executor - worker will send result directly to message loop
             if parallel_tx_executor.send_tx(
@@ -1895,7 +1901,7 @@ where
 
         let (
             AcceptedTxWithBudgetInfo {
-                accepted_tx,
+                mut accepted_tx,
                 remaining_slot_gas,
                 execution_time_micros,
             },
@@ -1914,14 +1920,37 @@ where
             }
         };
 
+        // Ensure the confirmation's tx hash is populated for downstream consumers.
+        // The executor guarantees consistency here, but we patch it defensively in
+        // case future changes forget to set it.
+        if accepted_tx.tx_hash != tx_hash {
+            accepted_tx.tx_hash = tx_hash;
+        }
+
         batch_size_tracker.add_tx(tx_len, execution_time_micros);
-        let rx = executor_events_sender
-            .send_accept_tx(accepted_tx, tx_changes, sequence_number)
+        // Always enqueue side effects so DB/cache semantics remain unchanged.
+        let side_effects_rx = executor_events_sender
+            .send_accept_tx(accepted_tx.clone(), tx_changes, sequence_number)
             .await;
 
         inner.close_batch_if_nearly_full(&remaining_slot_gas).await;
 
-        Ok(rx)
+        // Optional fast-ack mode: return the confirmation as soon as the in-memory
+        // executor accepts the tx, without waiting for DB writes in the side-effects
+        // task. This significantly reduces await_ms for HTTP callers.
+        if inner
+            .seq_config
+            .sequencer_kind_config
+            .fast_ack_after_executor
+        {
+            let (http_tx, http_rx) = oneshot::channel();
+            // If the receiver dropped (e.g., HTTP request was cancelled), we simply
+            // ignore the error – side effects are already enqueued.
+            let _ = http_tx.send(accepted_tx);
+            return Ok(http_rx);
+        }
+
+        Ok(side_effects_rx)
     }
 
     async fn process_latest_slot_number(&mut self, reason: &'static str) -> SlotNumber {
@@ -2004,7 +2033,7 @@ where
         let batch_metrics_time = batch_metrics_start.elapsed();
 
         let send_accept_start = std::time::Instant::now();
-        let rx = inner
+        let _rx = inner
             .executor_events_sender
             .send_accept_tx(
                 accepted_with_budget_main.accepted_tx.clone(),
@@ -2014,13 +2043,12 @@ where
             .await;
         let send_accept_time = send_accept_start.elapsed();
 
-        // Bridge to HTTP waiter without blocking the message loop
+        // Bridge to HTTP waiter as soon as the main executor commits, without waiting for DB side effects.
         let waiter_bridge_start = std::time::Instant::now();
         if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
+            let accepted_for_http = accepted_with_budget_main.accepted_tx.clone();
             tokio::spawn(async move {
-                if let Ok(accepted) = rx.await {
-                    let _ = waiter.send(accepted);
-                }
+                let _ = waiter.send(accepted_for_http);
             });
         }
         let waiter_bridge_time = waiter_bridge_start.elapsed();

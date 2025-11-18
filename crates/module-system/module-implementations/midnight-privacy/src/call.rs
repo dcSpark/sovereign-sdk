@@ -308,21 +308,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
-            let method_id_bytes = self
-                .method_id
-                .get(st)?
-                .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
-
-            let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
-
             // Try to use pre-verified credential (preferred fast path)
             let credential_check_start = std::time::Instant::now();
-            let ctx_public = _ctx
-                .get_sender_credential::<PreVerifiedWithdrawCredential>()
-                .map(|cred| cred.0.clone());
+            let ctx_credential = _ctx.get_sender_credential::<PreVerifiedWithdrawCredential>();
             let cached_public = crate::get_pre_verified_spend(&nullifier);
-            let has_credential = ctx_public.is_some() || cached_public.is_some();
+            let has_credential = ctx_credential.is_some() || cached_public.is_some();
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
@@ -330,14 +320,29 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 "Transfer: checked for pre-verified credential"
             );
 
-            let public = if let Some(public) = ctx_public.or(cached_public) {
-                info!("Using pre-verified credential path (skipping Ligero proof verification)");
+            let public = if let Some(cred) = ctx_credential {
+                // Prefer the credential embedded in the tx context when available.
+                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
+                cred.0.clone()
+            } else if let Some(public) = cached_public {
+                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
                 public
             } else {
                 info!("No pre-verified credential, performing full Ligero proof verification");
+
+                // Only load and decode method_id when we really need to verify a proof.
+                let method_id_bytes = self
+                    .method_id
+                    .get(st)?
+                    .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
+
+                let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
+                    .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
+
                 // Verify the proof and extract public output
-                LigeroVerifier::verify(&proof, &method_id)
-                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
+                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
+                })?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -433,11 +438,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
             let credential_check_start = std::time::Instant::now();
-            let ctx_public = ctx
-                .get_sender_credential::<PreVerifiedWithdrawCredential>()
-                .map(|cred| cred.0.clone());
+            let ctx_credential = ctx.get_sender_credential::<PreVerifiedWithdrawCredential>();
             let cached_public = crate::get_pre_verified_spend(&nullifier);
-            let has_credential = ctx_public.is_some() || cached_public.is_some();
+            let has_credential = ctx_credential.is_some() || cached_public.is_some();
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
@@ -445,8 +448,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 "Withdraw: checked for pre-verified credential"
             );
 
-            let public = if let Some(public) = ctx_public.or(cached_public) {
-                info!("Using pre-verified credential path (skipping Ligero proof verification)");
+            let public = if let Some(cred) = ctx_credential {
+                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
+                cred.0.clone()
+            } else if let Some(public) = cached_public {
+                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
                 public
             } else {
                 info!("No pre-verified credential, performing full Ligero proof verification");

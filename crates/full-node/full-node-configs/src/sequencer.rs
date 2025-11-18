@@ -164,6 +164,13 @@ pub struct PreferredSequencerConfig {
     /// The number of workers for parallel transaction processing (specifically for midnight privacy txs).
     /// When set to 0 or None, parallel processing is disabled and all txs are processed sequentially.
     pub num_parallel_tx_workers: Option<usize>,
+    /// When enabled, HTTP confirmations are sent as soon as the in-memory executor
+    /// accepts the transaction, without waiting for DB side effects in the side
+    /// effects task. This reduces end-to-end latency for clients at the cost of
+    /// making DB updates eventually consistent rather than strictly synchronous
+    /// with the HTTP response.
+    #[serde(default)]
+    pub fast_ack_after_executor: bool,
 }
 
 impl Default for PreferredSequencerConfig {
@@ -180,6 +187,7 @@ impl Default for PreferredSequencerConfig {
             batch_execution_time_limit_millis: 6_000, // 6 seconds
             num_cache_warmup_workers: default_num_cache_warmup_workers(),
             num_parallel_tx_workers: None,
+            fast_ack_after_executor: false,
         }
     }
 }

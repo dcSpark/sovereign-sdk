@@ -17,7 +17,13 @@ use crate::preferred::{
     RecoveryStrategy,
 };
 
-const MAX_EXECUTOR_EVENT_QUEUE_DEPTH: usize = 1000;
+// The executor event queue primarily buffers AcceptedTx and batch-related
+// events destined for the side-effects task (DB writes, cache updates,
+// API checkpoints). Under high throughput, a shallow queue can cause
+// backpressure on `send_accept_tx`, increasing submit/await latency.
+// A larger depth keeps the hot path mostly non-blocking while side-effects
+// catch up in the background.
+const MAX_EXECUTOR_EVENT_QUEUE_DEPTH: usize = 16_384;
 
 pub(crate) struct ExecutorEventsSender<S: Spec, Rt: Runtime<S>> {
     events_sender: mpsc::Sender<ExecutorEvent<S, Rt>>,

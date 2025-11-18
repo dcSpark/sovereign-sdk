@@ -1,15 +1,11 @@
 #![allow(dead_code)]
-use crate::preferred::batch_size_tracker::BatchSizeTracker;
 use crate::preferred::cache_warm_up_executor::StartBlockNotification;
-use crate::preferred::executor_events::ExecutorEventsSender;
-use crate::preferred::{Confirmation, PreferredSequencerConfig};
+use crate::preferred::PreferredSequencerConfig;
 use crate::preferred::RollupBlockExecutor;
 use crate::preferred::RollupBlockExecutorConfig;
 use crate::SequencerConfig;
 use crate::TxHash;
-use sov_blob_storage::SequenceNumber;
 use sov_metrics::Metric;
-use sov_modules_api::{ApiTxEffect, GasSpec, SuccessfulTxContents};
 use sov_modules_api::Spec;
 use sov_modules_api::StateUpdateInfo;
 use sov_modules_api::TxChangeSet;
@@ -19,7 +15,6 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// Global counter to track how many workers are actively processing transactions.

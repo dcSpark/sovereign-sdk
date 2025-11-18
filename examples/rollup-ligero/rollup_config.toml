@@ -10,7 +10,7 @@ connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
 finalization = 40
 [da.block_producing.periodic]
-block_time_ms = 1_000
+block_time_ms = 2_000
 # Disable reorg for now, for better stability
 #[da.randomization]
 #seed = "0x0000000000000000000000000000000000000000000000000000000000000012"
@@ -75,11 +75,16 @@ disable_state_root_consistency_checks = true
 # "None" - Shutdown the sequencer instead of attempting recovery (default)
 # "TryToSave" - Attempt to recover by flushing batches and catching up with the chain
 recovery_strategy = "TryToSave"
-batch_execution_time_limit_millis = 900
+batch_execution_time_limit_millis = 1500
+# Return HTTP confirmations as soon as the in-memory executor accepts a tx,
+# without waiting for DB side effects in the side-effects task. This reduces
+# await_ms for high-throughput benchmarks at the cost of making DB updates
+# eventually consistent relative to the HTTP response.
+fast_ack_after_executor = true
 # The sequencer optimistically pre-executes transactions across multiple worker threads.
 # This warms up caches so the main transaction executor can run with ready-to-use data.
 # This variable determines the number of worker threads.
-num_cache_warmup_workers = 10
+num_cache_warmup_workers = 12
 # Parallel workers for Midnight Privacy Transactions
 num_parallel_tx_workers = 12
 [sequencer.extension]

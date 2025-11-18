@@ -427,10 +427,16 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// Flush all pending worker-verified transactions to the sequencer in parallel
-async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ServiceError> {
+/// Flush all pending worker-verified transactions to the sequencer in parallel.
+/// 
+/// This returns as soon as all sequencer submissions have completed and the
+/// aggregate results are computed; the per-tx DB updates are applied in a
+/// background task so they don't block the HTTP response.
+async fn flush_pending_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ServiceError> {
     use worker_verified_transactions::{Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState};
-    use sea_orm::{QuerySelect, TransactionTrait};
+    use sea_orm::QuerySelect;
 
     // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
     let pending_tx_hashes: Vec<String> = VerifiedEntity::find()
@@ -456,10 +462,21 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     }
 
     let mut handles = Vec::with_capacity(total);
-    
+
+    // Limit the number of concurrent submissions to the sequencer to avoid
+    // overloading the preferred sequencer's single-threaded message loop.
+    // This helps reduce per-tx submit_ms/await_ms while still processing the
+    // whole batch efficiently.
+    const MAX_FLUSH_CONCURRENCY: usize = 12;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FLUSH_CONCURRENCY));
+
     for txh in pending_tx_hashes {
         let st = state.clone();
+        let sem = semaphore.clone();
         handles.push(tokio::spawn(async move {
+            // Acquire a permit to enforce the concurrency limit.
+            let _permit = sem.acquire_owned().await.expect("flush semaphore closed");
+
             // Only submit to sequencer and collect the outcome in memory.
             // Database updates are applied after all submissions complete.
             let res = send_worker_tx_to_sequencer(&st, &txh).await;
@@ -473,34 +490,18 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     let sequencer_elapsed_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
     info!("Sequencer processed worker transactions in {:.2} ms", sequencer_elapsed_ms);
 
-    // Group DB updates for worker transactions into a single short transaction
-    // to reduce commit overhead and hold locks for a minimal time window.
-    let txn = state
-        .da_conn
-        .begin()
-        .await
-        .map_err(|err| ServiceError::Internal(format!("Failed to begin transaction for worker tx updates: {err}")))?;
-
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut results = Vec::new();
+    let mut db_updates: Vec<(String, SequencerSubmissionOutcome)> = Vec::new();
 
     for outcome in all_results {
         match outcome {
             Ok((txh, Ok(outcome))) => {
-                // Apply DB update inside the shared transaction.
-                if let Err(err) =
-                    update_worker_tx_after_submission_in_conn(&txn, &txh, &outcome).await
-                {
-                    rejected += 1;
-                    results.push(serde_json::json!({
-                        "tx_hash": txh,
-                        "accepted": false,
-                        "error": format!("{}", err),
-                    }));
-                    continue;
-                }
+                // Queue this tx for background DB update.
+                let txh_for_db = txh.clone();
 
+                // Update aggregate counts based on sequencer outcome.
                 if outcome.accepted {
                     accepted += 1;
                 } else {
@@ -508,8 +509,10 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
                 }
 
                 // Build a breakdown object ensuring all expected timing keys exist.
-                let mut breakdown_value =
-                    outcome.internal_breakdown.unwrap_or_else(|| serde_json::json!({}));
+                let mut breakdown_value = outcome
+                    .internal_breakdown
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if let serde_json::Value::Object(ref mut map) = breakdown_value {
                     let total_fallback = outcome.internal_ms.unwrap_or(outcome.latency_ms);
                     map.entry("total_ms")
@@ -527,14 +530,16 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
                 }
 
                 results.push(serde_json::json!({
-                    "tx_hash": txh,
+                    "tx_hash": txh.clone(),
                     "accepted": outcome.accepted,
                     "status": outcome.status_code,
-                    "response": outcome.response_json,
+                    "response": outcome.response_json.clone(),
                     // Prefer internal sequencer processing time if available; fall back to HTTP latency.
                     "sequencer_ms": outcome.internal_ms.unwrap_or(outcome.latency_ms),
                     "sequencer_breakdown": breakdown_value,
                 }));
+
+                db_updates.push((txh_for_db, outcome));
             }
             Ok((txh, Err(err))) => {
                 rejected += 1;
@@ -555,9 +560,45 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
         }
     }
 
-    txn.commit()
-        .await
-        .map_err(|err| ServiceError::Internal(format!("Failed to commit worker tx updates: {err}")))?;
+    // Apply DB updates in the background so the HTTP response isn't blocked on
+    // SQLite/Postgres write latency. Errors are logged but do not affect the
+    // response.
+    if !db_updates.is_empty() {
+        let db_conn = state.da_conn.clone();
+        tokio::spawn(async move {
+            use sea_orm::TransactionTrait;
+
+            let txn_res = db_conn.begin().await;
+            let Ok(txn) = txn_res else {
+                if let Err(err) = txn_res {
+                    error!(
+                        "Failed to begin transaction for worker tx updates in background: {}",
+                        err
+                    );
+                }
+                return;
+            };
+
+            for (txh, outcome) in db_updates {
+                if let Err(err) =
+                    update_worker_tx_after_submission_in_conn(&txn, &txh, &outcome).await
+                {
+                    error!(
+                        tx_hash = %txh,
+                        "Failed to update worker transaction after sequencer submission in background: {}",
+                        err
+                    );
+                }
+            }
+
+            if let Err(err) = txn.commit().await {
+                error!(
+                    "Failed to commit worker tx updates in background: {}",
+                    err
+                );
+            }
+        });
+    }
 
     Ok(Json(serde_json::json!({
         "flushed": total,
@@ -1910,14 +1951,43 @@ where
     Ok(())
 }
 
-/// Backwards-compatible helper used by non-flush paths:
-/// sends the worker tx to the sequencer and immediately updates the DB.
 async fn submit_worker_tx_to_sequencer(
     state: &AppState,
     tx_hash: &str,
 ) -> Result<SequencerSubmissionOutcome, ServiceError> {
+    // First, send the worker transaction to the sequencer and obtain its outcome.
     let outcome = send_worker_tx_to_sequencer(state, tx_hash).await?;
-    update_worker_tx_after_submission(state, tx_hash, &outcome).await?;
+
+    // Apply the DB update in the background so this function's latency is
+    // dominated by the sequencer HTTP round-trip, not SQLite/Postgres writes.
+    //
+    // Errors are logged but do not affect the returned outcome; this mirrors
+    // the behavior used in flush_pending_handler.
+    let state_clone = state.clone();
+    let tx_hash_owned = tx_hash.to_string();
+    let outcome_clone = SequencerSubmissionOutcome {
+        accepted: outcome.accepted,
+        status_code: outcome.status_code,
+        raw_response: outcome.raw_response.clone(),
+        response_json: outcome.response_json.clone(),
+        log_message: outcome.log_message.clone(),
+        latency_ms: outcome.latency_ms,
+        internal_ms: outcome.internal_ms,
+        internal_breakdown: outcome.internal_breakdown.clone(),
+    };
+
+    tokio::spawn(async move {
+        if let Err(err) =
+            update_worker_tx_after_submission(&state_clone, &tx_hash_owned, &outcome_clone).await
+        {
+            error!(
+                tx_hash = %tx_hash_owned,
+                "Failed to update worker transaction after sequencer submission in background: {}",
+                err
+            );
+        }
+    });
+
     Ok(outcome)
 }
 

@@ -43,6 +43,7 @@ struct ContinuousConfig {
     external_verifier_url: String,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
+    continuous: bool,
 }
 
 impl ContinuousConfig {
@@ -63,7 +64,7 @@ impl ContinuousConfig {
         let cycle_delay_ms = std::env::var("CYCLE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(250);
+            .unwrap_or(1000);
 
         let external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
@@ -80,6 +81,11 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let continuous = std::env::var("CONTINUOUS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Ok(Self {
             num_wallets,
             initial_deposit,
@@ -89,6 +95,7 @@ impl ContinuousConfig {
             external_verifier_url,
             max_concurrent_proofs,
             detailed_wallet_logs,
+            continuous,
         })
     }
 }
@@ -163,17 +170,23 @@ struct CycleSummary {
     avg_seq_stf_ms: f64,
 }
 
-fn wait_for_c_to_continue(prompt: &str) -> Result<()> {
+fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()> {
     use std::io::Write;
 
     eprintln!("{}", prompt);
-    eprint!("Press Enter to continue...");
-    std::io::stdout().flush().ok();
+    
+    if config.continuous {
+        // In continuous mode, just sleep for cycle_delay_ms instead of waiting for user input
+        std::thread::sleep(Duration::from_millis(config.cycle_delay_ms));
+    } else {
+        eprint!("Press Enter to continue...");
+        std::io::stdout().flush().ok();
 
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_line(&mut buf)
-        .context("Failed to read from stdin")?;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .context("Failed to read from stdin")?;
+    }
 
     Ok(())
 }
@@ -446,7 +459,7 @@ async fn main() -> Result<()> {
         );
 
         // Interactive gate after each cycle summary.
-        wait_for_c_to_continue("[cycle] Cycle summary complete.").ok();
+        wait_for_c_to_continue("[cycle] Cycle summary complete.", &config).ok();
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -1013,7 +1026,7 @@ async fn perform_transfer_cycle(
     );
 
     eprintln!(
-        "[cycle] Submitting {} transfers to verifier with deferred submission...",
+        "[cycle] Submitting {} transfers to verifier...",
         transfer_txs_b64.len()
     );
 
@@ -1081,7 +1094,7 @@ async fn perform_transfer_cycle(
         transfer_submit_ms / transfer_hashes.len() as f64
     );
     // Interactive gate before flushing to the sequencer.
-    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.").ok();
+    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
     let flush_start = Instant::now();
     let resp = http
         .post(format!(

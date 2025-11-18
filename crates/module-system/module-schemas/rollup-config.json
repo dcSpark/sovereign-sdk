@@ -337,6 +337,11 @@
           "format": "uint",
           "minimum": 0.0
         },
+        "fast_ack_after_executor": {
+          "description": "When enabled, HTTP confirmations are sent as soon as the in-memory executor accepts the transaction, without waiting for DB side effects in the side effects task. This reduces end-to-end latency for clients at the cost of making DB updates eventually consistent rather than strictly synchronous with the HTTP response.",
+          "default": false,
+          "type": "boolean"
+        },
         "ideal_lag_behind_finalized_slot": {
           "description": "The ideal lag behind the finalized slot number.",
           "default": 10,
