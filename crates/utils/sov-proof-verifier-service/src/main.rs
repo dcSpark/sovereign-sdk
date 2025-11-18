@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use axum::ServiceExt;
 use clap::Parser;
+use sov_address::MultiAddressEvm;
+use sov_midnight_da::storable::service::StorableMidnightDaService;
 use sov_proof_verifier_service::{create_router, AppState, ServiceConfig};
+use sov_stf_runner::{from_toml_path, RollupConfig};
 use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -20,6 +23,12 @@ struct Args {
     /// URL of the rollup node RPC endpoint
     #[arg(long, default_value = "http://127.0.0.1:12346")]
     node_rpc_url: String,
+
+    /// Path to the rollup configuration TOML used by the rollup node.
+    /// When set, the MockDA connection string will be read from this file's [da] section
+    /// (same config used by rollup-ligero via --rollup-config-path).
+    #[arg(long = "rollup-config-path")]
+    rollup_config_path: Option<String>,
 
     /// Path to signing key for non-ZK transactions
     #[arg(
@@ -44,9 +53,12 @@ struct Args {
     #[arg(long, default_value = "10")]
     max_concurrent: usize,
 
-    /// Connection string for the shared MockDA database
-    #[arg(long, default_value = "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc")]
-    da_db: String,
+    /// Connection string for the shared MockDA database.
+    /// If not provided, the service will try to read it from --rollup-config-path.
+    /// If neither is set, it falls back to the demo default
+    /// "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".
+    #[arg(long)]
+    da_db: Option<String>,
 
     /// When set, the service will queue worker-verified txs instead of immediately submitting
     /// them to the sequencer. Use the /midnight-privacy/flush endpoint to release queued txs.
@@ -65,11 +77,14 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing(&args.log_level)?;
 
+    // Resolve DA connection string, preferring explicit CLI value, then rollup_config.toml, then demo default.
+    let da_connection_string = resolve_da_connection_string(&args)?;
+
     info!("Starting proof verifier service");
     info!("Bind address: {}", args.bind);
     info!("Node RPC URL: {}", args.node_rpc_url);
     info!("Max concurrent verifications: {}", args.max_concurrent);
-    info!("MockDA DB: {}", args.da_db);
+    info!("MockDA DB: {}", da_connection_string);
     info!("Defer submission: {}", args.defer_submission);
 
     // Parse optional method ID (will be auto-computed if not provided)
@@ -98,7 +113,7 @@ async fn main() -> Result<()> {
         midnight_method_id, // Will be auto-computed from note_spend_guest.wasm if None
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,
-        da_connection_string: args.da_db,
+        da_connection_string,
         defer_sequencer_submission: args.defer_submission,
     };
 
@@ -155,4 +170,47 @@ fn parse_method_id(hex: &str) -> Result<[u8; 32]> {
     let mut method_id = [0u8; 32];
     method_id.copy_from_slice(&bytes);
     Ok(method_id)
+}
+
+/// Resolve the DA connection string to use for the verifier service.
+///
+/// Priority:
+/// 1. Explicit `--da-db` CLI argument (if provided)
+/// 2. `--rollup-config-path`'s [da] section `connection_string`
+/// 3. Built-in demo default pointing at the Ligero mock DA database.
+fn resolve_da_connection_string(args: &Args) -> Result<String> {
+    if let Some(ref explicit) = args.da_db {
+        return Ok(explicit.clone());
+    }
+
+    if let Some(ref config_path) = args.rollup_config_path {
+        info!(
+            "No --da-db provided; loading DA connection string from rollup config at {}",
+            config_path
+        );
+
+        let rollup_config: RollupConfig<MultiAddressEvm, StorableMidnightDaService> =
+            from_toml_path(config_path).with_context(|| {
+                format!(
+                    "Failed to read rollup configuration from {} to resolve DA connection string",
+                    config_path
+                )
+            })?;
+
+        let conn = rollup_config.da.connection_string.clone();
+
+        info!(
+            "Using DA connection string from rollup config: {}",
+            conn
+        );
+
+        return Ok(conn);
+    }
+
+    let default_conn = "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".to_string();
+    info!(
+        "No --da-db or --rollup-config-path provided; falling back to default MockDA DB: {}",
+        default_conn
+    );
+    Ok(default_conn)
 }

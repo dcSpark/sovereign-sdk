@@ -66,12 +66,16 @@ sov-address = { workspace = true, features = ["native", "evm"] }
 sov-midnight-da = { workspace = true, features = ["native"] }
 sov-mock-zkvm = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
+sov-stf-runner = { workspace = true }
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }
 
 # CLI args
 clap = { workspace = true, features = ["derive"] }
+
+# Futures utilities
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

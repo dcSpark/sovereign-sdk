@@ -58,7 +58,7 @@ impl ContinuousConfig {
         let per_tx_delay_ms = std::env::var("PER_TX_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(1);
 
         let cycle_delay_ms = std::env::var("CYCLE_DELAY_MS")
             .ok()
@@ -327,15 +327,15 @@ async fn main() -> Result<()> {
 
         let total_setup_ms = wallet_setup_ms + deposit_ms;
         eprintln!(
-            "[setup] setup {} wallets in {:.2} ms",
+            "[setup] Setup {} wallets in {:.2} ms",
             config.num_wallets, wallet_setup_ms
         );
         eprintln!(
-            "[setup] deposited {} tokens in each wallet in {:.2} ms",
+            "[setup] Deposited {} tokens in each wallet in {:.2} ms",
             INITIAL_DEPOSIT_AMOUNT, deposit_ms
         );
         eprintln!(
-            "[setup] total time for initial setup (wallets + deposits): {:.2} ms",
+            "[setup] Total time for initial setup (wallets + deposits): {:.2} ms",
             total_setup_ms
         );
     } else {
@@ -389,6 +389,7 @@ async fn main() -> Result<()> {
                     total_seq_submit_ms,
                     total_seq_await_ms,
                     total_seq_stf_ms,
+                    config.detailed_wallet_logs,
                 );
                 return Ok(());
             }
@@ -440,7 +441,7 @@ async fn main() -> Result<()> {
         total_seq_stf_ms += summary.avg_seq_stf_ms * summary.num_transfers as f64;
 
         eprintln!(
-            "[summary] so far: cycles={} transfers={} included={}",
+            "[summary] So far: cycles={} transfers={} included={}",
             cycle_idx, total_transfers, total_included
         );
 
@@ -465,6 +466,7 @@ async fn main() -> Result<()> {
                     total_seq_submit_ms,
                     total_seq_await_ms,
                     total_seq_stf_ms,
+                    config.detailed_wallet_logs,
                 );
                 return Ok(());
             }
@@ -489,6 +491,7 @@ fn log_final_summary(
     total_seq_submit_ms: f64,
     total_seq_await_ms: f64,
     total_seq_stf_ms: f64,
+    detailed_wallet_logs: bool,
 ) {
     eprintln!("\n[final-summary] =================================");
     eprintln!(
@@ -540,22 +543,24 @@ fn log_final_summary(
     } else {
         0.0
     };
-    eprintln!(
-        "[final-summary] avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_submit_ms={:.2}",
-        global_worker_avg,
-        global_worker_proof_avg,
-        global_worker_db_avg,
-        global_sequencer_avg
-    );
-    eprintln!(
-        "[final-summary] sequencer_breakdown_ms: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
-        global_sequencer_avg,
-        global_seq_decode_avg,
-        global_seq_wrap_avg,
-        global_seq_submit_avg,
-        global_seq_await_avg,
-        global_seq_stf_avg,
-    );
+    if detailed_wallet_logs {
+        eprintln!(
+            "[final-summary] avg_worker_total_ms={:.2} avg_worker_proof_ms={:.2} avg_worker_db_ms={:.2} avg_sequencer_submit_ms={:.2}",
+            global_worker_avg,
+            global_worker_proof_avg,
+            global_worker_db_avg,
+            global_sequencer_avg
+        );
+        eprintln!(
+            "[final-summary] sequencer_breakdown_ms: total_ms={:.2} decode_ms={:.2} wrap_ms={:.2} submit_ms={:.2} await_ms={:.2} stf_ms={:.2}",
+            global_sequencer_avg,
+            global_seq_decode_avg,
+            global_seq_wrap_avg,
+            global_seq_submit_avg,
+            global_seq_await_avg,
+            global_seq_stf_avg,
+        );
+    }
     eprintln!("[final-summary] Block number distribution across all cycles:");
     for (block_number, count) in total_batches {
         eprintln!(
@@ -742,11 +747,13 @@ async fn perform_transfer_cycle(
         offset += batch_size;
     }
 
-    eprintln!(
-        "[cycle] tree: next_position={} notes_count={}",
-        state.next_position,
-        all_notes.len()
-    );
+    if config.detailed_wallet_logs {
+        eprintln!(
+            "[cycle] tree: next_position={} notes_count={}",
+            state.next_position,
+            all_notes.len()
+        );
+    }
 
     // Rebuild Merkle tree and map commitments to positions
     let mut sorted_notes = all_notes.clone();
@@ -928,7 +935,7 @@ async fn perform_transfer_cycle(
 
     let proof_generation_ms = proof_generation_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[cycle] proof generation: generated {} transfer proofs (one per wallet) in {:.2} ms",
+        "[cycle] Proof generation: generated {} transfer proofs (one per wallet) in {:.2} ms",
         proofs.len(),
         proof_generation_ms
     );
@@ -1047,7 +1054,7 @@ async fn perform_transfer_cycle(
 
     let transfer_submit_ms = transfer_submit_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[cycle] submitted {} transfers to verifier in {:.2} ms",
+        "[cycle] Submitted {} transfers to verifier in {:.2} ms",
         transfer_hashes.len(),
         transfer_submit_ms
     );
@@ -1074,11 +1081,16 @@ async fn perform_transfer_cycle(
 
     #[derive(Deserialize, Clone)]
     struct SeqBreakdown {
-        decode_ms: f64,
-        wrap_ms: f64,
-        submit_ms: f64,
-        await_ms: f64,
-        total_ms: f64,
+        #[serde(default)]
+        decode_ms: Option<f64>,
+        #[serde(default)]
+        wrap_ms: Option<f64>,
+        #[serde(default)]
+        submit_ms: Option<f64>,
+        #[serde(default)]
+        await_ms: Option<f64>,
+        #[serde(default)]
+        total_ms: Option<f64>,
         #[serde(default)]
         stf_execution_ms: Option<f64>,
     }
@@ -1108,10 +1120,14 @@ async fn perform_transfer_cycle(
 
     let flush: FlushSummary = serde_json::from_str(&body)
         .context("Failed to parse submit to sequencer JSON response")?;
-    eprintln!(
-        "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
-        flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
-    );
+    if config.detailed_wallet_logs {
+        eprintln!(
+            "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
+            flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
+        );
+    } else {
+        eprintln!("[cycle] Submit to sequencer complete.");
+    }
 
     // Track per-tx sequencer times and breakdown for this cycle
     let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
@@ -1119,6 +1135,11 @@ async fn perform_transfer_cycle(
     for entry in flush.results {
         if let Some(hash) = entry.tx_hash {
             if let Some(b) = entry.sequencer_breakdown {
+                let total_ms = b.total_ms.unwrap_or(0.0);
+                let decode_ms = b.decode_ms.unwrap_or(0.0);
+                let wrap_ms = b.wrap_ms.unwrap_or(0.0);
+                let submit_ms = b.submit_ms.unwrap_or(0.0);
+                let await_ms = b.await_ms.unwrap_or(0.0);
                 let stf_str = b
                     .stf_execution_ms
                     .map(|v| format!("{:.2}", v))
@@ -1127,15 +1148,15 @@ async fn perform_transfer_cycle(
                     eprintln!(
                         "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
                         hash,
-                        b.total_ms,
-                        b.decode_ms,
-                        b.wrap_ms,
-                        b.submit_ms,
-                        b.await_ms,
+                        total_ms,
+                        decode_ms,
+                        wrap_ms,
+                        submit_ms,
+                        await_ms,
                         stf_str,
                     );
                 }
-                sequencer_times_ms.insert(hash.clone(), b.total_ms);
+                sequencer_times_ms.insert(hash.clone(), total_ms);
                 sequencer_metrics_by_hash.insert(hash, b);
             } else if let Some(ms) = entry.sequencer_ms {
                 if config.detailed_wallet_logs {
@@ -1256,15 +1277,15 @@ async fn perform_transfer_cycle(
         let first_ts = format_time_hhmmss_millis(first_wall);
         let last_ts = format_time_hhmmss_millis(last_wall);
         eprintln!(
-            "[cycle] first tx included in block {} at {}",
+            "[cycle] First tx included in block {} at {}",
             first_block, first_ts
         );
         eprintln!(
-            "[cycle] last tx included in block {} at {}",
+            "[cycle] Last tx included in block {} at {}",
             last_block, last_ts
         );
         eprintln!(
-            "[cycle] total span: {:.2} ms, {} blocks, {} total txs",
+            "[cycle] Total span: {:.2} ms, {} blocks, {} total txs",
             span_ms, batches.len(), num_included
         );
         
@@ -1273,7 +1294,7 @@ async fn perform_transfer_cycle(
         for (block_num, tx_count) in &batches {
             let tps = *tx_count as f64 / BLOCK_TIME_MS * 1000.0;
             eprintln!(
-                "[cycle] block {} generated with {} txs ({:.2} tps)",
+                "[cycle] Block {} generated with {} txs ({:.2} tps)",
                 block_num, tx_count, tps
             );
         }
@@ -1288,11 +1309,17 @@ async fn perform_transfer_cycle(
             worker_count += 1;
         }
         if let Some(b) = sequencer_metrics_by_hash.get(hash) {
-            sequencer_sum_ms += b.total_ms;
-            seq_decode_sum_ms += b.decode_ms;
-            seq_wrap_sum_ms += b.wrap_ms;
-            seq_submit_sum_ms += b.submit_ms;
-            seq_await_sum_ms += b.await_ms;
+            let total_ms = b.total_ms.unwrap_or(0.0);
+            let decode_ms = b.decode_ms.unwrap_or(0.0);
+            let wrap_ms = b.wrap_ms.unwrap_or(0.0);
+            let submit_ms = b.submit_ms.unwrap_or(0.0);
+            let await_ms = b.await_ms.unwrap_or(0.0);
+
+            sequencer_sum_ms += total_ms;
+            seq_decode_sum_ms += decode_ms;
+            seq_wrap_sum_ms += wrap_ms;
+            seq_submit_sum_ms += submit_ms;
+            seq_await_sum_ms += await_ms;
             if let Some(stf) = b.stf_execution_ms {
                 seq_stf_sum_ms += stf;
             }

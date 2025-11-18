@@ -15,7 +15,8 @@ use futures::TryStreamExt;
 use hex::FromHex;
 use midnight_privacy::SpendPublic;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, EntityTrait, QueryFilter,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
+    QueryFilter,
 };
 use serde_with::base64::Base64;
 use serde_with::serde_as;
@@ -265,9 +266,33 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
         };
 
-        let db = Database::connect(connection_string)
-            .await
-            .map_err(|err| errors::database_error_response_500(err))?;
+        // Connect to the worker transactions database.
+        // For SQLite, use a pooled connection with a busy_timeout to reduce
+        // `database is locked` errors when the rollup and worker share the same DB file.
+        let db = if connection_string.starts_with("sqlite:") {
+            use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+            use std::str::FromStr;
+
+            let sqlite_opts = SqliteConnectOptions::from_str(&connection_string)
+                .map_err(|err| errors::database_error_response_500(err))?
+                .busy_timeout(std::time::Duration::from_millis(30_000));
+
+            let pool = SqlitePoolOptions::new()
+                .max_connections(5)
+                .min_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(Some(std::time::Duration::from_secs(300)))
+                .max_lifetime(Some(std::time::Duration::from_secs(1800)))
+                .connect_with(sqlite_opts)
+                .await
+                .map_err(|err| errors::database_error_response_500(err))?;
+
+            DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
+        } else {
+            Database::connect(connection_string)
+                .await
+                .map_err(|err| errors::database_error_response_500(err))?
+        };
 
         let record = worker_verified_transactions::Entity::find()
             .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.clone()))

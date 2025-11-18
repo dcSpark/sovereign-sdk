@@ -39,6 +39,7 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, error, info};
+use futures::future::join_all;
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
@@ -458,9 +459,11 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     for txh in pending_tx_hashes {
         let st = state.clone();
         handles.push(tokio::spawn(async move {
-            // Add 1 ms delay before submission
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            let res = submit_worker_tx_to_sequencer(&st, &txh).await;
+            // // Add 1 ms delay before submission
+            // tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            // Only submit to sequencer and collect the outcome in memory.
+            // Database updates are applied after all submissions complete.
+            let res = send_worker_tx_to_sequencer(&st, &txh).await;
             (txh, res)
         }));
     }
@@ -468,15 +471,57 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut results = Vec::new();
-    for h in handles {
-        match h.await {
+
+    // Await all handles in parallel
+    let all_results = join_all(handles).await;
+
+    for outcome in all_results {
+        match outcome {
             Ok((txh, Ok(outcome))) => {
-                if outcome.accepted { accepted += 1; } else { rejected += 1; }
+                // Apply DB update after all sequencer submissions have completed.
+                if let Err(err) = update_worker_tx_after_submission(&state, &txh, &outcome).await {
+                    rejected += 1;
+                    results.push(serde_json::json!({
+                        "tx_hash": txh,
+                        "accepted": false,
+                        "error": format!("{}", err),
+                    }));
+                    continue;
+                }
+
+                if outcome.accepted {
+                    accepted += 1;
+                } else {
+                    rejected += 1;
+                }
+
+                // Build a breakdown object ensuring all expected timing keys exist.
+                let mut breakdown_value =
+                    outcome.internal_breakdown.unwrap_or_else(|| serde_json::json!({}));
+                if let serde_json::Value::Object(ref mut map) = breakdown_value {
+                    let total_fallback = outcome.internal_ms.unwrap_or(outcome.latency_ms);
+                    map.entry("total_ms")
+                        .or_insert_with(|| serde_json::Value::from(total_fallback));
+                    map.entry("decode_ms")
+                        .or_insert_with(|| serde_json::Value::from(0.0_f64));
+                    map.entry("wrap_ms")
+                        .or_insert_with(|| serde_json::Value::from(0.0_f64));
+                    map.entry("submit_ms")
+                        .or_insert_with(|| serde_json::Value::from(total_fallback));
+                    map.entry("await_ms")
+                        .or_insert_with(|| serde_json::Value::from(0.0_f64));
+                    map.entry("stf_execution_ms")
+                        .or_insert_with(|| serde_json::Value::Null);
+                }
+
                 results.push(serde_json::json!({
                     "tx_hash": txh,
                     "accepted": outcome.accepted,
                     "status": outcome.status_code,
                     "response": outcome.response_json,
+                    // Prefer internal sequencer processing time if available; fall back to HTTP latency.
+                    "sequencer_ms": outcome.internal_ms.unwrap_or(outcome.latency_ms),
+                    "sequencer_breakdown": breakdown_value,
                 }));
             }
             Ok((txh, Err(err))) => {
@@ -1679,19 +1724,24 @@ struct SequencerSubmissionOutcome {
     raw_response: Option<String>,
     response_json: Option<serde_json::Value>,
     log_message: String,
+    /// End-to-end HTTP latency for the sequencer submission (ms)
+    latency_ms: f64,
+    /// Optional internal processing time reported by the sequencer (ms)
+    internal_ms: Option<f64>,
+    /// Optional internal breakdown metrics reported by the sequencer
+    internal_breakdown: Option<serde_json::Value>,
 }
 
-async fn submit_worker_tx_to_sequencer(
+/// Send a worker-verified transaction to the sequencer and return its outcome
+/// without mutating the shared MockDA database.
+async fn send_worker_tx_to_sequencer(
     state: &AppState,
     tx_hash: &str,
 ) -> Result<SequencerSubmissionOutcome, ServiceError> {
-    use worker_verified_transactions::{
-        ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
-        TransactionState,
-    };
-
     let url = format!("{}/sequencer/worker_txs/{}", state.node_client.base_url, tx_hash);
+    let http_start = std::time::Instant::now();
     let http_result = state.http_client.post(&url).send().await;
+    let latency_ms = http_start.elapsed().as_secs_f64() * 1000.0;
 
     let outcome = match http_result {
         Ok(response) => {
@@ -1702,6 +1752,25 @@ async fn submit_worker_tx_to_sequencer(
 
             let parsed_json = serde_json::from_str(&body).ok();
 
+            // Try to extract internal timing metrics from the sequencer response.
+            // Prefer the dedicated `sequencer_metrics` object when available,
+            // otherwise fall back to a generic `metrics` field or top-level totals.
+            let (internal_ms, internal_breakdown) = match &parsed_json {
+                Some(serde_json::Value::Object(map)) => {
+                    if let Some(metrics) = map.get("sequencer_metrics") {
+                        let total_ms = metrics.get("total_ms").and_then(|v| v.as_f64());
+                        (total_ms, Some(metrics.clone()))
+                    } else if let Some(metrics) = map.get("metrics") {
+                        let total_ms = metrics.get("total_ms").and_then(|v| v.as_f64());
+                        (total_ms, Some(metrics.clone()))
+                    } else {
+                        let total_ms = map.get("total_ms").and_then(|v| v.as_f64());
+                        (total_ms, parsed_json.clone())
+                    }
+                }
+                _ => (None, None),
+            };
+
             if status.is_success() {
                 SequencerSubmissionOutcome {
                     accepted: true,
@@ -1709,10 +1778,13 @@ async fn submit_worker_tx_to_sequencer(
                     raw_response: Some(body.clone()),
                     response_json: parsed_json,
                     log_message: body,
+                    latency_ms,
+                    internal_ms,
+                    internal_breakdown,
                 }
             } else {
                 let body_value =
-                    parsed_json.unwrap_or_else(|| serde_json::Value::String(body.clone()));
+                    parsed_json.clone().unwrap_or_else(|| serde_json::Value::String(body.clone()));
                 let response_value = serde_json::json!({
                     "status": status.as_u16(),
                     "body": body_value,
@@ -1723,8 +1795,11 @@ async fn submit_worker_tx_to_sequencer(
                     accepted: false,
                     status_code: Some(status.as_u16()),
                     raw_response: Some(payload),
-                    response_json: Some(response_value),
+                    response_json: Some(response_value.clone()),
                     log_message: body,
+                    latency_ms,
+                    internal_ms,
+                    internal_breakdown,
                 }
             }
         }
@@ -1737,8 +1812,26 @@ async fn submit_worker_tx_to_sequencer(
                 raw_response: Some(json_value.to_string()),
                 response_json: Some(json_value),
                 log_message: message,
+                latency_ms,
+                internal_ms: None,
+                internal_breakdown: None,
             }
         }
+    };
+
+    Ok(outcome)
+}
+
+/// Update the worker transaction record in the shared MockDA database after
+/// receiving the sequencer outcome.
+async fn update_worker_tx_after_submission(
+    state: &AppState,
+    tx_hash: &str,
+    outcome: &SequencerSubmissionOutcome,
+) -> Result<(), ServiceError> {
+    use worker_verified_transactions::{
+        ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
+        TransactionState,
     };
 
     let record = VerifiedEntity::find()
@@ -1787,6 +1880,17 @@ async fn submit_worker_tx_to_sequencer(
         );
     }
 
+    Ok(())
+}
+
+/// Backwards-compatible helper used by non-flush paths:
+/// sends the worker tx to the sequencer and immediately updates the DB.
+async fn submit_worker_tx_to_sequencer(
+    state: &AppState,
+    tx_hash: &str,
+) -> Result<SequencerSubmissionOutcome, ServiceError> {
+    let outcome = send_worker_tx_to_sequencer(state, tx_hash).await?;
+    update_worker_tx_after_submission(state, tx_hash, &outcome).await?;
     Ok(outcome)
 }
 
