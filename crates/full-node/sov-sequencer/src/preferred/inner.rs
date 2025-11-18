@@ -1986,7 +1986,15 @@ where
             return;
         }
 
-        let ParallelizedResponse { tx_hash, receipt, tx_changes, .. } = parallel_response;
+        let ParallelizedResponse {
+            tx_hash,
+            receipt,
+            tx_changes,
+            remaining_slot_gas: _,
+            execution_time_micros,
+            original_tx_queue_id: _,
+            api_effect,
+        } = parallel_response;
 
         // Rebuild the tx body from the worker’s receipt and commit via background task.
         let tx = FullyBakedTx {
@@ -1999,7 +2007,12 @@ where
         let commit_start = std::time::Instant::now();
         let (accepted_with_budget_main, tx_changes_main) = match inner
             .executor
-            .accept_precomputed_tx(tx, tx_changes)
+            .accept_precomputed_tx_from_parallel(
+                tx,
+                tx_changes,
+                api_effect,
+                execution_time_micros,
+            )
             .await
         {
             Ok(res) => res,
@@ -2012,7 +2025,7 @@ where
                     inner.pending_parallel_count -= 1;
                 }
                 eprintln!(
-                    "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (error in accept_precomputed_tx)",
+                    "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (error in accept_precomputed_tx_from_parallel)",
                     fn_start.elapsed().as_secs_f64() * 1000.0
                 );
                 return;
