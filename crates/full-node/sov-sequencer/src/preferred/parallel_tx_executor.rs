@@ -384,12 +384,12 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                         // Increment active workers counter to track concurrency
                         let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
 
-                        eprintln!(
-                            "[PARALLEL][Worker {}] ▶ START TX {} at t={}µs | Active workers: {}", 
-                            worker_id, 
-                            request.tx_hash,
-                            start_timestamp,
-                            active_count
+                        tracing::debug!(
+                            worker_id,
+                            tx_hash = %request.tx_hash,
+                            start_timestamp_micros = start_timestamp,
+                            active_workers = active_count,
+                            "[PARALLEL] Worker starting transaction execution"
                         );
 
                         tracing::trace!(
@@ -418,14 +418,14 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     .as_micros();
                                 txs_processed += 1;
 
-                                eprintln!(
-                                    "[PARALLEL][Worker {}] ✓ END TX {} at t={}µs (took {:.2}ms / {} µs) | Active workers: {}",
+                                tracing::debug!(
                                     worker_id,
-                                    request.tx_hash,
-                                    end_timestamp,
-                                    elapsed.as_secs_f64() * 1000.0,
-                                    elapsed.as_micros(),
-                                    active_count_after
+                                    tx_hash = %request.tx_hash,
+                                    end_timestamp_micros = end_timestamp,
+                                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                                    elapsed_micros = elapsed.as_micros(),
+                                    active_workers = active_count_after,
+                                    "[PARALLEL] Worker finished transaction execution"
                                 );
 
                                 tracing::debug!(

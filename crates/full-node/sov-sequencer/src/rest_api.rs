@@ -53,7 +53,9 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
                 .map_err(|_| "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set".to_string())?;
 
             if connection_string.starts_with("sqlite:") {
-                use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+                use sea_orm::sqlx::sqlite::{
+                    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+                };
                 use std::str::FromStr;
 
                 let sqlite_opts = SqliteConnectOptions::from_str(&connection_string)
@@ -62,6 +64,10 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
                             "Failed to parse worker DB SQLite connection string: {err}"
                         )
                     })?
+                    // Favor write throughput for the worker_txs DB: WAL + NORMAL
+                    // keeps fsync costs reasonable while retaining durability.
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
                     .busy_timeout(Duration::from_millis(30_000));
 
                 let pool = SqlitePoolOptions::new()
@@ -348,7 +354,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
         };
 
-        tracing::info!(%tx_hash_value, "Using OPTIMIZED pre-authenticated path (serialized tx, no blob, no auth)");
+        tracing::debug!(%tx_hash_value, "Using OPTIMIZED pre-authenticated path (serialized tx, no blob, no auth)");
 
         // Decide intent based on parsed transaction data and proof outputs.
         enum WorkerTxIntent {
@@ -511,9 +517,9 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         let result = match worker_tx_intent {
             WorkerTxIntent::Withdraw { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
+                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
                 let sequencer = state.sequencer.clone();
-                crate::common::with_pre_verified_withdraw(proof_outputs, async move {
+                crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
                     sequencer
                         .accept_serialized_pre_authenticated_tx(
                             serialized_tx_base64.clone(),
@@ -525,9 +531,9 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
             WorkerTxIntent::Transfer { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_withdraw(tx_hash_value, proof_outputs_clone);
+                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
                 let sequencer = state.sequencer.clone();
-                crate::common::with_pre_verified_withdraw(proof_outputs, async move {
+                crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
                     sequencer
                         .accept_serialized_pre_authenticated_tx(
                             serialized_tx_base64.clone(),
@@ -552,7 +558,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             Ok(res) => res,
             Err(e) => {
                 crate::common::clear_tx_pre_authenticated(&tx_hash_value);
-                crate::common::remove_pre_verified_withdraw(&tx_hash_value);
+                crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
                 // Do not clear the pre-verified spend here; allow STF to consume it.
                 if e.status.is_server_error() {
                     tracing::error!(error = ?e, "Error accepting worker transaction");
@@ -584,13 +590,13 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
         if let Err(err) = active_model.update(db).await {
             crate::common::clear_tx_pre_authenticated(&tx_hash_value);
-            crate::common::remove_pre_verified_withdraw(&tx_hash_value);
+            crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
             // Do not clear the pre-verified spend here; allow STF to consume it.
             return Err(errors::database_error_response_500(err));
         }
 
         crate::common::clear_tx_pre_authenticated(&tx_hash_value);
-        crate::common::remove_pre_verified_withdraw(&tx_hash_value);
+        crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
         // Do not clear the pre-verified spend here; allow STF to consume it.
 
         Ok(response_payload.into())

@@ -544,18 +544,18 @@ where
                 )
             });
         // Temporary debug to observe gas threshold behavior during load
-        eprintln!(
-            "[GAS CHECK] gas-based close check: remaining_slot_gas={:?} close_when_remaining={:?}",
-            remaining_slot_gas,
-            close_when_remaining
+        debug!(
+            ?remaining_slot_gas,
+            ?close_when_remaining,
+            "[GAS CHECK] gas-based close check (preferred sequencer)"
         );
         let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&close_when_remaining);
         if close_to_gas_limit {
             tracing::debug!(close_when_remaining = %close_when_remaining, %remaining_slot_gas, "Closing and publishing current batch because remaining gas is below threshold");
-            eprintln!(
-                "[BATCH CLOSE] reason=gas remaining_slot_gas={:?} threshold={:?}",
-                remaining_slot_gas,
-                close_when_remaining
+            debug!(
+                ?remaining_slot_gas,
+                ?close_when_remaining,
+                "[BATCH CLOSE] reason=gas (preferred sequencer)"
             );
             self.close_current_batch().await;
         }
@@ -565,10 +565,10 @@ where
 
         if current_batch_execution_time_micros > self.batch_execution_time_limit_micros {
             tracing::debug!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Closing and publishing current batch because we've reached the batch execution time cap");
-            eprintln!(
-                "[BATCH CLOSE] reason=time current_us={} limit_us={}",
-                current_batch_execution_time_micros,
-                self.batch_execution_time_limit_micros
+            debug!(
+                current_us = current_batch_execution_time_micros,
+                limit_us = self.batch_execution_time_limit_micros,
+                "[BATCH CLOSE] reason=time (preferred sequencer)"
             );
             self.close_current_batch().await;
         } else {
@@ -585,10 +585,10 @@ where
             });
         if (self.batch_size_tracker.current_batch_size as u64) > comfortable_size_limit {
             tracing::debug!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Closing and publishing current batch because we're close to the size limit");
-            eprintln!(
-                "[BATCH CLOSE] reason=size current_bytes={} limit_bytes={}",
-                self.batch_size_tracker.current_batch_size,
-                comfortable_size_limit
+            debug!(
+                current_bytes = self.batch_size_tracker.current_batch_size,
+                limit_bytes = comfortable_size_limit,
+                "[BATCH CLOSE] reason=size (preferred sequencer)"
             );
             self.close_current_batch().await;
         } else {
@@ -1366,7 +1366,7 @@ where
                 reason,
             } => {
                 let start = std::time::Instant::now();
-                info!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
+                debug!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1381,7 +1381,7 @@ where
                 self.send_response(resp, ret, "accept_tx").await;
                 let elapsed = start.elapsed();
                 let end = std::time::Instant::now();
-                info!("[ACCEPT TX] Ending AcceptTx message processing for tx_hash={} at {:?}, total duration: {:?}", tx_hash, end, elapsed);
+                debug!("[ACCEPT TX] Ending AcceptTx message processing for tx_hash={} at {:?}, total duration: {:?}", tx_hash, end, elapsed);
             }
             Message::LatestSlotNumber { resp, reason } => {
                 let ret = self.process_latest_slot_number(reason).await;
@@ -1832,7 +1832,7 @@ where
                 let runtime_call = Rt::wrap_call(decoded);
                 let debug_str = format!("{:?}", runtime_call);
                 let variant_name = debug_str.split('(').next().unwrap_or("");
-                eprintln!("Runtime call variant: {}", variant_name);
+                debug!(variant = variant_name, "[detect] Runtime call variant identified during process_accept_tx");
                 variant_name == "MidnightPrivacy"
             } else {
                 // Fallback: try generic AuthenticatorInput and parse the RawTx directly
@@ -1847,17 +1847,17 @@ where
                                 let runtime_call = tx.runtime_call();
                                 let debug_str = format!("{:?}", runtime_call);
                                 let variant_name = debug_str.split('(').next().unwrap_or("");
-                                eprintln!("Runtime call variant: {}", variant_name);
+                                debug!(variant = variant_name, "[detect] Runtime call variant identified during fallback process_accept_tx");
                                 variant_name == "MidnightPrivacy"
                             }
                             Err(e) => {
-                                eprintln!("Failed to deserialize Transaction from RawTx (fallback): {:?}", e);
+                                debug!(error = %e, "[detect] Failed to deserialize Transaction from RawTx (fallback)");
                                 false
                             }
                         }
                     }
                     Err(err) => {
-                        eprintln!("[detect] Failed to parse authenticator input in fallback: {:?}", err);
+                        debug!(error = ?err, "[detect] Failed to parse authenticator input in fallback");
                         false
                     }
                 }
@@ -1865,7 +1865,11 @@ where
         };
         let detection_elapsed = detection_start.elapsed();
 
-        eprintln!("Is midnight privacy tx: {} (detection took {:?})", is_midnight_privacy_tx, detection_elapsed);
+        debug!(
+            is_midnight_privacy_tx,
+            detection_micros = detection_elapsed.as_micros(),
+            "[detect] Midnight privacy detection timing"
+        );
 
         if is_midnight_privacy_tx {
             // Send to parallel executor - worker will send result directly to message loop
@@ -1877,7 +1881,7 @@ where
                 tx_len,
                 message_sender,
             ) {
-                eprintln!("[PARALLEL] Transaction sent to parallel executor: {}", tx_hash);
+                debug!(%tx_hash, "[PARALLEL] Transaction sent to parallel executor");
 
                 // Register an HTTP waiter and keep the batch open while in-flight
                 inner.pending_parallel_count += 1;
@@ -1885,7 +1889,10 @@ where
                 inner.pending_http_waiters.insert(tx_hash, http_tx);
                 return Ok(http_rx);
             } else {
-                eprintln!("[PARALLEL] Failed to send to parallel executor for {}, falling back to sequential", tx_hash);
+                debug!(
+                    %tx_hash,
+                    "[PARALLEL] Failed to send to parallel executor - falling back to sequential"
+                );
                 // Fall through to sequential processing
             }
         }
@@ -1982,7 +1989,10 @@ where
             if inner.pending_parallel_count > 0 {
                 inner.pending_parallel_count -= 1;
             }
-            eprintln!("[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (early return - no batch)", fn_start.elapsed().as_secs_f64() * 1000.0);
+            debug!(
+                total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
+                "[TIMING] process_parallel_tx_completed early return - no batch"
+            );
             return;
         }
 
@@ -2011,9 +2021,9 @@ where
                 if inner.pending_parallel_count > 0 {
                     inner.pending_parallel_count -= 1;
                 }
-                eprintln!(
-                    "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms (error in accept_precomputed_tx)",
-                    fn_start.elapsed().as_secs_f64() * 1000.0
+                debug!(
+                    total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
+                    "[TIMING] process_parallel_tx_completed exited early (error in accept_precomputed_tx)"
                 );
                 return;
             }
@@ -2087,14 +2097,14 @@ where
         let close_batch_time = close_batch_start.elapsed();
 
         let total_time = fn_start.elapsed();
-        eprintln!(
-            "[TIMING] process_parallel_tx_completed: TOTAL_TIME={:.3}ms | accept_precomputed_tx={:.3}ms | send_accept_tx={:.3}ms | close_batch_if_nearly_full={:.3}ms | batch_metrics={:.3}ms | waiter_bridge={:.3}ms",
-            total_time.as_secs_f64() * 1000.0,
-            commit_time.as_secs_f64() * 1000.0,
-            send_accept_time.as_secs_f64() * 1000.0,
-            close_batch_time.as_secs_f64() * 1000.0,
-            batch_metrics_time.as_secs_f64() * 1000.0,
-            waiter_bridge_time.as_secs_f64() * 1000.0
+        debug!(
+            total_ms = total_time.as_secs_f64() * 1000.0,
+            accept_precomputed_tx_ms = commit_time.as_secs_f64() * 1000.0,
+            send_accept_tx_ms = send_accept_time.as_secs_f64() * 1000.0,
+            close_batch_ms = close_batch_time.as_secs_f64() * 1000.0,
+            batch_metrics_ms = batch_metrics_time.as_secs_f64() * 1000.0,
+            waiter_bridge_ms = waiter_bridge_time.as_secs_f64() * 1000.0,
+            "[TIMING] process_parallel_tx_completed timings"
         );
     }
 

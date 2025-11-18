@@ -81,35 +81,36 @@ pub(crate) type SequencerEventStream<Rt> = Pin<
 >;
 
 task_local! {
-    static PRE_VERIFIED_WITHDRAW: RefCell<Option<SpendPublic>>;
+    static PRE_VERIFIED_MIDNIGHT_TRANSACTION: RefCell<Option<SpendPublic>>;
 }
 
-static PRE_VERIFIED_WITHDRAWALS: OnceLock<StdMutex<HashMap<TxHash, SpendPublic>>> =
+static PRE_VERIFIED_MIDNIGHT_TRANSACTIONS: OnceLock<StdMutex<HashMap<TxHash, SpendPublic>>> =
     OnceLock::new();
 
 fn pre_verified_map() -> &'static StdMutex<HashMap<TxHash, SpendPublic>> {
-    PRE_VERIFIED_WITHDRAWALS.get_or_init(|| StdMutex::new(HashMap::new()))
+    PRE_VERIFIED_MIDNIGHT_TRANSACTIONS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-pub(crate) fn cache_pre_verified_withdraw(tx_hash: TxHash, public: SpendPublic) {
+pub(crate) fn cache_pre_verified_midnight_transaction(tx_hash: TxHash, public: SpendPublic) {
     let _ = pre_verified_map().lock().unwrap().insert(tx_hash, public);
 }
 
-pub(crate) fn remove_pre_verified_withdraw(tx_hash: &TxHash) -> Option<SpendPublic> {
+pub(crate) fn remove_pre_verified_midnight_transaction(tx_hash: &TxHash) -> Option<SpendPublic> {
     pre_verified_map().lock().unwrap().remove(tx_hash)
 }
 
-pub async fn with_pre_verified_withdraw<T, Fut>(public: SpendPublic, fut: Fut) -> T
+pub async fn with_pre_verified_midnight_transaction<T, Fut>(public: SpendPublic, fut: Fut) -> T
 where
     Fut: Future<Output = T>,
 {
-    PRE_VERIFIED_WITHDRAW
+    PRE_VERIFIED_MIDNIGHT_TRANSACTION
         .scope(RefCell::new(Some(public)), fut)
         .await
 }
 
-pub(crate) fn take_pre_verified_withdraw() -> Option<SpendPublic> {
-    PRE_VERIFIED_WITHDRAW
+#[allow(dead_code)]
+pub(crate) fn take_pre_verified_midnight_transaction() -> Option<SpendPublic> {
+    PRE_VERIFIED_MIDNIGHT_TRANSACTION
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
@@ -683,9 +684,7 @@ where
     };
 
     let (auth_tx, mut auth_data, message) = auth_res;
-    if let Some(public) = take_pre_verified_withdraw()
-        .or_else(|| take_cached_pre_verified_withdraw::<S, Rt>(baked_tx))
-    {
+    if let Some(public) = take_cached_pre_verified_withdraw::<S, Rt>(baked_tx) {
         auth_data.credentials = auth_data
             .credentials
             .insert(PreVerifiedWithdrawCredential(public));

@@ -967,7 +967,7 @@ where
 
         let original_tx_queue_id = self.tx_queue_id.load(Ordering::Acquire);
         let start = std::time::Instant::now();
-        tracing::info!(%tx_hash, "Executing OPTIMIZED accept_serialized_pre_authenticated_tx (no deserialize, no reconstruct, no auth)");
+        tracing::debug!(%tx_hash, "Executing OPTIMIZED accept_serialized_pre_authenticated_tx (no deserialize, no reconstruct, no auth)");
 
         // Decode base64 serialized transaction - this is the only overhead
         let decode_start = std::time::Instant::now();
@@ -1059,7 +1059,7 @@ where
             .ok()
             .map(|accepted| accepted.confirmation.stf_execution_time_micros as f64 / 1000.0);
 
-        tracing::info!(
+        tracing::debug!(
             %tx_hash,
             decode_ms = format!("{:.2}", decode_ms),
             wrap_ms = format!("{:.2}", wrap_ms),

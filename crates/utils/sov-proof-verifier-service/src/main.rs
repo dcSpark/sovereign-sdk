@@ -50,7 +50,7 @@ struct Args {
     chain_id: u64,
 
     /// Maximum number of concurrent proof verifications
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "16")]
     max_concurrent: usize,
 
     /// Connection string for the worker_txs database (used to store worker_verified_transactions).

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 
@@ -24,6 +25,8 @@ use sov_api_spec::types as api_types;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
@@ -126,7 +129,7 @@ struct NotesResp {
     notes: Vec<NoteInfo>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct VerifierMetrics {
     deserialize_ms: f64,
     parse_ms: f64,
@@ -1033,56 +1036,88 @@ async fn perform_transfer_cycle(
     // Track per-tx worker processing metrics (from verifier)
     let transfer_submit_start = Instant::now();
     let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
+    let submit_endpoint = format!("{}/midnight-privacy", config.external_verifier_url);
+    let concurrency_limit = config.max_concurrent_proofs.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency_limit));
+    let mut join_set = JoinSet::new();
+
+    #[derive(Debug)]
+    struct TransferSubmitResult {
+        idx: usize,
+        wallet_idx: usize,
+        worker_hash: String,
+        metrics: VerifierMetrics,
+    }
 
     for (idx, (wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
-        let display_idx = idx + 1;
-        let resp = http
-            .post(format!(
-                "{}/midnight-privacy",
-                config.external_verifier_url
-            ))
-            .json(&json!({ "body": body_b64 }))
-            .send()
-            .await
-            .with_context(|| format!("transfer #{} request failed", display_idx))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!(
-                "transfer #{} verifier returned status {}: {}",
-                display_idx,
-                status, body
-            );
-        }
+        let client = http.clone();
+        let endpoint = submit_endpoint.clone();
+        let permit_pool = semaphore.clone();
+        let transfer_hash = transfer_hashes[idx].clone();
+        let per_tx_delay = config.per_tx_delay_ms;
+        join_set.spawn(async move {
+            let _permit = permit_pool
+                .acquire_owned()
+                .await
+                .expect("submit concurrency semaphore closed");
+            if per_tx_delay > 0 {
+                sleep(Duration::from_millis(per_tx_delay)).await;
+            }
+            let display_idx = idx + 1;
+            let resp = client
+                .post(endpoint)
+                .json(&json!({ "body": body_b64 }))
+                .send()
+                .await
+                .with_context(|| format!("transfer #{} request failed", display_idx))?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                bail!(
+                    "transfer #{} verifier returned status {}: {}",
+                    display_idx,
+                    status,
+                    body
+                );
+            }
 
-        // Parse verifier response to extract per-tx metrics
-        let vresp: VerifierResponse = serde_json::from_str(&body).context(format!(
-            "transfer #{}: failed to parse verifier JSON response",
-            display_idx
-        ))?;
-        let worker_hash = vresp
-            .tx_hash
-            .unwrap_or_else(|| transfer_hashes[idx].clone());
-        let m = vresp.metrics.clone();
-        worker_metrics_by_hash.insert(worker_hash.clone(), m.clone());
+            let vresp: VerifierResponse = serde_json::from_str(&body).context(format!(
+                "transfer #{}: failed to parse verifier JSON response",
+                display_idx
+            ))?;
+            let worker_hash = vresp.tx_hash.unwrap_or(transfer_hash);
+            Ok::<TransferSubmitResult, anyhow::Error>(TransferSubmitResult {
+                idx,
+                wallet_idx,
+                worker_hash,
+                metrics: vresp.metrics.clone(),
+            })
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        let TransferSubmitResult {
+            idx,
+            wallet_idx,
+            worker_hash,
+            metrics,
+        } = res??;
+        worker_metrics_by_hash.insert(worker_hash.clone(), metrics.clone());
 
         if config.detailed_wallet_logs {
+            let display_idx = idx + 1;
             eprintln!(
                 "    [timing][worker] wallet={} idx_in_cycle={} deserialize={:.2}ms parse={:.2}ms sig={:.2}ms proof={:.2}ms db={:.2}ms submit={:.2}ms total={:.2}ms",
                 wallet_idx,
                 display_idx,
-                m.deserialize_ms,
-                m.parse_ms,
-                m.signature_verify_ms,
-                m.proof_verify_ms,
-                m.tx_creation_ms,
-                m.node_submit_ms,
-                m.total_ms
+                metrics.deserialize_ms,
+                metrics.parse_ms,
+                metrics.signature_verify_ms,
+                metrics.proof_verify_ms,
+                metrics.tx_creation_ms,
+                metrics.node_submit_ms,
+                metrics.total_ms
             );
-        }
-
-        if config.per_tx_delay_ms > 0 {
-            sleep(Duration::from_millis(config.per_tx_delay_ms)).await;
         }
     }
 

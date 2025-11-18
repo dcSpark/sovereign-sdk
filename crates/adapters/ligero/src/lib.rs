@@ -547,7 +547,7 @@ mod native {
                         let computed = LigeroCodeCommitment(hasher.finalize().into());
 
                         if &computed == commitment {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Found matching program for commitment {}: {}",
                                 hex::encode(commitment.0),
                                 program_path.display()
