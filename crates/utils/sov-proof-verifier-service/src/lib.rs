@@ -1458,10 +1458,8 @@ fn extract_pre_authenticated_data(
                     .map_err(|e| ServiceError::Internal(format!("Failed to serialize details: {}", e)))?
             );
             
-            let runtime_call_hex = hex::encode(
-                &borsh::to_vec(&v0.runtime_call)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize runtime_call: {}", e)))?
-            );
+            // Empty to avoid storing the 3MB proof - the lightweight version is stored in serialized_tx_base64
+            let runtime_call_hex = String::new();
             
             // OPTIMIZATION: Create a lightweight transaction WITHOUT the proof for pre-authenticated path
             // 

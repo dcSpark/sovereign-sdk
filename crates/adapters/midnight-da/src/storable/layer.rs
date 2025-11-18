@@ -46,18 +46,26 @@ impl StorableMidnightDaLayer {
         connection_string: &str,
         blocks_to_finality: u32,
     ) -> anyhow::Result<Self> {
-        // For SQLite, we need to build SqliteConnectOptions with busy_timeout
+        // For SQLite, we need to build SqliteConnectOptions with per-connection PRAGMAs
         // For other databases, use standard ConnectOptions
         let conn: DatabaseConnection = if connection_string.starts_with("sqlite:") {
             use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+            use sea_orm::sqlx::ConnectOptions as SqlxConnectOptions; // bring log_* methods into scope
             
-            // Parse connection string and set busy_timeout
+            // Parse connection string and enable detailed logging
+            // Chain all methods together since they consume self
             let sqlite_opts = SqliteConnectOptions::from_str(connection_string)?
-                .busy_timeout(std::time::Duration::from_millis(30000)); // 30 seconds
+                .create_if_missing(true)
+                .log_statements(tracing::log::LevelFilter::Debug)
+                .log_slow_statements(
+                    tracing::log::LevelFilter::Warn,
+                    std::time::Duration::from_millis(5),
+                )
+                .busy_timeout(std::time::Duration::from_millis(30000));
             
-            // Create pool with optimized settings for SQLite
+            // Create pool with after_connect hook to apply PRAGMAs to EVERY connection
             let pool = SqlitePoolOptions::new()
-                .max_connections(10) // Conservative for SQLite (single-writer)
+                .max_connections(4) // Reduced from 10 - SQLite single-writer doesn't benefit from high connection counts
                 .min_connections(1)
                 .acquire_timeout(std::time::Duration::from_secs(30))
                 .idle_timeout(Some(std::time::Duration::from_secs(300)))
@@ -66,7 +74,7 @@ impl StorableMidnightDaLayer {
                 .await?;
             
             tracing::info!(
-                "Initializing SQLite database connection pool (max_connections=10, busy_timeout=30s)"
+                "Initializing SQLite database connection pool: 4 max_connections, 5ms slow-query threshold"
             );
             
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
@@ -80,9 +88,14 @@ impl StorableMidnightDaLayer {
                 .acquire_timeout(std::time::Duration::from_secs(30))
                 .idle_timeout(std::time::Duration::from_secs(300))
                 .max_lifetime(std::time::Duration::from_secs(1800))
-                .sqlx_logging_level(tracing::log::LevelFilter::Trace);
+                .sqlx_logging(true) // explicit, default is true
+                .sqlx_logging_level(tracing::log::LevelFilter::Debug)
+                .sqlx_slow_statements_logging_settings(
+                    tracing::log::LevelFilter::Warn,
+                    std::time::Duration::from_millis(5),
+                );
             
-            tracing::info!("Initializing PostgreSQL database connection pool (max_connections=50)");
+            tracing::info!("Initializing PostgreSQL database connection pool: 50 max_connections, 5ms slow-query threshold");
             
             Database::connect(opts).await?
         };

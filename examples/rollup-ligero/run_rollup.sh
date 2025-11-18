@@ -88,10 +88,14 @@ echo ""
 echo "🚀 Starting ligero rollup..."
 echo ""
 
+# Set RUST_LOG to info level to suppress debug logs
+export RUST_LOG="info"
+
 # Run the ligero rollup from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
 # Create demo_data directory if it doesn't exist (required for SQLite DB)
 mkdir -p demo_data
 
-exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
+# Run without capturing output - ensures eprintln! and all stderr/stdout are shown
+exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1
