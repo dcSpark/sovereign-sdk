@@ -32,12 +32,67 @@ use sov_rollup_interface::da::{DaBlobHash, DaSpec};
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::TxHash;
 use tokio::sync::watch::Receiver;
+use tokio::sync::OnceCell;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::common::{
     error_not_fully_synced, take_sequencer_metrics, AcceptedTx, Sequencer, SequencerMetrics,
 };
 use crate::TxStatus;
+
+/// Shared connection pool for the worker_txs database (worker_verified_transactions table).
+static WORKER_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
+
+/// Get a shared connection to the worker_txs database, initializing it on first use.
+async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::Response> {
+    use std::time::Duration;
+
+    let res: Result<&'static DatabaseConnection, String> = WORKER_DB
+        .get_or_try_init(|| async {
+            let connection_string = env::var("SOV_WORKER_TX_DB_CONNECTION_STRING")
+                .map_err(|_| "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set".to_string())?;
+
+            if connection_string.starts_with("sqlite:") {
+                use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+                use std::str::FromStr;
+
+                let sqlite_opts = SqliteConnectOptions::from_str(&connection_string)
+                    .map_err(|err| {
+                        format!(
+                            "Failed to parse worker DB SQLite connection string: {err}"
+                        )
+                    })?
+                    .busy_timeout(Duration::from_millis(30_000));
+
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(5)
+                    .min_connections(1)
+                    .acquire_timeout(Duration::from_secs(30))
+                    .idle_timeout(Some(Duration::from_secs(300)))
+                    .max_lifetime(Some(Duration::from_secs(1800)))
+                    .connect_with(sqlite_opts)
+                    .await
+                    .map_err(|err| format!("Failed to connect to worker SQLite DB: {err}"))?;
+
+                Ok(DatabaseConnection::SqlxSqlitePoolConnection(pool.into()))
+            } else {
+                Database::connect(connection_string)
+                    .await
+                    .map_err(|err| format!("Failed to connect to worker DB: {err}"))
+            }
+        })
+        .await;
+
+    res.map_err(|msg| {
+        if msg.contains("env var is not set") {
+            errors::internal_server_error_response_500(
+                "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set",
+            )
+        } else {
+            errors::database_error_response_500(anyhow::anyhow!(msg))
+        }
+    })
+}
 
 /// [`StartFrom`] is used as a query parameter for the txs subscription
 #[derive(
@@ -257,46 +312,12 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
     ) -> ApiResult<
         TxInfoWithConfirmation<DaBlobHash<<Seq::Da as DaService>::Spec>, Seq::Confirmation>,
     > {
-        let connection_string = match env::var("SOV_WORKER_TX_DB_CONNECTION_STRING") {
-            Ok(value) => value,
-            Err(_) => {
-                return Err(errors::internal_server_error_response_500(
-                    "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set",
-                ))
-            }
-        };
-
-        // Connect to the worker transactions database.
-        // For SQLite, use a pooled connection with a busy_timeout to reduce
-        // `database is locked` errors when the rollup and worker share the same DB file.
-        let db = if connection_string.starts_with("sqlite:") {
-            use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-            use std::str::FromStr;
-
-            let sqlite_opts = SqliteConnectOptions::from_str(&connection_string)
-                .map_err(|err| errors::database_error_response_500(err))?
-                .busy_timeout(std::time::Duration::from_millis(30_000));
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(5)
-                .min_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .idle_timeout(Some(std::time::Duration::from_secs(300)))
-                .max_lifetime(Some(std::time::Duration::from_secs(1800)))
-                .connect_with(sqlite_opts)
-                .await
-                .map_err(|err| errors::database_error_response_500(err))?;
-
-            DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
-        } else {
-            Database::connect(connection_string)
-                .await
-                .map_err(|err| errors::database_error_response_500(err))?
-        };
+        // Use a shared connection pool for the worker transactions database.
+        let db = get_worker_db().await?;
 
         let record = worker_verified_transactions::Entity::find()
             .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.clone()))
-            .one(&db)
+            .one(db)
             .await
             .map_err(|err| errors::database_error_response_500(err))?;
 
@@ -561,7 +582,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             Set(worker_verified_transactions::TransactionState::Accepted);
         active_model.sequencer_status = Set(Some(serialized_response));
 
-        if let Err(err) = active_model.update(&db).await {
+        if let Err(err) = active_model.update(db).await {
             crate::common::clear_tx_pre_authenticated(&tx_hash_value);
             crate::common::remove_pre_verified_withdraw(&tx_hash_value);
             // Do not clear the pre-verified spend here; allow STF to consume it.

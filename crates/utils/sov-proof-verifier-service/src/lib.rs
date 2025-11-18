@@ -16,7 +16,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
-    Database, DatabaseConnection, EntityTrait, QueryFilter,
+    ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
 };
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
@@ -430,7 +430,7 @@ async fn health_check() -> impl IntoResponse {
 /// Flush all pending worker-verified transactions to the sequencer in parallel
 async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ServiceError> {
     use worker_verified_transactions::{Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState};
-    use sea_orm::QuerySelect;
+    use sea_orm::{QuerySelect, TransactionTrait};
 
     // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
     let pending_tx_hashes: Vec<String> = VerifiedEntity::find()
@@ -456,11 +456,10 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
     }
 
     let mut handles = Vec::with_capacity(total);
+    
     for txh in pending_tx_hashes {
         let st = state.clone();
         handles.push(tokio::spawn(async move {
-            // // Add 1 ms delay before submission
-            // tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             // Only submit to sequencer and collect the outcome in memory.
             // Database updates are applied after all submissions complete.
             let res = send_worker_tx_to_sequencer(&st, &txh).await;
@@ -468,18 +467,31 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
         }));
     }
 
+    // Await all handles in parallel
+    let sequencer_start = std::time::Instant::now();
+    let all_results = join_all(handles).await;
+    let sequencer_elapsed_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+    info!("Sequencer processed worker transactions in {:.2} ms", sequencer_elapsed_ms);
+
+    // Group DB updates for worker transactions into a single short transaction
+    // to reduce commit overhead and hold locks for a minimal time window.
+    let txn = state
+        .da_conn
+        .begin()
+        .await
+        .map_err(|err| ServiceError::Internal(format!("Failed to begin transaction for worker tx updates: {err}")))?;
+
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut results = Vec::new();
 
-    // Await all handles in parallel
-    let all_results = join_all(handles).await;
-
     for outcome in all_results {
         match outcome {
             Ok((txh, Ok(outcome))) => {
-                // Apply DB update after all sequencer submissions have completed.
-                if let Err(err) = update_worker_tx_after_submission(&state, &txh, &outcome).await {
+                // Apply DB update inside the shared transaction.
+                if let Err(err) =
+                    update_worker_tx_after_submission_in_conn(&txn, &txh, &outcome).await
+                {
                     rejected += 1;
                     results.push(serde_json::json!({
                         "tx_hash": txh,
@@ -542,6 +554,10 @@ async fn flush_pending_handler(State(state): State<AppState>) -> Result<Json<ser
             }
         }
     }
+
+    txn.commit()
+        .await
+        .map_err(|err| ServiceError::Internal(format!("Failed to commit worker tx updates: {err}")))?;
 
     Ok(Json(serde_json::json!({
         "flushed": total,
@@ -1827,6 +1843,19 @@ async fn update_worker_tx_after_submission(
     tx_hash: &str,
     outcome: &SequencerSubmissionOutcome,
 ) -> Result<(), ServiceError> {
+    update_worker_tx_after_submission_in_conn(state.da_conn.as_ref(), tx_hash, outcome).await
+}
+
+/// Update the worker transaction record using a generic connection (can be a
+/// pooled connection or a transaction).
+async fn update_worker_tx_after_submission_in_conn<C>(
+    conn: &C,
+    tx_hash: &str,
+    outcome: &SequencerSubmissionOutcome,
+) -> Result<(), ServiceError>
+where
+    C: ConnectionTrait,
+{
     use worker_verified_transactions::{
         ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
         TransactionState,
@@ -1834,7 +1863,7 @@ async fn update_worker_tx_after_submission(
 
     let record = VerifiedEntity::find()
         .filter(VerifiedColumn::TxHash.eq(tx_hash))
-        .one(state.da_conn.as_ref())
+        .one(conn)
         .await
         .map_err(|err| {
             ServiceError::Internal(format!(
@@ -1855,7 +1884,7 @@ async fn update_worker_tx_after_submission(
     });
     active_model.sequencer_status = Set(outcome.raw_response.clone());
     active_model
-        .update(state.da_conn.as_ref())
+        .update(conn)
         .await
         .map_err(|err| {
             ServiceError::Internal(format!(

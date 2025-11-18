@@ -950,9 +950,13 @@ async fn perform_transfer_cycle(
     );
 
     // Build and send transfer transactions to verifier (deferred submission)
+    let transfer_txs_start = Instant::now();
     let mut transfer_txs_b64: Vec<(usize, String)> = Vec::with_capacity(proofs.len());
     let mut transfer_hashes: Vec<String> = Vec::with_capacity(proofs.len());
-    let transfer_submit_start = Instant::now();
+    eprintln!(
+        "[cycle] Building and signing {} transfers txs...",
+        proofs.len()
+    );
     for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
         let wallet = &mut wallets[wallet_idx];
 
@@ -1000,6 +1004,13 @@ async fn perform_transfer_cycle(
 
         transfer_txs_b64.push((wallet_idx, tx_b64));
     }
+    let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
+        transfer_txs_b64.len(),
+        transfer_txs_ms,
+        transfer_txs_ms / transfer_txs_b64.len() as f64
+    );
 
     eprintln!(
         "[cycle] Submitting {} transfers to verifier with deferred submission...",
@@ -1007,6 +1018,7 @@ async fn perform_transfer_cycle(
     );
 
     // Track per-tx worker processing metrics (from verifier)
+    let transfer_submit_start = Instant::now();
     let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
 
     for (idx, (wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
@@ -1063,9 +1075,10 @@ async fn perform_transfer_cycle(
 
     let transfer_submit_ms = transfer_submit_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[cycle] Submitted {} transfers to verifier in {:.2} ms",
+        "[cycle] Submitted {} transfers to verifier in {:.2} ms (avg {:.2} ms per tx)",
         transfer_hashes.len(),
-        transfer_submit_ms
+        transfer_submit_ms,
+        transfer_submit_ms / transfer_hashes.len() as f64
     );
     // Interactive gate before flushing to the sequencer.
     wait_for_c_to_continue("[cycle] Ready to submit to sequencer.").ok();
@@ -1135,7 +1148,7 @@ async fn perform_transfer_cycle(
             flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
         );
     } else {
-        eprintln!("[cycle] Submit to sequencer complete.");
+        eprintln!("[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms per tx)", flush_elapsed_ms, flush_elapsed_ms / flush.flushed as f64);
     }
 
     // Track per-tx sequencer times and breakdown for this cycle

@@ -53,10 +53,11 @@ struct Args {
     #[arg(long, default_value = "10")]
     max_concurrent: usize,
 
-    /// Connection string for the shared MockDA database.
-    /// If not provided, the service will try to read it from --rollup-config-path.
+    /// Connection string for the worker_txs database (used to store worker_verified_transactions).
+    /// If not provided, the service will try to derive it from --rollup-config-path's [da] section
+    /// by creating a sibling SQLite file (worker_txs.sqlite).
     /// If neither is set, it falls back to the demo default
-    /// "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".
+    /// "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".
     #[arg(long)]
     da_db: Option<String>,
 
@@ -77,14 +78,14 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing(&args.log_level)?;
 
-    // Resolve DA connection string, preferring explicit CLI value, then rollup_config.toml, then demo default.
+    // Resolve worker_txs DB connection string, preferring explicit CLI value, then rollup_config.toml, then demo default.
     let da_connection_string = resolve_da_connection_string(&args)?;
 
     info!("Starting proof verifier service");
     info!("Bind address: {}", args.bind);
     info!("Node RPC URL: {}", args.node_rpc_url);
     info!("Max concurrent verifications: {}", args.max_concurrent);
-    info!("MockDA DB: {}", da_connection_string);
+    info!("Worker transactions DB: {}", da_connection_string);
     info!("Defer submission: {}", args.defer_submission);
 
     // Parse optional method ID (will be auto-computed if not provided)
@@ -172,45 +173,78 @@ fn parse_method_id(hex: &str) -> Result<[u8; 32]> {
     Ok(method_id)
 }
 
-/// Resolve the DA connection string to use for the verifier service.
+/// Resolve the worker_txs DB connection string to use for the verifier service.
 ///
 /// Priority:
 /// 1. Explicit `--da-db` CLI argument (if provided)
-/// 2. `--rollup-config-path`'s [da] section `connection_string`
-/// 3. Built-in demo default pointing at the Ligero mock DA database.
+/// 2. Derived from `--rollup-config-path`'s [da] section `connection_string`
+///    by creating a sibling SQLite file `worker_txs.sqlite`
+/// 3. Built-in demo default pointing at a dedicated worker_txs SQLite database.
 fn resolve_da_connection_string(args: &Args) -> Result<String> {
     if let Some(ref explicit) = args.da_db {
         return Ok(explicit.clone());
     }
 
     if let Some(ref config_path) = args.rollup_config_path {
-        info!(
-            "No --da-db provided; loading DA connection string from rollup config at {}",
-            config_path
-        );
+        info!("No --da-db provided; loading rollup config from {}", config_path);
 
         let rollup_config: RollupConfig<MultiAddressEvm, StorableMidnightDaService> =
             from_toml_path(config_path).with_context(|| {
                 format!(
-                    "Failed to read rollup configuration from {} to resolve DA connection string",
+                    "Failed to read rollup configuration from {} to resolve worker DB connection string",
                     config_path
                 )
             })?;
 
-        let conn = rollup_config.da.connection_string.clone();
+        let conn =
+            derive_worker_db_connection_string(&rollup_config.da.connection_string);
 
         info!(
-            "Using DA connection string from rollup config: {}",
+            "Using derived worker_txs DB connection string from rollup config: {}",
             conn
         );
 
         return Ok(conn);
     }
 
-    let default_conn = "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".to_string();
+    let default_conn =
+        "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".to_string();
     info!(
-        "No --da-db or --rollup-config-path provided; falling back to default MockDA DB: {}",
+        "No --da-db or --rollup-config-path provided; falling back to default worker_txs DB: {}",
         default_conn
     );
     Ok(default_conn)
+}
+
+/// Derive a dedicated worker_txs SQLite connection string from the DA connection string.
+/// For non-SQLite backends, this returns the original string unchanged.
+fn derive_worker_db_connection_string(da_connection_string: &str) -> String {
+    // Only derive a separate file for file-based SQLite.
+    if da_connection_string.starts_with("sqlite::memory:") {
+        return da_connection_string.to_string();
+    }
+
+    if let Some(stripped) = da_connection_string.strip_prefix("sqlite://") {
+        let (path_str, query_opt) = match stripped.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (stripped, None),
+        };
+
+        use std::path::{Path, PathBuf};
+        let path = Path::new(path_str);
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let worker_path: PathBuf = dir.join("worker_txs.sqlite");
+
+        let mut conn = format!("sqlite://{}", worker_path.to_string_lossy());
+        if let Some(q) = query_opt {
+            if !q.is_empty() {
+                conn.push('?');
+                conn.push_str(q);
+            }
+        }
+        conn
+    } else {
+        // Non-SQLite (e.g., Postgres) – keep using the same connection string.
+        da_connection_string.to_string()
+    }
 }
