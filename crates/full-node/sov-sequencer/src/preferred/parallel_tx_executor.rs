@@ -10,7 +10,10 @@ use sov_modules_api::Spec;
 use sov_modules_api::StateUpdateInfo;
 use sov_modules_api::TxChangeSet;
 use sov_modules_api::TransactionReceipt;
-use sov_modules_api::{FullyBakedTx, Runtime, RuntimeEventProcessor};
+use sov_modules_api::{
+    ApiTxEffect, FullyBakedTx, Runtime, RuntimeEventProcessor, TxReceiptContents,
+};
+
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::atomic::Ordering;
@@ -41,6 +44,8 @@ pub struct ParallelizedResponse<S: Spec> {
     pub execution_time_micros: u64,
     /// Original transaction queue ID for ordering
     pub original_tx_queue_id: u64,
+    /// Precomputed user-facing effect (saves `.into()` on the main thread)
+    pub api_effect: ApiTxEffect<TxReceiptContents<S>>,
 }
 
 /// A transaction to be processed in parallel along with metadata needed for the response.
@@ -437,6 +442,10 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     "Transaction processed successfully in parallel"
                                 );
 
+                                // Heavy-ish conversion done in the worker.
+                                let api_effect: ApiTxEffect<TxReceiptContents<S>> =
+                                    receipt.receipt.clone().into();
+
                                 let parallel_response = ParallelizedResponse::<S> {
                                     tx_hash: request.tx_hash,
                                     receipt,
@@ -444,6 +453,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     remaining_slot_gas,
                                     execution_time_micros,
                                     original_tx_queue_id: request.original_tx_queue_id,
+                                    api_effect,
                                 };
 
                                 // Send completion message directly to the message loop

@@ -15,7 +15,8 @@ use sov_modules_api::{
     call_message_repr, BlobDataWithId, ChangeSet, DaSpec, ExecutionContext, FullyBakedTx, Gas,
     GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason, Runtime,
     RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
-    StateUpdateInfo, TransactionReceipt, TxChangeSet, TxHash, VersionReader, VisibleSlotNumber,
+    StateUpdateInfo, TransactionReceipt, TxChangeSet, TxHash, TxReceiptContents, VersionReader,
+    VisibleSlotNumber, ApiTxEffect,
 };
 use sov_modules_stf_blueprint::{BatchReceipt, StfBlueprint};
 use sov_rest_utils::{json_obj, ErrorObject};
@@ -260,7 +261,13 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         &mut self,
         baked_tx: FullyBakedTxWithMaybeChangeSet,
     ) -> Result<(AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet), RollupBlockExecutorError<S>> {
+        let apply_start = std::time::Instant::now();
         let result = self.apply_tx_to_in_progress_batch_inner(baked_tx).await;
+        let apply_time = apply_start.elapsed();
+        eprintln!(
+            "[TIMING] apply_tx_to_in_progress_batch: apply_tx_to_in_progress_batch_inner={:.3}ms",
+            apply_time.as_secs_f64() * 1000.0
+        );
 
         match result {
             Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes)) => {
@@ -318,18 +325,25 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         };
 
         // Stash the tx data for lazy decoding on error only
+        let clone_start = std::time::Instant::now();
         let tx_data_for_lazy_decode = baked_tx.tx.clone();
+        let clone_time = clone_start.elapsed();
 
+        let send_start = std::time::Instant::now();
         if let Err(TrySendError::Full(_)) = task_state.tx_sender.try_send(baked_tx) {
             return Err(RollupBlockExecutorError::Overloaded);
         }
+        let send_time = send_start.elapsed();
 
+        let recv_start = std::time::Instant::now();
         let Some(result) = task_state.result_receiver.recv().await else {
             tracing::error!("The rollup block executor task failed unexpectedly. Gracefully shutting down the sequencer.");
             let _ = self.shutdown_sender.send(()); // We don't care if this fails, because that would mean the sequencer is already shutting down - which is exactly what we want.
             return Err(RollupBlockExecutorError::UnexpectedFailure);
         };
+        let recv_time = recv_start.elapsed();
 
+        let process_start = std::time::Instant::now();
         let ExecutedTxResponse {
             receipt,
             tx_changes,
@@ -347,12 +361,27 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 call: call_repr,
             }
         })?;
+        let process_time = process_start.elapsed();
+
+        eprintln!(
+            "[TIMING] apply_tx_to_in_progress_batch_inner: clone={:.3}ms | try_send={:.3}ms | recv.await={:.3}ms | process_result={:.3}ms",
+            clone_time.as_secs_f64() * 1000.0,
+            send_time.as_secs_f64() * 1000.0,
+            recv_time.as_secs_f64() * 1000.0,
+            process_time.as_secs_f64() * 1000.0
+        );
 
         if !receipt.receipt.is_successful() {
             return Err(RollupBlockExecutorError::UnsuccessfulTransaction { receipt });
         }
 
+        let apply_changes_start = std::time::Instant::now();
         self.checkpoint.apply_tx_changes(tx_changes.clone());
+        let apply_changes_time = apply_changes_start.elapsed();
+        eprintln!(
+            "[TIMING] apply_tx_to_in_progress_batch_inner: checkpoint.apply_tx_changes={:.3}ms",
+            apply_changes_time.as_secs_f64() * 1000.0
+        );
 
         Ok((
             receipt,
@@ -597,7 +626,29 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         tx_receipt: &TransactionReceipt<S>,
         execution_time_micros: Option<u64>,
     ) -> AcceptedTx<Confirmation<S, Rt>> {
+        self.process_tx_receipt_inner(tx_receipt, execution_time_micros, None)
+    }
+
+    /// Same as `process_tx_receipt` but uses a precomputed ApiTxEffect
+    /// (e.g. from the parallel executor) instead of calling `.into()`.
+    fn process_tx_receipt_with_effect(
+        &mut self,
+        tx_receipt: &TransactionReceipt<S>,
+        execution_time_micros: Option<u64>,
+        precomputed_effect: ApiTxEffect<TxReceiptContents<S>>,
+    ) -> AcceptedTx<Confirmation<S, Rt>> {
+        self.process_tx_receipt_inner(tx_receipt, execution_time_micros, Some(precomputed_effect))
+    }
+
+    fn process_tx_receipt_inner(
+        &mut self,
+        tx_receipt: &TransactionReceipt<S>,
+        execution_time_micros: Option<u64>,
+        precomputed_effect: Option<ApiTxEffect<TxReceiptContents<S>>>,
+    ) -> AcceptedTx<Confirmation<S, Rt>> {
+        // 1. Allocate tx / event numbers (must stay serialized here).
         let tx_number = self.next_tx_number;
+        let events_decode_start = std::time::Instant::now();
         let events = tx_receipt
             .events
             .iter()
@@ -609,9 +660,24 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             })
             .collect::<anyhow::Result<Vec<_>>>()
             .expect("Supposedly infallible conversion failed; this is a bug, please report it");
+        let events_decode_time = events_decode_start.elapsed();
+        eprintln!(
+            "[TIMING] process_tx_receipt_inner: EVENT_DECODE={:.3}ms events={} tx_hash={}",
+            events_decode_time.as_secs_f64() * 1000.0,
+            events.len(),
+            tx_receipt.tx_hash,
+        );
 
         self.next_event_number += events.len() as u64;
         self.next_tx_number += 1;
+
+        // 2. Use precomputed effect if provided, otherwise do the existing `.into()`.
+        let receipt_effect = match precomputed_effect {
+            Some(effect) => effect,
+            None => tx_receipt.receipt.clone().into(),
+        };
+
+        // 3. Build the AcceptedTx.
         AcceptedTx {
             tx: FullyBakedTx {
                 data: tx_receipt.body_to_save.clone().expect(
@@ -621,7 +687,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             tx_hash: tx_receipt.tx_hash,
             confirmation: Confirmation {
                 events,
-                receipt: tx_receipt.receipt.clone().into(),
+                receipt: receipt_effect,
                 tx_number,
                 stf_execution_time_micros: execution_time_micros.unwrap_or_default(),
             },
@@ -630,6 +696,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
 
     /// Commit a pre-executed tx by delivering its TxChangeSet to the background task.
     /// Preserves gas accounting, numbering, and checkpoint consistency.
+    #[allow(dead_code)]
     pub async fn accept_precomputed_tx(
         &mut self,
         tx: FullyBakedTx,
@@ -648,6 +715,64 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         };
         let _ = sender.send(tx_changes);
         self.apply_tx_to_in_progress_batch(baked).await
+    }
+
+    /// Variant of `accept_precomputed_tx` used by the parallel executor.
+    /// It reuses a precomputed ApiTxEffect built off-thread so the main
+    /// executor only has to assign tx / event numbers.
+    pub async fn accept_precomputed_tx_from_parallel(
+        &mut self,
+        tx: FullyBakedTx,
+        tx_changes: TxChangeSet,
+        precomputed_effect: ApiTxEffect<TxReceiptContents<S>>,
+        execution_time_micros: u64,
+    ) -> Result<(AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet), RollupBlockExecutorError<S>>
+    where
+        Rt: RuntimeEventProcessor,
+    {
+        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
+        use tokio::sync::oneshot;
+
+        // Same trick as `accept_precomputed_tx`: hand the TxChangeSet to the
+        // background task so it doesn't have to re-execute.
+        let (sender, receiver) = oneshot::channel();
+        let baked = FullyBakedTxWithMaybeChangeSet {
+            tx,
+            receiver: Some(receiver),
+        };
+        let _ = sender.send(tx_changes);
+
+        let apply_start = std::time::Instant::now();
+        let result = self.apply_tx_to_in_progress_batch_inner(baked).await;
+        let apply_time = apply_start.elapsed();
+        eprintln!(
+            "[TIMING] accept_precomputed_tx_from_parallel: apply_tx_to_in_progress_batch_inner={:.3}ms",
+            apply_time.as_secs_f64() * 1000.0
+        );
+        match result {
+            Ok((receipt, remaining_slot_gas, _executor_time_micros, tx_changes)) => {
+                // Rebuild AcceptedTx using the precomputed ApiTxEffect from the worker.
+                let accepted_tx = self.process_tx_receipt_with_effect(
+                    &receipt,
+                    Some(execution_time_micros),
+                    precomputed_effect,
+                );
+
+                if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
+                    writer.insert(accepted_tx.clone()).await;
+                }
+
+                Ok((
+                    AcceptedTxWithBudgetInfo {
+                        accepted_tx,
+                        remaining_slot_gas,
+                        execution_time_micros,
+                    },
+                    tx_changes,
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn update_kernel_with_user_state_root(&mut self) {
