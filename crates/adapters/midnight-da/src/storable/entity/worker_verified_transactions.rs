@@ -39,9 +39,6 @@ pub struct Model {
     /// JSON representation of the transaction call message with proof replaced by "REMOVED".
     #[sea_orm(column_type = "Text")]
     pub transaction_data: String,
-    /// Unmodified data sent from the request body (base64-encoded transaction).
-    #[sea_orm(column_type = "Text")]
-    pub full_transaction_blob: String,
     /// JSON-serialized proof outputs (e.g., anchor_root, nullifier, withdraw_amount).
     #[sea_orm(column_type = "Text")]
     pub proof_outputs: String,
