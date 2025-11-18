@@ -934,10 +934,19 @@ async fn perform_transfer_cycle(
     }
 
     let proof_generation_ms = proof_generation_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_proof_ms = if !proofs.is_empty() {
+        proof_generation_ms / proofs.len() as f64
+    } else {
+        0.0
+    };
     eprintln!(
         "[cycle] Proof generation: generated {} transfer proofs (one per wallet) in {:.2} ms",
         proofs.len(),
         proof_generation_ms
+    );
+    eprintln!(
+        "[cycle] Proof generation: average {:.2} ms per proof",
+        avg_proof_ms
     );
 
     // Build and send transfer transactions to verifier (deferred submission)
