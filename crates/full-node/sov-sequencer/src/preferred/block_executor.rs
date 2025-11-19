@@ -26,7 +26,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, trace};
+use tracing::trace;
 use uuid::Uuid;
 
 use super::state_root_compute::StateRootComputeRequest;
