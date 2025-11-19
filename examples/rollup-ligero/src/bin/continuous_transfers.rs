@@ -32,6 +32,8 @@ use tokio::time::sleep;
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 const TREE_DEPTH: u8 = 16;
+const TREE_REBUILD_MAX_RETRIES: usize = 3;
+const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
@@ -737,60 +739,90 @@ async fn perform_transfer_cycle(
     program_path: &str,
     config: &ContinuousConfig,
 ) -> Result<CycleSummary> {
-    // Fetch tree state and all notes
-    let state: TreeState = client
-        .query_rest_endpoint("/modules/midnight-privacy/tree/state")
-        .await
-        .context("Failed to query tree state")?;
+    // Fetch tree state and all notes with retries in case the sequencer advances while we rebuild the tree
+    let (state, all_notes, mt) = {
+        let mut attempt_result = None;
+        for attempt in 0..TREE_REBUILD_MAX_RETRIES {
+            let state_attempt: TreeState = client
+                .query_rest_endpoint("/modules/midnight-privacy/tree/state")
+                .await
+                .context("Failed to query tree state")?;
 
-    let mut all_notes = Vec::new();
-    let batch_size = 1000;
-    let mut offset = 0;
-    loop {
-        let endpoint = format!(
-            "/modules/midnight-privacy/notes?limit={}&offset={}",
-            batch_size, offset
-        );
-        let batch_resp: NotesResp = client
-            .query_rest_endpoint(&endpoint)
-            .await
-            .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
-        let len = batch_resp.notes.len();
-        all_notes.extend(batch_resp.notes);
-        if len < batch_size {
-            break;
+            let mut all_notes_attempt = Vec::new();
+            let batch_size = 1000;
+            let mut offset = 0;
+            loop {
+                let endpoint = format!(
+                    "/modules/midnight-privacy/notes?limit={}&offset={}",
+                    batch_size, offset
+                );
+                let batch_resp: NotesResp = client
+                    .query_rest_endpoint(&endpoint)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to query notes batch at offset {}", offset)
+                    })?;
+                let len = batch_resp.notes.len();
+                all_notes_attempt.extend(batch_resp.notes);
+                if len < batch_size {
+                    break;
+                }
+                offset += batch_size;
+            }
+
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] tree attempt {}: next_position={} notes_count={}",
+                    attempt + 1,
+                    state_attempt.next_position,
+                    all_notes_attempt.len()
+                );
+            }
+
+            let mut sorted_attempt = all_notes_attempt.clone();
+            sorted_attempt.sort_by_key(|n| n.position);
+
+            let mut mt = MerkleTree::new(TREE_DEPTH);
+            for n in sorted_attempt.iter() {
+                if n.commitment.len() == 32 {
+                    let mut cm = [0u8; 32];
+                    cm.copy_from_slice(&n.commitment);
+                    mt.set_leaf(n.position as usize, cm);
+                }
+            }
+            let rebuilt_root = mt.root();
+            if rebuilt_root.as_slice() == state_attempt.root.as_slice() {
+                attempt_result = Some((state_attempt, all_notes_attempt, mt));
+                break;
+            }
+
+            let rebuilt_hex = hex::encode(rebuilt_root);
+            let state_hex = hex::encode(&state_attempt.root);
+
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] tree mismatch attempt {}/{}: rebuilt={} vs state={}",
+                    attempt + 1,
+                    TREE_REBUILD_MAX_RETRIES,
+                    rebuilt_hex,
+                    state_hex
+                );
+            }
+
+            if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
+                bail!(
+                    "Rebuilt tree root mismatch after {} attempts: rebuilt={} vs state={}",
+                    TREE_REBUILD_MAX_RETRIES,
+                    rebuilt_hex,
+                    state_hex
+                );
+            }
+
+            sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
         }
-        offset += batch_size;
-    }
 
-    if config.detailed_wallet_logs {
-        eprintln!(
-            "[cycle] tree: next_position={} notes_count={}",
-            state.next_position,
-            all_notes.len()
-        );
-    }
-
-    // Rebuild Merkle tree and map commitments to positions
-    let mut sorted_notes = all_notes.clone();
-    sorted_notes.sort_by_key(|n| n.position);
-
-    let mut mt = MerkleTree::new(TREE_DEPTH);
-    for n in sorted_notes.iter() {
-        if n.commitment.len() == 32 {
-            let mut cm = [0u8; 32];
-            cm.copy_from_slice(&n.commitment);
-            mt.set_leaf(n.position as usize, cm);
-        }
-    }
-    let rebuilt_root = mt.root();
-    if rebuilt_root.as_slice() != state.root.as_slice() {
-        bail!(
-            "Rebuilt tree root mismatch: rebuilt={} vs state={}",
-            hex::encode(rebuilt_root),
-            hex::encode(&state.root)
-        );
-    }
+        attempt_result.expect("Tree rebuild attempt must succeed or bail")
+    };
 
     let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
     for n in &all_notes {
