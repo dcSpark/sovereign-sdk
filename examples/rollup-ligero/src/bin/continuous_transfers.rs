@@ -62,7 +62,7 @@ impl ContinuousConfig {
         let per_tx_delay_ms = std::env::var("PER_TX_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(0);
 
         let cycle_delay_ms = std::env::var("CYCLE_DELAY_MS")
             .ok()
@@ -1196,7 +1196,7 @@ async fn perform_transfer_cycle(
             flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
         );
     } else {
-        eprintln!("[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms per tx)", flush_elapsed_ms, flush_elapsed_ms / flush.flushed as f64);
+        eprintln!("[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)", flush_elapsed_ms, flush_elapsed_ms / flush.flushed as f64, flush.flushed as f64 / (flush_elapsed_ms / 1000.0));
     }
 
     // Track per-tx sequencer times and breakdown for this cycle
@@ -1360,12 +1360,10 @@ async fn perform_transfer_cycle(
         );
         
         // Per-block statistics
-        const BLOCK_TIME_MS: f64 = 1000.0;
         for (block_num, tx_count) in &batches {
-            let tps = *tx_count as f64 / BLOCK_TIME_MS * 1000.0;
             eprintln!(
-                "[cycle] Block {} generated with {} txs ({:.2} tps)",
-                block_num, tx_count, tps
+                "[cycle] Block {} generated with {} txs.",
+                block_num, tx_count
             );
         }
     }

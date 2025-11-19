@@ -26,7 +26,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::trace;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use super::state_root_compute::StateRootComputeRequest;
@@ -363,12 +363,12 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         })?;
         let process_time = process_start.elapsed();
 
-        eprintln!(
-            "[TIMING] apply_tx_to_in_progress_batch_inner: clone={:.3}ms | try_send={:.3}ms | recv.await={:.3}ms | process_result={:.3}ms",
-            clone_time.as_secs_f64() * 1000.0,
-            send_time.as_secs_f64() * 1000.0,
-            recv_time.as_secs_f64() * 1000.0,
-            process_time.as_secs_f64() * 1000.0
+        tracing::debug!(
+            clone_ms = clone_time.as_secs_f64() * 1000.0,
+            try_send_ms = send_time.as_secs_f64() * 1000.0,
+            recv_ms = recv_time.as_secs_f64() * 1000.0,
+            process_result_ms = process_time.as_secs_f64() * 1000.0,
+            "[TIMING] apply_tx_to_in_progress_batch_inner breakdown"
         );
 
         if !receipt.receipt.is_successful() {
@@ -378,9 +378,9 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         let apply_changes_start = std::time::Instant::now();
         self.checkpoint.apply_tx_changes(tx_changes.clone());
         let apply_changes_time = apply_changes_start.elapsed();
-        eprintln!(
-            "[TIMING] apply_tx_to_in_progress_batch_inner: checkpoint.apply_tx_changes={:.3}ms",
-            apply_changes_time.as_secs_f64() * 1000.0
+        tracing::debug!(
+            checkpoint_apply_ms = apply_changes_time.as_secs_f64() * 1000.0,
+            "[TIMING] apply_tx_to_in_progress_batch_inner: checkpoint.apply_tx_changes"
         );
 
         Ok((
@@ -661,11 +661,11 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             .collect::<anyhow::Result<Vec<_>>>()
             .expect("Supposedly infallible conversion failed; this is a bug, please report it");
         let events_decode_time = events_decode_start.elapsed();
-        eprintln!(
-            "[TIMING] process_tx_receipt_inner: EVENT_DECODE={:.3}ms events={} tx_hash={}",
-            events_decode_time.as_secs_f64() * 1000.0,
-            events.len(),
-            tx_receipt.tx_hash,
+        tracing::debug!(
+            event_decode_ms = events_decode_time.as_secs_f64() * 1000.0,
+            events = events.len(),
+            tx_hash = %tx_receipt.tx_hash,
+            "[TIMING] process_tx_receipt timing"
         );
 
         self.next_event_number += events.len() as u64;
@@ -745,9 +745,9 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         let apply_start = std::time::Instant::now();
         let result = self.apply_tx_to_in_progress_batch_inner(baked).await;
         let apply_time = apply_start.elapsed();
-        eprintln!(
-            "[TIMING] accept_precomputed_tx_from_parallel: apply_tx_to_in_progress_batch_inner={:.3}ms",
-            apply_time.as_secs_f64() * 1000.0
+        tracing::debug!(
+            apply_ms = apply_time.as_secs_f64() * 1000.0,
+            "[TIMING] accept_precomputed_tx_from_parallel: apply_tx_to_in_progress_batch_inner"
         );
         match result {
             Ok((receipt, remaining_slot_gas, _executor_time_micros, tx_changes)) => {
