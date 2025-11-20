@@ -3,6 +3,7 @@
 #  - "sqlite://demo_data/da.sqlite?mode=rwc"
 #  - "sqlite::memory:"
 #  - "postgresql://root:hunter2@aws.amazon.com/mock-da"
+# connection_string = "postgresql://admin:1234@localhost:5432/sovereign"
 connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 # String representation of sequencer address.
 # For initial full node should match genesis of sequencer-registry.

@@ -15,8 +15,8 @@ use futures::TryStreamExt;
 use hex::FromHex;
 use midnight_privacy::SpendPublic;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
+    EntityTrait, QueryFilter,
 };
 use serde_with::base64::Base64;
 use serde_with::serde_as;
@@ -82,7 +82,21 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
 
                 Ok(DatabaseConnection::SqlxSqlitePoolConnection(pool.into()))
             } else {
-                Database::connect(connection_string)
+                let mut connect_opts = ConnectOptions::new(connection_string.clone());
+                connect_opts
+                    .max_connections(40)
+                    .min_connections(5)
+                    .connect_timeout(Duration::from_secs(30))
+                    .acquire_timeout(Duration::from_secs(30))
+                    .idle_timeout(Duration::from_secs(300))
+                    .max_lifetime(Duration::from_secs(1800))
+                    .sqlx_logging(false);
+
+                tracing::info!(
+                    "Connecting to worker shared database with tuned pool settings (max_connections=40, min_connections=5)"
+                );
+
+                Database::connect(connect_opts)
                     .await
                     .map_err(|err| format!("Failed to connect to worker DB: {err}"))
             }

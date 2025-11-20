@@ -8,6 +8,7 @@ use sov_midnight_da::storable::service::StorableMidnightDaService;
 use sov_proof_verifier_service::{create_router, AppState, ServiceConfig};
 use sov_stf_runner::{from_toml_path, RollupConfig};
 use std::net::SocketAddr;
+use std::path::Path;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -25,8 +26,8 @@ struct Args {
     node_rpc_url: String,
 
     /// Path to the rollup configuration TOML used by the rollup node.
-    /// When set, the MockDA connection string will be read from this file's [da] section
-    /// (same config used by rollup-ligero via --rollup-config-path).
+    /// When set, the worker transactions DB connection string will be read from this file's
+    /// [da] section `connection_string` (same config used by rollup-ligero via --rollup-config-path).
     #[arg(long = "rollup-config-path")]
     rollup_config_path: Option<String>,
 
@@ -54,8 +55,7 @@ struct Args {
     max_concurrent: usize,
 
     /// Connection string for the worker_txs database (used to store worker_verified_transactions).
-    /// If not provided, the service will try to derive it from --rollup-config-path's [da] section
-    /// by creating a sibling SQLite file (worker_txs.sqlite).
+    /// If not provided, the service will try to read it from --rollup-config-path's [da] section.
     /// If neither is set, it falls back to the demo default
     /// "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".
     #[arg(long)]
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         node_rpc_url: args.node_rpc_url,
         signing_key_path: args.signing_key_path,
         value_setter_method_id, // Will be auto-computed from value_validator.wasm if None
-        midnight_method_id, // Will be auto-computed from note_spend_guest.wasm if None
+        midnight_method_id,     // Will be auto-computed from note_spend_guest.wasm if None
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,
         da_connection_string,
@@ -177,8 +177,7 @@ fn parse_method_id(hex: &str) -> Result<[u8; 32]> {
 ///
 /// Priority:
 /// 1. Explicit `--da-db` CLI argument (if provided)
-/// 2. Derived from `--rollup-config-path`'s [da] section `connection_string`
-///    by creating a sibling SQLite file `worker_txs.sqlite`
+/// 2. Value from `--rollup-config-path`'s [da] section `connection_string`
 /// 3. Built-in demo default pointing at a dedicated worker_txs SQLite database.
 fn resolve_da_connection_string(args: &Args) -> Result<String> {
     if let Some(ref explicit) = args.da_db {
@@ -186,7 +185,10 @@ fn resolve_da_connection_string(args: &Args) -> Result<String> {
     }
 
     if let Some(ref config_path) = args.rollup_config_path {
-        info!("No --da-db provided; loading rollup config from {}", config_path);
+        info!(
+            "No --da-db provided; loading rollup config from {}",
+            config_path
+        );
 
         let rollup_config: RollupConfig<MultiAddressEvm, StorableMidnightDaService> =
             from_toml_path(config_path).with_context(|| {
@@ -196,11 +198,13 @@ fn resolve_da_connection_string(args: &Args) -> Result<String> {
                 )
             })?;
 
-        let conn =
-            derive_worker_db_connection_string(&rollup_config.da.connection_string);
+        let conn = normalize_sqlite_connection_path(
+            config_path,
+            rollup_config.da.connection_string.clone(),
+        )?;
 
         info!(
-            "Using derived worker_txs DB connection string from rollup config: {}",
+            "Using worker_txs DB connection string from rollup config: {}",
             conn
         );
 
@@ -216,35 +220,45 @@ fn resolve_da_connection_string(args: &Args) -> Result<String> {
     Ok(default_conn)
 }
 
-/// Derive a dedicated worker_txs SQLite connection string from the DA connection string.
-/// For non-SQLite backends, this returns the original string unchanged.
-fn derive_worker_db_connection_string(da_connection_string: &str) -> String {
-    // Only derive a separate file for file-based SQLite.
-    if da_connection_string.starts_with("sqlite::memory:") {
-        return da_connection_string.to_string();
-    }
+/// Convert relative SQLite paths (e.g. `sqlite://demo_data/worker_txs.sqlite`) into absolute
+/// paths rooted at the directory containing `rollup_config_path`. Non-SQLite strings are
+/// returned unchanged.
+fn normalize_sqlite_connection_path(
+    rollup_config_path: &str,
+    connection_string: String,
+) -> Result<String> {
+    if let Some(stripped) = connection_string.strip_prefix("sqlite://") {
+        // Leave special paths (absolute, :memory:, etc.) alone.
+        if stripped.starts_with('/') {
+            return Ok(connection_string);
+        }
 
-    if let Some(stripped) = da_connection_string.strip_prefix("sqlite://") {
-        let (path_str, query_opt) = match stripped.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
+        let (path_part, query) = match stripped.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
             None => (stripped, None),
         };
 
-        use std::path::{Path, PathBuf};
-        let path = Path::new(path_str);
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let worker_path: PathBuf = dir.join("worker_txs.sqlite");
+        let path = Path::new(path_part);
+        if path.is_absolute() {
+            return Ok(connection_string);
+        }
 
-        let mut conn = format!("sqlite://{}", worker_path.to_string_lossy());
-        if let Some(q) = query_opt {
+        // Resolve relative path against the directory containing the rollup config file.
+        let config_dir = Path::new(rollup_config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let resolved_path = config_dir.join(path);
+        let resolved_str = resolved_path.to_string_lossy();
+
+        let mut rebuilt = format!("sqlite://{}", resolved_str);
+        if let Some(q) = query {
             if !q.is_empty() {
-                conn.push('?');
-                conn.push_str(q);
+                rebuilt.push('?');
+                rebuilt.push_str(q);
             }
         }
-        conn
+        Ok(rebuilt)
     } else {
-        // Non-SQLite (e.g., Postgres) – keep using the same connection string.
-        da_connection_string.to_string()
+        Ok(connection_string)
     }
 }

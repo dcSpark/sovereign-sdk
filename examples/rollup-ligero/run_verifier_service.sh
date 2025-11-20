@@ -63,6 +63,7 @@ SIGNING_KEY_PATH="${SIGNING_KEY_PATH:-$WORKSPACE_ROOT/examples/test-data/keys/to
 CHAIN_ID="${CHAIN_ID:-4321}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
+ROLLUP_CONFIG_PATH="${ROLLUP_CONFIG_PATH:-$SCRIPT_DIR/rollup_config.toml}"
 
 # Optional: Skip verification for testing
 if [ -n "$SKIP_VERIFICATION" ]; then
@@ -96,6 +97,7 @@ echo "   Bind address: $BIND_ADDR"
 echo "   Node RPC: $NODE_RPC_URL"
 echo "   Log level: $LOG_LEVEL"
 echo "   Max concurrent: $MAX_CONCURRENT"
+echo "   Rollup config: $ROLLUP_CONFIG_PATH"
 echo ""
 
 # Run the verifier service
@@ -108,4 +110,5 @@ exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
     --chain-id "$CHAIN_ID" \
     --log-level "$LOG_LEVEL" \
     --max-concurrent "$MAX_CONCURRENT" \
+    --rollup-config-path "$ROLLUP_CONFIG_PATH" \
     $DEFER_FLAG

@@ -85,13 +85,10 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         _da_service: &Self::DaService,
         rollup_config: &RollupConfig<<Self::Spec as Spec>::Address, Self::DaService>,
     ) -> anyhow::Result<NodeEndpoints> {
-        // Ensure the worker_txs endpoint uses a dedicated SQLite database, separate from the DA DB,
-        // to reduce write contention on the DA database.
-        let worker_db_conn =
-            derive_worker_db_connection_string(&rollup_config.da.connection_string);
+        let worker_db_conn = rollup_config.da.connection_string.clone();
         std::env::set_var("SOV_WORKER_TX_DB_CONNECTION_STRING", &worker_db_conn);
         tracing::info!(
-            "Using dedicated worker_txs SQLite database: {}",
+            "Using worker_txs database connection string: {}",
             worker_db_conn
         );
 
@@ -174,37 +171,4 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
     }
 
     // We rely on the default create_sequencer; the worker DB is injected via env above.
-}
-
-/// Derive a dedicated worker_txs SQLite connection string from the DA connection string.
-/// For non-SQLite backends, this returns the original string unchanged.
-fn derive_worker_db_connection_string(da_connection_string: &str) -> String {
-    // Only derive a separate file for file-based SQLite.
-    if da_connection_string.starts_with("sqlite::memory:") {
-        return da_connection_string.to_string();
-    }
-
-    if let Some(stripped) = da_connection_string.strip_prefix("sqlite://") {
-        let (path_str, query_opt) = match stripped.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (stripped, None),
-        };
-
-        use std::path::{Path, PathBuf};
-        let path = Path::new(path_str);
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let worker_path: PathBuf = dir.join("worker_txs.sqlite");
-
-        let mut conn = format!("sqlite://{}", worker_path.to_string_lossy());
-        if let Some(q) = query_opt {
-            if !q.is_empty() {
-                conn.push('?');
-                conn.push_str(q);
-            }
-        }
-        conn
-    } else {
-        // Non-SQLite (e.g., Postgres) – keep using the same connection string.
-        da_connection_string.to_string()
-    }
 }
