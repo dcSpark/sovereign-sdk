@@ -57,7 +57,7 @@ struct Args {
     /// Connection string for the worker_txs database (used to store worker_verified_transactions).
     /// If not provided, the service will try to read it from --rollup-config-path's [da] section.
     /// If neither is set, it falls back to the demo default
-    /// "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".
+    /// "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".
     #[arg(long)]
     da_db: Option<String>,
 
@@ -212,15 +212,15 @@ fn resolve_da_connection_string(args: &Args) -> Result<String> {
     }
 
     let default_conn =
-        "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".to_string();
+        "sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc".to_string();
     info!(
-        "No --da-db or --rollup-config-path provided; falling back to default worker_txs DB: {}",
+        "No --da-db or --rollup-config-path provided; falling back to default da DB: {}",
         default_conn
     );
     Ok(default_conn)
 }
 
-/// Convert relative SQLite paths (e.g. `sqlite://demo_data/worker_txs.sqlite`) into absolute
+/// Convert relative SQLite paths (e.g. `sqlite://demo_data/da.sqlite`) into absolute
 /// paths rooted at the directory containing `rollup_config_path`. Non-SQLite strings are
 /// returned unchanged.
 fn normalize_sqlite_connection_path(

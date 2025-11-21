@@ -333,12 +333,12 @@ async fn main() -> Result<()> {
         );
         let deposit_start = Instant::now();
         perform_initial_deposits(
-            &client,
             &http,
             &mut wallets,
             &chain_hash,
             config.per_tx_delay_ms,
             config.detailed_wallet_logs,
+            &config.external_verifier_url,
         )
         .await?;
         let deposit_ms = deposit_start.elapsed().as_secs_f64() * 1000.0;
@@ -626,13 +626,15 @@ fn setup_ligero_env() -> Result<String> {
 }
 
 async fn perform_initial_deposits(
-    client: &NodeClient,
     http: &HttpClient,
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
     per_tx_delay_ms: u64,
     detailed_wallet_logs: bool,
+    verifier_url: &str,
 ) -> Result<()> {
+    let verifier_base = verifier_url.trim_end_matches('/');
+    let endpoint = format!("{}/midnight-privacy", verifier_base);
     for (i, wallet) in wallets.iter_mut().enumerate() {
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
@@ -643,6 +645,7 @@ async fn perform_initial_deposits(
                 amount,
                 rho,
                 recipient,
+                view_fvks: None,
                 gas: None,
             });
 
@@ -659,17 +662,15 @@ async fn perform_initial_deposits(
         let tx_bytes = borsh::to_vec(&tx)?;
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
 
-        let api_url = &client.base_url;
-        let url = format!("{}/sequencer/txs", api_url.trim_end_matches('/'));
         if detailed_wallet_logs {
             eprintln!(
-                "[deposit] wallet={} nonce={} amount={} url={}",
-                i, wallet.nonce, amount, url
+                "[deposit] wallet={} nonce={} amount={} endpoint={}",
+                i, wallet.nonce, amount, endpoint
             );
         }
 
         let resp = http
-            .post(&url)
+            .post(&endpoint)
             .json(&json!({ "body": tx_b64 }))
             .send()
             .await
@@ -683,6 +684,14 @@ async fn perform_initial_deposits(
                 status, body
             );
         }
+        let vresp: VerifierResponse = serde_json::from_str(&body)
+            .context("Failed to decode verifier response for deposit")?;
+        if !vresp.success {
+            let err = vresp
+                .error
+                .unwrap_or_else(|| "unspecified verifier error".to_string());
+            bail!("Verifier rejected deposit for wallet {}: {}", i, err);
+        }
 
         wallet.nonce += 1;
         wallet.value = amount;
@@ -692,6 +701,22 @@ async fn perform_initial_deposits(
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
         }
+    }
+
+    // Ensure deposits are forwarded to the sequencer before proceeding.
+    let flush_resp = http
+        .post(format!("{}/midnight-privacy/flush", verifier_base))
+        .send()
+        .await
+        .context("Deposit flush request failed")?;
+    let flush_status = flush_resp.status();
+    let flush_body = flush_resp.text().await.unwrap_or_default();
+    if !flush_status.is_success() {
+        bail!(
+            "Flush after deposits failed with status {}: {}",
+            flush_status,
+            flush_body
+        );
     }
 
     Ok(())
@@ -933,6 +958,7 @@ async fn perform_transfer_cycle(
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out],
+                    view_attestations: None,
                 };
 
                 let mut private_indices = vec![2, 3, 4, 5, 6];
@@ -1015,6 +1041,7 @@ async fn perform_transfer_cycle(
                     .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                 anchor_root,
                 nullifier: nf,
+                view_ciphertexts: None,
                 gas: None,
             });
 

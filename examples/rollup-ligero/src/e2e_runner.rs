@@ -861,6 +861,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             amount,
             rho,
             recipient,
+            view_fvks: None,
             gas: None,
         });
 
@@ -1472,6 +1473,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
+                    view_attestations: None,
                 };
 
                 // Private indices for 1 output (match guest ABI)
@@ -1678,6 +1680,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
             nullifier: nf,
+            view_ciphertexts: None,
             gas: None,
         });
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
