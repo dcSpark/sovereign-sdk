@@ -720,59 +720,85 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     /// Variant of `accept_precomputed_tx` used by the parallel executor.
     /// It reuses a precomputed ApiTxEffect built off-thread so the main
     /// executor only has to assign tx / event numbers.
+    ///
+    /// OPTIMIZATION: This function now accepts the full receipt from the parallel
+    /// worker and bypasses the background STF execution task entirely, since the
+    /// parallel worker has already fully executed the transaction.
     pub async fn accept_precomputed_tx_from_parallel(
         &mut self,
-        tx: FullyBakedTx,
+        receipt: TransactionReceipt<S>,
         tx_changes: TxChangeSet,
+        remaining_slot_gas: <S as Spec>::Gas,
         precomputed_effect: ApiTxEffect<TxReceiptContents<S>>,
         execution_time_micros: u64,
     ) -> Result<(AcceptedTxWithBudgetInfo<S, Rt>, TxChangeSet), RollupBlockExecutorError<S>>
     where
         Rt: RuntimeEventProcessor,
     {
-        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
-        use tokio::sync::oneshot;
+        // Fast path: The parallel worker already executed this transaction completely.
+        // We just need to:
+        // 1. Apply the tx_changes to our checkpoint
+        // 2. Build the AcceptedTx with the precomputed effect
+        // 3. Update any caches
 
-        // Same trick as `accept_precomputed_tx`: hand the TxChangeSet to the
-        // background task so it doesn't have to re-execute.
-        let (sender, receiver) = oneshot::channel();
-        let baked = FullyBakedTxWithMaybeChangeSet {
-            tx,
-            receiver: Some(receiver),
-        };
-        let _ = sender.send(tx_changes);
+        let fast_path_start = std::time::Instant::now();
 
-        let apply_start = std::time::Instant::now();
-        let result = self.apply_tx_to_in_progress_batch_inner(baked).await;
-        let apply_time = apply_start.elapsed();
-        tracing::debug!(
-            apply_ms = apply_time.as_secs_f64() * 1000.0,
-            "[TIMING] accept_precomputed_tx_from_parallel: apply_tx_to_in_progress_batch_inner"
-        );
-        match result {
-            Ok((receipt, remaining_slot_gas, _executor_time_micros, tx_changes)) => {
-                // Rebuild AcceptedTx using the precomputed ApiTxEffect from the worker.
-                let accepted_tx = self.process_tx_receipt_with_effect(
-                    &receipt,
-                    Some(execution_time_micros),
-                    precomputed_effect,
-                );
-
-                if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
-                    writer.insert(accepted_tx.clone()).await;
-                }
-
-                Ok((
-                    AcceptedTxWithBudgetInfo {
-                        accepted_tx,
-                        remaining_slot_gas,
-                        execution_time_micros,
-                    },
-                    tx_changes,
-                ))
-            }
-            Err(e) => Err(e),
+        // Validate that the receipt is successful
+        if !receipt.receipt.is_successful() {
+            tracing::warn!(
+                "Parallel worker returned unsuccessful transaction; rejecting"
+            );
+            return Err(RollupBlockExecutorError::UnsuccessfulTransaction { receipt });
         }
+
+        // Apply the state changes from the parallel worker to our checkpoint
+        let apply_changes_start = std::time::Instant::now();
+        self.checkpoint.apply_tx_changes(tx_changes.clone());
+        let apply_changes_time = apply_changes_start.elapsed();
+
+        // Build the AcceptedTx using the precomputed effect
+        let build_accepted_start = std::time::Instant::now();
+        let accepted_tx = self.process_tx_receipt_with_effect(
+            &receipt,
+            Some(execution_time_micros),
+            precomputed_effect,
+        );
+        let build_accepted_time = build_accepted_start.elapsed();
+
+        // Update caches if needed
+        let cache_start = std::time::Instant::now();
+        if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
+            writer.insert(accepted_tx.clone()).await;
+        }
+        let cache_time = cache_start.elapsed();
+
+        let total_time = fast_path_start.elapsed();
+        tracing::debug!(
+            total_ms = total_time.as_secs_f64() * 1000.0,
+            apply_changes_ms = apply_changes_time.as_secs_f64() * 1000.0,
+            build_accepted_ms = build_accepted_time.as_secs_f64() * 1000.0,
+            cache_ms = cache_time.as_secs_f64() * 1000.0,
+            "[TIMING] accept_precomputed_tx_from_parallel: FAST PATH (no STF re-execution)"
+        );
+
+        // Track metrics for monitoring the fast path performance
+        sov_metrics::track_metrics(|t| {
+            t.submit(crate::metrics::ParallelTxFastPathMetrics {
+                total_duration_us: total_time.as_micros() as u64,
+                apply_changes_us: apply_changes_time.as_micros() as u64,
+                build_accepted_us: build_accepted_time.as_micros() as u64,
+                cache_us: cache_time.as_micros() as u64,
+            });
+        });
+
+        Ok((
+            AcceptedTxWithBudgetInfo {
+                accepted_tx,
+                remaining_slot_gas,
+                execution_time_micros,
+            },
+            tx_changes,
+        ))
     }
 
     fn update_kernel_with_user_state_root(&mut self) {

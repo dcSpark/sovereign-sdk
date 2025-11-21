@@ -2000,26 +2000,22 @@ where
             tx_hash,
             receipt,
             tx_changes,
-            remaining_slot_gas: _,
+            remaining_slot_gas,
             execution_time_micros,
             original_tx_queue_id: _,
             api_effect,
         } = parallel_response;
 
-        // Rebuild the tx body from the worker’s receipt and commit via background task.
-        let tx = FullyBakedTx {
-            data: receipt
-                .body_to_save
-                .clone()
-                .expect("Transaction receipts must contain bodies with sov-modules-stf-blueprint"),
-        };
-
+        // OPTIMIZATION: Pass the full receipt and remaining gas directly to bypass
+        // the background STF execution task, since the parallel worker already
+        // executed this transaction completely.
         let commit_start = std::time::Instant::now();
         let (accepted_with_budget_main, tx_changes_main) = match inner
             .executor
             .accept_precomputed_tx_from_parallel(
-                tx,
+                receipt,
                 tx_changes,
+                remaining_slot_gas,
                 api_effect,
                 execution_time_micros,
             )

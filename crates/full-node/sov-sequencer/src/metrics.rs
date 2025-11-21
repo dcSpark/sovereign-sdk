@@ -187,3 +187,29 @@ impl Metric for PreferredSequencerExecutorEventSendingMetrics {
         )
     }
 }
+
+#[derive(Debug)]
+pub struct ParallelTxFastPathMetrics {
+    pub total_duration_us: u64,
+    pub apply_changes_us: u64,
+    pub build_accepted_us: u64,
+    pub cache_us: u64,
+}
+
+impl Metric for ParallelTxFastPathMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_parallel_tx_fast_path"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} total_duration_us={},apply_changes_us={},build_accepted_us={},cache_us={}",
+            self.measurement_name(),
+            self.total_duration_us,
+            self.apply_changes_us,
+            self.build_accepted_us,
+            self.cache_us,
+        )
+    }
+}
