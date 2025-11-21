@@ -80,10 +80,10 @@ impl<S: Spec, Rt: Runtime<S>> ExecutorEventsSender<S, Rt> {
     /// Send a notification of an accepted tx. Return a receiver that will receive the confirmation.
     pub(crate) async fn send_accept_tx(
         &mut self,
-        accepted_tx: AcceptedTx<Confirmation<S, Rt>>,
+        accepted_tx: Arc<AcceptedTx<Confirmation<S, Rt>>>,
         tx_changes: TxChangeSet,
         sequence_number: SequenceNumber,
-    ) -> oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>> {
+    ) -> oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>> {
         let tx_idx_within_batch = self
             .cache
             .in_progress_batch_opt()
@@ -347,9 +347,9 @@ where
 }
 
 pub(crate) struct AcceptedTxEventContents<S: Spec, Rt: Runtime<S>> {
-    pub accepted_tx: AcceptedTx<Confirmation<S, Rt>>,
+    pub accepted_tx: Arc<AcceptedTx<Confirmation<S, Rt>>>,
     pub tx_changes: TxChangeSet,
-    pub oneshot_sender: oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>,
+    pub oneshot_sender: oneshot::Sender<Arc<AcceptedTx<Confirmation<S, Rt>>>>,
     pub sequence_number: SequenceNumber,
     pub tx_idx_within_batch: u64,
 }

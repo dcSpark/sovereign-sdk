@@ -65,7 +65,7 @@ const METRICS_BATCH_SIZE: usize = 32;
 const CHANNEL_SIZE: usize = 2048;
 
 type AcceptTxRet<S, Rt> =
-    Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>;
+    Result<oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>>, AcceptTxError<S>>;
 
 /// A inner sequencer struct containing state that requires synchronized access.
 /// This struct accepts/rejects transactions, then hands them to the side effects task
@@ -106,7 +106,7 @@ where
     parallel_tx_executor: ParallelTxExecutor<S, Rt>,
     // Parallel in-flight tracking and HTTP waiters
     pending_parallel_count: usize,
-    pending_http_waiters: HashMap<TxHash, oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>>,
+    pending_http_waiters: HashMap<TxHash, oneshot::Sender<Arc<AcceptedTx<Confirmation<S, Rt>>>>>,
 }
 
 // We submit metrics when this guard is dropped.
@@ -1073,7 +1073,7 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<
-        Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>,
+        Result<oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>>, AcceptTxError<S>>,
         SequencerStateUpdatorError,
     > {
         let (resp, recv) = oneshot::channel();
@@ -1743,7 +1743,7 @@ where
         tx_hash: TxHash,
         original_tx_queue_id: u64,
         reason: &'static str,
-    ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+    ) -> Result<oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>>, AcceptTxError<S>> {
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
         let message_sender = self.message_sender.clone();
 
@@ -1903,7 +1903,7 @@ where
 
         let (
             AcceptedTxWithBudgetInfo {
-                mut accepted_tx,
+                accepted_tx,
                 remaining_slot_gas,
                 execution_time_micros,
             },
@@ -1925,14 +1925,19 @@ where
         // Ensure the confirmation's tx hash is populated for downstream consumers.
         // The executor guarantees consistency here, but we patch it defensively in
         // case future changes forget to set it.
-        if accepted_tx.tx_hash != tx_hash {
-            accepted_tx.tx_hash = tx_hash;
-        }
+        let accepted_tx = if accepted_tx.tx_hash != tx_hash {
+            // Need to fix the tx_hash - since it's in an Arc, create a new one
+            let mut fixed = (*accepted_tx).clone();
+            fixed.tx_hash = tx_hash;
+            Arc::new(fixed)
+        } else {
+            accepted_tx
+        };
 
         batch_size_tracker.add_tx(tx_len, execution_time_micros);
         // Always enqueue side effects so DB/cache semantics remain unchanged.
         let side_effects_rx = executor_events_sender
-            .send_accept_tx(accepted_tx.clone(), tx_changes, sequence_number)
+            .send_accept_tx(Arc::clone(&accepted_tx), tx_changes, sequence_number)
             .await;
 
         inner.close_batch_if_nearly_full(&remaining_slot_gas).await;
@@ -1948,7 +1953,7 @@ where
             let (http_tx, http_rx) = oneshot::channel();
             // If the receiver dropped (e.g., HTTP request was cancelled), we simply
             // ignore the error – side effects are already enqueued.
-            let _ = http_tx.send(accepted_tx);
+            let _ = http_tx.send(Arc::clone(&accepted_tx));
             return Ok(http_rx);
         }
 
@@ -2061,7 +2066,7 @@ where
         if fast_ack_after_executor {
             if let Some(waiter) = maybe_waiter.take() {
                 let waiter_bridge_start = std::time::Instant::now();
-                let accepted_for_http = accepted_with_budget_main.accepted_tx.clone();
+                let accepted_for_http = Arc::clone(&accepted_with_budget_main.accepted_tx);
                 tokio::spawn(async move {
                     let _ = waiter.send(accepted_for_http);
                 });
@@ -2074,7 +2079,7 @@ where
         let _rx = inner
             .executor_events_sender
             .send_accept_tx(
-                accepted_with_budget_main.accepted_tx.clone(),
+                Arc::clone(&accepted_with_budget_main.accepted_tx),
                 tx_changes_main,
                 sequence_number,
             )
@@ -2086,7 +2091,7 @@ where
         if !fast_ack_after_executor {
             if let Some(waiter) = maybe_waiter.take() {
                 let waiter_bridge_start = std::time::Instant::now();
-                let accepted_for_http = accepted_with_budget_main.accepted_tx.clone();
+                let accepted_for_http = Arc::clone(&accepted_with_budget_main.accepted_tx);
                 tokio::spawn(async move {
                     let _ = waiter.send(accepted_for_http);
                 });

@@ -894,7 +894,7 @@ where
         };
 
         match res {
-            Ok(rx) => rx.await.map_err(database_error_500),
+            Ok(rx) => rx.await.map(|arc_tx| (*arc_tx).clone()).map_err(database_error_500),
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => {
                     return Err(sequencer_overloaded_503());
@@ -1013,7 +1013,7 @@ where
 
         let await_start = std::time::Instant::now();
         let result = match res {
-            Ok(rx) => rx.await.map_err(database_error_500),
+            Ok(rx) => rx.await.map(|arc_tx| (*arc_tx).clone()).map_err(database_error_500),
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => Err(sequencer_overloaded_503()),
                 AcceptTxError::NotFullySynced(details) => {

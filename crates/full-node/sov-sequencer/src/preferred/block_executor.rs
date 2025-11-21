@@ -44,7 +44,7 @@ where
     S: Spec,
     Rt: Runtime<S> + RuntimeEventProcessor,
 {
-    pub accepted_tx: AcceptedTx<Confirmation<S, Rt>>,
+    pub accepted_tx: Arc<AcceptedTx<Confirmation<S, Rt>>>,
     pub remaining_slot_gas: <S as Spec>::Gas,
     pub execution_time_micros: u64,
 }
@@ -273,7 +273,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes)) => {
                 let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
                 if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
-                    writer.insert(accepted_tx.clone()).await;
+                    writer.insert((*accepted_tx).clone()).await;
                 }
                 Ok((
                     AcceptedTxWithBudgetInfo {
@@ -625,7 +625,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         &mut self,
         tx_receipt: &TransactionReceipt<S>,
         execution_time_micros: Option<u64>,
-    ) -> AcceptedTx<Confirmation<S, Rt>> {
+    ) -> Arc<AcceptedTx<Confirmation<S, Rt>>> {
         self.process_tx_receipt_inner(tx_receipt, execution_time_micros, None)
     }
 
@@ -636,7 +636,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         tx_receipt: &TransactionReceipt<S>,
         execution_time_micros: Option<u64>,
         precomputed_effect: ApiTxEffect<TxReceiptContents<S>>,
-    ) -> AcceptedTx<Confirmation<S, Rt>> {
+    ) -> Arc<AcceptedTx<Confirmation<S, Rt>>> {
         self.process_tx_receipt_inner(tx_receipt, execution_time_micros, Some(precomputed_effect))
     }
 
@@ -645,7 +645,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         tx_receipt: &TransactionReceipt<S>,
         execution_time_micros: Option<u64>,
         precomputed_effect: Option<ApiTxEffect<TxReceiptContents<S>>>,
-    ) -> AcceptedTx<Confirmation<S, Rt>> {
+    ) -> Arc<AcceptedTx<Confirmation<S, Rt>>> {
         // 1. Allocate tx / event numbers (must stay serialized here).
         let tx_number = self.next_tx_number;
         let events_decode_start = std::time::Instant::now();
@@ -677,8 +677,8 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             None => tx_receipt.receipt.clone().into(),
         };
 
-        // 3. Build the AcceptedTx.
-        AcceptedTx {
+        // 3. Build the AcceptedTx and wrap in Arc for efficient cloning.
+        Arc::new(AcceptedTx {
             tx: FullyBakedTx {
                 data: tx_receipt.body_to_save.clone().expect(
                     "Transaction receipts contain bodies when using sov-modules-stf-blueprint",
@@ -691,7 +691,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
                 tx_number,
                 stf_execution_time_micros: execution_time_micros.unwrap_or_default(),
             },
-        }
+        })
     }
 
     /// Commit a pre-executed tx by delivering its TxChangeSet to the background task.
@@ -724,6 +724,10 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     /// OPTIMIZATION: This function now accepts the full receipt from the parallel
     /// worker and bypasses the background STF execution task entirely, since the
     /// parallel worker has already fully executed the transaction.
+    ///
+    /// NOTE: This is the fast path that eliminates STF re-execution. The checkpoint
+    /// update is still the main cost (~50-150μs), which could be further optimized
+    /// by batching multiple transactions together at a higher level.
     pub async fn accept_precomputed_tx_from_parallel(
         &mut self,
         receipt: TransactionReceipt<S>,
@@ -768,7 +772,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         // Update caches if needed
         let cache_start = std::time::Instant::now();
         if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
-            writer.insert(accepted_tx.clone()).await;
+            writer.insert((*accepted_tx).clone()).await;
         }
         let cache_time = cache_start.elapsed();
 

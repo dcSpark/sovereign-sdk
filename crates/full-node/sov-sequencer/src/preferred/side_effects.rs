@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use sov_modules_api::{Runtime, Spec, StateCheckpoint, TxChangeSet};
 use sov_rollup_interface::node::da::DaService;
@@ -137,11 +138,11 @@ where
 
                 for contents in txs_to_insert {
                     self.transaction_cache
-                        .insert(contents.accepted_tx.clone())
+                        .insert((*contents.accepted_tx).clone())
                         .await;
                     // If the receiver is no longer listening, just don't send the confirmation.
                     self.update_api_state_with_changes(contents.tx_changes);
-                    let _ = contents.oneshot_sender.send(contents.accepted_tx);
+                    let _ = contents.oneshot_sender.send(Arc::clone(&contents.accepted_tx));
                 }
             }
             ExecutorEvent::CloseBatch(batch, checkpoint) => {
