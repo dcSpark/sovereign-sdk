@@ -89,7 +89,7 @@ echo "🚀 Starting ligero rollup..."
 echo ""
 
 # Set RUST_LOG to info level to suppress debug logs
-export RUST_LOG="info"
+# export RUST_LOG="info"
 
 # Run the ligero rollup from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
