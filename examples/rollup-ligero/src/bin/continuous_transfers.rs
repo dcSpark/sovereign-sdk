@@ -644,6 +644,7 @@ async fn perform_initial_deposits(
                 rho,
                 recipient,
                 gas: None,
+                view_fvks: None,
             });
 
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
@@ -933,6 +934,7 @@ async fn perform_transfer_cycle(
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out],
+                    view_attestations: None,
                 };
 
                 let mut private_indices = vec![2, 3, 4, 5, 6];
@@ -1015,6 +1017,7 @@ async fn perform_transfer_cycle(
                     .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                 anchor_root,
                 nullifier: nf,
+                view_ciphertexts: None,
                 gas: None,
             });
 
