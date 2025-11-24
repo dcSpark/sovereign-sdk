@@ -87,6 +87,6 @@ fast_ack_after_executor = true
 # This variable determines the number of worker threads.
 num_cache_warmup_workers = 10
 # Parallel workers for Midnight Privacy Transactions
-num_parallel_tx_workers = 1
+num_parallel_tx_workers = 10
 [sequencer.extension]
 max_log_limit = 20000
