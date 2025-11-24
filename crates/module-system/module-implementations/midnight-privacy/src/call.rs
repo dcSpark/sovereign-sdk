@@ -418,9 +418,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Stats: bump spent nullifier count
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
-            // Cleanup any cached pre-verified entry
-            crate::clear_pre_verified_spend(&public.nullifier);
-
             // 3) Add all output commitments to the tree (track pos + final root)
             let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
             let mut final_root: Option<Hash32> = None;
@@ -642,9 +639,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Stats: bump spent nullifier count
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
-            // Cleanup cached pre-verified entry
-            crate::clear_pre_verified_spend(&public.nullifier);
-
             // 3) Add change outputs (track pos + final root)
             let mut change_outputs: Vec<CommitmentPos> =
                 Vec::with_capacity(public.output_commitments.len());
