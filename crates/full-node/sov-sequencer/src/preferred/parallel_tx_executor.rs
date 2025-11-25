@@ -461,6 +461,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     parallel_response,
                                     sequence_number: request.sequence_number,
                                     tx_len: request.tx_len,
+                                    retry_count: 0,
                                     reason: "parallel_tx_completed",
                                 };
                                 
