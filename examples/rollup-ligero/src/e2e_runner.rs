@@ -108,13 +108,10 @@ impl RunnerConfig {
         }
         // Allow enabling batch/queued submission mode via env
         if let Ok(value) = std::env::var("DEFER_SEQUENCER_SUBMISSION")
-            .or_else(|_| std::env::var("E2E_VERIFIER_DEFER"))
-            .or_else(|_| std::env::var("VERIFIER_DEFER_SEQUENCER"))
         {
             cfg.defer_sequencer_submission = value == "1" || value.to_lowercase() == "true";
         }
         if let Ok(value) = std::env::var("TRANSFER_SUBMIT_DELAY_MS")
-            .or_else(|_| std::env::var("E2E_TRANSFER_DELAY_MS"))
         {
             if let Ok(parsed) = value.parse() {
                 cfg.transfer_submit_delay_ms = parsed;
@@ -862,6 +859,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             rho,
             recipient,
             gas: None,
+            view_fvks: None,
         });
 
         // Each account uses nonce 0 for its deposit (except account 0 which sent funding txs first)
@@ -1472,6 +1470,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
+                    view_attestations: None,
                 };
 
                 // Private indices for 1 output (match guest ABI)
@@ -1678,6 +1677,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
             nullifier: nf,
+            view_ciphertexts: None,
             gas: None,
         });
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =

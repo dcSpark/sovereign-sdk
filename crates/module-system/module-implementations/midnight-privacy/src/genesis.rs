@@ -75,6 +75,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.deposit_count.set(&0u64, state)?;
         self.total_withdrawn.set(&0u128, state)?;
         self.withdraw_count.set(&0u64, state)?;
+        self.spent_nullifier_count.set(&0u64, state)?;
 
         // Initialize indexed pending roots counter for genesis height (no roots yet)
         // Note: StateMap doesn't require explicit initialization, but we set 0 for clarity

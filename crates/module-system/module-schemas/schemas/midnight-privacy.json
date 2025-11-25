@@ -56,6 +56,16 @@
               },
               "maxItems": 32,
               "minItems": 32
+            },
+            "view_fvks": {
+              "description": "Optional list of Full Viewing Keys to emit encrypted payloads for this deposit note. For each FVK, the module will encrypt the note and emit `NoteEncrypted`.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/FullViewingKey"
+              }
             }
           }
         }
@@ -117,6 +127,16 @@
                   "$ref": "#/definitions/SafeVec_5000000_of_uint8"
                 }
               ]
+            },
+            "view_ciphertexts": {
+              "description": "Optional viewer ciphertexts (created off-chain by the prover). Each EncryptedNote must have `enc.cm` equal to one of the produced output commitments.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/EncryptedNote"
+              }
             }
           }
         }
@@ -189,6 +209,16 @@
                 }
               ]
             },
+            "view_ciphertexts": {
+              "description": "Optional viewer ciphertexts (created off-chain by the prover). Each EncryptedNote must have `enc.cm` equal to one of the produced *change* outputs.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/EncryptedNote"
+              }
+            },
             "withdraw_amount": {
               "description": "Withdrawal amount authorized by the proof",
               "type": "integer",
@@ -235,6 +265,41 @@
       "description": "Address",
       "type": "string",
       "pattern": "^sov1[a-zA-Z0-9]+$"
+    },
+    "EncryptedNote": {
+      "type": "object",
+      "required": [
+        "cm",
+        "ct",
+        "fvk_commitment",
+        "mac",
+        "nonce"
+      ],
+      "properties": {
+        "cm": {
+          "type": "string",
+          "format": "hex"
+        },
+        "ct": {
+          "type": "array"
+        },
+        "fvk_commitment": {
+          "type": "string",
+          "format": "hex"
+        },
+        "mac": {
+          "type": "string",
+          "format": "hex"
+        },
+        "nonce": {
+          "type": "string",
+          "format": "hex"
+        }
+      }
+    },
+    "FullViewingKey": {
+      "type": "string",
+      "format": "hex"
     },
     "GasUnit(2)": {
       "description": "GasUnit is an array of size 2",
