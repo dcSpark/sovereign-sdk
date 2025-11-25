@@ -525,14 +525,6 @@ where
 
     /// Closes the current batch if it is nearly full (by gas limit) or has reached the target batch execution time.
     async fn close_batch_if_nearly_full(&mut self, remaining_slot_gas: &<S as GasSpec>::Gas) {
-        // Keep the batch open while parallel txs are in-flight
-        if self.pending_parallel_count > 0 {
-            tracing::trace!(
-                pending = %self.pending_parallel_count,
-                "Deferring batch close due to pending parallel txs"
-            );
-            return;
-        }
         // Check if we're close to the gas limit and close the batch if we are.
         let mut comfortable_gas_limit = <S as GasSpec>::initial_gas_limit();
         comfortable_gas_limit
