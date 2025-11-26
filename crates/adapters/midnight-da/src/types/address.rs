@@ -21,10 +21,6 @@ pub const MOCK_SEQUENCER_DA_ADDRESS: [u8; 32] = [0u8; 32];
     borsh::BorshDeserialize,
     borsh::BorshSerialize,
 )]
-#[cfg_attr(
-    feature = "arbitrary",
-    derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
-)]
 pub struct MidnightAddress {
     /// Underlying mock address.
     addr: [u8; 32],
@@ -135,6 +131,27 @@ impl From<CredentialId> for MidnightAddress {
         MidnightAddress {
             addr: credential_id.0 .0,
         }
+    }
+}
+
+impl<'a> arbitrary::Arbitrary<'a> for MidnightAddress {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let addr: [u8; 32] = u.arbitrary()?;
+        Ok(Self::new(addr))
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl proptest::arbitrary::Arbitrary for MidnightAddress {
+    type Parameters = ();
+    type Strategy = proptest::strategy::Map<
+        proptest::array::UniformArrayStrategy<proptest::prelude::Any, [u8; 32], [u8; 32]>,
+        fn([u8; 32]) -> Self,
+    >;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        use proptest::strategy::Strategy;
+        proptest::array::uniform32(proptest::prelude::any::<u8>()).prop_map(Self::new)
     }
 }
 
