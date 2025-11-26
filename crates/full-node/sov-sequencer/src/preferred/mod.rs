@@ -141,6 +141,10 @@ where
             %da_address,
             "Instantiating the preferred sequencer"
         );
+        info!(
+            max_batch_size_bytes = config.max_batch_size_bytes,
+            "Preferred sequencer batch size configuration loaded"
+        );
 
         let mut runtime: Rt = Default::default();
         let tx_status_manager = TxStatusManager::default();

@@ -27,7 +27,7 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use self::mempool::{Mempool, MempoolCursor, MempoolTx};
 use crate::common::{
@@ -114,6 +114,17 @@ where
         let checkpoint =
             StateCheckpoint::new(latest_state_update.storage.clone(), &runtime.kernel());
         let (checkpoint_sender, checkpoint_receiver) = watch::channel(checkpoint);
+
+        let effective_batch_size_bytes = config
+            .sequencer_kind_config
+            .max_batch_size_bytes
+            .unwrap_or_else(|| NonZero::new(1024 * 1024).expect("1 MiB is non-zero"))
+            .get();
+        info!(
+            configured_max_batch_size_bytes = config.max_batch_size_bytes,
+            effective_standard_batch_size_bytes = effective_batch_size_bytes,
+            "Standard sequencer batch size configuration loaded"
+        );
 
         let api_state = ApiState::build(
             Arc::new(()),

@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use super::batch_size_tracker::BatchSizeTracker;
 use crate::metrics::{
-    track_sequence_number, PreferredSequencerChannelMetrics, PreferredSequencerChannelMetricsBatch,
-    PreferredSequencerPruneMetrics,
+    track_sequence_number, MessageLoopThroughputMetrics, PreferredSequencerChannelMetrics,
+    PreferredSequencerChannelMetricsBatch, PreferredSequencerPruneMetrics,
 };
 use crate::preferred::block_executor::{
     AcceptedTxWithBudgetInfo, RollupBlockExecutor, RollupBlockExecutorError,
@@ -62,12 +62,19 @@ const COMFORTABLE_GAS_LIMIT_DIVISOR: u64 = 20;
 
 const METRICS_BATCH_SIZE: usize = 32;
 
-const CHANNEL_SIZE: usize = 2048;
+const CHANNEL_SIZE: usize = 16384;
 const PARALLEL_COMPLETION_RETRY_DELAY_MS: u64 = 10;
 const PARALLEL_COMPLETION_MAX_RETRIES: u8 = 50;
 
 type AcceptTxRet<S, Rt> =
     Result<oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>>, AcceptTxError<S>>;
+
+/// Stores HTTP response channel and timing info for parallel transactions
+struct HttpWaiter<S: Spec, Rt: Runtime<S>> {
+    sender: oneshot::Sender<Arc<AcceptedTx<Confirmation<S, Rt>>>>,
+    http_received_at: std::time::Instant,
+    queued_at: std::time::Instant,
+}
 
 /// A inner sequencer struct containing state that requires synchronized access.
 /// This struct accepts/rejects transactions, then hands them to the side effects task
@@ -108,7 +115,23 @@ where
     parallel_tx_executor: ParallelTxExecutor<S, Rt>,
     // Parallel in-flight tracking and HTTP waiters
     pending_parallel_count: usize,
-    pending_http_waiters: HashMap<TxHash, oneshot::Sender<Arc<AcceptedTx<Confirmation<S, Rt>>>>>,
+    pending_http_waiters: HashMap<TxHash, HttpWaiter<S, Rt>>,
+    // Batch tracking for metrics
+    batch_start_time: std::time::Instant,
+    batch_tx_count: u64,
+    // Prune throttling
+    last_prune_time: std::time::Instant,
+    // Throughput tracking
+    throughput_tracking_start: std::time::Instant,
+    throughput_txs_accepted: u64,
+    throughput_txs_parallel: u64,
+    throughput_txs_sequential: u64,
+    throughput_batches_closed: u64,
+    throughput_total_txs_in_batches: u64,
+    throughput_total_batch_duration_ms: u64,
+    // Parallel queue tracking
+    parallel_enqueued_count: u64,
+    parallel_rejected_count: u64,
 }
 
 // We submit metrics when this guard is dropped.
@@ -402,6 +425,15 @@ where
     }
 
     async fn prune_sequencer_db(&mut self) {
+        // OPTIMIZATION: Only prune every 5 seconds to reduce overhead
+        const PRUNE_INTERVAL_SECS: u64 = 5;
+        let elapsed_since_last_prune = self.last_prune_time.elapsed();
+        if elapsed_since_last_prune.as_secs() < PRUNE_INTERVAL_SECS {
+            // Skip pruning - too soon since last prune
+            return;
+        }
+        self.last_prune_time = std::time::Instant::now();
+
         let next_sequence_number = self.sequence_number_of_next_blob;
         let latest_state_info = &self.latest_info;
         let mut runtime = Rt::default();
@@ -540,7 +572,7 @@ where
         let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&comfortable_gas_limit);
         if close_to_gas_limit {
             tracing::debug!(%comfortable_gas_limit, %remaining_slot_gas, "Closing and publishing current batch because we're close to the gas limit");
-            self.close_current_batch().await;
+            self.close_current_batch("gas_limit").await;
         }
 
         let current_batch_execution_time_micros =
@@ -548,7 +580,7 @@ where
 
         if current_batch_execution_time_micros > self.batch_execution_time_limit_micros {
             tracing::debug!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Closing and publishing current batch because we've reached the batch execution time cap");
-            self.close_current_batch().await;
+            self.close_current_batch("time_limit").await;
         } else {
             tracing::trace!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Batch execution time is within comfortable range, not closing batch");
         }
@@ -563,7 +595,7 @@ where
             });
         if (self.batch_size_tracker.current_batch_size as u64) > comfortable_size_limit {
             tracing::debug!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Closing and publishing current batch because we're close to the size limit");
-            self.close_current_batch().await;
+            self.close_current_batch("size_limit").await;
         } else {
             tracing::trace!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Batch size is within comfortable range, not closing batch");
         }
@@ -612,14 +644,14 @@ where
         }
 
         // Do not close if parallel txs are pending
-        if self.pending_parallel_count == 0 {
-            self.close_current_batch().await;
-        } else {
-            tracing::trace!(
-                pending = %self.pending_parallel_count,
-                "Skipping auto close; parallel txs pending"
-            );
-        }
+        // if self.pending_parallel_count == 0 {
+            self.close_current_batch("automatic").await;
+        // } else {
+        //     tracing::trace!(
+        //         pending = %self.pending_parallel_count,
+        //         "Skipping auto close; parallel txs pending"
+        //     );
+        // }
     }
 
     /// Closes the current batch.
@@ -630,7 +662,52 @@ where
     ///
     /// Case 2 only happens when we've just finished updating the state *and* we have more than our ideal number of finalized slots available.
     #[tracing::instrument(skip_all, level = "trace")]
-    async fn close_current_batch(&mut self) {
+    async fn close_current_batch(&mut self, reason: &'static str) {
+        // Collect metrics before closing
+        let batch_open_duration_us = self.batch_start_time.elapsed().as_micros() as u64;
+        let batch_size_bytes = self.batch_size_tracker.current_batch_size as u64;
+        let num_txs = self.batch_tx_count;
+        let batch_execution_time_micros = self.batch_size_tracker.batch_execution_time_micros;
+        let time_limit_us = self.batch_execution_time_limit_micros;
+        let time_headroom_us = time_limit_us.saturating_sub(batch_execution_time_micros);
+
+        // Emit batch closing metrics (gas_remaining set to 0 - can be added later if needed)
+        sov_metrics::track_metrics(|tracker| {
+            tracker.submit(crate::metrics::PreferredBatchClosingMetrics {
+                reason,
+                batch_size_bytes,
+                num_txs,
+                batch_open_duration_us,
+                batch_execution_time_micros,
+                batch_execution_time_limit_us: time_limit_us,
+                batch_execution_time_headroom_us: time_headroom_us,
+                pending_parallel_count: self.pending_parallel_count as u32,
+                configured_max_batch_size_bytes: self.seq_config.max_batch_size_bytes as u64,
+            });
+
+            // Emit batch lifecycle metric
+            tracker.submit(crate::metrics::BatchLifecycleMetrics {
+                event: "batch_closed",
+                batch_open_duration_us,
+                num_txs,
+                batch_size_bytes,
+                batch_execution_time_us: batch_execution_time_micros,
+                pending_parallel_count: self.pending_parallel_count as u32,
+                message_queue_depth: 0, // Will be filled by caller if available
+            });
+        });
+
+        // Update throughput tracking
+        self.throughput_batches_closed += 1;
+        self.throughput_total_txs_in_batches += num_txs;
+        self.throughput_total_batch_duration_ms += batch_open_duration_us / 1000;
+
+        // Emit aggregated throughput metrics every 10 batches or 30 seconds
+        let elapsed_secs = self.throughput_tracking_start.elapsed().as_secs();
+        if self.throughput_batches_closed >= 10 || elapsed_secs >= 30 {
+            self.emit_throughput_metrics();
+        }
+
         // Terminate the batch.
         self.executor.end_rollup_block().await;
         self.batch_size_tracker = BatchSizeTracker::new(self.seq_config.max_batch_size_bytes);
@@ -639,6 +716,76 @@ where
             .checkpoint
             .clone_with_empty_witness_dropping_temp_cache();
         self.executor_events_sender.close_batch(checkpoint).await;
+
+        // Reset batch tracking for next batch
+        self.batch_start_time = std::time::Instant::now();
+        self.batch_tx_count = 0;
+    }
+
+    fn emit_throughput_metrics(&mut self) {
+        if self.throughput_batches_closed == 0 {
+            return;
+        }
+
+        let elapsed = self.throughput_tracking_start.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        sov_metrics::track_metrics(|tracker| {
+            // Transaction throughput
+            if self.throughput_txs_accepted > 0 {
+                let avg_tx_processing_us = if self.throughput_txs_accepted > 0 {
+                    (elapsed.as_micros() as u64) / self.throughput_txs_accepted
+                } else {
+                    0
+                };
+
+                tracker.submit(crate::metrics::TransactionThroughputMetrics {
+                    txs_accepted: self.throughput_txs_accepted,
+                    txs_parallel: self.throughput_txs_parallel,
+                    txs_sequential: self.throughput_txs_sequential,
+                    duration_ms: elapsed_ms,
+                    avg_tx_processing_us,
+                });
+            }
+
+            // Batch throughput
+            let avg_txs_per_batch = self.throughput_total_txs_in_batches / self.throughput_batches_closed;
+            let avg_batch_duration_ms = self.throughput_total_batch_duration_ms / self.throughput_batches_closed;
+
+            tracker.submit(crate::metrics::BatchThroughputMetrics {
+                batches_closed: self.throughput_batches_closed,
+                total_txs: self.throughput_total_txs_in_batches,
+                duration_ms: elapsed_ms,
+                avg_txs_per_batch,
+                avg_batch_duration_ms,
+            });
+
+            // Parallel queue metrics
+            if self.parallel_enqueued_count > 0 || self.parallel_rejected_count > 0 {
+                let queue_depth = self.parallel_tx_executor.queue_depth();
+                let total_capacity = 16384; // PARALLEL_TX_CHANNEL_SIZE
+                let utilization_percent = ((queue_depth as u64 * 100) / total_capacity as u64).min(100);
+
+                tracker.submit(crate::metrics::ParallelExecutorQueueMetrics {
+                    queue_depth,
+                    total_capacity,
+                    utilization_percent,
+                    enqueued_count: self.parallel_enqueued_count,
+                    rejected_count: self.parallel_rejected_count,
+                });
+            }
+        });
+
+        // Reset tracking
+        self.throughput_tracking_start = std::time::Instant::now();
+        self.throughput_txs_accepted = 0;
+        self.throughput_txs_parallel = 0;
+        self.throughput_txs_sequential = 0;
+        self.throughput_batches_closed = 0;
+        self.throughput_total_txs_in_batches = 0;
+        self.throughput_total_batch_duration_ms = 0;
+        self.parallel_enqueued_count = 0;
+        self.parallel_rejected_count = 0;
     }
 
     async fn check_readiness(
@@ -771,6 +918,7 @@ pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
         tx_hash: TxHash,
         original_tx_queue_id: u64,
         reason: &'static str,
+        http_received_at: std::time::Instant,
     },
     LatestSlotNumber {
         resp: oneshot::Sender<SlotNumber>,
@@ -921,6 +1069,18 @@ where
         parallel_tx_executor,
         pending_parallel_count: 0,
         pending_http_waiters: HashMap::new(),
+        batch_start_time: std::time::Instant::now(),
+        batch_tx_count: 0,
+        last_prune_time: std::time::Instant::now(),
+        throughput_tracking_start: std::time::Instant::now(),
+        throughput_txs_accepted: 0,
+        throughput_txs_parallel: 0,
+        throughput_txs_sequential: 0,
+        throughput_batches_closed: 0,
+        throughput_total_txs_in_batches: 0,
+        throughput_total_batch_duration_ms: 0,
+        parallel_enqueued_count: 0,
+        parallel_rejected_count: 0,
     };
 
     let channel_size = Arc::new(AtomicU32::new(0));
@@ -930,6 +1090,10 @@ where
             channel_size: channel_size.clone(),
             message_receiver,
             message_sender: message_sender.clone(),
+            messages_processed: 0,
+            channel_size_sum: 0,
+            max_channel_size: 0,
+            throughput_tracking_start: std::time::Instant::now(),
         },
         SequencerStateUpdator {
             message_sender,
@@ -1057,6 +1221,7 @@ where
             tx_hash,
             original_tx_queue_id,
             reason,
+            http_received_at: std::time::Instant::now(),
         })
         .await?;
 
@@ -1232,6 +1397,11 @@ where
     channel_size: Arc<AtomicU32>,
     message_receiver: mpsc::Receiver<Message<S, Rt>>,
     message_sender: mpsc::Sender<Message<S, Rt>>,
+    // Throughput tracking
+    messages_processed: u64,
+    channel_size_sum: u64,
+    max_channel_size: u32,
+    throughput_tracking_start: std::time::Instant,
 }
 
 impl<S, Rt> SynchronizedSequencerState<S, Rt>
@@ -1242,6 +1412,47 @@ where
     async fn send_response<T>(&mut self, resp: oneshot::Sender<T>, v: T, name: &'static str) {
         if resp.send(v).is_err() {
             tracing::debug!("SynchronizedSequencerState: Response channel closed - unable to send response to {}", name);
+        }
+    }
+
+    fn update_throughput_tracking(&mut self, current_channel_size: u32) {
+        self.messages_processed += 1;
+        self.channel_size_sum += current_channel_size as u64;
+        self.max_channel_size = self.max_channel_size.max(current_channel_size);
+
+        // Emit metrics every 1000 messages or every 5 seconds
+        const REPORT_INTERVAL_MESSAGES: u64 = 1000;
+        const REPORT_INTERVAL_SECS: u64 = 5;
+
+        let elapsed = self.throughput_tracking_start.elapsed();
+        let should_report = self.messages_processed >= REPORT_INTERVAL_MESSAGES
+            || elapsed.as_secs() >= REPORT_INTERVAL_SECS;
+
+        if should_report && self.messages_processed > 0 {
+            let avg_channel_size = self.channel_size_sum / self.messages_processed;
+
+            // Get parallel executor utilization metrics
+            let total_workers = self.inner.seq_config.sequencer_kind_config.num_parallel_tx_workers.unwrap_or(0) as u32;
+            let parallel_metrics = self.inner.parallel_tx_executor.get_utilization_metrics(
+                total_workers,
+                self.inner.pending_parallel_count as u32,
+            );
+
+            sov_metrics::track_metrics(|tracker| {
+                tracker.submit(MessageLoopThroughputMetrics {
+                    messages_processed: self.messages_processed,
+                    duration_ms: elapsed.as_millis() as u64,
+                    avg_channel_size,
+                    max_channel_size: self.max_channel_size,
+                });
+                tracker.submit(parallel_metrics);
+            });
+
+            // Reset tracking
+            self.messages_processed = 0;
+            self.channel_size_sum = 0;
+            self.max_channel_size = 0;
+            self.throughput_tracking_start = std::time::Instant::now();
         }
     }
 
@@ -1262,6 +1473,10 @@ where
                             tracing::info!("SynchronizedSequencerState: Message channel closed, exiting");
                             return;
                         };
+
+                        // Track throughput metrics
+                        let current_channel_size = self.channel_size.load(Ordering::Relaxed);
+                        self.update_throughput_tracking(current_channel_size);
 
                         if let Err(e) = self.handle_next_message(msg).await {
                             match e {
@@ -1338,11 +1553,13 @@ where
                 tx_hash,
                 original_tx_queue_id,
                 reason,
+                http_received_at,
             } => {
                 let start = std::time::Instant::now();
+                let queue_wait_us = http_received_at.elapsed().as_micros() as u64;
                 debug!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
                 let ret = self
-                    .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
+                    .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason, http_received_at)
                     .await;
                 if let Err(AcceptTxError::ExecutorError(
                     RollupBlockExecutorError::UnexpectedFailure,
@@ -1354,8 +1571,20 @@ where
 
                 self.send_response(resp, ret, "accept_tx").await;
                 let elapsed = start.elapsed();
+                let execution_wait_us = elapsed.as_micros() as u64;
+                let total_wait_us = http_received_at.elapsed().as_micros() as u64;
                 let end = std::time::Instant::now();
                 debug!("[ACCEPT TX] Ending AcceptTx message processing for tx_hash={} at {:?}, total duration: {:?}", tx_hash, end, elapsed);
+
+                // Track HTTP wait time metrics
+                sov_metrics::track_metrics(|tracker| {
+                    tracker.submit(crate::metrics::HttpWaitTimeMetrics {
+                        total_wait_us,
+                        queue_wait_us,
+                        execution_wait_us,
+                        parallel_tx: false, // Will be set to true for parallel path
+                    });
+                });
             }
             Message::LatestSlotNumber { resp, reason } => {
                 let ret = self.process_latest_slot_number(reason).await;
@@ -1718,6 +1947,7 @@ where
         tx_hash: TxHash,
         original_tx_queue_id: u64,
         reason: &'static str,
+        http_received_at: std::time::Instant,
     ) -> Result<oneshot::Receiver<Arc<AcceptedTx<Confirmation<S, Rt>>>>, AcceptTxError<S>> {
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
         let message_sender = self.message_sender.clone();
@@ -1781,20 +2011,13 @@ where
         }
 
         let sequence_number = inner.current_sequence_number();
-        let Inner {
-            executor,
-            batch_size_tracker,
-            executor_events_sender,
-            cache_warm_up_executor,
-            parallel_tx_executor,
-            ..
-        } = &mut *inner;
-
         let tx_len = baked_tx.data.len();
-        if !batch_size_tracker.can_fit_tx_bytes(tx_len) {
+
+        // Check if transaction fits before destructuring
+        if !inner.batch_size_tracker.can_fit_tx_bytes(tx_len) {
             return Err(AcceptTxError::TxTooBig {
-                current_batch_size: batch_size_tracker.current_batch_size,
-                max_batch_size: batch_size_tracker.max_batch_size,
+                current_batch_size: inner.batch_size_tracker.current_batch_size,
+                max_batch_size: inner.batch_size_tracker.max_batch_size,
             });
         }
 
@@ -1848,7 +2071,7 @@ where
 
         if is_midnight_privacy_tx {
             // Send to parallel executor - worker will send result directly to message loop
-            if parallel_tx_executor.send_tx(
+            if inner.parallel_tx_executor.send_tx(
                 baked_tx.clone(),
                 tx_hash,
                 original_tx_queue_id,
@@ -1858,19 +2081,46 @@ where
             ) {
                 debug!(%tx_hash, "[PARALLEL] Transaction sent to parallel executor");
 
+                // Track metrics
+                inner.throughput_txs_accepted += 1;
+                inner.throughput_txs_parallel += 1;
+                inner.parallel_enqueued_count += 1;
+                inner.batch_tx_count += 1;
+
                 // Register an HTTP waiter and keep the batch open while in-flight
                 inner.pending_parallel_count += 1;
                 let (http_tx, http_rx) = oneshot::channel();
-                inner.pending_http_waiters.insert(tx_hash, http_tx);
+                inner.pending_http_waiters.insert(
+                    tx_hash,
+                    HttpWaiter {
+                        sender: http_tx,
+                        http_received_at,
+                        queued_at: std::time::Instant::now(),
+                    },
+                );
                 return Ok(http_rx);
             } else {
                 debug!(
                     %tx_hash,
                     "[PARALLEL] Failed to send to parallel executor - falling back to sequential"
                 );
+                // Track rejection
+                inner.parallel_rejected_count += 1;
                 // Fall through to sequential processing
             }
         }
+
+        // Now destructure for sequential processing
+        let Inner {
+            executor,
+            batch_size_tracker,
+            executor_events_sender,
+            cache_warm_up_executor,
+            batch_tx_count,
+            throughput_txs_accepted,
+            throughput_txs_sequential,
+            ..
+        } = &mut *inner;
 
         // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
         let baked_tx = cache_warm_up_executor.send_tx(baked_tx.clone());
@@ -1910,6 +2160,12 @@ where
         };
 
         batch_size_tracker.add_tx(tx_len, execution_time_micros);
+        *batch_tx_count += 1;
+
+        // Track sequential transaction metrics
+        *throughput_txs_accepted += 1;
+        *throughput_txs_sequential += 1;
+
         // Always enqueue side effects so DB/cache semantics remain unchanged.
         let side_effects_rx = executor_events_sender
             .send_accept_tx(Arc::clone(&accepted_tx), tx_changes, sequence_number)
@@ -2061,6 +2317,7 @@ where
         inner
             .batch_size_tracker
             .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+        inner.batch_tx_count += 1;
         let batch_metrics_time = batch_metrics_start.elapsed();
 
         // Decide whether to fast-ack HTTP callers immediately after the in-memory
@@ -2079,8 +2336,22 @@ where
             if let Some(waiter) = maybe_waiter.take() {
                 let waiter_bridge_start = std::time::Instant::now();
                 let accepted_for_http = Arc::clone(&accepted_with_budget_main.accepted_tx);
+
+                // Track HTTP wait time metrics for parallel tx
+                let total_wait_us = waiter.http_received_at.elapsed().as_micros() as u64;
+                let queue_wait_us = waiter.queued_at.duration_since(waiter.http_received_at).as_micros() as u64;
+                let execution_wait_us = total_wait_us - queue_wait_us;
+                sov_metrics::track_metrics(|tracker| {
+                    tracker.submit(crate::metrics::HttpWaitTimeMetrics {
+                        total_wait_us,
+                        queue_wait_us,
+                        execution_wait_us,
+                        parallel_tx: true,
+                    });
+                });
+
                 tokio::spawn(async move {
-                    let _ = waiter.send(accepted_for_http);
+                    let _ = waiter.sender.send(accepted_for_http);
                 });
                 waiter_bridge_time = waiter_bridge_start.elapsed();
             }
@@ -2104,8 +2375,22 @@ where
             if let Some(waiter) = maybe_waiter.take() {
                 let waiter_bridge_start = std::time::Instant::now();
                 let accepted_for_http = Arc::clone(&accepted_with_budget_main.accepted_tx);
+
+                // Track HTTP wait time metrics for parallel tx
+                let total_wait_us = waiter.http_received_at.elapsed().as_micros() as u64;
+                let queue_wait_us = waiter.queued_at.duration_since(waiter.http_received_at).as_micros() as u64;
+                let execution_wait_us = total_wait_us - queue_wait_us;
+                sov_metrics::track_metrics(|tracker| {
+                    tracker.submit(crate::metrics::HttpWaitTimeMetrics {
+                        total_wait_us,
+                        queue_wait_us,
+                        execution_wait_us,
+                        parallel_tx: true,
+                    });
+                });
+
                 tokio::spawn(async move {
-                    let _ = waiter.send(accepted_for_http);
+                    let _ = waiter.sender.send(accepted_for_http);
                 });
                 waiter_bridge_time = waiter_bridge_start.elapsed();
             }
@@ -2301,6 +2586,7 @@ where
         inner
             .batch_size_tracker
             .add_tx(baked_tx.data.len(), execution_time_micros);
+        inner.batch_tx_count += 1;
         inner
             .executor_events_sender
             .insert_tx_without_confirmation(baked_tx, tx_hash)
@@ -2351,7 +2637,7 @@ where
     #[cfg(feature = "test-utils")]
     async fn process_force_close_current_batch(&mut self, reason: &'static str) {
         let mut inner = self.get_inner_with_timing(reason).await;
-        inner.close_current_batch().await;
+        inner.close_current_batch("forced").await;
     }
 
     async fn process_proof_blob(
@@ -2380,7 +2666,7 @@ where
 
     async fn process_close_current_batch(&mut self, reason: &'static str) {
         let mut inner = self.get_inner_with_timing(reason).await;
-        inner.close_current_batch().await;
+        inner.close_current_batch("manual").await;
     }
 }
 

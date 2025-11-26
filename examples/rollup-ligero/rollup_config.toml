@@ -76,7 +76,7 @@ disable_state_root_consistency_checks = true
 # "None" - Shutdown the sequencer instead of attempting recovery (default)
 # "TryToSave" - Attempt to recover by flushing batches and catching up with the chain
 recovery_strategy = "TryToSave"
-batch_execution_time_limit_millis = 1800
+batch_execution_time_limit_millis = 4000
 # Return HTTP confirmations as soon as the in-memory executor accepts a tx,
 # without waiting for DB side effects in the side-effects task. This reduces
 # await_ms for high-throughput benchmarks at the cost of making DB updates

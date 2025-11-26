@@ -123,6 +123,42 @@ impl Metric for PreferredSequencerExecutorEventMetrics {
 }
 
 #[derive(Debug)]
+pub struct PreferredBatchClosingMetrics {
+    pub reason: &'static str,
+    pub num_txs: u64,
+    pub batch_size_bytes: u64,
+    pub batch_open_duration_us: u64,
+    pub batch_execution_time_micros: u64,
+    pub batch_execution_time_limit_us: u64,
+    pub batch_execution_time_headroom_us: u64,
+    pub pending_parallel_count: u32,
+    pub configured_max_batch_size_bytes: u64,
+}
+
+impl Metric for PreferredBatchClosingMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_preferred_batch_closing"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},reason={} num_txs={},batch_size_bytes={},batch_open_duration_us={},batch_execution_time_us={},batch_execution_time_limit_us={},batch_execution_time_headroom_us={},pending_parallel_count={},configured_max_batch_size_bytes={}",
+            self.measurement_name(),
+            self.reason,
+            self.num_txs,
+            self.batch_size_bytes,
+            self.batch_open_duration_us,
+            self.batch_execution_time_micros,
+            self.batch_execution_time_limit_us,
+            self.batch_execution_time_headroom_us,
+            self.pending_parallel_count,
+            self.configured_max_batch_size_bytes
+        )
+    }
+}
+
+#[derive(Debug)]
 pub struct PreferredSequencerFetchBatchesToReplayMetrics {
     pub duration: std::time::Duration,
     pub num_batches: u64,
@@ -210,6 +246,282 @@ impl Metric for ParallelTxFastPathMetrics {
             self.apply_changes_us,
             self.build_accepted_us,
             self.cache_us,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct MessageLoopThroughputMetrics {
+    pub messages_processed: u64,
+    pub duration_ms: u64,
+    pub avg_channel_size: u64,
+    pub max_channel_size: u32,
+}
+
+impl Metric for MessageLoopThroughputMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_message_loop_throughput"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} messages_processed={},duration_ms={},avg_channel_size={},max_channel_size={}",
+            self.measurement_name(),
+            self.messages_processed,
+            self.duration_ms,
+            self.avg_channel_size,
+            self.max_channel_size,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ParallelExecutorUtilizationMetrics {
+    pub active_workers: u32,
+    pub total_workers: u32,
+    pub pending_tx_count: u32,
+    pub tx_channel_size: usize,
+}
+
+impl Metric for ParallelExecutorUtilizationMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_parallel_executor_utilization"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} active_workers={},total_workers={},pending_tx_count={},tx_channel_size={}",
+            self.measurement_name(),
+            self.active_workers,
+            self.total_workers,
+            self.pending_tx_count,
+            self.tx_channel_size,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct HttpWaitTimeMetrics {
+    pub total_wait_us: u64,
+    pub queue_wait_us: u64,
+    pub execution_wait_us: u64,
+    pub parallel_tx: bool,
+}
+
+impl Metric for HttpWaitTimeMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_http_wait_time"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},parallel_tx={} total_wait_us={},queue_wait_us={},execution_wait_us={}",
+            self.measurement_name(),
+            self.parallel_tx,
+            self.total_wait_us,
+            self.queue_wait_us,
+            self.execution_wait_us,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BatchClosingMetrics {
+    pub reason: &'static str,
+    pub batch_size_bytes: u64,
+    pub num_txs: u64,
+    pub gas_remaining: u64,
+    pub batch_open_duration_us: u64,
+    pub pending_parallel_count: u32,
+}
+
+impl Metric for BatchClosingMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_batch_closing"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},reason={} batch_size_bytes={},num_txs={},gas_remaining={},batch_open_duration_us={},pending_parallel_count={}",
+            self.measurement_name(),
+            self.reason,
+            self.batch_size_bytes,
+            self.num_txs,
+            self.gas_remaining,
+            self.batch_open_duration_us,
+            self.pending_parallel_count,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct TransactionCacheContentionMetrics {
+    pub operation: &'static str,
+    pub lock_wait_us: u64,
+    pub operation_duration_us: u64,
+}
+
+impl Metric for TransactionCacheContentionMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_tx_cache_contention"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},operation={} lock_wait_us={},operation_duration_us={}",
+            self.measurement_name(),
+            self.operation,
+            self.lock_wait_us,
+            self.operation_duration_us,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BatchLifecycleMetrics {
+    pub event: &'static str,
+    pub batch_open_duration_us: u64,
+    pub num_txs: u64,
+    pub batch_size_bytes: u64,
+    pub batch_execution_time_us: u64,
+    pub pending_parallel_count: u32,
+    pub message_queue_depth: u32,
+}
+
+impl Metric for BatchLifecycleMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_batch_lifecycle"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},event={} batch_open_duration_us={},num_txs={},batch_size_bytes={},batch_execution_time_us={},pending_parallel_count={},message_queue_depth={}",
+            self.measurement_name(),
+            self.event,
+            self.batch_open_duration_us,
+            self.num_txs,
+            self.batch_size_bytes,
+            self.batch_execution_time_us,
+            self.pending_parallel_count,
+            self.message_queue_depth,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct TransactionThroughputMetrics {
+    pub txs_accepted: u64,
+    pub txs_parallel: u64,
+    pub txs_sequential: u64,
+    pub duration_ms: u64,
+    pub avg_tx_processing_us: u64,
+}
+
+impl Metric for TransactionThroughputMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_tx_throughput"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} txs_accepted={},txs_parallel={},txs_sequential={},duration_ms={},avg_tx_processing_us={}",
+            self.measurement_name(),
+            self.txs_accepted,
+            self.txs_parallel,
+            self.txs_sequential,
+            self.duration_ms,
+            self.avg_tx_processing_us,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BatchThroughputMetrics {
+    pub batches_closed: u64,
+    pub total_txs: u64,
+    pub duration_ms: u64,
+    pub avg_txs_per_batch: u64,
+    pub avg_batch_duration_ms: u64,
+}
+
+impl Metric for BatchThroughputMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_batch_throughput"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} batches_closed={},total_txs={},duration_ms={},avg_txs_per_batch={},avg_batch_duration_ms={}",
+            self.measurement_name(),
+            self.batches_closed,
+            self.total_txs,
+            self.duration_ms,
+            self.avg_txs_per_batch,
+            self.avg_batch_duration_ms,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ParallelExecutorQueueMetrics {
+    pub queue_depth: usize,
+    pub total_capacity: usize,
+    pub utilization_percent: u64,
+    pub enqueued_count: u64,
+    pub rejected_count: u64,
+}
+
+impl Metric for ParallelExecutorQueueMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_parallel_queue"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{} queue_depth={},total_capacity={},utilization_percent={},enqueued_count={},rejected_count={}",
+            self.measurement_name(),
+            self.queue_depth,
+            self.total_capacity,
+            self.utilization_percent,
+            self.enqueued_count,
+            self.rejected_count,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct TransactionExecutionDetailMetrics {
+    pub tx_type: &'static str,
+    pub total_duration_us: u64,
+    pub queue_wait_us: u64,
+    pub execution_us: u64,
+    pub post_process_us: u64,
+}
+
+impl Metric for TransactionExecutionDetailMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_rollup_tx_execution_detail"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},tx_type={} total_duration_us={},queue_wait_us={},execution_us={},post_process_us={}",
+            self.measurement_name(),
+            self.tx_type,
+            self.total_duration_us,
+            self.queue_wait_us,
+            self.execution_us,
+            self.post_process_us,
         )
     }
 }

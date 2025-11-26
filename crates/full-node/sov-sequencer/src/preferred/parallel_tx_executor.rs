@@ -27,7 +27,7 @@ static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 // Channel size for parallel transaction processing.
 // This should be large enough to accommodate multiple transactions being processed simultaneously
 // by different workers, but not so large that it causes memory issues.
-const PARALLEL_TX_CHANNEL_SIZE: usize = 2048;
+const PARALLEL_TX_CHANNEL_SIZE: usize = 16384;
 
 /// Result of parallel transaction execution that will be sent back to the main sequencer.
 /// Contains all the information needed to finalize the transaction without re-executing it.
@@ -107,6 +107,21 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
     pub(crate) fn send_batch_start_notification(&self, data: StartBlockNotification<S>) {
         // This `send` does not block.
         let _ = self.start_block_notification_sender.send(Some(data));
+    }
+
+    /// Get current utilization metrics for the parallel executor
+    pub(crate) fn get_utilization_metrics(&self, total_workers: u32, pending_parallel_count: u32) -> crate::metrics::ParallelExecutorUtilizationMetrics {
+        crate::metrics::ParallelExecutorUtilizationMetrics {
+            active_workers: ACTIVE_WORKERS.load(Ordering::Relaxed) as u32,
+            total_workers,
+            pending_tx_count: pending_parallel_count,
+            tx_channel_size: self.tx_sender.len(),
+        }
+    }
+
+    /// Get the current queue depth
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.tx_sender.len()
     }
 
     /// Send a transaction for parallel processing.
