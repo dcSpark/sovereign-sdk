@@ -2209,6 +2209,8 @@ where
 
         // Requeue the message if no batch is in progress.
         if !inner.executor.has_in_progress_batch() {
+            (&mut inner).trigger_batch_production_if_convenient().await;
+            
             tracing::warn!(
                 tx_hash = %parallel_response.tx_hash,
                 retry = retry_count,
