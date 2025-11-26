@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-arbitrary = { workspace = true, optional = true }
+arbitrary = { workspace = true }
 async-trait = { workspace = true }
 borsh = { workspace = true, features = ["bytes"] }
 bytes = { workspace = true, features = ["serde"] }
@@ -69,11 +69,9 @@ testcontainers-modules = { workspace = true, features = ["postgres"] }
 [features]
 default = []
 arbitrary = [
-    "dep:arbitrary",
     "chrono?/arbitrary",
     "dep:proptest",
     "dep:proptest-derive",
-    "sov-midnight-da/arbitrary",
     "sov-rollup-interface/arbitrary",
     "sov-test-utils/arbitrary"
 ]
