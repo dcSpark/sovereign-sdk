@@ -910,7 +910,7 @@ async fn perform_transfer_cycle(
 
         if position.is_none() {
             // Retry with fresh note fetches and small waits; useful when the tree has just advanced.
-            for attempt in 0..MISSING_NOTE_RETRY_MAX {
+            for _attempt in 0..MISSING_NOTE_RETRY_MAX {
                 sleep(Duration::from_millis(MISSING_NOTE_RETRY_DELAY_MS)).await;
                 pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
                 position = pos_by_cm.get(&cm).copied();
@@ -1066,53 +1066,88 @@ async fn perform_transfer_cycle(
         "[cycle] Building and signing {} transfers txs...",
         proofs.len()
     );
+
+    #[derive(Debug)]
+    struct BuiltTransfer {
+        idx: usize,
+        wallet_idx: usize,
+        tx_hash: String,
+        tx_b64: String,
+        new_nonce: u64,
+        new_rho: Hash32,
+        new_recipient: Hash32,
+    }
+
+    let mut build_tasks = Vec::with_capacity(proofs.len());
     for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
-        let wallet = &mut wallets[wallet_idx];
+        let mut wallet = wallets[wallet_idx].clone();
+        let chain_hash = *chain_hash;
+        let anchor_root = anchor_root;
+        let detailed_logs = config.detailed_wallet_logs;
+        build_tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<BuiltTransfer> {
+            let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
+            let call =
+                RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
+                    proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
+                        .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
+                    anchor_root,
+                    nullifier: nf,
+                    view_ciphertexts: None,
+                    gas: None,
+                });
 
-        let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
-        let call =
-            RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
-                proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
-                    .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
-                anchor_root,
-                nullifier: nf,
-                view_ciphertexts: None,
-                gas: None,
-            });
+            let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
+                default_test_signed_transaction(
+                    &wallet.account.private_key,
+                    &call,
+                    wallet.nonce,
+                    &chain_hash,
+                );
 
-        let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
-            default_test_signed_transaction(
-                &wallet.account.private_key,
-                &call,
-                wallet.nonce,
-                chain_hash,
-            );
+            let mut meter = sov_modules_api::gas::UnlimitedGasMeter::<DemoRollupSpec>::default();
+            tx.verify(&chain_hash, &mut meter)
+                .context("Transfer tx signature verify failed")?;
 
-        let mut meter = sov_modules_api::gas::UnlimitedGasMeter::<DemoRollupSpec>::default();
-        tx.verify(chain_hash, &mut meter)
-            .context("Transfer tx signature verify failed")?;
+            let tx_bytes = borsh::to_vec(&tx)?;
+            let tx_hash = tx.hash().to_string();
+            let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
 
-        let tx_bytes = borsh::to_vec(&tx)?;
-        let tx_hash = tx.hash().to_string();
-        let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
+            if detailed_logs {
+                eprintln!(
+                    "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
+                    wallet_idx,
+                    i + 1,
+                    wallet.nonce,
+                    tx_hash,
+                    hex::encode(&nf[..8])
+                );
+            }
 
-        if config.detailed_wallet_logs {
-            eprintln!(
-                "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
+            Ok(BuiltTransfer {
+                idx: i,
                 wallet_idx,
-                i + 1,
-                wallet.nonce,
                 tx_hash,
-                hex::encode(&nf[..8])
-            );
-        }
+                tx_b64,
+                new_nonce: wallet.nonce + 1,
+                new_rho: out_rho,
+                new_recipient: out_recipient,
+            })
+        }));
+    }
 
-        transfer_hashes.push(tx_hash);
-        wallet.nonce += 1;
-        wallet.rho = out_rho;
-        wallet.recipient = out_recipient;
+    let mut built = Vec::with_capacity(build_tasks.len());
+    for t in build_tasks {
+        built.push(t.await??);
+    }
+    built.sort_by_key(|b| b.idx);
 
-        transfer_txs_b64.push((wallet_idx, tx_b64));
+    for b in built {
+        transfer_hashes.push(b.tx_hash);
+        transfer_txs_b64.push((b.wallet_idx, b.tx_b64));
+        let w = &mut wallets[b.wallet_idx];
+        w.nonce = b.new_nonce;
+        w.rho = b.new_rho;
+        w.recipient = b.new_recipient;
     }
     let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
