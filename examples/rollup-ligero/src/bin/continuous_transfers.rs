@@ -1080,7 +1080,7 @@ async fn perform_transfer_cycle(
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
     for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
-        let mut wallet = wallets[wallet_idx].clone();
+        let wallet = wallets[wallet_idx].clone();
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;

@@ -48,6 +48,16 @@ chacha20poly1305 = { version = "0.10", features = ["std"] }
 hkdf = "0.12"
 sha2 = { workspace = true }
 tracing = { workspace = true }
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "postgres-array",
+    "with-chrono",
+] }
+sov-midnight-da = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 default = ["native"]

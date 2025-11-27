@@ -18,7 +18,9 @@ use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::*;
 use sov_modules_stf_blueprint::{PreExecError, Runtime};
 use sov_rest_utils::{json_obj, to_json_object};
-use midnight_privacy::{PreVerifiedWithdrawCredential, SpendPublic};
+#[cfg(feature = "native")]
+use midnight_privacy::prime_pre_verified_spend;
+use midnight_privacy::SpendPublic;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::ledger_api::{ItemOrHash, LedgerStateProvider, QueryMode};
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
@@ -141,29 +143,6 @@ pub(crate) fn cache_sequencer_metrics(tx_hash: TxHash, metrics: SequencerMetrics
 
 pub(crate) fn take_sequencer_metrics(tx_hash: &TxHash) -> Option<SequencerMetrics> {
     sequencer_metrics_map().lock().unwrap().remove(tx_hash)
-}
-
-#[cfg(feature = "native")]
-fn take_cached_pre_verified_withdraw<S, Rt>(baked_tx: &FullyBakedTx) -> Option<SpendPublic>
-where
-    S: Spec,
-    Rt: Runtime<S>,
-{
-    let tx_hash = Rt::Auth::compute_tx_hash(baked_tx).ok()?;
-    pre_verified_map()
-        .lock()
-        .unwrap()
-        .get(&tx_hash)
-        .cloned()
-}
-
-#[cfg(not(feature = "native"))]
-fn take_cached_pre_verified_withdraw<S, Rt>(_: &FullyBakedTx) -> Option<SpendPublic>
-where
-    S: Spec,
-    Rt: Runtime<S>,
-{
-    None
 }
 
 /// The [`Sequencer`] trait is responsible for accepting transactions and
@@ -683,12 +662,15 @@ where
         }
     };
 
-    let (auth_tx, mut auth_data, message) = auth_res;
-    if let Some(public) = take_cached_pre_verified_withdraw::<S, Rt>(baked_tx) {
-        auth_data.credentials = auth_data
-            .credentials
-            .insert(PreVerifiedWithdrawCredential(public));
+    let (auth_tx, auth_data, message) = auth_res;
+
+    #[cfg(feature = "native")]
+    {
+        if let Ok(tx_hash) = Rt::Auth::compute_tx_hash(baked_tx) {
+            prime_pre_verified_spend(&tx_hash);
+        }
     }
+
     let auth_res = (auth_tx, auth_data, Rt::wrap_call(message));
     let (tx_scratchpad, gas_meter) = pre_exec_ws.to_scratchpad_and_gas_meter();
 
