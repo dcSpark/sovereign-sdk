@@ -1,0 +1,15 @@
+[Unit]
+Description=Sovereign SDK Rollup Ligero Service
+After=network.target
+
+[Service]
+Type=simple
+User=guillevalin
+WorkingDirectory=/home/guillevalin/sovereign-sdk/examples/rollup-ligero
+ExecStart=/bin/bash /home/guillevalin/sovereign-sdk/examples/rollup-ligero/run_rollup.sh
+Restart=on-failure
+Environment="PATH=/home/guillevalin/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target
