@@ -1,0 +1,19 @@
+[Unit]
+Description=Sovereign SDK Ligero Proof Verifier Service
+After=network.target
+
+[Service]
+Type=simple
+User=guillevalin
+WorkingDirectory=/home/guillevalin/sovereign-sdk/examples/rollup-ligero
+ExecStart=/bin/bash /home/guillevalin/sovereign-sdk/examples/rollup-ligero/run_verifier_service.sh
+Restart=on-failure
+Environment="PATH=/home/guillevalin/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+#Environment="DEFER_SEQUENCER_SUBMISSION=true"
+#Environment="NODE_RPC_URL=http://127.0.0.1:12346"
+#Environment="LIGERO_SKIP_VERIFICATION=1"
+
+[Install]
+WantedBy=multi-user.target
+
