@@ -643,15 +643,8 @@ where
             return;
         }
 
-        // Do not close if parallel txs are pending
-        // if self.pending_parallel_count == 0 {
-            self.close_current_batch("automatic").await;
-        // } else {
-        //     tracing::trace!(
-        //         pending = %self.pending_parallel_count,
-        //         "Skipping auto close; parallel txs pending"
-        //     );
-        // }
+        // Close the batch to make room for the next one
+        self.close_current_batch("automatic").await;
     }
 
     /// Closes the current batch.
@@ -2209,66 +2202,75 @@ where
 
         // Requeue the message if no batch is in progress.
         if !inner.executor.has_in_progress_batch() {
-            (&mut inner).trigger_batch_production_if_convenient().await;
-            
-            tracing::warn!(
-                tx_hash = %parallel_response.tx_hash,
-                retry = retry_count,
-                "No in-progress batch when handling ParallelTxCompleted; rescheduling"
-            );
+            if let Err(e) = (&mut inner).try_to_create_and_start_batch_if_none_in_progress(false).await {
+                tracing::debug!(
+                    error = %e,
+                    tx_hash = %parallel_response.tx_hash,
+                    "Unable to create batch for completed parallel tx; will retry"
+                );
+            }
 
-            if retry_count >= PARALLEL_COMPLETION_MAX_RETRIES {
+            // Check again if we now have a batch after trying to create one
+            if !inner.executor.has_in_progress_batch() {
                 tracing::warn!(
                     tx_hash = %parallel_response.tx_hash,
-                    retries = retry_count,
-                    "Dropping parallel completion after max retries due to missing batch"
+                    retry = retry_count,
+                    "No in-progress batch when handling ParallelTxCompleted; rescheduling"
                 );
-                if let Some(waiter) = inner.pending_http_waiters.remove(&parallel_response.tx_hash)
-                {
-                    drop(waiter);
+
+                if retry_count >= PARALLEL_COMPLETION_MAX_RETRIES {
+                    tracing::warn!(
+                        tx_hash = %parallel_response.tx_hash,
+                        retries = retry_count,
+                        "Dropping parallel completion after max retries due to missing batch"
+                    );
+                    if let Some(waiter) = inner.pending_http_waiters.remove(&parallel_response.tx_hash)
+                    {
+                        drop(waiter);
+                    }
+                    if inner.pending_parallel_count > 0 {
+                        inner.pending_parallel_count -= 1;
+                    }
+                    debug!(
+                        total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
+                        "[TIMING] process_parallel_tx_completed dropped after missing batch"
+                    );
+                    return;
                 }
-                if inner.pending_parallel_count > 0 {
-                    inner.pending_parallel_count -= 1;
-                }
+
+                // Drop the inner guard before requeueing to avoid borrow conflicts.
+                drop(inner);
+
+                let sender = self.message_sender.clone();
+                let channel_size = self.channel_size.clone();
+                let retry_msg = Message::ParallelTxCompleted {
+                    parallel_response,
+                    sequence_number,
+                    tx_len,
+                    retry_count: retry_count.saturating_add(1),
+                    reason: "parallel_tx_completed_retry",
+                };
+
+                channel_size.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(
+                        PARALLEL_COMPLETION_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                    if let Err(err) = sender.send(retry_msg).await {
+                        channel_size.fetch_sub(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            ?err,
+                            "Failed to requeue ParallelTxCompleted message (likely shutdown)"
+                        );
+                    }
+                });
                 debug!(
                     total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
-                    "[TIMING] process_parallel_tx_completed dropped after missing batch"
+                    "[TIMING] process_parallel_tx_completed rescheduled - no batch"
                 );
                 return;
             }
-
-            // Drop the inner guard before requeueing to avoid borrow conflicts.
-            drop(inner);
-
-            let sender = self.message_sender.clone();
-            let channel_size = self.channel_size.clone();
-            let retry_msg = Message::ParallelTxCompleted {
-                parallel_response,
-                sequence_number,
-                tx_len,
-                retry_count: retry_count.saturating_add(1),
-                reason: "parallel_tx_completed_retry",
-            };
-
-            channel_size.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(
-                    PARALLEL_COMPLETION_RETRY_DELAY_MS,
-                ))
-                .await;
-                if let Err(err) = sender.send(retry_msg).await {
-                    channel_size.fetch_sub(1, Ordering::Relaxed);
-                    tracing::debug!(
-                        ?err,
-                        "Failed to requeue ParallelTxCompleted message (likely shutdown)"
-                    );
-                }
-            });
-            debug!(
-                total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
-                "[TIMING] process_parallel_tx_completed rescheduled - no batch"
-            );
-            return;
         }
 
         let ParallelizedResponse {
@@ -2315,10 +2317,13 @@ where
         let commit_time = commit_start.elapsed();
 
         // Update batch metrics
+        // Note: For parallel transactions, we don't count execution time towards the batch time limit
+        // because they execute concurrently. The cumulative execution time would be misleading.
+        // We still enforce gas and size limits, which appropriately constrain batch size.
         let batch_metrics_start = std::time::Instant::now();
         inner
             .batch_size_tracker
-            .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+            .add_tx(tx_len, 0); // Pass 0 for execution time for parallel txs
         inner.batch_tx_count += 1;
         let batch_metrics_time = batch_metrics_start.elapsed();
 
