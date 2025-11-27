@@ -112,7 +112,8 @@ impl EventReceiver {
     pub(crate) async fn spawn_db_data_fetcher(&mut self) {
         // Create a separate persistent connection pool for querying transaction data
         let query_pool = match PgPoolOptions::default()
-            .max_connections(5) // Small pool since we're just doing simple queries
+            // Primary endpoint: small but slightly larger pool to avoid acquisition backpressure
+            .max_connections(10)
             .connect(&self.connection_string)
             .await
         {

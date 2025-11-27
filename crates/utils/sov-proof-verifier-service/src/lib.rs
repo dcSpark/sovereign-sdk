@@ -212,15 +212,16 @@ impl AppState {
             let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
             
             connect_opts
-                .max_connections(20)
-                .min_connections(1)
+                // Primary endpoint: allow a larger pool to reduce acquire waits
+                .max_connections(128)
+                .min_connections(8)
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .acquire_timeout(std::time::Duration::from_secs(30))
                 .idle_timeout(std::time::Duration::from_secs(300))
                 .max_lifetime(std::time::Duration::from_secs(1800))
                 .sqlx_logging(false);
             
-            info!("Verifier service connecting to PostgreSQL database (max_connections=20)");
+            info!("Verifier service connecting to PostgreSQL database (max_connections=64)");
             
             Database::connect(connect_opts).await.with_context(|| {
                 format!(

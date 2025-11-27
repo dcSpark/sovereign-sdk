@@ -84,8 +84,9 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
             } else {
                 let mut connect_opts = ConnectOptions::new(connection_string.clone());
                 connect_opts
-                    .max_connections(40)
-                    .min_connections(5)
+                    // Primary Postgres endpoint: allow more headroom per process
+                    .max_connections(256)
+                    .min_connections(16)
                     .connect_timeout(Duration::from_secs(30))
                     .acquire_timeout(Duration::from_secs(30))
                     .idle_timeout(Duration::from_secs(300))
@@ -93,7 +94,7 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
                     .sqlx_logging(false);
 
                 tracing::info!(
-                    "Connecting to worker shared database with tuned pool settings (max_connections=40, min_connections=5)"
+                    "Connecting to worker shared database with tuned pool settings (max_connections=80, min_connections=5)"
                 );
 
                 Database::connect(connect_opts)

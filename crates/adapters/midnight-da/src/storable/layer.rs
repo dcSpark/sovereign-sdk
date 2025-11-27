@@ -82,8 +82,9 @@ impl StorableMidnightDaLayer {
             // PostgreSQL or other databases
             let mut opts = ConnectOptions::new(connection_string);
             
-            opts.max_connections(50)
-                .min_connections(1)
+            // Primary Postgres endpoint: allow a larger app-side pool to reduce acquire waits
+            opts.max_connections(256)
+                .min_connections(16)
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .acquire_timeout(std::time::Duration::from_secs(30))
                 .idle_timeout(std::time::Duration::from_secs(300))
@@ -94,8 +95,9 @@ impl StorableMidnightDaLayer {
                     tracing::log::LevelFilter::Warn,
                     std::time::Duration::from_millis(5),
                 );
-            
-            tracing::info!("Initializing PostgreSQL database connection pool: 50 max_connections, 5ms slow-query threshold");
+            tracing::info!(
+                "Initializing PostgreSQL database connection pool: 80 max_connections, 5ms slow-query threshold"
+            );
             
             Database::connect(opts).await?
         };
