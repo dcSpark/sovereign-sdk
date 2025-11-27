@@ -9,7 +9,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 use std::collections::HashSet;
 
-use super::{PreVerifiedWithdrawCredential, ValueMidnightPrivacy};
+use super::ValueMidnightPrivacy;
 use crate::event::{CommitmentPos, Event};
 use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
 use crate::types::{EncryptedNote, FullViewingKey};
@@ -340,24 +340,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
-            // Try to use pre-verified credential (preferred fast path)
             let credential_check_start = std::time::Instant::now();
-            let ctx_credential = _ctx.get_sender_credential::<PreVerifiedWithdrawCredential>();
             let cached_public = crate::get_pre_verified_spend(&nullifier);
-            let has_credential = ctx_credential.is_some() || cached_public.is_some();
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
-                has_credential = ?has_credential,
-                "Transfer: checked for pre-verified credential"
+                has_pre_verified = cached_public.is_some(),
+                "Transfer: checked for pre-verified proof outputs"
             );
 
-            let public = if let Some(cred) = ctx_credential {
-                // Prefer the credential embedded in the tx context when available.
-                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
-                cred.0.clone()
-            } else if let Some(public) = cached_public {
-                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
+            let public = if let Some(public) = cached_public {
+                debug!("Using pre-verified path (skipping Ligero proof verification)");
                 public
             } else {
                 info!("No pre-verified credential, performing full Ligero proof verification");
@@ -547,7 +540,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         view_ciphertexts: Option<Vec<EncryptedNote>>,
         gas: Option<S::Gas>,
-        ctx: &Context<S>,
+        _ctx: &Context<S>,
         st: &mut impl TxState<S>,
     ) -> Result<()> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
@@ -564,21 +557,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
             let credential_check_start = std::time::Instant::now();
-            let ctx_credential = ctx.get_sender_credential::<PreVerifiedWithdrawCredential>();
             let cached_public = crate::get_pre_verified_spend(&nullifier);
-            let has_credential = ctx_credential.is_some() || cached_public.is_some();
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
-                has_credential = ?has_credential,
-                "Withdraw: checked for pre-verified credential"
+                has_pre_verified = cached_public.is_some(),
+                "Withdraw: checked for pre-verified proof outputs"
             );
 
-            let public = if let Some(cred) = ctx_credential {
-                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
-                cred.0.clone()
-            } else if let Some(public) = cached_public {
-                debug!("Using pre-verified credential path (skipping Ligero proof verification)");
+            let public = if let Some(public) = cached_public {
+                debug!("Using pre-verified path (skipping Ligero proof verification)");
                 public
             } else {
                 info!("No pre-verified credential, performing full Ligero proof verification");
