@@ -109,16 +109,6 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
         let _ = self.start_block_notification_sender.send(Some(data));
     }
 
-    /// Get current utilization metrics for the parallel executor
-    pub(crate) fn get_utilization_metrics(&self, total_workers: u32, pending_parallel_count: u32) -> crate::metrics::ParallelExecutorUtilizationMetrics {
-        crate::metrics::ParallelExecutorUtilizationMetrics {
-            active_workers: ACTIVE_WORKERS.load(Ordering::Relaxed) as u32,
-            total_workers,
-            pending_tx_count: pending_parallel_count,
-            tx_channel_size: self.tx_sender.len(),
-        }
-    }
-
     /// Get the current queue depth
     pub(crate) fn queue_depth(&self) -> usize {
         self.tx_sender.len()

@@ -785,16 +785,6 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             "[TIMING] accept_precomputed_tx_from_parallel: FAST PATH (no STF re-execution)"
         );
 
-        // Track metrics for monitoring the fast path performance
-        sov_metrics::track_metrics(|t| {
-            t.submit(crate::metrics::ParallelTxFastPathMetrics {
-                total_duration_us: total_time.as_micros() as u64,
-                apply_changes_us: apply_changes_time.as_micros() as u64,
-                build_accepted_us: build_accepted_time.as_micros() as u64,
-                cache_us: cache_time.as_micros() as u64,
-            });
-        });
-
         Ok((
             AcceptedTxWithBudgetInfo {
                 accepted_tx,
