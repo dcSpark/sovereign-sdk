@@ -34,6 +34,8 @@ type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 const TREE_DEPTH: u8 = 16;
 const TREE_REBUILD_MAX_RETRIES: usize = 3;
 const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
+const MISSING_NOTE_RETRY_MAX: usize = 3;
+const MISSING_NOTE_RETRY_DELAY_MS: u64 = 200;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
@@ -129,6 +131,49 @@ struct NoteInfo {
 #[derive(Deserialize)]
 struct NotesResp {
     notes: Vec<NoteInfo>,
+}
+
+async fn fetch_note_positions(
+    client: &NodeClient,
+    detailed_wallet_logs: bool,
+) -> Result<HashMap<[u8; 32], u64>> {
+    let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
+    let batch_size = 1000;
+    let mut offset = 0;
+
+    loop {
+        let endpoint = format!(
+            "/modules/midnight-privacy/notes?limit={}&offset={}",
+            batch_size, offset
+        );
+        let batch_resp: NotesResp = client
+            .query_rest_endpoint(&endpoint)
+            .await
+            .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
+
+        for n in batch_resp.notes.iter() {
+            if n.commitment.len() == 32 {
+                let mut cm = [0u8; 32];
+                cm.copy_from_slice(&n.commitment);
+                pos_by_cm.insert(cm, n.position);
+            }
+        }
+
+        let len = batch_resp.notes.len();
+        if len < batch_size {
+            break;
+        }
+        offset += batch_size;
+    }
+
+    if detailed_wallet_logs {
+        eprintln!(
+            "[cycle] refreshed note positions: count={}",
+            pos_by_cm.len()
+        );
+    }
+
+    Ok(pos_by_cm)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -861,7 +906,21 @@ async fn perform_transfer_cycle(
             continue;
         }
         let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &wallet.recipient);
-        if let Some(&position) = pos_by_cm.get(&cm) {
+        let mut position = pos_by_cm.get(&cm).copied();
+
+        if position.is_none() {
+            // Retry with fresh note fetches and small waits; useful when the tree has just advanced.
+            for attempt in 0..MISSING_NOTE_RETRY_MAX {
+                sleep(Duration::from_millis(MISSING_NOTE_RETRY_DELAY_MS)).await;
+                pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
+                position = pos_by_cm.get(&cm).copied();
+                if position.is_some() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(position) = position {
             inputs.push(TransferInput {
                 wallet_idx: idx,
                 value: wallet.value,
@@ -1090,6 +1149,7 @@ async fn perform_transfer_cycle(
         let permit_pool = semaphore.clone();
         let transfer_hash = transfer_hashes[idx].clone();
         let per_tx_delay = config.per_tx_delay_ms;
+        const MAX_SUBMIT_RETRIES: usize = 3;
         join_set.spawn(async move {
             let _permit = permit_pool
                 .acquire_owned()
@@ -1099,34 +1159,76 @@ async fn perform_transfer_cycle(
                 sleep(Duration::from_millis(per_tx_delay)).await;
             }
             let display_idx = idx + 1;
-            let resp = client
-                .post(endpoint)
-                .json(&json!({ "body": body_b64 }))
-                .send()
-                .await
-                .with_context(|| format!("transfer #{} request failed", display_idx))?;
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                bail!(
-                    "transfer #{} verifier returned status {}: {}",
-                    display_idx,
-                    status,
-                    body
-                );
+
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..=MAX_SUBMIT_RETRIES {
+                let resp = client
+                    .post(&endpoint)
+                    .json(&json!({ "body": body_b64 }))
+                    .send()
+                    .await;
+
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_err = Some(e.into());
+                        if attempt < MAX_SUBMIT_RETRIES {
+                            let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                };
+
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    last_err = Some(anyhow::anyhow!(
+                        "transfer #{} verifier returned status {}: {}",
+                        display_idx,
+                        status,
+                        body
+                    ));
+                    if attempt < MAX_SUBMIT_RETRIES {
+                        let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+
+                let vresp: VerifierResponse = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = Some(e.into());
+                        if attempt < MAX_SUBMIT_RETRIES {
+                            let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                };
+
+                let worker_hash = vresp.tx_hash.unwrap_or(transfer_hash);
+                return Ok::<TransferSubmitResult, anyhow::Error>(TransferSubmitResult {
+                    idx,
+                    wallet_idx,
+                    worker_hash,
+                    metrics: vresp.metrics.clone(),
+                });
             }
 
-            let vresp: VerifierResponse = serde_json::from_str(&body).context(format!(
-                "transfer #{}: failed to parse verifier JSON response",
-                display_idx
-            ))?;
-            let worker_hash = vresp.tx_hash.unwrap_or(transfer_hash);
-            Ok::<TransferSubmitResult, anyhow::Error>(TransferSubmitResult {
-                idx,
-                wallet_idx,
-                worker_hash,
-                metrics: vresp.metrics.clone(),
-            })
+            Err(last_err.unwrap_or_else(|| {
+                anyhow::anyhow!(format!(
+                    "transfer #{} request failed after retries",
+                    display_idx
+                ))
+            }))
         });
     }
 
