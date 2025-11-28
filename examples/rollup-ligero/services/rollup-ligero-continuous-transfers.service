@@ -1,0 +1,20 @@
+[Unit]
+Description=Sovereign SDK Ligero Continuous Transfers Generator
+After=network.target rollup-ligero.service rollup-ligero-verifier.service
+
+[Service]
+Type=simple
+User=guillevalin
+WorkingDirectory=/home/guillevalin/sovereign-sdk/examples/rollup-ligero
+ExecStart=/usr/bin/env cargo run -p sov-rollup-ligero --bin continuous-transfers --release
+Restart=on-failure
+Environment="PATH=/home/guillevalin/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+Environment="CONTINUOUS_NUM_WALLETS=50"
+Environment="CONTINUOUS=1"
+Environment="E2E_ROLLUP_EXTERNAL_VERIFIER_URL=http://127.0.0.1:8080"
+Environment="E2E_ROLLUP_EXTERNAL_NODE_URL=http://127.0.0.1:12346"
+
+[Install]
+WantedBy=multi-user.target
+

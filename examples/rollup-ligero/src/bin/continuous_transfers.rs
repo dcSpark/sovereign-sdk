@@ -55,8 +55,11 @@ struct ContinuousConfig {
 
 impl ContinuousConfig {
     fn from_env() -> Result<Self> {
-        // Number of wallets will be provided interactively at startup.
-        let num_wallets = 0usize;
+        // Number of wallets defaults to interactive prompt unless provided via env.
+        let num_wallets = std::env::var("CONTINUOUS_NUM_WALLETS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0usize);
 
         let initial_deposit = std::env::var("INITIAL_DEPOSIT")
             .ok()
