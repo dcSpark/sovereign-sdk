@@ -1785,6 +1785,13 @@ where
         }
 
         let sequence_number = inner.current_sequence_number();
+        let has_parallel_capacity = inner
+            .seq_config
+            .sequencer_kind_config
+            .num_parallel_tx_workers
+            .unwrap_or(0)
+            > 1;
+
         let Inner {
             executor,
             batch_size_tracker,
@@ -1850,8 +1857,9 @@ where
             "[detect] Midnight privacy detection timing"
         );
 
-        if is_midnight_privacy_tx {
+        if is_midnight_privacy_tx && has_parallel_capacity {
             // Send to parallel executor - worker will send result directly to message loop
+            tracing::warn!(%tx_hash, "[PARALLEL] Sending transaction to parallel executor");
             if parallel_tx_executor.send_tx(
                 baked_tx.clone(),
                 tx_hash,

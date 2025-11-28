@@ -264,7 +264,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         let apply_start = std::time::Instant::now();
         let result = self.apply_tx_to_in_progress_batch_inner(baked_tx).await;
         let apply_time = apply_start.elapsed();
-        eprintln!(
+        tracing::debug!(
             "[TIMING] apply_tx_to_in_progress_batch: apply_tx_to_in_progress_batch_inner={:.3}ms",
             apply_time.as_secs_f64() * 1000.0
         );

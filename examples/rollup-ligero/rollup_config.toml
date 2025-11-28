@@ -11,7 +11,7 @@ connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
 finalization = 40
 [da.block_producing.periodic]
-block_time_ms = 2_000
+block_time_ms = 1_000
 # Disable reorg for now, for better stability
 #[da.randomization]
 #seed = "0x0000000000000000000000000000000000000000000000000000000000000012"
@@ -76,7 +76,7 @@ disable_state_root_consistency_checks = true
 # "None" - Shutdown the sequencer instead of attempting recovery (default)
 # "TryToSave" - Attempt to recover by flushing batches and catching up with the chain
 recovery_strategy = "TryToSave"
-batch_execution_time_limit_millis = 1500
+batch_execution_time_limit_millis = 1_000
 # Return HTTP confirmations as soon as the in-memory executor accepts a tx,
 # without waiting for DB side effects in the side-effects task. This reduces
 # await_ms for high-throughput benchmarks at the cost of making DB updates
