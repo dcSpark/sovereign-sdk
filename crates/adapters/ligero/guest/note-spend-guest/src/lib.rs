@@ -227,7 +227,10 @@ fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Has
 
 const MAX_ARGS: usize = 512;
 const MAX_BUF: usize = 128 * 1024;
-const MAX_DEPTH: usize = 64;
+/// Maximum Merkle tree depth supported by the circuit.
+/// Must be ≤ 63 to ensure the bound check `pos >= (1u64 << depth)` is safe
+/// (shifting by 64 would overflow a u64).
+const MAX_DEPTH: usize = 63;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
 const NOTE_PLAIN_LEN: usize = 112; // 32 + 16 + 32 + 32

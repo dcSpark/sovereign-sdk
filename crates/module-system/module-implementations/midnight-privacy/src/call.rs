@@ -156,10 +156,6 @@ pub enum MidnightPrivacyError<S: Spec> {
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     InvalidAnchorRoot(Hash32),
 
-    /// The tree is full.
-    #[error("Commitment tree is full (max size: {0})")]
-    TreeFull(usize),
-
     /// Amount conversion overflow.
     #[error("Amount {0} does not fit in the bank amount type")]
     AmountOverflow(u128),
@@ -177,6 +173,10 @@ pub enum MidnightPrivacyError<S: Spec> {
 impl<S: Spec> ValueMidnightPrivacy<S> {
     /// Internal helper: Add a single commitment to the tree.
     /// Used by deposit() and transfer() to append note commitments.
+    ///
+    /// If the tree is full, it automatically grows using the Verdict-style doubling technique:
+    /// the current tree becomes the left subtree of a deeper tree, with the right subtree
+    /// initialized to all-zero defaults. This allows unlimited growth up to MAX_TREE_DEPTH (63).
     fn add_commitment(
         &mut self,
         commitment: Hash32,
@@ -186,9 +186,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let mut tree = self.commitment_tree.get_or_err(state)??;
         let position = self.next_position.get_or_err(state)??;
 
-        // Check if tree is full
+        // Ensure the tree has capacity for this position; double as needed.
+        // This replaces the old TreeFull error with automatic growth.
         if position >= tree.len() as u64 {
-            return Err(MidnightPrivacyError::<S>::TreeFull(tree.len()).into());
+            // `position` is the index we are about to write, so we need at least `position + 1` leaves.
+            tree.grow_to_fit((position + 1) as usize);
         }
 
         // Add to tree
@@ -228,6 +230,39 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         );
 
         Ok((position, new_root))
+    }
+
+    /// Internal helper: Append a nullifier into the nullifier tree.
+    /// Used by transfer() and withdraw() to record spent nullifiers in Merkle tree form.
+    ///
+    /// If the tree is full, it automatically grows using the Verdict-style doubling technique.
+    /// This maintains an Aztec-style nullifier tree in parallel with `nullifier_set`,
+    /// ready for future IMT-based non-membership proofs in the circuit.
+    ///
+    /// Note: Double-spend protection is still done via `nullifier_set` (O(1) lookup).
+    /// The nullifier tree is for canonical root tracking and future circuit integration.
+    fn append_nullifier(
+        &mut self,
+        nullifier: Hash32,
+        state: &mut impl TxState<S>,
+    ) -> Result<u64> {
+        // Get current nullifier tree and position
+        let mut tree = self.nullifier_tree.get_or_err(state)??;
+        let pos = self.next_nullifier_position.get_or_err(state)??;
+
+        // Ensure the tree has capacity for this position; grow as needed.
+        if pos >= tree.len() as u64 {
+            tree.grow_to_fit((pos + 1) as usize);
+        }
+
+        // Append nullifier to tree
+        tree.set_leaf(pos as usize, nullifier);
+
+        // Persist updated tree and position
+        self.nullifier_tree.set(&tree, state)?;
+        self.next_nullifier_position.set(&(pos + 1), state)?;
+
+        Ok(pos)
     }
 
     /// Deposit: transfer tokens into the pool, append commitment, update root window.
@@ -411,6 +446,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Stats: bump spent nullifier count
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+
+            // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
+            let _nf_pos = self.append_nullifier(public.nullifier, st)?;
+
             // 3) Add all output commitments to the tree (track pos + final root)
             let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
             let mut final_root: Option<Hash32> = None;
@@ -627,6 +666,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Stats: bump spent nullifier count
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+
+            // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
+            let _nf_pos = self.append_nullifier(public.nullifier, st)?;
+
             // 3) Add change outputs (track pos + final root)
             let mut change_outputs: Vec<CommitmentPos> =
                 Vec::with_capacity(public.output_commitments.len());

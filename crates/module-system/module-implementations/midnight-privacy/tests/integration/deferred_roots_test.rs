@@ -114,6 +114,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         nullifier: nf1,
         withdraw_amount: 0,
         output_commitments: vec![out1, out2],
+        view_attestations: None,
     };
     cache_pre_verified_spend(pub1.clone());
 
@@ -123,6 +124,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             proof: Default::default(),
             anchor_root: pub1.anchor_root,
             nullifier: pub1.nullifier,
+            view_ciphertexts: None,
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
         &ctx,
@@ -160,6 +162,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         nullifier: nf2,
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 789, 0x23, 0x33)],
+        view_attestations: None,
     };
     cache_pre_verified_spend(pub2.clone());
 
@@ -169,6 +172,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
                 proof: Default::default(),
                 anchor_root: pub2.anchor_root,
                 nullifier: pub2.nullifier,
+                view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,
@@ -258,6 +262,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             proof: Default::default(),
             anchor_root: pub2.anchor_root,
             nullifier: pub2.nullifier,
+            view_ciphertexts: None,
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
         &ctx,
@@ -281,6 +286,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         nullifier: nf3,
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 111, 0x24, 0x34)],
+        view_attestations: None,
     };
     cache_pre_verified_spend(pub3.clone());
     let err_foreign_anchor = mp
@@ -289,6 +295,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
                 proof: Default::default(),
                 anchor_root: pub3.anchor_root,
                 nullifier: pub3.nullifier,
+                view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,

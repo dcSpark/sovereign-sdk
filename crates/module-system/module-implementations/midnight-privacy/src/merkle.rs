@@ -1,11 +1,20 @@
-//! Incremental/cached fixed-depth Merkle tree with O(log N) updates.
+//! Incremental/cached growable Merkle tree with O(log N) updates.
 //! Stores all internal nodes and updates only ancestors on leaf changes.
 //! This provides O(1) root access and O(log N) authentication paths without rehashing.
+//!
+//! The tree supports dynamic capacity growth using the Verdict-style doubling technique:
+//! when full, it embeds the current tree as the left subtree of a deeper tree,
+//! with the right subtree initialized to all-zero defaults.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{mt_combine, Hash32};
+
+/// Maximum tree depth supported by the guest circuit.
+/// The guest uses `1u64 << depth` for position bounds, so depth must be ≤ 63
+/// to avoid undefined behavior from shifting by 64 bits.
+pub const MAX_TREE_DEPTH: u8 = 63;
 
 /// An incremental Merkle tree that caches all internal nodes.
 /// - levels[0] = leaves
@@ -16,6 +25,7 @@ use crate::hash::{mt_combine, Hash32};
 ///   - set_leaf(): O(depth) - only updates ancestors
 ///   - root(): O(1) - direct access
 ///   - open(): O(depth) - no hashing, just sibling lookups
+///   - grow_to_fit(): O(N) memory reallocation when doubling capacity
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MerkleTree {
     depth: u8,
@@ -27,7 +37,17 @@ pub struct MerkleTree {
 impl MerkleTree {
     /// Create a tree of `2^depth` leaves initialized to zero.
     /// Precomputes default "all-zero subtree" hashes once, then fills levels with these defaults.
+    ///
+    /// # Panics
+    /// Panics if `depth > MAX_TREE_DEPTH` (63).
     pub fn new(depth: u8) -> Self {
+        assert!(
+            depth <= MAX_TREE_DEPTH,
+            "MerkleTree::new: depth {} exceeds MAX_TREE_DEPTH {}",
+            depth,
+            MAX_TREE_DEPTH
+        );
+
         let n = 1usize << depth;
 
         // Precompute default node for each level (O(depth) hashes)
@@ -66,6 +86,90 @@ impl MerkleTree {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Ensure the tree can hold at least `min_leaves` leaves.
+    /// If not, repeatedly double the capacity by embedding the old tree
+    /// as the left subtree of a deeper tree and filling the right subtree
+    /// with default (all-zero) nodes.
+    ///
+    /// Uses the Verdict-style doubling technique: given the root `r` of a `2^i`-sized tree,
+    /// the root of a `2^{i+1}`-sized tree is `hash(r, r₀)`, where `r₀` is the root of
+    /// the all-zero default tree of size `2^i`.
+    ///
+    /// # Panics
+    /// Panics if the required depth would exceed `MAX_TREE_DEPTH` (63).
+    pub fn grow_to_fit(&mut self, min_leaves: usize) {
+        if min_leaves <= self.len() {
+            return;
+        }
+        while self.len() < min_leaves {
+            self.grow_one();
+        }
+    }
+
+    /// Double the capacity of the tree once.
+    ///
+    /// New tree semantics:
+    /// - depth' = depth + 1
+    /// - leaves[0..old_len) = old leaves
+    /// - leaves[old_len..2*old_len) = zero leaves
+    /// - left subtree = old tree
+    /// - right subtree = default tree of depth `old_depth`
+    ///
+    /// New root = mt_combine(old_depth, old_root, default_root(old_depth)).
+    ///
+    /// # Panics
+    /// Panics if the new depth would exceed `MAX_TREE_DEPTH`.
+    fn grow_one(&mut self) {
+        let old_depth = self.depth;
+        let new_depth = old_depth
+            .checked_add(1)
+            .expect("MerkleTree depth overflow");
+
+        assert!(
+            new_depth <= MAX_TREE_DEPTH,
+            "MerkleTree cannot grow beyond depth {} (requested {})",
+            MAX_TREE_DEPTH,
+            new_depth
+        );
+
+        let old_levels = std::mem::take(&mut self.levels);
+        let old_leaf_len = 1usize << (old_depth as usize);
+        let new_leaf_len = 1usize << (new_depth as usize);
+
+        // Precompute default nodes for the *new* depth exactly like `new()`.
+        let mut default = Vec::with_capacity(new_depth as usize + 1);
+        default.push([0u8; 32]); // level 0: zero leaf
+        for lvl in 0..(new_depth as usize) {
+            let next = mt_combine(lvl as u8, &default[lvl], &default[lvl]);
+            default.push(next);
+        }
+
+        let mut levels: Vec<Vec<Hash32>> = Vec::with_capacity(new_depth as usize + 1);
+
+        // Leaves: old tree in left half, right half default
+        let mut leaves = vec![default[0]; new_leaf_len];
+        leaves[..old_leaf_len].copy_from_slice(&old_levels[0]);
+        levels.push(leaves);
+
+        // Internal levels 1..=old_depth: copy left subtree, right subtree stays default
+        for lvl in 1..=old_depth as usize {
+            let len_new = new_leaf_len >> lvl; // 2^(new_depth - lvl)
+            let len_old = old_levels[lvl].len();
+            let mut nodes = vec![default[lvl]; len_new];
+            nodes[..len_old].copy_from_slice(&old_levels[lvl]);
+            levels.push(nodes);
+        }
+
+        // New root level: combine old root with default right-subtree root
+        let left_root = old_levels[old_depth as usize][0];
+        let right_root = default[old_depth as usize]; // default root for depth `old_depth`
+        let root = mt_combine(old_depth, &left_root, &right_root);
+        levels.push(vec![root]);
+
+        self.depth = new_depth;
+        self.levels = levels;
     }
 
     /// Set the leaf at `index` to `val` and update all ancestors in O(log N).
