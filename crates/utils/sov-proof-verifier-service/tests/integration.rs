@@ -1,9 +1,11 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use sea_orm::{ConnectOptions, Database, EntityTrait};
 use sov_address::EthereumAddress;
-use sov_modules_api::transaction::{PriorityFeeBips, Transaction, TxDetails, UnsignedTransaction, VersionedTx};
-use sov_modules_api::{Amount, SafeVec};
 use sov_modules_api::capabilities::UniquenessData;
+use sov_modules_api::transaction::{
+    PriorityFeeBips, Transaction, TxDetails, UnsignedTransaction, VersionedTx,
+};
+use sov_modules_api::{Amount, SafeVec};
 use sov_proof_verifier_service::*;
 use std::str::FromStr;
 
@@ -11,8 +13,8 @@ use demo_stf::runtime::Runtime as DemoRuntime;
 use midnight_privacy::{CallMessage as MidnightCallMessage, SpendPublic};
 use sov_address::MultiAddressEvm;
 use sov_midnight_da::storable::{setup_db as setup_midnight_da_db, worker_verified_transactions};
-use sov_rollup_interface::{crypto::PrivateKey, zk::CryptoSpec};
 use sov_modules_api::Spec;
+use sov_rollup_interface::{crypto::PrivateKey, zk::CryptoSpec};
 
 // Import the rollup spec and runtime types from the service
 type RollupSpec = sov_proof_verifier_service::RollupSpec;
@@ -146,14 +148,32 @@ async fn test_store_verified_midnight_transaction_upsert() {
         output_commitments: vec![],
     };
 
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
-        .await
-        .unwrap();
+    store_verified_midnight_transaction(
+        &conn,
+        &tx_hash,
+        Some(&proof_public),
+        true,
+        Some(true),
+        &tx_json,
+        full_blob,
+        None,
+    )
+    .await
+    .unwrap();
 
     proof_public.withdraw_amount = 99;
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
-        .await
-        .unwrap();
+    store_verified_midnight_transaction(
+        &conn,
+        &tx_hash,
+        Some(&proof_public),
+        true,
+        Some(true),
+        &tx_json,
+        full_blob,
+        None,
+    )
+    .await
+    .unwrap();
 
     let stored = worker_verified_transactions::Entity::find()
         .all(&conn)
@@ -164,7 +184,7 @@ async fn test_store_verified_midnight_transaction_upsert() {
     assert_eq!(record.tx_hash, tx_hash);
     assert!(record.signature_valid);
     assert_eq!(record.proof_verified, Some(true));
-    
+
     // Verify proof outputs are stored as JSON
     let proof_outputs: SpendPublic = serde_json::from_str(&record.proof_outputs).unwrap();
     assert_eq!(proof_outputs.withdraw_amount, proof_public.withdraw_amount);
@@ -181,19 +201,20 @@ async fn test_store_deposit_transaction_without_proof() {
     setup_midnight_da_db(&conn).await.unwrap();
 
     let tx_hash = "0xdeposit123";
-    let transaction_data = r#"{"deposit":{"amount":"100","rho":"0x01...","recipient":"0x02...","gas":null}}"#;
+    let transaction_data =
+        r#"{"deposit":{"amount":"100","rho":"0x01...","recipient":"0x02...","gas":null}}"#;
     let full_blob = "base64encodeddeposittransaction";
 
     // Store deposit with no proof
     store_verified_midnight_transaction(
         &conn,
         tx_hash,
-        None,       // No proof outputs for deposits
-        true,       // signature_valid
-        None,       // proof_verified: NULL (transaction doesn't have a proof)
+        None, // No proof outputs for deposits
+        true, // signature_valid
+        None, // proof_verified: NULL (transaction doesn't have a proof)
         transaction_data,
         full_blob,
-        None,       // No pre-auth data in test
+        None, // No pre-auth data in test
     )
     .await
     .unwrap();
@@ -203,12 +224,18 @@ async fn test_store_deposit_transaction_without_proof() {
         .await
         .unwrap();
     assert_eq!(stored.len(), 1);
-    
+
     let record = &stored[0];
     assert_eq!(record.tx_hash, tx_hash);
     assert!(record.signature_valid, "Signature should be valid");
-    assert_eq!(record.proof_verified, None, "proof_verified should be NULL for deposits");
-    assert_eq!(record.proof_outputs, "{}", "proof_outputs should be empty JSON for deposits");
+    assert_eq!(
+        record.proof_verified, None,
+        "proof_verified should be NULL for deposits"
+    );
+    assert_eq!(
+        record.proof_outputs, "{}",
+        "proof_outputs should be empty JSON for deposits"
+    );
     assert_eq!(record.transaction_data, transaction_data);
 }
 
@@ -241,7 +268,7 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
 }
 
 /// End-to-end test that mimics the generate_and_send_midnight_tx.sh script
-/// 
+///
 /// This test validates the core workflow:
 /// 1. Transaction creation and serialization (like midnight-tx-generator)
 /// 2. Signature verification
@@ -251,7 +278,7 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
 #[tokio::test]
 async fn test_end_to_end_midnight_withdrawal_flow() {
     println!("\n=== Midnight Withdrawal E2E Test ===\n");
-    
+
     // Step 1: Setup database (mimics shared MockDA database)
     let mut db_opts = ConnectOptions::new("sqlite::memory:".to_string());
     db_opts.max_connections(10).sqlx_logging(false);
@@ -261,20 +288,20 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
 
     // Step 2: Generate a midnight withdrawal transaction (like midnight-tx-generator does)
     println!("\n✓ Step 2: Creating transaction (like midnight-tx-generator)");
-    
+
     let anchor_root = [0u8; 32]; // All zeros like the script default
     let nullifier = [0u8; 32];
     let withdraw_amount = 500u128; // Matches script default
     let recipient = MultiAddressEvm::Vm(
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
     );
-    
+
     // Use a small dummy proof (real proof would be ~3.2MB from Ligero)
     let dummy_proof: SafeVec<u8, 5_000_000> =
         SafeVec::try_from(vec![0u8; 32]).expect("within SafeVec capacity");
 
     let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
-    
+
     let call = MidnightCallMessage::<RollupSpec>::Withdraw {
         proof: dummy_proof,
         anchor_root,
@@ -292,11 +319,8 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     };
 
     let runtime_call = RuntimeCall::MidnightPrivacy(call);
-    let unsigned_tx = UnsignedTransaction::new_with_details(
-        runtime_call,
-        UniquenessData::Generation(0),
-        details,
-    );
+    let unsigned_tx =
+        UnsignedTransaction::new_with_details(runtime_call, UniquenessData::Generation(0), details);
 
     let tx = Transaction::<DemoRuntime<RollupSpec>, RollupSpec>::new_signed_tx(
         &signing_key,
@@ -320,19 +344,21 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
 
     // Step 4: SIGNATURE VERIFICATION (key test!)
     println!("\n✓ Step 4: Testing signature verification");
-    verify_midnight_transaction_signature(&tx)
-        .expect("Signature should be valid");
+    verify_midnight_transaction_signature(&tx).expect("Signature should be valid");
     println!("  ✓ Signature verified successfully!");
 
     // Step 5: Parse the transaction (extract proof, anchor_root, nullifier, etc.)
     println!("\n✓ Step 5: Testing transaction parsing");
     let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient) =
         parse_midnight_withdraw_call(&tx).expect("Should parse transaction");
-    
+
     assert_eq!(proof_bytes.len(), 32, "Proof should be our dummy 32 bytes");
     assert_eq!(parsed_anchor_root, anchor_root, "Anchor root should match");
     assert_eq!(parsed_nullifier, nullifier, "Nullifier should match");
-    assert_eq!(parsed_amount, withdraw_amount, "Withdraw amount should match");
+    assert_eq!(
+        parsed_amount, withdraw_amount,
+        "Withdraw amount should match"
+    );
     assert_eq!(parsed_recipient, recipient, "Recipient should match");
     println!("  ✓ All fields parsed correctly!");
 
@@ -347,21 +373,21 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         output_commitments: vec![],
     };
     println!("  ✓ Proof verification simulated (would verify with Ligero in production)");
-    
+
     // Step 7: DATABASE STORAGE (key test!)
     println!("\n✓ Step 7: Testing database storage");
-    let transaction_data = create_transaction_without_proof(&tx)
-        .expect("Should create transaction data");
-    
+    let transaction_data =
+        create_transaction_without_proof(&tx).expect("Should create transaction data");
+
     store_verified_midnight_transaction(
         &conn,
         &tx_hash,
         Some(&simulated_proof_output),
-        true,          // signature_valid
-        Some(true),    // proof_verified (has proof and verified)
+        true,       // signature_valid
+        Some(true), // proof_verified (has proof and verified)
         &transaction_data,
         &tx_base64, // full transaction blob
-        None,          // No pre-auth data in test
+        None,       // No pre-auth data in test
     )
     .await
     .expect("Should store to database");
@@ -373,40 +399,59 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         .all(&conn)
         .await
         .unwrap();
-    
+
     assert_eq!(stored.len(), 1, "Should have exactly 1 record");
     let record = &stored[0];
-    
+
     // Verify all fields
     assert_eq!(record.tx_hash, tx_hash, "Transaction hash should match");
     assert!(record.signature_valid, "Signature should be marked valid");
-    assert_eq!(record.proof_verified, Some(true), "Proof should be marked verified");
-    
+    assert_eq!(
+        record.proof_verified,
+        Some(true),
+        "Proof should be marked verified"
+    );
+
     // Verify proof outputs stored as JSON
-    let stored_proof_output: SpendPublic = serde_json::from_str(&record.proof_outputs)
-        .expect("Should deserialize proof outputs");
-    assert_eq!(stored_proof_output.anchor_root, anchor_root, "Stored anchor root should match");
-    assert_eq!(stored_proof_output.nullifier, nullifier, "Stored nullifier should match");
-    assert_eq!(stored_proof_output.withdraw_amount, withdraw_amount, "Stored amount should match");
-    
+    let stored_proof_output: SpendPublic =
+        serde_json::from_str(&record.proof_outputs).expect("Should deserialize proof outputs");
+    assert_eq!(
+        stored_proof_output.anchor_root, anchor_root,
+        "Stored anchor root should match"
+    );
+    assert_eq!(
+        stored_proof_output.nullifier, nullifier,
+        "Stored nullifier should match"
+    );
+    assert_eq!(
+        stored_proof_output.withdraw_amount, withdraw_amount,
+        "Stored amount should match"
+    );
+
     // Verify transaction data (without proof)
-    assert!(record.transaction_data.contains("withdraw"), "Should contain withdraw call");
-    assert!(record.transaction_data.contains("REMOVED"), "Proof should be removed from data");
-    
+    assert!(
+        record.transaction_data.contains("withdraw"),
+        "Should contain withdraw call"
+    );
+    assert!(
+        record.transaction_data.contains("REMOVED"),
+        "Proof should be removed from data"
+    );
+
     // Verify transaction state
     assert_eq!(
         record.transaction_state,
         worker_verified_transactions::TransactionState::Pending,
         "State should be Pending"
     );
-    
+
     println!("  ✓ All database fields verified correctly!");
-    
+
     // Step 9: Test idempotency - storing the same transaction again should update, not duplicate
     println!("\n✓ Step 9: Testing database upsert (idempotency)");
     let mut updated_proof_output = simulated_proof_output.clone();
     updated_proof_output.withdraw_amount = 999; // Change amount
-    
+
     store_verified_midnight_transaction(
         &conn,
         &tx_hash,
@@ -415,20 +460,28 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         Some(true),
         &transaction_data,
         &tx_base64,
-        None,  // No pre-auth data in test
+        None, // No pre-auth data in test
     )
     .await
     .expect("Should update existing record");
-    
+
     let stored_after_update = worker_verified_transactions::Entity::find()
         .all(&conn)
         .await
         .unwrap();
-    
-    assert_eq!(stored_after_update.len(), 1, "Should still have exactly 1 record (not duplicated)");
+
+    assert_eq!(
+        stored_after_update.len(),
+        1,
+        "Should still have exactly 1 record (not duplicated)"
+    );
     let updated_record = &stored_after_update[0];
-    let updated_stored_proof: SpendPublic = serde_json::from_str(&updated_record.proof_outputs).unwrap();
-    assert_eq!(updated_stored_proof.withdraw_amount, 999, "Amount should be updated");
+    let updated_stored_proof: SpendPublic =
+        serde_json::from_str(&updated_record.proof_outputs).unwrap();
+    assert_eq!(
+        updated_stored_proof.withdraw_amount, 999,
+        "Amount should be updated"
+    );
     println!("  ✓ Upsert works correctly - no duplicates!");
 
     println!("\n=== ✓ ALL TESTS PASSED ===");

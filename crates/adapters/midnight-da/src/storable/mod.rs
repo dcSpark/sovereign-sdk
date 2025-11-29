@@ -172,8 +172,11 @@ mod tests {
             for sender in [TestDaSender::One, TestDaSender::Two, TestDaSender::Three] {
                 da_services.insert(
                     sender,
-                    StorableMidnightDaService::new_manual_producing(sender.address(), da_layer.clone())
-                        .await,
+                    StorableMidnightDaService::new_manual_producing(
+                        sender.address(),
+                        da_layer.clone(),
+                    )
+                    .await,
                 );
             }
 

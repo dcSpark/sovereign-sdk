@@ -285,12 +285,12 @@ impl<S: Spec> StateCheckpoint<S> {
     // This TODO is not a security risk, it is used only in sequencer as intended.
     // TODO: Remove this method if we stop using `StateCheckpoint` in the sequencer
     #[cfg(feature = "native")]
-    pub fn apply_tx_changes(&mut self, changeset: TxChangeSet) {
-        for ((key, namespace), value) in changeset.writes {
+    pub fn apply_tx_changes(&mut self, changeset: &TxChangeSet) {
+        for ((key, namespace), value) in &changeset.writes {
             if let Some(value) = value {
-                self.set_value(namespace, &key, value);
+                self.set_value(*namespace, key, value.clone());
             } else {
-                self.delete_value(namespace, &key);
+                self.delete_value(*namespace, key);
             }
         }
     }

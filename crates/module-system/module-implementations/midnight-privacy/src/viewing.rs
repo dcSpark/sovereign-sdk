@@ -231,7 +231,9 @@ pub fn decrypt_and_verify_note_level_b(fvk: &FullViewingKey, enc: &EncryptedNote
     // 4. Verify MAC
     let mac_expected = view_mac(&k, &enc.cm, &ct_h);
     if mac_expected != enc.mac {
-        return Err(anyhow!("mac mismatch: ciphertext may be corrupted or tampered"));
+        return Err(anyhow!(
+            "mac mismatch: ciphertext may be corrupted or tampered"
+        ));
     }
 
     // 5. Decrypt

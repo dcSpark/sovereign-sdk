@@ -3,9 +3,9 @@
 //! This module provides functionality for retrieving the wallet's configuration,
 //! including RPC URL, wallet address, chain ID, and chain name.
 
-use anyhow::Result;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
+use anyhow::Result;
 
 /// Wallet configuration information
 #[derive(Debug, Clone, serde::Serialize)]

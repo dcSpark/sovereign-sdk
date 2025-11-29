@@ -18,10 +18,10 @@ use sov_modules_api::{
     VersionReader, VisibleSlotNumber,
 };
 use sov_state::{NativeStorage, Storage};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use std::collections::HashMap;
 
 use super::batch_size_tracker::BatchSizeTracker;
 use crate::metrics::{
@@ -45,9 +45,9 @@ use crate::preferred::{
 use crate::{SequencerConfig, SequencerNotReadyDetails, SlotNumber, TxHash};
 
 use borsh::BorshDeserialize;
-use sov_modules_api::transaction::Transaction;
-use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
 use sov_modules_api::capabilities::TransactionAuthenticator;
+use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
+use sov_modules_api::transaction::Transaction;
 
 /// These two constants are used to calculate the comfortable batch size limit.
 /// Currently, this is 99% of the hard limit. After the comfortable limit is reached,
@@ -1345,7 +1345,10 @@ where
                 reason,
             } => {
                 let start = std::time::Instant::now();
-                debug!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
+                debug!(
+                    "[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}",
+                    tx_hash, start
+                );
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1436,7 +1439,7 @@ where
             Message::SimpleStateUpdate { info } => {
                 self.process_new_storage(info).await;
             }
-            // stage 3 - post process results of parallelized workers that 
+            // stage 3 - post process results of parallelized workers that
             Message::ParallelTxCompleted {
                 parallel_response,
                 sequence_number,
@@ -1452,8 +1455,13 @@ where
                     start
                 );
                 // trace this function
-                self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
-                    .await;
+                self.process_parallel_tx_completed(
+                    parallel_response,
+                    sequence_number,
+                    tx_len,
+                    reason,
+                )
+                .await;
                 let elapsed = start.elapsed();
                 let end = std::time::Instant::now();
                 debug!(
@@ -1649,10 +1657,9 @@ where
                 // Only flush the tx cache when not actively producing a batch or holding
                 // pending parallel completions, to avoid reordering panics in the
                 // transaction_subscriptions cache during mid-batch sync transitions.
-                let should_flush_tx_cache =
-                    (is_startup || is_resync || is_recover)
-                        && !inner.executor.has_in_progress_batch()
-                        && inner.pending_parallel_count == 0;
+                let should_flush_tx_cache = (is_startup || is_resync || is_recover)
+                    && !inner.executor.has_in_progress_batch()
+                    && inner.pending_parallel_count == 0;
 
                 // We only need to replay the transactions in the edge cases where the event/tx cache needs repopulating.
                 // In all other cases, we can just accept the new storage and move on.
@@ -1818,7 +1825,10 @@ where
                 let runtime_call = Rt::wrap_call(decoded);
                 let debug_str = format!("{:?}", runtime_call);
                 let variant_name = debug_str.split('(').next().unwrap_or("");
-                debug!(variant = variant_name, "[detect] Runtime call variant identified during process_accept_tx");
+                debug!(
+                    variant = variant_name,
+                    "[detect] Runtime call variant identified during process_accept_tx"
+                );
                 variant_name == "MidnightPrivacy"
             } else {
                 // Fallback: try generic AuthenticatorInput and parse the RawTx directly
@@ -2004,12 +2014,7 @@ where
         let commit_start = std::time::Instant::now();
         let (accepted_with_budget_main, tx_changes_main) = match inner
             .executor
-            .accept_precomputed_tx_from_parallel(
-                tx,
-                tx_changes,
-                api_effect,
-                execution_time_micros,
-            )
+            .accept_precomputed_tx_from_parallel(tx, tx_changes, api_effect, execution_time_micros)
             .await
         {
             Ok(res) => res,

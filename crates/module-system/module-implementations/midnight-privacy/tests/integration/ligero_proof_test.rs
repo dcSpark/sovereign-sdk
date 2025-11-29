@@ -271,7 +271,7 @@ fn test_simple_note_spend() -> Result<()> {
     // Prepare public output with one shielded output (all value as change).
     let withdraw_amount: u128 = 0;
     let n_out: u32 = 1;
-    let out_value = value;                 // put entire input into a new note
+    let out_value = value; // put entire input into a new note
     let out_rho: Hash32 = [9u8; 32];
     let out_rcp: Hash32 = [5u8; 32];
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
@@ -290,7 +290,9 @@ fn test_simple_note_spend() -> Result<()> {
     // Private indices (1-based). Keep input note data and path private,
     // and mark output plaintext fields private (value_out, rho_out, recipient_out).
     let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
+    for i in 0..tree_depth as usize {
+        private_indices.push(8 + i);
+    }
     // Outputs start at index base = 12 + depth
     let base = 12 + (tree_depth as usize);
     private_indices.push(base + 0); // value_out_0
@@ -323,12 +325,12 @@ fn test_simple_note_spend() -> Result<()> {
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
     host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
-    host.add_str_arg(n_out.to_string());           // 11+depth: PUBLIC
-    // Output #0 (private fields first, public cm last)
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
+    host.add_str_arg(n_out.to_string()); // 11+depth: PUBLIC
+                                         // Output #0 (private fields first, public cm last)
+    host.add_str_arg(out_value.to_string()); // 12+depth + 0
+    host.add_hex_arg(hex::encode(out_rho)); // 12+depth + 1
+    host.add_hex_arg(hex::encode(out_rcp)); // 12+depth + 2
+    host.add_hex_arg(hex::encode(cm_out)); // 12+depth + 3
 
     // Set public output (now includes output_commitments)
     host.set_public_output(&public_output)?;
@@ -381,7 +383,10 @@ fn test_simple_note_spend() -> Result<()> {
         hex::encode(&verified_output.nullifier[..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
-    println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
+    println!(
+        "  - Outputs:   {} commitment(s)",
+        verified_output.output_commitments.len()
+    );
 
     println!("\n=== Performance Summary ===");
     println!(
@@ -479,7 +484,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     let withdraw_amount: u128 = 0;
     let n_out: u32 = 1;
-    let out_value = value;                 // all value to shielded change
+    let out_value = value; // all value to shielded change
     let out_rho: Hash32 = [7u8; 32];
     let out_rcp: Hash32 = [8u8; 32];
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
@@ -500,7 +505,10 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
         hex::encode(public_output.nullifier)
     );
     println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
-    println!("  - Output commitments: {}", public_output.output_commitments.len());
+    println!(
+        "  - Output commitments: {}",
+        public_output.output_commitments.len()
+    );
 
     // ---- 6) Generate REAL ZK proof with Ligero ----
     println!("\nStep 6: Generating REAL ZK proof with Ligero...");
@@ -514,7 +522,9 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // Private indices (1-based). Keep input note data and path private,
     // and mark output plaintext fields private (value_out, rho_out, recipient_out).
     let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
+    for i in 0..tree_depth as usize {
+        private_indices.push(8 + i);
+    }
     let base = 12 + (tree_depth as usize);
     private_indices.push(base + 0);
     private_indices.push(base + 1);
@@ -544,11 +554,11 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
     host.add_str_arg(withdraw_amount.to_string()); // 10+depth
-    host.add_str_arg(n_out.to_string());           // 11+depth
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
+    host.add_str_arg(n_out.to_string()); // 11+depth
+    host.add_str_arg(out_value.to_string()); // 12+depth + 0
+    host.add_hex_arg(hex::encode(out_rho)); // 12+depth + 1
+    host.add_hex_arg(hex::encode(out_rcp)); // 12+depth + 2
+    host.add_hex_arg(hex::encode(cm_out)); // 12+depth + 3
 
     // Set the public output
     host.set_public_output(&public_output)?;
@@ -596,7 +606,10 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
         hex::encode(&verified_output.nullifier[..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
-    println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
+    println!(
+        "  - Outputs:   {} commitment(s)",
+        verified_output.output_commitments.len()
+    );
 
     // ---- 8) Check nullifier consumption ----
     println!("\nStep 8: Validating spend conditions...");
@@ -633,7 +646,6 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 fn hex32(h: &Hash32) -> String {
     hex::encode(h)
 }
-
 
 /// Helper to discover guest program path and platform-specific binaries
 fn program_path() -> Result<PathBuf> {
@@ -715,25 +727,25 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     // Use platform-specific paths or environment overrides
     let (default_prover, default_verifier, default_shader_path) = get_platform_bin_paths()?;
-    
+
     let prover = if let Ok(path) = std::env::var("LIGERO_PROVER_BIN") {
         PathBuf::from(path)
     } else {
         default_prover
     };
-    
+
     let verifier = if let Ok(path) = std::env::var("LIGERO_VERIFIER_BIN") {
         PathBuf::from(path)
     } else {
         default_verifier
     };
-    
+
     let shader_path = if let Ok(path) = std::env::var("LIGERO_SHADER_PATH") {
         path
     } else {
         default_shader_path.to_string_lossy().to_string()
     };
-    
+
     let packing: u32 = std::env::var("LIGERO_PACKING")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1072,7 +1084,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("Input: {}, Withdraw: 0, Outputs: {} + {}", value, 600, 400);
 
     let withdraw_amount = 0u128;
-    
+
     // Create two output notes that sum to input value
     let out1_value = 600u128;
     let out1_rho = [10u8; 32];
@@ -1086,7 +1098,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     let program_path = config.program_path.to_string_lossy().to_string();
     let depth = siblings.len();
-    
+
     // Build private indices
     let mut private_indices = vec![
         2, // value
@@ -1150,11 +1162,14 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     // Generate and verify the valid proof
     let proof_data = host.run(true)?;
     println!("✅ Proof generated successfully for VALID balanced spend");
-    
+
     let code_commitment = host.code_commitment();
     let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)?;
     println!("✅ Proof verified successfully");
-    println!("   Balance satisfied: {} == {} + {} + {}", value, withdraw_amount, out1_value, out2_value);
+    println!(
+        "   Balance satisfied: {} == {} + {} + {}",
+        value, withdraw_amount, out1_value, out2_value
+    );
     assert_eq!(verified.anchor_root, anchor);
     assert_eq!(verified.nullifier, nf);
     assert_eq!(verified.output_commitments.len(), 2);
@@ -1163,9 +1178,15 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("  Circuit constraint at line 286 in note_spend_guest.wasm:");
     println!("  assert_one((value == withdraw_amount + sum(outputs)) as i32)");
     println!();
-    println!("  Valid spend: {} == {} + {} + {} ✓", value, withdraw_amount, out1_value, out2_value);
-    println!("  Invalid spend (no outputs): {} != {} + 0 would violate constraint", value, withdraw_amount);
-    
+    println!(
+        "  Valid spend: {} == {} + {} + {} ✓",
+        value, withdraw_amount, out1_value, out2_value
+    );
+    println!(
+        "  Invalid spend (no outputs): {} != {} + 0 would violate constraint",
+        value, withdraw_amount
+    );
+
     Ok(())
 }
 
@@ -1235,7 +1256,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
     host.add_str_arg(withdraw_amount.to_string()); // decimal u128
-    host.add_str_arg("0".to_string());             // n_out = 0 (no outputs in withdrawal scenario)
+    host.add_str_arg("0".to_string()); // n_out = 0 (no outputs in withdrawal scenario)
 
     let public = SpendPublic {
         anchor_root: anchor,
@@ -1265,7 +1286,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 }
 
 /// Test full transaction lifecycle: Deposit → Spend (2 outputs) → Withdraw
-/// 
+///
 /// This test demonstrates a complete privacy-preserving value flow:
 /// 1. **Deposit**: Create initial note with 1000 units
 /// 2. **Spend with 2 outputs**: Split into 600 + 400 (demonstrates value splitting)
@@ -1278,7 +1299,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     // Setup
     setup_ligero_env()?;
     let program_path = setup_ligero_env()?;
-    
+
     const TREE_DEPTH: u8 = 16;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain: Hash32 = [1u8; 32];
@@ -1288,19 +1309,19 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     // PHASE 1: DEPOSIT - Create initial note
     // ========================================================================
     println!("━━━ PHASE 1: DEPOSIT ━━━");
-    
+
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
     let deposit_recipient: Hash32 = [11u8; 32];
     let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
-    
+
     let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
     let deposit_pos = next_position;
     next_position += 1;
-    
+
     tree.set_leaf(deposit_pos as usize, deposit_cm);
     let anchor_after_deposit = tree.root();
-    
+
     println!("✓ Deposited note:");
     println!("  Value:       {}", initial_value);
     println!("  Commitment:  {}", hex::encode(&deposit_cm[..8]));
@@ -1310,48 +1331,68 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     // ========================================================================
     // PHASE 2: SPEND WITH 2 OUTPUTS - Split value into two notes
     // ========================================================================
-    println!("\n━━━ PHASE 2: SPEND (2 outputs) - Split {} into 600 + 400 ━━━", initial_value);
-    
+    println!(
+        "\n━━━ PHASE 2: SPEND (2 outputs) - Split {} into 600 + 400 ━━━",
+        initial_value
+    );
+
     // Prepare to spend the deposit note
     let deposit_siblings = tree.open(deposit_pos as usize);
     let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
-    
+
     // Create 2 output notes
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
     let out1_recipient: Hash32 = [21u8; 32];
     let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
-    
+
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
     let out2_recipient: Hash32 = [31u8; 32];
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
-    
+
     let n_out_phase2: u32 = 2;
     let withdraw_amount_phase2: u128 = 0;
-    
-    println!("  Input:  {} units (nullifier: {})", initial_value, hex::encode(&deposit_nf[..8]));
-    println!("  Output 1: {} units (cm: {})", out1_value, hex::encode(&out1_cm[..8]));
-    println!("  Output 2: {} units (cm: {})", out2_value, hex::encode(&out2_cm[..8]));
+
+    println!(
+        "  Input:  {} units (nullifier: {})",
+        initial_value,
+        hex::encode(&deposit_nf[..8])
+    );
+    println!(
+        "  Output 1: {} units (cm: {})",
+        out1_value,
+        hex::encode(&out1_cm[..8])
+    );
+    println!(
+        "  Output 2: {} units (cm: {})",
+        out2_value,
+        hex::encode(&out2_cm[..8])
+    );
     println!("  Withdraw: {} units", withdraw_amount_phase2);
-    println!("  ✓ Balance: {} = {} + {} + {}", initial_value, out1_value, out2_value, withdraw_amount_phase2);
-    
+    println!(
+        "  ✓ Balance: {} = {} + {} + {}",
+        initial_value, out1_value, out2_value, withdraw_amount_phase2
+    );
+
     // Prepare private indices for 2 outputs
     let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase2.push(8 + i); }
+    for i in 0..TREE_DEPTH as usize {
+        private_indices_phase2.push(8 + i);
+    }
     let base2 = 12 + (TREE_DEPTH as usize);
     // Output 0 private fields
     private_indices_phase2.push(base2 + 0); // value_out_0
     private_indices_phase2.push(base2 + 1); // rho_out_0
     private_indices_phase2.push(base2 + 2); // recipient_out_0
-    // Output 1 private fields
+                                            // Output 1 private fields
     private_indices_phase2.push(base2 + 4); // value_out_1
     private_indices_phase2.push(base2 + 5); // rho_out_1
     private_indices_phase2.push(base2 + 6); // recipient_out_1
-    
+
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
-    
+
     // Add arguments for phase 2 spend
     host2.add_hex_arg(hex::encode(domain));
     host2.add_str_arg(initial_value.to_string());
@@ -1377,82 +1418,105 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     host2.add_hex_arg(hex::encode(out2_rho));
     host2.add_hex_arg(hex::encode(out2_recipient));
     host2.add_hex_arg(hex::encode(out2_cm));
-    
+
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
         nullifier: deposit_nf,
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
     };
-    
+
     host2.set_public_output(&public2)?;
-    
+
     println!("\n  Generating proof for 2-output spend...");
     let proof_start2 = Instant::now();
     let proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
     let proof_time2 = proof_start2.elapsed().as_secs_f64();
-    println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data2.len(), proof_time2);
-    
+    println!(
+        "  ✓ Proof generated ({} bytes, {:.3}s)",
+        proof_data2.len(),
+        proof_time2
+    );
+
     println!("  Verifying proof...");
     let code_commitment2 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
     let verify_start2 = Instant::now();
     let verified2: SpendPublic = LigeroVerifier::verify(&proof_data2, &code_commitment2)
         .context("Phase 2 proof verification failed")?;
     let verify_time2 = verify_start2.elapsed().as_secs_f64();
-    
+
     assert_eq!(verified2.nullifier, deposit_nf);
     assert_eq!(verified2.output_commitments.len(), 2);
     assert_eq!(verified2.output_commitments[0], out1_cm);
     assert_eq!(verified2.output_commitments[1], out2_cm);
     println!("  ✓ Proof verified ({:.3}s)", verify_time2);
-    
+
     // Add the 2 output notes to tree
     let out1_pos = next_position;
     next_position += 1;
     tree.set_leaf(out1_pos as usize, out1_cm);
-    
+
     let out2_pos = next_position;
     next_position += 1;
     tree.set_leaf(out2_pos as usize, out2_cm);
-    
+
     let anchor_after_split = tree.root();
-    println!("  ✓ Added outputs to tree at positions {} and {}", out1_pos, out2_pos);
+    println!(
+        "  ✓ Added outputs to tree at positions {} and {}",
+        out1_pos, out2_pos
+    );
     println!("  ✓ New anchor: {}", hex::encode(&anchor_after_split[..8]));
 
     // ========================================================================
     // PHASE 3: WITHDRAW - Spend first output note, withdraw some, get change
     // ========================================================================
-    println!("\n━━━ PHASE 3: WITHDRAW - Spend {} note, withdraw 200, get 400 change ━━━", out1_value);
-    
+    println!(
+        "\n━━━ PHASE 3: WITHDRAW - Spend {} note, withdraw 200, get 400 change ━━━",
+        out1_value
+    );
+
     // We'll spend the first output (600 units) and withdraw 200
     let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
     let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
-    
+
     let withdraw_amount_phase3: u128 = 200;
     let change_value: u128 = out1_value - withdraw_amount_phase3; // 400
     let change_rho: Hash32 = [50u8; 32];
     let change_recipient: Hash32 = [51u8; 32];
     let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
-    
+
     let n_out_phase3: u32 = 1;
-    
-    println!("  Input:  {} units (nullifier: {})", out1_value, hex::encode(&out1_nf[..8]));
-    println!("  Output: {} units (change, cm: {})", change_value, hex::encode(&change_cm[..8]));
+
+    println!(
+        "  Input:  {} units (nullifier: {})",
+        out1_value,
+        hex::encode(&out1_nf[..8])
+    );
+    println!(
+        "  Output: {} units (change, cm: {})",
+        change_value,
+        hex::encode(&change_cm[..8])
+    );
     println!("  Withdraw: {} units (transparent)", withdraw_amount_phase3);
-    println!("  ✓ Balance: {} = {} + {}", out1_value, change_value, withdraw_amount_phase3);
-    
+    println!(
+        "  ✓ Balance: {} = {} + {}",
+        out1_value, change_value, withdraw_amount_phase3
+    );
+
     // Prepare private indices for 1 output
     let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase3.push(8 + i); }
+    for i in 0..TREE_DEPTH as usize {
+        private_indices_phase3.push(8 + i);
+    }
     let base3 = 12 + (TREE_DEPTH as usize);
     private_indices_phase3.push(base3 + 0); // value_out_0
     private_indices_phase3.push(base3 + 1); // rho_out_0
     private_indices_phase3.push(base3 + 2); // recipient_out_0
-    
+
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
-    
+
     // Add arguments for phase 3 spend
     host3.add_hex_arg(hex::encode(domain));
     host3.add_str_arg(out1_value.to_string());
@@ -1473,35 +1537,39 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     host3.add_hex_arg(hex::encode(change_rho));
     host3.add_hex_arg(hex::encode(change_recipient));
     host3.add_hex_arg(hex::encode(change_cm));
-    
+
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
         nullifier: out1_nf,
         withdraw_amount: withdraw_amount_phase3,
         output_commitments: vec![change_cm],
     };
-    
+
     host3.set_public_output(&public3)?;
-    
+
     println!("\n  Generating proof for withdraw...");
     let proof_start3 = Instant::now();
     let proof_data3 = host3.run(true).context("Phase 3 proof generation failed")?;
     let proof_time3 = proof_start3.elapsed().as_secs_f64();
-    println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data3.len(), proof_time3);
-    
+    println!(
+        "  ✓ Proof generated ({} bytes, {:.3}s)",
+        proof_data3.len(),
+        proof_time3
+    );
+
     println!("  Verifying proof...");
     let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
     let verify_start3 = Instant::now();
     let verified3: SpendPublic = LigeroVerifier::verify(&proof_data3, &code_commitment3)
         .context("Phase 3 proof verification failed")?;
     let verify_time3 = verify_start3.elapsed().as_secs_f64();
-    
+
     assert_eq!(verified3.nullifier, out1_nf);
     assert_eq!(verified3.withdraw_amount, withdraw_amount_phase3);
     assert_eq!(verified3.output_commitments.len(), 1);
     assert_eq!(verified3.output_commitments[0], change_cm);
     println!("  ✓ Proof verified ({:.3}s)", verify_time3);
-    
+
     // Add change to tree
     let change_pos = next_position;
     tree.set_leaf(change_pos as usize, change_cm);
@@ -1517,10 +1585,14 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("\nTransaction Flow:");
     println!("  1. Deposit:       1000 units → Note@pos{}", deposit_pos);
-    println!("  2. Split spend:   Note@pos{} → Note@pos{}(600) + Note@pos{}(400)", 
-             deposit_pos, out1_pos, out2_pos);
-    println!("  3. Withdraw:      Note@pos{}(600) → Transparent(200) + Note@pos{}(400)", 
-             out1_pos, change_pos);
+    println!(
+        "  2. Split spend:   Note@pos{} → Note@pos{}(600) + Note@pos{}(400)",
+        deposit_pos, out1_pos, out2_pos
+    );
+    println!(
+        "  3. Withdraw:      Note@pos{}(600) → Transparent(200) + Note@pos{}(400)",
+        out1_pos, change_pos
+    );
     println!("\nNullifiers consumed:");
     println!("  • {}", hex::encode(&deposit_nf[..16]));
     println!("  • {}", hex::encode(&out1_nf[..16]));
@@ -1529,21 +1601,30 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("  • After split: 2 notes (600 + 400 units)");
     println!("  • After withdraw: 2 notes (400 + 400 units, 200 withdrawn)");
     println!("\nPerformance:");
-    println!("  • Phase 2 proof: {:.3}s generation, {:.3}s verification", proof_time2, verify_time2);
-    println!("  • Phase 3 proof: {:.3}s generation, {:.3}s verification", proof_time3, verify_time3);
-    println!("  • Total:         {:.3}s", proof_time2 + verify_time2 + proof_time3 + verify_time3);
-    
+    println!(
+        "  • Phase 2 proof: {:.3}s generation, {:.3}s verification",
+        proof_time2, verify_time2
+    );
+    println!(
+        "  • Phase 3 proof: {:.3}s generation, {:.3}s verification",
+        proof_time3, verify_time3
+    );
+    println!(
+        "  • Total:         {:.3}s",
+        proof_time2 + verify_time2 + proof_time3 + verify_time3
+    );
+
     println!("\n🎉 Successfully demonstrated full privacy-preserving value flow!");
     println!("   ✓ Deposit → Shielded pool");
     println!("   ✓ Split into multiple notes (privacy set expansion)");
     println!("   ✓ Partial withdrawal with change");
     println!("   ✓ All proofs verified with correct balance enforcement");
-    
+
     Ok(())
 }
 
 /// Test that circuit rejects over-withdrawal attempts (trying to withdraw more than note value)
-/// 
+///
 /// This test demonstrates circuit-level balance enforcement preventing theft/inflation:
 /// 1. **Deposit**: Create note with 1000 units
 /// 2. **Split**: Create 600 + 400 notes
@@ -1556,7 +1637,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     // Setup
     setup_ligero_env()?;
     let program_path = setup_ligero_env()?;
-    
+
     const TREE_DEPTH: u8 = 16;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain: Hash32 = [1u8; 32];
@@ -1566,46 +1647,56 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     // PHASE 1: DEPOSIT - Create initial note
     // ========================================================================
     println!("━━━ PHASE 1: DEPOSIT ━━━");
-    
+
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
     let deposit_recipient: Hash32 = [11u8; 32];
     let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
-    
+
     let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
     let deposit_pos = next_position;
     next_position += 1;
-    
+
     tree.set_leaf(deposit_pos as usize, deposit_cm);
     let anchor_after_deposit = tree.root();
-    
-    println!("✓ Deposited note with {} units at position {}", initial_value, deposit_pos);
+
+    println!(
+        "✓ Deposited note with {} units at position {}",
+        initial_value, deposit_pos
+    );
 
     // ========================================================================
     // PHASE 2: SPLIT - Create 600 + 400 notes
     // ========================================================================
     println!("\n━━━ PHASE 2: SPLIT - Create 600 + 400 notes ━━━");
-    
+
     let deposit_siblings = tree.open(deposit_pos as usize);
     let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
-    
+
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
     let out1_recipient: Hash32 = [21u8; 32];
     let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
-    
+
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
     let out2_recipient: Hash32 = [31u8; 32];
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
-    
+
     let n_out_phase2: u32 = 2;
     let withdraw_amount_phase2: u128 = 0;
-    
-    println!("  Creating 2 outputs: {} + {} = {}", out1_value, out2_value, out1_value + out2_value);
-    
+
+    println!(
+        "  Creating 2 outputs: {} + {} = {}",
+        out1_value,
+        out2_value,
+        out1_value + out2_value
+    );
+
     let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase2.push(8 + i); }
+    for i in 0..TREE_DEPTH as usize {
+        private_indices_phase2.push(8 + i);
+    }
     let base2 = 12 + (TREE_DEPTH as usize);
     private_indices_phase2.push(base2 + 0);
     private_indices_phase2.push(base2 + 1);
@@ -1613,10 +1704,10 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     private_indices_phase2.push(base2 + 4);
     private_indices_phase2.push(base2 + 5);
     private_indices_phase2.push(base2 + 6);
-    
+
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
-    
+
     host2.add_hex_arg(hex::encode(domain));
     host2.add_str_arg(initial_value.to_string());
     host2.add_hex_arg(hex::encode(deposit_rho));
@@ -1639,55 +1730,63 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     host2.add_hex_arg(hex::encode(out2_rho));
     host2.add_hex_arg(hex::encode(out2_recipient));
     host2.add_hex_arg(hex::encode(out2_cm));
-    
+
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
         nullifier: deposit_nf,
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
     };
-    
+
     host2.set_public_output(&public2)?;
-    
+
     println!("  Generating split proof...");
     let _proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
     println!("  ✓ Split proof generated and will verify");
-    
+
     let out1_pos = next_position;
     next_position += 1;
     tree.set_leaf(out1_pos as usize, out1_cm);
-    
+
     let out2_pos = next_position;
     let _ = next_position + 1; // Final position would be here
     tree.set_leaf(out2_pos as usize, out2_cm);
-    
+
     let anchor_after_split = tree.root();
-    println!("  ✓ Notes added to tree at positions {} and {}", out1_pos, out2_pos);
+    println!(
+        "  ✓ Notes added to tree at positions {} and {}",
+        out1_pos, out2_pos
+    );
 
     // ========================================================================
     // PHASE 3: ATTEMPTED OVER-WITHDRAWAL - Try to steal value!
     // ========================================================================
     println!("\n━━━ PHASE 3: ATTEMPTED THEFT ━━━");
     println!("⚠️  Attacker tries to spend 600-unit note but withdraw 1000 units!");
-    
+
     let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
     let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
-    
+
     let malicious_withdraw: u128 = 1000; // ATTACK: Try to withdraw more than note value!
     let n_out_phase3: u32 = 0; // No change output
-    
+
     println!("  Note value:      {} units", out1_value);
     println!("  Withdraw attempt: {} units", malicious_withdraw);
     println!("  Outputs:         {} (no change)", n_out_phase3);
-    println!("  ❌ Balance: {} ≠ {} + 0 (INVALID!)", out1_value, malicious_withdraw);
-    
+    println!(
+        "  ❌ Balance: {} ≠ {} + 0 (INVALID!)",
+        out1_value, malicious_withdraw
+    );
+
     let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase3.push(8 + i); }
-    
+    for i in 0..TREE_DEPTH as usize {
+        private_indices_phase3.push(8 + i);
+    }
+
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
-    
+
     host3.add_hex_arg(hex::encode(domain));
     host3.add_str_arg(out1_value.to_string()); // Real note value: 600
     host3.add_hex_arg(hex::encode(out1_rho));
@@ -1702,19 +1801,19 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     host3.add_hex_arg(hex::encode(out1_nf));
     host3.add_str_arg(malicious_withdraw.to_string()); // Try to withdraw 1000!
     host3.add_str_arg(n_out_phase3.to_string());
-    
+
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
         nullifier: out1_nf,
         withdraw_amount: malicious_withdraw,
         output_commitments: vec![],
     };
-    
+
     host3.set_public_output(&public3)?;
-    
+
     println!("\n  Attempting to generate proof...");
     let proof_result = host3.run(true);
-    
+
     // The circuit MUST reject this because: input_value (600) != withdraw_amount (1000) + 0
     // Check if proof generation failed (ideal case)
     if proof_result.is_err() {
@@ -1723,14 +1822,17 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     } else {
         // If proof generation succeeded despite assertion failure (possible with some ZKVM backends),
         // verification should fail or the proof should be invalid
-        println!("  ⚠️  Proof generation completed (assertion may not halt execution in this ZKVM)");
+        println!(
+            "  ⚠️  Proof generation completed (assertion may not halt execution in this ZKVM)"
+        );
         println!("  ℹ️  Checking if verification detects the invalid balance...");
-        
+
         let proof_data = proof_result.unwrap();
         let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
-        
+
         // Attempt to verify the proof (if it was generated)
-        let verify_result: Result<SpendPublic, _> = LigeroVerifier::verify(&proof_data, &code_commitment3);
+        let verify_result: Result<SpendPublic, _> =
+            LigeroVerifier::verify(&proof_data, &code_commitment3);
         match verify_result {
             Err(_) => {
                 println!("  ✅ Verification FAILED as expected (invalid balance detected)");
@@ -1765,11 +1867,14 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("  • Cannot withdraw more than note value without outputs to balance");
     println!("  • Arithmetic constraint: input_value == withdraw_amount + sum(outputs)");
     println!("  • Balance enforced in zero-knowledge circuit (no trusted third party)");
-    
+
     println!("\n✅ Balance enforcement implemented in circuit!");
-    println!("   ✓ Attempted to withdraw {} units from {} unit note", malicious_withdraw, out1_value);
+    println!(
+        "   ✓ Attempted to withdraw {} units from {} unit note",
+        malicious_withdraw, out1_value
+    );
     println!("   ✓ Circuit has assertion: 600 == 1000 (fails)");
     println!("   ✓ Honest value accounting enforced at cryptographic level");
-    
+
     Ok(())
 }

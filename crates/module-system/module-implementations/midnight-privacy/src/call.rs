@@ -3,15 +3,15 @@ use std::fmt::Debug;
 use anyhow::Result;
 use schemars::JsonSchema;
 use sov_modules_api::macros::{serialize, UniversalWallet};
-use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
 use sov_modules_api::VersionReader;
+use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
+use std::collections::HashSet;
 use thiserror::Error;
 use tracing::{debug, info};
-use std::collections::HashSet;
 
 use super::ValueMidnightPrivacy;
 use crate::event::{CommitmentPos, Event};
-use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
+use crate::hash::{note_commitment, Hash32, PendingRootKey, RootKey};
 use crate::types::{EncryptedNote, FullViewingKey};
 
 #[cfg(feature = "native")]
@@ -286,7 +286,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Update deposit statistics
         let total_deposited = self.total_deposited.get(st)?.unwrap_or(0);
         self.total_deposited.set(&(total_deposited + amount), st)?;
-        
+
         let deposit_count = self.deposit_count.get(st)?.unwrap_or(0);
         self.deposit_count.set(&(deposit_count + 1), st)?;
 
@@ -321,8 +321,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
+            Vec<EncryptedNote>,
+        >,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -412,11 +413,15 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
             // 3) Add all output commitments to the tree (track pos + final root)
-            let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
+            let mut outputs: Vec<CommitmentPos> =
+                Vec::with_capacity(public.output_commitments.len());
             let mut final_root: Option<Hash32> = None;
             for cm in &public.output_commitments {
                 let (pos, root) = self.add_commitment(*cm, st)?;
-                outputs.push(CommitmentPos { commitment: *cm, position: pos });
+                outputs.push(CommitmentPos {
+                    commitment: *cm,
+                    position: pos,
+                });
                 final_root = Some(root);
             }
             let new_root = if let Some(r) = final_root {
@@ -438,10 +443,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Level B: Viewer attestation verification
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
-                
+
                 const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
-                let outputs_set: HashSet<Hash32> =
-                    outputs.iter().map(|o| o.commitment).collect();
+                let outputs_set: HashSet<Hash32> = outputs.iter().map(|o| o.commitment).collect();
 
                 // Require Level B attestations when ciphertexts are present
                 let attestations = public.view_attestations.as_ref().ok_or_else(|| {
@@ -537,8 +541,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
+            Vec<EncryptedNote>,
+        >,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -579,8 +584,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                     .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-                LigeroVerifier::verify(&proof, &method_id)
-                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
+                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
+                })?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -633,7 +639,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let mut final_root: Option<Hash32> = None;
             for cm in &public.output_commitments {
                 let (pos, root) = self.add_commitment(*cm, st)?;
-                change_outputs.push(CommitmentPos { commitment: *cm, position: pos });
+                change_outputs.push(CommitmentPos {
+                    commitment: *cm,
+                    position: pos,
+                });
                 final_root = Some(root);
             }
             let new_root = if let Some(r) = final_root {
@@ -671,15 +680,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
             // Update withdrawal statistics
             let total_withdrawn = self.total_withdrawn.get(st)?.unwrap_or(0);
-            self.total_withdrawn.set(&(total_withdrawn + public.withdraw_amount), st)?;
-            
+            self.total_withdrawn
+                .set(&(total_withdrawn + public.withdraw_amount), st)?;
+
             let withdraw_count = self.withdraw_count.get(st)?.unwrap_or(0);
             self.withdraw_count.set(&(withdraw_count + 1), st)?;
 
             // Level B: Viewer attestation verification for change outputs
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
-                
+
                 const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
                 let outputs_set: HashSet<Hash32> =
                     change_outputs.iter().map(|o| o.commitment).collect();
@@ -824,14 +834,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Reset count for this height (effectively "clears" the pending roots for this block)
         // Note: We don't delete the indexed entries to save gas. They're never read again since
         // count is reset, and new blocks use different heights. Cleanup could be added if needed.
-        self.pending_roots_count
-            .set(&current_height, &0u32, st)?;
+        self.pending_roots_count.set(&current_height, &0u32, st)?;
 
         Ok(())
     }
 
     /// Helper: Add a root to the recent roots window (for StateCheckpoint).
-    fn add_recent_root_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+    fn add_recent_root_direct(
+        &mut self,
+        root: Hash32,
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<()> {
         let mut recent_roots = self.recent_roots.get_or_err(state)??;
         let root_window_size = self.root_window_size.get_or_err(state)??;
 
@@ -846,7 +859,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
     /// Helper: Record a root in the full-history index (for StateCheckpoint).
     /// Note: This version doesn't emit events since StateCheckpoint doesn't implement EventContainer.
-    fn record_root_forever_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+    fn record_root_forever_direct(
+        &mut self,
+        root: Hash32,
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<()> {
         // Fast path: already recorded?
         if self.all_roots.get(&RootKey(root), state)?.is_some() {
             return Ok(());

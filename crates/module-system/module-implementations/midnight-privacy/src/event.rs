@@ -1,5 +1,5 @@
-use sov_modules_api::macros::serialize;
 use borsh::{BorshDeserialize, BorshSerialize};
+use sov_modules_api::macros::serialize;
 
 use crate::hash::Hash32;
 use crate::types::EncryptedNote;

@@ -9,11 +9,11 @@ use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
-use sov_modules_api::Amount;
 use sov_modules_api::capabilities::UniquenessData;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
+use sov_modules_api::Amount;
 
 use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::provider::Provider;
@@ -59,20 +59,26 @@ pub struct UpdateValueZkResult {
 /// Bincode-serialized proof package ready for transaction
 fn build_proof_package(proof_bytes: Vec<u8>, value: u32) -> Result<Vec<u8>> {
     let public_output = ValueProofPublic { value };
-    let public_output_bytes = bincode::serialize(&public_output)
-        .context("Failed to bincode-serialize public output")?;
+    let public_output_bytes =
+        bincode::serialize(&public_output).context("Failed to bincode-serialize public output")?;
 
-    tracing::debug!("Serialized public output: {} bytes", public_output_bytes.len());
+    tracing::debug!(
+        "Serialized public output: {} bytes",
+        public_output_bytes.len()
+    );
 
     let proof_package = LigeroProofPackage {
         proof: proof_bytes,
         public_output: public_output_bytes,
     };
 
-    let proof_package_bytes = bincode::serialize(&proof_package)
-        .context("Failed to bincode-serialize proof package")?;
+    let proof_package_bytes =
+        bincode::serialize(&proof_package).context("Failed to bincode-serialize proof package")?;
 
-    tracing::info!("Created proof package: {} bytes total", proof_package_bytes.len());
+    tracing::info!(
+        "Created proof package: {} bytes total",
+        proof_package_bytes.len()
+    );
 
     Ok(proof_package_bytes)
 }
@@ -181,13 +187,9 @@ pub async fn update_value_zk(
 
     let proof_package_bytes = build_proof_package(proof_bytes, value_u32)?;
 
-    let unsigned_tx = create_value_setter_zk_unsigned_tx(
-        provider,
-        wallet,
-        proof_package_bytes,
-        value_u32,
-    )
-    .await?;
+    let unsigned_tx =
+        create_value_setter_zk_unsigned_tx(provider, wallet, proof_package_bytes, value_u32)
+            .await?;
 
     let raw_tx = wallet
         .sign_transaction::<McpRuntime>(unsigned_tx)
@@ -228,8 +230,9 @@ mod tests {
         let value = 60000i64;
 
         tracing::info!("Creating wallet from private key");
-        let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
-            .expect("Failed to create wallet");
+        let wallet =
+            WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
+                .expect("Failed to create wallet");
 
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
@@ -243,11 +246,18 @@ mod tests {
 
         let result = update_value_zk(&ligero, &provider, &wallet, value).await;
 
-        assert!(result.is_ok(), "update_value_zk should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "update_value_zk should succeed: {:?}",
+            result.err()
+        );
 
         let update_result = result.unwrap();
 
-        assert!(!update_result.tx_hash.is_empty(), "tx_hash should not be empty");
+        assert!(
+            !update_result.tx_hash.is_empty(),
+            "tx_hash should not be empty"
+        );
 
         tracing::info!("✅ Transaction submitted successfully!");
         tracing::info!("   Transaction hash: {}", update_result.tx_hash);

@@ -13,6 +13,11 @@ mod batch;
 #[cfg(feature = "native")]
 pub mod cli;
 
+/// Global in-process execution cache for transaction results.
+/// Used for verifying sequencer-computed results against node replay.
+#[cfg(feature = "native")]
+pub mod tx_cache;
+
 /// Defines common types, concepts and utilities used throughout the codebase.
 pub mod common;
 
@@ -126,6 +131,11 @@ pub use sov_rollup_interface::{execution_mode, BasicAddress, TxHash};
 pub use sov_state::{CompileTimeNamespace, Storage};
 pub use state::*;
 pub use transaction::AuthenticatedTransactionData;
+#[cfg(feature = "native")]
+pub use tx_cache::{
+    count_writes, verify_against_cache, BatchVerificationStats, CacheVerificationResult,
+    PrecomputedResult, GLOBAL_TX_CACHE,
+};
 pub use tx_receipt::*;
 pub use {schemars, sov_universal_wallet};
 

@@ -5,12 +5,12 @@ use std::ops::Range;
 use rand::prelude::{SliceRandom, SmallRng};
 use rand::{Rng, SeedableRng};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, ConnectOptions,
+    ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder,
 };
-use std::str::FromStr;
 use sha2::Digest;
 use sov_rollup_interface::common::{HexHash, HexString};
+use std::str::FromStr;
 use tokio::sync::{broadcast, watch};
 
 use crate::config::{GENESIS_BLOCK, GENESIS_HEADER};
@@ -19,8 +19,8 @@ use crate::storable::entity::blobs::Entity as Blobs;
 use crate::storable::entity::block_headers::Entity as BlockHeaders;
 use crate::storable::entity::{blobs, block_headers, finalized_height, query_last_saved_block};
 use crate::{
-    MidnightAddress, MidnightBlob, MidnightBlock, MidnightBlockHeader, MidnightDaConfig, MidnightHash,
-    RandomizationBehaviour, RandomizationConfig,
+    MidnightAddress, MidnightBlob, MidnightBlock, MidnightBlockHeader, MidnightDaConfig,
+    MidnightHash, RandomizationBehaviour, RandomizationConfig,
 };
 
 /// Struct that stores blobs and block headers. Controller of the sea orm entities.
@@ -51,7 +51,7 @@ impl StorableMidnightDaLayer {
         let conn: DatabaseConnection = if connection_string.starts_with("sqlite:") {
             use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
             use sea_orm::sqlx::ConnectOptions as SqlxConnectOptions; // bring log_* methods into scope
-            
+
             // Parse connection string and enable detailed logging
             // Chain all methods together since they consume self
             let sqlite_opts = SqliteConnectOptions::from_str(connection_string)?
@@ -62,7 +62,7 @@ impl StorableMidnightDaLayer {
                     std::time::Duration::from_millis(5),
                 )
                 .busy_timeout(std::time::Duration::from_millis(30000));
-            
+
             // Create pool with after_connect hook to apply PRAGMAs to EVERY connection
             let pool = SqlitePoolOptions::new()
                 .max_connections(4) // Reduced from 10 - SQLite single-writer doesn't benefit from high connection counts
@@ -72,16 +72,16 @@ impl StorableMidnightDaLayer {
                 .max_lifetime(Some(std::time::Duration::from_secs(1800)))
                 .connect_with(sqlite_opts)
                 .await?;
-            
+
             tracing::info!(
                 "Initializing SQLite database connection pool: 4 max_connections, 5ms slow-query threshold"
             );
-            
+
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
             // PostgreSQL or other databases
             let mut opts = ConnectOptions::new(connection_string);
-            
+
             opts.max_connections(50)
                 .min_connections(1)
                 .connect_timeout(std::time::Duration::from_secs(30))
@@ -94,9 +94,9 @@ impl StorableMidnightDaLayer {
                     tracing::log::LevelFilter::Warn,
                     std::time::Duration::from_millis(5),
                 );
-            
+
             tracing::info!("Initializing PostgreSQL database connection pool: 50 max_connections, 5ms slow-query threshold");
-            
+
             Database::connect(opts).await?
         };
 
@@ -338,11 +338,16 @@ impl StorableMidnightDaLayer {
         self.head_header_sender.subscribe()
     }
 
-    pub(crate) async fn get_last_finalized_block_header(&self) -> anyhow::Result<MidnightBlockHeader> {
+    pub(crate) async fn get_last_finalized_block_header(
+        &self,
+    ) -> anyhow::Result<MidnightBlockHeader> {
         self.get_header_at(self.last_finalized_height).await
     }
 
-    pub(crate) async fn get_block_header_at(&self, height: u32) -> anyhow::Result<MidnightBlockHeader> {
+    pub(crate) async fn get_block_header_at(
+        &self,
+        height: u32,
+    ) -> anyhow::Result<MidnightBlockHeader> {
         if height >= self.next_height {
             anyhow::bail!("Block at height {} has not been produced yet", height);
         }
@@ -988,7 +993,8 @@ mod tests {
         // Iteration 2, load from disk and check.
         {
             // Open from disk again.
-            let da_layer = StorableMidnightDaLayer::new_from_connection(connection_string, 0).await?;
+            let da_layer =
+                StorableMidnightDaLayer::new_from_connection(connection_string, 0).await?;
             check_expected_blobs(&da_layer, &blocks).await?;
         }
 
@@ -1480,7 +1486,8 @@ mod tests {
         // Create blocks, so finalization happens.
         // Rewind to the last finalized height.
         {
-            let mut da_layer = StorableMidnightDaLayer::new_in_path(tempdir.path(), finality).await?;
+            let mut da_layer =
+                StorableMidnightDaLayer::new_in_path(tempdir.path(), finality).await?;
             for _ in 0..blocks {
                 da_layer.produce_block().await?;
             }
@@ -1498,7 +1505,8 @@ mod tests {
         }
         // Last finalized height == head
         {
-            let mut da_layer = StorableMidnightDaLayer::new_in_path(tempdir.path(), finality).await?;
+            let mut da_layer =
+                StorableMidnightDaLayer::new_in_path(tempdir.path(), finality).await?;
             assert_eq!(
                 da_layer.get_last_finalized_block_header().await?.height(),
                 expected_last_finalized_height

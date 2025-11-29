@@ -62,11 +62,11 @@ fn create_mock_tx(discriminant: u8, payload_size: usize) -> FullyBakedTx {
         15 => MockRuntimeCall::MidnightPrivacy(42),
         _ => MockRuntimeCall::Bank(42),
     };
-    
+
     let mut data = borsh::to_vec(&call).unwrap();
     // Pad with extra data to simulate real transaction size
     data.extend(vec![0u8; payload_size]);
-    
+
     FullyBakedTx::new(data)
 }
 
@@ -88,7 +88,7 @@ fn bench_discriminant_checks() {
 
     const WARMUP_ITERATIONS: usize = 10_000;
     const ITERATIONS: usize = 1_000_000;
-    
+
     // Test with different transaction sizes
     let test_cases = vec![
         ("Tiny (100 bytes)", 100),
@@ -100,27 +100,27 @@ fn bench_discriminant_checks() {
     for (name, size) in test_cases {
         println!("📦 Transaction Size: {}", name);
         println!("─────────────────────────────────────────────────────────");
-        
+
         // Create test transactions
         let midnight_tx = create_mock_tx(MIDNIGHT_PRIVACY_DISCRIMINANT, size);
         let other_tx = create_mock_tx(0, size);
-        
+
         // Verify correctness first
         assert!(option1_raw_byte_check(&midnight_tx));
         assert!(option2_deserialize_discriminant(&midnight_tx));
         assert!(option3_full_deserialize(&midnight_tx));
-        
+
         assert!(!option1_raw_byte_check(&other_tx));
         assert!(!option2_deserialize_discriminant(&other_tx));
         assert!(!option3_full_deserialize(&other_tx));
-        
+
         // Warmup
         for _ in 0..WARMUP_ITERATIONS {
             std::hint::black_box(option1_raw_byte_check(&midnight_tx));
             std::hint::black_box(option2_deserialize_discriminant(&midnight_tx));
             std::hint::black_box(option3_full_deserialize(&midnight_tx));
         }
-        
+
         // Benchmark Option 1
         let start = Instant::now();
         for _ in 0..ITERATIONS {
@@ -128,7 +128,7 @@ fn bench_discriminant_checks() {
         }
         let option1_time = start.elapsed();
         let option1_per_call = option1_time.as_nanos() / ITERATIONS as u128;
-        
+
         // Benchmark Option 2
         let start = Instant::now();
         for _ in 0..ITERATIONS {
@@ -136,7 +136,7 @@ fn bench_discriminant_checks() {
         }
         let option2_time = start.elapsed();
         let option2_per_call = option2_time.as_nanos() / ITERATIONS as u128;
-        
+
         // Benchmark Option 3
         let start = Instant::now();
         for _ in 0..ITERATIONS {
@@ -144,43 +144,67 @@ fn bench_discriminant_checks() {
         }
         let option3_time = start.elapsed();
         let option3_per_call = option3_time.as_nanos() / ITERATIONS as u128;
-        
+
         // Calculate throughput
         let option1_throughput = 1_000_000_000 / option1_per_call.max(1);
         let option2_throughput = 1_000_000_000 / option2_per_call.max(1);
         let option3_throughput = 1_000_000_000 / option3_per_call.max(1);
-        
+
         // Calculate overhead
         let overhead_2_vs_1 = if option1_per_call > 0 {
             ((option2_per_call as f64 / option1_per_call as f64) - 1.0) * 100.0
         } else {
             0.0
         };
-        
+
         let overhead_3_vs_1 = if option1_per_call > 0 {
             ((option3_per_call as f64 / option1_per_call as f64) - 1.0) * 100.0
         } else {
             0.0
         };
-        
+
         println!("  Option 1 (Raw byte check):");
-        println!("    ⏱  Time per check:  {}", format_duration(option1_per_call));
-        println!("    🚀 Throughput:      {} million checks/sec", option1_throughput / 1_000_000);
+        println!(
+            "    ⏱  Time per check:  {}",
+            format_duration(option1_per_call)
+        );
+        println!(
+            "    🚀 Throughput:      {} million checks/sec",
+            option1_throughput / 1_000_000
+        );
         println!();
-        
+
         println!("  Option 2 (Deserialize discriminant):");
-        println!("    ⏱  Time per check:  {}", format_duration(option2_per_call));
-        println!("    🚀 Throughput:      {} million checks/sec", option2_throughput / 1_000_000);
-        println!("    📊 Overhead:        {:.1}% slower than Option 1", overhead_2_vs_1);
+        println!(
+            "    ⏱  Time per check:  {}",
+            format_duration(option2_per_call)
+        );
+        println!(
+            "    🚀 Throughput:      {} million checks/sec",
+            option2_throughput / 1_000_000
+        );
+        println!(
+            "    📊 Overhead:        {:.1}% slower than Option 1",
+            overhead_2_vs_1
+        );
         println!();
-        
+
         println!("  Option 3 (Full deserialize):");
-        println!("    ⏱  Time per check:  {}", format_duration(option3_per_call));
-        println!("    🚀 Throughput:      {} million checks/sec", option3_throughput / 1_000_000);
-        println!("    📊 Overhead:        {:.1}% slower than Option 1", overhead_3_vs_1);
+        println!(
+            "    ⏱  Time per check:  {}",
+            format_duration(option3_per_call)
+        );
+        println!(
+            "    🚀 Throughput:      {} million checks/sec",
+            option3_throughput / 1_000_000
+        );
+        println!(
+            "    📊 Overhead:        {:.1}% slower than Option 1",
+            overhead_3_vs_1
+        );
         println!();
     }
-    
+
     println!("════════════════════════════════════════════════════════════");
     println!("📝 NOTE: Run with --release for realistic performance!");
     println!("   cargo test --test discriminant_bench --release -- --nocapture");
@@ -192,23 +216,27 @@ fn bench_cache_effects() {
     println!("\n════════════════════════════════════════════════════════════");
     println!("   CACHE LOCALITY TEST");
     println!("════════════════════════════════════════════════════════════\n");
-    
+
     const ITERATIONS: usize = 100_000;
-    
+
     // Test with varying numbers of transactions to show cache effects
     let batch_sizes = vec![1, 10, 100, 1000];
-    
+
     for batch_size in batch_sizes {
         println!("📦 Batch Size: {} transactions", batch_size);
-        
+
         // Create a batch of transactions
         let txs: Vec<_> = (0..batch_size)
             .map(|i| {
-                let discriminant = if i % 2 == 0 { MIDNIGHT_PRIVACY_DISCRIMINANT } else { 0 };
+                let discriminant = if i % 2 == 0 {
+                    MIDNIGHT_PRIVACY_DISCRIMINANT
+                } else {
+                    0
+                };
                 create_mock_tx(discriminant, 1024)
             })
             .collect();
-        
+
         // Option 2: Sequential checking
         let start = Instant::now();
         for _ in 0..ITERATIONS {
@@ -218,11 +246,11 @@ fn bench_cache_effects() {
         }
         let time = start.elapsed();
         let per_check = time.as_nanos() / (ITERATIONS as u128 * batch_size as u128);
-        
+
         println!("  ⏱  Time per check: {}", format_duration(per_check));
         println!();
     }
-    
+
     println!("════════════════════════════════════════════════════════════\n");
 }
 
@@ -231,18 +259,18 @@ fn bench_real_world_context() {
     println!("\n════════════════════════════════════════════════════════════");
     println!("   REAL-WORLD CONTEXT COMPARISON");
     println!("════════════════════════════════════════════════════════════\n");
-    
+
     const ITERATIONS: usize = 10_000;
-    
+
     let tx = create_mock_tx(MIDNIGHT_PRIVACY_DISCRIMINANT, 1024);
-    
+
     // Discriminant check (Option 2)
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         std::hint::black_box(option2_deserialize_discriminant(&tx));
     }
     let discriminant_time = start.elapsed().as_nanos() / ITERATIONS as u128;
-    
+
     // Simulate full deserialization cost
     let start = Instant::now();
     for _ in 0..ITERATIONS {
@@ -250,9 +278,9 @@ fn bench_real_world_context() {
         std::hint::black_box(MockRuntimeCall::deserialize(&mut data).ok());
     }
     let full_deserialize_time = start.elapsed().as_nanos() / ITERATIONS as u128;
-    
+
     // Simulate hash computation (as proxy for signature verification)
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         let mut hasher = Sha256::new();
@@ -260,16 +288,28 @@ fn bench_real_world_context() {
         std::hint::black_box(hasher.finalize());
     }
     let hash_time = start.elapsed().as_nanos() / ITERATIONS as u128;
-    
-    println!("  Discriminant check (Option 2):  {}", format_duration(discriminant_time));
-    println!("  Full deserialization:           {}", format_duration(full_deserialize_time));
-    println!("  SHA-256 hash:                   {}", format_duration(hash_time));
+
+    println!(
+        "  Discriminant check (Option 2):  {}",
+        format_duration(discriminant_time)
+    );
+    println!(
+        "  Full deserialization:           {}",
+        format_duration(full_deserialize_time)
+    );
+    println!(
+        "  SHA-256 hash:                   {}",
+        format_duration(hash_time)
+    );
     println!();
-    println!("  Discriminant check is {:.1}x faster than full deserialization", 
-             full_deserialize_time as f64 / discriminant_time as f64);
-    println!("  Discriminant check is {:.1}x faster than SHA-256", 
-             hash_time as f64 / discriminant_time as f64);
+    println!(
+        "  Discriminant check is {:.1}x faster than full deserialization",
+        full_deserialize_time as f64 / discriminant_time as f64
+    );
+    println!(
+        "  Discriminant check is {:.1}x faster than SHA-256",
+        hash_time as f64 / discriminant_time as f64
+    );
     println!();
     println!("════════════════════════════════════════════════════════════\n");
 }
-

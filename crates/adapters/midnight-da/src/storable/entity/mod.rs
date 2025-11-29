@@ -53,7 +53,8 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
         .col(worker_verified_transactions::Column::CreatedAt)
         .if_not_exists()
         .to_owned();
-    db.execute(builder.build(&verified_tx_state_created_idx)).await?;
+    db.execute(builder.build(&verified_tx_state_created_idx))
+        .await?;
     if let DbBackend::Sqlite = db.get_database_backend() {
         // Enable WAL mode for better concurrency
         db.execute(sea_orm::Statement::from_string(
@@ -61,7 +62,7 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
             "PRAGMA journal_mode = WAL".to_owned(),
         ))
         .await?;
-        
+
         // Set busy timeout to 30 seconds to handle high-concurrency scenarios
         // This prevents immediate "database is locked" errors
         db.execute(sea_orm::Statement::from_string(
@@ -69,7 +70,7 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
             "PRAGMA busy_timeout = 30000".to_owned(),
         ))
         .await?;
-        
+
         // Increase cache size to 64MB for better performance
         // Negative value means size in KB (64MB = 64 * 1024 KB = 65536 KB)
         db.execute(sea_orm::Statement::from_string(
@@ -77,7 +78,7 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
             "PRAGMA cache_size = -65536".to_owned(),
         ))
         .await?;
-        
+
         // Use NORMAL synchronous mode for better write performance
         // Still crash-safe with WAL mode, but faster than FULL
         db.execute(sea_orm::Statement::from_string(
@@ -85,7 +86,7 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
             "PRAGMA synchronous = NORMAL".to_owned(),
         ))
         .await?;
-        
+
         // Increase page size to 8KB for better I/O efficiency with large blobs
         // Note: This only affects new databases; existing ones keep their page size
         db.execute(sea_orm::Statement::from_string(
@@ -93,21 +94,21 @@ pub async fn setup_db(db: &DatabaseConnection) -> anyhow::Result<()> {
             "PRAGMA page_size = 8192".to_owned(),
         ))
         .await?;
-        
+
         // Use memory for temporary storage to speed up complex queries
         db.execute(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             "PRAGMA temp_store = MEMORY".to_owned(),
         ))
         .await?;
-        
+
         // Set mmap_size to 256MB for memory-mapped I/O performance
         db.execute(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             "PRAGMA mmap_size = 268435456".to_owned(),
         ))
         .await?;
-        
+
         tracing::info!("SQLite performance optimizations applied: WAL mode, 30s busy_timeout, 64MB cache, NORMAL sync, 8KB pages, MEMORY temp_store, 256MB mmap");
     }
     Ok(())

@@ -6,19 +6,20 @@
 
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
-    Hash32, SpendPublic, ValueMidnightPrivacy, MidnightPrivacyConfig, PendingRootKey,
+    Hash32, MidnightPrivacyConfig, PendingRootKey, SpendPublic, ValueMidnightPrivacy,
 };
-use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::capabilities::mocks::MockKernel;
-use sov_modules_api::{Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet};
-use sov_modules_api::VersionReader;
-use sov_modules_api::Context;
+use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::transaction::AuthenticatedTransactionData;
+use sov_modules_api::Context;
 use sov_modules_api::StateProvider;
+use sov_modules_api::VersionReader;
+use sov_modules_api::{Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet};
 use sov_test_utils::storage::ForklessStorageManager;
 use sov_test_utils::storage::SimpleStorageManager;
 use sov_test_utils::{
-    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec, TestStorageSpec,
+    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec,
+    TestStorageSpec,
 };
 
 fn make_cm(domain: &Hash32, val: u128, rho_byte: u8, recipient_byte: u8) -> Hash32 {
@@ -61,7 +62,8 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // Run module genesis against a checkpoint, then materialize to storage
     {
         let storage = sm.create_storage();
-        let mut cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let mut cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         // Create a genesis accessor from the checkpoint and initialize module state
         let mut gs = cp.to_genesis_state_accessor::<ValueMidnightPrivacy<TestSpec>>(&cfg);
         Genesis::genesis(&mut mp, &Default::default(), &cfg, &mut gs).unwrap();
@@ -85,7 +87,8 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // Construct a Context
     let sender = <TestSpec as Spec>::Address::from([0xA1; 28]);
     let sequencer = <TestSpec as Spec>::Address::from([0xA2; 28]);
-    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address = Default::default();
+    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address =
+        Default::default();
     let ctx = Context::<TestSpec>::new(
         sender,
         Default::default(), // Credentials
@@ -94,12 +97,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     );
 
     // Initial root is present in recent_roots
-    let initial_root = mp
-        .commitment_tree
-        .get(&mut ws)
-        .unwrap()
-        .unwrap()
-        .root();
+    let initial_root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
     let recent0 = mp.recent_roots.get(&mut ws).unwrap().unwrap();
     assert_eq!(recent0.len(), 1);
     assert_eq!(recent0.front().copied().unwrap(), initial_root);
@@ -247,8 +245,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
 
     // Block 2: same transfer anchored to same_block_root now succeeds.
     let storage2 = sm.create_storage();
-    let cp2 =
-        StateCheckpoint::<TestSpec>::new(storage2, &MockKernel::<TestSpec>::default());
+    let cp2 = StateCheckpoint::<TestSpec>::new(storage2, &MockKernel::<TestSpec>::default());
     let scratchpad2 = cp2.to_tx_scratchpad();
     let tx2 = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
     let gas_meter2 = new_test_gas_meter::<TestSpec>();
@@ -306,5 +303,3 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     clear_pre_verified_spend(&pub2.nullifier);
     clear_pre_verified_spend(&pub3.nullifier);
 }
-
-

@@ -92,12 +92,12 @@ impl Ligero {
         } else {
             format!("ligero_proof_{:?}", std::thread::current().id())
         };
-        
+
         // Use project-relative path instead of /tmp/
         let proof_outputs_base = std::env::current_dir()
             .context("Failed to get current directory")?
             .join("proof_outputs");
-        
+
         let unique_proof_dir = proof_outputs_base.join(dir_name);
         std::fs::create_dir_all(&unique_proof_dir)
             .context("Failed to create unique proof directory")?;
@@ -105,8 +105,18 @@ impl Ligero {
         let proof_path = unique_proof_dir.join(Self::LIGERO_PROOF_FILE_NAME);
         tracing::info!("generating ligero proof at {}", proof_path.display());
 
-        let ligero_program_path = self.ligero_program_path.clone().unwrap().canonicalize().unwrap();
-        let ligero_shader_path = self.ligero_shader_path.clone().unwrap().canonicalize().unwrap();
+        let ligero_program_path = self
+            .ligero_program_path
+            .clone()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let ligero_shader_path = self
+            .ligero_shader_path
+            .clone()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
 
         let ligero_argument = LigeroArgument {
             program: ligero_program_path.to_string_lossy().into_owned(),
@@ -126,7 +136,12 @@ impl Ligero {
         );
         tracing::info!("ligero argument: {}", ligero_argument_json);
 
-        let ligero_prover_binary_path = self.ligero_prover_binary_path.clone().unwrap().canonicalize().unwrap();
+        let ligero_prover_binary_path = self
+            .ligero_prover_binary_path
+            .clone()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
 
         let output = Command::new(&ligero_prover_binary_path)
             .current_dir(&unique_proof_dir)
@@ -168,12 +183,12 @@ impl Ligero {
 
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
         let proof = std::fs::read(&proof_path).context("failed to read proof_data.gz")?;
-        
+
         // Clean up the temporary directory after reading the proof
         if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
             tracing::warn!("Failed to clean up temporary proof directory: {}", e);
         }
-        
+
         Ok(proof)
     }
 }

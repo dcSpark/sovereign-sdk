@@ -46,7 +46,9 @@ pub mod involvement {
     }
 
     impl Related<super::Entity> for Entity {
-        fn to() -> RelationDef { Relation::Events.def() }
+        fn to() -> RelationDef {
+            Relation::Events.def()
+        }
     }
 
     impl ActiveModelBehavior for ActiveModel {}

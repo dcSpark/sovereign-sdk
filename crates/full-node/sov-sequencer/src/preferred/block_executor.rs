@@ -12,11 +12,11 @@ use sov_modules_api::capabilities::{
 use sov_modules_api::macros::config_value;
 use sov_modules_api::CryptoSpec;
 use sov_modules_api::{
-    call_message_repr, BlobDataWithId, ChangeSet, DaSpec, ExecutionContext, FullyBakedTx, Gas,
-    GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason, Runtime,
-    RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
+    call_message_repr, ApiTxEffect, BlobDataWithId, ChangeSet, DaSpec, ExecutionContext,
+    FullyBakedTx, Gas, GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason,
+    Runtime, RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
     StateUpdateInfo, TransactionReceipt, TxChangeSet, TxHash, TxReceiptContents, VersionReader,
-    VisibleSlotNumber, ApiTxEffect,
+    VisibleSlotNumber,
 };
 use sov_modules_stf_blueprint::{BatchReceipt, StfBlueprint};
 use sov_rest_utils::{json_obj, ErrorObject};
@@ -295,12 +295,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         &mut self,
         baked_tx: FullyBakedTxWithMaybeChangeSet,
     ) -> Result<
-        (
-            TransactionReceipt<S>,
-            TxChangeSet,
-            <S as Spec>::Gas,
-            u64,
-        ),
+        (TransactionReceipt<S>, TxChangeSet, <S as Spec>::Gas, u64),
         RollupBlockExecutorError<S>,
     > {
         let (receipt, remaining_slot_gas, execution_time_micros, tx_changes) =
@@ -376,7 +371,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         }
 
         let apply_changes_start = std::time::Instant::now();
-        self.checkpoint.apply_tx_changes(tx_changes.clone());
+        self.checkpoint.apply_tx_changes(&tx_changes);
         let apply_changes_time = apply_changes_start.elapsed();
         tracing::debug!(
             checkpoint_apply_ms = apply_changes_time.as_secs_f64() * 1000.0,

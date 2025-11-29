@@ -3,9 +3,9 @@
 //! This module provides functionality for retrieving a list of all transactions
 //! associated with the wallet.
 
-use anyhow::Result;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Transaction information

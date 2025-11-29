@@ -10,10 +10,10 @@ mod genesis;
 mod hash;
 mod merkle;
 mod preverified;
-mod types;
-pub mod viewing;
 #[cfg(feature = "native")]
 mod query;
+mod types;
+pub mod viewing;
 
 pub use call::CallMessage;
 pub use event::{CommitmentPos, Event};
@@ -30,16 +30,16 @@ pub use viewing::{decrypt_and_verify_note, encrypt_note_for_fvk};
 #[cfg(feature = "native")]
 pub use query::*;
 
+use sov_modules_api::capabilities::RollupHeight;
+use sov_modules_api::hooks::BlockHooks;
+use sov_modules_api::VersionReader;
 use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
     StateValue, TxState,
 };
-use sov_modules_api::hooks::BlockHooks;
-use sov_modules_api::VersionReader;
-use sov_modules_api::capabilities::RollupHeight;
 use std::collections::VecDeque;
 
-pub use crate::hash::{Hash32, RootKey, PendingRootKey};
+pub use crate::hash::{Hash32, PendingRootKey, RootKey};
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
@@ -162,7 +162,7 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Indexed pending roots: (rollup_height, idx) -> root.
     /// Each block appends roots with sequential indices, avoiding VecDeque rewrite overhead.
     /// For thousands of txs per block, this is O(1) per append vs O(n) for VecDeque serialization.
-    /// 
+    ///
     /// ASSUMPTION: rollup_height_to_access() is stable throughout block execution (start to end_hook).
     /// DANGER: Stale entries from abandoned blocks (crashes/reverts) accumulate but are harmless
     /// (never read, don't affect correctness, minimal state cost). Cleanup not implemented.
@@ -226,7 +226,15 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 nullifier,
                 view_ciphertexts,
                 gas,
-            } => Ok(self.transfer(proof, anchor_root, nullifier, view_ciphertexts, gas, context, state)?),
+            } => Ok(self.transfer(
+                proof,
+                anchor_root,
+                nullifier,
+                view_ciphertexts,
+                gas,
+                context,
+                state,
+            )?),
             CallMessage::Withdraw {
                 proof,
                 anchor_root,

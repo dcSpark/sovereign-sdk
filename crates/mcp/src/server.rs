@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use demo_stf::runtime::Runtime;
 use rmcp::{
-    // Types used by the server
-    ErrorData,
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     // Re-exported derive crates (handy in derives below)
@@ -14,6 +11,9 @@ use rmcp::{
     tool,
     tool_handler,
     tool_router,
+    // Types used by the server
+    ErrorData,
+    ServerHandler,
 };
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
@@ -290,11 +290,11 @@ impl CryptoServer {
         Parameters(_params): Parameters<GetWalletAddressRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                    None,
-                )
-            })?;
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
 
         let ctx = wallet_ctx.read().await;
 

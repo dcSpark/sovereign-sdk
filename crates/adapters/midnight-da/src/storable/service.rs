@@ -21,8 +21,9 @@ use tracing::Instrument;
 use crate::config::WAIT_ATTEMPT_PAUSE;
 use crate::storable::layer::{Randomizer, StorableMidnightDaLayer};
 use crate::{
-    BlockProducingConfig, MidnightAddress, MidnightBlock, MidnightBlockHeader, MidnightDaConfig, MidnightDaSpec,
-    MidnightDaVerifier, RandomizationBehaviour, RandomizationConfig, DEFAULT_BLOCK_WAITING_TIME_MS,
+    BlockProducingConfig, MidnightAddress, MidnightBlock, MidnightBlockHeader, MidnightDaConfig,
+    MidnightDaSpec, MidnightDaVerifier, RandomizationBehaviour, RandomizationConfig,
+    DEFAULT_BLOCK_WAITING_TIME_MS,
 };
 
 const DEFAULT_BLOCK_WAITING_TIME: Duration = Duration::from_secs(3600);
@@ -217,7 +218,10 @@ impl StorableMidnightDaService {
     /// Block producing happens on blob submission.
     /// Data is stored only in memory.
     /// It is very similar to [`crate::MidnightDaService`] parameters.
-    pub async fn new_in_memory(sequencer_da_address: MidnightAddress, blocks_to_finality: u32) -> Self {
+    pub async fn new_in_memory(
+        sequencer_da_address: MidnightAddress,
+        blocks_to_finality: u32,
+    ) -> Self {
         let da_layer = StorableMidnightDaLayer::new_in_memory(blocks_to_finality)
             .await
             .expect("Failed to initialize StorableMidnightDaLayer");
@@ -233,7 +237,10 @@ impl StorableMidnightDaService {
     }
 
     /// Creates new in memory [`StorableMidnightDaService`] from [`MidnightDaConfig`].
-    pub async fn from_config(config: MidnightDaConfig, shutdown_receiver: watch::Receiver<()>) -> Self {
+    pub async fn from_config(
+        config: MidnightDaConfig,
+        shutdown_receiver: watch::Receiver<()>,
+    ) -> Self {
         let da_layer = match config.da_layer.as_ref() {
             None => {
                 let mut da_layer = StorableMidnightDaLayer::new_from_connection(
@@ -608,7 +615,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multiple_threads_producing_reading() -> anyhow::Result<()> {
-        let da_layer = Arc::new(RwLock::new(StorableMidnightDaLayer::new_in_memory(0).await?));
+        let da_layer = Arc::new(RwLock::new(
+            StorableMidnightDaLayer::new_in_memory(0).await?,
+        ));
         let block_time = Duration::from_millis(50);
         let block_producing = BlockProducingConfig::Periodic {
             block_time_ms: block_time.as_millis() as u64,
@@ -643,7 +652,8 @@ mod tests {
             let address = MidnightAddress::new([idx as u8; 32]);
             handlers.push(tokio::spawn(async move {
                 let da_service =
-                    StorableMidnightDaService::new(address, this_da_layer, this_block_producing).await;
+                    StorableMidnightDaService::new(address, this_da_layer, this_block_producing)
+                        .await;
                 for (wait, blob) in this_service_blobs {
                     sleep(wait).await;
                     da_service
@@ -662,8 +672,12 @@ mod tests {
         // Sleep extra block time so all blocks are produced.
         sleep(block_time * 2).await;
 
-        let da_service =
-            StorableMidnightDaService::new(MidnightAddress::new([1; 32]), da_layer, block_producing).await;
+        let da_service = StorableMidnightDaService::new(
+            MidnightAddress::new([1; 32]),
+            da_layer,
+            block_producing,
+        )
+        .await;
         check_consistency(&da_service, services_count * blobs_per_service).await?;
 
         shutdown_sender.send(())?;
@@ -678,7 +692,8 @@ mod tests {
         let producing = BlockProducingConfig::OnBatchSubmit {
             block_wait_timeout_ms: Some(10),
         };
-        let mut service = StorableMidnightDaService::new_in_memory(MidnightAddress::new([0; 32]), 0).await;
+        let mut service =
+            StorableMidnightDaService::new_in_memory(MidnightAddress::new([0; 32]), 0).await;
         service.block_producing = producing;
 
         let height_1 = u32::MAX as u64;
