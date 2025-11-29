@@ -32,6 +32,10 @@ pub struct MerkleTree {
     /// levels[i] contains 2^(depth - i) nodes
     /// levels[0] = leaves, levels[depth] = root (single node)
     levels: Vec<Vec<Hash32>>,
+    /// Cached default nodes: defaults[i] = hash of all-zero subtree at level i.
+    /// This avoids recomputing defaults on each grow operation.
+    /// Length is always depth + 1 (indices 0..=depth).
+    defaults: Vec<Hash32>,
 }
 
 impl MerkleTree {
@@ -51,23 +55,23 @@ impl MerkleTree {
         let n = 1usize << depth;
 
         // Precompute default node for each level (O(depth) hashes)
-        // default[i] = hash of all-zero subtree at level i
-        let mut default = Vec::with_capacity(depth as usize + 1);
-        default.push([0u8; 32]); // level 0: zero leaf
+        // defaults[i] = hash of all-zero subtree at level i
+        let mut defaults = Vec::with_capacity(depth as usize + 1);
+        defaults.push([0u8; 32]); // level 0: zero leaf
         for lvl in 0..depth {
-            let next = mt_combine(lvl, &default[lvl as usize], &default[lvl as usize]);
-            default.push(next);
+            let next = mt_combine(lvl, &defaults[lvl as usize], &defaults[lvl as usize]);
+            defaults.push(next);
         }
 
         // Allocate and initialize each level with its default node (no hashing here)
         let mut levels = Vec::with_capacity(depth as usize + 1);
-        levels.push(vec![default[0]; n]); // leaves at level 0
+        levels.push(vec![defaults[0]; n]); // leaves at level 0
         for lvl in 1..=depth as usize {
             let len = n >> lvl; // 2^(depth - lvl)
-            levels.push(vec![default[lvl]; len]);
+            levels.push(vec![defaults[lvl]; len]);
         }
 
-        Self { depth, levels }
+        Self { depth, levels, defaults }
     }
 
     /// Return the tree depth (number of levels from leaves to root).
@@ -138,18 +142,19 @@ impl MerkleTree {
         let old_leaf_len = 1usize << (old_depth as usize);
         let new_leaf_len = 1usize << (new_depth as usize);
 
-        // Precompute default nodes for the *new* depth exactly like `new()`.
-        let mut default = Vec::with_capacity(new_depth as usize + 1);
-        default.push([0u8; 32]); // level 0: zero leaf
-        for lvl in 0..(new_depth as usize) {
-            let next = mt_combine(lvl as u8, &default[lvl], &default[lvl]);
-            default.push(next);
-        }
+        // Extend defaults by one level (O(1) hash instead of O(depth) hashes)
+        // The new default at level `new_depth` = hash(default[old_depth], default[old_depth])
+        let new_default = mt_combine(
+            old_depth,
+            &self.defaults[old_depth as usize],
+            &self.defaults[old_depth as usize],
+        );
+        self.defaults.push(new_default);
 
         let mut levels: Vec<Vec<Hash32>> = Vec::with_capacity(new_depth as usize + 1);
 
         // Leaves: old tree in left half, right half default
-        let mut leaves = vec![default[0]; new_leaf_len];
+        let mut leaves = vec![self.defaults[0]; new_leaf_len];
         leaves[..old_leaf_len].copy_from_slice(&old_levels[0]);
         levels.push(leaves);
 
@@ -157,14 +162,14 @@ impl MerkleTree {
         for lvl in 1..=old_depth as usize {
             let len_new = new_leaf_len >> lvl; // 2^(new_depth - lvl)
             let len_old = old_levels[lvl].len();
-            let mut nodes = vec![default[lvl]; len_new];
+            let mut nodes = vec![self.defaults[lvl]; len_new];
             nodes[..len_old].copy_from_slice(&old_levels[lvl]);
             levels.push(nodes);
         }
 
         // New root level: combine old root with default right-subtree root
         let left_root = old_levels[old_depth as usize][0];
-        let right_root = default[old_depth as usize]; // default root for depth `old_depth`
+        let right_root = self.defaults[old_depth as usize]; // default root for depth `old_depth`
         let root = mt_combine(old_depth, &left_root, &right_root);
         levels.push(vec![root]);
 
