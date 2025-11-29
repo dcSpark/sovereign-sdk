@@ -334,6 +334,12 @@ k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std
 quick_cache = "0.6.16"
 # End of EVM dependencies
 
+# Profile for profiling with samply/perf - release performance with debug symbols
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 [profile.rust-analyzer-optimized]
 inherits = "dev"
 debug = false
