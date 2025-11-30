@@ -8,15 +8,15 @@ use crate::TxHash;
 use sov_metrics::Metric;
 use sov_modules_api::Spec;
 use sov_modules_api::StateUpdateInfo;
-use sov_modules_api::TxChangeSet;
 use sov_modules_api::TransactionReceipt;
+use sov_modules_api::TxChangeSet;
 use sov_modules_api::{
     ApiTxEffect, FullyBakedTx, Runtime, RuntimeEventProcessor, TxReceiptContents,
 };
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -78,7 +78,7 @@ impl<S: Spec, Rt: Runtime<S>> Clone for TxReceiver<S, Rt> {
 }
 
 /// Parallel transaction executor for midnight privacy module transactions.
-/// 
+///
 /// This executor processes transactions in parallel using a pool of workers,
 /// each with its own executor instance. Transactions are fully processed
 /// (except for the final batch addition) and results are sent back to the
@@ -110,7 +110,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
     }
 
     /// Send a transaction for parallel processing.
-    /// 
+    ///
     /// Worker will send the result directly to the message channel when done.
     /// Returns true if the transaction was accepted, false if the queue is full or disconnected.
     pub(crate) fn send_tx(
@@ -176,7 +176,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
     }
 
     /// Spawn the parallel execution task with a pool of workers.
-    /// 
+    ///
     /// Creates N worker threads (based on config) that will process transactions
     /// in parallel. Each worker maintains its own executor instance with a cloned
     /// state checkpoint.
@@ -222,7 +222,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                             .sequencer_kind_config
                             .num_parallel_tx_workers
                             .unwrap_or(0);
-                        
+
                         if configured_workers == 0 {
                             std::thread::available_parallelism()
                                 .map(|n| n.get())
@@ -239,7 +239,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                     .sequencer_kind_config
                     .num_parallel_tx_workers
                     .unwrap_or(0);
-                
+
                 if configured_workers == 0 {
                     // Default to number of available CPU cores
                     std::thread::available_parallelism()
@@ -259,7 +259,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
         } else {
             "config"
         };
-        
+
         tracing::info!(
             num_workers,
             source = config_source,
@@ -308,7 +308,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
     {
         tokio::spawn(async move {
             tracing::debug!(worker_id, "Parallel tx worker starting");
-            
+
             let mut shutdown_receiver = exec_config.shutdown_receiver.clone();
             let mut executor = RollupBlockExecutor::<_, Rt>::new(
                 &info,
@@ -321,9 +321,14 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
             let mut txs_processed: u64 = 0;
 
             loop {
+                // Use `biased` to ensure notification branch is ALWAYS checked first.
+                // This prevents the race condition where both notification and tx are ready,
+                // but select picks the tx branch, causing stale state execution.
                 tokio::select! {
+                    biased;
+
                     _ = start_block_notification_receiver.changed() => {
-                        let notify = start_block_notification_receiver.borrow().clone();
+                        let notify = start_block_notification_receiver.borrow_and_update().clone();
                         if let Some(notify) = notify {
                             tracing::debug!(
                                 worker_id,
@@ -339,7 +344,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                         }
                     }
 
-                    request = tx_receiver.receiver.recv_async() => {
+                    request = tx_receiver.receiver.recv_async(), if is_started => {
                         let request = match request {
                             Ok(req) => {
                                 tx_receiver.size.fetch_sub(1, Ordering::Relaxed);
@@ -351,161 +356,132 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                             },
                         };
 
-                        if !is_started {
-                            tracing::debug!(
+                        let start_time = std::time::Instant::now();
+                            let start_timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros();
+
+                            // Increment active workers counter to track concurrency
+                            let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
+
+                            tracing::info!(
                                 worker_id,
                                 tx_hash = %request.tx_hash,
-                                "Parallel worker received tx before batch start; waiting for start notification"
+                                start_timestamp_micros = start_timestamp,
+                                active_workers = active_count,
+                                "[PARALLEL] Worker starting transaction execution"
                             );
 
-                            // Wait until the batch start notification arrives (or shutdown)
-                            loop {
-                                tokio::select! {
-                                    _ = start_block_notification_receiver.changed() => {
-                                        let notify_opt = start_block_notification_receiver.borrow().clone();
-                                        if let Some(notify) = notify_opt {
-                                            // Restart executor with new state and mark as started
-                                            let _ = executor.shutdown().await;
-                                            Self::start_block(notify, &mut executor).await;
-                                            is_started = true;
-                                            txs_processed = 0;
-                                            break;
-                                        }
-                                    }
-                                    _ = shutdown_receiver.changed() => {
-                                        tracing::info!(worker_id, "Parallel worker shutting down while waiting for start");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                            tracing::trace!(
+                                worker_id,
+                                tx_hash = %request.tx_hash,
+                                queue_id = request.original_tx_queue_id,
+                                start_timestamp,
+                                active_workers = active_count,
+                                "Processing transaction in parallel"
+                            );
 
-                        let start_time = std::time::Instant::now();
-                        let start_timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros();
+                            // Process the transaction using our executor
+                            use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
+                            let baked_tx = FullyBakedTxWithMaybeChangeSet::new(request.tx);
+                            let result = executor.execute_tx_return_receipt(baked_tx).await;
 
-                        // Increment active workers counter to track concurrency
-                        let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
+                            // Decrement active workers counter
+                            let active_count_after = ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst) - 1;
 
-                        tracing::debug!(
-                            worker_id,
-                            tx_hash = %request.tx_hash,
-                            start_timestamp_micros = start_timestamp,
-                            active_workers = active_count,
-                            "[PARALLEL] Worker starting transaction execution"
-                        );
+                            match result {
+                                Ok((receipt, tx_changes, remaining_slot_gas, execution_time_micros)) => {
+                                    let elapsed = start_time.elapsed();
+                                    let end_timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_micros();
+                                    txs_processed += 1;
 
-                        tracing::trace!(
-                            worker_id,
-                            tx_hash = %request.tx_hash,
-                            queue_id = request.original_tx_queue_id,
-                            start_timestamp,
-                            active_workers = active_count,
-                            "Processing transaction in parallel"
-                        );
-
-                        // Process the transaction using our executor
-                        use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
-                        let baked_tx = FullyBakedTxWithMaybeChangeSet::new(request.tx);
-                        let result = executor.execute_tx_return_receipt(baked_tx).await;
-
-                        // Decrement active workers counter
-                        let active_count_after = ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst) - 1;
-
-                        match result {
-                            Ok((receipt, tx_changes, remaining_slot_gas, execution_time_micros)) => {
-                                let elapsed = start_time.elapsed();
-                                let end_timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_micros();
-                                txs_processed += 1;
-
-                                tracing::debug!(
-                                    worker_id,
-                                    tx_hash = %request.tx_hash,
-                                    end_timestamp_micros = end_timestamp,
-                                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
-                                    elapsed_micros = elapsed.as_micros(),
-                                    active_workers = active_count_after,
-                                    "[PARALLEL] Worker finished transaction execution"
-                                );
-
-                                tracing::debug!(
-                                    worker_id,
-                                    tx_hash = %request.tx_hash,
-                                    queue_id = request.original_tx_queue_id,
-                                    elapsed_micros = elapsed.as_micros(),
-                                    txs_processed,
-                                    "Transaction processed successfully in parallel"
-                                );
-
-                                // Heavy-ish conversion done in the worker.
-                                let api_effect: ApiTxEffect<TxReceiptContents<S>> =
-                                    receipt.receipt.clone().into();
-
-                                let parallel_response = ParallelizedResponse::<S> {
-                                    tx_hash: request.tx_hash,
-                                    receipt,
-                                    tx_changes,
-                                    remaining_slot_gas,
-                                    execution_time_micros,
-                                    original_tx_queue_id: request.original_tx_queue_id,
-                                    api_effect,
-                                };
-
-                                // Send completion message directly to the message loop
-                                let msg = crate::preferred::inner::Message::ParallelTxCompleted {
-                                    parallel_response,
-                                    sequence_number: request.sequence_number,
-                                    tx_len: request.tx_len,
-                                    reason: "parallel_tx_completed",
-                                };
-                                
-                                // It's safe to ignore errors if the channel is closed (shutdown)
-                                if let Err(err) = request.message_sender.send(msg).await {
                                     tracing::debug!(
                                         worker_id,
                                         tx_hash = %request.tx_hash,
-                                        "Failed to send completion message (likely shutdown): {:?}",
-                                        err
+                                        end_timestamp_micros = end_timestamp,
+                                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                                        elapsed_micros = elapsed.as_micros(),
+                                        active_workers = active_count_after,
+                                        "[PARALLEL] Worker finished transaction execution"
                                     );
+
+                                    tracing::debug!(
+                                        worker_id,
+                                        tx_hash = %request.tx_hash,
+                                        queue_id = request.original_tx_queue_id,
+                                        elapsed_micros = elapsed.as_micros(),
+                                        txs_processed,
+                                        "Transaction processed successfully in parallel"
+                                    );
+
+                                    // Heavy-ish conversion done in the worker.
+                                    let api_effect: ApiTxEffect<TxReceiptContents<S>> =
+                                        receipt.receipt.clone().into();
+
+                                    let parallel_response = ParallelizedResponse::<S> {
+                                        tx_hash: request.tx_hash,
+                                        receipt,
+                                        tx_changes,
+                                        remaining_slot_gas,
+                                        execution_time_micros,
+                                        original_tx_queue_id: request.original_tx_queue_id,
+                                        api_effect,
+                                    };
+
+                                    // Send completion message directly to the message loop
+                                    let msg = crate::preferred::inner::Message::ParallelTxCompleted {
+                                        parallel_response,
+                                        sequence_number: request.sequence_number,
+                                        tx_len: request.tx_len,
+                                        reason: "parallel_tx_completed",
+                                    };
+
+                                    // It's safe to ignore errors if the channel is closed (shutdown)
+                                    if let Err(err) = request.message_sender.send(msg).await {
+                                        tracing::debug!(
+                                            worker_id,
+                                            tx_hash = %request.tx_hash,
+                                            "Failed to send completion message (likely shutdown): {:?}",
+                                            err
+                                        );
+                                    }
                                 }
-                            }
-            Err(err) => {
-                tracing::debug!(
-                    worker_id,
-                    tx_hash = %request.tx_hash,
-                    %err,
-                    "Parallel worker failed to execute transaction"
-                );
-                // Notify the main sequencer so it can clean up the HTTP waiter
-                // and decrement the in-flight parallel counter, instead of
-                // leaving the request hanging indefinitely.
-                let fail_msg = crate::preferred::inner::Message::ParallelTxFailed {
-                    tx_hash: request.tx_hash,
-                    reason: "parallel_tx_failed",
-                };
-                if let Err(send_err) = request.message_sender.send(fail_msg).await {
+                Err(err) => {
                     tracing::debug!(
                         worker_id,
                         tx_hash = %request.tx_hash,
-                        "Failed to send ParallelTxFailed message (likely shutdown): {:?}",
-                        send_err
+                        %err,
+                        "Parallel worker failed to execute transaction"
                     );
+                    // Notify the main sequencer so it can clean up the HTTP waiter
+                    // and decrement the in-flight parallel counter, instead of
+                    // leaving the request hanging indefinitely.
+                    let fail_msg = crate::preferred::inner::Message::ParallelTxFailed {
+                        tx_hash: request.tx_hash,
+                        reason: "parallel_tx_failed",
+                    };
+                    if let Err(send_err) = request.message_sender.send(fail_msg).await {
+                        tracing::debug!(
+                            worker_id,
+                            tx_hash = %request.tx_hash,
+                            "Failed to send ParallelTxFailed message (likely shutdown): {:?}",
+                            send_err
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
+                            }
+                        }
+
+                        _ = shutdown_receiver.changed() => {
+                            tracing::info!(worker_id, txs_processed, "Parallel worker shutting down");
+                            return;
                         }
                     }
-
-                    _ = shutdown_receiver.changed() => {
-                        tracing::info!(worker_id, txs_processed, "Parallel worker shutting down");
-                        return;
-                    }
-                }
             }
         })
     }
