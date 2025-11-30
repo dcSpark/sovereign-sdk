@@ -1869,7 +1869,7 @@ where
 
         if is_midnight_privacy_tx && has_parallel_capacity {
             // Send to parallel executor - worker will send result directly to message loop
-            tracing::warn!(%tx_hash, "[PARALLEL] Sending transaction to parallel executor");
+            tracing::info!(%tx_hash, "[STAGE 1] Sending transaction to parallel executor");
             if parallel_tx_executor.send_tx(
                 baked_tx.clone(),
                 tx_hash,
@@ -1997,24 +1997,28 @@ where
             tx_hash,
             receipt,
             tx_changes,
-            remaining_slot_gas: _,
+            remaining_slot_gas,
             execution_time_micros,
             original_tx_queue_id: _,
             api_effect,
         } = parallel_response;
 
-        // Rebuild the tx body from the worker’s receipt and commit via background task.
-        let tx = FullyBakedTx {
-            data: receipt
-                .body_to_save
-                .clone()
-                .expect("Transaction receipts must contain bodies with sov-modules-stf-blueprint"),
-        };
+        tracing::info!(
+            %tx_hash,
+            "[STAGE 3] Committing parallel execution result to main executor (FAST PATH)"
+        );
 
+        // FAST PATH: Pass the full receipt to skip re-execution
         let commit_start = std::time::Instant::now();
         let (accepted_with_budget_main, tx_changes_main) = match inner
             .executor
-            .accept_precomputed_tx_from_parallel(tx, tx_changes, api_effect, execution_time_micros)
+            .accept_precomputed_tx_from_parallel(
+                receipt,
+                tx_changes,
+                remaining_slot_gas,
+                api_effect,
+                execution_time_micros,
+            )
             .await
         {
             Ok(res) => res,
@@ -2094,6 +2098,17 @@ where
         if inner.pending_parallel_count > 0 {
             inner.pending_parallel_count -= 1;
         }
+
+        let total_time = fn_start.elapsed();
+        tracing::info!(
+            %tx_hash,
+            total_ms = format!("{:.2}", total_time.as_secs_f64() * 1000.0),
+            commit_ms = format!("{:.2}", commit_time.as_secs_f64() * 1000.0),
+            send_accept_ms = format!("{:.2}", send_accept_time.as_secs_f64() * 1000.0),
+            batch_metrics_ms = format!("{:.2}", batch_metrics_time.as_secs_f64() * 1000.0),
+            waiter_bridge_ms = format!("{:.2}", waiter_bridge_time.as_secs_f64() * 1000.0),
+            "[STAGE 3] Transaction processing complete"
+        );
 
         let close_batch_start = std::time::Instant::now();
         inner

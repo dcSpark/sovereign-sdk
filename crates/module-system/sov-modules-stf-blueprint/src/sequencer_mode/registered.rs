@@ -445,17 +445,11 @@ where
         // Check if we have a cached result and should skip execution (Node context only)
         #[cfg(feature = "native")]
         if execution_context == ExecutionContext::Node {
+            let cache_start = std::time::Instant::now();
             let tx_hash = RT::Auth::compute_tx_hash(&raw_tx)
                 .expect("Failed to compute tx hash for cache lookup");
             // Check cache directly (don't rely on batch's control flow which may be NoOpControlFlow)
             if let Some(cached) = GLOBAL_TX_CACHE.get::<S>(&tx_hash) {
-                tracing::info!(
-                    tx_hash = %tx_hash,
-                    gas_used = ?cached.gas_used,
-                    num_writes = cached.tx_changes.writes.len(),
-                    num_events = cached.receipt.events.len(),
-                    "[NODE CACHE HIT] Using cached result - SKIPPING EXECUTION"
-                );
                 // CACHE HIT: Use cached result directly, skip execution
                 // Note: `cached` is Arc<PrecomputedResult<S>>, so accessing fields is cheap
                 let provisional_reward = cached.reward;
@@ -489,11 +483,22 @@ where
                 // Clone receipt only when pushing to results (unavoidable)
                 tx_receipts.push(cached.receipt.clone());
                 clean_scratchpad = new_checkpoint.to_tx_scratchpad();
+
+                let cache_elapsed = cache_start.elapsed();
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    elapsed_ms = format!("{:.2}", cache_elapsed.as_secs_f64() * 1000.0),
+                    num_writes = write_count,
+                    "[NODE] Transaction processed via cache hit"
+                );
                 continue; // Skip to next transaction
             }
         }
 
         // CACHE MISS: Execute normally
+        #[cfg(feature = "native")]
+        let exec_start = std::time::Instant::now();
+
         injected_control_flow.try_warm_up_cache(&mut clean_scratchpad);
 
         // Authorize and process the transaction, handling sequencer rewards/penalties internally.
@@ -642,6 +647,17 @@ where
                 accumulated_penalty = accumulated_penalty
                     .checked_add(provisional_penalty)
                     .expect("Total supply of gas token exceeded");
+                
+                #[cfg(feature = "native")]
+                if execution_context == ExecutionContext::Node {
+                    let exec_elapsed = exec_start.elapsed();
+                    tracing::info!(
+                        tx_hash = %receipt.tx_hash,
+                        elapsed_ms = format!("{:.2}", exec_elapsed.as_secs_f64() * 1000.0),
+                        "[NODE] Transaction processed via execution (cache miss)"
+                    );
+                }
+
                 tx_receipts.push(receipt);
             }
             TxControlFlow::IgnoreTx => {
