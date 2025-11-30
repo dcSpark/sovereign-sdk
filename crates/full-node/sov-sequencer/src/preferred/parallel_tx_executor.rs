@@ -321,66 +321,42 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
             let mut txs_processed: u64 = 0;
 
             loop {
+                // Use `biased` to ensure notification branch is ALWAYS checked first.
+                // This prevents the race condition where both notification and tx are ready,
+                // but select picks the tx branch, causing stale state execution.
                 tokio::select! {
-                        _ = start_block_notification_receiver.changed() => {
-                            let notify = start_block_notification_receiver.borrow().clone();
-                            if let Some(notify) = notify {
-                                tracing::debug!(
-                                    worker_id,
-                                    txs_processed,
-                                    "Parallel worker received batch start notification"
-                                );
+                    biased;
 
-                                // Shutdown the old executor and start fresh with new state
-                                let _ = executor.shutdown().await;
-                                Self::start_block(notify, &mut executor).await;
-                                is_started = true;
-                                txs_processed = 0;
-                            }
+                    _ = start_block_notification_receiver.changed() => {
+                        let notify = start_block_notification_receiver.borrow_and_update().clone();
+                        if let Some(notify) = notify {
+                            tracing::debug!(
+                                worker_id,
+                                txs_processed,
+                                "Parallel worker received batch start notification"
+                            );
+
+                            // Shutdown the old executor and start fresh with new state
+                            let _ = executor.shutdown().await;
+                            Self::start_block(notify, &mut executor).await;
+                            is_started = true;
+                            txs_processed = 0;
                         }
+                    }
 
-                        request = tx_receiver.receiver.recv_async() => {
-                            let request = match request {
-                                Ok(req) => {
-                                    tx_receiver.size.fetch_sub(1, Ordering::Relaxed);
-                                    req
-                                },
-                                Err(flume::RecvError::Disconnected) => {
-                                    tracing::info!(worker_id, txs_processed, "Parallel worker shutting down (channel disconnected)");
-                                    return;
-                                },
-                            };
+                    request = tx_receiver.receiver.recv_async(), if is_started => {
+                        let request = match request {
+                            Ok(req) => {
+                                tx_receiver.size.fetch_sub(1, Ordering::Relaxed);
+                                req
+                            },
+                            Err(flume::RecvError::Disconnected) => {
+                                tracing::info!(worker_id, txs_processed, "Parallel worker shutting down (channel disconnected)");
+                                return;
+                            },
+                        };
 
-                            if !is_started {
-                                tracing::debug!(
-                                    worker_id,
-                                    tx_hash = %request.tx_hash,
-                                    "Parallel worker received tx before batch start; waiting for start notification"
-                                );
-
-                                // Wait until the batch start notification arrives (or shutdown)
-                                loop {
-                                    tokio::select! {
-                                        _ = start_block_notification_receiver.changed() => {
-                                            let notify_opt = start_block_notification_receiver.borrow().clone();
-                                            if let Some(notify) = notify_opt {
-                                                // Restart executor with new state and mark as started
-                                                let _ = executor.shutdown().await;
-                                                Self::start_block(notify, &mut executor).await;
-                                                is_started = true;
-                                                txs_processed = 0;
-                                                break;
-                                            }
-                                        }
-                                        _ = shutdown_receiver.changed() => {
-                                            tracing::info!(worker_id, "Parallel worker shutting down while waiting for start");
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-
-                            let start_time = std::time::Instant::now();
+                        let start_time = std::time::Instant::now();
                             let start_timestamp = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
@@ -389,7 +365,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                             // Increment active workers counter to track concurrency
                             let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
 
-                            tracing::debug!(
+                            tracing::info!(
                                 worker_id,
                                 tx_hash = %request.tx_hash,
                                 start_timestamp_micros = start_timestamp,

@@ -447,13 +447,21 @@ where
         if execution_context == ExecutionContext::Node {
             let tx_hash = RT::Auth::compute_tx_hash(&raw_tx)
                 .expect("Failed to compute tx hash for cache lookup");
-            if let Some(cached) = injected_control_flow.should_skip_execution(&tx_hash) {
+            // Check cache directly (don't rely on batch's control flow which may be NoOpControlFlow)
+            if let Some(cached) = GLOBAL_TX_CACHE.get::<S>(&tx_hash) {
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    gas_used = ?cached.gas_used,
+                    num_writes = cached.tx_changes.writes.len(),
+                    num_events = cached.receipt.events.len(),
+                    "[NODE CACHE HIT] Using cached result - SKIPPING EXECUTION"
+                );
                 // CACHE HIT: Use cached result directly, skip execution
                 // Note: `cached` is Arc<PrecomputedResult<S>>, so accessing fields is cheap
                 let provisional_reward = cached.reward;
                 let provisional_penalty = cached.penalty;
 
-                // Record stats - cache hit used, NOT verified
+                // Record stats - cache hit used
                 let write_count = cached.tx_changes.writes.len();
                 batch_verification_stats.record_cache_hit(write_count);
 
@@ -477,10 +485,6 @@ where
                 accumulated_penalty = accumulated_penalty
                     .checked_add(provisional_penalty)
                     .expect("Total supply of gas token exceeded");
-
-                // NOTE: Do NOT update sequencer_bond_per_tx here.
-                // The normal path only updates it in IgnoreTx (penalty case),
-                // not for successful ContinueProcessing txs.
 
                 // Clone receipt only when pushing to results (unavoidable)
                 tx_receipts.push(cached.receipt.clone());

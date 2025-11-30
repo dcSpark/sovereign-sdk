@@ -6,8 +6,8 @@
 //! 2. If cached, SKIPS execution and uses the cached result directly
 //! 3. If not cached, executes normally
 //!
-//! This is an optimization mode that allows the node to skip re-execution when the
-//! sequencer has already computed and cached the result.
+//! This optimization allows the node to skip re-execution when the sequencer has already
+//! computed and cached the result.
 
 use std::marker::PhantomData;
 
