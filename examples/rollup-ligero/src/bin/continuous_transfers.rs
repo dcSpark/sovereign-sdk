@@ -789,9 +789,12 @@ async fn perform_transfer_cycle(
     config: &ContinuousConfig,
 ) -> Result<CycleSummary> {
     // Fetch tree state and all notes with retries in case the sequencer advances while we rebuild the tree
+    let tree_rebuild_phase_start = Instant::now();
+    let mut attempts_made = 0;
     let (state, all_notes, mt) = {
         let mut attempt_result = None;
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
+            attempts_made = attempt + 1;
             let state_attempt: TreeState = client
                 .query_rest_endpoint("/modules/midnight-privacy/tree/state")
                 .await
@@ -881,6 +884,12 @@ async fn perform_transfer_cycle(
 
         attempt_result.expect("Tree rebuild attempt must succeed or bail")
     };
+    let tree_rebuild_phase_elapsed = tree_rebuild_phase_start.elapsed();
+    eprintln!(
+        "[cycle] tree rebuild finished in {:.2} ms after {} attempt(s)",
+        tree_rebuild_phase_elapsed.as_secs_f64() * 1000.0,
+        attempts_made
+    );
 
     let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
     for n in &all_notes {
