@@ -612,15 +612,8 @@ where
             return;
         }
 
-        // Do not close if parallel txs are pending
-        if self.pending_parallel_count == 0 {
-            self.close_current_batch().await;
-        } else {
-            tracing::trace!(
-                pending = %self.pending_parallel_count,
-                "Skipping auto close; parallel txs pending"
-            );
-        }
+        self.close_current_batch().await;
+
     }
 
     /// Closes the current batch.
