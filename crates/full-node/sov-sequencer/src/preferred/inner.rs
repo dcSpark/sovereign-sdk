@@ -2090,9 +2090,18 @@ where
 
         // Update batch metrics
         let batch_metrics_start = std::time::Instant::now();
+        let num_parallel_tx_workers = inner
+            .seq_config
+            .sequencer_kind_config
+            .num_parallel_tx_workers
+            .unwrap_or(0)
+            .max(1) as u64;
         inner
             .batch_size_tracker
-            .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+            .add_tx(
+                tx_len,
+                accepted_with_budget_main.execution_time_micros / num_parallel_tx_workers,
+            );
         let batch_metrics_time = batch_metrics_start.elapsed();
 
         // Decide whether to fast-ack HTTP callers immediately after the in-memory
