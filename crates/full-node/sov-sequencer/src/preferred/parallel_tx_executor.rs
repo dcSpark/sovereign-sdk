@@ -382,6 +382,15 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     let elapsed = start_time.elapsed();
                                     txs_processed += 1;
 
+                                    // Track Stage 2 metrics
+                                    sov_metrics::track_metrics(|t| {
+                                        t.submit(crate::metrics::ParallelTxStageMetrics {
+                                            tx_hash: request.tx_hash.to_string(),
+                                            stage: 2,
+                                            duration_us: elapsed.as_micros() as u64,
+                                        });
+                                    });
+
                                     tracing::info!(
                                         worker_id,
                                         tx_hash = %request.tx_hash,
@@ -418,6 +427,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                         parallel_response,
                                         sequence_number: request.sequence_number,
                                         tx_len: request.tx_len,
+                                        retry_count: 0,
                                         reason: "parallel_tx_completed",
                                     };
 
