@@ -262,9 +262,15 @@ fn test_different_fvks_different_ciphertexts() {
     let enc1 = encrypt_note_for_fvk(&fvk1, &note, &cm).unwrap();
     let enc2 = encrypt_note_for_fvk(&fvk2, &note, &cm).unwrap();
 
-    // Different FVKs should produce different ciphertexts
+    // Different FVKs should produce different ciphertexts and MACs
     assert_ne!(enc1.ct, enc2.ct);
-    assert_ne!(enc1.nonce, enc2.nonce);
+    assert_ne!(enc1.fvk_commitment, enc2.fvk_commitment);
+    assert_ne!(enc1.mac, enc2.mac);
+
+    // Note: nonces are dummy [0; 24] in Level B encryption (Poseidon-stream is deterministic)
+    // so we don't assert they differ - they're both zeros for backward compatibility
+    assert_eq!(enc1.nonce, [0u8; 24]);
+    assert_eq!(enc2.nonce, [0u8; 24]);
 }
 
 /// Test that demonstrates the "not a trust me bro" guarantee:

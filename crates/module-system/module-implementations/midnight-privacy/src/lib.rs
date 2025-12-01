@@ -71,8 +71,10 @@ pub use crate::hash::{Hash32, PendingRootKey, RootKey};
 ///
 /// # Module State
 /// - `commitment_tree`: Merkle tree of note commitments
-/// - `next_position`: Next available position in the tree
-/// - `nullifier_set`: Set of used nullifiers (prevents double-spending)
+/// - `next_position`: Next available position in the commitment tree
+/// - `nullifier_tree`: Merkle tree of spent nullifiers (Aztec-style dual-tree design)
+/// - `next_nullifier_position`: Next available position in the nullifier tree
+/// - `nullifier_set`: Set of used nullifiers (prevents double-spending, O(1) lookup)
 /// - `recent_roots`: Recent Merkle roots (anchor window for fast mempool checks)
 /// - `root_window_size`: Size of the anchor window
 /// - `all_roots`: Persistent index of ALL historical roots (NOMT-backed, enables long-range anchors)
@@ -99,6 +101,17 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Next available position in the commitment tree.
     #[state]
     pub next_position: StateValue<u64>,
+
+    /// Merkle tree of spent nullifiers (Aztec-style dual-tree design).
+    /// Append-only: each new nullifier is inserted at the next free position.
+    /// This tree is maintained in parallel with `nullifier_set` for future
+    /// IMT-based non-membership proofs in the circuit.
+    #[state]
+    pub nullifier_tree: StateValue<MerkleTree>,
+
+    /// Next available position in the nullifier tree.
+    #[state]
+    pub next_nullifier_position: StateValue<u64>,
 
     /// Set of used nullifiers (maps nullifier -> true if spent).
     #[state]

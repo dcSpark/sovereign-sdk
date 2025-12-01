@@ -6,7 +6,7 @@ use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
 use crate::hash::{Hash32, RootKey};
-use crate::merkle::MerkleTree;
+use crate::merkle::{MerkleTree, MAX_TREE_DEPTH};
 
 /// Initial configuration for midnight-privacy module.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq, JsonSchema)]
@@ -39,6 +39,15 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         config: &<Self as sov_modules_api::Module>::Config,
         state: &mut impl GenesisState<S>,
     ) -> Result<()> {
+        // Sanity check: tree_depth must not exceed what the guest circuit supports.
+        // The guest uses `1u64 << depth` for position bounds, so depth must be ≤ 63.
+        anyhow::ensure!(
+            config.tree_depth <= MAX_TREE_DEPTH,
+            "midnight-privacy: tree_depth {} exceeds MAX_TREE_DEPTH {}",
+            config.tree_depth,
+            MAX_TREE_DEPTH,
+        );
+
         // Set the admin
         self.admin.set(&config.admin, state)?;
 
@@ -55,6 +64,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Initialize the next position to 0
         self.next_position.set(&0u64, state)?;
+
+        // Initialize the nullifier tree (Aztec-style dual-tree design)
+        // Uses the same initial depth as commitment tree; both can grow dynamically.
+        let nf_tree = MerkleTree::new(config.tree_depth);
+        self.nullifier_tree.set(&nf_tree, state)?;
+        self.next_nullifier_position.set(&0u64, state)?;
 
         // Set the root window size
         self.root_window_size.set(&config.root_window_size, state)?;

@@ -280,6 +280,7 @@ fn test_simple_note_spend() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
 
     println!("\n--- Generating ZK Proof ---");
@@ -493,6 +494,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
 
     println!("Public output (committed by proof):");
@@ -1155,6 +1157,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![out1_cm, out2_cm],
+        view_attestations: None,
     };
 
     host.set_public_output(&public)?;
@@ -1263,6 +1266,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![],
+        view_attestations: None,
     };
 
     host.set_public_output(&public)?;
@@ -1424,6 +1428,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         nullifier: deposit_nf,
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
+        view_attestations: None,
     };
 
     host2.set_public_output(&public2)?;
@@ -1543,6 +1548,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         nullifier: out1_nf,
         withdraw_amount: withdraw_amount_phase3,
         output_commitments: vec![change_cm],
+        view_attestations: None,
     };
 
     host3.set_public_output(&public3)?;
@@ -1736,6 +1742,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
         nullifier: deposit_nf,
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
+        view_attestations: None,
     };
 
     host2.set_public_output(&public2)?;
@@ -1807,6 +1814,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
         nullifier: out1_nf,
         withdraw_amount: malicious_withdraw,
         output_commitments: vec![],
+        view_attestations: None,
     };
 
     host3.set_public_output(&public3)?;
