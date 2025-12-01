@@ -429,6 +429,10 @@ async fn main() -> Result<()> {
     let mut total_seq_submit_ms: f64 = 0.0;
     let mut total_seq_await_ms: f64 = 0.0;
     let mut total_seq_stf_ms: f64 = 0.0;
+    let mut cached_tree: Option<MerkleTree> = None;
+    let mut cached_next_position: u64 = 0;
+    let mut cached_root: Option<Hash32> = None;
+    let mut cached_pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -466,6 +470,10 @@ async fn main() -> Result<()> {
                 &chain_hash,
                 &program_path,
                 &config,
+                &mut cached_tree,
+                &mut cached_next_position,
+                &mut cached_root,
+                &mut cached_pos_by_cm,
             ) => res?,
         };
 
@@ -787,11 +795,19 @@ async fn perform_transfer_cycle(
     chain_hash: &[u8; 32],
     program_path: &str,
     config: &ContinuousConfig,
+    cached_tree: &mut Option<MerkleTree>,
+    cached_next_position: &mut u64,
+    cached_root: &mut Option<Hash32>,
+    cached_pos_by_cm: &mut HashMap<[u8; 32], u64>,
 ) -> Result<CycleSummary> {
-    // Fetch tree state and all notes with retries in case the sequencer advances while we rebuild the tree
+    // Fetch tree state incrementally; reuse cached tree when possible to avoid O(n) rebuilds.
     let tree_rebuild_phase_start = Instant::now();
     let mut attempts_made = 0;
-    let (state, all_notes, mt) = {
+    let mut mt = cached_tree.take().unwrap_or_else(|| MerkleTree::new(TREE_DEPTH));
+    let mut pos_by_cm = std::mem::take(cached_pos_by_cm);
+    let mut cached_root_val = *cached_root;
+    let mut cached_next_pos = *cached_next_position;
+    let (state, _state_root) = {
         let mut attempt_result = None;
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
             attempts_made = attempt + 1;
@@ -800,82 +816,87 @@ async fn perform_transfer_cycle(
                 .await
                 .context("Failed to query tree state")?;
 
-            let mut all_notes_attempt = Vec::new();
-            let batch_size = 1000;
-            let mut offset = 0;
-            loop {
-                let endpoint = format!(
-                    "/modules/midnight-privacy/notes?limit={}&offset={}",
-                    batch_size, offset
-                );
-                let batch_resp: NotesResp = client
-                    .query_rest_endpoint(&endpoint)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to query notes batch at offset {}", offset)
-                    })?;
-                let len = batch_resp.notes.len();
-                all_notes_attempt.extend(batch_resp.notes);
-                if len < batch_size {
-                    break;
-                }
-                offset += batch_size;
-            }
+            anyhow::ensure!(
+                state_attempt.root.len() == 32,
+                "Tree state root has unexpected length: {}",
+                state_attempt.root.len()
+            );
+            let mut attempt_root = [0u8; 32];
+            attempt_root.copy_from_slice(&state_attempt.root);
 
-            if config.detailed_wallet_logs {
-                eprintln!(
-                    "[cycle] tree attempt {}: next_position={} notes_count={}",
-                    attempt + 1,
-                    state_attempt.next_position,
-                    all_notes_attempt.len()
-                );
-            }
-
-            let mut sorted_attempt = all_notes_attempt.clone();
-            sorted_attempt.sort_by_key(|n| n.position);
-
-            let mut mt = MerkleTree::new(TREE_DEPTH);
-            // If the on-chain tree has grown beyond the local default depth, grow before replaying leaves.
-            let required_leaves = sorted_attempt
-                .last()
-                .map(|n| n.position.saturating_add(1) as usize)
-                .unwrap_or(0)
-                .max(state_attempt.next_position as usize);
-            if required_leaves > mt.len() {
-                mt.grow_to_fit(required_leaves);
-            }
-            for n in sorted_attempt.iter() {
-                if n.commitment.len() == 32 {
-                    let mut cm = [0u8; 32];
-                    cm.copy_from_slice(&n.commitment);
-                    mt.set_leaf(n.position as usize, cm);
+            let mut reuse_cache = false;
+            if let Some(root) = cached_root_val {
+                if root == attempt_root && cached_next_pos == state_attempt.next_position {
+                    reuse_cache = true;
+                } else if state_attempt.next_position < cached_next_pos {
+                    // Chain rewound; drop cache and rebuild from scratch.
+                    mt = MerkleTree::new(TREE_DEPTH);
+                    pos_by_cm.clear();
+                    cached_next_pos = 0;
+                    cached_root_val = None;
                 }
             }
-            let rebuilt_root = mt.root();
-            if rebuilt_root.as_slice() == state_attempt.root.as_slice() {
-                attempt_result = Some((state_attempt, all_notes_attempt, mt));
+
+            if !reuse_cache {
+                // Grow once to the target size to amortize growth cost.
+                let target_leaves = state_attempt.next_position as usize;
+                if target_leaves > mt.len() {
+                    mt.grow_to_fit(target_leaves);
+                }
+
+                // Fetch only new notes since the last rebuild, and append them.
+                let batch_size = 1000;
+                let mut offset = cached_next_pos as usize;
+                while offset < target_leaves {
+                    let endpoint = format!(
+                        "/modules/midnight-privacy/notes?limit={}&offset={}",
+                        batch_size, offset
+                    );
+                    let batch_resp: NotesResp = client
+                        .query_rest_endpoint(&endpoint)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to query notes batch at offset {}", offset)
+                        })?;
+
+                    if batch_resp.notes.is_empty() {
+                        break;
+                    }
+
+                    for n in batch_resp.notes.iter() {
+                        if n.commitment.len() == 32 {
+                            let mut cm = [0u8; 32];
+                            cm.copy_from_slice(&n.commitment);
+                            if n.position as usize >= mt.len() {
+                                mt.grow_to_fit(n.position as usize + 1);
+                            }
+                            mt.set_leaf(n.position as usize, cm);
+                            pos_by_cm.insert(cm, n.position);
+                        }
+                    }
+
+                    let len = batch_resp.notes.len();
+                    offset += len;
+                }
+            }
+
+            if mt.root().as_slice() == state_attempt.root.as_slice() {
+                cached_root_val = Some(attempt_root);
+                cached_next_pos = state_attempt.next_position;
+                attempt_result = Some((state_attempt, attempt_root));
                 break;
-            }
-
-            let rebuilt_hex = hex::encode(rebuilt_root);
-            let state_hex = hex::encode(&state_attempt.root);
-
-            if config.detailed_wallet_logs {
-                eprintln!(
-                    "[cycle] tree mismatch attempt {}/{}: rebuilt={} vs state={}",
-                    attempt + 1,
-                    TREE_REBUILD_MAX_RETRIES,
-                    rebuilt_hex,
-                    state_hex
-                );
+            } else if reuse_cache {
+                // Cached tree diverged; reset cache and rebuild on the next attempt.
+                mt = MerkleTree::new(TREE_DEPTH);
+                pos_by_cm.clear();
+                cached_next_pos = 0;
+                cached_root_val = None;
             }
 
             if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
                 bail!(
-                    "Rebuilt tree root mismatch after {} attempts: rebuilt={} vs state={}",
-                    TREE_REBUILD_MAX_RETRIES,
-                    rebuilt_hex,
-                    state_hex
+                    "Rebuilt tree root mismatch after {} attempts",
+                    TREE_REBUILD_MAX_RETRIES
                 );
             }
 
@@ -890,15 +911,6 @@ async fn perform_transfer_cycle(
         tree_rebuild_phase_elapsed.as_secs_f64() * 1000.0,
         attempts_made
     );
-
-    let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
-    for n in &all_notes {
-        if n.commitment.len() == 32 {
-            let mut cm = [0u8; 32];
-            cm.copy_from_slice(&n.commitment);
-            pos_by_cm.insert(cm, n.position);
-        }
-    }
 
     let roots_state: RootsResp = client
         .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
@@ -958,6 +970,10 @@ async fn perform_transfer_cycle(
     }
 
     if inputs.is_empty() {
+        *cached_tree = Some(mt);
+        *cached_next_position = cached_next_pos;
+        *cached_root = cached_root_val;
+        *cached_pos_by_cm = pos_by_cm;
         eprintln!("[cycle] No spendable notes found in tree; nothing to do.");
         return Ok(CycleSummary {
             num_transfers: 0,
@@ -1591,6 +1607,12 @@ async fn perform_transfer_cycle(
             sequencer_count += 1;
         }
     }
+
+    // Persist rebuilt tree and note index for the next cycle.
+    *cached_tree = Some(mt);
+    *cached_next_position = cached_next_pos;
+    *cached_root = cached_root_val;
+    *cached_pos_by_cm = pos_by_cm;
 
     let avg_worker_ms = if worker_count > 0 {
         worker_sum_ms / worker_count as f64
