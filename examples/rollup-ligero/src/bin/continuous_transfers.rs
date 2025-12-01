@@ -832,6 +832,15 @@ async fn perform_transfer_cycle(
             sorted_attempt.sort_by_key(|n| n.position);
 
             let mut mt = MerkleTree::new(TREE_DEPTH);
+            // If the on-chain tree has grown beyond the local default depth, grow before replaying leaves.
+            let required_leaves = sorted_attempt
+                .last()
+                .map(|n| n.position.saturating_add(1) as usize)
+                .unwrap_or(0)
+                .max(state_attempt.next_position as usize);
+            if required_leaves > mt.len() {
+                mt.grow_to_fit(required_leaves);
+            }
             for n in sorted_attempt.iter() {
                 if n.commitment.len() == 32 {
                     let mut cm = [0u8; 32];
