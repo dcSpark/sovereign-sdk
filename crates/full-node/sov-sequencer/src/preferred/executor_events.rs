@@ -25,6 +25,11 @@ use crate::preferred::{
 // catch up in the background.
 const MAX_EXECUTOR_EVENT_QUEUE_DEPTH: usize = 16_384;
 
+/// Error indicating the executor event channel was closed.
+/// This typically means the side-effects task has crashed or shut down.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutorChannelClosed;
+
 pub(crate) struct ExecutorEventsSender<S: Spec, Rt: Runtime<S>> {
     events_sender: mpsc::Sender<ExecutorEvent<S, Rt>>,
     cache: PreferredSequencerCache,
@@ -52,38 +57,49 @@ impl<S: Spec, Rt: Runtime<S>> ExecutorEventsSender<S, Rt> {
         exit_rollup(&self.shutdown_sender).await;
     }
 
-    /// Send an event tracking metrics on the queue depth and blocking time and shutting down on error.
-    async fn send(&self, event: ExecutorEvent<S, Rt>) {
+    /// Send an event tracking metrics on the queue depth and blocking time.
+    /// Returns `true` if send succeeded, `false` if the channel was closed.
+    /// On failure, triggers shutdown via `shutdown_on_error()`.
+    async fn send(&self, event: ExecutorEvent<S, Rt>) -> bool {
         let mut metrics = PreferredSequencerExecutorEventSendingMetrics::default();
-        match self.events_sender.try_send(event) {
-            Ok(()) => (),
+        let success = match self.events_sender.try_send(event) {
+            Ok(()) => true,
             Err(TrySendError::Full(event)) => {
                 tracing::trace!(
                     "Executor event channel is full. Blocking until it becomes available again."
                 );
                 let started_blocking = std::time::Instant::now();
-                if self.events_sender.send(event).await.is_err() {
+                let send_ok = self.events_sender.send(event).await.is_ok();
+                if !send_ok {
                     self.shutdown_on_error().await;
-                };
+                }
                 metrics.blocked_for_us = started_blocking.elapsed().as_micros() as u64;
+                send_ok
             }
-            Err(TrySendError::Closed(_)) => self.shutdown_on_error().await,
-        }
+            Err(TrySendError::Closed(_)) => {
+                self.shutdown_on_error().await;
+                false
+            }
+        };
 
         let queue_depth = self.events_sender.max_capacity() - self.events_sender.capacity();
         metrics.queue_depth = queue_depth;
         sov_metrics::track_metrics(|t| {
             t.submit(metrics);
         });
+        success
     }
 
     /// Send a notification of an accepted tx. Return a receiver that will receive the confirmation.
+    ///
+    /// Returns `Err(ExecutorChannelClosed)` if the executor event channel was closed,
+    /// indicating the side-effects task is no longer running.
     pub(crate) async fn send_accept_tx(
         &mut self,
         accepted_tx: AcceptedTx<Confirmation<S, Rt>>,
         tx_changes: TxChangeSet,
         sequence_number: SequenceNumber,
-    ) -> oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>> {
+    ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, ExecutorChannelClosed> {
         let tx_idx_within_batch = self
             .cache
             .in_progress_batch_opt()
@@ -101,15 +117,20 @@ impl<S: Spec, Rt: Runtime<S>> ExecutorEventsSender<S, Rt> {
                 .map(|b| b.txs.len() as u64)
                 .unwrap_or(0),
         );
-        self.send(ExecutorEvent::AcceptedTx(AcceptedTxEventContents {
-            accepted_tx,
-            tx_changes,
-            oneshot_sender: sender,
-            sequence_number,
-            tx_idx_within_batch,
-        }))
-        .await;
-        receiver
+        let send_ok = self
+            .send(ExecutorEvent::AcceptedTx(AcceptedTxEventContents {
+                accepted_tx,
+                tx_changes,
+                oneshot_sender: sender,
+                sequence_number,
+                tx_idx_within_batch,
+            }))
+            .await;
+        if send_ok {
+            Ok(receiver)
+        } else {
+            Err(ExecutorChannelClosed)
+        }
     }
 
     pub(crate) async fn flush_transactions_cache(&self, next_tx_number: u64) {

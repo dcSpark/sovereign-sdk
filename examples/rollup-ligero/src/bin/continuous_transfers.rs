@@ -398,6 +398,9 @@ async fn start_managed_stack(
 struct TreeState {
     root: Vec<u8>,
     next_position: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    depth: Option<u8>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -409,6 +412,11 @@ struct NoteInfo {
 #[derive(Deserialize)]
 struct NotesResp {
     notes: Vec<NoteInfo>,
+    #[serde(default)]
+    current_root: Option<Vec<u8>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    count: Option<u64>,
 }
 
 async fn fetch_note_positions(
@@ -1144,8 +1152,22 @@ async fn perform_transfer_cycle(
     let mut cached_next_pos = *cached_next_position;
     let (state, _state_root) = {
         let mut attempt_result = None;
+        let mut used_fallback = false;
+        
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
             attempts_made = attempt + 1;
+            
+            // On the last attempt, use bomb-proof full rebuild
+            let force_full_rebuild = attempt == TREE_REBUILD_MAX_RETRIES - 1;
+            if force_full_rebuild && !used_fallback {
+                eprintln!("[cycle] Incremental rebuild failed, falling back to full rebuild from scratch");
+                mt = MerkleTree::new(TREE_DEPTH);
+                pos_by_cm.clear();
+                cached_next_pos = 0;
+                cached_root_val = None;
+                used_fallback = true;
+            }
+            
             let state_attempt: TreeState = client
                 .query_rest_endpoint("/modules/midnight-privacy/tree/state")
                 .await
@@ -1179,9 +1201,12 @@ async fn perform_transfer_cycle(
                     mt.grow_to_fit(target_leaves);
                 }
 
-                // Fetch only new notes since the last rebuild, and append them.
+                // Fetch notes and use current_root from response for atomic consistency.
+                // This avoids race conditions between separate /tree/state and /notes calls.
                 let batch_size = 1000;
                 let mut offset = cached_next_pos as usize;
+                let mut last_current_root: Option<Vec<u8>> = None;
+                
                 while offset < target_leaves {
                     let endpoint = format!(
                         "/modules/midnight-privacy/notes?limit={}&offset={}",
@@ -1196,6 +1221,11 @@ async fn perform_transfer_cycle(
 
                     if batch_resp.notes.is_empty() {
                         break;
+                    }
+                    
+                    // Capture current_root from the response for atomic consistency
+                    if let Some(ref root) = batch_resp.current_root {
+                        last_current_root = Some(root.clone());
                     }
 
                     for n in batch_resp.notes.iter() {
@@ -1213,15 +1243,32 @@ async fn perform_transfer_cycle(
                     let len = batch_resp.notes.len();
                     offset += len;
                 }
+                
+                // Prefer using current_root from notes response (atomic with notes data)
+                // Fall back to state_attempt.root if not available
+                if let Some(ref api_root) = last_current_root {
+                    if api_root.len() == 32 {
+                        attempt_root.copy_from_slice(api_root);
+                    }
+                }
             }
 
-            if mt.root().as_slice() == state_attempt.root.as_slice() {
+            if mt.root().as_slice() == attempt_root.as_slice() {
+                // Update state_attempt.root to match attempt_root for consistency
+                let mut final_state = state_attempt.clone();
+                final_state.root = attempt_root.to_vec();
                 cached_root_val = Some(attempt_root);
-                cached_next_pos = state_attempt.next_position;
-                attempt_result = Some((state_attempt, attempt_root));
+                cached_next_pos = final_state.next_position;
+                attempt_result = Some((final_state, attempt_root));
                 break;
-            } else if reuse_cache {
-                // Cached tree diverged; reset cache and rebuild on the next attempt.
+            } else {
+                // Roots don't match - reset cache for next attempt
+                eprintln!(
+                    "[cycle] Tree root mismatch on attempt {}: rebuilt={} vs expected={}",
+                    attempt + 1,
+                    hex::encode(mt.root()),
+                    hex::encode(&attempt_root)
+                );
                 mt = MerkleTree::new(TREE_DEPTH);
                 pos_by_cm.clear();
                 cached_next_pos = 0;
@@ -1231,7 +1278,7 @@ async fn perform_transfer_cycle(
 
             if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
                 bail!(
-                    "Rebuilt tree root mismatch after {} attempts",
+                    "Rebuilt tree root mismatch after {} attempts (including full rebuild fallback)",
                     TREE_REBUILD_MAX_RETRIES
                 );
             }
