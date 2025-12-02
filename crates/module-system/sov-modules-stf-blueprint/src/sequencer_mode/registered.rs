@@ -11,6 +11,10 @@ use sov_modules_api::{
     SequencerBondForTx, SlotGasMeter, Spec, StateCheckpoint, StateProvider, TransactionReceipt,
     TxControlFlow, TxScratchpad, WorkingSet, *,
 };
+#[cfg(feature = "native")]
+use sov_modules_api::{
+    count_writes, verify_against_cache, BatchVerificationStats, PrecomputedResult, GLOBAL_TX_CACHE,
+};
 use sov_rollup_interface::TxHash;
 use tracing::{trace, warn};
 
@@ -433,7 +437,59 @@ where
 
     let mut clean_scratchpad = checkpoint.to_tx_scratchpad();
 
+    // Track batch-level verification stats (only used in Node context)
+    #[cfg(feature = "native")]
+    let mut batch_verification_stats = BatchVerificationStats::new();
+
     for (idx, (raw_tx, mut injected_control_flow)) in batch_with_id.enumerate() {
+        // Check if we have a cached result and should skip execution (Node context only)
+        #[cfg(feature = "native")]
+        if execution_context == ExecutionContext::Node {
+            let tx_hash = RT::Auth::compute_tx_hash(&raw_tx)
+                .expect("Failed to compute tx hash for cache lookup");
+            if let Some(cached) = injected_control_flow.should_skip_execution(&tx_hash) {
+                // CACHE HIT: Use cached result directly, skip execution
+                // Note: `cached` is Arc<PrecomputedResult<S>>, so accessing fields is cheap
+                let provisional_reward = cached.reward;
+                let provisional_penalty = cached.penalty;
+
+                // Record stats - cache hit used, NOT verified
+                let write_count = cached.tx_changes.writes.len();
+                batch_verification_stats.record_cache_hit(write_count);
+
+                // Commit scratchpad to get checkpoint, then apply cached writes
+                let mut new_checkpoint = clean_scratchpad.commit();
+                
+                // Apply cached tx_changes writes to the checkpoint (by reference, no clone)
+                new_checkpoint.apply_tx_changes(&cached.tx_changes);
+                
+                new_checkpoint.commit_revertable_storage_cache();
+
+                // Charge gas
+                slot_gas_meter
+                    .charge_gas(&cached.gas_used, sequencer_da_address)
+                    .expect("Impossible happened: SlotGasMeter underflows when charging gas.");
+
+                // Accumulate rewards/penalties
+                accumulated_reward = accumulated_reward
+                    .checked_add(provisional_reward)
+                    .expect("Total supply of gas token exceeded.");
+                accumulated_penalty = accumulated_penalty
+                    .checked_add(provisional_penalty)
+                    .expect("Total supply of gas token exceeded");
+
+                // NOTE: Do NOT update sequencer_bond_per_tx here.
+                // The normal path only updates it in IgnoreTx (penalty case),
+                // not for successful ContinueProcessing txs.
+
+                // Clone receipt only when pushing to results (unavoidable)
+                tx_receipts.push(cached.receipt.clone());
+                clean_scratchpad = new_checkpoint.to_tx_scratchpad();
+                continue; // Skip to next transaction
+            }
+        }
+
+        // CACHE MISS: Execute normally
         injected_control_flow.try_warm_up_cache(&mut clean_scratchpad);
 
         // Authorize and process the transaction, handling sequencer rewards/penalties internally.
@@ -460,7 +516,7 @@ where
 
         let provisional_outcome = match outcome {
             AuthAndProcessOutcome::IllegalSequencer { reason } => {
-                tracing::warn!(%reason, "Transaction could not be attempted due to sequencer error. If this error persists, check that your sequencer has sufficient funds");
+                tracing::warn!(%reason, idx, "[TX OUTCOME] IllegalSequencer - transaction could not be attempted");
                 ProvisionalSequencerOutcome::out_of_funds(
                     // SAFETY: `gas_used` is either Zero or comes from `BasicGasMeter`, which ensures overflow protection.
                     gas_used
@@ -474,6 +530,7 @@ where
                 tx_hash,
                 tx_body,
             } => {
+                tracing::warn!(%tx_hash, idx, ?error, "[TX OUTCOME] Skipped - transaction failed before execution");
                 ProvisionalSequencerOutcome::penalize(
                     // SAFETY: `gas_used`  comes from `BasicGasMeter`, which ensures overflow protection.
                     gas_used
@@ -492,11 +549,22 @@ where
             AuthAndProcessOutcome::Applied {
                 transaction_consumption,
                 receipt,
-            } => ProvisionalSequencerOutcome::reward(
-                transaction_consumption.priority_fee().0,
-                receipt,
-            ),
+            } => {
+                tracing::debug!(
+                    tx_hash = %receipt.tx_hash,
+                    idx,
+                    "[TX OUTCOME] Applied - transaction executed successfully"
+                );
+                ProvisionalSequencerOutcome::reward(
+                    transaction_consumption.priority_fee().0,
+                    receipt,
+                )
+            }
         };
+
+        // Capture tx_changes for verification BEFORE post_tx consumes the scratchpad
+        #[cfg(feature = "native")]
+        let tx_changes_for_verification = dirty_scratchpad.tx_changes(execution_context);
 
         let provisional_reward = provisional_outcome.reward;
         let provisional_penalty = provisional_outcome.penalty;
@@ -509,6 +577,54 @@ where
         );
         match outcome {
             TxControlFlow::ContinueProcessing(receipt) => {
+                // Build PrecomputedResult from the same pipeline point for both Sequencer and Node.
+                // This ensures we're comparing like-for-like when verifying.
+                #[cfg(feature = "native")]
+                let precomputed_for_verification = PrecomputedResult {
+                    receipt: receipt.clone(),
+                    tx_changes: tx_changes_for_verification,
+                    gas_used: gas_used.clone(),
+                    execution_time_micros: 0, // Not tracked here
+                    reward: provisional_reward,
+                    penalty: provisional_penalty,
+                };
+
+                #[cfg(feature = "native")]
+                {
+                    // For Sequencer context: Insert into global cache for later node verification
+                    if execution_context == ExecutionContext::Sequencer {
+                        GLOBAL_TX_CACHE.insert::<S>(
+                            receipt.tx_hash,
+                            precomputed_for_verification.clone(),
+                        );
+                        tracing::debug!(
+                            tx_hash = %receipt.tx_hash,
+                            num_writes = precomputed_for_verification.tx_changes.writes.len(),
+                            reward = ?precomputed_for_verification.reward,
+                            penalty = ?precomputed_for_verification.penalty,
+                            "[CACHE] Inserted tx result from Sequencer context for node verification"
+                        );
+                    }
+
+                    // For Node context: Verify against cached sequencer result
+                    if execution_context == ExecutionContext::Node {
+                        let verification_result = verify_against_cache(
+                            &receipt.tx_hash,
+                            &precomputed_for_verification,
+                        );
+                        let write_count = count_writes(&precomputed_for_verification);
+                        batch_verification_stats.record(&verification_result, write_count);
+
+                        // Notify control flow of verification result (for logging)
+                        injected_control_flow.on_verification_result(
+                            &receipt.tx_hash,
+                            &precomputed_for_verification,
+                            &verification_result,
+                            execution_context,
+                        );
+                    }
+                }
+
                 new_checkpoint.commit_revertable_storage_cache();
                 // SAFETY: It is safe to unwrap here because the total gas used is guaranteed to be less than the slot gas limit.
                 slot_gas_meter
@@ -602,6 +718,31 @@ where
         sequencer_da_address,
         &mut checkpoint,
     );
+
+    // Log batch-level verification summary (only in Node context)
+    #[cfg(feature = "native")]
+    if execution_context == ExecutionContext::Node && batch_verification_stats.total_txs > 0 {
+        if batch_verification_stats.all_verified_match() {
+            tracing::info!(
+                blob_idx,
+                stats = %batch_verification_stats,
+                "[BATCH VERIFICATION] ✓ All transactions verified successfully"
+            );
+        } else if batch_verification_stats.mismatches > 0 {
+            tracing::warn!(
+                blob_idx,
+                stats = %batch_verification_stats,
+                "[BATCH VERIFICATION] ⚠ Some transactions had verification mismatches"
+            );
+        } else {
+            tracing::debug!(
+                blob_idx,
+                stats = %batch_verification_stats,
+                "[BATCH VERIFICATION] Batch verification complete (some cache misses)"
+            );
+        }
+    }
+
     apply_batch_logs(&batch_receipt, blob_idx);
     span.exit();
     (batch_receipt, checkpoint)

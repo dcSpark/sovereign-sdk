@@ -378,7 +378,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         }
 
         let apply_changes_start = std::time::Instant::now();
-        self.checkpoint.apply_tx_changes(tx_changes.clone());
+        self.checkpoint.apply_tx_changes(&tx_changes);
         let apply_changes_time = apply_changes_start.elapsed();
         tracing::debug!(
             checkpoint_apply_ms = apply_changes_time.as_secs_f64() * 1000.0,

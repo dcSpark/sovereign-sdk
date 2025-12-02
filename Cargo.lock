@@ -12667,6 +12667,7 @@ dependencies = [
  "borsh",
  "bs58",
  "clap",
+ "dashmap 6.1.0",
  "derivative",
  "derive_more 1.0.0",
  "digest 0.10.7",
@@ -12674,6 +12675,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "nearly-linear",
+ "once_cell",
  "openapiv3",
  "proptest",
  "proptest-derive",
@@ -13134,7 +13136,6 @@ dependencies = [
  "sov-zkvm-utils",
  "tempfile",
  "tokio",
- "toml 0.8.23",
  "tracing",
  "tracing-panic",
 ]
