@@ -171,96 +171,90 @@ pub enum MidnightPrivacyError<S: Spec> {
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
-    /// Internal helper: Add a single commitment to the tree.
+    /// Internal helper: Queue a single commitment for end-of-block processing.
     /// Used by deposit() and transfer() to append note commitments.
     ///
-    /// If the tree is full, it automatically grows using the Verdict-style doubling technique:
-    /// the current tree becomes the left subtree of a deeper tree, with the right subtree
-    /// initialized to all-zero defaults. This allows unlimited growth up to MAX_TREE_DEPTH (63).
+    /// BLOCK-DEFERRED DESIGN: The commitment_tree is NOT updated here. Instead:
+    /// 1. Position is assigned and incremented (per tx)
+    /// 2. Commitment is queued for this block
+    /// 3. Tree update and root computation happen in end_block_flush (once per block)
+    ///
+    /// This reduces per-tx state writes from ~4MB (full tree) to ~100 bytes,
+    /// dramatically reducing cache memory usage.
+    ///
+    /// SEMANTIC CHANGE: new_root is a placeholder [0u8; 32]. Real roots are computed
+    /// and published to recent_roots/all_roots at end of block in end_block_flush.
     fn add_commitment(
         &mut self,
         commitment: Hash32,
         state: &mut impl TxState<S>,
     ) -> Result<(u64, Hash32)> {
-        // Get current tree and position
-        let mut tree = self.commitment_tree.get_or_err(state)??;
+        // 1) Position bookkeeping (per tx)
         let position = self.next_position.get_or_err(state)??;
-
-        // Ensure the tree has capacity for this position; double as needed.
-        // This replaces the old TreeFull error with automatic growth.
-        if position >= tree.len() as u64 {
-            // `position` is the index we are about to write, so we need at least `position + 1` leaves.
-            tree.grow_to_fit((position + 1) as usize);
-        }
-
-        // Add to tree
-        tree.set_leaf(position as usize, commitment);
-        let new_root = tree.root();
-
-        // Update state
-        self.commitment_tree.set(&tree, state)?;
         self.next_position.set(&(position + 1), state)?;
 
-        // DEFERRED: Queue root for end-of-block flush instead of making it visible immediately.
-        // This allows true parallelism within a block since roots aren't contended.
-        // Same-block anchors naturally fail since roots aren't in recent_roots/all_roots yet.
-        // INDEXED APPEND: O(1) state write per root, scales to thousands of txs per block.
-        // REQUIRES: rollup_height_to_access() is stable during entire block execution.
+        // 2) Queue this commitment for end-of-block tree update
         let current_height = state.rollup_height_to_access();
         let idx = self
-            .pending_roots_count
+            .pending_commitments_count
             .get(&current_height, state)?
             .unwrap_or(0);
         let key = PendingRootKey {
             height: current_height.get(),
             idx,
         };
-        self.pending_roots_indexed.set(&key, &new_root, state)?;
-        self.pending_roots_count
+        self.pending_commitments_indexed.set(&key, &commitment, state)?;
+        self.pending_commitments_count
             .set(&current_height, &(idx + 1), state)?;
 
-        // Emit event
+        // 3) Emit event with placeholder root
+        // NOTE: new_root is [0; 32] placeholder. Real roots are emitted by end_block_flush.
+        // Clients should use RootPublished events (from end_block_flush) for anchor tracking.
+        let placeholder_root = [0u8; 32];
         self.emit_event(
             state,
             Event::NoteCreated {
                 commitment,
                 position,
-                new_root,
+                new_root: placeholder_root,
             },
         );
 
-        Ok((position, new_root))
+        Ok((position, placeholder_root))
     }
 
-    /// Internal helper: Append a nullifier into the nullifier tree.
+    /// Internal helper: Queue a nullifier for end-of-block processing.
     /// Used by transfer() and withdraw() to record spent nullifiers in Merkle tree form.
     ///
-    /// If the tree is full, it automatically grows using the Verdict-style doubling technique.
-    /// This maintains an Aztec-style nullifier tree in parallel with `nullifier_set`,
-    /// ready for future IMT-based non-membership proofs in the circuit.
+    /// BLOCK-DEFERRED DESIGN: The nullifier_tree is NOT updated here. Instead:
+    /// 1. Position is assigned and incremented (per tx)
+    /// 2. Nullifier is queued for this block
+    /// 3. Tree update happens in end_block_flush (once per block)
     ///
-    /// Note: Double-spend protection is still done via `nullifier_set` (O(1) lookup).
+    /// Note: Double-spend protection is still done via `nullifier_set` (O(1) lookup, per tx).
     /// The nullifier tree is for canonical root tracking and future circuit integration.
     fn append_nullifier(
         &mut self,
         nullifier: Hash32,
         state: &mut impl TxState<S>,
     ) -> Result<u64> {
-        // Get current nullifier tree and position
-        let mut tree = self.nullifier_tree.get_or_err(state)??;
+        // 1) Position bookkeeping (per tx)
         let pos = self.next_nullifier_position.get_or_err(state)??;
-
-        // Ensure the tree has capacity for this position; grow as needed.
-        if pos >= tree.len() as u64 {
-            tree.grow_to_fit((pos + 1) as usize);
-        }
-
-        // Append nullifier to tree
-        tree.set_leaf(pos as usize, nullifier);
-
-        // Persist updated tree and position
-        self.nullifier_tree.set(&tree, state)?;
         self.next_nullifier_position.set(&(pos + 1), state)?;
+
+        // 2) Queue this nullifier for end-of-block tree update
+        let current_height = state.rollup_height_to_access();
+        let idx = self
+            .pending_nullifiers_count
+            .get(&current_height, state)?
+            .unwrap_or(0);
+        let key = PendingRootKey {
+            height: current_height.get(),
+            idx,
+        };
+        self.pending_nullifiers_indexed.set(&key, &nullifier, state)?;
+        self.pending_nullifiers_count
+            .set(&current_height, &(idx + 1), state)?;
 
         Ok(pos)
     }
@@ -822,33 +816,157 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(self.all_roots.get(&RootKey(*anchor), state)?.is_some())
     }
 
-    /// End-of-block flush: Drain ONLY the current block's pending roots into recent_roots and all_roots.
+    /// End-of-block flush: Replay all pending commitments/nullifiers into their trees.
     /// Called automatically by BlockHooks at the end of each block after all transactions.
-    /// This makes all roots from the block visible for anchor validation in future blocks.
     ///
-    /// SCOPE: Flushes only pending_roots_indexed[(current_height, 0..count)]. Other heights ignored.
-    /// INVARIANT: begin_rollup_block_hook resets count to 0 for current height at block start.
-    /// DANGER: Indexed entries from abandoned blocks (crashes/reverts) remain in state forever
-    /// but are harmless—they're never read, don't affect validation, cause minimal state bloat.
+    /// BLOCK-DEFERRED TREE UPDATE: Instead of updating trees per-tx (causing ~4MB writes each),
+    /// we queue commitments/nullifiers during txs and replay them here once per block.
+    /// This reduces per-tx cache memory from ~4MB to ~100 bytes.
+    ///
+    /// Process:
+    /// 1. Load commitment_tree, replay all pending commitments, record each root
+    /// 2. Load nullifier_tree, replay all pending nullifiers
+    /// 3. Save both trees once
+    ///
+    /// SCOPE: Flushes only current block's pending items. Other heights ignored.
+    /// INVARIANT: begin_rollup_block_hook resets counts to 0 at block start.
+    /// DANGER: Indexed entries from abandoned blocks remain in state (harmless bloat).
     ///
     /// Idempotent: safe to call multiple times (subsequent calls are no-ops if count is 0).
-    ///
-    /// Note: This should NOT be exposed as a transaction call - it must only run at block boundaries
-    /// to maintain parallelism guarantees. Tests can call this directly or via end_rollup_block_hook.
     pub fn end_block_flush(
         &mut self,
         st: &mut sov_modules_api::StateCheckpoint<S>,
     ) -> anyhow::Result<()> {
-        // Fetch count for the CURRENT rollup height only.
-        // Other heights (e.g., from abandoned blocks) are deliberately ignored.
         let current_height = st.rollup_height_to_access();
-        let count = self
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // PHASE 1: Replay pending commitments into the commitment tree
+        // ═══════════════════════════════════════════════════════════════════════════════
+        let commitment_count = self
+            .pending_commitments_count
+            .get(&current_height, st)?
+            .unwrap_or(0);
+
+        if commitment_count > 0 {
+            // Load tree once
+            let mut tree = self.commitment_tree.get_or_err(st)??;
+            
+            // Get the final next_position (already incremented during txs)
+            let final_next_pos = self.next_position.get_or_err(st)??;
+            
+            // Starting position for this block's commitments
+            let start_pos = final_next_pos
+                .checked_sub(commitment_count as u64)
+                .ok_or_else(|| anyhow::anyhow!("next_position underflow in end_block_flush"))?;
+
+            // Replay each commitment
+            let mut pos = start_pos;
+            for idx in 0..commitment_count {
+                let key = PendingRootKey {
+                    height: current_height.get(),
+                    idx,
+                };
+                let cm = self
+                    .pending_commitments_indexed
+                    .get(&key, st)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Missing pending commitment at ({}, {}). State corruption detected.",
+                            current_height,
+                            idx
+                        )
+                    })?;
+
+                // Grow tree if needed
+                if pos >= tree.len() as u64 {
+                    tree.grow_to_fit((pos + 1) as usize);
+                }
+
+                // Set leaf and compute root
+                tree.set_leaf(pos as usize, cm);
+                let root = tree.root();
+
+                // Record root in recent_roots and all_roots
+                self.add_recent_root_direct(root, st)?;
+                self.record_root_forever_direct(root, st)?;
+
+                pos += 1;
+            }
+
+            // Save tree once (single ~4MB write per block instead of per tx)
+            self.commitment_tree.set(&tree, st)?;
+        }
+
+        // Reset commitment count
+        self.pending_commitments_count
+            .set(&current_height, &0u32, st)?;
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // PHASE 2: Replay pending nullifiers into the nullifier tree
+        // ═══════════════════════════════════════════════════════════════════════════════
+        let nullifier_count = self
+            .pending_nullifiers_count
+            .get(&current_height, st)?
+            .unwrap_or(0);
+
+        if nullifier_count > 0 {
+            // Load tree once
+            let mut tree = self.nullifier_tree.get_or_err(st)??;
+            
+            // Get the final next_nullifier_position (already incremented during txs)
+            let final_next_pos = self.next_nullifier_position.get_or_err(st)??;
+            
+            // Starting position for this block's nullifiers
+            let start_pos = final_next_pos
+                .checked_sub(nullifier_count as u64)
+                .ok_or_else(|| anyhow::anyhow!("next_nullifier_position underflow in end_block_flush"))?;
+
+            // Replay each nullifier
+            let mut pos = start_pos;
+            for idx in 0..nullifier_count {
+                let key = PendingRootKey {
+                    height: current_height.get(),
+                    idx,
+                };
+                let nf = self
+                    .pending_nullifiers_indexed
+                    .get(&key, st)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Missing pending nullifier at ({}, {}). State corruption detected.",
+                            current_height,
+                            idx
+                        )
+                    })?;
+
+                // Grow tree if needed
+                if pos >= tree.len() as u64 {
+                    tree.grow_to_fit((pos + 1) as usize);
+                }
+
+                // Set leaf
+                tree.set_leaf(pos as usize, nf);
+                pos += 1;
+            }
+
+            // Save tree once
+            self.nullifier_tree.set(&tree, st)?;
+        }
+
+        // Reset nullifier count
+        self.pending_nullifiers_count
+            .set(&current_height, &0u32, st)?;
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // PHASE 3: Legacy - flush any pending roots (for backwards compatibility)
+        // This handles roots that were already queued before this change.
+        // ═══════════════════════════════════════════════════════════════════════════════
+        let root_count = self
             .pending_roots_count
             .get(&current_height, st)?
             .unwrap_or(0);
 
-        // Iterate through indexed roots and apply each one
-        for idx in 0..count {
+        for idx in 0..root_count {
             let key = PendingRootKey {
                 height: current_height.get(),
                 idx,
@@ -864,9 +982,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.record_root_forever_direct(root, st)?;
         }
 
-        // Reset count for this height (effectively "clears" the pending roots for this block)
-        // Note: We don't delete the indexed entries to save gas. They're never read again since
-        // count is reset, and new blocks use different heights. Cleanup could be added if needed.
         self.pending_roots_count
             .set(&current_height, &0u32, st)?;
 

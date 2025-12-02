@@ -187,6 +187,27 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[state]
     pub pending_roots_count: StateMap<RollupHeight, u32>,
 
+    /// Indexed pending commitments: (rollup_height, idx) -> commitment.
+    /// Each block appends commitments with sequential indices for deferred tree update.
+    /// This allows the commitment_tree to be updated only once at end of block,
+    /// drastically reducing per-tx state writes and cache memory.
+    #[state]
+    pub pending_commitments_indexed: StateMap<PendingRootKey, Hash32>,
+
+    /// Per-height counter: how many commitments are pending for each height.
+    #[state]
+    pub pending_commitments_count: StateMap<RollupHeight, u32>,
+
+    /// Indexed pending nullifiers: (rollup_height, idx) -> nullifier.
+    /// Each block appends nullifiers with sequential indices for deferred tree update.
+    /// This allows the nullifier_tree to be updated only once at end of block.
+    #[state]
+    pub pending_nullifiers_indexed: StateMap<PendingRootKey, Hash32>,
+
+    /// Per-height counter: how many nullifiers are pending for each height.
+    #[state]
+    pub pending_nullifiers_count: StateMap<RollupHeight, u32>,
+
     /// Total number of **spent nullifiers** (both transfers and withdrawals).
     #[state]
     pub spent_nullifier_count: StateValue<u64>,
@@ -281,13 +302,15 @@ impl<S: Spec> BlockHooks for ValueMidnightPrivacy<S> {
         _visible_hash: &<<Self::Spec as Spec>::Storage as sov_modules_api::Storage>::Root,
         state: &mut sov_modules_api::StateCheckpoint<Self::Spec>,
     ) {
-        // CRITICAL: Reset counter for current height. Defensive against:
+        // CRITICAL: Reset counters for current height. Defensive against:
         // - Block re-execution after crash/revert (prevents double-flush)
         // - State replay from checkpoint (clears stale pending count)
         // NOTE: Only resets CURRENT height. Stale indexed entries from abandoned heights
         // remain in state (harmless but wastes space). Periodic cleanup not implemented.
         let height = state.rollup_height_to_access();
         let _ = self.pending_roots_count.set(&height, &0u32, state);
+        let _ = self.pending_commitments_count.set(&height, &0u32, state);
+        let _ = self.pending_nullifiers_count.set(&height, &0u32, state);
     }
 
     fn end_rollup_block_hook(&mut self, state: &mut sov_modules_api::StateCheckpoint<Self::Spec>) {
