@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
 
@@ -23,11 +25,16 @@ use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_api_spec::types as api_types;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
+use sov_rollup_interface::zk::CodeCommitment;
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
+use sov_proof_verifier_service::{create_router, AppState, RollupSpec, ServiceConfig};
 use tokio::sync::Semaphore;
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
+use tempfile::TempDir;
+use toml::Value as TomlValue;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -46,11 +53,12 @@ struct ContinuousConfig {
     initial_deposit: bool,
     per_tx_delay_ms: u64,
     cycle_delay_ms: u64,
-    external_node_url: String,
-    external_verifier_url: String,
+    external_node_url: Option<String>,
+    external_verifier_url: Option<String>,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
     continuous: bool,
+    managed_mode: bool,
 }
 
 impl ContinuousConfig {
@@ -77,9 +85,11 @@ impl ContinuousConfig {
             .unwrap_or(1000);
 
         let external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL")
-            .unwrap_or_else(|_| "http://localhost:12346".to_string());
+            .ok()
+            .or_else(|| Some("http://localhost:12346".to_string()));
         let external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+            .ok()
+            .or_else(|| Some("http://localhost:8080".to_string()));
 
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
@@ -95,6 +105,10 @@ impl ContinuousConfig {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let managed_mode = std::env::var("MANAGED_MODE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Ok(Self {
             num_wallets,
@@ -106,6 +120,7 @@ impl ContinuousConfig {
             max_concurrent_proofs,
             detailed_wallet_logs,
             continuous,
+            managed_mode,
         })
     }
 }
@@ -117,6 +132,266 @@ struct WalletState {
     value: u128,
     rho: Hash32,
     recipient: Hash32,
+}
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+struct ManagedStack {
+    api_url: String,
+    verifier_url: String,
+    chain_hash: [u8; 32],
+    _temp_dir: TempDir,
+    _child_guard: ChildGuard,
+}
+
+#[derive(Clone)]
+struct LigeroEnv {
+    program_path: String,
+    method_id: [u8; 32],
+    prover_bin: String,
+    verifier_bin: String,
+    shader_dir: String,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(child)
+    }
+}
+
+fn find_rollup_binary() -> Result<String> {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov-rollup-ligero") {
+        return Ok(p);
+    }
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov_rollup_ligero") {
+        return Ok(p);
+    }
+
+    let target_dir = std::env::var("CARGO_TARGET_DIR").ok().unwrap_or_else(|| {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let target_path = Path::new(&target_dir);
+    for profile in &["release", "debug"] {
+        let candidate = target_path.join(profile).join("sov-rollup-ligero");
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    bail!(
+        "sov-rollup-ligero binary not found in target/{{release,debug}}; \
+         run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
+    );
+}
+
+fn make_temp_config(base_config: &str, data_dir: &Path, http_port: u16) -> String {
+    // Keep configuration verbatim; rely on values in rollup_config.toml.
+    let _ = data_dir;
+    let _ = http_port;
+    base_config.to_string()
+}
+
+async fn wait_for_ready(client: &NodeClient, timeout: Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            bail!("Timeout waiting for rollup to be ready");
+        }
+        if client.client.is_ready().await.is_ok() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn start_local_verifier(
+    api_url: &str,
+    method_id: [u8; 32],
+    da_connection_string: &str,
+    max_concurrent_verifications: usize,
+) -> Result<String> {
+    use sov_rollup_interface::crypto::PrivateKey as _;
+
+    let sk: <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey =
+        <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey::generate();
+    let pk = sk.pub_key();
+    let addr: <RollupSpec as sov_modules_api::Spec>::Address = pk.credential_id().into();
+
+    let tmpkey = tempfile::NamedTempFile::new().context("Failed to create temp key file")?;
+    std::fs::write(
+        tmpkey.path(),
+        serde_json::to_string(&serde_json::json!({
+            "private_key": sk,
+            "address": addr,
+        }))?,
+    )?;
+
+    let verifier_cfg = ServiceConfig {
+        node_rpc_url: api_url.to_string(),
+        signing_key_path: tmpkey.path().to_string_lossy().to_string(),
+        value_setter_method_id: None,
+        midnight_method_id: Some(method_id),
+        max_concurrent_verifications,
+        chain_id: 1,
+        da_connection_string: da_connection_string.to_string(),
+        defer_sequencer_submission: false,
+    };
+    let state = AppState::new(verifier_cfg)
+        .await
+        .context("Failed to create AppState")?;
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let service_addr = listener.local_addr()?;
+    let verifier_url = format!("http://{}", service_addr);
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
+        )
+        .await
+        .expect("Failed to serve proof verifier service");
+    });
+    std::mem::forget(tmpkey);
+
+    let hc = reqwest::Client::new();
+    let _ = hc.get(format!("{}/health", verifier_url)).send().await;
+
+    Ok(verifier_url)
+}
+
+async fn start_managed_stack(
+    ligero_env: &LigeroEnv,
+    config: &ContinuousConfig,
+) -> Result<ManagedStack> {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bin_path = find_rollup_binary()?;
+
+    let base_cfg_path = crate_dir.join("rollup_config.toml");
+    let base_cfg = std::fs::read_to_string(&base_cfg_path)
+        .with_context(|| format!("Failed to read base config at {}", base_cfg_path.display()))?;
+
+    let temp = tempfile::tempdir()?;
+    let new_cfg = make_temp_config(&base_cfg, temp.path(), 0);
+    let cfg_path = temp.path().join("rollup_config.toml");
+    std::fs::write(&cfg_path, new_cfg)?;
+
+    // Parse bind_host/bind_port and DA connection string from the (verbatim) config.
+    let cfg_value: TomlValue = toml::from_str(&base_cfg)
+        .with_context(|| "Failed to parse rollup_config.toml for managed mode")?;
+    let bind_host = cfg_value
+        .get("runner")
+        .and_then(|r| r.get("http_config"))
+        .and_then(|h| h.get("bind_host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("127.0.0.1");
+    let bind_port = cfg_value
+        .get("runner")
+        .and_then(|r| r.get("http_config"))
+        .and_then(|h| h.get("bind_port"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(12346);
+    let da_connection_string = cfg_value
+        .get("da")
+        .and_then(|d| d.get("connection_string"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("sqlite://demo_data/da.sqlite?mode=rwc")
+        .to_string();
+
+    let mut child = Command::new(bin_path)
+        .current_dir(crate_dir)
+        .arg("--rollup-config-path")
+        .arg(cfg_path.as_os_str())
+        .arg("--prometheus-exporter-bind")
+        .arg("127.0.0.1:0")
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+        )
+        .env("LIGERO_PROGRAM_PATH", &ligero_env.program_path)
+        .env("LIGERO_VERIFIER_BIN", &ligero_env.verifier_bin)
+        .env("LIGERO_PROVER_BIN", &ligero_env.prover_bin)
+        .env("LIGERO_SHADER_PATH", &ligero_env.shader_dir)
+        .env("LIGERO_PACKING", "8192")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn sov-rollup-ligero")?;
+
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                eprintln!("[node stdout] {}", line);
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                eprintln!("[node stderr] {}", line);
+            }
+        });
+    }
+
+    let api_host = if bind_host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        bind_host
+    };
+    let api_url = format!("http://{}:{}", api_host, bind_port);
+    let client = NodeClient::new_unchecked(&api_url);
+    wait_for_ready(&client, Duration::from_secs(90)).await?;
+
+    #[derive(Deserialize)]
+    struct SchemaRespLocal {
+        chain_hash: String,
+    }
+    let schema: SchemaRespLocal = client
+        .query_rest_endpoint("/rollup/schema")
+        .await
+        .context("Failed to fetch /rollup/schema from managed node")?;
+    let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
+    let chain_hash_vec =
+        hex::decode(chain_hash_hex).with_context(|| "Invalid chain_hash returned by node")?;
+    if chain_hash_vec.len() != 32 {
+        bail!("chain_hash must be 32 bytes");
+    }
+    let mut chain_hash = [0u8; 32];
+    chain_hash.copy_from_slice(&chain_hash_vec);
+
+    let verifier_parallelism = std::cmp::max(4, config.max_concurrent_proofs);
+    let verifier_url = start_local_verifier(
+        &api_url,
+        ligero_env.method_id,
+        &da_connection_string,
+        verifier_parallelism,
+    )
+    .await?;
+
+    Ok(ManagedStack {
+        api_url,
+        verifier_url,
+        chain_hash,
+        _temp_dir: temp,
+        _child_guard: ChildGuard::new(child),
+    })
 }
 
 #[derive(Deserialize, Clone)]
@@ -286,14 +561,47 @@ async fn main() -> Result<()> {
         config.max_concurrent_proofs
     );
     eprintln!(
-        "[config] node_url={} verifier_url={}",
-        config.external_node_url, config.external_verifier_url
+        "[config] node_url={} verifier_url={} managed_mode={}",
+        config
+            .external_node_url
+            .as_deref()
+            .unwrap_or("<managed (local)>"),
+        config
+            .external_verifier_url
+            .as_deref()
+            .unwrap_or("<managed (local)>"),
+        config.managed_mode
     );
 
-    // Setup Ligero environment (program path, prover/verifier bins, shaders)
-    let program_path = setup_ligero_env()?;
+    // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
+    let ligero_env = setup_ligero_env()?;
+    let program_path = ligero_env.program_path.clone();
 
-    let client = NodeClient::new_unchecked(&config.external_node_url);
+    // Start local stack if endpoints not provided.
+    let mut managed_stack: Option<ManagedStack> = None;
+    let (node_url, verifier_url) = if config.managed_mode {
+        let managed = start_managed_stack(&ligero_env, &config).await?;
+        let node = managed.api_url.clone();
+        let verifier = managed.verifier_url.clone();
+        managed_stack = Some(managed);
+        (node, verifier)
+    } else {
+        let node = config
+            .external_node_url
+            .clone()
+            .ok_or_else(|| anyhow!("E2E_ROLLUP_EXTERNAL_NODE_URL must be set unless MANAGED_MODE=1"))?;
+        let verifier = config
+            .external_verifier_url
+            .clone()
+            .ok_or_else(|| anyhow!("E2E_ROLLUP_EXTERNAL_VERIFIER_URL must be set unless MANAGED_MODE=1"))?;
+        (node, verifier)
+    };
+    eprintln!(
+        "[config] using node_url={} verifier_url={}",
+        node_url, verifier_url
+    );
+
+    let client = NodeClient::new_unchecked(&node_url);
     let http = HttpClient::new();
 
     // Fetch chain hash for signing
@@ -301,18 +609,26 @@ async fn main() -> Result<()> {
     struct SchemaResp {
         chain_hash: String,
     }
-    let schema: SchemaResp = client
-        .query_rest_endpoint("/rollup/schema")
-        .await
-        .context("Failed to fetch /rollup/schema")?;
-    let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
-    let chain_hash_vec =
-        hex::decode(chain_hash_hex).with_context(|| "Invalid chain_hash returned by node")?;
-    if chain_hash_vec.len() != 32 {
-        bail!("chain_hash must be 32 bytes");
+    if managed_stack.is_some() {
+        wait_for_ready(&client, Duration::from_secs(90)).await?;
     }
-    let mut chain_hash = [0u8; 32];
-    chain_hash.copy_from_slice(&chain_hash_vec);
+    let chain_hash: [u8; 32] = if let Some(ms) = managed_stack.as_ref() {
+        ms.chain_hash
+    } else {
+        let schema: SchemaResp = client
+            .query_rest_endpoint("/rollup/schema")
+            .await
+            .context("Failed to fetch /rollup/schema")?;
+        let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
+        let chain_hash_vec =
+            hex::decode(chain_hash_hex).with_context(|| "Invalid chain_hash returned by node")?;
+        if chain_hash_vec.len() != 32 {
+            bail!("chain_hash must be 32 bytes");
+        }
+        let mut chain_hash_arr = [0u8; 32];
+        chain_hash_arr.copy_from_slice(&chain_hash_vec);
+        chain_hash_arr
+    };
 
     // Load genesis keypairs
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -342,7 +658,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let node_base_url = config.external_node_url.clone();
+    let node_base_url = node_url.clone();
     let wallet_setup_start = Instant::now();
     let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
     for i in 0..config.num_wallets {
@@ -470,6 +786,7 @@ async fn main() -> Result<()> {
                 &chain_hash,
                 &program_path,
                 &config,
+                &verifier_url,
                 &mut cached_tree,
                 &mut cached_next_position,
                 &mut cached_root,
@@ -645,7 +962,7 @@ fn log_final_summary(
     eprintln!("[final-summary] =================================\n");
 }
 
-fn setup_ligero_env() -> Result<String> {
+fn setup_ligero_env() -> Result<LigeroEnv> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
         .ancestors()
@@ -672,13 +989,30 @@ fn setup_ligero_env() -> Result<String> {
         );
     }
 
+    // Compute the method id (code commitment) and set environment variables for downstream tools.
+    use sov_rollup_interface::zk::ZkvmHost;
+    let host = <sov_ligero_adapter::Ligero as sov_rollup_interface::zk::Zkvm>::Host::from_args(
+        &program_path.to_string_lossy().to_string(),
+    );
+    let code_commitment = host.code_commitment();
+    let method_id: [u8; 32] = code_commitment
+        .encode()
+        .try_into()
+        .map_err(|_| anyhow!("Code commitment should be 32 bytes"))?;
+
     std::env::set_var("LIGERO_PROGRAM_PATH", &program_path);
     std::env::set_var("LIGERO_PROVER_BIN", &prover_bin);
     std::env::set_var("LIGERO_VERIFIER_BIN", &verifier_bin);
     std::env::set_var("LIGERO_SHADER_PATH", &shader_dir);
     std::env::set_var("LIGERO_PACKING", "8192");
 
-    Ok(program_path.to_string_lossy().to_string())
+    Ok(LigeroEnv {
+        program_path: program_path.to_string_lossy().to_string(),
+        method_id,
+        prover_bin: prover_bin.to_string_lossy().to_string(),
+        verifier_bin: verifier_bin.to_string_lossy().to_string(),
+        shader_dir: shader_dir.to_string_lossy().to_string(),
+    })
 }
 
 async fn perform_initial_deposits(
@@ -795,6 +1129,7 @@ async fn perform_transfer_cycle(
     chain_hash: &[u8; 32],
     program_path: &str,
     config: &ContinuousConfig,
+    verifier_url: &str,
     cached_tree: &mut Option<MerkleTree>,
     cached_next_position: &mut u64,
     cached_root: &mut Option<Hash32>,
@@ -891,6 +1226,7 @@ async fn perform_transfer_cycle(
                 pos_by_cm.clear();
                 cached_next_pos = 0;
                 cached_root_val = None;
+                continue;
             }
 
             if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
@@ -900,6 +1236,11 @@ async fn perform_transfer_cycle(
                 );
             }
 
+            // Force a full rebuild on the next attempt to resync.
+            mt = MerkleTree::new(TREE_DEPTH);
+            pos_by_cm.clear();
+            cached_next_pos = 0;
+            cached_root_val = None;
             sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
         }
 
@@ -1202,7 +1543,7 @@ async fn perform_transfer_cycle(
     // Track per-tx worker processing metrics (from verifier)
     let transfer_submit_start = Instant::now();
     let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
-    let submit_endpoint = format!("{}/midnight-privacy", config.external_verifier_url);
+    let submit_endpoint = format!("{}/midnight-privacy", verifier_url);
     let concurrency_limit = config.max_concurrent_proofs.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency_limit));
     let mut join_set = JoinSet::new();
@@ -1343,7 +1684,7 @@ async fn perform_transfer_cycle(
     let resp = http
         .post(format!(
             "{}/midnight-privacy/flush",
-            config.external_verifier_url
+            verifier_url
         ))
         .send()
         .await
