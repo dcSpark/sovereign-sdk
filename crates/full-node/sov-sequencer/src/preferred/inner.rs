@@ -14,8 +14,8 @@ use sov_blob_sender::BlobInternalId;
 use sov_blob_storage::SequenceNumber;
 use sov_modules_api::capabilities::RollupHeight;
 use sov_modules_api::{
-    FullyBakedTx, GasArray, GasSpec, Runtime, Spec, StateCheckpoint, StateUpdateInfo,
-    VersionReader, VisibleSlotNumber,
+    FullyBakedTx, GasArray, GasSpec, PrecomputedResult, Runtime, Spec, StateCheckpoint,
+    StateUpdateInfo, VersionReader, VisibleSlotNumber, GLOBAL_TX_CACHE,
 };
 use sov_state::{NativeStorage, Storage};
 use std::collections::HashMap;
@@ -2099,6 +2099,11 @@ where
             execution_time_micros,
             original_tx_queue_id: _,
             api_effect,
+            gas_used,
+            reward,
+            penalty,
+            receipt_for_cache,
+            tx_changes_for_cache,
         } = parallel_response;
 
         tracing::info!(
@@ -2136,6 +2141,22 @@ where
             }
         };
         let commit_time = commit_start.elapsed();
+
+        // Insert into GLOBAL_TX_CACHE for later node verification.
+        // This mirrors what registered::apply_batch does for sequential execution.
+        let precomputed_for_cache = PrecomputedResult {
+            receipt: receipt_for_cache,
+            tx_changes: tx_changes_for_cache,
+            gas_used,
+            execution_time_micros,
+            reward,
+            penalty,
+        };
+        GLOBAL_TX_CACHE.insert::<S>(tx_hash, precomputed_for_cache);
+        tracing::debug!(
+            %tx_hash,
+            "[CACHE] Inserted tx result from parallel execution for node verification"
+        );
 
         // Update batch metrics
         let batch_metrics_start = std::time::Instant::now();
