@@ -14,9 +14,9 @@ use sov_modules_api::capabilities::{
 use sov_modules_api::macros::config_value;
 use sov_modules_api::CryptoSpec;
 use sov_modules_api::{
-    call_message_repr, BlobDataWithId, ChangeSet, DaSpec, ExecutionContext, FullyBakedTx, Gas,
-    GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason, Runtime,
-    RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
+    call_message_repr, Amount, ApiTxEffect, BlobDataWithId, ChangeSet, DaSpec, ExecutionContext,
+    FullyBakedTx, Gas, GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason,
+    Runtime, RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
     StateUpdateInfo, TransactionReceipt, TxChangeSet, TxHash, TxReceiptContents, VersionReader,
     VisibleSlotNumber, ApiTxEffect,
 };
@@ -272,7 +272,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         );
 
         match result {
-            Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes)) => {
+            Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes, _gas_used, _reward, _penalty)) => {
                 let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
                 if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
                     writer.insert(accepted_tx.clone()).await;
@@ -293,6 +293,8 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
     /// Execute a tx and return the raw receipt + change set without constructing an AcceptedTx.
     /// This is used by parallel workers to avoid double work; the main thread will adopt the
     /// result and assign canonical numbering.
+    ///
+    /// Returns: (receipt, tx_changes, remaining_slot_gas, execution_time_micros, gas_used, reward, penalty)
     pub async fn execute_tx_return_receipt(
         &mut self,
         baked_tx: FullyBakedTxWithMaybeChangeSet,
@@ -302,16 +304,22 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             TxChangeSet,
             <S as Spec>::Gas,
             u64,
+            <S as Spec>::Gas,
+            Amount,
+            Amount,
         ),
         RollupBlockExecutorError<S>,
     > {
-        let (receipt, remaining_slot_gas, execution_time_micros, tx_changes) =
+        let (receipt, remaining_slot_gas, execution_time_micros, tx_changes, gas_used, reward, penalty) =
             self.apply_tx_to_in_progress_batch_inner(baked_tx).await?;
         Ok((
             receipt,
             tx_changes,
             remaining_slot_gas,
             execution_time_micros,
+            gas_used,
+            reward,
+            penalty,
         ))
     }
 
@@ -319,7 +327,15 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         &mut self,
         baked_tx: FullyBakedTxWithMaybeChangeSet,
     ) -> Result<
-        (TransactionReceipt<S>, <S as Spec>::Gas, u64, TxChangeSet),
+        (
+            TransactionReceipt<S>,
+            <S as Spec>::Gas,
+            u64,
+            TxChangeSet,
+            <S as Spec>::Gas,
+            Amount,
+            Amount,
+        ),
         RollupBlockExecutorError<S>,
     > {
         let Some(task_state) = self.rollup_block_task_state.as_mut() else {
@@ -351,6 +367,9 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             tx_changes,
             remaining_slot_gas,
             execution_time_micros,
+            gas_used,
+            reward,
+            penalty,
         } = result.map_err(|reason| {
             // Decode *only if* we have a RejectReason
             let call_repr = Rt::Auth::decode_serialized_tx(&tx_data_for_lazy_decode)
@@ -387,6 +406,9 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             remaining_slot_gas,
             execution_time_micros,
             tx_changes,
+            gas_used,
+            reward,
+            penalty,
         ))
     }
 
