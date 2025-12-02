@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
 use anyhow::Context;
+#[cfg(feature = "native")]
+use midnight_privacy::prime_pre_verified_spend;
 use axum::http::StatusCode;
 use sov_modules_api::capabilities::{
     BlobSelector, BlobSelectorOutput, ChainState, FatalError, RollupHeight,
@@ -473,6 +475,12 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
             %tx_hash,
             "Re-applying state changes for the soft-confirmed transaction"
         );
+
+        #[cfg(feature = "native")]
+        // We need to reload the pre-verified cache after a restart.
+        {
+            prime_pre_verified_spend(&tx_hash);
+        }
 
         let tx = FullyBakedTxWithMaybeChangeSet::new(tx);
         match self.apply_tx_to_in_progress_batch(tx).await {
