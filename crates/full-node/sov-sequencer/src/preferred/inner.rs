@@ -1746,6 +1746,8 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+        let stage1_start = std::time::Instant::now();
+
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
         let message_sender = self.message_sender.clone();
 
@@ -1814,7 +1816,6 @@ where
             .num_parallel_tx_workers
             .unwrap_or(0)
             > 1;
-
         let parallel_routing_paused = inner.parallel_routing_paused;
         let Inner {
             executor,
@@ -1833,17 +1834,29 @@ where
             });
         }
 
-        // Try parallel processing for midnight privacy module transactions
+        // Try parallel processing for midnight privacy module transactions (only Transfer and Withdraw, not Deposit)
         // baked_tx.data contains an authenticator wrapper; unwrap it to get the RawTx first
         let detection_start = std::time::Instant::now();
-        let is_midnight_privacy_tx = {
+        let is_parallelizable_midnight_privacy_tx = {
+            // Helper to check if the debug string represents a parallelizable MidnightPrivacy call
+            // (Transfer or Withdraw, but NOT Deposit)
+            let is_parallelizable_call = |debug_str: &str| -> bool {
+                if !debug_str.starts_with("MidnightPrivacy(") {
+                    return false;
+                }
+                // Extract the inner call type after "MidnightPrivacy("
+                // The format is "Transfer { ... }" or "Deposit { ... }" so split on whitespace
+                let inner = &debug_str["MidnightPrivacy(".len()..];
+                let inner_variant = inner.split_whitespace().next().unwrap_or("");
+                // Only Transfer and Withdraw are parallelizable, Deposit is not
+                inner_variant == "Transfer" || inner_variant == "Withdraw"
+            };
+
             // Preferred: use the runtime's authenticator to decode and wrap the call
             if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
                 let runtime_call = Rt::wrap_call(decoded);
                 let debug_str = format!("{:?}", runtime_call);
-                let variant_name = debug_str.split('(').next().unwrap_or("");
-                debug!(variant = variant_name, "[detect] Runtime call variant identified during process_accept_tx");
-                variant_name == "MidnightPrivacy"
+                is_parallelizable_call(&debug_str)
             } else {
                 // Fallback: try generic AuthenticatorInput and parse the RawTx directly
                 match AuthenticatorInput::try_from_slice(&baked_tx.data) {
@@ -1856,27 +1869,19 @@ where
                             Ok(tx) => {
                                 let runtime_call = tx.runtime_call();
                                 let debug_str = format!("{:?}", runtime_call);
-                                let variant_name = debug_str.split('(').next().unwrap_or("");
-                                debug!(variant = variant_name, "[detect] Runtime call variant identified during fallback process_accept_tx");
-                                variant_name == "MidnightPrivacy"
+                                is_parallelizable_call(&debug_str)
                             }
-                            Err(e) => {
-                                debug!(error = %e, "[detect] Failed to deserialize Transaction from RawTx (fallback)");
-                                false
-                            }
+                            Err(_) => false,
                         }
                     }
-                    Err(err) => {
-                        debug!(error = ?err, "[detect] Failed to parse authenticator input in fallback");
-                        false
-                    }
+                    Err(_) => false,
                 }
             }
         };
-        let detection_elapsed = detection_start.elapsed();
 
+        let detection_elapsed = detection_start.elapsed();
         debug!(
-            is_midnight_privacy_tx,
+            is_parallelizable_midnight_privacy_tx,
             detection_micros = detection_elapsed.as_micros(),
             "[detect] Midnight privacy detection timing"
         );
@@ -1886,9 +1891,9 @@ where
         // 2. We have parallel workers configured
         // 3. Parallel routing is not paused (batch not waiting to close)
         let can_route_parallel =
-            is_midnight_privacy_tx && has_parallel_capacity && !parallel_routing_paused;
+            is_parallelizable_midnight_privacy_tx && has_parallel_capacity && !parallel_routing_paused;
 
-        if parallel_routing_paused && is_midnight_privacy_tx {
+        if parallel_routing_paused && is_parallelizable_midnight_privacy_tx {
             tracing::debug!(
                 %tx_hash,
                 "[PARALLEL] Routing to sequential path: parallel routing paused (batch closing)"
@@ -1897,8 +1902,6 @@ where
 
         if can_route_parallel {
             // Send to parallel executor - worker will send result directly to message loop
-            let stage1_start = std::time::Instant::now();
-            tracing::info!(%tx_hash, "[STAGE 1] Sending transaction to parallel executor");
             if parallel_tx_executor.send_tx(
                 baked_tx.clone(),
                 tx_hash,
@@ -1907,15 +1910,13 @@ where
                 tx_len,
                 message_sender,
             ) {
-                let stage1_duration = stage1_start.elapsed();
-                sov_metrics::track_metrics(|t| {
-                    t.submit(crate::metrics::ParallelTxStageMetrics {
-                        tx_hash: tx_hash.to_string(),
-                        stage: 1,
-                        duration_us: stage1_duration.as_micros() as u64,
-                    });
-                });
-                debug!(%tx_hash, "[PARALLEL] Transaction sent to parallel executor");
+                let stage1_elapsed = stage1_start.elapsed();
+                info!(
+                    %tx_hash,
+                    stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
+                    path = "parallel",
+                    "[STAGE 1] Pre-process completed, sent to parallel executor"
+                );
 
                 // Register an HTTP waiter and keep the batch open while in-flight
                 inner.pending_parallel_count += 1;
@@ -1932,6 +1933,14 @@ where
         }
 
         // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
+        let stage1_elapsed = stage1_start.elapsed();
+        info!(
+            %tx_hash,
+            stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
+            path = "sequential",
+            "[STAGE 1] Pre-process completed, proceeding with sequential execution"
+        );
+
         let baked_tx = cache_warm_up_executor.send_tx(baked_tx.clone());
         let apply_tx_res = executor.apply_tx_to_in_progress_batch(baked_tx).await;
 
