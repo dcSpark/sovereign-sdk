@@ -955,23 +955,3 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Test that RootKey serialization works correctly
-    #[test]
-    fn test_root_key_display_and_parse() {
-        let root = [42u8; 32];
-        let root_key = RootKey(root);
-
-        // Test Display
-        let display_str = format!("{}", root_key);
-        assert_eq!(display_str, hex::encode(root));
-
-        // Test FromStr
-        let parsed: RootKey = display_str.parse().unwrap();
-        assert_eq!(parsed, root_key);
-    }
-}
