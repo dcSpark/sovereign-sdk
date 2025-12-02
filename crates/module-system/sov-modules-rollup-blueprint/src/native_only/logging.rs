@@ -1,6 +1,7 @@
 //! Logging utilities and defaults.
 
 use std::env;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 pub use crate::native_only::telemetry::{should_init_open_telemetry_exporter, OtelGuard};
@@ -11,6 +12,13 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
+
+/// Guard that holds the file appender worker guard
+/// This must be held for the lifetime of the application to ensure logs are flushed
+pub struct LoggingGuard {
+    _otel: Option<OtelGuard>,
+    _file_writer: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
 
 #[derive(Clone, Copy)]
 struct IgnoreSpan(&'static str);
@@ -30,9 +38,9 @@ where
 }
 
 /// Default [`tracing`] initialization for the rollup node.
-/// Returns optional [`OtelGuard`] which should be held through the lifetime of the caller,
-/// so traces and logs are exported in that time.
-pub fn initialize_logging() -> Option<OtelGuard> {
+/// Returns [`LoggingGuard`] which should be held through the lifetime of the caller,
+/// so traces and logs are exported in that time and file logs are properly flushed.
+pub fn initialize_logging() -> LoggingGuard {
     let env_filter = env::var("RUST_LOG").unwrap_or_else(|_| default_rust_log_value().to_string());
 
     let otel: Option<OtelGuard> = if should_init_open_telemetry_exporter() {
@@ -47,6 +55,44 @@ pub fn initialize_logging() -> Option<OtelGuard> {
         .with_filter(get_env_filter())
         .with_filter(IgnoreSpan(ExecutionContext::SEQUENCER_WARM_UP))
         .boxed();
+
+    // Add file logging layer if LOG_FILE_PATH is set
+    let file_writer_guard = if let Ok(log_file_path) = env::var("LOG_FILE_PATH") {
+        let file_path = PathBuf::from(&log_file_path);
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+
+        // Create file appender with daily rotation
+        let file_appender = tracing_appender::rolling::daily(
+            file_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            file_path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("rollup.log")),
+        );
+
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        layers = layers
+            .and_then(
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .with_filter(get_env_filter())
+                    .with_filter(IgnoreSpan(ExecutionContext::SEQUENCER_WARM_UP)),
+            )
+            .boxed();
+
+        Some(guard)
+    } else {
+        None
+    };
 
     if cfg!(tokio_unstable) {
         layers = layers
@@ -69,7 +115,11 @@ pub fn initialize_logging() -> Option<OtelGuard> {
 
     log_info_about_logging(&env_filter);
     set_tracing_panic_hook();
-    otel
+
+    LoggingGuard {
+        _otel: otel,
+        _file_writer: file_writer_guard,
+    }
 }
 
 /// A good default for [`EnvFilter`] when `RUST_LOG` is not set.
@@ -111,6 +161,16 @@ fn log_info_about_logging(current_env_filter: &str) {
         commit = GIT_COMMIT_HASH,
         "Logging initialized; you can restart the node with a custom `RUST_LOG` env. var. to customize log filtering"
     );
+
+    // Log information about file logging
+    if let Ok(log_file_path) = env::var("LOG_FILE_PATH") {
+        info!(
+            LOG_FILE_PATH = log_file_path,
+            "File logging enabled with daily rotation"
+        );
+    } else {
+        info!("File logging disabled; set `LOG_FILE_PATH` env. var. to enable (e.g., LOG_FILE_PATH=logs/rollup.log)");
+    }
 
     let tokio_console_info_url = "https://github.com/tokio-rs/console";
     if cfg!(tokio_unstable) {
