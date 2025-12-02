@@ -27,7 +27,7 @@ static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 // Channel size for parallel transaction processing.
 // This should be large enough to accommodate multiple transactions being processed simultaneously
 // by different workers, but not so large that it causes memory issues.
-const PARALLEL_TX_CHANNEL_SIZE: usize = 2048;
+const PARALLEL_TX_CHANNEL_SIZE: usize = 16_384;
 
 /// Result of parallel transaction execution that will be sent back to the main sequencer.
 /// Contains all the information needed to finalize the transaction without re-executing it.
