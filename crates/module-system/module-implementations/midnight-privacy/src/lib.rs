@@ -16,7 +16,7 @@ pub mod viewing;
 mod query;
 
 pub use call::CallMessage;
-pub use event::{CommitmentPos, Event};
+pub use event::Event;
 pub use genesis::*;
 pub use hash::*;
 pub use merkle::*;
@@ -39,7 +39,7 @@ use sov_modules_api::VersionReader;
 use sov_modules_api::capabilities::RollupHeight;
 use std::collections::VecDeque;
 
-pub use crate::hash::{Hash32, RootKey, PendingRootKey};
+pub use crate::hash::{Hash32, RootKey, PendingRootKey, PendingCommitmentKey, PendingNullifierKey};
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
@@ -187,26 +187,19 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[state]
     pub pending_roots_count: StateMap<RollupHeight, u32>,
 
-    /// Indexed pending commitments: (rollup_height, idx) -> commitment.
-    /// Each block appends commitments with sequential indices for deferred tree update.
-    /// This allows the commitment_tree to be updated only once at end of block,
-    /// drastically reducing per-tx state writes and cache memory.
+    /// Parallel-safe pending commitments storage: (rollup_height, commitment) -> ().
+    /// Uses the commitment hash as the key to ensure uniqueness across parallel executions.
+    /// Each transaction writes to a unique key, so no conflicts occur during parallel execution.
+    /// The value is just a presence marker - positions are assigned at flush time.
+    /// Enumerated at flush time using StateMap::iter_prefix with PendingCommitmentPrefix.
     #[state]
-    pub pending_commitments_indexed: StateMap<PendingRootKey, Hash32>,
+    pub pending_commitments_by_hash: StateMap<PendingCommitmentKey, ()>,
 
-    /// Per-height counter: how many commitments are pending for each height.
+    /// Parallel-safe pending nullifiers storage: (rollup_height, nullifier) -> ().
+    /// Uses the nullifier hash as the key to ensure uniqueness across parallel executions.
+    /// Enumerated at flush time using StateMap::iter_prefix with PendingNullifierPrefix.
     #[state]
-    pub pending_commitments_count: StateMap<RollupHeight, u32>,
-
-    /// Indexed pending nullifiers: (rollup_height, idx) -> nullifier.
-    /// Each block appends nullifiers with sequential indices for deferred tree update.
-    /// This allows the nullifier_tree to be updated only once at end of block.
-    #[state]
-    pub pending_nullifiers_indexed: StateMap<PendingRootKey, Hash32>,
-
-    /// Per-height counter: how many nullifiers are pending for each height.
-    #[state]
-    pub pending_nullifiers_count: StateMap<RollupHeight, u32>,
+    pub pending_nullifiers_by_hash: StateMap<PendingNullifierKey, ()>,
 
     /// Total number of **spent nullifiers** (both transfers and withdrawals).
     #[state]
@@ -302,15 +295,11 @@ impl<S: Spec> BlockHooks for ValueMidnightPrivacy<S> {
         _visible_hash: &<<Self::Spec as Spec>::Storage as sov_modules_api::Storage>::Root,
         state: &mut sov_modules_api::StateCheckpoint<Self::Spec>,
     ) {
-        // CRITICAL: Reset counters for current height. Defensive against:
-        // - Block re-execution after crash/revert (prevents double-flush)
-        // - State replay from checkpoint (clears stale pending count)
-        // NOTE: Only resets CURRENT height. Stale indexed entries from abandoned heights
-        // remain in state (harmless but wastes space). Periodic cleanup not implemented.
+        // Reset pending roots counter for current height (defensive against re-execution).
         let height = state.rollup_height_to_access();
         let _ = self.pending_roots_count.set(&height, &0u32, state);
-        let _ = self.pending_commitments_count.set(&height, &0u32, state);
-        let _ = self.pending_nullifiers_count.set(&height, &0u32, state);
+        // Note: Slot-based commitment/nullifier storage doesn't need counter resets.
+        // Each slot is overwritten per-block, and enumeration scans all slots.
     }
 
     fn end_rollup_block_hook(&mut self, state: &mut sov_modules_api::StateCheckpoint<Self::Spec>) {

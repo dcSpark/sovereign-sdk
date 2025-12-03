@@ -132,6 +132,17 @@ impl<S: Storage> Delta<S> {
             .collect();
         ChangeSet { changes }
     }
+
+    /// Returns an iterator over all User namespace writes whose key starts with the given prefix.
+    #[cfg(feature = "native")]
+    pub fn iter_user_prefix_writes<'a>(
+        &'a mut self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a SlotKey, Option<SlotValue>)> + 'a {
+        self.user_cache
+            .iter_prefix_writes(prefix)
+            .map(|(k, v)| (k, v.clone()))
+    }
 }
 
 /// Holds keys and values that were read for the first time.

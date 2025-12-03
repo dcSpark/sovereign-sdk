@@ -301,6 +301,16 @@ impl<S: Spec> StateCheckpoint<S> {
         self.visible_slot_num.advance(advance.get().into());
         self.rollup_height.incr();
     }
+
+    /// Returns an iterator over all User namespace writes whose key starts with the given prefix.
+    /// This is used for prefix iteration in StateMap to enumerate keys matching a pattern.
+    #[cfg(feature = "native")]
+    pub fn iter_user_prefix_writes<'a>(
+        &'a mut self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a sov_state::SlotKey, Option<sov_state::SlotValue>)> + 'a {
+        self.delta.iter_user_prefix_writes(prefix)
+    }
 }
 
 impl<S: Spec> VersionReader for StateCheckpoint<S> {

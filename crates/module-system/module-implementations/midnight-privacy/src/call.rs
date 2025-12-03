@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use std::collections::HashSet;
 
 use super::ValueMidnightPrivacy;
-use crate::event::{CommitmentPos, Event};
+use crate::event::Event;
 use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
 use crate::types::{EncryptedNote, FullViewingKey};
 
@@ -175,88 +175,68 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// Used by deposit() and transfer() to append note commitments.
     ///
     /// BLOCK-DEFERRED DESIGN: The commitment_tree is NOT updated here. Instead:
-    /// 1. Position is assigned and incremented (per tx)
-    /// 2. Commitment is queued for this block
-    /// 3. Tree update and root computation happen in end_block_flush (once per block)
+    /// 1. Commitment is queued for this block (per tx, unique key)
+    /// 2. Positions and roots are assigned in end_block_flush (once per block)
     ///
     /// This reduces per-tx state writes from ~4MB (full tree) to ~100 bytes,
     /// dramatically reducing cache memory usage.
-    ///
-    /// SEMANTIC CHANGE: new_root is a placeholder [0u8; 32]. Real roots are computed
-    /// and published to recent_roots/all_roots at end of block in end_block_flush.
+
+    /// Queue a commitment for end-of-block processing.
+    /// 
+    /// This function does NOT update the tree or assign positions. It only enqueues
+    /// the commitment. All tree updates and position assignments happen in `end_block_flush`,
+    /// which runs single-threaded after all transactions complete.
+    /// 
+    /// PARALLEL-SAFE: Each commitment writes to a unique key `(height, commitment)`,
+    /// so there are no write conflicts between concurrent transactions.
+    /// Enumeration at flush time uses StateMap::iter_prefix to find all commitments
+    /// for the current height.
     fn add_commitment(
         &mut self,
         commitment: Hash32,
         state: &mut impl TxState<S>,
-    ) -> Result<(u64, Hash32)> {
-        // 1) Position bookkeeping (per tx)
-        let position = self.next_position.get_or_err(state)??;
-        self.next_position.set(&(position + 1), state)?;
-
-        // 2) Queue this commitment for end-of-block tree update
+    ) -> Result<()> {
         let current_height = state.rollup_height_to_access();
-        let idx = self
-            .pending_commitments_count
-            .get(&current_height, state)?
-            .unwrap_or(0);
-        let key = PendingRootKey {
+        
+        // Store commitment with unique key (height, commitment) - no conflicts in parallel execution
+        // Value is just a presence marker - position is assigned at flush time.
+        let cm_key = crate::hash::PendingCommitmentKey {
             height: current_height.get(),
-            idx,
+            commitment,
         };
-        self.pending_commitments_indexed.set(&key, &commitment, state)?;
-        self.pending_commitments_count
-            .set(&current_height, &(idx + 1), state)?;
+        self.pending_commitments_by_hash.set(&cm_key, &(), state)?;
 
-        // 3) Emit event with placeholder root
-        // NOTE: new_root is [0; 32] placeholder. Real roots are emitted by end_block_flush.
-        // Clients should use RootPublished events (from end_block_flush) for anchor tracking.
-        let placeholder_root = [0u8; 32];
-        self.emit_event(
-            state,
-            Event::NoteCreated {
-                commitment,
-                position,
-                new_root: placeholder_root,
-            },
-        );
+        // Emit event - position is assigned at flush time
+        self.emit_event(state, Event::NoteCreated { commitment });
 
-        Ok((position, placeholder_root))
+        Ok(())
     }
 
-    /// Internal helper: Queue a nullifier for end-of-block processing.
-    /// Used by transfer() and withdraw() to record spent nullifiers in Merkle tree form.
-    ///
-    /// BLOCK-DEFERRED DESIGN: The nullifier_tree is NOT updated here. Instead:
-    /// 1. Position is assigned and incremented (per tx)
-    /// 2. Nullifier is queued for this block
-    /// 3. Tree update happens in end_block_flush (once per block)
-    ///
-    /// Note: Double-spend protection is still done via `nullifier_set` (O(1) lookup, per tx).
+    /// Queue a nullifier for end-of-block processing.
+    /// 
+    /// This function does NOT update the nullifier tree. It only enqueues the nullifier.
+    /// Tree updates happen in `end_block_flush`.
+    /// 
+    /// PARALLEL-SAFE: Each nullifier writes to a unique key `(height, nullifier)`,
+    /// so there are no write conflicts between concurrent transactions.
+    /// 
+    /// Note: Double-spend protection is done via `nullifier_set` (O(1) lookup, per tx).
     /// The nullifier tree is for canonical root tracking and future circuit integration.
     fn append_nullifier(
         &mut self,
         nullifier: Hash32,
         state: &mut impl TxState<S>,
-    ) -> Result<u64> {
-        // 1) Position bookkeeping (per tx)
-        let pos = self.next_nullifier_position.get_or_err(state)??;
-        self.next_nullifier_position.set(&(pos + 1), state)?;
-
-        // 2) Queue this nullifier for end-of-block tree update
+    ) -> Result<()> {
         let current_height = state.rollup_height_to_access();
-        let idx = self
-            .pending_nullifiers_count
-            .get(&current_height, state)?
-            .unwrap_or(0);
-        let key = PendingRootKey {
+        
+        // Store nullifier with unique key (height, nullifier) - no conflicts
+        let nf_key = crate::hash::PendingNullifierKey {
             height: current_height.get(),
-            idx,
+            nullifier,
         };
-        self.pending_nullifiers_indexed.set(&key, &nullifier, state)?;
-        self.pending_nullifiers_count
-            .set(&current_height, &(idx + 1), state)?;
+        self.pending_nullifiers_by_hash.set(&nf_key, &(), state)?;
 
-        Ok(pos)
+        Ok(())
     }
 
     /// Deposit: transfer tokens into the pool, append commitment, update root window.
@@ -289,10 +269,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.bank
             .transfer_from(ctx.sender(), self.id.to_payable(), coins, st)?;
 
-        // Compute commitment and add to tree
+        // Compute commitment and queue for end-of-block processing
         let domain = self.domain.get_or_err(st)??;
         let cm = note_commitment(&domain, amount, &rho, &recipient);
-        let (position, new_root) = self.add_commitment(cm, st)?;
+        self.add_commitment(cm, st)?;
 
         // Optional: emit viewer ciphertexts for the deposit note
         if let Some(fvks) = view_fvks {
@@ -319,14 +299,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let deposit_count = self.deposit_count.get(st)?.unwrap_or(0);
         self.deposit_count.set(&(deposit_count + 1), st)?;
 
-        // Emit explicit pool deposit event
+        // Emit pool deposit event (position is provisional, assigned at flush)
         self.emit_event(
             st,
             Event::PoolDeposit {
                 amount,
                 commitment: cm,
-                position,
-                new_root,
             },
         );
 
@@ -442,22 +420,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
 
             // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            let _nf_pos = self.append_nullifier(public.nullifier, st)?;
+            self.append_nullifier(public.nullifier, st)?;
 
-            // 3) Add all output commitments to the tree (track pos + final root)
-            let mut outputs: Vec<CommitmentPos> = Vec::with_capacity(public.output_commitments.len());
-            let mut final_root: Option<Hash32> = None;
-            for cm in &public.output_commitments {
-                let (pos, root) = self.add_commitment(*cm, st)?;
-                outputs.push(CommitmentPos { commitment: *cm, position: pos });
-                final_root = Some(root);
+            // 3) Queue all output commitments for end-of-block processing
+            let outputs: Vec<Hash32> = public.output_commitments.clone();
+            for cm in &outputs {
+                self.add_commitment(*cm, st)?;
             }
-            let new_root = if let Some(r) = final_root {
-                r
-            } else {
-                // No outputs: root unchanged
-                self.commitment_tree.get_or_err(st)??.root()
-            };
 
             // Emit spent event
             self.emit_event(
@@ -472,9 +441,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
                 
-                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
-                let outputs_set: HashSet<Hash32> =
-                    outputs.iter().map(|o| o.commitment).collect();
+                const MAX_VIEW_CT: usize = 16; // reasonable upper bound for viewer ciphertexts
+                let outputs_set: HashSet<Hash32> = outputs.iter().copied().collect();
 
                 // Require Level B attestations when ciphertexts are present
                 let attestations = public.view_attestations.as_ref().ok_or_else(|| {
@@ -537,14 +505,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 }
             }
 
-            // Aggregate event for client convenience
+            // Aggregate event (positions are provisional, assigned at flush)
             self.emit_event(
                 st,
                 Event::PoolTransfer {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
                     outputs,
-                    new_root,
                 },
             );
 
@@ -662,22 +629,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
 
             // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            let _nf_pos = self.append_nullifier(public.nullifier, st)?;
+            self.append_nullifier(public.nullifier, st)?;
 
-            // 3) Add change outputs (track pos + final root)
-            let mut change_outputs: Vec<CommitmentPos> =
-                Vec::with_capacity(public.output_commitments.len());
-            let mut final_root: Option<Hash32> = None;
-            for cm in &public.output_commitments {
-                let (pos, root) = self.add_commitment(*cm, st)?;
-                change_outputs.push(CommitmentPos { commitment: *cm, position: pos });
-                final_root = Some(root);
+            // 3) Queue change outputs for end-of-block processing
+            let change_outputs: Vec<Hash32> = public.output_commitments.clone();
+            for cm in &change_outputs {
+                self.add_commitment(*cm, st)?;
             }
-            let new_root = if let Some(r) = final_root {
-                r
-            } else {
-                self.commitment_tree.get_or_err(st)??.root()
-            };
 
             // 4) Transfer transparent tokens
             use sov_bank::IntoPayable;
@@ -717,9 +675,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
                 
-                const MAX_VIEW_CT: usize = 16; // 8 viewers × 2 outputs max
-                let outputs_set: HashSet<Hash32> =
-                    change_outputs.iter().map(|o| o.commitment).collect();
+                const MAX_VIEW_CT: usize = 16; // reasonable upper bound for viewer ciphertexts
+                let outputs_set: HashSet<Hash32> = change_outputs.iter().copied().collect();
 
                 // Require Level B attestations when ciphertexts are present
                 let attestations = public.view_attestations.as_ref().ok_or_else(|| {
@@ -782,6 +739,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 }
             }
 
+            // Aggregate event (positions are provisional, assigned at flush)
             self.emit_event(
                 st,
                 Event::PoolWithdraw {
@@ -789,7 +747,6 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
                     change: change_outputs,
-                    new_root,
                 },
             );
 
@@ -829,10 +786,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// 3. Save both trees once
     ///
     /// SCOPE: Flushes only current block's pending items. Other heights ignored.
-    /// INVARIANT: begin_rollup_block_hook resets counts to 0 at block start.
-    /// DANGER: Indexed entries from abandoned blocks remain in state (harmless bloat).
-    ///
-    /// Idempotent: safe to call multiple times (subsequent calls are no-ops if count is 0).
+    /// 
+    /// PARALLEL-SAFE: Uses StateMap::iter_prefix to enumerate all commitments/nullifiers
+    /// for the current height. Each tx writes to a unique key (height, hash), so there
+    /// are no conflicts during parallel execution. Final ordering is deterministic (sorted by hash).
     pub fn end_block_flush(
         &mut self,
         st: &mut sov_modules_api::StateCheckpoint<S>,
@@ -842,120 +799,91 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // ═══════════════════════════════════════════════════════════════════════════════
         // PHASE 1: Replay pending commitments into the commitment tree
         // ═══════════════════════════════════════════════════════════════════════════════
-        let commitment_count = self
-            .pending_commitments_count
-            .get(&current_height, st)?
-            .unwrap_or(0);
-
-        if commitment_count > 0 {
-            // Load tree once
+        
+        // Collect all commitments using prefix iteration (parallel-safe: no data loss)
+        let cm_prefix = crate::hash::PendingCommitmentPrefix {
+            height: current_height.get(),
+        };
+        let cm_entries = self.pending_commitments_by_hash.iter_prefix(&cm_prefix, st)?;
+        
+        // Extract commitments and sort for deterministic ordering
+        let mut commitments: Vec<Hash32> = cm_entries
+            .into_iter()
+            .map(|(key, _)| key.commitment)
+            .collect();
+        commitments.sort();
+        
+        if !commitments.is_empty() {
             let mut tree = self.commitment_tree.get_or_err(st)??;
+            let mut pos = self.next_position.get_or_err(st)??;
             
-            // Get the final next_position (already incremented during txs)
-            let final_next_pos = self.next_position.get_or_err(st)??;
-            
-            // Starting position for this block's commitments
-            let start_pos = final_next_pos
-                .checked_sub(commitment_count as u64)
-                .ok_or_else(|| anyhow::anyhow!("next_position underflow in end_block_flush"))?;
-
-            // Replay each commitment
-            let mut pos = start_pos;
-            for idx in 0..commitment_count {
-                let key = PendingRootKey {
-                    height: current_height.get(),
-                    idx,
-                };
-                let cm = self
-                    .pending_commitments_indexed
-                    .get(&key, st)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Missing pending commitment at ({}, {}). State corruption detected.",
-                            current_height,
-                            idx
-                        )
-                    })?;
-
-                // Grow tree if needed
+            for cm in &commitments {
                 if pos >= tree.len() as u64 {
                     tree.grow_to_fit((pos + 1) as usize);
                 }
-
-                // Set leaf and compute root
-                tree.set_leaf(pos as usize, cm);
+                tree.set_leaf(pos as usize, *cm);
                 let root = tree.root();
-
-                // Record root in recent_roots and all_roots
                 self.add_recent_root_direct(root, st)?;
                 self.record_root_forever_direct(root, st)?;
-
                 pos += 1;
             }
-
-            // Save tree once (single ~4MB write per block instead of per tx)
+            
+            self.next_position.set(&pos, st)?;
             self.commitment_tree.set(&tree, st)?;
+            
+            // Clean up processed entries
+            self.pending_commitments_by_hash.delete_prefix(&cm_prefix, st)?;
+            
+            tracing::debug!(
+                height = current_height.get(),
+                commitments_flushed = commitments.len(),
+                new_next_position = pos,
+                "Flushed pending commitments to tree"
+            );
         }
-
-        // Reset commitment count
-        self.pending_commitments_count
-            .set(&current_height, &0u32, st)?;
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // PHASE 2: Replay pending nullifiers into the nullifier tree
         // ═══════════════════════════════════════════════════════════════════════════════
-        let nullifier_count = self
-            .pending_nullifiers_count
-            .get(&current_height, st)?
-            .unwrap_or(0);
-
-        if nullifier_count > 0 {
-            // Load tree once
+        
+        // Collect all nullifiers using prefix iteration
+        let nf_prefix = crate::hash::PendingNullifierPrefix {
+            height: current_height.get(),
+        };
+        let nf_entries = self.pending_nullifiers_by_hash.iter_prefix(&nf_prefix, st)?;
+        
+        // Extract nullifiers and sort for deterministic ordering
+        let mut nullifiers: Vec<Hash32> = nf_entries
+            .into_iter()
+            .map(|(key, _)| key.nullifier)
+            .collect();
+        nullifiers.sort();
+        
+        if !nullifiers.is_empty() {
             let mut tree = self.nullifier_tree.get_or_err(st)??;
+            let mut pos = self.next_nullifier_position.get_or_err(st)??;
             
-            // Get the final next_nullifier_position (already incremented during txs)
-            let final_next_pos = self.next_nullifier_position.get_or_err(st)??;
-            
-            // Starting position for this block's nullifiers
-            let start_pos = final_next_pos
-                .checked_sub(nullifier_count as u64)
-                .ok_or_else(|| anyhow::anyhow!("next_nullifier_position underflow in end_block_flush"))?;
-
-            // Replay each nullifier
-            let mut pos = start_pos;
-            for idx in 0..nullifier_count {
-                let key = PendingRootKey {
-                    height: current_height.get(),
-                    idx,
-                };
-                let nf = self
-                    .pending_nullifiers_indexed
-                    .get(&key, st)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Missing pending nullifier at ({}, {}). State corruption detected.",
-                            current_height,
-                            idx
-                        )
-                    })?;
-
-                // Grow tree if needed
+            for nf in &nullifiers {
                 if pos >= tree.len() as u64 {
                     tree.grow_to_fit((pos + 1) as usize);
                 }
-
-                // Set leaf
-                tree.set_leaf(pos as usize, nf);
+                tree.set_leaf(pos as usize, *nf);
                 pos += 1;
             }
-
-            // Save tree once
+            
+            self.next_nullifier_position.set(&pos, st)?;
             self.nullifier_tree.set(&tree, st)?;
+            
+            // Clean up processed entries
+            self.pending_nullifiers_by_hash.delete_prefix(&nf_prefix, st)?;
+            
+            tracing::debug!(
+                height = current_height.get(),
+                nullifiers_flushed = nullifiers.len(),
+                new_next_position = pos,
+                "Flushed pending nullifiers to tree"
+            );
         }
-
-        // Reset nullifier count
-        self.pending_nullifiers_count
-            .set(&current_height, &0u32, st)?;
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // PHASE 3: Legacy - flush any pending roots (for backwards compatibility)
@@ -1014,8 +942,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let seq = self.root_seq.get_or_err(state)??;
         self.all_roots.set(&RootKey(root), &seq, state)?;
 
-        // Note: We don't emit events here because StateCheckpoint doesn't implement EventContainer.
-        // Events for these roots were already emitted when the commitment was added in add_commitment.
+        // Note: We don't emit root events here because StateCheckpoint doesn't implement EventContainer.
+        // Root publication happens silently during flush; clients query state for current roots.
 
         // Bump sequence (checked add to be safe against overflow)
         let next_seq = seq

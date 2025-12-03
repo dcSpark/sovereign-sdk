@@ -134,6 +134,128 @@ impl FromStr for PendingRootKey {
     }
 }
 
+/// Composite key for pending commitments: (rollup_height, commitment).
+/// Uses the commitment hash itself as the unique identifier to avoid conflicts
+/// during parallel execution. Each commitment is unique, so each key is unique.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct PendingCommitmentKey {
+    /// Rollup height this commitment was created in
+    pub height: u64,
+    /// The commitment hash (unique identifier)
+    pub commitment: Hash32,
+}
+
+impl fmt::Display for PendingCommitmentKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, hex::encode(self.commitment))
+    }
+}
+
+impl FromStr for PendingCommitmentKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.splitn(2, '_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_commitment".to_string());
+        }
+        let height = parts[0]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse height: {}", e))?;
+        let commitment_bytes = hex::decode(parts[1])
+            .map_err(|e| format!("Failed to parse commitment: {}", e))?;
+        if commitment_bytes.len() != 32 {
+            return Err("Commitment must be 32 bytes".to_string());
+        }
+        let mut commitment = [0u8; 32];
+        commitment.copy_from_slice(&commitment_bytes);
+        Ok(PendingCommitmentKey { height, commitment })
+    }
+}
+
+/// Composite key for pending nullifiers: (rollup_height, nullifier).
+/// Uses the nullifier hash itself as the unique identifier to avoid conflicts
+/// during parallel execution.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct PendingNullifierKey {
+    /// Rollup height this nullifier was spent in
+    pub height: u64,
+    /// The nullifier hash (unique identifier)
+    pub nullifier: Hash32,
+}
+
+impl fmt::Display for PendingNullifierKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, hex::encode(self.nullifier))
+    }
+}
+
+impl FromStr for PendingNullifierKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.splitn(2, '_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_nullifier".to_string());
+        }
+        let height = parts[0]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse height: {}", e))?;
+        let nullifier_bytes = hex::decode(parts[1])
+            .map_err(|e| format!("Failed to parse nullifier: {}", e))?;
+        if nullifier_bytes.len() != 32 {
+            return Err("Nullifier must be 32 bytes".to_string());
+        }
+        let mut nullifier = [0u8; 32];
+        nullifier.copy_from_slice(&nullifier_bytes);
+        Ok(PendingNullifierKey { height, nullifier })
+    }
+}
+
+/// Prefix type for iterating pending commitments by height.
+/// When Borsh-serialized, this produces the prefix bytes of PendingCommitmentKey.
+/// Used with StateMap::iter_prefix to enumerate all commitments for a given height.
+#[derive(Debug, Clone, Copy, BorshSerialize)]
+pub struct PendingCommitmentPrefix {
+    /// Rollup height to iterate
+    pub height: u64,
+}
+
+/// Prefix type for iterating pending nullifiers by height.
+/// When Borsh-serialized, this produces the prefix bytes of PendingNullifierKey.
+/// Used with StateMap::iter_prefix to enumerate all nullifiers for a given height.
+#[derive(Debug, Clone, Copy, BorshSerialize)]
+pub struct PendingNullifierPrefix {
+    /// Rollup height to iterate
+    pub height: u64,
+}
+
 // Thread-local Poseidon2 hasher instance (deterministic with fixed seed).
 // Using thread-local instances avoids repeated allocations and initialization overhead
 // while ensuring thread-safety without synchronization overhead.

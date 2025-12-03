@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,10 +39,10 @@ use toml::Value as TomlValue;
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 const TREE_DEPTH: u8 = 16;
-const TREE_REBUILD_MAX_RETRIES: usize = 3;
+const TREE_REBUILD_MAX_RETRIES: usize = 5;
 const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
-const MISSING_NOTE_RETRY_MAX: usize = 3;
-const MISSING_NOTE_RETRY_DELAY_MS: u64 = 200;
+const MISSING_NOTE_RETRY_MAX: usize = 10;
+const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
@@ -1993,6 +1993,55 @@ async fn perform_transfer_cycle(
             // Only total_ms is available (older sequencer)
             sequencer_sum_ms += *ms;
             sequencer_count += 1;
+        }
+    }
+
+    // Wait for all new output notes to be indexed before ending the cycle.
+    // This ensures the next cycle can find the note commitments for all wallets.
+    const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
+    const NOTE_SYNC_POLL_MS: u64 = 100;
+    
+    // Collect expected output commitments for wallets that participated in this cycle
+    let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
+    for input in &inputs {
+        // The wallet state has already been updated with new_rho/new_recipient
+        let w = &wallets[input.wallet_idx];
+        let expected_cm = note_commitment(&DOMAIN, w.value, &w.rho, &w.recipient);
+        expected_commitments.push((expected_cm, input.wallet_idx));
+    }
+    
+    if !expected_commitments.is_empty() {
+        let sync_start = Instant::now();
+        let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
+        let mut pending: HashSet<[u8; 32]> = expected_commitments.iter().map(|(cm, _)| *cm).collect();
+        
+        while !pending.is_empty() && Instant::now() < sync_deadline {
+            let fresh_positions = fetch_note_positions(client, false).await?;
+            pending.retain(|cm| !fresh_positions.contains_key(cm));
+            
+            if !pending.is_empty() {
+                sleep(Duration::from_millis(NOTE_SYNC_POLL_MS)).await;
+            }
+        }
+        
+        let sync_elapsed = sync_start.elapsed();
+        if pending.is_empty() {
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] All {} new output notes indexed in {:.2} ms",
+                    expected_commitments.len(),
+                    sync_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            // Update the cached position map with fresh data
+            pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
+        } else {
+            eprintln!(
+                "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
+                pending.len(),
+                expected_commitments.len(),
+                sync_elapsed.as_secs_f64()
+            );
         }
     }
 
