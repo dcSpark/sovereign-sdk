@@ -137,6 +137,25 @@ pub struct GetWalletConfigResult {
     pub chain_name: String,
 }
 
+// -----------------------------
+// Types for Deposit
+// -----------------------------
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DepositRequest {
+    /// Amount to deposit into the shielded pool
+    pub amount: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct DepositResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+    /// Random nonce (rho) used for the note
+    pub rho: String,
+    /// Recipient binding used for the note
+    pub recipient: String,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
@@ -420,6 +439,60 @@ impl CryptoServer {
             address: config.address,
             chain_id: config.chain_id,
             chain_name: config.chain_name,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Deposit funds into the Midnight Privacy shielded pool.
+    /// Moves funds from the transparent balance into the privacy pool, creating a shielded note.
+    #[tool(
+        name = "deposit",
+        description = "Deposit funds into the Midnight Privacy shielded pool. Moves funds from transparent balance to shielded balance."
+    )]
+    async fn deposit(
+        &self,
+        Parameters(params): Parameters<DepositRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        // Parse amount from string
+        let amount: u128 = params
+            .amount
+            .parse()
+            .map_err(|_| {
+                ErrorData::invalid_params(
+                    "Invalid amount format. Must be a valid u128 number.",
+                    None,
+                )
+            })?;
+
+        tracing::debug!("deposit called with amount: {}", amount);
+
+        let deposit_result = crate::operations::deposit(provider, &*ctx, amount)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = DepositResult {
+            tx_hash: deposit_result.tx_hash,
+            rho: hex::encode(&deposit_result.rho),
+            recipient: hex::encode(&deposit_result.recipient),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

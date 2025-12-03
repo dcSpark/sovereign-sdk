@@ -66,5 +66,6 @@ native = [
     "sov-rollup-interface/native",
     "sov-state/native",
     "sov-address/native",
-    "sov-ligero-adapter/native"
+    "sov-ligero-adapter/native",
+    "sov-midnight-da/native"
 ]
