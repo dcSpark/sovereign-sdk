@@ -208,6 +208,26 @@ pub(crate) mod internal {
         pub(crate) fn discard_revertable_log(&mut self) {
             self.revertable_log.clear();
         }
+
+        /// Returns an iterator over all writes whose key starts with the given prefix.
+        /// The revertable_log should be either merged or discarded before calling this method.
+        pub(crate) fn iter_prefix_writes<'a>(
+            &'a self,
+            prefix: &'a [u8],
+        ) -> impl Iterator<Item = (&'a SlotKey, &'a Option<SlotValue>)> + 'a {
+            assert!(
+                self.revertable_log.is_empty(),
+                "Revertable cache should be merged or discarded before calling `iter_prefix_writes`"
+            );
+            self.log.iter().filter_map(move |(k, access)| {
+                if k.key_ref().starts_with(prefix) {
+                    if let Access::Write { modified } = access {
+                        return Some((k, modified));
+                    }
+                }
+                None
+            })
+        }
     }
 }
 
@@ -322,6 +342,17 @@ impl<N: ProvableCompileTimeNamespace> ProvableStorageCache<N> {
                 None
             }
         })
+    }
+
+    /// Returns an iterator over all writes whose key starts with the given prefix.
+    /// Commits any pending revertable cache first.
+    pub fn iter_prefix_writes<'a>(
+        &'a mut self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a SlotKey, &'a Option<SlotValue>)> + 'a {
+        // Commit revertable log first to ensure we see all writes
+        self.cache.commit_revertable_log();
+        self.cache.iter_prefix_writes(prefix)
     }
 
     /// Converts the `ProvableStorageCache` into `OrderedReadsAndWrites`.

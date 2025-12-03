@@ -4,6 +4,34 @@ set -e
 # Script to run the proof verifier service with proper Ligero configuration
 # This sets all required environment variables for Ligero proof verification
 
+# Parse arguments
+MEMORY_PROFILE=0
+for arg in "$@"; do
+    case $arg in
+        --memory-profile)
+            MEMORY_PROFILE=1
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --memory-profile    Enable macOS memory profiling for Instruments.app"
+            echo "                      - Enables MallocStackLogging for better stack traces"
+            echo "                      - Prints PID for easy attachment in Instruments"
+            echo "                      - Open Instruments → Allocations/Leaks → Attach to Process"
+            echo ""
+            echo "  --help, -h          Show this help message"
+            echo ""
+            echo "Environment variables:"
+            echo "  SKIP_VERIFICATION           Skip Ligero proof verification"
+            echo "  LIGERO_SKIP_VERIFICATION    Same as SKIP_VERIFICATION"
+            echo "  DEFER_SEQUENCER_SUBMISSION  Defer sequencer submission"
+            exit 0
+            ;;
+    esac
+done
+
 # Get the workspace root (assuming this script is in examples/rollup-ligero/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -80,12 +108,31 @@ if [ -n "$SKIP_VERIFICATION" ]; then
 fi
 
 # Build ligero rollup
-echo "Building ligero rollup..."
 cd "$WORKSPACE_ROOT"
-cargo build --release -p sov-rollup-ligero
+
+if [ "$MEMORY_PROFILE" -eq 1 ]; then
+    echo "Building ligero rollup with debug symbols for profiling..."
+    # Build with full debug symbols and frame pointers for proper stack traces
+    CARGO_PROFILE_RELEASE_DEBUG=2 \
+    CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
+    RUSTFLAGS="-C force-frame-pointers=yes" \
+    cargo build --release -p sov-rollup-ligero
+    
+    echo "Generating dSYM for Instruments symbolication..."
+    # Generate dSYM bundle that Instruments uses for symbol resolution
+    dsymutil "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" -o "$WORKSPACE_ROOT/target/release/sov-rollup-ligero.dSYM"
+    echo "   ✓ dSYM generated at target/release/sov-rollup-ligero.dSYM"
+else
+    echo "Building ligero rollup..."
+    cargo build --release -p sov-rollup-ligero
+fi
 
 echo ""
-echo "🚀 Starting ligero rollup..."
+if [ "$MEMORY_PROFILE" -eq 1 ]; then
+    echo "🚀 Starting ligero rollup with memory profiling..."
+else
+    echo "🚀 Starting ligero rollup..."
+fi
 echo ""
 
 # Set RUST_LOG to info level to suppress debug logs
@@ -97,5 +144,63 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create demo_data directory if it doesn't exist (required for SQLite DB)
 mkdir -p demo_data
 
+# Memory profiling setup (macOS only)
+if [ "$MEMORY_PROFILE" -eq 1 ]; then
+    if [[ "$OSTYPE" != "darwin"* ]]; then
+        echo "❌ Error: Memory profiling is only supported on macOS"
+        exit 1
+    fi
+    
+    echo "🔬 Memory profiling enabled for Instruments.app!"
+    echo ""
+    
+    # Codesign the binary with get-task-allow entitlement for Instruments attachment
+    echo "   Codesigning binary for Instruments attachment..."
+    codesign -s - -f --entitlements /dev/stdin "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" << 'ENTITLEMENTS' 2>/dev/null
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+    echo "   ✓ Binary codesigned with get-task-allow entitlement"
+    echo ""
+    
+    echo "   ┌─────────────────────────────────────────────────────────────────┐"
+    echo "   │  INSTRUMENTS.APP SETUP                                          │"
+    echo "   ├─────────────────────────────────────────────────────────────────┤"
+    echo "   │  1. Open Instruments.app (Cmd+Space → 'Instruments')            │"
+    echo "   │  2. Choose a template:                                          │"
+    echo "   │     • 'Allocations' - track memory allocations over time        │"
+    echo "   │     • 'Leaks' - detect memory leaks                             │"
+    echo "   │     • 'VM Tracker' - virtual memory regions                     │"
+    echo "   │  3. Click the target dropdown (top left) → 'Attach to Process'  │"
+    echo "   │  4. Select 'sov-rollup-ligero' from the list                    │"
+    echo "   │  5. Click the red Record button to start profiling              │"
+    echo "   └─────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "   PID will be printed below once the process starts."
+    echo ""
+    
+    # Enable malloc stack logging - gives Instruments better stack traces
+    export MallocStackLogging=1
+    export MallocStackLoggingNoCompact=1
+fi
+
 # Run without capturing output - ensures eprintln! and all stderr/stdout are shown
-exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1
+if [ "$MEMORY_PROFILE" -eq 1 ]; then
+    # Run in background briefly to get PID, then wait
+    "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1 &
+    ROLLUP_PID=$!
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "   📍 Process started with PID: $ROLLUP_PID"
+    echo "   🔗 In Instruments: Attach to Process → sov-rollup-ligero ($ROLLUP_PID)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    wait $ROLLUP_PID
+else
+    exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1
+fi

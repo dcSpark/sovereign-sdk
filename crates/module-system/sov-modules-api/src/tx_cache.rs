@@ -118,6 +118,18 @@ impl GlobalTxExecutionCache {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Get the current size of the order queue (for debugging).
+    /// Note: This may differ from `len()` due to stale entries.
+    pub fn order_queue_len(&self) -> usize {
+        self.order.lock().unwrap().len()
+    }
+
+    /// Get cache capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
 }
 
 // Safety: DashMap and Mutex are thread-safe

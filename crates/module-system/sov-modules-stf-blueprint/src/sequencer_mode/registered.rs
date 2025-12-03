@@ -445,7 +445,6 @@ where
         // Check if we have a cached result and should skip execution (Node context only)
         #[cfg(feature = "native")]
         if execution_context == ExecutionContext::Node {
-            let cache_start = std::time::Instant::now();
             let tx_hash = RT::Auth::compute_tx_hash(&raw_tx)
                 .expect("Failed to compute tx hash for cache lookup");
             // Check cache directly (don't rely on batch's control flow which may be NoOpControlFlow)
@@ -484,13 +483,8 @@ where
                 tx_receipts.push(cached.receipt.clone());
                 clean_scratchpad = new_checkpoint.to_tx_scratchpad();
 
-                let cache_elapsed = cache_start.elapsed();
-                tracing::info!(
-                    tx_hash = %tx_hash,
-                    elapsed_ms = format!("{:.2}", cache_elapsed.as_secs_f64() * 1000.0),
-                    num_writes = write_count,
-                    "[NODE] Transaction processed via cache hit"
-                );
+                // Remove the entry from cache after node successfully consumed it
+                GLOBAL_TX_CACHE.remove::<S>(&tx_hash);
                 continue; // Skip to next transaction
             }
         }
@@ -606,13 +600,6 @@ where
                             receipt.tx_hash,
                             precomputed_for_verification.clone(),
                         );
-                        tracing::debug!(
-                            tx_hash = %receipt.tx_hash,
-                            num_writes = precomputed_for_verification.tx_changes.writes.len(),
-                            reward = ?precomputed_for_verification.reward,
-                            penalty = ?precomputed_for_verification.penalty,
-                            "[CACHE] Inserted tx result from Sequencer context for node verification"
-                        );
                     }
 
                     // For Node context: Verify against cached sequencer result
@@ -654,7 +641,9 @@ where
                     tracing::info!(
                         tx_hash = %receipt.tx_hash,
                         elapsed_ms = format!("{:.2}", exec_elapsed.as_secs_f64() * 1000.0),
-                        "[NODE] Transaction processed via execution (cache miss)"
+                        cache_size = GLOBAL_TX_CACHE.len(),
+                        cache_order_size = GLOBAL_TX_CACHE.order_queue_len(),
+                        "[NODE] Transaction processed via execution (CACHE MISS - had to re-execute)"
                     );
                 }
 
@@ -739,26 +728,19 @@ where
         &mut checkpoint,
     );
 
-    // Log batch-level verification summary (only in Node context)
+    // Log batch verification summary and clear large value store (Node context only)
     #[cfg(feature = "native")]
-    if execution_context == ExecutionContext::Node && batch_verification_stats.total_txs > 0 {
-        if batch_verification_stats.all_verified_match() {
+    if execution_context == ExecutionContext::Node {
+        // Log batch summary
+        if batch_verification_stats.total_txs > 0 {
             tracing::info!(
                 blob_idx,
-                stats = %batch_verification_stats,
-                "[BATCH VERIFICATION] ✓ All transactions verified successfully"
-            );
-        } else if batch_verification_stats.mismatches > 0 {
-            tracing::warn!(
-                blob_idx,
-                stats = %batch_verification_stats,
-                "[BATCH VERIFICATION] ⚠ Some transactions had verification mismatches"
-            );
-        } else {
-            tracing::debug!(
-                blob_idx,
-                stats = %batch_verification_stats,
-                "[BATCH VERIFICATION] Batch verification complete (some cache misses)"
+                total = batch_verification_stats.total_txs,
+                cache_hits = batch_verification_stats.cache_hits_used,
+                cache_misses = batch_verification_stats.cache_misses,
+                verified_matches = batch_verification_stats.verified_matches,
+                mismatches = batch_verification_stats.mismatches,
+                "[BATCH] Node batch processing complete"
             );
         }
     }

@@ -16,8 +16,10 @@ use super::{Borrowed, BorrowedMut};
 use crate::state::StateReader;
 #[cfg(feature = "native")]
 use crate::ProvenStateAccessor;
+#[cfg(feature = "native")]
+use crate::StateCheckpoint;
 #[cfg(feature = "arbitrary")]
-use crate::{InfallibleStateReaderAndWriter, StateCheckpoint};
+use crate::InfallibleStateReaderAndWriter;
 use crate::{StateReaderAndWriter, StateWriter};
 
 /// A container that maps keys to values.
@@ -339,6 +341,11 @@ where
         tracing::trace!(%key, "Deleting map value");
         state.delete(&key)
     }
+
+    /// Returns the raw prefix bytes for this map (without any key prefix).
+    pub fn raw_prefix_bytes(&self) -> &[u8] {
+        self.prefix.as_ref()
+    }
 }
 
 #[cfg(feature = "native")]
@@ -399,6 +406,131 @@ where {
             })
             .transpose()?;
         Ok((item_key, value))
+    }
+}
+
+/// Prefix iteration support for StateMap (User namespace only).
+/// This enables enumeration of keys matching a given prefix, which is essential
+/// for parallel-safe storage patterns where each transaction writes to unique keys
+/// and we need to enumerate them at flush time.
+#[cfg(feature = "native")]
+impl<K, V, Codec> NamespacedStateMap<User, K, V, Codec>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemDecoder<V>,
+    Codec::KeyCodec: StateItemCodec<K> + StateItemDecoder<K>,
+    K: FromStr + std::fmt::Display,
+    <Codec::KeyCodec as StateItemDecoder<K>>::Error: std::error::Error + Send + Sync + 'static,
+    <Codec::ValueCodec as StateItemDecoder<V>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    /// Iterates over all key-value pairs in this map whose key starts with `key_prefix`.
+    ///
+    /// This is used for parallel-safe enumeration: each transaction writes to unique keys
+    /// (e.g., `(height, commitment)`), and at flush time we enumerate all keys for the
+    /// current height using this method.
+    ///
+    /// # Arguments
+    /// * `key_prefix` - A prefix struct that, when Borsh-serialized, produces the prefix
+    ///   bytes to match against. For example, `PendingCommitmentPrefix { height: 42 }` will
+    ///   match all `PendingCommitmentKey { height: 42, commitment: ... }` keys.
+    /// * `state` - The StateCheckpoint to iterate over.
+    ///
+    /// # Returns
+    /// A vector of (key, value) pairs matching the prefix.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Define prefix type (must serialize to prefix of full key)
+    /// #[derive(BorshSerialize)]
+    /// struct PendingCommitmentPrefix { height: u64 }
+    ///
+    /// // Enumerate all commitments for height 42
+    /// let prefix = PendingCommitmentPrefix { height: 42 };
+    /// let entries = map.iter_prefix(&prefix, &mut checkpoint)?;
+    /// for (key, value) in entries {
+    ///     // Process each matching entry
+    /// }
+    /// ```
+    pub fn iter_prefix<P, S>(
+        &self,
+        key_prefix: &P,
+        state: &mut StateCheckpoint<S>,
+    ) -> anyhow::Result<Vec<(K, V)>>
+    where
+        P: borsh::BorshSerialize,
+        S: crate::Spec,
+    {
+        // Build the full prefix: map prefix + serialized key prefix
+        let mut full_prefix = self.prefix.as_ref().to_vec();
+        let key_prefix_bytes = borsh::to_vec(key_prefix)?;
+        full_prefix.extend_from_slice(&key_prefix_bytes);
+
+        let mut results = Vec::new();
+        let map_prefix_len = self.prefix.as_ref().len();
+
+        // Iterate over all writes matching the prefix
+        for (slot_key, maybe_value) in state.iter_user_prefix_writes(&full_prefix) {
+            // Only process if there's a value (not deleted)
+            if let Some(value) = maybe_value {
+                // Strip the map prefix to get the raw key bytes
+                let key_bytes = slot_key.key_ref();
+                if key_bytes.len() > map_prefix_len {
+                    let item_key_bytes = &key_bytes[map_prefix_len..];
+
+                    // Decode key and value
+                    let key = self.codec.key_codec().try_decode(item_key_bytes)?;
+                    let val = self.codec.value_codec().try_decode(value.value())?;
+                    results.push((key, val));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Deletes all entries matching the given prefix.
+    ///
+    /// This is typically called after `iter_prefix` to clean up processed entries.
+    pub fn delete_prefix<P, S>(
+        &mut self,
+        key_prefix: &P,
+        state: &mut StateCheckpoint<S>,
+    ) -> anyhow::Result<()>
+    where
+        P: borsh::BorshSerialize,
+        S: crate::Spec,
+    {
+        // Build the full prefix: map prefix + serialized key prefix
+        let mut full_prefix = self.prefix.as_ref().to_vec();
+        let key_prefix_bytes = borsh::to_vec(key_prefix)?;
+        full_prefix.extend_from_slice(&key_prefix_bytes);
+
+        let map_prefix_len = self.prefix.as_ref().len();
+
+        // Collect keys to delete (we need to collect first to avoid borrow issues)
+        let keys_to_delete: Vec<K> = state
+            .iter_user_prefix_writes(&full_prefix)
+            .filter_map(|(slot_key, maybe_value)| {
+                if maybe_value.is_some() {
+                    let key_bytes = slot_key.key_ref();
+                    if key_bytes.len() > map_prefix_len {
+                        let item_key_bytes = &key_bytes[map_prefix_len..];
+                        self.codec.key_codec().try_decode(item_key_bytes).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Delete each key
+        for key in keys_to_delete {
+            self.delete(&key, state)?;
+        }
+
+        Ok(())
     }
 }
 

@@ -6,6 +6,7 @@ use crate::preferred::RollupBlockExecutorConfig;
 use crate::SequencerConfig;
 use crate::TxHash;
 use sov_metrics::Metric;
+use sov_modules_api::Amount;
 use sov_modules_api::Spec;
 use sov_modules_api::StateUpdateInfo;
 use sov_modules_api::TransactionReceipt;
@@ -46,6 +47,16 @@ pub struct ParallelizedResponse<S: Spec> {
     pub original_tx_queue_id: u64,
     /// Precomputed user-facing effect (saves `.into()` on the main thread)
     pub api_effect: ApiTxEffect<TxReceiptContents<S>>,
+    /// Gas consumed by this transaction (needed for GLOBAL_TX_CACHE)
+    pub gas_used: <S as Spec>::Gas,
+    /// Sequencer reward for this transaction (needed for GLOBAL_TX_CACHE)
+    pub reward: Amount,
+    /// Sequencer penalty for this transaction (needed for GLOBAL_TX_CACHE)
+    pub penalty: Amount,
+    /// Pre-cloned receipt for GLOBAL_TX_CACHE (cloned in worker to avoid main thread latency)
+    pub receipt_for_cache: TransactionReceipt<S>,
+    /// Pre-cloned tx_changes for GLOBAL_TX_CACHE (cloned in worker to avoid main thread latency)
+    pub tx_changes_for_cache: TxChangeSet,
 }
 
 /// A transaction to be processed in parallel along with metadata needed for the response.
@@ -378,7 +389,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                             let active_count_after = ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst) - 1;
 
                             match result {
-                                Ok((receipt, tx_changes, remaining_slot_gas, execution_time_micros)) => {
+                                Ok((receipt, tx_changes, remaining_slot_gas, execution_time_micros, gas_used, reward, penalty)) => {
                                     let elapsed = start_time.elapsed();
                                     txs_processed += 1;
 
@@ -412,6 +423,11 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     let api_effect: ApiTxEffect<TxReceiptContents<S>> =
                                         receipt.receipt.clone().into();
 
+                                    // Clone receipt and tx_changes for GLOBAL_TX_CACHE in the worker
+                                    // to avoid cloning on the main thread critical path.
+                                    let receipt_for_cache = receipt.clone();
+                                    let tx_changes_for_cache = tx_changes.clone();
+
                                     let parallel_response = ParallelizedResponse::<S> {
                                         tx_hash: request.tx_hash,
                                         receipt,
@@ -420,6 +436,11 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                         execution_time_micros,
                                         original_tx_queue_id: request.original_tx_queue_id,
                                         api_effect,
+                                        gas_used,
+                                        reward,
+                                        penalty,
+                                        receipt_for_cache,
+                                        tx_changes_for_cache,
                                     };
 
                                     // Send completion message directly to the message loop

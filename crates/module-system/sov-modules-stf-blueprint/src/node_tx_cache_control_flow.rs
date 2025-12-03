@@ -19,7 +19,6 @@ use sov_modules_api::{
     StateCheckpoint, TransactionReceipt, TxControlFlow, TxScratchpad, GLOBAL_TX_CACHE,
 };
 use sov_rollup_interface::TxHash;
-use sov_state::SlotValue;
 
 /// Control flow used by the node (ExecutionContext::Node) to use cached execution
 /// results from the sequencer.
@@ -55,19 +54,7 @@ impl<S: Spec + 'static> InjectedControlFlow<S> for NodeTxCacheControlFlow<S> {
 
     fn should_skip_execution(&self, tx_hash: &TxHash) -> Option<Arc<PrecomputedResult<S>>> {
         // Check if we have a cached result from the sequencer
-        let cached = GLOBAL_TX_CACHE.get::<S>(tx_hash);
-        if let Some(ref result) = cached {
-            tracing::debug!(
-                tx_hash = %tx_hash,
-                gas_used = ?result.gas_used,
-                num_writes = result.tx_changes.writes.len(),
-                num_events = result.receipt.events.len(),
-                reward = ?result.reward,
-                penalty = ?result.penalty,
-                "[NODE CACHE HIT] Using cached result - SKIPPING EXECUTION"
-            );
-        }
-        cached
+        GLOBAL_TX_CACHE.get::<S>(tx_hash)
     }
 
     fn on_verification_result(
@@ -77,97 +64,20 @@ impl<S: Spec + 'static> InjectedControlFlow<S> for NodeTxCacheControlFlow<S> {
         verification_result: &CacheVerificationResult,
         execution_context: ExecutionContext,
     ) {
-        // Only log in Node context
+        // Only log errors in Node context
         if execution_context != ExecutionContext::Node {
             return;
         }
 
-        match verification_result {
-            CacheVerificationResult::CacheMiss => {
-                tracing::debug!(
-                    tx_hash = %tx_hash,
-                    "[NODE CACHE] No cached result found for transaction"
-                );
-            }
-            CacheVerificationResult::Match => {
-                tracing::debug!(
-                    tx_hash = %tx_hash,
-                    gas_used = ?computed.gas_used,
-                    num_writes = computed.tx_changes.writes.len(),
-                    num_events = computed.receipt.events.len(),
-                    reward = ?computed.reward,
-                    penalty = ?computed.penalty,
-                    "[NODE CACHE VERIFIED] ✓ Computed result matches cached result"
-                );
-            }
-            CacheVerificationResult::Mismatch { reason } => {
-                tracing::error!(
-                    tx_hash = %tx_hash,
-                    reason = %reason,
-                    computed_gas = ?computed.gas_used,
-                    computed_writes = computed.tx_changes.writes.len(),
-                    computed_events = computed.receipt.events.len(),
-                    computed_reward = ?computed.reward,
-                    computed_penalty = ?computed.penalty,
-                    "[NODE CACHE MISMATCH] ✗ Computed result differs from cached result!"
-                );
-
-                // Log detailed write-by-write comparison for debugging
-                if let Some(cached) = GLOBAL_TX_CACHE.get::<S>(tx_hash) {
-                    tracing::error!(
-                        cached_gas = ?cached.gas_used,
-                        cached_writes = cached.tx_changes.writes.len(),
-                        cached_events = cached.receipt.events.len(),
-                        cached_reward = ?cached.reward,
-                        cached_penalty = ?cached.penalty,
-                        "[NODE CACHE MISMATCH] Cached result details"
-                    );
-
-                    // Helper to format value for logging
-                    fn format_value(val: &Option<SlotValue>) -> String {
-                        match val {
-                            None => "None".to_string(),
-                            Some(v) => {
-                                let bytes = v.value();
-                                if bytes.len() > 64 {
-                                    format!(
-                                        "{}... ({} bytes)",
-                                        hex::encode(&bytes[..32]),
-                                        bytes.len()
-                                    )
-                                } else {
-                                    hex::encode(bytes)
-                                }
-                            }
-                        }
-                    }
-
-                    // Log each write for comparison
-                    tracing::error!("[NODE CACHE MISMATCH] === COMPUTED WRITES (Node) ===");
-                    for (i, ((key, ns), value)) in computed.tx_changes.writes.iter().enumerate() {
-                        let key_str = String::from_utf8_lossy(key.as_ref());
-                        tracing::error!(
-                            idx = i,
-                            key = %key_str,
-                            namespace = ?ns,
-                            value = %format_value(value),
-                            "[COMPUTED WRITE]"
-                        );
-                    }
-
-                    tracing::error!("[NODE CACHE MISMATCH] === CACHED WRITES (Sequencer) ===");
-                    for (i, ((key, ns), value)) in cached.tx_changes.writes.iter().enumerate() {
-                        let key_str = String::from_utf8_lossy(key.as_ref());
-                        tracing::error!(
-                            idx = i,
-                            key = %key_str,
-                            namespace = ?ns,
-                            value = %format_value(value),
-                            "[CACHED WRITE]"
-                        );
-                    }
-                }
-            }
+        // Only log mismatches - they indicate potential issues
+        if let CacheVerificationResult::Mismatch { reason } = verification_result {
+            tracing::error!(
+                tx_hash = %tx_hash,
+                reason = %reason,
+                computed_gas = ?computed.gas_used,
+                computed_writes = computed.tx_changes.writes.len(),
+                "[NODE CACHE MISMATCH] Computed result differs from cached result"
+            );
         }
     }
 
