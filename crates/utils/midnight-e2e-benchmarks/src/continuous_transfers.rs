@@ -639,8 +639,8 @@ pub async fn run() -> Result<()> {
         );
         let deposit_start = Instant::now();
         perform_initial_deposits(
-            &client,
             &http,
+            &verifier_url,
             &mut wallets,
             &chain_hash,
             config.per_tx_delay_ms,
@@ -905,8 +905,8 @@ fn log_final_summary(
 }
 
 async fn perform_initial_deposits(
-    client: &NodeClient,
     http: &HttpClient,
+    verifier_url: &str,
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
     per_tx_delay_ms: u64,
@@ -939,26 +939,25 @@ async fn perform_initial_deposits(
         let tx_bytes = borsh::to_vec(&tx)?;
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
 
-        let api_url = &client.base_url;
-        let url = format!("{}/sequencer/txs", api_url.trim_end_matches('/'));
+        let url = format!("{}/midnight-privacy", verifier_url.trim_end_matches('/'));
         if detailed_wallet_logs {
             eprintln!(
-                "[deposit] wallet={} nonce={} amount={} url={}",
+                "[deposit] wallet={} nonce={} amount={} via verifier {}",
                 i, wallet.nonce, amount, url
             );
         }
 
         let resp = http
             .post(&url)
-            .json(&json!({ "body": tx_b64 }))
+            .json(&json!({ "body": tx_b64, "serialized_tx_base64": tx_b64 }))
             .send()
             .await
-            .context("Deposit HTTP request failed")?;
+            .context("Deposit HTTP request to verifier failed")?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             bail!(
-                "Deposit for wallet {} failed with status {}: {}",
+                "Deposit for wallet {} failed via verifier with status {}: {}",
                 i,
                 status, body
             );
@@ -972,6 +971,21 @@ async fn perform_initial_deposits(
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
         }
+    }
+
+    // Flush any queued deposits to the sequencer to ensure inclusion before proceeding.
+    let flush_endpoint = format!("{}/midnight-privacy/flush", verifier_url.trim_end_matches('/'));
+    let flush_resp = http.post(&flush_endpoint).send().await.context("Deposit flush request failed")?;
+    let status = flush_resp.status();
+    let body = flush_resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "Deposit flush failed with status {}: {}",
+            status,
+            body
+        );
+    } else if detailed_wallet_logs {
+        eprintln!("[deposit] flushed queued deposits via {}", flush_endpoint);
     }
 
     Ok(())
@@ -1505,7 +1519,7 @@ async fn perform_transfer_cycle(
             for attempt in 0..=MAX_SUBMIT_RETRIES {
                 let resp = client
                     .post(&endpoint)
-                    .json(&json!({ "body": body_b64 }))
+                    .json(&json!({ "body": body_b64, "serialized_tx_base64": body_b64 }))
                     .send()
                     .await;
 
