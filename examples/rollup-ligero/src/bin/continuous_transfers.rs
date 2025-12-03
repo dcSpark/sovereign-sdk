@@ -12,8 +12,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
+    note_commitment, nullifier, CallMessage as MidnightCallMessage, EncryptedNote,
+    FullViewingKey, Hash32, MerkleTree, SpendPublic, ViewAttestation,
 };
+use qp_poseidon_core::Poseidon2Core;
 use rand::Rng;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
@@ -38,6 +40,122 @@ use toml::Value as TomlValue;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
+// === Authority Viewing Key Support (Level-B Compliance) ===
+
+/// Plaintext length: 32(domain) + 16(value) + 32(rho) + 32(recipient) = 112 bytes
+const NOTE_PLAIN_LEN: usize = 112;
+
+/// Load authority viewing key from AUTHORITY_FVK environment variable.
+fn load_authority_fvk() -> Option<Hash32> {
+    let raw = std::env::var("AUTHORITY_FVK").ok()?;
+    let s = raw.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn get_hasher() -> Poseidon2Core {
+    Poseidon2Core::new()
+}
+
+fn poseidon2_hash_domain(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
+    let hasher = get_hasher();
+    let mut len = tag.len();
+    for p in parts {
+        len += p.len();
+    }
+    let mut tmp = Vec::with_capacity(len);
+    tmp.extend_from_slice(tag);
+    for p in parts {
+        tmp.extend_from_slice(p);
+    }
+    hasher.hash_padded(&tmp)
+}
+
+fn fvk_commit(fvk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"FVK_COMMIT_V1", &[fvk])
+}
+
+fn view_kdf(fvk: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_KDF_V1", &[fvk, cm])
+}
+
+fn stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    let c = ctr.to_le_bytes();
+    poseidon2_hash_domain(b"VIEW_STREAM_V1", &[k, &c])
+}
+
+fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
+    debug_assert_eq!(pt.len(), ct_out.len());
+    let mut ctr = 0u32;
+    let mut off = 0usize;
+    while off < pt.len() {
+        let ks = stream_block(k, ctr);
+        ctr = ctr.wrapping_add(1);
+        let take = core::cmp::min(32, pt.len() - off);
+        for i in 0..take {
+            ct_out[off + i] = pt[off + i] ^ ks[i];
+        }
+        off += take;
+    }
+}
+
+fn ct_hash_bytes(ct: &[u8]) -> Hash32 {
+    poseidon2_hash_domain(b"CT_HASH_V1", &[ct])
+}
+
+fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"VIEW_MAC_V1", &[k, cm, ct_h])
+}
+
+fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> [u8; NOTE_PLAIN_LEN] {
+    let mut out = [0u8; NOTE_PLAIN_LEN];
+    out[0..32].copy_from_slice(domain);
+    out[32..48].copy_from_slice(&value.to_le_bytes());
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+    out
+}
+
+fn make_viewer_bundle(
+    fvk: &Hash32,
+    domain: &Hash32,
+    value: u128,
+    rho: &Hash32,
+    recipient: &Hash32,
+    cm: &Hash32,
+) -> (ViewAttestation, EncryptedNote) {
+    let fvk_commitment = fvk_commit(fvk);
+    let pt = encode_note_plain(domain, value, rho, recipient);
+    let k = view_kdf(fvk, cm);
+    let mut ct = [0u8; NOTE_PLAIN_LEN];
+    stream_xor_encrypt(&k, &pt, &mut ct);
+    let ct_h = ct_hash_bytes(&ct);
+    let mac = view_mac(&k, cm, &ct_h);
+
+    let enc = EncryptedNote {
+        cm: *cm,
+        nonce: [0u8; 24],
+        ct: sov_modules_api::SafeVec::try_from(ct.to_vec()).expect("ciphertext fits"),
+        fvk_commitment,
+        mac,
+    };
+
+    let att = ViewAttestation {
+        cm: *cm,
+        fvk_commitment,
+        ct_hash: ct_h,
+        mac,
+    };
+
+    (att, enc)
+}
+
 const TREE_DEPTH: u8 = 16;
 const TREE_REBUILD_MAX_RETRIES: usize = 5;
 const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
@@ -59,6 +177,8 @@ struct ContinuousConfig {
     detailed_wallet_logs: bool,
     continuous: bool,
     managed_mode: bool,
+    /// Authority FVK for Level-B compliance (optional)
+    authority_fvk: Option<Hash32>,
 }
 
 impl ContinuousConfig {
@@ -110,6 +230,9 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Load authority FVK for Level-B compliance
+        let authority_fvk = load_authority_fvk();
+
         Ok(Self {
             num_wallets,
             initial_deposit,
@@ -121,6 +244,7 @@ impl ContinuousConfig {
             detailed_wallet_logs,
             continuous,
             managed_mode,
+            authority_fvk,
         })
     }
 }
@@ -581,6 +705,15 @@ async fn main() -> Result<()> {
         config.managed_mode
     );
 
+    // Log authority FVK status
+    if let Some(fvk) = config.authority_fvk {
+        eprintln!("[config] AUTHORITY_FVK set: Level-B viewing attestations enabled");
+        eprintln!("[config] Authority FVK: 0x{}...", &hex::encode(&fvk[..8]));
+        eprintln!("[config] Proofs will include viewer attestations for compliance");
+    } else {
+        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+    }
+
     // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
     let ligero_env = setup_ligero_env()?;
     let program_path = ligero_env.program_path.clone();
@@ -711,6 +844,7 @@ async fn main() -> Result<()> {
             &chain_hash,
             config.per_tx_delay_ms,
             config.detailed_wallet_logs,
+            config.authority_fvk,
         )
         .await?;
         let deposit_ms = deposit_start.elapsed().as_secs_f64() * 1000.0;
@@ -1030,11 +1164,17 @@ async fn perform_initial_deposits(
     chain_hash: &[u8; 32],
     per_tx_delay_ms: u64,
     detailed_wallet_logs: bool,
+    authority_fvk: Option<Hash32>,
 ) -> Result<()> {
     for (i, wallet) in wallets.iter_mut().enumerate() {
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
         let recipient: Hash32 = rand::random();
+
+        // Include authority viewing key if configured
+        let view_fvks: Option<Vec<FullViewingKey>> = authority_fvk.map(|fvk| {
+            vec![FullViewingKey(fvk)]
+        });
 
         let call =
             RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
@@ -1042,7 +1182,7 @@ async fn perform_initial_deposits(
                 rho,
                 recipient,
                 gas: None,
-                view_fvks: None,
+                view_fvks,
             });
 
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
@@ -1379,10 +1519,16 @@ async fn perform_transfer_cycle(
         });
     }
 
+    let viewer_status = if config.authority_fvk.is_some() {
+        "viewer=true (Level-B)"
+    } else {
+        "viewer=false"
+    };
     eprintln!(
-        "[cycle] Building proofs for {} wallets (max_concurrent_proofs={})",
+        "[cycle] Building proofs for {} wallets (max_concurrent_proofs={}, {})",
         inputs.len(),
-        config.max_concurrent_proofs
+        config.max_concurrent_proofs,
+        viewer_status
     );
     let proof_generation_start = Instant::now();
 
@@ -1404,6 +1550,7 @@ async fn perform_transfer_cycle(
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
+        let authority_fvk_copy = config.authority_fvk; // Option<[u8;32]> is Copy
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
@@ -1413,20 +1560,37 @@ async fn perform_transfer_cycle(
                 let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
                 let nf = nullifier(&DOMAIN, &NF_KEY, &in_rho);
+
+                // Build viewer attestation if authority FVK is set
+                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk_copy {
+                    let (att, _enc) = make_viewer_bundle(&fvk, &DOMAIN, value, &out_rho, &out_recipient, &cm_out);
+                    (Some(vec![att.clone()]), Some((fvk, att)))
+                } else {
+                    (None, None)
+                };
+
                 let public = SpendPublic {
                     anchor_root: anchor,
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out],
-                    view_attestations: None,
+                    view_attestations,
                 };
 
+                let n_out = 1usize;
                 let mut private_indices = vec![2, 3, 4, 5, 6];
                 for j in 0..depth_usize {
                     private_indices.push(7 + j);
                 }
-                let out_base = 11 + depth_usize;
+                let out_base = 12 + depth_usize;
                 private_indices.extend_from_slice(&[out_base + 0, out_base + 1, out_base + 2]);
+
+                // If viewer attestations are present, add private index for the FVK
+                if viewer_data.is_some() {
+                    let viewer_base = 12 + depth_usize + 4 * n_out;
+                    let fvk_arg_index = viewer_base + 2;
+                    private_indices.push(fvk_arg_index);
+                }
 
                 let mut host =
                     <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
@@ -1450,6 +1614,16 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode(out_rho));
                 host.add_hex_arg(hex::encode(out_recipient));
                 host.add_hex_arg(hex::encode(cm_out));
+
+                // Viewer section (Level-B) if authority FVK is set
+                if let Some((fvk, att)) = viewer_data {
+                    host.add_str_arg("1".to_string()); // m_viewers = 1
+                    host.add_hex_arg(hex::encode(att.fvk_commitment));
+                    host.add_hex_arg(hex::encode(fvk));
+                    host.add_hex_arg(hex::encode(att.ct_hash));
+                    host.add_hex_arg(hex::encode(att.mac));
+                }
+
                 host.set_public_output(&public)
                     .context("set public output (round 2)")?;
 
@@ -1509,15 +1683,24 @@ async fn perform_transfer_cycle(
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;
+        let authority_fvk_copy = config.authority_fvk;
         build_tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<BuiltTransfer> {
             let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
+
+            // Build EncryptedNote for the authority, if configured
+            let cm_out = note_commitment(&DOMAIN, wallet.value, &out_rho, &out_recipient);
+            let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk_copy.map(|fvk| {
+                let (_att, enc) = make_viewer_bundle(&fvk, &DOMAIN, wallet.value, &out_rho, &out_recipient, &cm_out);
+                vec![enc]
+            });
+
             let call =
                 RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
                     proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
                         .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                     anchor_root,
                     nullifier: nf,
-                    view_ciphertexts: None,
+                    view_ciphertexts,
                     gas: None,
                 });
 

@@ -74,6 +74,7 @@ prometheus_exporter = "0.8.5"
 clap = { workspace = true, features = ["derive"] }
 secp256k1 = { workspace = true, features = ["global-context", "recovery"] }
 midnight-privacy = { workspace = true, features = ["native"] }
+qp-poseidon-core = { version = "0.9.5", features = ["std"] }
 sov-api-spec = { workspace = true }
 sov-test-utils = { workspace = true }
 sov-proof-verifier-service = { path = "../../crates/utils/sov-proof-verifier-service" }
@@ -163,3 +164,7 @@ path = "src/bin/generate_genesis_keys.rs"
 [[bin]]
 name = "continuous-transfers"
 path = "src/bin/continuous_transfers.rs"
+
+[[bin]]
+name = "generate-authority-fvk"
+path = "src/bin/generate_authority_fvk.rs"
