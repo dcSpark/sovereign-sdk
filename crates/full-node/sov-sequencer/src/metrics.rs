@@ -187,3 +187,31 @@ impl Metric for PreferredSequencerExecutorEventSendingMetrics {
         )
     }
 }
+
+/// Metrics for tracking the 3 stages of parallel transaction execution
+/// Stage 1: Sending transaction to parallel executor
+/// Stage 2: Worker executing the transaction in parallel
+/// Stage 3: Committing the result back to the main executor
+#[derive(Debug)]
+pub struct ParallelTxStageMetrics {
+    pub tx_hash: String,
+    pub stage: u8,
+    pub duration_us: u64,
+}
+
+impl Metric for ParallelTxStageMetrics {
+    fn measurement_name(&self) -> &'static str {
+        "sov_sequencer_parallel_tx_stage"
+    }
+
+    fn serialize_for_telegraf(&self, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+        write!(
+            buffer,
+            "{},tx_hash={},stage={} duration_us={}",
+            self.measurement_name(),
+            self.tx_hash,
+            self.stage,
+            self.duration_us,
+        )
+    }
+}

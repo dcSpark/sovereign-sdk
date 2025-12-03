@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,10 +39,10 @@ use toml::Value as TomlValue;
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 const TREE_DEPTH: u8 = 16;
-const TREE_REBUILD_MAX_RETRIES: usize = 3;
+const TREE_REBUILD_MAX_RETRIES: usize = 5;
 const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
-const MISSING_NOTE_RETRY_MAX: usize = 3;
-const MISSING_NOTE_RETRY_DELAY_MS: u64 = 200;
+const MISSING_NOTE_RETRY_MAX: usize = 10;
+const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
@@ -398,6 +398,9 @@ async fn start_managed_stack(
 struct TreeState {
     root: Vec<u8>,
     next_position: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    depth: Option<u8>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -409,6 +412,11 @@ struct NoteInfo {
 #[derive(Deserialize)]
 struct NotesResp {
     notes: Vec<NoteInfo>,
+    #[serde(default)]
+    current_root: Option<Vec<u8>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    count: Option<u64>,
 }
 
 async fn fetch_note_positions(
@@ -1144,8 +1152,22 @@ async fn perform_transfer_cycle(
     let mut cached_next_pos = *cached_next_position;
     let (state, _state_root) = {
         let mut attempt_result = None;
+        let mut used_fallback = false;
+        
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
             attempts_made = attempt + 1;
+            
+            // On the last attempt, use bomb-proof full rebuild
+            let force_full_rebuild = attempt == TREE_REBUILD_MAX_RETRIES - 1;
+            if force_full_rebuild && !used_fallback {
+                eprintln!("[cycle] Incremental rebuild failed, falling back to full rebuild from scratch");
+                mt = MerkleTree::new(TREE_DEPTH);
+                pos_by_cm.clear();
+                cached_next_pos = 0;
+                cached_root_val = None;
+                used_fallback = true;
+            }
+            
             let state_attempt: TreeState = client
                 .query_rest_endpoint("/modules/midnight-privacy/tree/state")
                 .await
@@ -1179,9 +1201,12 @@ async fn perform_transfer_cycle(
                     mt.grow_to_fit(target_leaves);
                 }
 
-                // Fetch only new notes since the last rebuild, and append them.
+                // Fetch notes and use current_root from response for atomic consistency.
+                // This avoids race conditions between separate /tree/state and /notes calls.
                 let batch_size = 1000;
                 let mut offset = cached_next_pos as usize;
+                let mut last_current_root: Option<Vec<u8>> = None;
+                
                 while offset < target_leaves {
                     let endpoint = format!(
                         "/modules/midnight-privacy/notes?limit={}&offset={}",
@@ -1196,6 +1221,11 @@ async fn perform_transfer_cycle(
 
                     if batch_resp.notes.is_empty() {
                         break;
+                    }
+                    
+                    // Capture current_root from the response for atomic consistency
+                    if let Some(ref root) = batch_resp.current_root {
+                        last_current_root = Some(root.clone());
                     }
 
                     for n in batch_resp.notes.iter() {
@@ -1213,15 +1243,32 @@ async fn perform_transfer_cycle(
                     let len = batch_resp.notes.len();
                     offset += len;
                 }
+                
+                // Prefer using current_root from notes response (atomic with notes data)
+                // Fall back to state_attempt.root if not available
+                if let Some(ref api_root) = last_current_root {
+                    if api_root.len() == 32 {
+                        attempt_root.copy_from_slice(api_root);
+                    }
+                }
             }
 
-            if mt.root().as_slice() == state_attempt.root.as_slice() {
+            if mt.root().as_slice() == attempt_root.as_slice() {
+                // Update state_attempt.root to match attempt_root for consistency
+                let mut final_state = state_attempt.clone();
+                final_state.root = attempt_root.to_vec();
                 cached_root_val = Some(attempt_root);
-                cached_next_pos = state_attempt.next_position;
-                attempt_result = Some((state_attempt, attempt_root));
+                cached_next_pos = final_state.next_position;
+                attempt_result = Some((final_state, attempt_root));
                 break;
-            } else if reuse_cache {
-                // Cached tree diverged; reset cache and rebuild on the next attempt.
+            } else {
+                // Roots don't match - reset cache for next attempt
+                eprintln!(
+                    "[cycle] Tree root mismatch on attempt {}: rebuilt={} vs expected={}",
+                    attempt + 1,
+                    hex::encode(mt.root()),
+                    hex::encode(&attempt_root)
+                );
                 mt = MerkleTree::new(TREE_DEPTH);
                 pos_by_cm.clear();
                 cached_next_pos = 0;
@@ -1231,7 +1278,7 @@ async fn perform_transfer_cycle(
 
             if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
                 bail!(
-                    "Rebuilt tree root mismatch after {} attempts",
+                    "Rebuilt tree root mismatch after {} attempts (including full rebuild fallback)",
                     TREE_REBUILD_MAX_RETRIES
                 );
             }
@@ -1946,6 +1993,55 @@ async fn perform_transfer_cycle(
             // Only total_ms is available (older sequencer)
             sequencer_sum_ms += *ms;
             sequencer_count += 1;
+        }
+    }
+
+    // Wait for all new output notes to be indexed before ending the cycle.
+    // This ensures the next cycle can find the note commitments for all wallets.
+    const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
+    const NOTE_SYNC_POLL_MS: u64 = 100;
+    
+    // Collect expected output commitments for wallets that participated in this cycle
+    let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
+    for input in &inputs {
+        // The wallet state has already been updated with new_rho/new_recipient
+        let w = &wallets[input.wallet_idx];
+        let expected_cm = note_commitment(&DOMAIN, w.value, &w.rho, &w.recipient);
+        expected_commitments.push((expected_cm, input.wallet_idx));
+    }
+    
+    if !expected_commitments.is_empty() {
+        let sync_start = Instant::now();
+        let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
+        let mut pending: HashSet<[u8; 32]> = expected_commitments.iter().map(|(cm, _)| *cm).collect();
+        
+        while !pending.is_empty() && Instant::now() < sync_deadline {
+            let fresh_positions = fetch_note_positions(client, false).await?;
+            pending.retain(|cm| !fresh_positions.contains_key(cm));
+            
+            if !pending.is_empty() {
+                sleep(Duration::from_millis(NOTE_SYNC_POLL_MS)).await;
+            }
+        }
+        
+        let sync_elapsed = sync_start.elapsed();
+        if pending.is_empty() {
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] All {} new output notes indexed in {:.2} ms",
+                    expected_commitments.len(),
+                    sync_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            // Update the cached position map with fresh data
+            pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
+        } else {
+            eprintln!(
+                "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
+                pending.len(),
+                expected_commitments.len(),
+                sync_elapsed.as_secs_f64()
+            );
         }
     }
 

@@ -1,40 +1,32 @@
 use sov_modules_api::macros::serialize;
-use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::hash::Hash32;
 use crate::types::EncryptedNote;
 
-/// A (commitment, position) pair used by aggregate events.
-#[derive(
-    Debug,
-    PartialEq,
-    Clone,
-    schemars::JsonSchema,
-    serde::Serialize,
-    serde::Deserialize,
-    BorshSerialize,
-    BorshDeserialize,
-)]
-pub struct CommitmentPos {
-    /// The note commitment
-    pub commitment: Hash32,
-    /// Position in the tree
-    pub position: u64,
-}
-
-/// Events emitted by the MidnightPrivacy module
+/// Events emitted by the MidnightPrivacy module.
+/// 
+/// **IMPORTANT: Position and root values in per-tx events are PROVISIONAL.**
+/// 
+/// Due to parallel execution, the actual tree positions and roots are only finalized
+/// at the end of the block in `end_block_flush`. Events emitted during transaction
+/// execution contain placeholder values:
+/// - `position`: Will be `None` (unknown until flush)
+/// - `new_root`: Will be `[0u8; 32]` placeholder
+/// 
+/// For authoritative position/root data, indexers should:
+/// 1. Query `/modules/midnight-privacy/notes` endpoint after block finalization
+/// 2. Use `AnchorRootRecorded` events which are emitted during flush with real roots
 #[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
 #[serialize(Borsh, Serde)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
-    /// A note commitment was added to the tree
+    /// A note commitment was queued for addition to the tree.
+    /// 
+    /// **Note:** Position is provisional and will be assigned at end-of-block flush.
+    /// The `new_root` is a placeholder `[0u8; 32]` - real roots come from `AnchorRootRecorded`.
     NoteCreated {
         /// The note commitment
         commitment: Hash32,
-        /// Position in the tree
-        position: u64,
-        /// New Merkle root
-        new_root: Hash32,
     },
     /// A note was spent (nullifier consumed)
     NoteSpent {
@@ -48,29 +40,29 @@ pub enum Event {
         /// The new method ID
         new_method_id: [u8; 32],
     },
-    /// Tokens were deposited into the pool and a note was created
+    /// Tokens were deposited into the pool and a note was queued for creation.
+    /// 
+    /// **Note:** Position is provisional. Final position assigned at end-of-block flush.
     PoolDeposit {
         /// Amount deposited
         amount: u128,
         /// The note commitment
         commitment: Hash32,
-        /// Position in the tree
-        position: u64,
-        /// New Merkle root
-        new_root: Hash32,
     },
-    /// Shielded → Shielded transfer (pure privacy), aggregating the outputs.
+    /// Shielded → Shielded transfer (pure privacy).
+    /// 
+    /// **Note:** Output positions are provisional. Final positions assigned at flush.
     PoolTransfer {
         /// The nullifier that was spent
         nullifier: Hash32,
         /// The anchor root used
         anchor_root: Hash32,
-        /// Output notes (commitment + position) added by this transfer
-        outputs: Vec<CommitmentPos>,
-        /// Final Merkle root after all outputs were appended
-        new_root: Hash32,
+        /// Output note commitments added by this transfer
+        outputs: Vec<Hash32>,
     },
-    /// Tokens were withdrawn from the pool after consuming a nullifier
+    /// Tokens were withdrawn from the pool after consuming a nullifier.
+    /// 
+    /// **Note:** Change output positions are provisional.
     PoolWithdraw {
         /// Amount withdrawn
         amount: u128,
@@ -78,12 +70,13 @@ pub enum Event {
         nullifier: Hash32,
         /// The anchor root used
         anchor_root: Hash32,
-        /// Change outputs created (often 0 or 1)
-        change: Vec<CommitmentPos>,
-        /// Final Merkle root after appending any change
-        new_root: Hash32,
+        /// Change output commitments created (often 0 or 1)
+        change: Vec<Hash32>,
     },
-    /// A Merkle root was recorded in the permanent historical index (NOMT-backed)
+    /// A Merkle root was recorded in the permanent historical index (NOMT-backed).
+    /// 
+    /// This event is emitted during `end_block_flush` and contains the **authoritative**
+    /// root value. Use this for anchor tracking, not per-tx events.
     AnchorRootRecorded {
         /// The root value
         root: Hash32,

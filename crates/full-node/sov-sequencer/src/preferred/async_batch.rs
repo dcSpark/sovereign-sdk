@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
 use sov_modules_api::state::TxScratchpad;
 use sov_modules_api::{
-    ChangeSet, Context, DispatchCall, ExecutionContext, FullyBakedTx, GasArray, IncrementalBatch,
-    InjectedControlFlow, IterableBatchWithId, MaybeExecuted, NoOpControlFlow,
+    Amount, ChangeSet, Context, DispatchCall, ExecutionContext, FullyBakedTx, GasArray,
+    IncrementalBatch, InjectedControlFlow, IterableBatchWithId, MaybeExecuted, NoOpControlFlow,
     ProvisionalSequencerOutcome, Runtime, SlotGasMeter, TransactionReceipt, TxChangeSet,
     TxControlFlow,
 };
@@ -153,6 +153,12 @@ pub(crate) struct ExecutedTxResponse<S: Spec> {
     pub tx_changes: TxChangeSet,
     pub remaining_slot_gas: <S as Spec>::Gas,
     pub execution_time_micros: u64,
+    /// Gas consumed by this transaction (needed for GLOBAL_TX_CACHE)
+    pub gas_used: <S as Spec>::Gas,
+    /// Sequencer reward for this transaction (needed for GLOBAL_TX_CACHE)
+    pub reward: Amount,
+    /// Sequencer penalty for this transaction (needed for GLOBAL_TX_CACHE)
+    pub penalty: Amount,
 }
 
 /// The channel responsible for notifying an async tx submitter of the txs result
@@ -239,6 +245,9 @@ impl<S: Spec> AsyncBatchResponder<S> {
                     .remaining_preferred_slot_gas()
                     .clone(), // Since we ignore this tx, the remaining gas limit is unchanged
                 execution_time_micros: execution_time,
+                gas_used: gas_used.clone(),
+                reward,
+                penalty,
             };
 
             self.send_item(Ok(response));
@@ -265,6 +274,9 @@ impl<S: Spec> AsyncBatchResponder<S> {
             tx_changes: dirty_scratchpad.tx_changes(execution_context),
             remaining_slot_gas,
             execution_time_micros: execution_time,
+            gas_used: gas_used.clone(),
+            reward,
+            penalty,
         };
 
         self.send_item(Ok(response));

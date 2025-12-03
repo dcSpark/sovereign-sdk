@@ -62,3 +62,5 @@ PARALLEL_TX_EXECUTOR_GUIDE.md
 crates/full-node/sov-sequencer/test_output.log
 proof_cache/
 .env
+examples/rollup-ligero/output.log
+cache_l2.txt

@@ -224,6 +224,7 @@ bytes = { version = "1.7.1", default-features = false }
 convert_case = { version = "0.6", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["now"] }
 darling = "0.20"
+dashmap = "6.1"
 delegate = "0.13.4"
 derive-new = "0.7.0"
 derivative = { version = "2.2", features = ["use_core"] }
@@ -265,6 +266,7 @@ tower-http = "0.5"
 tower-request-id = "0.3"
 tracing = { version = "0.1.40", default-features = false }
 tracing-subscriber = { version = "0.3.18" } # There's hardly any reason to disable its default features.
+tracing-appender = { version = "0.2" }
 tracing-test = { version = "0.2.5", features = [
     "no-env-filter",
 ] } # https://docs.rs/tracing-test/latest/tracing_test/#per-crate-filtering
@@ -332,6 +334,12 @@ secp256k1 = { version = "=0.30.0", default-features = false, features = [
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
 quick_cache = "0.6.16"
 # End of EVM dependencies
+
+# Profile for profiling with samply/perf - release performance with debug symbols
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
 
 [profile.rust-analyzer-optimized]
 inherits = "dev"

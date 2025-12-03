@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
+use crate::tx_cache::{CacheVerificationResult, PrecomputedResult};
 use crate::ExecutionContext;
+#[cfg(feature = "native")]
+type ArcPrecomputedResult<S> = Arc<PrecomputedResult<S>>;
 use crate::{
     Amount, Context, DispatchCall, Gas, Runtime, SlotGasMeter, Spec, StateCheckpoint,
     TransactionReceipt, TxScratchpad,
@@ -8,6 +12,8 @@ use crate::{
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_rollup_interface::da::DaSpec;
+#[cfg(feature = "native")]
+use sov_rollup_interface::TxHash;
 
 /// `FullyBakedTx` represents a serialized signed rollup transaction that has been encoded with
 /// authentication information and is ready to be placed on the DA layer.
@@ -331,6 +337,37 @@ pub trait InjectedControlFlow<S: Spec> {
     /// sequencer executor and only if a warm up worker task finishes executing the given transaction
     /// before the main executor.
     fn try_warm_up_cache(&mut self, scratchpad: &mut TxScratchpad<S, StateCheckpoint<S>>);
+
+    /// Returns a precomputed result if this transaction should skip execution entirely.
+    /// When this returns `Some`, the STF should use the precomputed receipt and changes
+    /// instead of re-executing the transaction.
+    ///
+    /// The `tx_hash` parameter allows implementations to look up cached results.
+    /// Returns `Arc` to avoid cloning large structures on every cache hit.
+    #[cfg(feature = "native")]
+    fn should_skip_execution(&self, _tx_hash: &TxHash) -> Option<ArcPrecomputedResult<S>> {
+        None
+    }
+
+    /// Called after a transaction is executed to handle verification results.
+    ///
+    /// This method is called with the verification result from comparing the computed
+    /// result against a cached version. Implementations can use this for logging.
+    ///
+    /// - `tx_hash`: The hash of the transaction.
+    /// - `computed`: The result computed by this execution.
+    /// - `verification_result`: The result of comparing against cache (already computed).
+    /// - `execution_context`: The execution context (Sequencer, Node, etc.)
+    #[cfg(feature = "native")]
+    fn on_verification_result(
+        &self,
+        _tx_hash: &TxHash,
+        _computed: &PrecomputedResult<S>,
+        _verification_result: &CacheVerificationResult,
+        _execution_context: ExecutionContext,
+    ) {
+        // Default: no-op
+    }
 
     /// Runs after authentication but before the transaction executes
     fn pre_flight<RT: Runtime<S>>(

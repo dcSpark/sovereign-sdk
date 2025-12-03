@@ -14,8 +14,8 @@ use sov_blob_sender::BlobInternalId;
 use sov_blob_storage::SequenceNumber;
 use sov_modules_api::capabilities::RollupHeight;
 use sov_modules_api::{
-    FullyBakedTx, GasArray, GasSpec, Runtime, Spec, StateCheckpoint, StateUpdateInfo,
-    VersionReader, VisibleSlotNumber,
+    FullyBakedTx, GasArray, GasSpec, PrecomputedResult, Runtime, Spec, StateCheckpoint,
+    StateUpdateInfo, VersionReader, VisibleSlotNumber, GLOBAL_TX_CACHE,
 };
 use sov_state::{NativeStorage, Storage};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -62,7 +62,10 @@ const COMFORTABLE_GAS_LIMIT_DIVISOR: u64 = 20;
 
 const METRICS_BATCH_SIZE: usize = 32;
 
-const CHANNEL_SIZE: usize = 2048;
+const CHANNEL_SIZE: usize = 16384;
+
+const PARALLEL_COMPLETION_MAX_RETRIES: u8 = 50;
+const PARALLEL_COMPLETION_RETRY_DELAY_MS: u64 = 10;
 
 type AcceptTxRet<S, Rt> =
     Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>;
@@ -107,6 +110,10 @@ where
     // Parallel in-flight tracking and HTTP waiters
     pending_parallel_count: usize,
     pending_http_waiters: HashMap<TxHash, oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>>,
+    /// Set when the batch should close but parallel txs are still in-flight.
+    /// While true, new txs are routed to sequential path (not parallel workers).
+    /// When pending_parallel_count reaches 0 and this is true, close the batch.
+    parallel_routing_paused: bool,
 }
 
 // We submit metrics when this guard is dropped.
@@ -312,6 +319,12 @@ where
 
         self.parallel_tx_executor
             .send_batch_start_notification(notification);
+
+        // Reset parallel routing pause when new batch starts
+        if self.parallel_routing_paused {
+            tracing::debug!("Resuming parallel routing: new batch started");
+            self.parallel_routing_paused = false;
+        }
 
         self.executor_events_sender
             .start_batch(
@@ -525,14 +538,6 @@ where
 
     /// Closes the current batch if it is nearly full (by gas limit) or has reached the target batch execution time.
     async fn close_batch_if_nearly_full(&mut self, remaining_slot_gas: &<S as GasSpec>::Gas) {
-        // Keep the batch open while parallel txs are in-flight
-        if self.pending_parallel_count > 0 {
-            tracing::trace!(
-                pending = %self.pending_parallel_count,
-                "Deferring batch close due to pending parallel txs"
-            );
-            return;
-        }
         // Check if we're close to the gas limit and close the batch if we are.
         let mut comfortable_gas_limit = <S as GasSpec>::initial_gas_limit();
         comfortable_gas_limit
@@ -546,7 +551,7 @@ where
         let close_to_gas_limit = remaining_slot_gas.dim_is_less_or_eq(&comfortable_gas_limit);
         if close_to_gas_limit {
             tracing::debug!(%comfortable_gas_limit, %remaining_slot_gas, "Closing and publishing current batch because we're close to the gas limit");
-            self.close_current_batch().await;
+            self.close_or_defer_batch().await;
         }
 
         let current_batch_execution_time_micros =
@@ -554,7 +559,7 @@ where
 
         if current_batch_execution_time_micros > self.batch_execution_time_limit_micros {
             tracing::debug!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Closing and publishing current batch because we've reached the batch execution time cap");
-            self.close_current_batch().await;
+            self.close_or_defer_batch().await;
         } else {
             tracing::trace!(%self.batch_execution_time_limit_micros, %current_batch_execution_time_micros, "Batch execution time is within comfortable range, not closing batch");
         }
@@ -569,10 +574,27 @@ where
             });
         if (self.batch_size_tracker.current_batch_size as u64) > comfortable_size_limit {
             tracing::debug!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Closing and publishing current batch because we're close to the size limit");
-            self.close_current_batch().await;
+            self.close_or_defer_batch().await;
         } else {
             tracing::trace!(%comfortable_size_limit, current_batch_size = %self.batch_size_tracker.current_batch_size, "Batch size is within comfortable range, not closing batch");
         }
+    }
+
+    /// Close the batch, or defer if parallel transactions are in-flight.
+    /// If deferred, sets `parallel_routing_paused` to stop new parallel txs.
+    async fn close_or_defer_batch(&mut self) {
+        if self.pending_parallel_count > 0 {
+            if !self.parallel_routing_paused {
+                tracing::info!(
+                    pending_parallel_count = self.pending_parallel_count,
+                    "Pausing parallel routing: batch needs to close but {} parallel txs in-flight",
+                    self.pending_parallel_count
+                );
+                self.parallel_routing_paused = true;
+            }
+            return;
+        }
+        self.close_current_batch().await;
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -617,15 +639,7 @@ where
             return;
         }
 
-        // Do not close if parallel txs are pending
-        if self.pending_parallel_count == 0 {
-            self.close_current_batch().await;
-        } else {
-            tracing::trace!(
-                pending = %self.pending_parallel_count,
-                "Skipping auto close; parallel txs pending"
-            );
-        }
+        self.close_or_defer_batch().await;
     }
 
     /// Closes the current batch.
@@ -835,6 +849,7 @@ pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
         parallel_response: ParallelizedResponse<S>,
         sequence_number: SequenceNumber,
         tx_len: usize,
+        retry_count: u8,
         reason: &'static str,
     },
     ParallelTxFailed {
@@ -926,6 +941,7 @@ where
         parallel_tx_executor,
         pending_parallel_count: 0,
         pending_http_waiters: HashMap::new(),
+        parallel_routing_paused: false,
     };
 
     let channel_size = Arc::new(AtomicU32::new(0));
@@ -1441,6 +1457,7 @@ where
                 parallel_response,
                 sequence_number,
                 tx_len,
+                retry_count,
                 reason,
             } => {
                 let start = std::time::Instant::now();
@@ -1452,8 +1469,14 @@ where
                     start
                 );
                 // trace this function
-                self.process_parallel_tx_completed(parallel_response, sequence_number, tx_len, reason)
-                    .await;
+                self.process_parallel_tx_completed(
+                    parallel_response,
+                    sequence_number,
+                    tx_len,
+                    retry_count,
+                    reason,
+                )
+                .await;
                 let elapsed = start.elapsed();
                 let end = std::time::Instant::now();
                 debug!(
@@ -1723,6 +1746,8 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+        let stage1_start = std::time::Instant::now();
+
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
         let message_sender = self.message_sender.clone();
 
@@ -1791,7 +1816,7 @@ where
             .num_parallel_tx_workers
             .unwrap_or(0)
             > 1;
-
+        let parallel_routing_paused = inner.parallel_routing_paused;
         let Inner {
             executor,
             batch_size_tracker,
@@ -1809,17 +1834,29 @@ where
             });
         }
 
-        // Try parallel processing for midnight privacy module transactions
+        // Try parallel processing for midnight privacy module transactions (only Transfer and Withdraw, not Deposit)
         // baked_tx.data contains an authenticator wrapper; unwrap it to get the RawTx first
         let detection_start = std::time::Instant::now();
-        let is_midnight_privacy_tx = {
+        let is_parallelizable_midnight_privacy_tx = {
+            // Helper to check if the debug string represents a parallelizable MidnightPrivacy call
+            // (Transfer or Withdraw, but NOT Deposit)
+            let is_parallelizable_call = |debug_str: &str| -> bool {
+                if !debug_str.starts_with("MidnightPrivacy(") {
+                    return false;
+                }
+                // Extract the inner call type after "MidnightPrivacy("
+                // The format is "Transfer { ... }" or "Deposit { ... }" so split on whitespace
+                let inner = &debug_str["MidnightPrivacy(".len()..];
+                let inner_variant = inner.split_whitespace().next().unwrap_or("");
+                // Only Transfer and Withdraw are parallelizable, Deposit is not
+                inner_variant == "Transfer" || inner_variant == "Withdraw"
+            };
+
             // Preferred: use the runtime's authenticator to decode and wrap the call
             if let Ok(decoded) = Rt::Auth::decode_serialized_tx(&baked_tx) {
                 let runtime_call = Rt::wrap_call(decoded);
                 let debug_str = format!("{:?}", runtime_call);
-                let variant_name = debug_str.split('(').next().unwrap_or("");
-                debug!(variant = variant_name, "[detect] Runtime call variant identified during process_accept_tx");
-                variant_name == "MidnightPrivacy"
+                is_parallelizable_call(&debug_str)
             } else {
                 // Fallback: try generic AuthenticatorInput and parse the RawTx directly
                 match AuthenticatorInput::try_from_slice(&baked_tx.data) {
@@ -1832,34 +1869,39 @@ where
                             Ok(tx) => {
                                 let runtime_call = tx.runtime_call();
                                 let debug_str = format!("{:?}", runtime_call);
-                                let variant_name = debug_str.split('(').next().unwrap_or("");
-                                debug!(variant = variant_name, "[detect] Runtime call variant identified during fallback process_accept_tx");
-                                variant_name == "MidnightPrivacy"
+                                is_parallelizable_call(&debug_str)
                             }
-                            Err(e) => {
-                                debug!(error = %e, "[detect] Failed to deserialize Transaction from RawTx (fallback)");
-                                false
-                            }
+                            Err(_) => false,
                         }
                     }
-                    Err(err) => {
-                        debug!(error = ?err, "[detect] Failed to parse authenticator input in fallback");
-                        false
-                    }
+                    Err(_) => false,
                 }
             }
         };
-        let detection_elapsed = detection_start.elapsed();
 
+        let detection_elapsed = detection_start.elapsed();
         debug!(
-            is_midnight_privacy_tx,
+            is_parallelizable_midnight_privacy_tx,
             detection_micros = detection_elapsed.as_micros(),
             "[detect] Midnight privacy detection timing"
         );
 
-        if is_midnight_privacy_tx && has_parallel_capacity {
+        // Route to parallel only if:
+        // 1. It's a midnight privacy tx
+        // 2. We have parallel workers configured
+        // 3. Parallel routing is not paused (batch not waiting to close)
+        let can_route_parallel =
+            is_parallelizable_midnight_privacy_tx && has_parallel_capacity && !parallel_routing_paused;
+
+        if parallel_routing_paused && is_parallelizable_midnight_privacy_tx {
+            tracing::debug!(
+                %tx_hash,
+                "[PARALLEL] Routing to sequential path: parallel routing paused (batch closing)"
+            );
+        }
+
+        if can_route_parallel {
             // Send to parallel executor - worker will send result directly to message loop
-            tracing::warn!(%tx_hash, "[PARALLEL] Sending transaction to parallel executor");
             if parallel_tx_executor.send_tx(
                 baked_tx.clone(),
                 tx_hash,
@@ -1868,7 +1910,13 @@ where
                 tx_len,
                 message_sender,
             ) {
-                debug!(%tx_hash, "[PARALLEL] Transaction sent to parallel executor");
+                let stage1_elapsed = stage1_start.elapsed();
+                info!(
+                    %tx_hash,
+                    stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
+                    path = "parallel",
+                    "[STAGE 1] Pre-process completed, sent to parallel executor"
+                );
 
                 // Register an HTTP waiter and keep the batch open while in-flight
                 inner.pending_parallel_count += 1;
@@ -1885,6 +1933,14 @@ where
         }
 
         // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
+        let stage1_elapsed = stage1_start.elapsed();
+        info!(
+            %tx_hash,
+            stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
+            path = "sequential",
+            "[STAGE 1] Pre-process completed, proceeding with sequential execution"
+        );
+
         let baked_tx = cache_warm_up_executor.send_tx(baked_tx.clone());
         let apply_tx_res = executor.apply_tx_to_in_progress_batch(baked_tx).await;
 
@@ -1918,9 +1974,19 @@ where
 
         batch_size_tracker.add_tx(tx_len, execution_time_micros);
         // Always enqueue side effects so DB/cache semantics remain unchanged.
-        let side_effects_rx = executor_events_sender
+        let side_effects_rx = match executor_events_sender
             .send_accept_tx(accepted_tx.clone(), tx_changes, sequence_number)
-            .await;
+            .await
+        {
+            Ok(rx) => rx,
+            Err(_channel_closed) => {
+                tracing::error!(
+                    %tx_hash,
+                    "Executor event channel closed; side-effects task is down"
+                );
+                return Err(AcceptTxError::Shutdown);
+            }
+        };
 
         inner.close_batch_if_nearly_full(&remaining_slot_gas).await;
 
@@ -1952,33 +2018,79 @@ where
         parallel_response: ParallelizedResponse<S>,
         sequence_number: SequenceNumber,
         tx_len: usize,
+        retry_count: u8,
         reason: &'static str,
     ) {
         let fn_start = std::time::Instant::now();
         let mut inner = self.get_inner_with_timing(reason).await;
 
-        // If no batch is in progress, drop and fail any waiter
-        if !inner.executor.has_in_progress_batch() {
+        // If no batch in progress or wrong sequence number, reschedule or drop
+        if !inner.executor.has_in_progress_batch()
+            || inner.current_sequence_number() != sequence_number
+        {
+            let reason = if !inner.executor.has_in_progress_batch() {
+                "no in-progress batch"
+            } else {
+                "sequence number mismatch"
+            };
             tracing::warn!(
                 tx_hash = %parallel_response.tx_hash,
-                "No in-progress batch when handling ParallelTxCompleted; dropping"
+                retry = retry_count,
+                %reason,
+                "Cannot process ParallelTxCompleted; rescheduling"
             );
-            if let Some(waiter) = inner
-                .pending_http_waiters
-                .remove(&parallel_response.tx_hash)
-            {
+
+            if retry_count >= PARALLEL_COMPLETION_MAX_RETRIES {
                 tracing::warn!(
                     tx_hash = %parallel_response.tx_hash,
-                    "Dropping waiter due to missing batch"
+                    retries = retry_count,
+                    %reason,
+                    "Dropping parallel completion after max retries"
                 );
-                drop(waiter);
+                if let Some(waiter) = inner.pending_http_waiters.remove(&parallel_response.tx_hash)
+                {
+                    drop(waiter);
+                }
+                if inner.pending_parallel_count > 0 {
+                    inner.pending_parallel_count -= 1;
+                }
+                debug!(
+                    total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
+                    "[TIMING] process_parallel_tx_completed dropped after max retries"
+                );
+                return;
             }
-            if inner.pending_parallel_count > 0 {
-                inner.pending_parallel_count -= 1;
-            }
+
+            // Drop the inner guard before requeueing to avoid borrow conflicts.
+            drop(inner);
+
+            let sender = self.message_sender.clone();
+            let channel_size = self.channel_size.clone();
+            let retry_msg = Message::ParallelTxCompleted {
+                parallel_response,
+                sequence_number,
+                tx_len,
+                retry_count: retry_count.saturating_add(1),
+                reason: "parallel_tx_completed_retry",
+            };
+
+            channel_size.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(
+                    PARALLEL_COMPLETION_RETRY_DELAY_MS,
+                ))
+                .await;
+                if let Err(err) = sender.send(retry_msg).await {
+                    channel_size.fetch_sub(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        ?err,
+                        "Failed to requeue ParallelTxCompleted message (likely shutdown)"
+                    );
+                }
+            });
             debug!(
                 total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
-                "[TIMING] process_parallel_tx_completed early return - no batch"
+                "[TIMING] process_parallel_tx_completed rescheduled"
             );
             return;
         }
@@ -1987,26 +2099,30 @@ where
             tx_hash,
             receipt,
             tx_changes,
-            remaining_slot_gas: _,
+            remaining_slot_gas,
             execution_time_micros,
             original_tx_queue_id: _,
             api_effect,
+            gas_used,
+            reward,
+            penalty,
+            receipt_for_cache,
+            tx_changes_for_cache,
         } = parallel_response;
 
-        // Rebuild the tx body from the worker’s receipt and commit via background task.
-        let tx = FullyBakedTx {
-            data: receipt
-                .body_to_save
-                .clone()
-                .expect("Transaction receipts must contain bodies with sov-modules-stf-blueprint"),
-        };
+        tracing::info!(
+            %tx_hash,
+            "[STAGE 3] Committing parallel execution result to main executor (FAST PATH)"
+        );
 
+        // FAST PATH: Pass the full receipt to skip re-execution
         let commit_start = std::time::Instant::now();
         let (accepted_with_budget_main, tx_changes_main) = match inner
             .executor
             .accept_precomputed_tx_from_parallel(
-                tx,
+                receipt,
                 tx_changes,
+                remaining_slot_gas,
                 api_effect,
                 execution_time_micros,
             )
@@ -2030,11 +2146,36 @@ where
         };
         let commit_time = commit_start.elapsed();
 
+        // Insert into GLOBAL_TX_CACHE for later node verification.
+        // This mirrors what registered::apply_batch does for sequential execution.
+        let precomputed_for_cache = PrecomputedResult {
+            receipt: receipt_for_cache,
+            tx_changes: tx_changes_for_cache,
+            gas_used,
+            execution_time_micros,
+            reward,
+            penalty,
+        };
+        GLOBAL_TX_CACHE.insert::<S>(tx_hash, precomputed_for_cache);
+        tracing::debug!(
+            %tx_hash,
+            "[CACHE] Inserted tx result from parallel execution for node verification"
+        );
+
         // Update batch metrics
         let batch_metrics_start = std::time::Instant::now();
+        let num_parallel_tx_workers = inner
+            .seq_config
+            .sequencer_kind_config
+            .num_parallel_tx_workers
+            .unwrap_or(0)
+            .max(1) as u64;
         inner
             .batch_size_tracker
-            .add_tx(tx_len, accepted_with_budget_main.execution_time_micros);
+            .add_tx(
+                tx_len,
+                accepted_with_budget_main.execution_time_micros / num_parallel_tx_workers,
+            );
         let batch_metrics_time = batch_metrics_start.elapsed();
 
         // Decide whether to fast-ack HTTP callers immediately after the in-memory
@@ -2047,7 +2188,39 @@ where
 
         let mut maybe_waiter = inner.pending_http_waiters.remove(&tx_hash);
 
-        // Bridge to HTTP waiter as soon as the main executor commits when fast-ack is enabled.
+        // Publish side-effects (DB writes, cache updates, etc.) BEFORE acknowledging HTTP.
+        // This ensures we don't ack the client if side-effects can't be queued.
+        let send_accept_start = std::time::Instant::now();
+        let send_result = inner
+            .executor_events_sender
+            .send_accept_tx(
+                accepted_with_budget_main.accepted_tx.clone(),
+                tx_changes_main,
+                sequence_number,
+            )
+            .await;
+        let send_accept_time = send_accept_start.elapsed();
+
+        // If the executor event channel is closed, don't acknowledge HTTP - the client
+        // should see an error rather than thinking the tx succeeded.
+        if send_result.is_err() {
+            tracing::error!(
+                %tx_hash,
+                "Executor event channel closed during parallel tx completion; dropping HTTP waiter"
+            );
+            // Drop waiter without sending - HTTP client will get channel-closed error
+            drop(maybe_waiter);
+            if inner.pending_parallel_count > 0 {
+                inner.pending_parallel_count -= 1;
+            }
+            debug!(
+                total_ms = fn_start.elapsed().as_secs_f64() * 1000.0,
+                "[TIMING] process_parallel_tx_completed exited early (executor channel closed)"
+            );
+            return;
+        }
+
+        // Bridge to HTTP waiter after side-effects are successfully queued.
         let mut waiter_bridge_time = std::time::Duration::from_millis(0);
         if fast_ack_after_executor {
             if let Some(waiter) = maybe_waiter.take() {
@@ -2059,18 +2232,6 @@ where
                 waiter_bridge_time = waiter_bridge_start.elapsed();
             }
         }
-
-        // Publish side-effects (DB writes, cache updates, etc.).
-        let send_accept_start = std::time::Instant::now();
-        let _rx = inner
-            .executor_events_sender
-            .send_accept_tx(
-                accepted_with_budget_main.accepted_tx.clone(),
-                tx_changes_main,
-                sequence_number,
-            )
-            .await;
-        let send_accept_time = send_accept_start.elapsed();
 
         // When fast-ack is disabled, keep the previous behavior and only notify
         // HTTP callers after side-effects have been enqueued.
@@ -2085,10 +2246,41 @@ where
             }
         }
 
-        // Decrement before attempting to close; the closer early-returns when pending > 0
+        // Decrement pending count
         if inner.pending_parallel_count > 0 {
             inner.pending_parallel_count -= 1;
         }
+
+        // If parallel routing was paused (batch waiting to close) and this was the last
+        // parallel tx, close the batch now and resume parallel routing.
+        if inner.pending_parallel_count == 0 && inner.parallel_routing_paused {
+            tracing::info!(
+                "Last parallel tx completed while routing was paused; closing batch and resuming parallel routing"
+            );
+            inner.parallel_routing_paused = false;
+            inner.close_current_batch().await;
+        }
+
+        let total_time = fn_start.elapsed();
+
+        // Track Stage 3 metrics
+        sov_metrics::track_metrics(|t| {
+            t.submit(crate::metrics::ParallelTxStageMetrics {
+                tx_hash: tx_hash.to_string(),
+                stage: 3,
+                duration_us: total_time.as_micros() as u64,
+            });
+        });
+
+        tracing::info!(
+            %tx_hash,
+            total_ms = format!("{:.2}", total_time.as_secs_f64() * 1000.0),
+            commit_ms = format!("{:.2}", commit_time.as_secs_f64() * 1000.0),
+            send_accept_ms = format!("{:.2}", send_accept_time.as_secs_f64() * 1000.0),
+            batch_metrics_ms = format!("{:.2}", batch_metrics_time.as_secs_f64() * 1000.0),
+            waiter_bridge_ms = format!("{:.2}", waiter_bridge_time.as_secs_f64() * 1000.0),
+            "[STAGE 3] Transaction processing complete"
+        );
 
         let close_batch_start = std::time::Instant::now();
         inner
