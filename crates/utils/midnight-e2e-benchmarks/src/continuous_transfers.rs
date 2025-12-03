@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
+use std::io::{self, Write};
+use std::fs;
 
 use chrono::{DateTime, Local};
 
@@ -25,16 +27,18 @@ use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_api_spec::types as api_types;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
-use sov_rollup_interface::zk::CodeCommitment;
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
-use sov_proof_verifier_service::{create_router, AppState, RollupSpec, ServiceConfig};
 use tokio::sync::Semaphore;
-use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tempfile::TempDir;
 use toml::Value as TomlValue;
+
+use crate::{
+    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
+    LigeroEnv,
+};
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -134,12 +138,43 @@ struct WalletState {
     recipient: Hash32,
 }
 
-struct ChildGuard(std::process::Child);
+fn rollup_crate_dir() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .ancestors()
+        .find(|p| p.join("Cargo.toml").exists() && p.join("examples/rollup-ligero").exists())
+        .ok_or_else(|| anyhow!("Could not find repository root"))?;
+    Ok(repo_root.join("examples/rollup-ligero"))
+}
 
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
+fn confirm_and_wipe_demo_data(crate_dir: &Path) -> Result<()> {
+    let demo_data = crate_dir.join("demo_data");
+    if !demo_data.exists() {
+        return Ok(());
     }
+
+    eprintln!(
+        "[managed-mode] This will DELETE all data under {}",
+        demo_data.display()
+    );
+    eprint!("Type 'yes' to continue (anything else aborts): ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read confirmation")?;
+    let trimmed = input.trim().to_ascii_lowercase();
+    if trimmed != "yes" {
+        bail!("Aborted by user; demo_data preserved");
+    }
+
+    fs::remove_dir_all(&demo_data)
+        .with_context(|| format!("Failed to delete {}", demo_data.display()))?;
+    fs::create_dir_all(&demo_data)
+        .with_context(|| format!("Failed to recreate {}", demo_data.display()))?;
+
+    Ok(())
 }
 
 struct ManagedStack {
@@ -150,135 +185,31 @@ struct ManagedStack {
     _child_guard: ChildGuard,
 }
 
-#[derive(Clone)]
-struct LigeroEnv {
-    program_path: String,
-    method_id: [u8; 32],
-    prover_bin: String,
-    verifier_bin: String,
-    shader_dir: String,
-}
-
-impl ChildGuard {
-    fn new(child: std::process::Child) -> Self {
-        Self(child)
-    }
-}
-
-fn find_rollup_binary() -> Result<String> {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov-rollup-ligero") {
-        return Ok(p);
-    }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov_rollup_ligero") {
-        return Ok(p);
-    }
-
-    let target_dir = std::env::var("CARGO_TARGET_DIR").ok().unwrap_or_else(|| {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let target_path = Path::new(&target_dir);
-    for profile in &["release", "debug"] {
-        let candidate = target_path.join(profile).join("sov-rollup-ligero");
-        if candidate.exists() {
-            return Ok(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    bail!(
-        "sov-rollup-ligero binary not found in target/{{release,debug}}; \
-         run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
+fn make_temp_config(base_config: &str, crate_dir: &Path) -> String {
+    // Rewrite DA connection to point at the real demo_data in the repo so managed mode works from any CWD.
+    let da_conn = format!(
+        "connection_string = \"sqlite://{}/demo_data/da.sqlite?mode=rwc\"",
+        crate_dir.display()
     );
-}
 
-fn make_temp_config(base_config: &str, data_dir: &Path, http_port: u16) -> String {
-    // Keep configuration verbatim; rely on values in rollup_config.toml.
-    let _ = data_dir;
-    let _ = http_port;
-    base_config.to_string()
-}
-
-async fn wait_for_ready(client: &NodeClient, timeout: Duration) -> Result<()> {
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            bail!("Timeout waiting for rollup to be ready");
+    let mut out = String::with_capacity(base_config.len() + 64);
+    for line in base_config.lines() {
+        let l = line.trim_start();
+        if l.starts_with("connection_string = ") {
+            out.push_str(&da_conn);
+        } else {
+            out.push_str(line);
         }
-        if client.client.is_ready().await.is_ok() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
+        out.push('\n');
     }
-}
-
-async fn start_local_verifier(
-    api_url: &str,
-    method_id: [u8; 32],
-    da_connection_string: &str,
-    max_concurrent_verifications: usize,
-) -> Result<String> {
-    use sov_rollup_interface::crypto::PrivateKey as _;
-
-    let sk: <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey =
-        <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey::generate();
-    let pk = sk.pub_key();
-    let addr: <RollupSpec as sov_modules_api::Spec>::Address = pk.credential_id().into();
-
-    let tmpkey = tempfile::NamedTempFile::new().context("Failed to create temp key file")?;
-    std::fs::write(
-        tmpkey.path(),
-        serde_json::to_string(&serde_json::json!({
-            "private_key": sk,
-            "address": addr,
-        }))?,
-    )?;
-
-    let verifier_cfg = ServiceConfig {
-        node_rpc_url: api_url.to_string(),
-        signing_key_path: tmpkey.path().to_string_lossy().to_string(),
-        value_setter_method_id: None,
-        midnight_method_id: Some(method_id),
-        max_concurrent_verifications,
-        chain_id: 1,
-        da_connection_string: da_connection_string.to_string(),
-        defer_sequencer_submission: false,
-    };
-    let state = AppState::new(verifier_cfg)
-        .await
-        .context("Failed to create AppState")?;
-    let app = create_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let service_addr = listener.local_addr()?;
-    let verifier_url = format!("http://{}", service_addr);
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
-        )
-        .await
-        .expect("Failed to serve proof verifier service");
-    });
-    std::mem::forget(tmpkey);
-
-    let hc = reqwest::Client::new();
-    let _ = hc.get(format!("{}/health", verifier_url)).send().await;
-
-    Ok(verifier_url)
+    out
 }
 
 async fn start_managed_stack(
     ligero_env: &LigeroEnv,
     config: &ContinuousConfig,
 ) -> Result<ManagedStack> {
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = rollup_crate_dir()?;
     let bin_path = find_rollup_binary()?;
 
     let base_cfg_path = crate_dir.join("rollup_config.toml");
@@ -286,7 +217,7 @@ async fn start_managed_stack(
         .with_context(|| format!("Failed to read base config at {}", base_cfg_path.display()))?;
 
     let temp = tempfile::tempdir()?;
-    let new_cfg = make_temp_config(&base_cfg, temp.path(), 0);
+    let new_cfg = make_temp_config(&base_cfg, &crate_dir);
     let cfg_path = temp.path().join("rollup_config.toml");
     std::fs::write(&cfg_path, new_cfg)?;
 
@@ -305,12 +236,10 @@ async fn start_managed_stack(
         .and_then(|h| h.get("bind_port"))
         .and_then(|v| v.as_integer())
         .unwrap_or(12346);
-    let da_connection_string = cfg_value
-        .get("da")
-        .and_then(|d| d.get("connection_string"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("sqlite://demo_data/da.sqlite?mode=rwc")
-        .to_string();
+    let da_connection_string = format!(
+        "sqlite://{}/demo_data/da.sqlite?mode=rwc",
+        crate_dir.display()
+    );
 
     let mut child = Command::new(bin_path)
         .current_dir(crate_dir)
@@ -382,6 +311,7 @@ async fn start_managed_stack(
         ligero_env.method_id,
         &da_connection_string,
         verifier_parallelism,
+        false,
     )
     .await?;
 
@@ -527,8 +457,8 @@ fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()>
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+/// Run the continuous transfers loop.
+pub async fn run() -> Result<()> {
     let mut config = ContinuousConfig::from_env()?;
 
     // Prompt the user for the number of wallets if not set.
@@ -588,6 +518,7 @@ async fn main() -> Result<()> {
     // Start local stack if endpoints not provided.
     let mut managed_stack: Option<ManagedStack> = None;
     let (node_url, verifier_url) = if config.managed_mode {
+        confirm_and_wipe_demo_data(&rollup_crate_dir()?)?;
         let managed = start_managed_stack(&ligero_env, &config).await?;
         let node = managed.api_url.clone();
         let verifier = managed.verifier_url.clone();
@@ -638,8 +569,11 @@ async fn main() -> Result<()> {
         chain_hash_arr
     };
 
+    // Ensure the node is serving /health and the sequencer is ready before sending deposits.
+    wait_for_sequencer_ready(&http, &node_url, Duration::from_secs(60)).await?;
+
     // Load genesis keypairs
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = rollup_crate_dir()?;
     let keypairs_path = crate_dir
         .parent()
         .unwrap()
@@ -970,59 +904,6 @@ fn log_final_summary(
     eprintln!("[final-summary] =================================\n");
 }
 
-fn setup_ligero_env() -> Result<LigeroEnv> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .ancestors()
-        .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
-        .ok_or_else(|| anyhow!("Could not find repository root"))?;
-    let ligero_dir = repo_root.join("crates/adapters/ligero");
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux-amd64"
-    } else {
-        bail!("Unsupported platform");
-    };
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
-    let program_path = ligero_dir.join("guest/bins/programs/note_spend_guest.wasm");
-    let prover_bin = bin_dir.join("webgpu_prover");
-    let verifier_bin = bin_dir.join("webgpu_verifier");
-
-    if !program_path.exists() {
-        bail!(
-            "note_spend_guest.wasm not found at {}",
-            program_path.display()
-        );
-    }
-
-    // Compute the method id (code commitment) and set environment variables for downstream tools.
-    use sov_rollup_interface::zk::ZkvmHost;
-    let host = <sov_ligero_adapter::Ligero as sov_rollup_interface::zk::Zkvm>::Host::from_args(
-        &program_path.to_string_lossy().to_string(),
-    );
-    let code_commitment = host.code_commitment();
-    let method_id: [u8; 32] = code_commitment
-        .encode()
-        .try_into()
-        .map_err(|_| anyhow!("Code commitment should be 32 bytes"))?;
-
-    std::env::set_var("LIGERO_PROGRAM_PATH", &program_path);
-    std::env::set_var("LIGERO_PROVER_BIN", &prover_bin);
-    std::env::set_var("LIGERO_VERIFIER_BIN", &verifier_bin);
-    std::env::set_var("LIGERO_SHADER_PATH", &shader_dir);
-    std::env::set_var("LIGERO_PACKING", "8192");
-
-    Ok(LigeroEnv {
-        program_path: program_path.to_string_lossy().to_string(),
-        method_id,
-        prover_bin: prover_bin.to_string_lossy().to_string(),
-        verifier_bin: verifier_bin.to_string_lossy().to_string(),
-        shader_dir: shader_dir.to_string_lossy().to_string(),
-    })
-}
-
 async fn perform_initial_deposits(
     client: &NodeClient,
     http: &HttpClient,
@@ -1130,6 +1011,20 @@ async fn fetch_initial_nonce(
     Ok(body.generation.unwrap_or(0))
 }
 
+async fn wait_for_sequencer_ready(http: &HttpClient, node_url: &str, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    let url = format!("{}/sequencer/ready", node_url.trim_end_matches('/'));
+    loop {
+        if start.elapsed() > timeout {
+            bail!("Timeout waiting for sequencer readiness at {}", url);
+        }
+        if http.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn perform_transfer_cycle(
     client: &NodeClient,
     http: &HttpClient,
@@ -1190,7 +1085,6 @@ async fn perform_transfer_cycle(
                     mt = MerkleTree::new(TREE_DEPTH);
                     pos_by_cm.clear();
                     cached_next_pos = 0;
-                    cached_root_val = None;
                 }
             }
 
@@ -1273,22 +1167,9 @@ async fn perform_transfer_cycle(
                 pos_by_cm.clear();
                 cached_next_pos = 0;
                 cached_root_val = None;
+                sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
                 continue;
             }
-
-            if attempt + 1 == TREE_REBUILD_MAX_RETRIES {
-                bail!(
-                    "Rebuilt tree root mismatch after {} attempts (including full rebuild fallback)",
-                    TREE_REBUILD_MAX_RETRIES
-                );
-            }
-
-            // Force a full rebuild on the next attempt to resync.
-            mt = MerkleTree::new(TREE_DEPTH);
-            pos_by_cm.clear();
-            cached_next_pos = 0;
-            cached_root_val = None;
-            sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
         }
 
         attempt_result.expect("Tree rebuild attempt must succeed or bail")

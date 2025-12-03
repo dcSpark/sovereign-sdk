@@ -7111,6 +7111,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "midnight-e2e-benchmarks"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "borsh",
+ "chrono",
+ "clap",
+ "demo-stf",
+ "hex",
+ "midnight-privacy",
+ "num_cpus",
+ "rand 0.8.5",
+ "reqwest 0.12.23",
+ "serde",
+ "serde_json",
+ "sov-api-spec",
+ "sov-cli",
+ "sov-ligero-adapter",
+ "sov-modules-api",
+ "sov-modules-rollup-blueprint",
+ "sov-node-client",
+ "sov-proof-verifier-service",
+ "sov-rollup-interface",
+ "sov-rollup-ligero",
+ "sov-test-utils",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "midnight-privacy"
 version = "0.3.0"
 dependencies = [

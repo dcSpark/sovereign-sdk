@@ -30,6 +30,7 @@ members = [
     "crates/utils/sov-eip-712",
     "crates/utils/sov-rpc-eth-types",
     "crates/utils/sov-evm-soak-testing",
+    "crates/utils/midnight-e2e-benchmarks",
     "crates/utils/sov-proof-verifier-service",
     "crates/utils/sov-indexer",
     # Module System

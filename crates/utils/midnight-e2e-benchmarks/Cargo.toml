@@ -1,0 +1,34 @@
+[package]
+name = "midnight-e2e-benchmarks"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true, default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = false }
+sov-ligero-adapter = { workspace = true, features = ["native"] }
+sov-modules-api = { workspace = true, features = ["native"] }
+sov-modules-rollup-blueprint = { workspace = true }
+sov-node-client = { workspace = true }
+sov-proof-verifier-service = { path = "../sov-proof-verifier-service" }
+sov-rollup-interface = { workspace = true }
+demo-stf = { workspace = true, features = ["native"] }
+midnight-privacy = { workspace = true, features = ["native"] }
+sov-api-spec = { workspace = true }
+sov-cli = { workspace = true }
+sov-test-utils = { workspace = true }
+sov-rollup-ligero = { path = "../../../examples/rollup-ligero" }
+borsh = { workspace = true, features = ["bytes", "derive"] }
+base64 = { workspace = true }
+hex = { workspace = true }
+num_cpus = "1.16"
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+toml = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "net", "macros", "sync", "tracing"] }
+chrono = { workspace = true, features = ["clock"] }
