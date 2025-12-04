@@ -737,8 +737,21 @@ async fn verify_and_record_midnight_handler(
             );
 
             let persist_start = std::time::Instant::now();
-            // Deposits don't need pre-authenticated optimization (no proof to strip)
-            // Use standard path for deposits
+            // Populate serialized_tx_base64 so sequencer flush path works uniformly.
+            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    error!("⚠️  Failed to extract pre-authenticated data for deposit: {e}; falling back to base64 body only");
+                    Some((
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        req.body.clone(),
+                    ))
+                }
+            };
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &tx_hash,
@@ -747,7 +760,7 @@ async fn verify_and_record_midnight_handler(
                 None, // proof_verified: NULL (transaction doesn't have a proof)
                 &transaction_data,
                 &req.body,
-                None, // No pre-auth data - deposits use standard path
+                pre_auth_data,
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;

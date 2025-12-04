@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::MockDemoRollup;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
@@ -18,31 +18,19 @@ use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::gas::UnlimitedGasMeter;
 use sov_modules_api::transaction::Transaction;
-use sov_modules_api::{PublicKey, Spec};
+use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
-// Proof verifier service (runs alongside the node)
-use sov_proof_verifier_service::{create_router, AppState, RollupSpec, ServiceConfig};
+use crate::{
+    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
+};
+use sov_rollup_ligero::MockDemoRollup;
 
 // Match the spec used by the demo rollup binary
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
-
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-    }
-}
-
-impl ChildGuard {
-    fn new(child: std::process::Child) -> Self {
-        Self(child)
-    }
-}
 
 /// Configuration for running the E2E benchmark.
 #[derive(Clone, Debug)]
@@ -125,42 +113,13 @@ impl RunnerConfig {
 
 // We no longer rely on the compiled CHAIN_HASH; fetch from /rollup/schema instead.
 
-fn find_binary() -> Result<String> {
-    // Cargo sets this for integration tests of the same package
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov-rollup-ligero") {
-        return Ok(p);
-    }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov_rollup_ligero") {
-        return Ok(p);
-    }
-
-    // Fallback: compute from target dir
-    let target_dir = std::env::var("CARGO_TARGET_DIR").ok().unwrap_or_else(|| {
-        // workspace target = two levels up from this crate dir
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    // Try release first (preferred for benchmarks), then debug
-    let target_path = std::path::Path::new(&target_dir);
-    for profile in &["release", "debug"] {
-        let candidate = target_path.join(profile).join("sov-rollup-ligero");
-        if candidate.exists() {
-            return Ok(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    anyhow::bail!(
-        "sov-rollup-ligero binary not found in target/{{release,debug}}; \
-         run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
-    );
+fn rollup_crate_dir() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .ancestors()
+        .find(|p| p.join("Cargo.toml").exists() && p.join("examples/rollup-ligero").exists())
+        .ok_or_else(|| anyhow!("Could not find repository root"))?;
+    Ok(repo_root.join("examples/rollup-ligero"))
 }
 
 fn make_temp_config(base_config: &str, data_dir: &std::path::Path, http_port: u16) -> String {
@@ -192,19 +151,6 @@ fn make_temp_config(base_config: &str, data_dir: &std::path::Path, http_port: u1
         out.push('\n');
     }
     out
-}
-
-async fn wait_for_ready(client: &NodeClient, timeout: Duration) -> Result<()> {
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            anyhow::bail!("Timeout waiting for rollup to be ready");
-        }
-        if client.client.is_ready().await.is_ok() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -333,74 +279,17 @@ fn prepare_environment(
     })
 }
 
-async fn start_local_verifier(
-    api_url: &str,
-    method_id: [u8; 32],
-    da_connection_string: &str,
-    max_concurrent_verifications: usize,
-    defer_sequencer_submission: bool,
-) -> Result<String> {
-    use sov_rollup_interface::crypto::PrivateKey as _;
-
-    let sk: <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey =
-        <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey::generate();
-    let pk = sk.pub_key();
-    let addr: <RollupSpec as sov_modules_api::Spec>::Address = pk.credential_id().into();
-
-    let tmpkey = tempfile::NamedTempFile::new().context("Failed to create temp key file")?;
-    std::fs::write(
-        tmpkey.path(),
-        serde_json::to_string(&serde_json::json!({
-            "private_key": sk,
-            "address": addr,
-        }))?,
-    )?;
-
-    let verifier_cfg = ServiceConfig {
-        node_rpc_url: api_url.to_string(),
-        signing_key_path: tmpkey.path().to_string_lossy().to_string(),
-        value_setter_method_id: None,
-        midnight_method_id: Some(method_id),
-        max_concurrent_verifications,
-        chain_id: 1,
-        da_connection_string: da_connection_string.to_string(),
-        defer_sequencer_submission,
-    };
-    let state = AppState::new(verifier_cfg)
-        .await
-        .context("Failed to create AppState")?;
-    let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let service_addr = listener.local_addr()?;
-    let verifier_url = format!("http://{}", service_addr);
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
-        )
-        .await
-        .expect("Failed to serve proof verifier service");
-    });
-    std::mem::forget(tmpkey);
-
-    let hc = reqwest::Client::new();
-    let _ = hc.get(format!("{}/health", verifier_url)).send().await;
-
-    Ok(verifier_url)
-}
-
 /// Runs the full E2E benchmark, optionally connecting to external services.
 pub async fn run(config: RunnerConfig) -> Result<()> {
     // Arrange: prepare isolated config or connect to existing services
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin_path = find_binary()?;
-    let (
-        program_path_for_node,
-        method_id_for_node,
-        verifier_bin_for_node,
-        prover_bin_for_node,
-        shader_dir_for_node,
-    ) = setup_ligero_env()?;
+    let crate_dir = rollup_crate_dir()?;
+    let bin_path = find_rollup_binary()?;
+    let ligero_env = setup_ligero_env()?;
+    let program_path_for_node = ligero_env.program_path.clone();
+    let method_id_for_node = ligero_env.method_id;
+    let verifier_bin_for_node = ligero_env.verifier_bin.clone();
+    let prover_bin_for_node = ligero_env.prover_bin.clone();
+    let shader_dir_for_node = ligero_env.shader_dir.clone();
     let external_services = ExternalConfig::from_config(&config)?;
     let mut env = prepare_environment(
         &crate_dir,
@@ -432,57 +321,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     anyhow::ensure!(chain_hash_vec.len() == 32, "chain_hash must be 32 bytes");
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
-
-    // Helper: setup Ligero env and compute method id (code commitment)
-    // Returns: (program_path, method_id, verifier_bin, prover_bin, shader_dir)
-    fn setup_ligero_env() -> anyhow::Result<(String, [u8; 32], String, String, String)> {
-        use sov_rollup_interface::zk::CodeCommitment;
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .ancestors()
-            .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
-            .ok_or_else(|| anyhow::anyhow!("Could not find repository root"))?;
-        let ligero_dir = repo_root.join("crates/adapters/ligero");
-        let platform_dir = if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux-amd64"
-        } else {
-            anyhow::bail!("Unsupported platform");
-        };
-        let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-        let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
-        let program_path = ligero_dir.join("guest/bins/programs/note_spend_guest.wasm");
-        let prover_bin = bin_dir.join("webgpu_prover");
-        let verifier_bin = bin_dir.join("webgpu_verifier");
-        anyhow::ensure!(
-            program_path.exists(),
-            "note_spend_guest.wasm not found at {}",
-            program_path.display()
-        );
-        let host = <sov_ligero_adapter::Ligero as sov_rollup_interface::zk::Zkvm>::Host::from_args(
-            &program_path.to_string_lossy().to_string(),
-        );
-        let code_commitment = host.code_commitment();
-        let method_id: [u8; 32] = code_commitment
-            .encode()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Code commitment should be 32 bytes"))?;
-
-        std::env::set_var("LIGERO_PROGRAM_PATH", &program_path);
-        std::env::set_var("LIGERO_PROVER_BIN", &prover_bin);
-        std::env::set_var("LIGERO_VERIFIER_BIN", &verifier_bin);
-        std::env::set_var("LIGERO_SHADER_PATH", &shader_dir);
-        std::env::set_var("LIGERO_PACKING", "8192");
-
-        Ok((
-            program_path.to_string_lossy().to_string(),
-            method_id,
-            verifier_bin.to_string_lossy().to_string(),
-            prover_bin.to_string_lossy().to_string(),
-            shader_dir.to_string_lossy().to_string(),
-        ))
-    }
 
     // Use the method_id we already computed when starting the node
     let method_id = method_id_for_node;
@@ -1404,6 +1242,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Create semaphore to limit concurrent proof generation
     let max_concurrent = config.max_concurrent_proofs;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let program_path_for_host = Arc::new(program_path_for_node.clone());
     eprintln!(
         "  [proof] limiting concurrent proof generation to {} tasks",
         max_concurrent
@@ -1441,6 +1280,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
         let sem = semaphore.clone();
+        let program_path_for_host = program_path_for_host.clone();
         proof_tasks.push(tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await.expect("semaphore closed");
@@ -1491,7 +1331,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                                   // skip out_base + 3 (cm is public)
                 ]);
 
-                let (program_path, _, _, _, _) = setup_ligero_env()?;
+                let program_path = program_path_for_host.as_ref().clone();
                 let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                     .with_private_indices(private_indices);
 

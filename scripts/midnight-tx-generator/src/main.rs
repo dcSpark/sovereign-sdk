@@ -1,7 +1,7 @@
 #!/usr/bin/env rust-script
 //! Generate a midnight withdrawal transaction with a REAL Ligero proof
 //! Using exact parameters from the working integration test
-//! 
+//!
 //! This creates a borsh-serialized transaction that can be sent to the sequencer.
 
 use anyhow::{Context, Result};
@@ -11,13 +11,13 @@ use midnight_privacy::{
     note_commitment, nullifier, root_from_path, CallMessage, Hash32, MerkleTree, SpendPublic,
 };
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_rollup_ligero::MockDemoRollup;
 use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::{CryptoSpec, PrivateKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    
+
     let output_file = if args.len() > 1 {
         PathBuf::from(&args[1])
     } else {
@@ -50,32 +50,36 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "0".to_string())
         .parse()
         .context("Invalid WITHDRAW_AMOUNT")?;
-    
+
     let recipient_addr = std::env::var("RECIPIENT")
         .unwrap_or_else(|_| "sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s".to_string());
-    
+
     let nonce: u64 = std::env::var("NONCE")
         .unwrap_or_else(|_| "0".to_string())
         .parse()
         .context("Invalid NONCE")?;
-    
+
     // Note: The test uses a fixed note value of 100
     // If you need larger withdrawals, you'll need to create a note with more value
     let note_value: u128 = 100; // Fixed from test
-    
+
     if withdraw_amount > note_value {
         anyhow::bail!(
             "Withdraw amount ({}) exceeds note value ({}). \n\
             The test-based generator uses a fixed note value of 100.\n\
             Please set WITHDRAW_AMOUNT to a value between 0 and 100.",
-            withdraw_amount, note_value
+            withdraw_amount,
+            note_value
         );
     }
 
     println!("Configuration:");
     println!("  Note value: {}", note_value);
     println!("  Withdraw amount: {}", withdraw_amount);
-    println!("  Change: {} (stays shielded)", note_value - withdraw_amount);
+    println!(
+        "  Change: {} (stays shielded)",
+        note_value - withdraw_amount
+    );
     println!("  Recipient: {}", recipient_addr);
     println!("  Nonce: {}\n", nonce);
 
@@ -88,7 +92,7 @@ fn main() -> Result<()> {
 
     // Use EXACT parameters from test_simple_note_spend test
     println!("Step 1: Creating note using test parameters...");
-    
+
     let domain: Hash32 = [1u8; 32];
     let value: u128 = note_value; // Use the validated note value
     let rho: Hash32 = [2u8; 32];
@@ -98,11 +102,11 @@ fn main() -> Result<()> {
     println!("  Domain: 0x{}", hex::encode(&domain[..4]));
     println!("  Value: {}", value);
     println!("  Rho: 0x{}", hex::encode(&rho[..4]));
-    
+
     // Compute note commitment
     let cm = note_commitment(&domain, value, &rho, &recipient);
     println!("✓ Note commitment: 0x{}", hex::encode(&cm[..8]));
-    
+
     // Build Merkle tree
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
@@ -110,48 +114,51 @@ fn main() -> Result<()> {
     tree.set_leaf(position as usize, cm);
     let anchor = tree.root();
     println!("✓ Merkle root: 0x{}", hex::encode(&anchor[..8]));
-    
+
     // Get authentication path
     let siblings = tree.open(position as usize);
-    
+
     // Verify path locally
     let computed_root = root_from_path(&cm, position, &siblings, tree_depth);
     assert_eq!(computed_root, anchor, "Merkle path verification failed!");
     println!("✓ Path verified\n");
-    
+
     // Derive nullifier
     let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: 0x{}\n", hex::encode(&nf[..8]));
-    
+
     // Create output with ALL value (like the test does)
     let n_out: u32 = 1;
     let out_value = value; // Put entire input into shielded change
     let out_rho: Hash32 = [9u8; 32];
     let out_rcp: Hash32 = [5u8; 32];
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
-    
+
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
-    
+
     println!("Step 2: Generating proof (exactly like test)...");
-    
+
     // Use exact private indices from test
     let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
+    for i in 0..tree_depth as usize {
+        private_indices.push(8 + i);
+    }
     let base = 12 + (tree_depth as usize);
     private_indices.push(base + 0); // value_out_0
     private_indices.push(base + 1); // rho_out_0
     private_indices.push(base + 2); // recipient_out_0
-    
+
     let program_path = ligero_config.program_path.to_string_lossy().to_string();
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(ligero_config.packing)
         .with_private_indices(private_indices);
-    
+
     // Add arguments in exact test order
     host.add_hex_arg(hex::encode(domain));
     host.add_str_arg(value.to_string());
@@ -160,11 +167,11 @@ fn main() -> Result<()> {
     host.add_hex_arg(hex::encode(nf_key));
     host.add_str_arg(position.to_string());
     host.add_str_arg(tree_depth.to_string());
-    
+
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
     }
-    
+
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
     host.add_str_arg(withdraw_amount.to_string());
@@ -173,26 +180,31 @@ fn main() -> Result<()> {
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_rcp));
     host.add_hex_arg(hex::encode(cm_out));
-    
+
     host.set_public_output(&public_output)?;
-    
+
     println!("  Calling webgpu_prover...");
     let proof_start = Instant::now();
     let proof_bytes = host.run(true).context("Failed to generate proof")?;
     let proof_time = proof_start.elapsed();
-    
-    println!("✓ Proof generated: {} bytes ({:.1}s)\n", proof_bytes.len(), proof_time.as_secs_f64());
-    
+
+    println!(
+        "✓ Proof generated: {} bytes ({:.1}s)\n",
+        proof_bytes.len(),
+        proof_time.as_secs_f64()
+    );
+
     // Parse recipient address
-    let recipient: <DemoRollupSpec as Spec>::Address = recipient_addr.parse()
+    let recipient: <DemoRollupSpec as Spec>::Address = recipient_addr
+        .parse()
         .context("Invalid recipient address")?;
 
     // Load or generate private key
     let private_key = if let Ok(key_file) = std::env::var("PRIVATE_KEY_FILE") {
         println!("Loading private key from: {}", key_file);
-        let key_data: PrivateKeyAndAddress<DemoRollupSpec> = 
-            serde_json::from_str(&fs::read_to_string(&key_file)
-                .context("Failed to read private key file")?)?;
+        let key_data: PrivateKeyAndAddress<DemoRollupSpec> = serde_json::from_str(
+            &fs::read_to_string(&key_file).context("Failed to read private key file")?,
+        )?;
         key_data.private_key
     } else {
         println!("⚠ No PRIVATE_KEY_FILE set, generating random key");
@@ -202,52 +214,50 @@ fn main() -> Result<()> {
 
     // Step 3: Build the transaction
     println!("Step 3: Building signed transaction...");
-    
-    let proof_safe_vec = proof_bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("Proof too large"))?;
-    
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Withdraw {
-            proof: proof_safe_vec,
-            anchor_root: anchor,
-            nullifier: nf,
-            withdraw_amount,
-            to: recipient,
-            gas: None,
-        }
-    );
 
-    let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
+    let proof_safe_vec = proof_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Proof too large"))?;
+
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Withdraw {
+        proof: proof_safe_vec,
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount,
+        to: recipient,
+        view_ciphertexts: None,
+        gas: None,
+    });
+
+    let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
         default_test_signed_transaction(&private_key, &msg, nonce, &CHAIN_HASH);
-    
+
     let tx_hash = tx.hash();
     println!("  ✓ Transaction hash: {}\n", tx_hash);
 
     // Serialize with borsh
     println!("Step 4: Serializing transaction...");
-    let tx_bytes = borsh::to_vec(&tx)
-        .context("Failed to serialize transaction")?;
-    
+    let tx_bytes = borsh::to_vec(&tx).context("Failed to serialize transaction")?;
+
     println!("  ✓ Serialized size: {} bytes\n", tx_bytes.len());
 
     // Write to file
-    fs::write(&output_file, &tx_bytes)
-        .context("Failed to write transaction file")?;
-    
+    fs::write(&output_file, &tx_bytes).context("Failed to write transaction file")?;
+
     println!("✓ Wrote transaction to: {}\n", output_file.display());
 
     // Also output base64 encoding for direct API use
     use base64::Engine;
     let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
-    
+
     let json_payload = serde_json::json!({
         "body": tx_base64
     });
-    
+
     let json_file = output_file.with_extension("json");
     fs::write(&json_file, serde_json::to_string_pretty(&json_payload)?)
         .context("Failed to write JSON payload")?;
-    
+
     println!("✓ Wrote JSON payload to: {}\n", json_file.display());
 
     println!("=== Success! ===");
@@ -256,7 +266,10 @@ fn main() -> Result<()> {
     println!("  Nullifier: 0x{}", hex::encode(nf));
     println!("  Note value: {}", value);
     println!("  Withdraw amount: {} (transparent)", withdraw_amount);
-    println!("  Change: {} (stays in shielded pool)", value - withdraw_amount);
+    println!(
+        "  Change: {} (stays in shielded pool)",
+        value - withdraw_amount
+    );
 
     Ok(())
 }
@@ -315,7 +328,10 @@ fn setup_ligero_env() -> Result<LigeroConfig> {
     }
 
     if !config.shader_path.exists() {
-        anyhow::bail!("Shader directory not found at {}", config.shader_path.display());
+        anyhow::bail!(
+            "Shader directory not found at {}",
+            config.shader_path.display()
+        );
     }
 
     // Set environment variables for Ligero
