@@ -41,10 +41,9 @@ generator as background services on Linux.
   `sov-proof-verifier-service`. Adjust environment variables inside the script
   (or in the unit file) if you need non-default Ligero settings.
 - The continuous transfers service runs
-  `cargo run -p sov-rollup-ligero --bin continuous-transfers --release`. Update
-  the `Environment=` entries inside the unit file to control the number of
-  wallets (`CONTINUOUS_NUM_WALLETS`) and the verifier/sequencer endpoints
+  `cargo run -p midnight-e2e-benchmarks --bin continuous_transfers --release`.
+  Update the `Environment=` entries inside the unit file to control the number
+  of wallets (`CONTINUOUS_NUM_WALLETS`) and the verifier/sequencer endpoints
   (`E2E_ROLLUP_EXTERNAL_VERIFIER_URL` and `E2E_ROLLUP_EXTERNAL_NODE_URL`).
 - Ensure that all services run under a user with permission to access the
   workspace and required key material.
-

@@ -1,11 +1,10 @@
 use anyhow::Result;
-use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_modules_api::PrivateKey; // bring trait into scope for pub_key()
-use sov_rollup_interface::crypto::PublicKey as _; // for credential_id()
 use serde::Deserialize;
+use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
+use sov_modules_api::PrivateKey; // bring trait into scope for pub_key()
 use sov_modules_rollup_blueprint::RollupBlueprint;
-use sov_node_client::NodeClient;
+use sov_rollup_interface::crypto::PublicKey as _; // for credential_id()
 use std::env;
 use std::fs;
 
@@ -21,8 +20,6 @@ async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let node_url = args.next().unwrap_or_else(|| usage());
     let key_path = args.next().unwrap_or_else(|| usage());
-
-    let client = NodeClient::new_unchecked(&node_url);
 
     let key_json = fs::read_to_string(&key_path)?;
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> = serde_json::from_str(&key_json)?;

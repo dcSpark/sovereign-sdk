@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use sov_rollup_ligero::e2e_runner::{run, RunnerConfig};
+use midnight_e2e_benchmarks::e2e_runner::{run, RunnerConfig};
 
 /// CLI wrapper around the E2E benchmark runner.
 #[derive(Parser, Debug)]
