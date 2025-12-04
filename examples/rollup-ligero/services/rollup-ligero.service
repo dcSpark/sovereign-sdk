@@ -4,11 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=guillevalin
-WorkingDirectory=/home/guillevalin/sovereign-sdk/examples/rollup-ligero
-ExecStart=/bin/bash /home/guillevalin/sovereign-sdk/examples/rollup-ligero/run_rollup.sh
+User=replace_for_linux_user
+WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero
+ExecStart=/bin/bash /home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero/run_rollup.sh
 Restart=on-failure
-Environment="PATH=/home/guillevalin/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=info"
 
 [Install]
