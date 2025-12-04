@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree,
+    SpendPublic,
 };
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
+use sov_ligero_adapter::{Ligero as LigeroAdapter, LigeroProofPackage};
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -494,8 +495,8 @@ pub async fn transfer(
     // Step 4: Compute nullifier
     let nf = nullifier(&DOMAIN, &NF_KEY, &input_rho);
 
-    // Note: The public output (SpendPublic) is computed and committed by the guest program
-    // based on the arguments we provide. We don't need to pass it explicitly here.
+    // Note: The webgpu_prover generates the proof AND packages it with the public output
+    // (SpendPublic) internally, so we don't need to create it here.
 
     // Step 5: Generate ZK proof
     tracing::info!("Generating ZK proof...");
@@ -544,9 +545,14 @@ pub async fn transfer(
         LigeroProgramArguments::HEX { hex: hex::encode(cm_out) },        // output commitment
     ]);
 
+    // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
+    let proof_args_for_package = proof_args.clone();
+    let private_indices_for_package: Vec<usize> =
+        private_indices.iter().map(|i| (*i as usize) + 1).collect();
+
     let (packing, gpu_threads) = ligero.resolve_prover_params(8192, None);
     let proof_start = StdInstant::now();
-    let proof_bytes = ligero
+    let proof_bytes_raw = ligero
         .generate_proof(
             packing,
             gpu_threads,
@@ -558,8 +564,33 @@ pub async fn transfer(
 
     tracing::info!(
         elapsed_ms = proof_start.elapsed().as_millis(),
-        proof_bytes_len = proof_bytes.len(),
+        proof_bytes_len = proof_bytes_raw.len(),
         "Generated proof bytes"
+    );
+
+    // Package proof with public outputs (SpendPublic) for verifier compatibility
+    let public_output = SpendPublic {
+        anchor_root,
+        nullifier: nf,
+        withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
+        output_commitments: vec![cm_out],
+        view_attestations: None,
+    };
+
+    let proof_package = LigeroProofPackage {
+        proof: proof_bytes_raw,
+        public_output: bincode::serialize(&public_output)
+            .context("Failed to serialize spend public output")?,
+        args_json: serde_json::to_vec(&proof_args_for_package)
+            .context("Failed to serialize Ligero args for package")?,
+        private_indices: private_indices_for_package,
+    };
+
+    let proof_bytes = bincode::serialize(&proof_package)
+        .context("Failed to serialize Ligero proof package")?;
+    tracing::debug!(
+        proof_package_len = proof_bytes.len(),
+        "Serialized Ligero proof package for submission"
     );
 
     // Step 6: Create and sign transaction
