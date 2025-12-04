@@ -10,6 +10,13 @@ NC='\033[0m'
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 
+PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
+RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
+DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-1000}"
+TRANSFER_OUT1="${TRANSFER_OUT1:-600}"
+TRANSFER_OUT2="${TRANSFER_OUT2:-400}"
+WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-200}"
+
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
 NONCE_STATE_FILE="$GENERATOR_DIR/.last_nonce"
 BASE_NONCE=$(date +%s)
@@ -36,12 +43,10 @@ fi
 
 # Allow override via env NONCE; otherwise use computed BASE_NONCE
 NONCE="${NONCE:-$BASE_NONCE}"
-DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-1000}"
-TRANSFER_OUT1="${TRANSFER_OUT1:-600}"
-TRANSFER_OUT2="${TRANSFER_OUT2:-400}"
-WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-200}"
-PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
-RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
+
+# Optional: fund the sender before shielded deposit
+FUNDER_KEY_FILE="${FUNDER_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
+FUND_AMOUNT="${FUND_AMOUNT:-1000}" # clear tokens to send to sender
 
 # Endpoint - always send to worker (proof verifier service which forwards to sequencer)
 VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
@@ -64,6 +69,29 @@ if [ ! -f "$GENERATOR_DIR/target/debug/midnight-deposit-generator" ]; then
     SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator 2>&1 | grep -E "Compiling|Finished" || true
     cd "$REPO_ROOT"
     echo ""
+fi
+
+# Step 0: fund sender if requested (native Rust funder)
+if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
+  echo -e "${YELLOW}Step 0: Funding sender with $FUND_AMOUNT tokens${NC}"
+  cd "$GENERATOR_DIR"
+  SKIP_GUEST_BUILD=1 cargo build --bin fund 2>&1 | grep -E "Compiling|Finished" || true
+  cd "$REPO_ROOT"
+  FUND_NONCE=""
+  if [ -f "$NONCE_STATE_FILE" ]; then
+    LAST_NONCE=$(cat "$NONCE_STATE_FILE" | tr -d '\n' || echo 0)
+    if [[ "$LAST_NONCE" =~ ^[0-9]+$ ]]; then
+      FUND_NONCE=$((LAST_NONCE + 1))
+    fi
+  fi
+  env \
+    NODE_API_URL="${NODE_API_URL:-http://localhost:12346}" \
+    RECIPIENT="$RECIPIENT" \
+    FUND_AMOUNT="$FUND_AMOUNT" \
+    FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
+    ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
+    "$GENERATOR_DIR/target/debug/fund"
+  echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"
 fi
 
 #############################################################################
@@ -95,18 +123,37 @@ if [ -z "$SEQUENCER_RESPONSE" ] || [ "$SEQUENCER_RESPONSE" = "null" ]; then
     exit 1
 fi
 
-# Extract position and anchor root
-NOTE_POSITION=$(echo "$SEQUENCER_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.position')
-ANCHOR_ROOT=$(echo "$SEQUENCER_RESPONSE" | jq -c '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.new_root')
+# Extract commitment from deposit response and look up authoritative position/root via REST
+COMMITMENT=$(echo "$SEQUENCER_RESPONSE" | jq -c '.events[] | select(.key == "ValueMidnightPrivacy/PoolDeposit") | .value.pool_deposit.commitment')
+if [ -z "$COMMITMENT" ] || [ "$COMMITMENT" = "null" ]; then
+    echo -e "${RED}✗ Failed to extract commitment from deposit response${NC}"
+    exit 1
+fi
 
-if [ -z "$NOTE_POSITION" ] || [ "$NOTE_POSITION" = "null" ]; then
-    echo -e "${RED}✗ Failed to extract note position${NC}"
+NOTE_POSITION=""
+ANCHOR_ROOT=""
+for attempt in $(seq 1 60); do
+    NOTES_RESP=$(curl -s "${NODE_API_URL}/modules/midnight-privacy/notes?limit=200&reverse=true")
+    NOTE_POSITION=$(echo "$NOTES_RESP" | jq --argjson target "$COMMITMENT" -r '.notes[] | select(.commitment == $target) | .position' | head -n1 | tr -d '\n')
+    ANCHOR_ROOT=$(echo "$NOTES_RESP" | jq -c '.current_root // empty')
+    if [ -n "$NOTE_POSITION" ] && [ "$NOTE_POSITION" != "null" ]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ -z "$NOTE_POSITION" ] || [ "$NOTE_POSITION" = "null" ] || ! [[ "$NOTE_POSITION" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}✗ Failed to locate valid note position in /modules/midnight-privacy/notes${NC}"
     exit 1
 fi
 
 echo -e "${GREEN}✓ Deposit successful${NC}"
 echo "  Created: Note@pos$NOTE_POSITION ($DEPOSIT_AMOUNT tokens)"
-echo "  Anchor: $(echo $ANCHOR_ROOT | jq -r 'if type == "array" then (.[0:8] | map(tostring) | join(",")) else . end')"
+if [ -n "$ANCHOR_ROOT" ] && [ "$ANCHOR_ROOT" != "null" ]; then
+    echo "  Anchor: $(echo $ANCHOR_ROOT | jq -r 'if type == "array" then (.[0:8] | map(tostring) | join(",")) else . end')"
+else
+    echo "  Anchor: (not returned from notes endpoint)"
+fi
 echo ""
 
 # Wait for confirmation
@@ -171,11 +218,31 @@ if [ -z "$SEQUENCER_TRANSFER_RESPONSE" ] || [ "$SEQUENCER_TRANSFER_RESPONSE" = "
     exit 1
 fi
 
-# Extract new positions from transfer response
+# Extract new positions from transfer response (lookup via /notes)
 TRANSFER_EVENTS=$(echo "$SEQUENCER_TRANSFER_RESPONSE" | jq -c '[.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated")]')
-OUT1_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[0].value.note_created.position')
-OUT2_POSITION=$(echo "$TRANSFER_EVENTS" | jq -r '.[1].value.note_created.position')
-TRANSFER_ROOT=$(echo "$TRANSFER_EVENTS" | jq -c '.[1].value.note_created.new_root')
+OUT1_COMMITMENT=$(echo "$TRANSFER_EVENTS" | jq -c '.[0].value.note_created.commitment')
+OUT2_COMMITMENT=$(echo "$TRANSFER_EVENTS" | jq -c '.[1].value.note_created.commitment')
+
+OUT1_POSITION=""
+OUT2_POSITION=""
+TRANSFER_ROOT=""
+for attempt in $(seq 1 60); do
+    NOTES_RESP=$(curl -s "${NODE_API_URL}/modules/midnight-privacy/notes?limit=200&reverse=true")
+    OUT1_POSITION=$(echo "$NOTES_RESP" | jq --argjson target "$OUT1_COMMITMENT" -r '.notes[] | select(.commitment == $target) | .position' | head -n1 | tr -d '\n')
+    OUT2_POSITION=$(echo "$NOTES_RESP" | jq --argjson target "$OUT2_COMMITMENT" -r '.notes[] | select(.commitment == $target) | .position' | head -n1 | tr -d '\n')
+    TRANSFER_ROOT=$(echo "$NOTES_RESP" | jq -c '.current_root // empty')
+    if [ -n "$OUT1_POSITION" ] && [ "$OUT1_POSITION" != "null" ] && [[ "$OUT1_POSITION" =~ ^[0-9]+$ ]] \
+       && [ -n "$OUT2_POSITION" ] && [ "$OUT2_POSITION" != "null" ] && [[ "$OUT2_POSITION" =~ ^[0-9]+$ ]]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ -z "$OUT1_POSITION" ] || [ "$OUT1_POSITION" = "null" ] || ! [[ "$OUT1_POSITION" =~ ^[0-9]+$ ]] \
+   || [ -z "$OUT2_POSITION" ] || [ "$OUT2_POSITION" = "null" ] || ! [[ "$OUT2_POSITION" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}✗ Failed to locate transfer output positions in /modules/midnight-privacy/notes${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}✓ Transfer successful${NC}"
 echo "  Consumed: Note@pos$NOTE_POSITION ($DEPOSIT_AMOUNT tokens)"

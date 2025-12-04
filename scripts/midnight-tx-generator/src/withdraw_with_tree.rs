@@ -1,19 +1,19 @@
 use anyhow::Result;
 use base64::Engine;
 use borsh;
-use hex;
 use demo_stf::runtime::{Runtime, RuntimeCall};
+use hex;
 use midnight_privacy::{note_commitment, nullifier, CallMessage, Hash32, SpendPublic};
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_rollup_ligero::MockDemoRollup;
 use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 
@@ -27,27 +27,33 @@ const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
 
 fn main() -> Result<()> {
     let domain: Hash32 = hex::decode(std::env::var("NOTE_DOMAIN")?)?
-        .try_into().map_err(|_| anyhow::anyhow!("Invalid domain"))?;
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid domain"))?;
     let value: u128 = std::env::var("NOTE_VALUE")?.parse()?;
     let rho: Hash32 = hex::decode(std::env::var("NOTE_RHO")?)?
-        .try_into().map_err(|_| anyhow::anyhow!("Invalid rho"))?;
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid rho"))?;
     let recipient: Hash32 = hex::decode(std::env::var("NOTE_RECIPIENT")?)?
-        .try_into().map_err(|_| anyhow::anyhow!("Invalid recipient"))?;
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid recipient"))?;
     let nf_key: Hash32 = hex::decode(std::env::var("NOTE_NF_KEY")?)?
-        .try_into().map_err(|_| anyhow::anyhow!("Invalid nf_key"))?;
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid nf_key"))?;
     let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")?.parse()?;
     let position: u64 = std::env::var("NOTE_POSITION")?.parse()?;
     let nonce: u64 = std::env::var("NONCE")?.parse()?;
     let recipient_addr: String = std::env::var("RECIPIENT")?;
-    
+
     // Get the actual anchor root from the deposit response
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("ANCHOR_ROOT")?)?;
-    let anchor: Hash32 = anchor_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
-    
+    let anchor: Hash32 = anchor_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
+
     // Compute the note commitment
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let nf = nullifier(&domain, &nf_key, &rho);
-    
+
     // Build a Merkle tree with the note at the actual position
     // and get the authentication path
     use midnight_privacy::MerkleTree;
@@ -55,36 +61,42 @@ fn main() -> Result<()> {
     let mut tree = MerkleTree::new(tree_depth);
     tree.set_leaf(position as usize, cm);
     let siblings = tree.open(position as usize);
-    
+
     println!("Note commitment: 0x{}", hex::encode(&cm[..8]));
     println!("Position: {}", position);
-    println!("Anchor root (from deposit): 0x{}", hex::encode(&anchor[..8]));
+    println!(
+        "Anchor root (from deposit): 0x{}",
+        hex::encode(&anchor[..8])
+    );
     println!("Nullifier: 0x{}", hex::encode(&nf[..8]));
-    
+
     let change_value = value - withdraw_amount;
     let out_rho: Hash32 = rand::thread_rng().gen();
     let out_recipient: Hash32 = rand::thread_rng().gen();
     let cm_out = note_commitment(&domain, change_value, &out_rho, &out_recipient);
-    
+
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
         withdraw_amount,
         output_commitments: vec![cm_out],
+        view_attestations: None,
     };
-    
+
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
     let packing: u32 = std::env::var("LIGERO_PACKING")?.parse()?;
-    
+
     let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
+    for i in 0..tree_depth as usize {
+        private_indices.push(8 + i);
+    }
     let base = 12 + tree_depth as usize;
     private_indices.extend(&[base, base + 1, base + 2]);
-    
+
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(packing)
         .with_private_indices(private_indices);
-    
+
     host.add_hex_arg(hex::encode(domain));
     host.add_str_arg(value.to_string());
     host.add_hex_arg(hex::encode(rho));
@@ -92,11 +104,11 @@ fn main() -> Result<()> {
     host.add_hex_arg(hex::encode(nf_key));
     host.add_str_arg(position.to_string());
     host.add_str_arg(tree_depth.to_string());
-    
+
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
     }
-    
+
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
     host.add_str_arg(withdraw_amount.to_string());
@@ -105,41 +117,43 @@ fn main() -> Result<()> {
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_recipient));
     host.add_hex_arg(hex::encode(cm_out));
-    
+
     host.set_public_output(&public_output)?;
-    
+
     println!("Generating proof...");
     let proof_bytes = host.run(true)?;
     println!("✓ Proof: {} bytes", proof_bytes.len());
-    
+
     let recipient_parsed: <DemoRollupSpec as Spec>::Address = recipient_addr.parse()?;
-    let key_data: PrivateKeyAndAddress<DemoRollupSpec> = 
+    let key_data: PrivateKeyAndAddress<DemoRollupSpec> =
         serde_json::from_str(&fs::read_to_string(std::env::var("PRIVATE_KEY_FILE")?)?)?;
-    
-    let proof_safe = proof_bytes.try_into()
+
+    let proof_safe = proof_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Proof too large"))?;
-    
-    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(
-        CallMessage::Withdraw {
-            proof: proof_safe,
-            anchor_root: anchor,
-            nullifier: nf,
-            withdraw_amount,
-            to: recipient_parsed,
-            gas: None,
-        }
-    );
-    
-    let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> = 
+
+    let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Withdraw {
+        proof: proof_safe,
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount,
+        to: recipient_parsed,
+        view_ciphertexts: None,
+        gas: None,
+    });
+
+    let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
         default_test_signed_transaction(&key_data.private_key, &msg, nonce, &CHAIN_HASH);
-    
+
     let tx_bytes = borsh::to_vec(&tx)?;
     fs::write("midnight_withdraw_tx.bin", &tx_bytes)?;
-    
+
     let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
-    fs::write("midnight_withdraw_tx.json", 
-        serde_json::to_string_pretty(&serde_json::json!({"body": tx_base64}))?)?;
-    
+    fs::write(
+        "midnight_withdraw_tx.json",
+        serde_json::to_string_pretty(&serde_json::json!({"body": tx_base64}))?,
+    )?;
+
     println!("✓ Transaction: {} bytes", tx_bytes.len());
     Ok(())
 }
