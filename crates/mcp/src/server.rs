@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use demo_stf::runtime::Runtime;
 use rmcp::{
-    // Types used by the server
-    ErrorData,
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     // Re-exported derive crates (handy in derives below)
@@ -14,6 +11,9 @@ use rmcp::{
     tool,
     tool_handler,
     tool_router,
+    // Types used by the server
+    ErrorData,
+    ServerHandler,
 };
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
@@ -154,6 +154,29 @@ pub struct DepositResult {
     pub rho: String,
     /// Recipient binding used for the note
     pub recipient: String,
+}
+
+// -----------------------------
+// Types for Transfer
+// -----------------------------
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct TransferRequest {
+    /// Value of the note to transfer
+    pub value: String,
+    /// Rho (nonce) of the input note to spend (hex string)
+    pub input_rho: String,
+    /// Recipient of the input note to spend (hex string)
+    pub input_recipient: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct TransferResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+    /// New random nonce (rho) for the output note
+    pub new_rho: String,
+    /// New recipient binding for the output note
+    pub new_recipient: String,
 }
 
 #[derive(Clone)]
@@ -309,11 +332,11 @@ impl CryptoServer {
         Parameters(_params): Parameters<GetWalletAddressRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                    None,
-                )
-            })?;
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
 
         let ctx = wallet_ctx.read().await;
 
@@ -473,15 +496,9 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
 
         // Parse amount from string
-        let amount: u128 = params
-            .amount
-            .parse()
-            .map_err(|_| {
-                ErrorData::invalid_params(
-                    "Invalid amount format. Must be a valid u128 number.",
-                    None,
-                )
-            })?;
+        let amount: u128 = params.amount.parse().map_err(|_| {
+            ErrorData::invalid_params("Invalid amount format. Must be a valid u128 number.", None)
+        })?;
 
         tracing::debug!("deposit called with amount: {}", amount);
 
@@ -493,6 +510,105 @@ impl CryptoServer {
             tx_hash: deposit_result.tx_hash,
             rho: hex::encode(&deposit_result.rho),
             recipient: hex::encode(&deposit_result.recipient),
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Transfer funds within the Midnight Privacy shielded pool.
+    /// Creates a ZK proof to spend an existing note and creates a new output note.
+    #[tool(
+        name = "transfer",
+        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note."
+    )]
+    async fn transfer(
+        &self,
+        Parameters(params): Parameters<TransferRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let ligero = self.ligero_prover.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Ligero prover not configured. Please set LIGERO_PROVER_BINARY_PATH and LIGERO_SHADER_PATH environment variables.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        // Parse value from string
+        let value: u128 = params.value.parse().map_err(|_| {
+            ErrorData::invalid_params("Invalid value format. Must be a valid u128 number.", None)
+        })?;
+
+        // Parse input_rho from hex string
+        let input_rho_hex = params.input_rho.trim_start_matches("0x");
+        let input_rho_bytes = hex::decode(input_rho_hex).map_err(|_| {
+            ErrorData::invalid_params(
+                "Invalid input_rho format. Must be a valid hex string.",
+                None,
+            )
+        })?;
+
+        if input_rho_bytes.len() != 32 {
+            return Err(ErrorData::invalid_params(
+                "input_rho must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+
+        let mut input_rho = [0u8; 32];
+        input_rho.copy_from_slice(&input_rho_bytes);
+
+        // Parse input_recipient from hex string
+        let input_recipient_hex = params.input_recipient.trim_start_matches("0x");
+        let input_recipient_bytes = hex::decode(input_recipient_hex).map_err(|_| {
+            ErrorData::invalid_params(
+                "Invalid input_recipient format. Must be a valid hex string.",
+                None,
+            )
+        })?;
+
+        if input_recipient_bytes.len() != 32 {
+            return Err(ErrorData::invalid_params(
+                "input_recipient must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+
+        let mut input_recipient = [0u8; 32];
+        input_recipient.copy_from_slice(&input_recipient_bytes);
+
+        tracing::debug!(
+            "transfer called with value: {}, input_rho: {}, input_recipient: {}",
+            value,
+            hex::encode(&input_rho),
+            hex::encode(&input_recipient)
+        );
+
+        let transfer_result =
+            crate::operations::transfer(ligero, provider, &*ctx, value, input_rho, input_recipient)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = TransferResult {
+            tx_hash: transfer_result.tx_hash,
+            new_rho: hex::encode(&transfer_result.new_rho),
+            new_recipient: hex::encode(&transfer_result.new_recipient),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

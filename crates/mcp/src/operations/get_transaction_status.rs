@@ -2,8 +2,8 @@
 //!
 //! This module provides functionality for retrieving the current status of a specific transaction.
 
-use anyhow::{Context, Result};
 use crate::provider::{Provider, TransactionStatus};
+use anyhow::{Context, Result};
 
 /// Get the status of a transaction by its ID
 ///
@@ -38,11 +38,7 @@ pub async fn get_transaction_status(
         .await
         .with_context(|| format!("Failed to get transaction status for {}", tx_hash))?;
 
-    tracing::info!(
-        "Transaction {} status: {}",
-        tx_status.id,
-        tx_status.status
-    );
+    tracing::info!("Transaction {} status: {}", tx_status.id, tx_status.status);
 
     Ok(tx_status)
 }
@@ -55,7 +51,9 @@ mod tests {
     #[tracing_test::traced_test]
     async fn test_get_transaction_status_with_update_value_zk() {
         use crate::operations::update_value_zk;
-        use crate::test_utils::{is_rollup_available, ligero::create_test_ligero, TEST_PRIVATE_KEY_HEX};
+        use crate::test_utils::{
+            is_rollup_available, ligero::create_test_ligero, TEST_PRIVATE_KEY_HEX,
+        };
         use crate::wallet::WalletContext;
         use demo_stf::runtime::Runtime;
         use sov_address::MultiAddressEvm;
@@ -71,25 +69,32 @@ mod tests {
             return;
         }
 
-        type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+        type McpSpec =
+            ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
         type McpRuntime = Runtime<McpSpec>;
 
         let ligero = create_test_ligero();
         let value = 60000i64;
 
         tracing::info!("Creating wallet from private key");
-        let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
-            .expect("Failed to create wallet");
+        let wallet =
+            WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
+                .expect("Failed to create wallet");
 
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
+        let verifier_url = std::env::var("VERIFIER_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
 
         tracing::info!("Connecting to rollup at: {}", rpc_url);
-        let provider = Provider::new(&rpc_url)
+        let provider = Provider::new(&rpc_url, &verifier_url)
             .await
             .expect("Failed to connect to rollup");
 
-        tracing::info!("Submitting transaction with update_value_zk (value: {})", value);
+        tracing::info!(
+            "Submitting transaction with update_value_zk (value: {})",
+            value
+        );
         let update_result = update_value_zk(&ligero, &provider, &wallet, value)
             .await
             .expect("Failed to submit transaction");
@@ -109,7 +114,10 @@ mod tests {
             tx_hash.to_lowercase(),
             "Transaction ID should match the submitted hash"
         );
-        assert!(!status_result.status.is_empty(), "Transaction status should not be empty");
+        assert!(
+            !status_result.status.is_empty(),
+            "Transaction status should not be empty"
+        );
 
         tracing::info!("✅ Test completed successfully!");
     }

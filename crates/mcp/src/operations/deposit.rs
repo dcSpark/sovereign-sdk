@@ -10,11 +10,11 @@ use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
-use sov_modules_api::Amount;
 use sov_modules_api::capabilities::UniquenessData;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
+use sov_modules_api::Amount;
 
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
@@ -111,7 +111,7 @@ pub async fn create_deposit_unsigned_tx(
 /// This operation:
 /// 1. Generates random rho and recipient values for the note
 /// 2. Creates a deposit transaction that moves funds from transparent to shielded
-/// 3. Signs and submits the transaction to the rollup sequencer
+/// 3. Signs and submits the transaction to the verifier service (which forwards to sequencer)
 ///
 /// # Parameters
 /// * `provider` - Provider for rollup connection
@@ -147,12 +147,12 @@ pub async fn deposit(
     tracing::info!("Transaction signed and serialized: {} bytes", raw_tx.len());
 
     let tx_hash = provider
-        .submit_transaction(raw_tx)
+        .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
-        .context("Failed to submit transaction to rollup")?;
+        .context("Failed to submit transaction to verifier service")?;
 
-    tracing::info!("Deposit transaction submitted successfully: {}", tx_hash);
+    tracing::info!("Deposit transaction submitted successfully via verifier: {}", tx_hash);
 
     Ok(DepositResult {
         tx_hash,
@@ -180,14 +180,17 @@ mod tests {
         let amount = 100u128;
 
         tracing::info!("Creating wallet from private key");
-        let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
-            .expect("Failed to create wallet");
+        let wallet =
+            WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
+                .expect("Failed to create wallet");
 
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
+        let verifier_url = std::env::var("VERIFIER_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
 
         tracing::info!("Connecting to rollup at: {}", rpc_url);
-        let provider = Provider::new(&rpc_url)
+        let provider = Provider::new(&rpc_url, &verifier_url)
             .await
             .expect("Failed to connect to rollup");
 
@@ -199,9 +202,15 @@ mod tests {
 
         let deposit_result = result.unwrap();
 
-        assert!(!deposit_result.tx_hash.is_empty(), "tx_hash should not be empty");
+        assert!(
+            !deposit_result.tx_hash.is_empty(),
+            "tx_hash should not be empty"
+        );
         assert_ne!(deposit_result.rho, [0u8; 32], "rho should be random");
-        assert_ne!(deposit_result.recipient, [0u8; 32], "recipient should be random");
+        assert_ne!(
+            deposit_result.recipient, [0u8; 32],
+            "recipient should be random"
+        );
 
         tracing::info!("✅ Deposit transaction submitted successfully!");
         tracing::info!("   Transaction hash: {}", deposit_result.tx_hash);

@@ -1,5 +1,5 @@
-use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("[mcp] Starting Sovereign SDK MCP Server");
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
+    tracing::info!("[mcp] Verifier URL: {}", cfg.verifier_url);
     tracing::info!("[mcp] Initializing wallet from private key...");
 
     // Create wallet from private key hex string (no files needed!)
@@ -41,9 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
     // Initialize RPC provider (separate from wallet)
-    tracing::info!("[mcp] Connecting to rollup RPC...");
-    let provider = Provider::new(cfg.rollup_rpc_url.as_str()).await?;
-    tracing::info!("[mcp] Connected to rollup RPC successfully");
+    tracing::info!("[mcp] Connecting to rollup RPC and verifier service...");
+    let provider = Provider::new(cfg.rollup_rpc_url.as_str(), cfg.verifier_url.as_str()).await?;
+    tracing::info!("[mcp] Connected to rollup RPC and verifier service successfully");
     let provider = Arc::new(provider);
 
     // Initialize Ligero prover

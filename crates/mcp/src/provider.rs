@@ -40,11 +40,13 @@ pub struct TransactionStatus {
 pub struct Provider {
     client: Arc<NodeClient>,
     rpc_url: String,
+    verifier_url: String,
+    http_client: reqwest::Client,
 }
 
 impl Provider {
-    /// Create a new provider connected to the given RPC URL
-    pub async fn new(rpc_url: &str) -> Result<Self> {
+    /// Create a new provider connected to the given RPC URL and verifier service
+    pub async fn new(rpc_url: &str, verifier_url: &str) -> Result<Self> {
         let client = NodeClient::new(rpc_url)
             .await
             .with_context(|| format!("Failed to connect to rollup node at {}", rpc_url))?;
@@ -52,6 +54,8 @@ impl Provider {
         Ok(Self {
             client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
+            verifier_url: verifier_url.to_string(),
+            http_client: reqwest::Client::new(),
         })
     }
 
@@ -155,6 +159,75 @@ impl Provider {
         Ok(tx_hash.to_string())
     }
 
+    /// Submit a midnight-privacy transaction to the verifier service
+    ///
+    /// This method submits a borsh-serialized transaction to the verifier service,
+    /// which will verify the proof and then submit to the sequencer.
+    /// Returns the transaction hash from the verifier response.
+    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+
+        let tx_b64 = BASE64_STANDARD.encode(&raw_tx);
+        // Trim trailing slash from verifier_url to avoid double slashes
+        let base_url = self.verifier_url.trim_end_matches('/');
+        let endpoint = format!("{}/midnight-privacy", base_url);
+
+        tracing::info!("Submitting transaction to verifier service at {}", endpoint);
+        tracing::debug!("Transaction size: {} bytes, base64 size: {} bytes", raw_tx.len(), tx_b64.len());
+
+        let resp = self
+            .http_client
+            .post(&endpoint)
+            .json(&serde_json::json!({ "body": tx_b64 }))
+            .send()
+            .await
+            .context("Failed to send transaction to verifier service")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::error!(
+                "Verifier service error - URL: {}, Status: {}, Body: {}",
+                endpoint,
+                status,
+                body
+            );
+            anyhow::bail!(
+                "Verifier service returned error status {}: {}",
+                status,
+                body
+            );
+        }
+
+        let body = resp.text().await.context("Failed to read verifier response")?;
+
+        #[derive(serde::Deserialize)]
+        struct VerifierResponse {
+            success: bool,
+            tx_hash: Option<String>,
+            error: Option<String>,
+        }
+
+        let verifier_resp: VerifierResponse = serde_json::from_str(&body)
+            .context("Failed to parse verifier response")?;
+
+        if !verifier_resp.success {
+            anyhow::bail!(
+                "Verifier service reported failure: {}",
+                verifier_resp.error.unwrap_or_else(|| "Unknown error".to_string())
+            );
+        }
+
+        let tx_hash = verifier_resp
+            .tx_hash
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+
+        tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
+
+        Ok(tx_hash)
+    }
+
     /// Get the status of a transaction by its hash
     ///
     /// This queries the `/sequencer/txs/{txHash}/status` endpoint to check
@@ -219,5 +292,18 @@ impl Provider {
             Ok(response) => response.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    /// Query a REST endpoint and deserialize the response
+    ///
+    /// Generic method to query any REST endpoint on the rollup node.
+    pub async fn query_rest_endpoint<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+    ) -> Result<T> {
+        self.client
+            .query_rest_endpoint(endpoint)
+            .await
+            .with_context(|| format!("Failed to query REST endpoint: {}", endpoint))
     }
 }

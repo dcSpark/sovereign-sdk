@@ -46,9 +46,9 @@ pub fn create_test_ligero() -> Ligero {
         ),
         Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../adapters/ligero/bins/programs/value_validator.wasm")
+                .join("../adapters/ligero/guest/bins/programs/note_spend_guest.wasm")
                 .canonicalize()
-                .expect("Failed to find value_validator.wasm"),
+                .expect("Failed to find note_spend_guest.wasm"),
         ),
     )
 }

@@ -21,6 +21,10 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub rollup_rpc_url: Url,
 
+    /// Verifier service URL for midnight-privacy transactions (env: VERIFIER_URL, required)
+    #[validate(custom(function = "validate_http_url"))]
+    pub verifier_url: Url,
+
     /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_program_path: PathBuf,
