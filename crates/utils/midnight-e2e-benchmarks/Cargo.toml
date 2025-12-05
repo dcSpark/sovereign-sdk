@@ -28,7 +28,7 @@ num_cpus = "1.16"
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 toml = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "net", "macros", "sync", "tracing"] }
 chrono = { workspace = true, features = ["clock"] }
