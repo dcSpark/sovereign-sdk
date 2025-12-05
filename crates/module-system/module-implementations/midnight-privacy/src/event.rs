@@ -3,6 +3,19 @@ use sov_modules_api::macros::serialize;
 use crate::hash::Hash32;
 use crate::types::EncryptedNote;
 
+/// Lightweight viewer attestation for events.
+/// Contains only the essential information for indexers/authorities.
+/// The full ct_hash and mac were already verified on-chain; no need to include them in events.
+#[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
+#[serialize(Borsh, Serde)]
+pub struct ViewerBinding {
+    /// Output commitment this attestation is bound to
+    pub cm: Hash32,
+    /// FVK commitment identifying which viewer key holder can decrypt this note.
+    /// H("FVK_COMMIT_V1" || fvk)
+    pub fvk_commitment: Hash32,
+}
+
 /// Events emitted by the MidnightPrivacy module.
 /// 
 /// **IMPORTANT: Position and root values in per-tx events are PROVISIONAL.**
@@ -59,6 +72,10 @@ pub enum Event {
         anchor_root: Hash32,
         /// Output note commitments added by this transfer
         outputs: Vec<Hash32>,
+        /// Viewer bindings from the proof (Level-B compliance).
+        /// Present when the prover included viewer attestations binding ciphertexts to outputs.
+        /// Each binding indicates which viewer (by fvk_commitment) can decrypt a specific output (by cm).
+        viewer_bindings: Option<Vec<ViewerBinding>>,
     },
     /// Tokens were withdrawn from the pool after consuming a nullifier.
     /// 
@@ -72,6 +89,10 @@ pub enum Event {
         anchor_root: Hash32,
         /// Change output commitments created (often 0 or 1)
         change: Vec<Hash32>,
+        /// Viewer bindings from the proof (Level-B compliance).
+        /// Present when the prover included viewer attestations binding ciphertexts to change outputs.
+        /// Each binding indicates which viewer (by fvk_commitment) can decrypt a specific output (by cm).
+        viewer_bindings: Option<Vec<ViewerBinding>>,
     },
     /// A Merkle root was recorded in the permanent historical index (NOMT-backed).
     /// 
