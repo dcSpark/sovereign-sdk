@@ -20,6 +20,7 @@ sea-orm = { version = "1.1", default-features = false, features = [
     "sqlx-postgres",
     "runtime-tokio-rustls",
     "macros",
+    "with-json",
 ] }
 # No CLI flags; service reads config from env vars
 

@@ -42,6 +42,12 @@ pub struct Model {
     /// JSON-serialized proof outputs (e.g., anchor_root, nullifier, withdraw_amount).
     #[sea_orm(column_type = "Text")]
     pub proof_outputs: String,
+    /// JSON-serialized Full Viewing Keys attached to a deposit (if any).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub view_fvks_json: Option<String>,
+    /// JSON-serialized viewer attestations from the proof (if any).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub view_attestations_json: Option<String>,
     /// Borsh-serialized public key (hex string) - for pre-authenticated path
     #[sea_orm(column_type = "Text", nullable)]
     pub pub_key_hex: Option<String>,
@@ -64,6 +70,9 @@ pub struct Model {
     /// L2 sender address (canonical string), derived from the transaction's public key.
     #[sea_orm(column_type = "String(StringLen::None)")]
     pub sender: String,
+    /// Withdraw recipient (transparent address), if present in the transaction.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub recipient: Option<String>,
     /// Current state of the transaction in the processing pipeline.
     pub transaction_state: TransactionState,
     /// Response from the sequencer after processing (JSON or error message).
