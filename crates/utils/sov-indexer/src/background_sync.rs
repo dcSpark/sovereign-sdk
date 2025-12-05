@@ -149,7 +149,7 @@ pub fn spawn_sync_loop(da: DatabaseConnection, idx: DatabaseConnection) {
     });
 }
 
-fn parse_kind_amount_roots(
+pub fn parse_kind_amount_roots(
     tx_json: &str,
 ) -> Result<(String, Option<String>, Option<String>, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
@@ -191,7 +191,7 @@ fn parse_kind_amount_roots(
     Ok(("other".to_string(), None, None, None))
 }
 
-fn parse_deposit_fields(
+pub fn parse_deposit_fields(
     tx_json: &str,
 ) -> Result<(Option<String>, Option<String>, Option<serde_json::Value>)> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
@@ -210,7 +210,7 @@ fn parse_deposit_fields(
     Ok((None, None, None))
 }
 
-fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
+pub fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
     if let Some(obj) = v.get("withdraw").and_then(|x| x.as_object()) {
         let to = obj
@@ -222,7 +222,7 @@ fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn parse_withdraw_attestations(proof_outputs_json: &str) -> Result<Option<String>> {
+pub fn parse_withdraw_attestations(proof_outputs_json: &str) -> Result<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(proof_outputs_json)?;
     if let Some(obj) = v.as_object() {
         if let Some(att) = obj.get("view_attestations") {
