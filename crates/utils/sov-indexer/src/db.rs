@@ -67,6 +67,9 @@ pub struct InvolvementItem {
     pub view_fvks: Option<JsonValue>,
     pub view_attestations: Option<JsonValue>,
     pub events: Option<JsonValue>,
+    pub status: Option<String>,
+    pub encrypted_notes: Option<JsonValue>,
+    pub payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -79,6 +82,41 @@ pub struct ListResponse {
 pub struct CursorInner {
     pub ts_ms: i64,
     pub tx_hash: String,
+}
+
+pub fn after_cursor(cur: &CursorInner, created_at: DateTime<Utc>, tx_hash: &str) -> bool {
+    let ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms).unwrap();
+    created_at < ts || (created_at == ts && tx_hash < cur.tx_hash.as_str())
+}
+
+pub fn extract_events_from_status(
+    sequencer_resp: Option<&str>,
+) -> Result<Option<serde_json::Value>, serde_json::Error> {
+    if let Some(resp) = sequencer_resp {
+        let v: serde_json::Value = serde_json::from_str(resp)?;
+        if let Some(ev) = v.get("events") {
+            return Ok(Some(ev.clone()));
+        }
+    }
+    Ok(None)
+}
+
+pub fn extract_status_from_status(sequencer_resp: Option<&str>) -> Option<String> {
+    if let Some(resp) = sequencer_resp {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(resp) {
+            if let Some(r) = v
+                .get("receipt")
+                .and_then(|r| r.get("result"))
+                .and_then(|s| s.as_str())
+            {
+                return Some(r.to_string());
+            }
+            if let Some(s) = v.get("status").and_then(|s| s.as_str()) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub async fn get_last_processed_id(idx_db: &DatabaseConnection) -> Result<Option<i32>> {
@@ -116,6 +154,7 @@ pub async fn insert_event(
     module: &str,
     kind: &str,
     payload: &str,
+    status: Option<String>,
     events: Option<JsonValue>,
 ) -> Result<i32> {
     let res = idx::Entity::insert(idx::ActiveModel {
@@ -123,6 +162,7 @@ pub async fn insert_event(
         created_at: Set(created_at),
         module: Set(module.to_string()),
         kind: Set(kind.to_string()),
+        status: Set(status),
         events: Set(events),
         payload: Set(payload.to_string()),
         ..Default::default()
@@ -140,6 +180,7 @@ pub async fn insert_midnight_deposit(
     recipient: Option<String>,
     sender: Option<String>,
     view_fvks: Option<JsonValue>,
+    encrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_deposit::Entity::insert(idx::midnight_deposit::ActiveModel {
         event_id: Set(event_id),
@@ -148,6 +189,7 @@ pub async fn insert_midnight_deposit(
         recipient: Set(recipient),
         sender: Set(sender),
         view_fvks: Set(view_fvks),
+        encrypted_notes: Set(encrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -163,6 +205,7 @@ pub async fn insert_midnight_withdraw(
     to: Option<String>,
     sender: Option<String>,
     view_attestations: Option<JsonValue>,
+    encrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_withdraw::Entity::insert(idx::midnight_withdraw::ActiveModel {
         event_id: Set(event_id),
@@ -172,6 +215,7 @@ pub async fn insert_midnight_withdraw(
         to_addr: Set(to),
         sender: Set(sender),
         view_attestations: Set(view_attestations),
+        encrypted_notes: Set(encrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -185,6 +229,7 @@ pub async fn insert_midnight_transfer(
     nullifier: Option<String>,
     sender: Option<String>,
     view_attestations: Option<JsonValue>,
+    encrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_transfer::Entity::insert(idx::midnight_transfer::ActiveModel {
         event_id: Set(event_id),
@@ -192,6 +237,7 @@ pub async fn insert_midnight_transfer(
         nullifier: Set(nullifier),
         sender: Set(sender),
         view_attestations: Set(view_attestations),
+        encrypted_notes: Set(encrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -238,6 +284,9 @@ pub async fn list_wallet_txs_sync(
             view_fvks: md.view_fvks.clone(),
             view_attestations: None,
             events: ev.events.clone(),
+            status: ev.status.clone(),
+            encrypted_notes: md.encrypted_notes.clone(),
+            payload: serde_json::from_str(&ev.payload).ok(),
         });
     }
 
@@ -276,6 +325,9 @@ pub async fn list_wallet_txs_sync(
             view_fvks: None,
             view_attestations: mw.view_attestations.clone(),
             events: ev.events.clone(),
+            status: ev.status.clone(),
+            encrypted_notes: mw.encrypted_notes.clone(),
+            payload: serde_json::from_str(&ev.payload).ok(),
         });
     }
 
@@ -310,6 +362,9 @@ pub async fn list_wallet_txs_sync(
             view_fvks: None,
             view_attestations: mt.view_attestations.clone(),
             events: ev.events.clone(),
+            status: ev.status.clone(),
+            encrypted_notes: mt.encrypted_notes.clone(),
+            payload: serde_json::from_str(&ev.payload).ok(),
         });
     }
 
@@ -400,6 +455,11 @@ pub async fn list_wallet_txs_direct(
         let events = extract_events_from_status(row.sequencer_status.as_deref())
             .ok()
             .flatten();
+        let status = extract_status_from_status(row.sequencer_status.as_deref());
+        let encrypted_notes = row
+            .encrypted_notes_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
 
         collected.push(InvolvementItem {
             tx_hash: row.tx_hash.clone(),
@@ -413,6 +473,9 @@ pub async fn list_wallet_txs_direct(
             view_fvks,
             view_attestations,
             events,
+            status,
+            encrypted_notes,
+            payload: serde_json::from_str(&row.transaction_data).ok(),
         });
     }
 
@@ -429,21 +492,4 @@ pub async fn list_wallet_txs_direct(
         items: collected,
         next,
     })
-}
-
-pub fn extract_events_from_status(
-    sequencer_resp: Option<&str>,
-) -> Result<Option<serde_json::Value>, serde_json::Error> {
-    if let Some(resp) = sequencer_resp {
-        let v: serde_json::Value = serde_json::from_str(resp)?;
-        if let Some(ev) = v.get("events") {
-            return Ok(Some(ev.clone()));
-        }
-    }
-    Ok(None)
-}
-
-pub fn after_cursor(cur: &CursorInner, created_at: DateTime<Utc>, tx_hash: &str) -> bool {
-    let ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms).unwrap();
-    created_at < ts || (created_at == ts && tx_hash < cur.tx_hash.as_str())
 }
