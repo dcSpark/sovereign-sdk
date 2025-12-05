@@ -23,6 +23,7 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use tokio::sync::RwLock;
 
+use crate::authority_fvk::AuthorityFvk;
 use crate::ligero::Ligero as LigeroProver;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
@@ -195,6 +196,9 @@ pub struct CryptoServer {
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     ligero_prover: Option<Arc<LigeroProver>>,
+    /// Authority FVK for decrypting encrypted notes (to be used in future decrypt implementation)
+    #[allow(dead_code)]
+    authority_fvk: Option<Arc<AuthorityFvk>>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -212,12 +216,14 @@ impl CryptoServer {
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
+        authority_fvk: Option<Arc<AuthorityFvk>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             provider: Some(provider),
             wallet_context: Some(wallet_context),
             ligero_prover: Some(ligero_prover),
+            authority_fvk,
         }
     }
 

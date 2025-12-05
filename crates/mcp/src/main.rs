@@ -2,6 +2,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tracing_subscriber::EnvFilter;
 
+mod authority_fvk;
 mod config;
 mod ligero;
 mod operations;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::authority_fvk::AuthorityFvk;
 use crate::config::Config;
 use crate::ligero::Ligero;
 use crate::provider::Provider;
@@ -69,6 +71,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cfg.ligero_program_path.clone()),
     ));
 
+    // Initialize authority FVK if provided
+    let authority_fvk = if let Some(ref fvk_hex) = cfg.authority_fvk {
+        tracing::info!("[mcp] Initializing authority FVK from environment variable");
+        match AuthorityFvk::from_hex(fvk_hex) {
+            Ok(fvk) => {
+                tracing::info!("[mcp] Authority FVK initialized successfully");
+                Some(Arc::new(fvk))
+            }
+            Err(e) => {
+                tracing::warn!("[mcp] Failed to initialize authority FVK: {}", e);
+                tracing::warn!("[mcp] Note decryption will not be available");
+                None
+            }
+        }
+    } else {
+        tracing::info!("[mcp] No AUTHORITY_FVK provided, note decryption will not be available");
+        None
+    };
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -81,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 provider.clone(),
                 wallet_ctx.clone(),
                 ligero.clone(),
+                authority_fvk.clone(),
             ))
         },
         LocalSessionManager::default().into(),

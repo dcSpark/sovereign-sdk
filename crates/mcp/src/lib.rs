@@ -1,3 +1,4 @@
+pub mod authority_fvk;
 pub mod config;
 pub mod ligero;
 pub mod operations;
