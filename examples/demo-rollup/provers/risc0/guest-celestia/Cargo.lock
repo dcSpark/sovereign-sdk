@@ -2960,6 +2960,7 @@ name = "midnight-privacy"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bech32",
  "bincode",
  "borsh",
  "chacha20poly1305",
