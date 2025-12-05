@@ -1772,6 +1772,23 @@ pub async fn store_verified_midnight_transaction(
         "{}".to_string()
     };
 
+    // Extract optional viewing data
+    let view_attestations_json = proof_output
+        .and_then(|p| p.view_attestations.as_ref())
+        .map(|atts| {
+            serde_json::to_string(atts).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize view_attestations: {err}"))
+            })
+        })
+        .transpose()?;
+    let view_fvks_json = (|| -> Option<Result<String, ServiceError>> {
+        let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;
+        let fvks = v.get("deposit")?.get("view_fvks")?.clone();
+        Some(serde_json::to_string(&fvks).map_err(|err| {
+            ServiceError::Internal(format!("Failed to serialize view_fvks: {err}"))
+        }))
+    })()
+    .transpose()?;
     // Serialize encrypted notes to JSON for Level-B viewing access
     let encrypted_notes_json = encrypted_notes
         .map(|notes| {
@@ -1786,8 +1803,8 @@ pub async fn store_verified_midnight_transaction(
         Some((pk, sig, uq, det, rt, ser_tx)) => (Set(Some(pk)), Set(Some(sig)), Set(Some(uq)), Set(Some(det)), Set(Some(rt)), Set(Some(ser_tx))),
         None => (Set(None), Set(None), Set(None), Set(None), Set(None), Set(None)),
     };
-    // Derive sender address from the full transaction blob (base64-encoded borsh Transaction)
-    let sender_str = (|| -> Result<String, ServiceError> {
+    // Derive sender address (and withdraw recipient, if any) from the full transaction blob (base64-encoded borsh Transaction)
+    let (sender_str, recipient_str) = (|| -> Result<(String, Option<String>), ServiceError> {
         let raw = BASE64_STANDARD
             .decode(full_transaction_blob.as_bytes())
             .map_err(|e| ServiceError::Internal(format!("Failed to decode base64 tx blob: {e}")))?;
@@ -1799,7 +1816,13 @@ pub async fn store_verified_midnight_transaction(
                 cred.into()
             }
         };
-        Ok(sender_addr.to_string())
+        let recipient = match tx.runtime_call() {
+            demo_stf::runtime::RuntimeCall::MidnightPrivacy(midnight_privacy::CallMessage::Withdraw { to, .. }) => {
+                Some(to.to_string())
+            }
+            _ => None,
+        };
+        Ok((sender_addr.to_string(), recipient))
     })()?;
 
     VerifiedEntity::insert(VerifiedActiveModel {
@@ -1808,6 +1831,8 @@ pub async fn store_verified_midnight_transaction(
         proof_verified: Set(proof_verified),
         transaction_data: Set(transaction_data.to_owned()),
         proof_outputs: Set(proof_outputs_json),
+        view_fvks_json: Set(view_fvks_json),
+        view_attestations_json: Set(view_attestations_json),
         encrypted_notes_json: Set(encrypted_notes_json),
         pub_key_hex,
         signature_hex,
@@ -1818,6 +1843,7 @@ pub async fn store_verified_midnight_transaction(
         transaction_state: Set(TransactionState::Pending),
         sequencer_status: Set(None),
         sender: Set(sender_str),
+        recipient: Set(recipient_str),
         created_at: Set(Utc::now()),
         ..Default::default()
     })
@@ -1828,6 +1854,8 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::ProofVerified,
                 VerifiedColumn::TransactionData,
                 VerifiedColumn::ProofOutputs,
+                VerifiedColumn::ViewFvksJson,
+                VerifiedColumn::ViewAttestationsJson,
                 VerifiedColumn::EncryptedNotesJson,
                 VerifiedColumn::PubKeyHex,
                 VerifiedColumn::SignatureHex,
@@ -1838,6 +1866,7 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::TransactionState,
                 VerifiedColumn::SequencerStatus,
                 VerifiedColumn::Sender,
+                VerifiedColumn::Recipient,
                 VerifiedColumn::CreatedAt,
             ])
             .to_owned(),

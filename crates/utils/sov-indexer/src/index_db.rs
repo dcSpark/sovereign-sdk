@@ -1,4 +1,4 @@
-use sea_orm::entity::prelude::*;
+use sea_orm::{entity::prelude::*, JsonValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "events")]
@@ -10,47 +10,18 @@ pub struct Model {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub module: String,
     pub kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub status: Option<String>,
+    #[sea_orm(column_type = "Json", nullable)]
+    pub events: Option<JsonValue>,
     #[sea_orm(column_type = "Text")]
     pub payload: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(has_many = "super::index_db::involvement::Entity")]
-    Involvement,
-}
+pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
-
-pub mod involvement {
-    use super::*;
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-    #[sea_orm(table_name = "involvement")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = true, column_type = "Integer")]
-        pub id: i32,
-        pub event_id: i32,
-        pub address: String,
-        pub role: String,
-        pub direction: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {
-        #[sea_orm(
-            belongs_to = "super::Entity",
-            from = "Column::EventId",
-            to = "super::Column::Id"
-        )]
-        Events,
-    }
-
-    impl Related<super::Entity> for Entity {
-        fn to() -> RelationDef { Relation::Events.def() }
-    }
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
 
 pub mod midnight_deposit {
     use super::*;
@@ -64,6 +35,10 @@ pub mod midnight_deposit {
         pub recipient: Option<String>,
         #[sea_orm(nullable)]
         pub sender: Option<String>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub view_fvks: Option<JsonValue>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub encrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -91,6 +66,10 @@ pub mod midnight_withdraw {
         pub to_addr: Option<String>,
         #[sea_orm(nullable)]
         pub sender: Option<String>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub view_attestations: Option<JsonValue>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub encrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -115,5 +94,33 @@ pub mod index_meta {
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod midnight_transfer {
+    use super::*;
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "midnight_transfer")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false, column_type = "Integer")]
+        pub event_id: i32,
+        pub anchor_root: Option<String>,
+        pub nullifier: Option<String>,
+        #[sea_orm(nullable)]
+        pub sender: Option<String>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub view_attestations: Option<JsonValue>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub encrypted_notes: Option<JsonValue>,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::Entity",
+            from = "Column::EventId",
+            to = "super::Column::Id"
+        )]
+        Events,
+    }
     impl ActiveModelBehavior for ActiveModel {}
 }

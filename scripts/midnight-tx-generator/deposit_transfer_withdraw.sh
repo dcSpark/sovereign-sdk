@@ -315,7 +315,23 @@ if [ -z "$SEQUENCER_WITHDRAW_RESPONSE" ] || [ "$SEQUENCER_WITHDRAW_RESPONSE" = "
     exit 1
 fi
 
-CHANGE_POSITION=$(echo "$SEQUENCER_WITHDRAW_RESPONSE" | jq -r '.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated") | .value.note_created.position')
+CHANGE_COMMITMENT=$(echo "$SEQUENCER_WITHDRAW_RESPONSE" | jq -c '.events[] | select(.key == "ValueMidnightPrivacy/NoteCreated") | .value.note_created.commitment' | head -n1)
+CHANGE_POSITION=""
+if [ -n "$CHANGE_COMMITMENT" ] && [ "$CHANGE_COMMITMENT" != "null" ]; then
+    for attempt in $(seq 1 60); do
+        NOTES_RESP=$(curl -s "${NODE_API_URL}/modules/midnight-privacy/notes?limit=200&reverse=true")
+        CHANGE_POSITION=$(echo "$NOTES_RESP" | jq --argjson target "$CHANGE_COMMITMENT" -r '.notes[] | select(.commitment == $target) | .position' | head -n1 | tr -d '\n')
+        if [ -n "$CHANGE_POSITION" ] && [ "$CHANGE_POSITION" != "null" ] && [[ "$CHANGE_POSITION" =~ ^[0-9]+$ ]]; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+if [ -z "$CHANGE_POSITION" ] || [ "$CHANGE_POSITION" = "null" ] || ! [[ "$CHANGE_POSITION" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}✗ Failed to locate change note position in /modules/midnight-privacy/notes${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}✓ Withdrawal successful${NC}"
 echo "  Consumed: Note@pos$OUT1_POSITION ($TRANSFER_OUT1 tokens)"
