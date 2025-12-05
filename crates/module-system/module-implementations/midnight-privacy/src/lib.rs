@@ -25,7 +25,11 @@ pub use preverified::{
     prime_pre_verified_spend,
 };
 pub use types::*;
-pub use viewing::{decrypt_and_verify_note, encrypt_note_for_fvk};
+pub use viewing::{
+    decrypt_and_verify_note, decrypt_and_verify_note_with_sender,
+    encrypt_note_for_fvk, encrypt_note_for_fvk_with_sender,
+    ct_hash, fvk_commitment, view_kdf, view_mac,
+};
 
 #[cfg(feature = "native")]
 pub use query::*;

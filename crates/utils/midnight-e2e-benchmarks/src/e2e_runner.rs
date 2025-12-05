@@ -1328,9 +1328,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let nf = nullifier(&domain, &nf_key, &rho);
 
                 // Build viewer attestation if authority FVK is set
+                // sender_id = recipient (the input note's owner / spender's address)
                 let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &domain, out_value, &out_rho, &out_recipient, &cm_out,
+                        &fvk, &domain, out_value, &out_rho, &out_recipient, &recipient, &cm_out,
                     );
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
@@ -1586,9 +1587,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
 
         // Build EncryptedNote for the authority, if configured
+        // sender_id = input.recipient (the spender's address)
         let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
             let (_att, enc) = make_viewer_bundle(
-                &fvk, &domain, out_value, &out_rho, &out_recipient, &cm_out,
+                &fvk, &domain, out_value, &out_rho, &out_recipient, &input.recipient, &cm_out,
             );
             vec![enc]
         });
