@@ -8,8 +8,8 @@ use midnight_privacy::{
     EncryptedNote, FullViewingKey, Hash32, ViewAttestation,
 };
 
-/// Length of note plaintext: 32(domain) + 16(value) + 32(rho) + 32(recipient)
-pub const NOTE_PLAIN_LEN: usize = 112;
+/// Length of note plaintext: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
+pub const NOTE_PLAIN_LEN: usize = 144;
 
 /// Load authority viewing key from environment variable AUTHORITY_FVK.
 ///
@@ -59,18 +59,20 @@ fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
     }
 }
 
-/// Serialize note plaintext for encryption.
+/// Serialize note plaintext for encryption (144 bytes with sender_id).
 pub fn encode_note_plain(
     domain: &Hash32,
     value: u128,
     rho: &Hash32,
     recipient: &Hash32,
+    sender_id: &Hash32,
 ) -> [u8; NOTE_PLAIN_LEN] {
     let mut out = [0u8; NOTE_PLAIN_LEN];
     out[0..32].copy_from_slice(domain);
     out[32..48].copy_from_slice(&value.to_le_bytes());
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
     out
 }
 
@@ -82,6 +84,7 @@ pub fn encode_note_plain(
 /// * `value` - The token amount
 /// * `rho` - The note randomness
 /// * `recipient` - The recipient identifier
+/// * `sender_id` - The sender identifier (spender's address for transfers)
 /// * `cm` - The note commitment
 ///
 /// # Returns
@@ -94,11 +97,12 @@ pub fn make_viewer_bundle(
     value: u128,
     rho: &Hash32,
     recipient: &Hash32,
+    sender_id: &Hash32,
     cm: &Hash32,
 ) -> (ViewAttestation, EncryptedNote) {
     let fvk_obj = FullViewingKey(*fvk);
     let fvk_c = fvk_commitment(&fvk_obj);
-    let pt = encode_note_plain(domain, value, rho, recipient);
+    let pt = encode_note_plain(domain, value, rho, recipient, sender_id);
     let k = view_kdf(&fvk_obj, cm);
     let mut ct = [0u8; NOTE_PLAIN_LEN];
     stream_xor_encrypt(&k, &pt, &mut ct);

@@ -41,6 +41,7 @@ borsh = { workspace = true, features = ["rc"] }
 sov-state = { workspace = true }
 bincode = { workspace = true }
 hex = { workspace = true }
+bech32 = { workspace = true }
 qp-poseidon-core = { version = "0.9.5", features = ["std"] }
 sov-bank = { workspace = true }
 once_cell = { workspace = true }

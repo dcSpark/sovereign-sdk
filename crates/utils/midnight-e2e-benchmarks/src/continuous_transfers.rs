@@ -1328,9 +1328,10 @@ async fn perform_transfer_cycle(
                 let nf = nullifier(&DOMAIN, &NF_KEY, &in_rho);
 
                 // Build viewer attestation if authority FVK is set
+                // sender_id = in_recipient (the spender's address)
                 let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &cm_out,
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &in_recipient, &cm_out,
                     );
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
@@ -1457,10 +1458,11 @@ async fn perform_transfer_cycle(
             let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
 
             // Build encrypted note for authority if configured
+            // sender_id = wallet.recipient (the spender's address)
             let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
                 let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
                 let (_att, enc) = make_viewer_bundle(
-                    &fvk, &DOMAIN, value, &out_rho, &out_recipient, &cm_out,
+                    &fvk, &DOMAIN, value, &out_rho, &out_recipient, &wallet.recipient, &cm_out,
                 );
                 vec![enc]
             });

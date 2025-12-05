@@ -12,7 +12,10 @@
  *   [2]  value_dec                  — input note value (u128; asserted ≤ u64::MAX)
  *   [3]  rho_hex                    — 32-byte hex
  *   [4]  recipient_hex              — 32-byte hex  [PRIVATE]
- *   [5]  nf_key_hex                 — 32-byte hex  [PRIVATE]
+ *                                   MUST equal recipient_from_sk(domain, spend_sk)
+ *   [5]  spend_sk_hex               — 32-byte hex  [PRIVATE]
+ *                                   Used to (a) authorize spend via recipient binding
+ *                                   and (b) derive nf_key := H("NFKEY_V1"||domain||spend_sk)
  *   [6]  pos_dec                    — u64          [PRIVATE]
  *   [7]  depth_dec                  — u32
  *   [8..8+depth) siblings_hex[i]    — 32-byte hex each   [PRIVATE]
@@ -23,12 +26,17 @@
  *   For each j in [0..n_out):
  *     [12+depth + 4*j + 0] value_out_j_dec     — u128               [PRIVATE]
  *     [12+depth + 4*j + 1] rho_out_j_hex       — 32-byte hex        [PRIVATE]
- *     [12+depth + 4*j + 2] recipient_out_j_hex — 32-byte hex        [PRIVATE]
+ *     [12+depth + 4*j + 2] pk_out_j_hex        — 32-byte hex        [PRIVATE]
+ *                                              recipient is DERIVED: H("ADDR_V1"||domain||pk_out)
+ *                                              This prevents sending to arbitrary/normal addresses
  *     [12+depth + 4*j + 3] cm_out_j_hex        — 32-byte hex (PUBLIC; must equal computed)
  *
  * Expected argc = 12 + depth + 4*n_out (argc includes argv[0]).
  *
  * Hashing uses qp_poseidon_core::Poseidon2Core exactly like on-chain.
+ *
+ * Viewer plaintexts (Level B) are extended to include an attested sender_id:
+ *   [ domain | value | rho | recipient | sender_id ]
  * 
  * Copyright (C) 2023-2025 Sovereign Labs
  * Licensed under the Apache License, Version 2.0
@@ -153,6 +161,33 @@ fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
 }
 
+// === Spend authorization / identity derivations (Poseidon-only) ===
+
+/// pk = H("PK_V1" || spend_sk)
+#[inline(always)]
+fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"PK_V1", &[spend_sk])
+}
+
+/// recipient_addr = H("ADDR_V1" || domain || pk)
+#[inline(always)]
+fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+}
+
+/// recipient_addr from spend_sk (convenience: sk -> pk -> recipient)
+#[inline(always)]
+fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let pk = pk_from_sk(spend_sk);
+    recipient_from_pk(domain, &pk)
+}
+
+/// nf_key = H("NFKEY_V1" || domain || spend_sk)
+#[inline(always)]
+fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"NFKEY_V1", &[domain, spend_sk])
+}
+
 fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u32) -> Hash32 {
     let mut cur = *leaf;
     let mut idx = pos;
@@ -217,12 +252,13 @@ fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
 }
 
 /// Deterministic serialization of a Note plaintext used for encryption:
-/// [ domain(32) | value_le_16 | rho(32) | recipient(32) ] => 112 bytes
-fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32, out: &mut [u8; 112]) {
+/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
+fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32, sender_id: &Hash32, out: &mut [u8; 144]) {
     out[0..32].copy_from_slice(domain);
     out[32..48].copy_from_slice(&value.to_le_bytes());
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
 }
 
 const MAX_ARGS: usize = 512;
@@ -233,7 +269,7 @@ const MAX_BUF: usize = 128 * 1024;
 const MAX_DEPTH: usize = 63;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
-const NOTE_PLAIN_LEN: usize = 112; // 32 + 16 + 32 + 32
+const NOTE_PLAIN_LEN: usize = 144; // 32 + 16 + 32 + 32 + 32 (domain + value + rho + recipient + sender_id)
 
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
@@ -261,13 +297,21 @@ pub unsafe extern "C" fn _start() -> ! {
     let n = read_cstr(ptrs[3] as *const u8, &mut tmp);
     let rho = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
 
-    // 4) recipient [PRIVATE]
+    // 4) recipient [PRIVATE] - MUST equal recipient_from_sk(domain, spend_sk)
     let n = read_cstr(ptrs[4] as *const u8, &mut tmp);
     let recipient = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
 
-    // 5) nf_key [PRIVATE]
+    // 5) spend_sk [PRIVATE] - used to (a) authorize spend via recipient binding
+    //    and (b) derive nf_key := H("NFKEY_V1"||domain||spend_sk)
     let n = read_cstr(ptrs[5] as *const u8, &mut tmp);
-    let nf_key = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+    let spend_sk = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+
+    // Enforce: recipient is derived from spend_sk (authorization binding)
+    let recipient_expected = recipient_from_sk(&domain, &spend_sk);
+    assert_one(eq_bytes(&recipient_expected, &recipient) as i32);
+
+    // Sender identity (attested) = input-note owner identity
+    let sender_id = recipient_expected;
 
     // 6) pos [PRIVATE]
     let n = read_cstr(ptrs[6] as *const u8, &mut tmp);
@@ -340,9 +384,12 @@ pub unsafe extern "C" fn _start() -> ! {
         let n = read_cstr(ptrs[base + 1] as *const u8, &mut tmp);
         let rho_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
 
-        // recipient_out_j [PRIVATE]
+        // pk_out_j [PRIVATE] — recipient is DERIVED from this (prevents arbitrary addresses)
         let n = read_cstr(ptrs[base + 2] as *const u8, &mut tmp);
-        let rcp_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        let pk_out_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        
+        // Derive recipient from pk_out_j (ensures only valid privacy addresses can receive)
+        let rcp_j = recipient_from_pk(&domain, &pk_out_j);
 
         // cm_out_j (PUBLIC) — must equal computed commitment
         let n = read_cstr(ptrs[base + 3] as *const u8, &mut tmp);
@@ -360,7 +407,8 @@ pub unsafe extern "C" fn _start() -> ! {
     let anchor_computed = root_from_path(&cm_in, pos, &siblings[..depth], depth_u32);
     assert_one(eq_bytes(&anchor_computed, &anchor_arg) as i32);
 
-    // Compute PRF nullifier and check
+    // Compute PRF nullifier and check (nf_key is derived; not prover-chosen)
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
     assert_one(eq_bytes(&nf, &nullifier_arg) as i32);
 
@@ -418,8 +466,8 @@ pub unsafe extern "C" fn _start() -> ! {
         for j in 0..n_out {
             let outp = &outs[j];
 
-            // Serialize plaintext
-            encode_note_plain(&domain, outp.v, &outp.rho, &outp.rcp, &mut pt_buf);
+            // Serialize plaintext with sender_id (computed from spend_sk, not provided)
+            encode_note_plain(&domain, outp.v, &outp.rho, &outp.rcp, &sender_id, &mut pt_buf);
 
             // Key from (fvk, cm_j)
             let k = view_kdf(&fvk, &outp.cm);
