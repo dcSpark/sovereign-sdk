@@ -22,9 +22,9 @@ type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddres
 type McpRuntime = Runtime<McpSpec>;
 
 /// Helper to check if services are available
-async fn check_services_available(rpc_url: &str, verifier_url: &str) -> bool {
+async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> bool {
     // Check rollup
-    let provider_result = Provider::new(rpc_url, verifier_url).await;
+    let provider_result = Provider::new(rpc_url, verifier_url, indexer_url).await;
     if provider_result.is_err() {
         eprintln!("⚠️  Rollup not available at {}", rpc_url);
         return false;
@@ -98,14 +98,17 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         .expect("ROLLUP_RPC_URL must be set in .env");
     let verifier_url = std::env::var("VERIFIER_URL")
         .expect("VERIFIER_URL must be set in .env");
+    let indexer_url = std::env::var("INDEXER_URL")
+        .unwrap_or_else(|_| "http://localhost:13100".to_string());
 
     assert!(
-        check_services_available(&rpc_url, &verifier_url).await,
+        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
         "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
     );
 
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
+    tracing::info!("Using INDEXER_URL: {}", indexer_url);
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");
@@ -124,7 +127,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 
     // Step 2: Connect to provider
     tracing::info!("Step 2: Connecting to rollup and verifier");
-    let provider = Provider::new(&rpc_url, &verifier_url).await?;
+    let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
     tracing::info!("✓ Connected to services");
 
     // Step 3: Check wallet balance
@@ -257,14 +260,16 @@ async fn test_balance_check() -> Result<()> {
         .expect("ROLLUP_RPC_URL must be set in .env");
     let verifier_url = std::env::var("VERIFIER_URL")
         .expect("VERIFIER_URL must be set in .env");
+    let indexer_url = std::env::var("INDEXER_URL")
+        .unwrap_or_else(|_| "http://localhost:13100".to_string());
 
     assert!(
-        check_services_available(&rpc_url, &verifier_url).await,
+        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
         "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
     );
 
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
-    let provider = Provider::new(&rpc_url, &verifier_url).await?;
+    let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
 
     let token_id: TokenId = config_gas_token_id();
     let address = wallet.get_address();

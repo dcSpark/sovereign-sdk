@@ -17,8 +17,6 @@ pub struct Transaction {
     pub timestamp_ms: i64,
     /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
     pub kind: String,
-    /// Direction of involvement (e.g., "in", "out")
-    pub direction: String,
     /// Sender address (if available)
     pub sender: Option<String>,
     /// Recipient address (if available)
@@ -29,6 +27,18 @@ pub struct Transaction {
     pub anchor_root: Option<String>,
     /// Nullifier for privacy transactions
     pub nullifier: Option<String>,
+    /// View Full Viewing Keys (FVKs) for note decryption
+    pub view_fvks: Option<serde_json::Value>,
+    /// View attestations for privacy proofs
+    pub view_attestations: Option<serde_json::Value>,
+    /// Transaction events from the rollup
+    pub events: Option<serde_json::Value>,
+    /// Transaction status (e.g., "Success", "Failed")
+    pub status: Option<String>,
+    /// Encrypted notes for privacy transactions
+    pub encrypted_notes: Option<serde_json::Value>,
+    /// Full transaction payload
+    pub payload: Option<serde_json::Value>,
 }
 
 impl From<InvolvementItem> for Transaction {
@@ -37,12 +47,17 @@ impl From<InvolvementItem> for Transaction {
             tx_hash: item.tx_hash,
             timestamp_ms: item.timestamp_ms,
             kind: item.kind,
-            direction: item.direction,
             sender: item.sender,
             recipient: item.recipient,
             amount: item.amount,
             anchor_root: item.anchor_root,
             nullifier: item.nullifier,
+            view_fvks: item.view_fvks,
+            view_attestations: item.view_attestations,
+            events: item.events,
+            status: item.status,
+            encrypted_notes: item.encrypted_notes,
+            payload: item.payload,
         }
     }
 }

@@ -66,10 +66,21 @@ pub struct GetWalletAddressResult {
 // -----------------------------
 // Types for GetWalletBalance
 // -----------------------------
+
+/// Default gas token ID
+pub const DEFAULT_TOKEN_ID: &str = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetWalletBalanceRequest {
-    /// Token ID to query (as bech32 string, e.g., "token_1...")
+    /// Token ID to query (as bech32 string, e.g., "token_1...").
+    /// If not provided, defaults to the gas token (token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7).
+    #[serde(default = "default_token_id")]
+    #[schemars(default = "default_token_id")]
     pub token_id: String,
+}
+
+fn default_token_id() -> String {
+    DEFAULT_TOKEN_ID.to_string()
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -80,20 +91,56 @@ pub struct GetWalletBalanceResult {
 }
 
 // -----------------------------
-// Types for GetTransactionStatus
+// Types for GetTransaction
 // -----------------------------
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusRequest {
+pub struct GetTransactionRequest {
     /// Transaction hash ID (with or without 0x prefix)
     pub tx_hash: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusResult {
-    /// Transaction hash ID
-    pub id: String,
-    /// Transaction status (e.g., "pending", "confirmed", "failed")
+pub struct GetTransactionResult {
+    /// Transaction hash
+    pub tx_hash: String,
+    /// Transaction status (e.g., "Success", "Failed", or "pending" if not yet indexed)
     pub status: String,
+    /// Timestamp in milliseconds (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Sender address (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// Recipient address (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// Transaction amount (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    /// Anchor root for privacy transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_root: Option<String>,
+    /// Nullifier for privacy transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nullifier: Option<String>,
+    /// View Full Viewing Keys (FVKs) for note decryption
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_fvks: Option<serde_json::Value>,
+    /// View attestations for privacy proofs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_attestations: Option<serde_json::Value>,
+    /// Transaction events from the rollup
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<serde_json::Value>,
+    /// Encrypted notes for privacy transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_notes: Option<serde_json::Value>,
+    /// Full transaction payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 // -----------------------------
@@ -110,8 +157,6 @@ pub struct TransactionInfo {
     pub timestamp_ms: i64,
     /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
     pub kind: String,
-    /// Direction of involvement (e.g., "in", "out")
-    pub direction: String,
     /// Sender address (if available)
     pub sender: Option<String>,
     /// Recipient address (if available)
@@ -122,6 +167,24 @@ pub struct TransactionInfo {
     pub anchor_root: Option<String>,
     /// Nullifier for privacy transactions
     pub nullifier: Option<String>,
+    /// View Full Viewing Keys (FVKs) for note decryption
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_fvks: Option<serde_json::Value>,
+    /// View attestations for privacy proofs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_attestations: Option<serde_json::Value>,
+    /// Transaction events from the rollup
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<serde_json::Value>,
+    /// Transaction status (e.g., "Success", "Failed")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Encrypted notes for privacy transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_notes: Option<serde_json::Value>,
+    /// Full transaction payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -297,10 +360,11 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
     /// Get the balance of the wallet's default address for a given token ID.
+    /// If token_id is not provided, defaults to the gas token.
     /// Requires wallet context to be configured.
     #[tool(
         name = "walletBalance",
-        description = "Get the balance of the wallet's default address for a given token ID."
+        description = "Get the balance of the wallet's default address. Token ID is optional and defaults to the gas token."
     )]
     async fn wallet_balance(
         &self,
@@ -366,29 +430,42 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the status of a transaction by its ID.
+    /// Get full details of a transaction by its ID.
+    /// Retrieves complete transaction information from the indexer including status, kind, amounts, and privacy fields.
     #[tool(
-        name = "getTransactionStatus",
-        description = "Get the status of a transaction by its ID. Retrieves the current status of a specific transaction."
+        name = "getTransaction",
+        description = "Get transaction details by its ID. Retrieves complete transaction information including status, kind, amounts, and privacy-related fields."
     )]
-    async fn get_transaction_status(
+    async fn get_transaction(
         &self,
-        Parameters(params): Parameters<GetTransactionStatusRequest>,
+        Parameters(params): Parameters<GetTransactionRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
             )
         })?;
 
-        let tx_status = crate::operations::get_transaction_status(provider, &params.tx_hash)
+        let tx_details = crate::operations::get_transaction_status(provider, &params.tx_hash)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let result = GetTransactionStatusResult {
-            id: tx_status.id,
-            status: tx_status.status,
+        let result = GetTransactionResult {
+            tx_hash: tx_details.tx_hash,
+            status: tx_details.status,
+            timestamp_ms: tx_details.timestamp_ms,
+            kind: tx_details.kind,
+            sender: tx_details.sender,
+            recipient: tx_details.recipient,
+            amount: tx_details.amount,
+            anchor_root: tx_details.anchor_root,
+            nullifier: tx_details.nullifier,
+            view_fvks: tx_details.view_fvks,
+            view_attestations: tx_details.view_attestations,
+            events: tx_details.events,
+            encrypted_notes: tx_details.encrypted_notes,
+            payload: tx_details.payload,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -431,12 +508,17 @@ impl CryptoServer {
                 tx_hash: tx.tx_hash,
                 timestamp_ms: tx.timestamp_ms,
                 kind: tx.kind,
-                direction: tx.direction,
                 sender: tx.sender,
                 recipient: tx.recipient,
                 amount: tx.amount,
                 anchor_root: tx.anchor_root,
                 nullifier: tx.nullifier,
+                view_fvks: tx.view_fvks,
+                view_attestations: tx.view_attestations,
+                events: tx.events,
+                status: tx.status,
+                encrypted_notes: tx.encrypted_notes,
+                payload: tx.payload,
             })
             .collect();
 

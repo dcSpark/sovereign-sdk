@@ -240,9 +240,11 @@ mod tests {
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
         let verifier_url = std::env::var("VERIFIER_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let indexer_url = std::env::var("INDEXER_URL")
+            .unwrap_or_else(|_| "http://localhost:13100".to_string());
 
         tracing::info!("Connecting to rollup at: {}", rpc_url);
-        let provider = Provider::new(&rpc_url, &verifier_url)
+        let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url)
             .await
             .expect("Failed to connect to rollup");
 

@@ -22,8 +22,10 @@ pub async fn is_rollup_available() -> bool {
         std::env::var("ROLLUP_RPC_URL").unwrap_or_else(|_| "http://localhost:12346".to_string());
     let verifier_url =
         std::env::var("VERIFIER_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let indexer_url =
+        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
 
-    match Provider::new(&rpc_url, &verifier_url).await {
+    match Provider::new(&rpc_url, &verifier_url, &indexer_url).await {
         Ok(provider) => provider.is_healthy().await,
         Err(_) => false,
     }
