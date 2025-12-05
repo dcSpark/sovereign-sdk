@@ -10,6 +10,7 @@ use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
+    EncryptedNote,
 };
 use num_cpus;
 use serde_json::Value as JsonValue;
@@ -26,6 +27,7 @@ use tokio::time::sleep;
 
 use crate::{
     find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
+    load_authority_fvk, make_viewer_bundle,
 };
 use sov_rollup_ligero::MockDemoRollup;
 
@@ -53,6 +55,9 @@ pub struct RunnerConfig {
     pub defer_sequencer_submission: bool,
     /// Optional delay (ms) between submitting transfer requests to the verifier to avoid OS/socket overloads.
     pub transfer_submit_delay_ms: u64,
+    /// Authority Full Viewing Key for Level-B compliance (32-byte hex from AUTHORITY_FVK env var).
+    /// When set, transfer proofs will include viewer attestations and txs will include encrypted notes.
+    pub authority_fvk: Option<Hash32>,
 }
 
 impl Default for RunnerConfig {
@@ -67,6 +72,7 @@ impl Default for RunnerConfig {
             max_concurrent_proofs: num_cpus::get(),
             defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
+            authority_fvk: None,
         }
     }
 }
@@ -107,6 +113,8 @@ impl RunnerConfig {
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
+        // Load authority viewing key for Level-B compliance
+        cfg.authority_fvk = load_authority_fvk();
         cfg
     }
 }
@@ -321,6 +329,17 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     anyhow::ensure!(chain_hash_vec.len() == 32, "chain_hash must be 32 bytes");
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
+
+    // Log authority viewing key status
+    let authority_fvk = config.authority_fvk;
+    if let Some(ref fvk) = authority_fvk {
+        eprintln!(
+            "[config] AUTHORITY_FVK set: Level-B viewing attestations ENABLED (fvk={}...)",
+            hex::encode(&fvk[..8])
+        );
+    } else {
+        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+    }
 
     // Use the method_id we already computed when starting the node
     let method_id = method_id_for_node;
@@ -1281,18 +1300,20 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let anchor = shared_anchor;
         let sem = semaphore.clone();
         let program_path_for_host = program_path_for_host.clone();
+        let authority_fvk = authority_fvk; // Option<Hash32>, Copy
         proof_tasks.push(tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
                 eprintln!(
-                    "  [proof] gen_proof idx={} account={} pos={} value={} sib_len={} anchor={}",
+                    "  [proof] gen_proof idx={} account={} pos={} value={} sib_len={} anchor={} viewer={}",
                     i,
                     account_idx,
                     position,
                     value,
                     siblings.len(),
-                    hex::encode(anchor)
+                    hex::encode(anchor),
+                    authority_fvk.is_some()
                 );
                 // Transfer to self: one input → one output (same value)
                 // Keep the same value (no splitting)
@@ -1303,20 +1324,34 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 out_recipient[0] = (i as u8).wrapping_add(101); // Different recipient for output note
                 let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
 
-                // Public output
+                // Compute nullifier
                 let nf = nullifier(&domain, &nf_key, &rho);
+
+                // Build viewer attestation if authority FVK is set
+                // sender_id = recipient (the input note's owner / spender's address)
+                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
+                    let (att, _enc) = make_viewer_bundle(
+                        &fvk, &domain, out_value, &out_rho, &out_recipient, &recipient, &cm_out,
+                    );
+                    (Some(vec![att.clone()]), Some((fvk, att)))
+                } else {
+                    (None, None)
+                };
+
+                // Public output with view_attestations populated
                 let public = midnight_privacy::SpendPublic {
                     anchor_root: anchor,
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
-                    view_attestations: None,
+                    view_attestations,
                 };
 
                 // Private indices for 1 output (match guest ABI)
                 // Arguments: 0:domain 1:value 2:rho 3:recipient 4:nf_key 5:pos 6:depth 7..7+depth:siblings
                 //            7+depth:anchor 8+depth:nf 9+depth:withdraw 10+depth:n_out
                 //            11+depth..:outputs
+                let n_out: usize = 1;
                 let mut private_indices = vec![2, 3, 4, 5, 6]; // rho, recipient, nf_key, pos, depth
                 for j in 0..depth_usize {
                     private_indices.push(7 + j); // siblings
@@ -1331,10 +1366,22 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                                   // skip out_base + 3 (cm is public)
                 ]);
 
+                // Viewer section: fvk is private
+                if viewer_data.is_some() {
+                    // After outputs: base index for m_viewers
+                    // Layout: 12 + depth + 4*n_out = base_after_outs
+                    // Then: m_viewers, then per viewer: fvk_commit(public), fvk(private), (ct_hash, mac)*n_out
+                    let base_after_outs = 12 + depth_usize + 4 * n_out;
+                    // m_viewers is at base_after_outs, fvk_commit at +1, fvk at +2
+                    let fvk_arg_index = base_after_outs + 2; // fvk itself is private
+                    private_indices.push(fvk_arg_index);
+                }
+
                 let program_path = program_path_for_host.as_ref().clone();
                 let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                     .with_private_indices(private_indices);
 
+                // Base args (same as before)
                 host.add_hex_arg(hex::encode(domain));
                 host.add_str_arg(value.to_string());
                 host.add_hex_arg(hex::encode(rho));
@@ -1349,22 +1396,39 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 host.add_hex_arg(hex::encode(nf));
                 host.add_str_arg("0".to_string()); // withdraw_amount
                 host.add_str_arg("1".to_string()); // ONE output
+
+                // Output 0
                 host.add_str_arg(out_value.to_string());
                 host.add_hex_arg(hex::encode(out_rho));
                 host.add_hex_arg(hex::encode(out_recipient));
                 host.add_hex_arg(hex::encode(cm_out));
+
+                // Viewer section (Level-B) - add viewer args if authority FVK is set
+                if let Some((fvk, att)) = viewer_data {
+                    // m_viewers
+                    host.add_str_arg("1".to_string());
+                    // public fvk_commitment
+                    host.add_hex_arg(hex::encode(att.fvk_commitment));
+                    // private fvk
+                    host.add_hex_arg(hex::encode(fvk));
+                    // per-output (only j=0 here): ct_hash, mac
+                    host.add_hex_arg(hex::encode(att.ct_hash));
+                    host.add_hex_arg(hex::encode(att.mac));
+                }
+
                 host.set_public_output(&public)
                     .context("set public output")?;
                 let proof_data = host.run(true).context("generate transfer proof")?;
                 eprintln!(
-                "  [proof] gen_proof ok idx={} account={} pos={} bytes={} nullifier={} out_cm={}",
-                i,
-                account_idx,
-                position,
-                proof_data.len(),
-                hex::encode(nf),
-                hex::encode(cm_out)
-            );
+                    "  [proof] gen_proof ok idx={} account={} pos={} bytes={} nullifier={} out_cm={} viewer={}",
+                    i,
+                    account_idx,
+                    position,
+                    proof_data.len(),
+                    hex::encode(nf),
+                    hex::encode(cm_out),
+                    authority_fvk.is_some()
+                );
                 Ok((account_idx, proof_data))
             })
             .await
@@ -1511,13 +1575,32 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             1u64
         };
 
+        // Same nullifier as before
         let nf = nullifier(&domain, &nf_key, &input.rho);
+
+        // Reconstruct the *same* output note layout used in the proof
+        let out_value = input.value;
+        let mut out_rho = [0u8; 32];
+        out_rho[0] = (i as u8).wrapping_add(100);
+        let mut out_recipient = [0u8; 32];
+        out_recipient[0] = (i as u8).wrapping_add(101);
+        let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+
+        // Build EncryptedNote for the authority, if configured
+        // sender_id = input.recipient (the spender's address)
+        let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
+            let (_att, enc) = make_viewer_bundle(
+                &fvk, &domain, out_value, &out_rho, &out_recipient, &input.recipient, &cm_out,
+            );
+            vec![enc]
+        });
+
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
             proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
             nullifier: nf,
-            view_ciphertexts: None,
+            view_ciphertexts,
             gas: None,
         });
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
@@ -1535,12 +1618,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let tx_hash = tx.hash().to_string();
         transfer_txs_b64.push(BASE64_STANDARD.encode(&tx_bytes));
         eprintln!(
-            "  [transfers] transfer #{} from account={} nonce={} tx={} nullifier={}",
+            "  [transfers] transfer #{} from account={} nonce={} tx={} nullifier={} viewer={}",
             i + 1,
             account_idx,
             transfer_nonce,
             tx_hash,
-            hex::encode(&nf[..8])
+            hex::encode(&nf[..8]),
+            authority_fvk.is_some()
         );
     }
 

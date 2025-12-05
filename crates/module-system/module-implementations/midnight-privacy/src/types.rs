@@ -4,8 +4,172 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sov_modules_api::macros::UniversalWallet;
+use std::fmt;
+use std::str::FromStr;
 
 use crate::hash::Hash32;
+
+/// Human-readable prefix for privacy pool addresses
+pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
+
+/// A privacy pool address (bech32m-encoded public key).
+/// 
+/// This is the user-facing format for privacy recipients. The inner value is
+/// a 32-byte public key (`pk_out`) which is used to derive the actual recipient:
+/// `recipient = H("ADDR_V1" || domain || pk_out)`
+/// 
+/// Format: `privpool1<bech32m-encoded-32-bytes>`
+/// 
+/// # Example
+/// ```ignore
+/// let addr = PrivacyAddress::from_pk(&pk);
+/// println!("Send to: {}", addr); // privpool1qypqxpq9qcrsszg2pvxq6rs...
+/// 
+/// // Parse from string
+/// let addr: PrivacyAddress = "privpool1qypqxpq9qcrsszg2pvxq6rs...".parse()?;
+/// let pk = addr.to_pk();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PrivacyAddress(pub [u8; 32]);
+
+impl PrivacyAddress {
+    /// Create a PrivacyAddress from a 32-byte public key
+    pub fn from_pk(pk: &Hash32) -> Self {
+        Self(*pk)
+    }
+
+    /// Get the underlying 32-byte public key
+    pub fn to_pk(&self) -> Hash32 {
+        self.0
+    }
+
+    /// Get reference to the underlying bytes
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for PrivacyAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use bech32::{Bech32m, Hrp};
+        let hrp = Hrp::parse(PRIVACY_ADDRESS_HRP).expect("valid HRP");
+        let encoded = bech32::encode::<Bech32m>(hrp, &self.0).expect("encoding succeeds");
+        write!(f, "{}", encoded)
+    }
+}
+
+impl FromStr for PrivacyAddress {
+    type Err = PrivacyAddressError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use bech32::{Bech32m, Hrp};
+        
+        let (hrp, data) = bech32::decode(s)
+            .map_err(|e| PrivacyAddressError::InvalidBech32(e.to_string()))?;
+        
+        let expected_hrp = Hrp::parse(PRIVACY_ADDRESS_HRP).expect("valid HRP");
+        if hrp != expected_hrp {
+            return Err(PrivacyAddressError::WrongPrefix {
+                expected: PRIVACY_ADDRESS_HRP.to_string(),
+                got: hrp.to_string(),
+            });
+        }
+        
+        // Verify it's bech32m (not bech32)
+        // Re-encode to check variant
+        let _: String = bech32::encode::<Bech32m>(hrp, &data)
+            .map_err(|_| PrivacyAddressError::NotBech32m)?;
+        
+        if data.len() != 32 {
+            return Err(PrivacyAddressError::WrongLength {
+                expected: 32,
+                got: data.len(),
+            });
+        }
+        
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&data);
+        Ok(PrivacyAddress(pk))
+    }
+}
+
+impl Serialize for PrivacyAddress {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for PrivacyAddress {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for PrivacyAddress {
+    fn schema_name() -> String {
+        "PrivacyAddress".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::String.into());
+        obj.string = Some(Box::new(StringValidation {
+            pattern: Some(format!("^{}1[a-z0-9]+$", PRIVACY_ADDRESS_HRP)),
+            ..Default::default()
+        }));
+
+        Schema::Object(obj)
+    }
+}
+
+/// Error type for privacy address parsing
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivacyAddressError {
+    /// Invalid bech32 encoding
+    InvalidBech32(String),
+    /// Wrong human-readable prefix
+    WrongPrefix {
+        /// Expected prefix
+        expected: String,
+        /// Actual prefix found
+        got: String,
+    },
+    /// Wrong data length
+    WrongLength {
+        /// Expected byte length
+        expected: usize,
+        /// Actual byte length
+        got: usize,
+    },
+    /// Not bech32m variant
+    NotBech32m,
+}
+
+impl fmt::Display for PrivacyAddressError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBech32(e) => write!(f, "invalid bech32: {}", e),
+            Self::WrongPrefix { expected, got } => {
+                write!(f, "wrong prefix: expected '{}', got '{}'", expected, got)
+            }
+            Self::WrongLength { expected, got } => {
+                write!(f, "wrong length: expected {} bytes, got {}", expected, got)
+            }
+            Self::NotBech32m => write!(f, "not bech32m variant (use bech32m, not bech32)"),
+        }
+    }
+}
+
+impl std::error::Error for PrivacyAddressError {}
 
 /// Public data "committed" by the proof package (journal).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -24,6 +188,7 @@ pub struct SpendPublic {
 
 /// A single viewer attestation binding (output_cm, viewer_fvk_commitment, ct_hash, mac).
 /// The guest produces these inside the circuit; the module verifies them on-chain.
+/// Note: This struct is used internally for verification. Events use the lighter `ViewerBinding`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct ViewAttestation {
     /// Output commitment this attestation is bound to

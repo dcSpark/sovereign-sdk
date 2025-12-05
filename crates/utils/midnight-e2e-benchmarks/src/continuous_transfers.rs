@@ -15,6 +15,7 @@ use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
+    EncryptedNote,
 };
 use rand::Rng;
 use reqwest::Client as HttpClient;
@@ -37,7 +38,7 @@ use toml::Value as TomlValue;
 
 use crate::{
     find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
-    LigeroEnv,
+    LigeroEnv, load_authority_fvk, make_viewer_bundle,
 };
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
@@ -63,6 +64,9 @@ struct ContinuousConfig {
     detailed_wallet_logs: bool,
     continuous: bool,
     managed_mode: bool,
+    /// Authority Full Viewing Key for Level-B compliance.
+    /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
+    authority_fvk: Option<Hash32>,
 }
 
 impl ContinuousConfig {
@@ -114,6 +118,9 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // Load authority viewing key for Level-B compliance
+        let authority_fvk = load_authority_fvk();
+
         Ok(Self {
             num_wallets,
             initial_deposit,
@@ -125,6 +132,7 @@ impl ContinuousConfig {
             detailed_wallet_logs,
             continuous,
             managed_mode,
+            authority_fvk,
         })
     }
 }
@@ -510,6 +518,14 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
+    if let Some(ref fvk) = config.authority_fvk {
+        eprintln!(
+            "[config] AUTHORITY_FVK set: Level-B viewing attestations ENABLED (fvk={}...)",
+            hex::encode(&fvk[..8])
+        );
+    } else {
+        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+    }
 
     // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
     let ligero_env = setup_ligero_env()?;
@@ -1289,6 +1305,7 @@ async fn perform_transfer_cycle(
     ));
     let mut proof_tasks = Vec::with_capacity(inputs.len());
 
+    let authority_fvk = config.authority_fvk;
     for input in inputs.iter() {
         let account_idx = input.wallet_idx;
         let value = input.value;
@@ -1299,6 +1316,7 @@ async fn perform_transfer_cycle(
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
+        let authority_fvk = authority_fvk; // Copy for closure
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
@@ -1308,20 +1326,40 @@ async fn perform_transfer_cycle(
                 let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
                 let nf = nullifier(&DOMAIN, &NF_KEY, &in_rho);
+
+                // Build viewer attestation if authority FVK is set
+                // sender_id = in_recipient (the spender's address)
+                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
+                    let (att, _enc) = make_viewer_bundle(
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &in_recipient, &cm_out,
+                    );
+                    (Some(vec![att.clone()]), Some((fvk, att)))
+                } else {
+                    (None, None)
+                };
+
                 let public = SpendPublic {
                     anchor_root: anchor,
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out],
-                    view_attestations: None,
+                    view_attestations,
                 };
 
+                let n_out: usize = 1;
                 let mut private_indices = vec![2, 3, 4, 5, 6];
                 for j in 0..depth_usize {
                     private_indices.push(7 + j);
                 }
                 let out_base = 11 + depth_usize;
                 private_indices.extend_from_slice(&[out_base + 0, out_base + 1, out_base + 2]);
+
+                // Viewer section: fvk is private
+                if viewer_data.is_some() {
+                    let base_after_outs = 12 + depth_usize + 4 * n_out;
+                    let fvk_arg_index = base_after_outs + 2;
+                    private_indices.push(fvk_arg_index);
+                }
 
                 let mut host =
                     <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
@@ -1345,6 +1383,16 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode(out_rho));
                 host.add_hex_arg(hex::encode(out_recipient));
                 host.add_hex_arg(hex::encode(cm_out));
+
+                // Viewer section (Level-B)
+                if let Some((fvk, att)) = viewer_data {
+                    host.add_str_arg("1".to_string()); // m_viewers
+                    host.add_hex_arg(hex::encode(att.fvk_commitment));
+                    host.add_hex_arg(hex::encode(fvk));
+                    host.add_hex_arg(hex::encode(att.ct_hash));
+                    host.add_hex_arg(hex::encode(att.mac));
+                }
+
                 host.set_public_output(&public)
                     .context("set public output (round 2)")?;
 
@@ -1404,15 +1452,28 @@ async fn perform_transfer_cycle(
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;
+        let authority_fvk = authority_fvk; // Copy for closure
+        let value = wallet.value; // The output value (same as input for pure transfer)
         build_tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<BuiltTransfer> {
             let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
+
+            // Build encrypted note for authority if configured
+            // sender_id = wallet.recipient (the spender's address)
+            let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
+                let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
+                let (_att, enc) = make_viewer_bundle(
+                    &fvk, &DOMAIN, value, &out_rho, &out_recipient, &wallet.recipient, &cm_out,
+                );
+                vec![enc]
+            });
+
             let call =
                 RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
                     proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
                         .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                     anchor_root,
                     nullifier: nf,
-                    view_ciphertexts: None,
+                    view_ciphertexts,
                     gas: None,
                 });
 

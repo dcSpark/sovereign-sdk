@@ -39,15 +39,13 @@ pub struct Model {
     /// JSON representation of the transaction call message with proof replaced by "REMOVED".
     #[sea_orm(column_type = "Text")]
     pub transaction_data: String,
-    /// JSON-serialized proof outputs (e.g., anchor_root, nullifier, withdraw_amount).
+    /// JSON-serialized proof outputs (e.g., anchor_root, nullifier, withdraw_amount, view_attestations).
     #[sea_orm(column_type = "Text")]
     pub proof_outputs: String,
-    /// JSON-serialized Full Viewing Keys attached to a deposit (if any).
+    /// JSON-serialized encrypted notes (EncryptedNote array) for Level-B viewing.
+    /// Stored separately for easy access by compliance/authority viewers.
     #[sea_orm(column_type = "Text", nullable)]
-    pub view_fvks_json: Option<String>,
-    /// JSON-serialized viewer attestations from the proof (if any).
-    #[sea_orm(column_type = "Text", nullable)]
-    pub view_attestations_json: Option<String>,
+    pub encrypted_notes_json: Option<String>,
     /// Borsh-serialized public key (hex string) - for pre-authenticated path
     #[sea_orm(column_type = "Text", nullable)]
     pub pub_key_hex: Option<String>,

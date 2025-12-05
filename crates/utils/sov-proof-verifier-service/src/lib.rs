@@ -761,6 +761,7 @@ async fn verify_and_record_midnight_handler(
                 &transaction_data,
                 &req.body,
                 pre_auth_data,
+                None, // Deposits don't have encrypted notes (they use view_fvks instead)
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -854,14 +855,16 @@ async fn verify_and_record_midnight_handler(
                 &transaction_data,
                 &req.body,
                 pre_auth_data,
+                view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             debug!(
-                "✓ Stored verified midnight transfer: nullifier=0x{}, anchor_root=0x{}, hash={}",
+                "✓ Stored verified midnight transfer: nullifier=0x{}, anchor_root=0x{}, hash={}, encrypted_notes={}",
                 hex::encode(nullifier),
                 hex::encode(anchor_root),
-                tx_hash
+                tx_hash,
+                view_ciphertexts.as_ref().map(|v| v.len()).unwrap_or(0)
             );
 
             if state.config.defer_sequencer_submission {
@@ -947,16 +950,18 @@ async fn verify_and_record_midnight_handler(
                 &transaction_data,
                 &req.body,
                 pre_auth_data,
+                view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             debug!(
-                "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}",
+                "✓ Stored verified midnight withdrawal: nullifier=0x{}, anchor_root=0x{}, withdraw_amount={}, to={:?}, hash={}, encrypted_notes={}",
                 hex::encode(nullifier),
                 hex::encode(anchor_root),
                 withdraw_amount,
                 to,
-                tx_hash
+                tx_hash,
+                view_ciphertexts.as_ref().map(|v| v.len()).unwrap_or(0)
             );
 
             if state.config.defer_sequencer_submission {
@@ -1719,6 +1724,7 @@ pub async fn store_verified_midnight_transaction(
     transaction_data: &str,
     full_transaction_blob: &str,
     pre_auth_data: Option<(String, String, String, String, String, String)>,
+    encrypted_notes: Option<&Vec<EncryptedNote>>,
 ) -> Result<(), ServiceError> {
     use worker_verified_transactions::{
         ActiveModel as VerifiedActiveModel, Column as VerifiedColumn, Entity as VerifiedEntity,
@@ -1766,23 +1772,14 @@ pub async fn store_verified_midnight_transaction(
         "{}".to_string()
     };
 
-    // Extract optional viewing data
-    let view_attestations_json = proof_output
-        .and_then(|p| p.view_attestations.as_ref())
-        .map(|atts| {
-            serde_json::to_string(atts).map_err(|err| {
-                ServiceError::Internal(format!("Failed to serialize view_attestations: {err}"))
+    // Serialize encrypted notes to JSON for Level-B viewing access
+    let encrypted_notes_json = encrypted_notes
+        .map(|notes| {
+            serde_json::to_string(notes).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize encrypted notes: {err}"))
             })
         })
         .transpose()?;
-    let view_fvks_json = (|| -> Option<Result<String, ServiceError>> {
-        let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;
-        let fvks = v.get("deposit")?.get("view_fvks")?.clone();
-        Some(serde_json::to_string(&fvks).map_err(|err| {
-            ServiceError::Internal(format!("Failed to serialize view_fvks: {err}"))
-        }))
-    })()
-    .transpose()?;
 
     // Extract pre-authenticated data if available
     let (pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64) = match pre_auth_data {
@@ -1817,8 +1814,7 @@ pub async fn store_verified_midnight_transaction(
         proof_verified: Set(proof_verified),
         transaction_data: Set(transaction_data.to_owned()),
         proof_outputs: Set(proof_outputs_json),
-        view_fvks_json: Set(view_fvks_json),
-        view_attestations_json: Set(view_attestations_json),
+        encrypted_notes_json: Set(encrypted_notes_json),
         pub_key_hex,
         signature_hex,
         uniqueness_hex,
@@ -1839,8 +1835,7 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::ProofVerified,
                 VerifiedColumn::TransactionData,
                 VerifiedColumn::ProofOutputs,
-                VerifiedColumn::ViewFvksJson,
-                VerifiedColumn::ViewAttestationsJson,
+                VerifiedColumn::EncryptedNotesJson,
                 VerifiedColumn::PubKeyHex,
                 VerifiedColumn::SignatureHex,
                 VerifiedColumn::UniquenessHex,
