@@ -1,17 +1,17 @@
-use crate::index_db as idx;
-use anyhow::Result;
-use chrono::{DateTime, Utc};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine as _;
-use sea_orm::{
-    entity::prelude::*, sea_query::OnConflict, Condition, DatabaseConnection, JsonValue, QueryOrder,
-    QuerySelect, Schema, Set,
-};
-use serde::{Deserialize, Serialize};
-use sov_midnight_da::storable::worker_verified_transactions;
 use crate::background_sync::{
     parse_kind_amount_roots, parse_withdraw_attestations, parse_withdraw_recipient,
 };
+use crate::index_db as idx;
+use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use chrono::{DateTime, Utc};
+use sea_orm::{
+    entity::prelude::*, sea_query::OnConflict, Condition, DatabaseConnection, JsonValue,
+    QueryOrder, QuerySelect, Schema, Set,
+};
+use serde::{Deserialize, Serialize};
+use sov_midnight_da::storable::worker_verified_transactions;
 
 pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     let builder = idx_db.get_database_backend();
@@ -492,4 +492,297 @@ pub async fn list_wallet_txs_direct(
         items: collected,
         next,
     })
+}
+
+pub async fn list_txs(
+    db: &DatabaseConnection,
+    mode: crate::api::Mode,
+    limit: usize,
+    offset: usize,
+) -> Result<ListResponse> {
+    if mode == crate::api::Mode::Direct {
+        let rows = worker_verified_transactions::Entity::find()
+            .order_by_desc(worker_verified_transactions::Column::CreatedAt)
+            .offset(offset as u64)
+            .limit(limit as u64)
+            .all(db)
+            .await?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(
+                &row.transaction_data,
+            )
+            .unwrap_or(("other".to_string(), None, None, None));
+            let view_fvks = row
+                .view_fvks_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            let view_attestations = row
+                .view_attestations_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .or_else(|| {
+                    parse_withdraw_attestations(&row.proof_outputs)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                });
+            let recipient = if kind == "withdraw" {
+                row.recipient.clone().or_else(|| {
+                    parse_withdraw_recipient(&row.transaction_data)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            let events = extract_events_from_status(row.sequencer_status.as_deref())
+                .ok()
+                .flatten();
+            let status = extract_status_from_status(row.sequencer_status.as_deref());
+            let encrypted_notes = row
+                .encrypted_notes_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+            items.push(InvolvementItem {
+                tx_hash: row.tx_hash.clone(),
+                timestamp_ms: row.created_at.timestamp_millis(),
+                kind,
+                sender: Some(row.sender.clone()),
+                recipient,
+                amount,
+                anchor_root,
+                nullifier,
+                view_fvks,
+                view_attestations,
+                events,
+                status,
+                encrypted_notes,
+                payload: serde_json::from_str(&row.transaction_data).ok(),
+            });
+        }
+        return Ok(ListResponse { items, next: None });
+    }
+
+    // Sync mode
+    let rows = idx::Entity::find()
+        .order_by_desc(idx::Column::CreatedAt)
+        .offset(offset as u64)
+        .limit(limit as u64)
+        .all(db)
+        .await?;
+    let mut items = Vec::new();
+    for ev in rows {
+        let mut sender = None;
+        let mut recipient = None;
+        let mut amount = None;
+        let mut anchor_root = None;
+        let mut nullifier = None;
+        let mut view_fvks = None;
+        let mut view_attestations = None;
+        let mut encrypted_notes = None;
+        match ev.kind.as_str() {
+            "deposit" => {
+                if let Some(md) = idx::midnight_deposit::Entity::find_by_id(ev.id)
+                    .one(db)
+                    .await?
+                {
+                    sender = md.sender;
+                    amount = md.amount;
+                    view_fvks = md.view_fvks;
+                    encrypted_notes = md.encrypted_notes;
+                }
+            }
+            "withdraw" => {
+                if let Some(mw) = idx::midnight_withdraw::Entity::find_by_id(ev.id)
+                    .one(db)
+                    .await?
+                {
+                    sender = mw.sender;
+                    recipient = mw.to_addr;
+                    amount = mw.amount;
+                    anchor_root = mw.anchor_root;
+                    nullifier = mw.nullifier;
+                    view_attestations = mw.view_attestations;
+                    encrypted_notes = mw.encrypted_notes;
+                }
+            }
+            "transfer" => {
+                if let Some(mt) = idx::midnight_transfer::Entity::find_by_id(ev.id)
+                    .one(db)
+                    .await?
+                {
+                    sender = mt.sender;
+                    anchor_root = mt.anchor_root;
+                    nullifier = mt.nullifier;
+                    view_attestations = mt.view_attestations;
+                    encrypted_notes = mt.encrypted_notes;
+                }
+            }
+            _ => {}
+        }
+
+        items.push(InvolvementItem {
+            tx_hash: ev.tx_hash.clone(),
+            timestamp_ms: ev.created_at.timestamp_millis(),
+            kind: ev.kind.clone(),
+            sender,
+            recipient,
+            amount,
+            anchor_root,
+            nullifier,
+            view_fvks,
+            view_attestations,
+            events: ev.events.clone(),
+            status: ev.status.clone(),
+            encrypted_notes,
+            payload: serde_json::from_str(&ev.payload).ok(),
+        });
+    }
+    Ok(ListResponse { items, next: None })
+}
+
+pub async fn get_tx(
+    db: &DatabaseConnection,
+    mode: crate::api::Mode,
+    tx_hash: &str,
+) -> Result<Option<InvolvementItem>> {
+    if mode == crate::api::Mode::Direct {
+        let row = worker_verified_transactions::Entity::find()
+            .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.to_string()))
+            .one(db)
+            .await?;
+        if let Some(row) = row {
+            let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(
+                &row.transaction_data,
+            )
+            .unwrap_or(("other".to_string(), None, None, None));
+            let view_fvks = row
+                .view_fvks_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            let view_attestations = row
+                .view_attestations_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .or_else(|| {
+                    parse_withdraw_attestations(&row.proof_outputs)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                });
+            let recipient = if kind == "withdraw" {
+                row.recipient.clone().or_else(|| {
+                    parse_withdraw_recipient(&row.transaction_data)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            let events = extract_events_from_status(row.sequencer_status.as_deref())
+                .ok()
+                .flatten();
+            let status = extract_status_from_status(row.sequencer_status.as_deref());
+            let encrypted_notes = row
+                .encrypted_notes_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+            return Ok(Some(InvolvementItem {
+                tx_hash: row.tx_hash.clone(),
+                timestamp_ms: row.created_at.timestamp_millis(),
+                kind,
+                sender: Some(row.sender.clone()),
+                recipient,
+                amount,
+                anchor_root,
+                nullifier,
+                view_fvks,
+                view_attestations,
+                events,
+                status,
+                encrypted_notes,
+                payload: serde_json::from_str(&row.transaction_data).ok(),
+            }));
+        }
+        return Ok(None);
+    }
+
+    // Sync mode: look up by tx_hash in events then related tables
+    let ev = idx::Entity::find()
+        .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
+        .one(db)
+        .await?;
+    let Some(ev) = ev else {
+        return Ok(None);
+    };
+
+    let mut sender = None;
+    let mut recipient = None;
+    let mut amount = None;
+    let mut anchor_root = None;
+    let mut nullifier = None;
+    let mut view_fvks = None;
+    let mut view_attestations = None;
+    let mut encrypted_notes = None;
+
+    match ev.kind.as_str() {
+        "deposit" => {
+            if let Some(md) = idx::midnight_deposit::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = md.sender;
+                amount = md.amount;
+                view_fvks = md.view_fvks;
+                encrypted_notes = md.encrypted_notes;
+            }
+        }
+        "withdraw" => {
+            if let Some(mw) = idx::midnight_withdraw::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = mw.sender;
+                recipient = mw.to_addr;
+                amount = mw.amount;
+                anchor_root = mw.anchor_root;
+                nullifier = mw.nullifier;
+                view_attestations = mw.view_attestations;
+                encrypted_notes = mw.encrypted_notes;
+            }
+        }
+        "transfer" => {
+            if let Some(mt) = idx::midnight_transfer::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = mt.sender;
+                anchor_root = mt.anchor_root;
+                nullifier = mt.nullifier;
+                view_attestations = mt.view_attestations;
+                encrypted_notes = mt.encrypted_notes;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(Some(InvolvementItem {
+        tx_hash: ev.tx_hash.clone(),
+        timestamp_ms: ev.created_at.timestamp_millis(),
+        kind: ev.kind.clone(),
+        sender,
+        recipient,
+        amount,
+        anchor_root,
+        nullifier,
+        view_fvks,
+        view_attestations,
+        events: ev.events.clone(),
+        status: ev.status.clone(),
+        encrypted_notes,
+        payload: serde_json::from_str(&ev.payload).ok(),
+    }))
 }
