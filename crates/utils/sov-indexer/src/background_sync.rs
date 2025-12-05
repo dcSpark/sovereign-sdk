@@ -54,7 +54,6 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 view_fvks,
             )
             .await?;
-            db::insert_involvement(idx, event_id, &sender, "sender", "out").await?;
         } else if kind == "withdraw" {
             // Prefer recipient stored by worker; fallback to parsing
             let recipient = row.recipient.clone().or_else(|| {
@@ -97,8 +96,6 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                     view_att,
                 )
                 .await?;
-                db::insert_involvement(idx, event_id, &recipient, "recipient", "in").await?;
-                db::insert_involvement(idx, event_id, &row.sender, "sender", "out").await?;
             }
         } else if kind == "transfer" {
             let ev_json = extract_events(row.sequencer_status.as_deref())
@@ -133,7 +130,6 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 view_att,
             )
             .await?;
-            db::insert_involvement(idx, event_id, &row.sender, "sender", "out").await?;
         }
     }
     db::set_last_processed_id(idx, cur).await?;

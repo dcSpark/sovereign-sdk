@@ -17,44 +17,9 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(has_many = "super::index_db::involvement::Entity")]
-    Involvement,
-}
+pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
-
-pub mod involvement {
-    use super::*;
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-    #[sea_orm(table_name = "involvement")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = true, column_type = "Integer")]
-        pub id: i32,
-        pub event_id: i32,
-        pub address: String,
-        pub role: String,
-        pub direction: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {
-        #[sea_orm(
-            belongs_to = "super::Entity",
-            from = "Column::EventId",
-            to = "super::Column::Id"
-        )]
-        Events,
-    }
-
-    impl Related<super::Entity> for Entity {
-        fn to() -> RelationDef {
-            Relation::Events.def()
-        }
-    }
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
 
 pub mod midnight_deposit {
     use super::*;

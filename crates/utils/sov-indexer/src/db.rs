@@ -3,7 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Index, IndexCreateStatement, OnConflict},
+    sea_query::OnConflict,
     DatabaseConnection, JsonValue, Schema, Set,
 };
 
@@ -13,13 +13,6 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     let stmt = builder.build(
         &schema
             .create_table_from_entity(idx::Entity)
-            .if_not_exists()
-            .to_owned(),
-    );
-    idx_db.execute(stmt).await?;
-    let stmt = builder.build(
-        &schema
-            .create_table_from_entity(idx::involvement::Entity)
             .if_not_exists()
             .to_owned(),
     );
@@ -52,13 +45,6 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
-    let inv_idx: IndexCreateStatement = Index::create()
-        .name("idx_involvement_address")
-        .table(idx::involvement::Entity)
-        .col(idx::involvement::Column::Address)
-        .if_not_exists()
-        .to_owned();
-    idx_db.execute(builder.build(&inv_idx)).await?;
     Ok(())
 }
 
@@ -111,25 +97,6 @@ pub async fn insert_event(
     .exec(idx_db)
     .await?;
     Ok(res.last_insert_id)
-}
-
-pub async fn insert_involvement(
-    idx_db: &DatabaseConnection,
-    event_id: i32,
-    address: &str,
-    role: &str,
-    direction: &str,
-) -> Result<()> {
-    let _ = idx::involvement::Entity::insert(idx::involvement::ActiveModel {
-        event_id: Set(event_id),
-        address: Set(address.to_string()),
-        role: Set(role.to_string()),
-        direction: Set(direction.to_string()),
-        ..Default::default()
-    })
-    .exec(idx_db)
-    .await?;
-    Ok(())
 }
 
 pub async fn insert_midnight_deposit(
