@@ -84,7 +84,7 @@ pub fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
     poseidon2_hash(b"VIEW_MAC_V1", &[k, cm, ct_h])
 }
 
-/// Deterministic serialization of a Note plaintext:
+/// Deterministic serialization of a Note plaintext (deposit format):
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) ] => 112 bytes
 fn encode_note_bytes(note: &Note) -> Vec<u8> {
     let mut pt = Vec::with_capacity(112);
@@ -95,10 +95,28 @@ fn encode_note_bytes(note: &Note) -> Vec<u8> {
     pt
 }
 
-/// Deserialize Note from 112-byte plaintext
+/// Deterministic serialization of a Note plaintext with sender_id (transfer format):
+/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
+fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Vec<u8> {
+    let mut pt = Vec::with_capacity(144);
+    pt.extend_from_slice(&note.domain);
+    pt.extend_from_slice(&note.value.to_le_bytes());
+    pt.extend_from_slice(&note.rho);
+    pt.extend_from_slice(&note.recipient);
+    pt.extend_from_slice(sender_id);
+    pt
+}
+
+/// Deserialize Note from plaintext.
+/// 
+/// Supports two formats:
+/// - 112 bytes: Deposit notes [domain(32) | value(16) | rho(32) | recipient(32)]
+/// - 144 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
+/// 
+/// For 144-byte format, sender_id is ignored when returning Note (use decode_note_with_sender for full data).
 fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
-    if pt.len() != 112 {
-        return Err(anyhow!("invalid note plaintext length: {}", pt.len()));
+    if pt.len() != 112 && pt.len() != 144 {
+        return Err(anyhow!("invalid note plaintext length: {} (expected 112 or 144)", pt.len()));
     }
     let mut domain = [0u8; 32];
     domain.copy_from_slice(&pt[0..32]);
@@ -115,6 +133,26 @@ fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
         rho,
         recipient,
     })
+}
+
+/// Deserialize Note from plaintext, including optional sender_id.
+/// 
+/// Returns (Note, Option<sender_id>) where sender_id is present for 144-byte spend outputs.
+pub fn decode_note_with_sender(pt: &[u8]) -> Result<(Note, Option<Hash32>)> {
+    if pt.len() != 112 && pt.len() != 144 {
+        return Err(anyhow!("invalid note plaintext length: {} (expected 112 or 144)", pt.len()));
+    }
+    let note = decode_note_bytes(pt)?;
+    
+    let sender_id = if pt.len() == 144 {
+        let mut sender = [0u8; 32];
+        sender.copy_from_slice(&pt[112..144]);
+        Some(sender)
+    } else {
+        None
+    };
+    
+    Ok((note, sender_id))
 }
 
 /// Encrypt a `Note` for a given `cm` using the FVK (Level B - Poseidon-based).
@@ -167,6 +205,48 @@ pub fn encrypt_note_for_fvk_level_b(
     Ok(EncryptedNote {
         cm: *cm,
         nonce: [0u8; 24], // dummy nonce for Level B (kept for backward compat)
+        ct: sov_modules_api::SafeVec::try_from(ct_vec)
+            .map_err(|_| anyhow!("ciphertext too large"))?,
+        fvk_commitment: fvk_c,
+        mac,
+    })
+}
+
+/// Encrypt a `Note` with sender_id for a given `cm` using the FVK (Level B - transfer format).
+///
+/// This is used for transfer/withdraw outputs where sender_id is required.
+/// The plaintext is 144 bytes: [domain | value | rho | recipient | sender_id]
+///
+/// # Arguments
+/// * `fvk` - The Full Viewing Key
+/// * `note` - The note to encrypt
+/// * `sender_id` - The sender's address (spender's recipient address)
+/// * `cm` - The note commitment
+///
+/// # Returns
+/// EncryptedNote with 144-byte ciphertext containing sender_id
+pub fn encrypt_note_for_fvk_with_sender(
+    fvk: &FullViewingKey,
+    note: &Note,
+    sender_id: &Hash32,
+    cm: &Hash32,
+) -> Result<EncryptedNote> {
+    let fvk_c = fvk_commitment(fvk);
+    let k = view_kdf(fvk, cm);
+
+    // Serialize Note with sender_id (144 bytes)
+    let pt = encode_note_bytes_with_sender(note, sender_id);
+
+    // Encrypt with Poseidon2-stream XOR
+    let ct_vec = stream_xor_encrypt(&k, &pt);
+
+    // Compute ct_hash and mac
+    let ct_h = ct_hash(&ct_vec);
+    let mac = view_mac(&k, cm, &ct_h);
+
+    Ok(EncryptedNote {
+        cm: *cm,
+        nonce: [0u8; 24], // dummy nonce for Level B
         ct: sov_modules_api::SafeVec::try_from(ct_vec)
             .map_err(|_| anyhow!("ciphertext too large"))?,
         fvk_commitment: fvk_c,
@@ -342,6 +422,46 @@ pub fn encrypt_note_for_fvk(
 /// Decrypt and verify a note (uses Level B by default).
 pub fn decrypt_and_verify_note(fvk: &FullViewingKey, enc: &EncryptedNote) -> Result<Note> {
     decrypt_and_verify_note_level_b(fvk, enc)
+}
+
+/// Decrypt and verify a note, returning optional sender_id (for spend outputs).
+/// 
+/// Returns (Note, Option<sender_id>) where sender_id is present for 144-byte spend outputs
+/// and absent for 112-byte deposit notes.
+pub fn decrypt_and_verify_note_with_sender(fvk: &FullViewingKey, enc: &EncryptedNote) -> Result<(Note, Option<Hash32>)> {
+    // 1. Verify FVK matches commitment
+    let fvk_c = fvk_commitment(fvk);
+    if fvk_c != enc.fvk_commitment {
+        return Err(anyhow!("fvk_commitment mismatch: wrong viewer key"));
+    }
+
+    // 2. Derive key
+    let k = view_kdf(fvk, &enc.cm);
+
+    // 3. Recompute ct_hash
+    let ct_h = ct_hash(&enc.ct);
+
+    // 4. Verify MAC
+    let mac_expected = view_mac(&k, &enc.cm, &ct_h);
+    if mac_expected != enc.mac {
+        return Err(anyhow!("mac mismatch: ciphertext may be corrupted or tampered"));
+    }
+
+    // 5. Decrypt
+    let pt_vec = stream_xor_decrypt(&k, &enc.ct);
+
+    // 6. Deserialize Note with optional sender_id
+    let (note, sender_id) = decode_note_with_sender(&pt_vec)?;
+
+    // 7. Recompute commitment
+    let cm_recomputed = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+
+    // 8. Verify commitment matches
+    if cm_recomputed != enc.cm {
+        return Err(anyhow!("commitment mismatch: not truthful"));
+    }
+
+    Ok((note, sender_id))
 }
 
 #[cfg(test)]

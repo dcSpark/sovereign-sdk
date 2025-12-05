@@ -336,6 +336,57 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
+// === Privacy Address Key Derivation ===
+// These functions derive public key (pk) and recipient from spend_sk.
+// The circuit uses these to bind spending authorization to note ownership.
+
+const PK_TAG: &[u8; 5] = b"PK_V1";
+const ADDR_TAG: &[u8; 7] = b"ADDR_V1";
+const NFKEY_TAG: &[u8; 8] = b"NFKEY_V1";
+
+/// Derive public key from spending secret key.
+/// pk = H("PK_V1" || spend_sk)
+#[inline]
+pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 5 + 32];
+    buf[..5].copy_from_slice(PK_TAG);
+    buf[5..].copy_from_slice(spend_sk);
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+}
+
+/// Derive privacy recipient address from domain and public key.
+/// recipient = H("ADDR_V1" || domain || pk)
+/// 
+/// This is the internal 32-byte "recipient" value used in note commitments.
+/// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
+#[inline]
+pub fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 7 + 32 + 32];
+    buf[..7].copy_from_slice(ADDR_TAG);
+    buf[7..39].copy_from_slice(domain);
+    buf[39..].copy_from_slice(pk);
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+}
+
+/// Derive privacy recipient address from domain and spending secret key.
+/// This is a convenience function: recipient = H("ADDR_V1" || domain || pk_from_sk(spend_sk))
+#[inline]
+pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let pk = pk_from_sk(spend_sk);
+    recipient_from_pk(domain, &pk)
+}
+
+/// Derive nullifier key from domain and spending secret key.
+/// nf_key = H("NFKEY_V1" || domain || spend_sk)
+#[inline]
+pub fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 8 + 32 + 32];
+    buf[..8].copy_from_slice(NFKEY_TAG);
+    buf[8..40].copy_from_slice(domain);
+    buf[40..].copy_from_slice(spend_sk);
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+}
+
 /// Recompute the Merkle root from a leaf using its authentication path.
 /// Verifies that a leaf with given siblings can produce the claimed root.
 pub fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Hash32 {
