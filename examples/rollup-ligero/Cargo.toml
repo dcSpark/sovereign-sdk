@@ -159,3 +159,11 @@ path = "src/main.rs"
 [[bin]]
 name = "generate-genesis-keys"
 path = "src/bin/generate_genesis_keys.rs"
+
+[[bin]]
+name = "generate-authority-fvk"
+path = "src/bin/generate_authority_fvk.rs"
+
+[[bin]]
+name = "decrypt-authority-notes"
+path = "src/bin/decrypt_authority_notes.rs"

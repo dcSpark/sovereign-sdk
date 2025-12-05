@@ -145,7 +145,7 @@ impl<'a> arbitrary::Arbitrary<'a> for MidnightAddress {
 impl proptest::arbitrary::Arbitrary for MidnightAddress {
     type Parameters = ();
     type Strategy = proptest::strategy::Map<
-        proptest::array::UniformArrayStrategy<proptest::prelude::Any, [u8; 32], [u8; 32]>,
+        proptest::array::UniformArrayStrategy<proptest::num::u8::Any, [u8; 32]>,
         fn([u8; 32]) -> Self,
     >;
 

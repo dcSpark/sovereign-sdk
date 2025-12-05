@@ -506,12 +506,23 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             }
 
             // Aggregate event (positions are provisional, assigned at flush)
+            // Convert view attestations to lightweight viewer bindings for the event
+            let viewer_bindings = public.view_attestations.map(|atts| {
+                atts.into_iter()
+                    .map(|att| crate::event::ViewerBinding {
+                        cm: att.cm,
+                        fvk_commitment: att.fvk_commitment,
+                    })
+                    .collect()
+            });
+
             self.emit_event(
                 st,
                 Event::PoolTransfer {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
                     outputs,
+                    viewer_bindings,
                 },
             );
 
@@ -740,6 +751,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             }
 
             // Aggregate event (positions are provisional, assigned at flush)
+            // Convert view attestations to lightweight viewer bindings for the event
+            let viewer_bindings = public.view_attestations.map(|atts| {
+                atts.into_iter()
+                    .map(|att| crate::event::ViewerBinding {
+                        cm: att.cm,
+                        fvk_commitment: att.fvk_commitment,
+                    })
+                    .collect()
+            });
+
             self.emit_event(
                 st,
                 Event::PoolWithdraw {
@@ -747,6 +768,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                     nullifier: public.nullifier,
                     anchor_root: public.anchor_root,
                     change: change_outputs,
+                    viewer_bindings,
                 },
             );
 

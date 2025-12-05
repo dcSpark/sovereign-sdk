@@ -24,6 +24,7 @@ pub struct SpendPublic {
 
 /// A single viewer attestation binding (output_cm, viewer_fvk_commitment, ct_hash, mac).
 /// The guest produces these inside the circuit; the module verifies them on-chain.
+/// Note: This struct is used internally for verification. Events use the lighter `ViewerBinding`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct ViewAttestation {
     /// Output commitment this attestation is bound to
