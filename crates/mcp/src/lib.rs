@@ -1,4 +1,4 @@
-pub mod authority_fvk;
+pub mod authority_vfk;
 pub mod config;
 pub mod ligero;
 pub mod operations;

@@ -41,10 +41,10 @@ pub struct Config {
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_shader_path: PathBuf,
 
-    /// Authority Full Viewing Key (FVK) for decrypting privacy pool notes (env: AUTHORITY_FVK, optional)
+    /// Authority Viewing Full Key (VFK) for decrypting privacy pool notes (env: AUTHORITY_VFK, optional)
     /// 32-byte hex string with or without 0x prefix
     #[serde(default)]
-    pub authority_fvk: Option<String>,
+    pub authority_vfk: Option<String>,
 }
 
 fn default_server_bind_address() -> String {
