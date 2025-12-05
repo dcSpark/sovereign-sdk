@@ -67,6 +67,8 @@ struct ContinuousConfig {
     /// Authority Full Viewing Key for Level-B compliance.
     /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
     authority_fvk: Option<Hash32>,
+    /// Maximum number of transfer cycles to run. None means run indefinitely.
+    max_cycles: Option<u64>,
 }
 
 impl ContinuousConfig {
@@ -121,6 +123,10 @@ impl ContinuousConfig {
         // Load authority viewing key for Level-B compliance
         let authority_fvk = load_authority_fvk();
 
+        let max_cycles = std::env::var("MAX_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         Ok(Self {
             num_wallets,
             initial_deposit,
@@ -133,6 +139,7 @@ impl ContinuousConfig {
             continuous,
             managed_mode,
             authority_fvk,
+            max_cycles,
         })
     }
 }
@@ -161,20 +168,31 @@ fn confirm_and_wipe_demo_data(crate_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Check if we should skip the confirmation prompt
+    let skip_confirm = std::env::var("MANAGED_MODE_SKIP_CONFIRM")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+
     eprintln!(
         "[managed-mode] This will DELETE all data under {}",
         demo_data.display()
     );
-    eprint!("Type 'yes' to continue (anything else aborts): ");
-    io::stdout().flush().ok();
 
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read confirmation")?;
-    let trimmed = input.trim().to_ascii_lowercase();
-    if trimmed != "yes" {
-        bail!("Aborted by user; demo_data preserved");
+    if !skip_confirm {
+        eprint!("Type 'yes' to continue (anything else aborts): ");
+        io::stdout().flush().ok();
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read confirmation")?;
+        let trimmed = input.trim().to_ascii_lowercase();
+        if trimmed != "yes" {
+            bail!("Aborted by user; demo_data preserved");
+        }
+    } else {
+        eprintln!("[managed-mode] MANAGED_MODE_SKIP_CONFIRM=1 set, proceeding without confirmation");
     }
 
     fs::remove_dir_all(&demo_data)
@@ -655,6 +673,7 @@ pub async fn run() -> Result<()> {
         );
         let deposit_start = Instant::now();
         perform_initial_deposits(
+            &client,
             &http,
             &verifier_url,
             &mut wallets,
@@ -685,9 +704,16 @@ pub async fn run() -> Result<()> {
     }
 
     // Main loop: repeated transfer cycles
-    eprintln!(
-        "\n[loop] Starting continuous transfer cycles (Ctrl+C to stop)..."
-    );
+    if let Some(max) = config.max_cycles {
+        eprintln!(
+            "\n[loop] Starting transfer cycles (max_cycles={}, Ctrl+C to stop)...",
+            max
+        );
+    } else {
+        eprintln!(
+            "\n[loop] Starting continuous transfer cycles (Ctrl+C to stop)..."
+        );
+    }
     let mut cycle_idx: u64 = 0;
     let mut total_transfers: usize = 0;
     let mut total_included: usize = 0;
@@ -793,6 +819,32 @@ pub async fn run() -> Result<()> {
             "[summary] So far: cycles={} transfers={} included={}",
             cycle_idx, total_transfers, total_included
         );
+
+        // Check if we've reached the maximum number of cycles
+        if let Some(max) = config.max_cycles {
+            if cycle_idx >= max {
+                eprintln!("[loop] Reached max_cycles={}, stopping.", max);
+                log_final_summary(
+                    cycle_idx,
+                    total_transfers,
+                    total_included,
+                    &total_batches,
+                    total_worker_ms,
+                    total_worker_proof_ms,
+                    total_worker_db_ms,
+                    total_worker_samples,
+                    total_sequencer_ms,
+                    total_sequencer_samples,
+                    total_seq_decode_ms,
+                    total_seq_wrap_ms,
+                    total_seq_submit_ms,
+                    total_seq_await_ms,
+                    total_seq_stf_ms,
+                    config.detailed_wallet_logs,
+                );
+                return Ok(());
+            }
+        }
 
         // Interactive gate after each cycle summary.
         wait_for_c_to_continue("[cycle] Cycle summary complete.", &config).ok();
@@ -921,6 +973,7 @@ fn log_final_summary(
 }
 
 async fn perform_initial_deposits(
+    client: &NodeClient,
     http: &HttpClient,
     verifier_url: &str,
     wallets: &mut [WalletState],
@@ -1002,6 +1055,52 @@ async fn perform_initial_deposits(
         );
     } else if detailed_wallet_logs {
         eprintln!("[deposit] flushed queued deposits via {}", flush_endpoint);
+    }
+
+    // Wait for all deposit notes to be indexed in the tree before returning.
+    // This ensures the first transfer cycle can find the note commitments.
+    const DEPOSIT_SYNC_TIMEOUT_SECS: u64 = 60;
+    const DEPOSIT_SYNC_POLL_MS: u64 = 100;
+
+    let mut expected_commitments: Vec<[u8; 32]> = Vec::with_capacity(wallets.len());
+    for wallet in wallets.iter() {
+        let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &wallet.recipient);
+        expected_commitments.push(cm);
+    }
+
+    if !expected_commitments.is_empty() {
+        eprintln!(
+            "[deposit] Waiting for {} deposit notes to be indexed...",
+            expected_commitments.len()
+        );
+        let sync_start = Instant::now();
+        let sync_deadline = sync_start + Duration::from_secs(DEPOSIT_SYNC_TIMEOUT_SECS);
+        let mut pending: HashSet<[u8; 32]> = expected_commitments.iter().copied().collect();
+
+        while !pending.is_empty() && Instant::now() < sync_deadline {
+            let fresh_positions = fetch_note_positions(client, false).await?;
+            pending.retain(|cm| !fresh_positions.contains_key(cm));
+
+            if !pending.is_empty() {
+                sleep(Duration::from_millis(DEPOSIT_SYNC_POLL_MS)).await;
+            }
+        }
+
+        let sync_elapsed = sync_start.elapsed();
+        if pending.is_empty() {
+            eprintln!(
+                "[deposit] All {} deposit notes indexed in {:.2} ms",
+                expected_commitments.len(),
+                sync_elapsed.as_secs_f64() * 1000.0
+            );
+        } else {
+            bail!(
+                "Timeout: {} of {} deposit notes not indexed after {:.2}s",
+                pending.len(),
+                expected_commitments.len(),
+                sync_elapsed.as_secs_f64()
+            );
+        }
     }
 
     Ok(())
