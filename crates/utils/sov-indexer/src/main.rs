@@ -1,12 +1,12 @@
-use std::net::SocketAddr;
-use std::env;
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::Database;
+use std::env;
+use std::net::SocketAddr;
 use tracing::{info, warn};
-mod index_db;
-mod db;
-mod background_sync;
 mod api;
+mod background_sync;
+mod db;
+mod index_db;
 
 // main only handles wiring; API, DB, sync live in modules
 
@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
     // Read env-based config
     let da_conn = env::var("DA_CONNECTION_STRING")
         .map_err(|_| anyhow!("DA_CONNECTION_STRING env var is required"))?;
-    let index_db_url = env::var("INDEX_DB").unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
+    let index_db_url = env::var("INDEX_DB")
+        .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
 
     let da_db = Database::connect(&da_conn)
