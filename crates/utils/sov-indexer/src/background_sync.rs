@@ -1,4 +1,5 @@
 use crate::db;
+use crate::db::{extract_events_from_status, extract_status_from_status};
 use anyhow::Result;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sov_midnight_da::storable::worker_verified_transactions;
@@ -31,9 +32,10 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .or(view_fvks_json);
-            let ev_json = extract_events(row.sequencer_status.as_deref())
+            let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
                 .ok()
                 .flatten();
+            let status = extract_status_from_status(row.sequencer_status.as_deref());
             let event_id = db::insert_event(
                 idx,
                 &row.tx_hash,
@@ -41,6 +43,7 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 "midnight_privacy",
                 &kind,
                 &payload,
+                status,
                 ev_json,
             )
             .await?;
@@ -52,6 +55,9 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 recip_hex,
                 Some(sender.clone()),
                 view_fvks,
+                row.encrypted_notes_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok()),
             )
             .await?;
         } else if kind == "withdraw" {
@@ -62,9 +68,10 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                     .flatten()
             });
             if let Some(recipient) = recipient {
-                let ev_json = extract_events(row.sequencer_status.as_deref())
+                let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
                     .ok()
                     .flatten();
+                let status = extract_status_from_status(row.sequencer_status.as_deref());
                 let event_id = db::insert_event(
                     idx,
                     &row.tx_hash,
@@ -72,6 +79,7 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                     "midnight_privacy",
                     &kind,
                     &payload,
+                    status,
                     ev_json,
                 )
                 .await?;
@@ -94,13 +102,17 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                     Some(recipient.clone()),
                     Some(row.sender.clone()),
                     view_att,
+                    row.encrypted_notes_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok()),
                 )
                 .await?;
             }
         } else if kind == "transfer" {
-            let ev_json = extract_events(row.sequencer_status.as_deref())
+            let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
                 .ok()
                 .flatten();
+            let status = extract_status_from_status(row.sequencer_status.as_deref());
             let event_id = db::insert_event(
                 idx,
                 &row.tx_hash,
@@ -108,6 +120,7 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 "midnight_privacy",
                 &kind,
                 &payload,
+                status,
                 ev_json,
             )
             .await?;
@@ -128,6 +141,9 @@ pub async fn backfill_index(da: &DatabaseConnection, idx: &DatabaseConnection) -
                 nullifier.clone(),
                 Some(row.sender.clone()),
                 view_att,
+                row.encrypted_notes_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok()),
             )
             .await?;
         }
@@ -149,7 +165,7 @@ pub fn spawn_sync_loop(da: DatabaseConnection, idx: DatabaseConnection) {
     });
 }
 
-fn parse_kind_amount_roots(
+pub fn parse_kind_amount_roots(
     tx_json: &str,
 ) -> Result<(String, Option<String>, Option<String>, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
@@ -191,7 +207,7 @@ fn parse_kind_amount_roots(
     Ok(("other".to_string(), None, None, None))
 }
 
-fn parse_deposit_fields(
+pub fn parse_deposit_fields(
     tx_json: &str,
 ) -> Result<(Option<String>, Option<String>, Option<serde_json::Value>)> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
@@ -210,7 +226,7 @@ fn parse_deposit_fields(
     Ok((None, None, None))
 }
 
-fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
+pub fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
     if let Some(obj) = v.get("withdraw").and_then(|x| x.as_object()) {
         let to = obj
@@ -222,21 +238,11 @@ fn parse_withdraw_recipient(tx_json: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn parse_withdraw_attestations(proof_outputs_json: &str) -> Result<Option<String>> {
+pub fn parse_withdraw_attestations(proof_outputs_json: &str) -> Result<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(proof_outputs_json)?;
     if let Some(obj) = v.as_object() {
         if let Some(att) = obj.get("view_attestations") {
             return Ok(Some(att.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-fn extract_events(sequencer_resp: Option<&str>) -> Result<Option<serde_json::Value>> {
-    if let Some(resp) = sequencer_resp {
-        let v: serde_json::Value = serde_json::from_str(resp)?;
-        if let Some(ev) = v.get("events") {
-            return Ok(Some(ev.clone()));
         }
     }
     Ok(None)

@@ -1772,6 +1772,23 @@ pub async fn store_verified_midnight_transaction(
         "{}".to_string()
     };
 
+    // Extract optional viewing data
+    let view_attestations_json = proof_output
+        .and_then(|p| p.view_attestations.as_ref())
+        .map(|atts| {
+            serde_json::to_string(atts).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize view_attestations: {err}"))
+            })
+        })
+        .transpose()?;
+    let view_fvks_json = (|| -> Option<Result<String, ServiceError>> {
+        let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;
+        let fvks = v.get("deposit")?.get("view_fvks")?.clone();
+        Some(serde_json::to_string(&fvks).map_err(|err| {
+            ServiceError::Internal(format!("Failed to serialize view_fvks: {err}"))
+        }))
+    })()
+    .transpose()?;
     // Serialize encrypted notes to JSON for Level-B viewing access
     let encrypted_notes_json = encrypted_notes
         .map(|notes| {
@@ -1814,6 +1831,8 @@ pub async fn store_verified_midnight_transaction(
         proof_verified: Set(proof_verified),
         transaction_data: Set(transaction_data.to_owned()),
         proof_outputs: Set(proof_outputs_json),
+        view_fvks_json: Set(view_fvks_json),
+        view_attestations_json: Set(view_attestations_json),
         encrypted_notes_json: Set(encrypted_notes_json),
         pub_key_hex,
         signature_hex,
@@ -1835,6 +1854,8 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::ProofVerified,
                 VerifiedColumn::TransactionData,
                 VerifiedColumn::ProofOutputs,
+                VerifiedColumn::ViewFvksJson,
+                VerifiedColumn::ViewAttestationsJson,
                 VerifiedColumn::EncryptedNotesJson,
                 VerifiedColumn::PubKeyHex,
                 VerifiedColumn::SignatureHex,

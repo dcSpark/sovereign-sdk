@@ -21,23 +21,41 @@ async fn main() -> anyhow::Result<()> {
     let index_db_url = env::var("INDEX_DB")
         .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
+    let mode = match env::var("MODE")
+        .unwrap_or_else(|_| "direct".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "sync" => api::Mode::Sync,
+        _ => api::Mode::Direct,
+    };
 
     let da_db = Database::connect(&da_conn)
         .await
         .with_context(|| format!("Failed to connect DB {}", da_conn))?;
 
-    // Index DB
-    let idx_db = Database::connect(&index_db_url)
-        .await
-        .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
-    db::init_index_db(&idx_db).await?;
-    // Try a one-shot backfill; if DA tables are not ready, log and continue.
-    if let Err(e) = background_sync::backfill_index(&da_db, &idx_db).await {
-        warn!(error = %e, "Initial backfill failed; will retry in background loop");
-    }
-    background_sync::spawn_sync_loop(da_db.clone(), idx_db.clone());
+    let idx_db = if mode == api::Mode::Sync {
+        let idx = Database::connect(&index_db_url)
+            .await
+            .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
+        db::init_index_db(&idx).await?;
+        // Try a one-shot backfill; if DA tables are not ready, log and continue.
+        if let Err(e) = background_sync::backfill_index(&da_db, &idx).await {
+            warn!(error = %e, "Initial backfill failed; will retry in background loop");
+        }
+        background_sync::spawn_sync_loop(da_db.clone(), idx.clone());
+        idx
+    } else {
+        da_db.clone()
+    };
 
-    let app = api::router(api::AppState { db: idx_db.clone() });
+    if mode == api::Mode::Direct {
+        info!("Indexer running in DIRECT mode; querying worker DB directly");
+    } else {
+        info!("Indexer running in SYNC mode; serving from index DB");
+    }
+
+    let app = api::router(api::AppState { db: idx_db, mode });
 
     let addr: SocketAddr = bind_addr.parse()?;
     info!("sov-indexer listening on {}", addr);

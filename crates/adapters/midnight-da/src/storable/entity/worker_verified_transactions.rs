@@ -46,6 +46,12 @@ pub struct Model {
     /// Stored separately for easy access by compliance/authority viewers.
     #[sea_orm(column_type = "Text", nullable)]
     pub encrypted_notes_json: Option<String>,
+    /// JSON-serialized Full Viewing Keys attached to a deposit (if any).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub view_fvks_json: Option<String>,
+    /// JSON-serialized viewer attestations from the proof (if any).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub view_attestations_json: Option<String>,
     /// Borsh-serialized public key (hex string) - for pre-authenticated path
     #[sea_orm(column_type = "Text", nullable)]
     pub pub_key_hex: Option<String>,
