@@ -25,6 +25,10 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub verifier_url: Url,
 
+    /// Indexer service URL for querying transaction history (env: INDEXER_URL, required)
+    #[validate(custom(function = "validate_http_url"))]
+    pub indexer_url: Url,
+
     /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_program_path: PathBuf,

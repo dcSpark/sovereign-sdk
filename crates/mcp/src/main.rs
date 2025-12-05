@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Starting Sovereign SDK MCP Server");
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
     tracing::info!("[mcp] Verifier URL: {}", cfg.verifier_url);
+    tracing::info!("[mcp] Indexer URL: {}", cfg.indexer_url);
     tracing::info!("[mcp] Initializing wallet from private key...");
 
     // Create wallet from private key hex string (no files needed!)
@@ -42,9 +43,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
     // Initialize RPC provider (separate from wallet)
-    tracing::info!("[mcp] Connecting to rollup RPC and verifier service...");
-    let provider = Provider::new(cfg.rollup_rpc_url.as_str(), cfg.verifier_url.as_str()).await?;
-    tracing::info!("[mcp] Connected to rollup RPC and verifier service successfully");
+    tracing::info!("[mcp] Connecting to rollup RPC, verifier service, and indexer...");
+    let provider = Provider::new(
+        cfg.rollup_rpc_url.as_str(),
+        cfg.verifier_url.as_str(),
+        cfg.indexer_url.as_str(),
+    )
+    .await?;
+    tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
 
     // Initialize Ligero prover

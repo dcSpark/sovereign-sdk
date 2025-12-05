@@ -104,13 +104,23 @@ pub struct GetTransactionsRequest {}
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct TransactionInfo {
     /// Transaction hash
-    pub hash: String,
-    /// Transaction status
-    pub status: String,
-    /// Block number (if confirmed)
-    pub block_number: Option<u64>,
-    /// Timestamp
-    pub timestamp: Option<u64>,
+    pub tx_hash: String,
+    /// Timestamp in milliseconds
+    pub timestamp_ms: i64,
+    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
+    pub kind: String,
+    /// Direction of involvement (e.g., "in", "out")
+    pub direction: String,
+    /// Sender address (if available)
+    pub sender: Option<String>,
+    /// Recipient address (if available)
+    pub recipient: Option<String>,
+    /// Transaction amount (if available)
+    pub amount: Option<String>,
+    /// Anchor root for privacy transactions
+    pub anchor_root: Option<String>,
+    /// Nullifier for privacy transactions
+    pub nullifier: Option<String>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -412,10 +422,15 @@ impl CryptoServer {
         let transaction_infos: Vec<TransactionInfo> = transactions
             .into_iter()
             .map(|tx| TransactionInfo {
-                hash: tx.hash,
-                status: tx.status,
-                block_number: tx.block_number,
-                timestamp: tx.timestamp,
+                tx_hash: tx.tx_hash,
+                timestamp_ms: tx.timestamp_ms,
+                kind: tx.kind,
+                direction: tx.direction,
+                sender: tx.sender,
+                recipient: tx.recipient,
+                amount: tx.amount,
+                anchor_root: tx.anchor_root,
+                nullifier: tx.nullifier,
             })
             .collect();
 

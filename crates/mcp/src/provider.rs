@@ -32,6 +32,38 @@ pub struct TransactionStatus {
     pub status: String,
 }
 
+/// Transaction involvement item from the indexer
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct InvolvementItem {
+    /// Transaction hash
+    pub tx_hash: String,
+    /// Timestamp in milliseconds
+    pub timestamp_ms: i64,
+    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
+    pub kind: String,
+    /// Direction of involvement (e.g., "in", "out")
+    pub direction: String,
+    /// Sender address (if available)
+    pub sender: Option<String>,
+    /// Recipient address (if available)
+    pub recipient: Option<String>,
+    /// Transaction amount (if available)
+    pub amount: Option<String>,
+    /// Anchor root for privacy transactions
+    pub anchor_root: Option<String>,
+    /// Nullifier for privacy transactions
+    pub nullifier: Option<String>,
+}
+
+/// Response from the indexer's list transactions endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ListTransactionsResponse {
+    /// List of transaction items
+    pub items: Vec<InvolvementItem>,
+    /// Cursor for pagination (optional)
+    pub next: Option<String>,
+}
+
 /// Provider for RPC communication with the Sovereign rollup
 ///
 /// Responsible for all network communication and chain state queries.
@@ -41,12 +73,13 @@ pub struct Provider {
     client: Arc<NodeClient>,
     rpc_url: String,
     verifier_url: String,
+    indexer_url: String,
     http_client: reqwest::Client,
 }
 
 impl Provider {
-    /// Create a new provider connected to the given RPC URL and verifier service
-    pub async fn new(rpc_url: &str, verifier_url: &str) -> Result<Self> {
+    /// Create a new provider connected to the given RPC URL, verifier service, and indexer
+    pub async fn new(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> Result<Self> {
         let client = NodeClient::new(rpc_url)
             .await
             .with_context(|| format!("Failed to connect to rollup node at {}", rpc_url))?;
@@ -55,6 +88,7 @@ impl Provider {
             client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
             verifier_url: verifier_url.to_string(),
+            indexer_url: indexer_url.to_string(),
             http_client: reqwest::Client::new(),
         })
     }
@@ -305,5 +339,90 @@ impl Provider {
             .query_rest_endpoint(endpoint)
             .await
             .with_context(|| format!("Failed to query REST endpoint: {}", endpoint))
+    }
+
+    /// Get transactions for a specific wallet address from the indexer
+    ///
+    /// This queries the indexer API to retrieve all transactions associated with
+    /// the given wallet address. The indexer tracks both incoming and outgoing
+    /// transactions, including deposits, withdrawals, and transfers.
+    ///
+    /// # Parameters
+    /// * `address` - The wallet address to query transactions for
+    /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
+    /// * `cursor` - Optional cursor for pagination
+    /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
+    ///
+    /// # Returns
+    /// A list of transactions with their details
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// let address = "0x1234...";
+    /// let transactions = provider.get_wallet_transactions(address, None, None, None).await?;
+    /// println!("Found {} transactions", transactions.items.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_wallet_transactions(
+        &self,
+        address: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        tx_type: Option<&str>,
+    ) -> Result<ListTransactionsResponse> {
+        // Trim trailing slash from indexer_url to avoid double slashes
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let mut url = format!("{}/wallets/{}/txs", base_url, address);
+
+        // Build query parameters
+        let mut query_params = Vec::new();
+        if let Some(limit) = limit {
+            query_params.push(format!("limit={}", limit));
+        }
+        if let Some(cursor) = cursor {
+            query_params.push(format!("cursor={}", cursor));
+        }
+        if let Some(tx_type) = tx_type {
+            query_params.push(format!("type={}", tx_type));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        tracing::debug!("Fetching transactions from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer returned error status {}: {}",
+                status,
+                body
+            );
+        }
+
+        let tx_list: ListTransactionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse indexer response")?;
+
+        tracing::debug!(
+            "Fetched {} transactions for address {}",
+            tx_list.items.len(),
+            address
+        );
+
+        Ok(tx_list)
     }
 }
