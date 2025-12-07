@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree,
-    SpendPublic,
+    note_commitment, nullifier, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
+    MerkleTree, SpendPublic,
 };
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
@@ -24,6 +24,7 @@ use tokio::time::{sleep, Instant as TokioInstant};
 
 use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::provider::Provider;
+use crate::viewer;
 use crate::wallet::WalletContext;
 
 // Use the same spec types as the MCP server
@@ -356,6 +357,7 @@ async fn create_transfer_unsigned_tx(
     proof_bytes: Vec<u8>,
     anchor_root: Hash32,
     nullifier: Hash32,
+    view_ciphertexts: Option<Vec<EncryptedNote>>,
 ) -> Result<UnsignedTransaction<McpRuntime, McpSpec>> {
     let chain_data = provider
         .get_chain_data()
@@ -372,7 +374,7 @@ async fn create_transfer_unsigned_tx(
         proof: safe_proof,
         anchor_root,
         nullifier,
-        view_ciphertexts: None,
+        view_ciphertexts,
         gas: None,
     };
 
@@ -495,6 +497,21 @@ pub async fn transfer(
     // Step 4: Compute nullifier
     let nf = nullifier(&DOMAIN, &NF_KEY, &input_rho);
 
+    // Step 4b: Load authority VFK and create viewer bundle if configured
+    let authority_vfk = viewer::load_authority_vfk();
+    let (view_attestations, view_ciphertexts) = if let Some(vfk) = authority_vfk {
+        tracing::info!(
+            "Authority VFK configured: generating viewer attestation and encrypted note for compliance"
+        );
+        // sender_id for transfers is the input_recipient (spender's address)
+        let (attestation, encrypted_note) =
+            viewer::make_viewer_bundle(&vfk, &DOMAIN, value, &out_rho, &out_recipient, &input_recipient, &cm_out);
+        (Some(vec![attestation]), Some(vec![encrypted_note]))
+    } else {
+        tracing::debug!("No authority VFK configured: transfer will not include viewer attestation");
+        (None, None)
+    };
+
     // Note: The webgpu_prover generates the proof AND packages it with the public output
     // (SpendPublic) internally, so we don't need to create it here.
 
@@ -515,6 +532,13 @@ pub async fn transfer(
     // Outputs start at 11+depth; mark value/rho/recipient for output 0 as private
     let output_base = 11 + depth;
     private_indices.extend_from_slice(&[output_base, output_base + 1, output_base + 2]);
+
+    // Viewer section: vfk is private (if authority VFK is configured)
+    if authority_vfk.is_some() {
+        let base_after_outs = 12 + depth + 4 * num_outputs;
+        let vfk_arg_index = base_after_outs + 2;
+        private_indices.push(vfk_arg_index);
+    }
 
     // Prepare proof arguments with correct HEX/STR format
     // Hash values use HEX format, numeric values use STR format
@@ -545,6 +569,19 @@ pub async fn transfer(
         LigeroProgramArguments::HEX { hex: hex::encode(cm_out) },        // output commitment
     ]);
 
+    // Add viewer section arguments if authority VFK is configured
+    if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
+        if let Some(att) = atts.first() {
+            proof_args.extend_from_slice(&[
+                LigeroProgramArguments::STR { str: "1".to_string() },              // m_viewers
+                LigeroProgramArguments::HEX { hex: hex::encode(att.fvk_commitment) }, // vfk_commitment
+                LigeroProgramArguments::HEX { hex: hex::encode(vfk) },             // vfk (private)
+                LigeroProgramArguments::HEX { hex: hex::encode(att.ct_hash) },     // ct_hash
+                LigeroProgramArguments::HEX { hex: hex::encode(att.mac) },         // mac
+            ]);
+        }
+    }
+
     // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
     let proof_args_for_package = proof_args.clone();
     let private_indices_for_package: Vec<usize> =
@@ -574,7 +611,7 @@ pub async fn transfer(
         nullifier: nf,
         withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
         output_commitments: vec![cm_out],
-        view_attestations: None,
+        view_attestations,
     };
 
     let proof_package = LigeroProofPackage {
@@ -596,7 +633,7 @@ pub async fn transfer(
     // Step 6: Create and sign transaction
     let unsigned_tx_start = StdInstant::now();
     let unsigned_tx =
-        create_transfer_unsigned_tx(provider, wallet, proof_bytes, anchor_root, nf).await?;
+        create_transfer_unsigned_tx(provider, wallet, proof_bytes, anchor_root, nf, view_ciphertexts).await?;
     tracing::info!(
         elapsed_ms = unsigned_tx_start.elapsed().as_millis(),
         "Unsigned transfer transaction created"

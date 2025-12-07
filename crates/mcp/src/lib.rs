@@ -4,6 +4,7 @@ pub mod ligero;
 pub mod operations;
 pub mod provider;
 pub mod server;
+pub mod viewer;
 pub mod wallet;
 
 #[cfg(test)]

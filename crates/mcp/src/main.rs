@@ -8,6 +8,7 @@ mod ligero;
 mod operations;
 mod provider;
 mod server;
+mod viewer;
 mod wallet;
 
 #[cfg(test)]

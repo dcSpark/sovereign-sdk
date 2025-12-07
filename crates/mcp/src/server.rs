@@ -253,6 +253,55 @@ pub struct TransferResult {
     pub new_recipient: String,
 }
 
+// -----------------------------
+// Types for DecryptTransaction
+// -----------------------------
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DecryptTransactionRequest {
+    /// Transaction hash to decrypt (with or without 0x prefix)
+    pub tx_hash: String,
+    /// Authority VFK (32-byte hex string, with or without 0x prefix)
+    pub vfk: String,
+}
+
+/// Decrypted note information from a transaction
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct DecryptedNoteInfo {
+    /// Note domain
+    pub domain: String,
+    /// Token value/amount
+    pub value: String,
+    /// Note randomness (rho)
+    pub rho: String,
+    /// Recipient identifier
+    pub recipient: String,
+    /// Sender identifier (spender's address for transfers)
+    /// - For deposit notes: None
+    /// - For transfer notes: Some(sender_id)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct DecryptTransactionResult {
+    /// Transaction hash
+    pub tx_hash: String,
+    /// Transaction status
+    pub status: String,
+    /// Transaction kind
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Timestamp in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    /// Decrypted notes from the transaction
+    pub decrypted_notes: Vec<DecryptedNoteInfo>,
+    /// Number of encrypted notes that were successfully decrypted
+    pub decrypted_count: usize,
+    /// Total number of encrypted notes in the transaction
+    pub total_encrypted_notes: usize,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
@@ -712,6 +761,51 @@ impl CryptoServer {
             tx_hash: transfer_result.tx_hash,
             new_rho: hex::encode(&transfer_result.new_rho),
             new_recipient: hex::encode(&transfer_result.new_recipient),
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get transaction with selective privacy (authority view).
+    /// Fetches the transaction from the indexer and decrypts encrypted notes using an authority VFK,
+    /// enabling selective disclosure of transaction details while preserving privacy for others.
+    #[tool(
+        name = "getTransactionWithSelectivePrivacy",
+        description = "Get transaction with selective privacy. Allows authorities to decrypt encrypted notes from a privacy transaction using their VFK (Viewing Full Key)."
+    )]
+    async fn get_transaction_with_selective_privacy(
+        &self,
+        Parameters(params): Parameters<DecryptTransactionRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        let decrypt_result = crate::operations::decrypt_transaction(provider, &params.tx_hash, &params.vfk)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = DecryptTransactionResult {
+            tx_hash: decrypt_result.tx_hash,
+            status: decrypt_result.status,
+            kind: decrypt_result.kind,
+            timestamp_ms: decrypt_result.timestamp_ms,
+            decrypted_notes: decrypt_result.decrypted_notes.into_iter().map(|note| {
+                DecryptedNoteInfo {
+                    domain: note.domain,
+                    value: note.value.to_string(),
+                    rho: note.rho,
+                    recipient: note.recipient,
+                    sender_id: note.sender_id,
+                }
+            }).collect(),
+            decrypted_count: decrypt_result.decrypted_count,
+            total_encrypted_notes: decrypt_result.total_encrypted_notes,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
