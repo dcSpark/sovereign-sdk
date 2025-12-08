@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 
 use crate::authority_vfk::AuthorityVfk;
 use crate::ligero::Ligero as LigeroProver;
+use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
@@ -209,6 +210,8 @@ pub struct GetWalletConfigResult {
     pub chain_id: u64,
     /// Chain name
     pub chain_name: String,
+    /// Privacy pool address for receiving shielded funds
+    pub privacy_address: String,
 }
 
 // -----------------------------
@@ -311,15 +314,10 @@ pub struct CryptoServer {
     /// Authority VFK for decrypting encrypted notes (to be used in future decrypt implementation)
     #[allow(dead_code)]
     authority_vfk: Option<Arc<AuthorityVfk>>,
+    /// Privacy key for deriving recipient addresses and spending notes (REQUIRED)
+    #[allow(dead_code)]
+    privacy_key: Arc<PrivacyKey>,
 }
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct WalletStatusResult {
-    pub status: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct WalletStatusRequest {}
 
 #[allow(rust_analyzer::macro_error)]
 #[tool_router]
@@ -329,6 +327,7 @@ impl CryptoServer {
         wallet_context: Arc<RwLock<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
         authority_vfk: Option<Arc<AuthorityVfk>>,
+        privacy_key: Arc<PrivacyKey>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -336,6 +335,7 @@ impl CryptoServer {
             wallet_context: Some(wallet_context),
             ligero_prover: Some(ligero_prover),
             authority_vfk,
+            privacy_key,
         }
     }
 
@@ -393,21 +393,6 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the current synchronization status of the wallet.
-    #[tool(
-        name = "walletStatus",
-        description = "Get the current synchronization status of the wallet."
-    )]
-    async fn wallet_status(
-        &self,
-        Parameters(_params): Parameters<WalletStatusRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let result = WalletStatusResult {
-            status: "synchronized".to_string(),
-        };
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
     /// Get the balance of the wallet's default address for a given token ID.
     /// If token_id is not provided, defaults to the gas token.
     /// Requires wallet context to be configured.
@@ -583,7 +568,7 @@ impl CryptoServer {
     /// Get the wallet's configuration.
     #[tool(
         name = "getWalletConfig",
-        description = "Get the wallet's configuration. Retrieves the configuration of the wallet, including the RPC URL, wallet address, chain ID, and chain name."
+        description = "Get the wallet's configuration. Retrieves the configuration of the wallet, including the RPC URL, wallet address, chain ID, chain name, and privacy pool address."
     )]
     async fn get_wallet_config(
         &self,
@@ -605,7 +590,7 @@ impl CryptoServer {
 
         let ctx = wallet_ctx.read().await;
 
-        let config = crate::operations::get_wallet_config(provider, &*ctx)
+        let config = crate::operations::get_wallet_config(provider, &*ctx, &self.privacy_key)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -614,6 +599,7 @@ impl CryptoServer {
             address: config.address,
             chain_id: config.chain_id,
             chain_name: config.chain_name,
+            privacy_address: config.privacy_address,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -654,7 +640,8 @@ impl CryptoServer {
 
         tracing::debug!("deposit called with amount: {}", amount);
 
-        let deposit_result = crate::operations::deposit(provider, &*ctx, amount)
+        // Privacy key is always available (required for server startup)
+        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &self.privacy_key)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 

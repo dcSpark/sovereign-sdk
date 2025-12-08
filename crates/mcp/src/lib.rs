@@ -2,6 +2,7 @@ pub mod authority_vfk;
 pub mod config;
 pub mod ligero;
 pub mod operations;
+pub mod privacy_key;
 pub mod provider;
 pub mod server;
 pub mod viewer;

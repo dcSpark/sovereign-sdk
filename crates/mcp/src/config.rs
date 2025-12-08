@@ -45,6 +45,12 @@ pub struct Config {
     /// 32-byte hex string with or without 0x prefix
     #[serde(default)]
     pub authority_vfk: Option<String>,
+
+    /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
+    /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
+    /// This is REQUIRED to start the MCP server - deposits can only be made to your own privacy address
+    #[validate(length(min = 1))]
+    pub privpool_spend_key: String,
 }
 
 fn default_server_bind_address() -> String {

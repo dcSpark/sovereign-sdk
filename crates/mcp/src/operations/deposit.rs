@@ -16,12 +16,17 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
 
+use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
 // Use the same spec types as the MCP server
 pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
+
+/// Domain tag for the privacy pool (matches the value in transfer.rs and genesis config)
+/// This should ideally be fetched from the chain, but for now we use the same constant
+const DOMAIN: [u8; 32] = [1u8; 32];
 
 /// Result of a deposit operation
 #[derive(Debug)]
@@ -109,7 +114,7 @@ pub async fn create_deposit_unsigned_tx(
 /// Deposit funds into the Midnight Privacy shielded pool
 ///
 /// This operation:
-/// 1. Generates random rho and recipient values for the note
+/// 1. Derives recipient from the provided privacy key
 /// 2. Creates a deposit transaction that moves funds from transparent to shielded
 /// 3. Signs and submits the transaction to the verifier service (which forwards to sequencer)
 ///
@@ -117,22 +122,37 @@ pub async fn create_deposit_unsigned_tx(
 /// * `provider` - Provider for rollup connection
 /// * `wallet` - Wallet context for signing
 /// * `amount` - Amount to deposit (in the smallest unit)
+/// * `privacy_key` - Privacy key to derive recipient address from (REQUIRED)
 ///
 /// # Returns
 /// DepositResult containing the transaction hash and note parameters (rho, recipient)
+///
+/// # Note
+/// All deposits are made to the privacy address derived from the privacy key.
+/// Users cannot deposit to other addresses - this ensures you can spend your own notes.
 pub async fn deposit(
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     amount: u128,
+    privacy_key: &PrivacyKey,
 ) -> Result<DepositResult> {
     tracing::info!("Creating deposit for amount: {}", amount);
 
-    // Generate random note parameters using rand::random() which is Send-safe
+    // Always generate random rho
     let rho: [u8; 32] = rand::random();
-    let recipient: [u8; 32] = rand::random();
+
+    // Derive recipient from privacy key (always required)
+    let recipient = privacy_key.recipient(&DOMAIN);
+    let privacy_address = privacy_key.privacy_address();
+
+    tracing::info!(
+        "Depositing to privacy address: {} (recipient: {})",
+        privacy_address,
+        hex::encode(&recipient)
+    );
 
     tracing::debug!(
-        "Generated note parameters - rho: {}, recipient: {}",
+        "Note parameters - rho: {}, recipient: {}",
         hex::encode(&rho),
         hex::encode(&recipient)
     );
@@ -184,6 +204,13 @@ mod tests {
             WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
                 .expect("Failed to create wallet");
 
+        // Create a test privacy key
+        let test_spend_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let privacy_key = PrivacyKey::from_hex(test_spend_sk)
+            .expect("Failed to create privacy key");
+
+        tracing::info!("Privacy address: {}", privacy_key.privacy_address());
+
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
         let verifier_url = std::env::var("VERIFIER_URL")
@@ -198,7 +225,7 @@ mod tests {
 
         tracing::info!("Calling deposit with amount: {}", amount);
 
-        let result = deposit(&provider, &wallet, amount).await;
+        let result = deposit(&provider, &wallet, amount, &privacy_key).await;
 
         assert!(result.is_ok(), "deposit should succeed: {:?}", result.err());
 
@@ -209,9 +236,12 @@ mod tests {
             "tx_hash should not be empty"
         );
         assert_ne!(deposit_result.rho, [0u8; 32], "rho should be random");
-        assert_ne!(
-            deposit_result.recipient, [0u8; 32],
-            "recipient should be random"
+
+        // Recipient should match the privacy key's derived recipient
+        let expected_recipient = privacy_key.recipient(&DOMAIN);
+        assert_eq!(
+            deposit_result.recipient, expected_recipient,
+            "recipient should match privacy key's derived recipient"
         );
 
         tracing::info!("✅ Deposit transaction submitted successfully!");

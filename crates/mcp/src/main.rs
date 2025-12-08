@@ -6,6 +6,7 @@ mod authority_vfk;
 mod config;
 mod ligero;
 mod operations;
+mod privacy_key;
 mod provider;
 mod server;
 mod viewer;
@@ -21,6 +22,7 @@ use tokio::sync::RwLock;
 use crate::authority_vfk::AuthorityVfk;
 use crate::config::Config;
 use crate::ligero::Ligero;
+use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::server::CryptoServer;
 use crate::wallet::WalletContext;
@@ -91,6 +93,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Initialize privacy key (REQUIRED)
+    tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
+
+    // Try to parse as bech32m address first, then as hex
+    let privacy_key = if cfg.privpool_spend_key.starts_with("privpool1") {
+        PrivacyKey::from_address(&cfg.privpool_spend_key)
+    } else {
+        PrivacyKey::from_hex(&cfg.privpool_spend_key)
+    }
+    .map_err(|e| {
+        format!(
+            "Failed to initialize privacy key from PRIVPOOL_SPEND_KEY: {}. \
+            Please provide a valid 32-byte hex string (with or without 0x prefix) \
+            or a bech32m privacy address (privpool1...)",
+            e
+        )
+    })?;
+
+    tracing::info!("[mcp] Privacy key initialized successfully");
+    tracing::info!("[mcp] Privacy address: {}", privacy_key.privacy_address());
+    tracing::info!(
+        "[mcp] All deposits will be made to this privacy address: {}",
+        privacy_key.privacy_address()
+    );
+
+    let privacy_key = Arc::new(privacy_key);
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -104,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_ctx.clone(),
                 ligero.clone(),
                 authority_vfk.clone(),
+                privacy_key.clone(), // Always present, required for server startup
             ))
         },
         LocalSessionManager::default().into(),
