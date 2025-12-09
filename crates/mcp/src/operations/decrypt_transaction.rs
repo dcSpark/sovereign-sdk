@@ -79,8 +79,7 @@ pub async fn decrypt_transaction(
     tracing::info!("Fetching transaction {} for decryption", tx_hash);
 
     // Parse VFK from hex string
-    let vfk = parse_vfk_hex(vfk_hex)
-        .context("Failed to parse VFK hex string")?;
+    let vfk = parse_vfk_hex(vfk_hex).context("Failed to parse VFK hex string")?;
 
     // Fetch transaction from indexer
     let tx_option = provider
@@ -88,9 +87,8 @@ pub async fn decrypt_transaction(
         .await
         .with_context(|| format!("Failed to fetch transaction {}", tx_hash))?;
 
-    let tx = tx_option.ok_or_else(|| {
-        anyhow::anyhow!("Transaction {} not found in indexer", tx_hash)
-    })?;
+    let tx =
+        tx_option.ok_or_else(|| anyhow::anyhow!("Transaction {} not found in indexer", tx_hash))?;
 
     tracing::info!(
         "Transaction fetched: kind={}, status={:?}",
@@ -113,7 +111,11 @@ pub async fn decrypt_transaction(
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
         match viewer::decrypt_note(&vfk, encrypted_note) {
             Ok((domain, value, rho, recipient, sender_id)) => {
-                let note_type = if sender_id.is_some() { "transfer" } else { "deposit" };
+                let note_type = if sender_id.is_some() {
+                    "transfer"
+                } else {
+                    "deposit"
+                };
                 tracing::info!(
                     "Successfully decrypted {} note {}: value={}",
                     note_type,
@@ -161,8 +163,7 @@ pub async fn decrypt_transaction(
 fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
     let s = vfk_hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .with_context(|| format!("Invalid hex string: {}", vfk_hex))?;
+    let bytes = hex::decode(s).with_context(|| format!("Invalid hex string: {}", vfk_hex))?;
 
     if bytes.len() != 32 {
         anyhow::bail!("VFK must be exactly 32 bytes, got {} bytes", bytes.len());
@@ -174,7 +175,9 @@ fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
 }
 
 /// Extract encrypted notes from the transaction's encrypted_notes field
-fn extract_encrypted_notes_from_tx(encrypted_notes_field: &Option<serde_json::Value>) -> Result<Vec<EncryptedNote>> {
+fn extract_encrypted_notes_from_tx(
+    encrypted_notes_field: &Option<serde_json::Value>,
+) -> Result<Vec<EncryptedNote>> {
     let encrypted_notes_value = match encrypted_notes_field {
         Some(val) => val,
         None => {
@@ -187,7 +190,10 @@ fn extract_encrypted_notes_from_tx(encrypted_notes_field: &Option<serde_json::Va
     let arr = match encrypted_notes_value.as_array() {
         Some(arr) => arr,
         None => {
-            tracing::warn!("encrypted_notes field is not an array: {:?}", encrypted_notes_value);
+            tracing::warn!(
+                "encrypted_notes field is not an array: {:?}",
+                encrypted_notes_value
+            );
             return Ok(Vec::new());
         }
     };
@@ -200,7 +206,12 @@ fn extract_encrypted_notes_from_tx(encrypted_notes_field: &Option<serde_json::Va
                 encrypted_notes.push(note);
             }
             Err(e) => {
-                tracing::warn!("Failed to parse encrypted note {}: {} - value: {:?}", idx, e, item);
+                tracing::warn!(
+                    "Failed to parse encrypted note {}: {} - value: {:?}",
+                    idx,
+                    e,
+                    item
+                );
             }
         }
     }

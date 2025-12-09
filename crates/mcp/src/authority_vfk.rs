@@ -71,7 +71,11 @@ mod tests {
     #[test]
     fn test_from_hex() {
         let result = AuthorityVfk::from_hex(TEST_VFK_HEX);
-        assert!(result.is_ok(), "Failed to create AuthorityVfk: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create AuthorityVfk: {:?}",
+            result.err()
+        );
 
         let vfk = result.unwrap();
         assert_eq!(vfk.to_hex(), TEST_VFK_HEX);
@@ -81,7 +85,11 @@ mod tests {
     fn test_from_hex_with_0x_prefix() {
         let vfk_with_prefix = format!("0x{}", TEST_VFK_HEX);
         let result = AuthorityVfk::from_hex(&vfk_with_prefix);
-        assert!(result.is_ok(), "Failed to create AuthorityVfk with 0x prefix: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create AuthorityVfk with 0x prefix: {:?}",
+            result.err()
+        );
 
         let vfk = result.unwrap();
         assert_eq!(vfk.to_hex(), TEST_VFK_HEX);

@@ -124,11 +124,8 @@ where
     );
 
     // Convert InvolvementItems to Transaction structs
-    let transactions: Vec<Transaction> = response
-        .items
-        .into_iter()
-        .map(Transaction::from)
-        .collect();
+    let transactions: Vec<Transaction> =
+        response.items.into_iter().map(Transaction::from).collect();
 
     Ok(transactions)
 }

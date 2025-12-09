@@ -172,7 +172,10 @@ pub async fn deposit(
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
 
-    tracing::info!("Deposit transaction submitted successfully via verifier: {}", tx_hash);
+    tracing::info!(
+        "Deposit transaction submitted successfully via verifier: {}",
+        tx_hash
+    );
 
     Ok(DepositResult {
         tx_hash,
@@ -206,17 +209,17 @@ mod tests {
 
         // Create a test privacy key
         let test_spend_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let privacy_key = PrivacyKey::from_hex(test_spend_sk)
-            .expect("Failed to create privacy key");
+        let privacy_key =
+            PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
 
         tracing::info!("Privacy address: {}", privacy_key.privacy_address());
 
         let rpc_url = std::env::var("ROLLUP_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:12346".to_string());
-        let verifier_url = std::env::var("VERIFIER_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let indexer_url = std::env::var("INDEXER_URL")
-            .unwrap_or_else(|_| "http://localhost:13100".to_string());
+        let verifier_url =
+            std::env::var("VERIFIER_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let indexer_url =
+            std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
 
         tracing::info!("Connecting to rollup at: {}", rpc_url);
         let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url)

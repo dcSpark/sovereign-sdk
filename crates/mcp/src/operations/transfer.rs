@@ -254,8 +254,12 @@ async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> R
 
                 for (i, n) in first_batch.notes.iter().enumerate() {
                     if n.commitment.len() == 32 {
-                        tracing::info!("  Note {}: position={}, commitment={}",
-                            i, n.position, hex::encode(&n.commitment));
+                        tracing::info!(
+                            "  Note {}: position={}, commitment={}",
+                            i,
+                            n.position,
+                            hex::encode(&n.commitment)
+                        );
                     }
                 }
             }
@@ -429,6 +433,7 @@ async fn create_transfer_unsigned_tx(
 /// * `value` - Value of the note to transfer
 /// * `input_rho` - Rho (nonce) of the input note to spend
 /// * `input_recipient` - Recipient of the input note to spend
+/// * `output_recipient` - Recipient for the new output note
 ///
 /// # Returns
 /// TransferResult containing the transaction hash and new note parameters
@@ -439,6 +444,7 @@ pub async fn transfer(
     value: u128,
     input_rho: [u8; 32],
     input_recipient: [u8; 32],
+    output_recipient: [u8; 32],
 ) -> Result<TransferResult> {
     tracing::info!("Starting transfer for value: {}", value);
     let overall_start = StdInstant::now();
@@ -491,7 +497,7 @@ pub async fn transfer(
 
     // Step 3: Generate new output note parameters
     let out_rho: [u8; 32] = rand::random();
-    let out_recipient: [u8; 32] = rand::random();
+    let out_recipient: [u8; 32] = output_recipient;
     let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
     // Step 4: Compute nullifier
@@ -504,11 +510,20 @@ pub async fn transfer(
             "Authority VFK configured: generating viewer attestation and encrypted note for compliance"
         );
         // sender_id for transfers is the input_recipient (spender's address)
-        let (attestation, encrypted_note) =
-            viewer::make_viewer_bundle(&vfk, &DOMAIN, value, &out_rho, &out_recipient, &input_recipient, &cm_out);
+        let (attestation, encrypted_note) = viewer::make_viewer_bundle(
+            &vfk,
+            &DOMAIN,
+            value,
+            &out_rho,
+            &out_recipient,
+            &input_recipient,
+            &cm_out,
+        );
         (Some(vec![attestation]), Some(vec![encrypted_note]))
     } else {
-        tracing::debug!("No authority VFK configured: transfer will not include viewer attestation");
+        tracing::debug!(
+            "No authority VFK configured: transfer will not include viewer attestation"
+        );
         (None, None)
     };
 
@@ -543,41 +558,83 @@ pub async fn transfer(
     // Prepare proof arguments with correct HEX/STR format
     // Hash values use HEX format, numeric values use STR format
     let mut proof_args: Vec<LigeroProgramArguments> = vec![
-        LigeroProgramArguments::HEX { hex: hex::encode(DOMAIN) },          // domain
-        LigeroProgramArguments::STR { str: value.to_string() },            // value
-        LigeroProgramArguments::HEX { hex: hex::encode(input_rho) },       // in_rho
-        LigeroProgramArguments::HEX { hex: hex::encode(input_recipient) }, // in_recipient
-        LigeroProgramArguments::HEX { hex: hex::encode(NF_KEY) },          // nf_key
-        LigeroProgramArguments::STR { str: position.to_string() },         // position
-        LigeroProgramArguments::STR { str: depth.to_string() },            // depth
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(DOMAIN),
+        }, // domain
+        LigeroProgramArguments::STR {
+            str: value.to_string(),
+        }, // value
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(input_rho),
+        }, // in_rho
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(input_recipient),
+        }, // in_recipient
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(NF_KEY),
+        }, // nf_key
+        LigeroProgramArguments::STR {
+            str: position.to_string(),
+        }, // position
+        LigeroProgramArguments::STR {
+            str: depth.to_string(),
+        }, // depth
     ];
 
     // Add siblings as HEX
     for s in &siblings {
-        proof_args.push(LigeroProgramArguments::HEX { hex: hex::encode(s) });
+        proof_args.push(LigeroProgramArguments::HEX {
+            hex: hex::encode(s),
+        });
     }
 
     // Add remaining public inputs
     proof_args.extend_from_slice(&[
-        LigeroProgramArguments::HEX { hex: hex::encode(anchor_root) },   // anchor
-        LigeroProgramArguments::HEX { hex: hex::encode(nf) },            // nullifier
-        LigeroProgramArguments::STR { str: "0".to_string() },            // withdraw_amount
-        LigeroProgramArguments::STR { str: num_outputs.to_string() },    // num_outputs
-        LigeroProgramArguments::STR { str: value.to_string() },          // output value
-        LigeroProgramArguments::HEX { hex: hex::encode(out_rho) },       // output rho
-        LigeroProgramArguments::HEX { hex: hex::encode(out_recipient) }, // output recipient
-        LigeroProgramArguments::HEX { hex: hex::encode(cm_out) },        // output commitment
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(anchor_root),
+        }, // anchor
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(nf),
+        }, // nullifier
+        LigeroProgramArguments::STR {
+            str: "0".to_string(),
+        }, // withdraw_amount
+        LigeroProgramArguments::STR {
+            str: num_outputs.to_string(),
+        }, // num_outputs
+        LigeroProgramArguments::STR {
+            str: value.to_string(),
+        }, // output value
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(out_rho),
+        }, // output rho
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(out_recipient),
+        }, // output recipient
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(cm_out),
+        }, // output commitment
     ]);
 
     // Add viewer section arguments if authority VFK is configured
     if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
         if let Some(att) = atts.first() {
             proof_args.extend_from_slice(&[
-                LigeroProgramArguments::STR { str: "1".to_string() },              // m_viewers
-                LigeroProgramArguments::HEX { hex: hex::encode(att.fvk_commitment) }, // vfk_commitment
-                LigeroProgramArguments::HEX { hex: hex::encode(vfk) },             // vfk (private)
-                LigeroProgramArguments::HEX { hex: hex::encode(att.ct_hash) },     // ct_hash
-                LigeroProgramArguments::HEX { hex: hex::encode(att.mac) },         // mac
+                LigeroProgramArguments::STR {
+                    str: "1".to_string(),
+                }, // m_viewers
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(att.fvk_commitment),
+                }, // vfk_commitment
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(vfk),
+                }, // vfk (private)
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(att.ct_hash),
+                }, // ct_hash
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(att.mac),
+                }, // mac
             ]);
         }
     }
@@ -590,12 +647,7 @@ pub async fn transfer(
     let (packing, gpu_threads) = ligero.resolve_prover_params(8192, None);
     let proof_start = StdInstant::now();
     let proof_bytes_raw = ligero
-        .generate_proof(
-            packing,
-            gpu_threads,
-            private_indices,
-            proof_args,
-        )
+        .generate_proof(packing, gpu_threads, private_indices, proof_args)
         .inspect_err(|e| tracing::error!("Failed to generate Ligero proof for transfer: {:?}", e))
         .context("Failed to generate Ligero proof for transfer")?;
 
@@ -623,8 +675,8 @@ pub async fn transfer(
         private_indices: private_indices_for_package,
     };
 
-    let proof_bytes = bincode::serialize(&proof_package)
-        .context("Failed to serialize Ligero proof package")?;
+    let proof_bytes =
+        bincode::serialize(&proof_package).context("Failed to serialize Ligero proof package")?;
     tracing::debug!(
         proof_package_len = proof_bytes.len(),
         "Serialized Ligero proof package for submission"
@@ -632,8 +684,15 @@ pub async fn transfer(
 
     // Step 6: Create and sign transaction
     let unsigned_tx_start = StdInstant::now();
-    let unsigned_tx =
-        create_transfer_unsigned_tx(provider, wallet, proof_bytes, anchor_root, nf, view_ciphertexts).await?;
+    let unsigned_tx = create_transfer_unsigned_tx(
+        provider,
+        wallet,
+        proof_bytes,
+        anchor_root,
+        nf,
+        view_ciphertexts,
+    )
+    .await?;
     tracing::info!(
         elapsed_ms = unsigned_tx_start.elapsed().as_millis(),
         "Unsigned transfer transaction created"

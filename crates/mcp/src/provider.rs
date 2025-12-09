@@ -215,7 +215,11 @@ impl Provider {
         let endpoint = format!("{}/midnight-privacy", base_url);
 
         tracing::info!("Submitting transaction to verifier service at {}", endpoint);
-        tracing::debug!("Transaction size: {} bytes, base64 size: {} bytes", raw_tx.len(), tx_b64.len());
+        tracing::debug!(
+            "Transaction size: {} bytes, base64 size: {} bytes",
+            raw_tx.len(),
+            tx_b64.len()
+        );
 
         let resp = self
             .http_client
@@ -241,7 +245,10 @@ impl Provider {
             );
         }
 
-        let body = resp.text().await.context("Failed to read verifier response")?;
+        let body = resp
+            .text()
+            .await
+            .context("Failed to read verifier response")?;
 
         #[derive(serde::Deserialize)]
         struct VerifierResponse {
@@ -250,13 +257,15 @@ impl Provider {
             error: Option<String>,
         }
 
-        let verifier_resp: VerifierResponse = serde_json::from_str(&body)
-            .context("Failed to parse verifier response")?;
+        let verifier_resp: VerifierResponse =
+            serde_json::from_str(&body).context("Failed to parse verifier response")?;
 
         if !verifier_resp.success {
             anyhow::bail!(
                 "Verifier service reported failure: {}",
-                verifier_resp.error.unwrap_or_else(|| "Unknown error".to_string())
+                verifier_resp
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string())
             );
         }
 
@@ -268,7 +277,6 @@ impl Provider {
 
         Ok(tx_hash)
     }
-
 
     /// Get the RPC URL this provider is connected to
     pub fn rpc_url(&self) -> &str {
@@ -334,11 +342,7 @@ impl Provider {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Indexer returned error status {}: {}",
-                status,
-                body
-            );
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
         }
 
         let tx: InvolvementItem = response
@@ -433,11 +437,7 @@ impl Provider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Indexer returned error status {}: {}",
-                status,
-                body
-            );
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
         }
 
         let tx_list: ListTransactionsResponse = response
@@ -449,6 +449,79 @@ impl Provider {
             "Fetched {} transactions for address {}",
             tx_list.items.len(),
             address
+        );
+
+        Ok(tx_list)
+    }
+
+    /// Get all transactions from the indexer (global list, not filtered by address)
+    ///
+    /// This is used for privacy pool balance calculation, where we need to scan all
+    /// transactions to find notes that belong to the user.
+    ///
+    /// # Parameters
+    /// * `limit` - Optional limit on number of transactions per page (default: 100)
+    /// * `offset` - Optional offset for pagination (default: 0)
+    ///
+    /// # Returns
+    /// A list of all transactions from the indexer
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
+    /// println!("Found {} transactions", transactions.items.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_all_transactions(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListTransactionsResponse> {
+        // Trim trailing slash from indexer_url to avoid double slashes
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let mut url = format!("{}/txs", base_url);
+
+        // Build query parameters
+        let mut query_params = Vec::new();
+        if let Some(limit) = limit {
+            query_params.push(format!("limit={}", limit));
+        }
+        if let Some(offset) = offset {
+            query_params.push(format!("offset={}", offset));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        tracing::debug!("Fetching all transactions from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
+        }
+
+        let tx_list: ListTransactionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse transactions list from indexer")?;
+
+        tracing::debug!(
+            "Fetched {} transactions from indexer (offset: {:?}, limit: {:?})",
+            tx_list.items.len(),
+            offset,
+            limit
         );
 
         Ok(tx_list)

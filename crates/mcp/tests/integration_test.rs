@@ -5,6 +5,7 @@
 //! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL) should be set in .env.
 
 use anyhow::Result;
+use demo_stf::runtime::Runtime;
 use mcp::ligero::Ligero;
 use mcp::operations::{deposit, transfer};
 use mcp::provider::Provider;
@@ -16,7 +17,6 @@ use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
-use demo_stf::runtime::Runtime;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
@@ -71,8 +71,8 @@ fn create_test_ligero() -> Ligero {
         .join(os_name)
         .join("shader");
 
-    let program_path = base_path
-        .join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm");
+    let program_path =
+        base_path.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm");
 
     Ligero::new(
         Some(prover_binary_path),
@@ -92,14 +92,12 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Starting deposit and transfer integration test");
 
     // Get configuration from environment
-    let wallet_private_key = std::env::var("WALLET_PRIVATE_KEY")
-        .expect("WALLET_PRIVATE_KEY must be set in .env");
-    let rpc_url = std::env::var("ROLLUP_RPC_URL")
-        .expect("ROLLUP_RPC_URL must be set in .env");
-    let verifier_url = std::env::var("VERIFIER_URL")
-        .expect("VERIFIER_URL must be set in .env");
-    let indexer_url = std::env::var("INDEXER_URL")
-        .unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let wallet_private_key =
+        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
+    let rpc_url = std::env::var("ROLLUP_RPC_URL").expect("ROLLUP_RPC_URL must be set in .env");
+    let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
+    let indexer_url =
+        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
@@ -159,9 +157,15 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("  Recipient: {}", hex::encode(&deposit_result.recipient));
 
     // Step 4a: Verify deposit result contains expected data
-    assert!(!deposit_result.tx_hash.is_empty(), "Transaction hash should not be empty");
+    assert!(
+        !deposit_result.tx_hash.is_empty(),
+        "Transaction hash should not be empty"
+    );
     assert_ne!(deposit_result.rho, [0u8; 32], "Rho should not be all zeros");
-    assert_ne!(deposit_result.recipient, [0u8; 32], "Recipient should not be all zeros");
+    assert_ne!(
+        deposit_result.recipient, [0u8; 32],
+        "Recipient should not be all zeros"
+    );
     tracing::info!("✓ Deposit completed successfully");
 
     // Step 5: Wait for deposit to be included in a block
@@ -184,18 +188,31 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         transfer_value,
         deposit_result.rho,
         deposit_result.recipient,
+        deposit_result.recipient,
     )
     .await?;
 
     tracing::info!("Transfer successful!");
     tracing::info!("  Transaction hash: {}", transfer_result.tx_hash);
     tracing::info!("  New rho: {}", hex::encode(&transfer_result.new_rho));
-    tracing::info!("  New recipient: {}", hex::encode(&transfer_result.new_recipient));
+    tracing::info!(
+        "  New recipient: {}",
+        hex::encode(&transfer_result.new_recipient)
+    );
 
     // Step 7a: Verify transfer result
-    assert!(!transfer_result.tx_hash.is_empty(), "Transfer tx hash should not be empty");
-    assert_ne!(transfer_result.new_rho, [0u8; 32], "New rho should not be all zeros");
-    assert_ne!(transfer_result.new_recipient, [0u8; 32], "New recipient should not be all zeros");
+    assert!(
+        !transfer_result.tx_hash.is_empty(),
+        "Transfer tx hash should not be empty"
+    );
+    assert_ne!(
+        transfer_result.new_rho, [0u8; 32],
+        "New rho should not be all zeros"
+    );
+    assert_ne!(
+        transfer_result.new_recipient, [0u8; 32],
+        "New recipient should not be all zeros"
+    );
     assert_ne!(
         transfer_result.new_rho, deposit_result.rho,
         "New rho should be different from input rho"
@@ -221,8 +238,8 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 async fn test_wallet_address_format() -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    let wallet_private_key = std::env::var("WALLET_PRIVATE_KEY")
-        .expect("WALLET_PRIVATE_KEY must be set in .env");
+    let wallet_private_key =
+        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
 
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let address = wallet.get_address();
@@ -254,14 +271,12 @@ async fn test_wallet_address_format() -> Result<()> {
 async fn test_balance_check() -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    let wallet_private_key = std::env::var("WALLET_PRIVATE_KEY")
-        .expect("WALLET_PRIVATE_KEY must be set in .env");
-    let rpc_url = std::env::var("ROLLUP_RPC_URL")
-        .expect("ROLLUP_RPC_URL must be set in .env");
-    let verifier_url = std::env::var("VERIFIER_URL")
-        .expect("VERIFIER_URL must be set in .env");
-    let indexer_url = std::env::var("INDEXER_URL")
-        .unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let wallet_private_key =
+        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
+    let rpc_url = std::env::var("ROLLUP_RPC_URL").expect("ROLLUP_RPC_URL must be set in .env");
+    let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
+    let indexer_url =
+        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
@@ -273,9 +288,7 @@ async fn test_balance_check() -> Result<()> {
 
     let token_id: TokenId = config_gas_token_id();
     let address = wallet.get_address();
-    let balance = provider
-        .get_balance::<McpSpec>(&address, &token_id)
-        .await?;
+    let balance = provider.get_balance::<McpSpec>(&address, &token_id).await?;
 
     let balance_u128: u128 = balance.0;
     tracing::info!("Wallet balance: {}", balance_u128);

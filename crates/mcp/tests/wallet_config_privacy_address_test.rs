@@ -9,8 +9,7 @@ use mcp::privacy_key::PrivacyKey;
 fn test_privacy_address_format() {
     // Create a test privacy key
     let test_spend_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let privacy_key = PrivacyKey::from_hex(test_spend_sk)
-        .expect("Failed to create privacy key");
+    let privacy_key = PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
 
     // Get the privacy address
     let privacy_address = privacy_key.privacy_address();
@@ -57,13 +56,13 @@ fn test_privacy_address_consistency() {
 #[test]
 fn test_different_keys_different_addresses() {
     // Different keys should produce different addresses
-    let key1 = PrivacyKey::from_hex(
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    ).unwrap();
+    let key1 =
+        PrivacyKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
 
-    let key2 = PrivacyKey::from_hex(
-        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    ).unwrap();
+    let key2 =
+        PrivacyKey::from_hex("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
 
     let addr1 = key1.privacy_address().to_string();
     let addr2 = key2.privacy_address().to_string();

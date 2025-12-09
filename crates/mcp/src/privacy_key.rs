@@ -263,10 +263,7 @@ mod tests {
 
         // NF key should be deterministic for same domain
         let nf_key2 = key.nf_key(&domain_bytes);
-        assert_eq!(
-            nf_key, nf_key2,
-            "NF key derivation should be deterministic"
-        );
+        assert_eq!(nf_key, nf_key2, "NF key derivation should be deterministic");
     }
 
     #[test]

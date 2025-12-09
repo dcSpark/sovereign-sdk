@@ -13,8 +13,8 @@ fn test_privacy_address_to_recipient() {
     let privacy_address = "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
 
     // Parse the privacy address
-    let key_from_address = PrivacyKey::from_address(privacy_address)
-        .expect("Failed to parse privacy address");
+    let key_from_address =
+        PrivacyKey::from_address(privacy_address).expect("Failed to parse privacy address");
 
     // Derive the recipient from the privacy address
     let recipient = key_from_address.recipient(&DOMAIN);
@@ -59,8 +59,7 @@ fn test_reverse_engineer_privacy_key() {
 
     // Try the privacy address from the user
     let privacy_address = "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
-    let key = PrivacyKey::from_address(privacy_address)
-        .expect("Failed to parse privacy address");
+    let key = PrivacyKey::from_address(privacy_address).expect("Failed to parse privacy address");
 
     let derived_recipient = hex::encode(&key.recipient(&DOMAIN));
 
@@ -84,8 +83,7 @@ fn test_show_privacy_address_components() {
     let privacy_address = "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
 
     // Parse the privacy address to get the public key
-    let key = PrivacyKey::from_address(privacy_address)
-        .expect("Failed to parse privacy address");
+    let key = PrivacyKey::from_address(privacy_address).expect("Failed to parse privacy address");
 
     // Get the public key (pk_out)
     let pk = key.pk();

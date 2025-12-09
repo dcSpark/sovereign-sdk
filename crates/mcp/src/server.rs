@@ -61,7 +61,10 @@ pub struct GetWalletAddressRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct GetWalletAddressResult {
+    /// Transparent wallet address
     pub address: String,
+    /// Privacy pool address for receiving shielded funds
+    pub privacy_address: String,
 }
 
 // -----------------------------
@@ -69,7 +72,8 @@ pub struct GetWalletAddressResult {
 // -----------------------------
 
 /// Default gas token ID
-pub const DEFAULT_TOKEN_ID: &str = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
+pub const DEFAULT_TOKEN_ID: &str =
+    "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetWalletBalanceRequest {
@@ -244,6 +248,8 @@ pub struct TransferRequest {
     pub input_rho: String,
     /// Recipient of the input note to spend (hex string)
     pub input_recipient: String,
+    /// Recipient for the output note (hex string)
+    pub output_recipient: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -263,8 +269,9 @@ pub struct TransferResult {
 pub struct DecryptTransactionRequest {
     /// Transaction hash to decrypt (with or without 0x prefix)
     pub tx_hash: String,
-    /// Authority VFK (32-byte hex string, with or without 0x prefix)
-    pub vfk: String,
+    /// Optional VFK (32-byte hex string, with or without 0x prefix). Defaults to configured AUTHORITY_VFK.
+    #[serde(default)]
+    pub vfk: Option<String>,
 }
 
 /// Decrypted note information from a transaction
@@ -303,6 +310,47 @@ pub struct DecryptTransactionResult {
     pub decrypted_count: usize,
     /// Total number of encrypted notes in the transaction
     pub total_encrypted_notes: usize,
+}
+
+// -----------------------------
+// Types for GetPrivacyBalance
+// -----------------------------
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GetPrivacyBalanceRequest {
+    /// Optional viewing key (hex) to decrypt notes; overrides AUTHORITY_VFK if provided.
+    #[serde(default)]
+    pub viewing_key: Option<String>,
+}
+
+/// An unspent note in the privacy pool
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct UnspentNoteInfo {
+    /// Note value
+    pub value: String,
+    /// Note rho (nonce) as hex string
+    pub rho: String,
+    /// Transaction hash where this note was created
+    pub tx_hash: String,
+    /// Timestamp when the note was created (milliseconds)
+    pub timestamp_ms: i64,
+    /// Transaction kind (deposit, transfer, withdraw)
+    pub kind: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetPrivacyBalanceResult {
+    /// Total unspent balance in the privacy pool
+    pub balance: String,
+    /// List of unspent notes
+    pub unspent_notes: Vec<UnspentNoteInfo>,
+    /// Number of deposits received
+    pub deposit_count: usize,
+    /// Number of transfers received
+    pub transfer_count: usize,
+    /// Number of withdrawals made
+    pub withdraw_count: usize,
+    /// Total transactions scanned
+    pub total_transactions_scanned: usize,
 }
 
 #[derive(Clone)]
@@ -436,10 +484,10 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Return the wallet's default address.
+    /// Return the wallet's default address and privacy pool address.
     #[tool(
         name = "walletAddress",
-        description = "Return the wallet's default address."
+        description = "Return the wallet's default address and privacy pool address for receiving shielded funds."
     )]
     async fn wallet_address(
         &self,
@@ -457,7 +505,13 @@ impl CryptoServer {
         let address = crate::operations::get_default_address(&*ctx)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let result = GetWalletAddressResult { address };
+        // Get privacy address from privacy key
+        let privacy_address = self.privacy_key.privacy_address().to_string();
+
+        let result = GetWalletAddressResult {
+            address,
+            privacy_address,
+        };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
@@ -660,7 +714,7 @@ impl CryptoServer {
     /// Creates a ZK proof to spend an existing note and creates a new output note.
     #[tool(
         name = "transfer",
-        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note."
+        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note. Requires `output_recipient` (32-byte hex) to direct the output to the desired recipient."
     )]
     async fn transfer(
         &self,
@@ -732,6 +786,25 @@ impl CryptoServer {
         let mut input_recipient = [0u8; 32];
         input_recipient.copy_from_slice(&input_recipient_bytes);
 
+        // Output recipient (required)
+        let out_recipient_hex = params.output_recipient.trim_start_matches("0x");
+        let out_recipient_bytes = hex::decode(out_recipient_hex).map_err(|_| {
+            ErrorData::invalid_params(
+                "Invalid output_recipient format. Must be a valid hex string.",
+                None,
+            )
+        })?;
+
+        if out_recipient_bytes.len() != 32 {
+            return Err(ErrorData::invalid_params(
+                "output_recipient must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+
+        let mut output_recipient = [0u8; 32];
+        output_recipient.copy_from_slice(&out_recipient_bytes);
+
         tracing::debug!(
             "transfer called with value: {}, input_rho: {}, input_recipient: {}",
             value,
@@ -739,10 +812,17 @@ impl CryptoServer {
             hex::encode(&input_recipient)
         );
 
-        let transfer_result =
-            crate::operations::transfer(ligero, provider, &*ctx, value, input_rho, input_recipient)
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let transfer_result = crate::operations::transfer(
+            ligero,
+            provider,
+            &*ctx,
+            value,
+            input_rho,
+            input_recipient,
+            output_recipient,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = TransferResult {
             tx_hash: transfer_result.tx_hash,
@@ -773,26 +853,119 @@ impl CryptoServer {
             )
         })?;
 
-        let decrypt_result = crate::operations::decrypt_transaction(provider, &params.tx_hash, &params.vfk)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        // Choose VFK: request parameter overrides configured AUTHORITY_VFK
+        let vfk_hex = if let Some(ref provided) = params.vfk {
+            provided.clone()
+        } else if let Some(ref authority_vfk) = self.authority_vfk {
+            hex::encode(authority_vfk.as_bytes())
+        } else {
+            return Err(ErrorData::invalid_params(
+                "Viewing key not provided. Pass `vfk` or set AUTHORITY_VFK.",
+                None,
+            ));
+        };
+
+        let decrypt_result =
+            crate::operations::decrypt_transaction(provider, &params.tx_hash, &vfk_hex)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = DecryptTransactionResult {
             tx_hash: decrypt_result.tx_hash,
             status: decrypt_result.status,
             kind: decrypt_result.kind,
             timestamp_ms: decrypt_result.timestamp_ms,
-            decrypted_notes: decrypt_result.decrypted_notes.into_iter().map(|note| {
-                DecryptedNoteInfo {
+            decrypted_notes: decrypt_result
+                .decrypted_notes
+                .into_iter()
+                .map(|note| DecryptedNoteInfo {
                     domain: note.domain,
                     value: note.value.to_string(),
                     rho: note.rho,
                     recipient: note.recipient,
                     sender_id: note.sender_id,
-                }
-            }).collect(),
+                })
+                .collect(),
             decrypted_count: decrypt_result.decrypted_count,
             total_encrypted_notes: decrypt_result.total_encrypted_notes,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get privacy pool balance by scanning all transactions.
+    /// Scans the entire transaction history from the indexer, decrypts notes using the viewing key,
+    /// identifies notes belonging to the user, tracks spent notes, and calculates the unspent balance.
+    #[tool(
+        name = "getPrivacyBalance",
+        description = "Get privacy pool balance. Scans all transactions from the indexer, decrypts notes with viewing key, and calculates unspent balance."
+    )]
+    async fn get_privacy_balance(
+        &self,
+        Parameters(params): Parameters<GetPrivacyBalanceRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        // Choose viewing key: request param overrides configured AUTHORITY_VFK
+        let viewing_key_bytes = if let Some(ref hex_key) = params.viewing_key {
+            let key_str = hex_key.trim().trim_start_matches("0x");
+            let bytes = hex::decode(key_str).map_err(|_| {
+                ErrorData::invalid_params(
+                    "Invalid viewing_key: must be 32-byte hex (with or without 0x prefix).",
+                    None,
+                )
+            })?;
+
+            if bytes.len() != 32 {
+                return Err(ErrorData::invalid_params(
+                    "Invalid viewing_key: must be exactly 32 bytes (64 hex chars).",
+                    None,
+                ));
+            }
+
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        } else if let Some(ref authority_vfk) = self.authority_vfk {
+            *authority_vfk.as_bytes()
+        } else {
+            return Err(ErrorData::invalid_params(
+                "Viewing key not provided. Pass `viewing_key` or set AUTHORITY_VFK to decrypt notes.",
+                None,
+            ));
+        };
+
+        let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
+
+        let balance_result =
+            crate::operations::get_privacy_balance(provider, &self.privacy_key, &viewing_key)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = GetPrivacyBalanceResult {
+            balance: balance_result.balance.to_string(),
+            unspent_notes: balance_result
+                .unspent_notes
+                .into_iter()
+                .map(|note| UnspentNoteInfo {
+                    value: note.value.to_string(),
+                    rho: note.rho,
+                    tx_hash: note.tx_hash,
+                    timestamp_ms: note.timestamp_ms,
+                    kind: note.kind,
+                })
+                .collect(),
+            deposit_count: balance_result.deposit_count,
+            transfer_count: balance_result.transfer_count,
+            withdraw_count: balance_result.withdraw_count,
+            total_transactions_scanned: balance_result.total_transactions_scanned,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
