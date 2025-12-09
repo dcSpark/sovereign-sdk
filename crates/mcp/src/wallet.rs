@@ -1,7 +1,6 @@
-use std::path::PathBuf;
+use std::marker::PhantomData;
 
 use anyhow::{Context, Result};
-use sov_cli::wallet_state::{AddressEntry, WalletState};
 use sov_modules_api::transaction::{Transaction, UnsignedTransaction};
 use sov_modules_api::{CredentialId, CryptoSpec, DispatchCall, PrivateKey, PublicKey, Spec};
 use sov_modules_stf_blueprint::Runtime as RuntimeTrait;
@@ -20,14 +19,9 @@ where
     /// Public key derived from the private key
     public_key: <S::CryptoSpec as CryptoSpec>::PublicKey,
     /// Address derived from the private key
-    #[allow(dead_code)]
     address: S::Address,
-    /// Legacy wallet state (optional, for backward compatibility)
-    #[allow(dead_code)]
-    wallet_state: Option<WalletState<Tx, S>>,
-    /// Legacy wallet path (optional, for backward compatibility)
-    #[allow(dead_code)]
-    wallet_path: Option<PathBuf>,
+    /// Phantom data to maintain generic parameter
+    _phantom: PhantomData<Tx>,
 }
 
 impl<Tx, S> WalletContext<Tx, S>
@@ -83,8 +77,7 @@ where
             private_key,
             public_key,
             address,
-            wallet_state: None,
-            wallet_path: None,
+            _phantom: PhantomData,
         })
     }
 
@@ -101,20 +94,6 @@ where
     /// Get the private key (used internally for signing)
     pub fn load_default_private_key(&self) -> Result<<S::CryptoSpec as CryptoSpec>::PrivateKey> {
         Ok(self.private_key.clone())
-    }
-
-    /// Get the default address entry (legacy - for backward compatibility)
-    #[deprecated(since = "0.3.0", note = "Use get_address() instead")]
-    #[allow(dead_code)]
-    pub fn default_address(&self) -> Option<&AddressEntry<S>> {
-        self.wallet_state.as_ref()?.addresses.default_address()
-    }
-
-    /// Get the wallet path (legacy - for backward compatibility)
-    #[deprecated(since = "0.3.0", note = "Wallet no longer uses file paths")]
-    #[allow(dead_code)]
-    pub fn wallet_path(&self) -> Option<&PathBuf> {
-        self.wallet_path.as_ref()
     }
 
     /// Sign a transaction using the default wallet key
@@ -274,12 +253,9 @@ mod tests {
             WalletContext::<TestRuntime, TestSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
                 .expect("Failed to create wallet");
 
-        // Create a dummy proof package for testing (we're only testing signing, not verification)
-        // This mimics the structure from update_value_zk operation
-        let dummy_proof = vec![0u8; 100]; // Dummy proof bytes
-        let dummy_public_output = vec![0u8; 32]; // Dummy public output
+        let dummy_proof = vec![0u8; 100];
+        let dummy_public_output = vec![0u8; 32];
 
-        // Create a proof package structure (bincode serialized)
         #[derive(serde::Serialize)]
         struct DummyProofPackage {
             proof: Vec<u8>,

@@ -142,7 +142,6 @@ pub fn make_viewer_bundle(
 /// Decrypted note data as (domain, value, rho, recipient, sender_id) where sender_id is Option<Hash32>
 /// - For deposits (112 bytes): sender_id is None
 /// - For transfers (144 bytes): sender_id is Some(Hash32)
-#[allow(dead_code)]
 pub fn decrypt_note(
     vfk: &Hash32,
     encrypted_note: &EncryptedNote,

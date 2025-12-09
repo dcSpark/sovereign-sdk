@@ -1,7 +1,4 @@
 //! Deposit operation for Midnight Privacy module
-//!
-//! Provides functionality for creating deposit transactions that move funds from
-//! transparent balance into the shielded pool.
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
@@ -20,29 +17,18 @@ use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-// Use the same spec types as the MCP server
 pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
-/// Domain tag for the privacy pool (matches the value in transfer.rs and genesis config)
-/// This should ideally be fetched from the chain, but for now we use the same constant
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-/// Result of a deposit operation
 #[derive(Debug)]
 pub struct DepositResult {
-    /// Transaction hash from the rollup
     pub tx_hash: String,
-    /// Random nonce used for the note (for user records)
     pub rho: [u8; 32],
-    /// Recipient binding used for the note (for user records)
     pub recipient: [u8; 32],
 }
 
-/// Create an unsigned transaction for deposit into the privacy pool
-///
-/// Encapsulates transaction creation logic including chain ID retrieval,
-/// nonce/generation retrieval, and proper fee configuration.
 pub async fn create_deposit_unsigned_tx(
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
@@ -112,24 +98,6 @@ pub async fn create_deposit_unsigned_tx(
 }
 
 /// Deposit funds into the Midnight Privacy shielded pool
-///
-/// This operation:
-/// 1. Derives recipient from the provided privacy key
-/// 2. Creates a deposit transaction that moves funds from transparent to shielded
-/// 3. Signs and submits the transaction to the verifier service (which forwards to sequencer)
-///
-/// # Parameters
-/// * `provider` - Provider for rollup connection
-/// * `wallet` - Wallet context for signing
-/// * `amount` - Amount to deposit (in the smallest unit)
-/// * `privacy_key` - Privacy key to derive recipient address from (REQUIRED)
-///
-/// # Returns
-/// DepositResult containing the transaction hash and note parameters (rho, recipient)
-///
-/// # Note
-/// All deposits are made to the privacy address derived from the privacy key.
-/// Users cannot deposit to other addresses - this ensures you can spend your own notes.
 pub async fn deposit(
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
@@ -138,10 +106,7 @@ pub async fn deposit(
 ) -> Result<DepositResult> {
     tracing::info!("Creating deposit for amount: {}", amount);
 
-    // Always generate random rho
     let rho: [u8; 32] = rand::random();
-
-    // Derive recipient from privacy key (always required)
     let recipient = privacy_key.recipient(&DOMAIN);
     let privacy_address = privacy_key.privacy_address();
 

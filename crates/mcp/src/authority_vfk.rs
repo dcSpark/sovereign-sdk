@@ -10,8 +10,7 @@ use anyhow::{Context, Result};
 /// The VFK is a 32-byte key that can be used to decrypt all encrypted notes
 /// in the privacy pool (Level-B encryption for authority viewing).
 pub struct AuthorityVfk {
-    /// The 32-byte viewing full key (to be used in future decrypt implementation)
-    #[allow(dead_code)]
+    /// The 32-byte viewing full key
     vfk: [u8; 32],
 }
 
@@ -48,13 +47,12 @@ impl AuthorityVfk {
         Ok(Self { vfk })
     }
 
-    /// Get the raw VFK bytes (to be used in future decrypt implementation)
-    #[allow(dead_code)]
+    /// Get the raw VFK bytes
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.vfk
     }
 
-    /// Get the VFK as a hex string (to be used in future decrypt implementation)
+    /// Get the VFK as a hex string
     #[allow(dead_code)]
     pub fn to_hex(&self) -> String {
         hex::encode(&self.vfk)

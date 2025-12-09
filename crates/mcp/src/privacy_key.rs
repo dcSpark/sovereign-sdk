@@ -17,7 +17,6 @@ use midnight_privacy::{nf_key_from_sk, pk_from_sk, recipient_from_pk, Hash32, Pr
 /// The spending secret key is a 32-byte key that can be used to:
 /// - Receive funds (via derived public key and recipient address)
 /// - Spend notes (via derived nullifier key)
-#[allow(dead_code)]
 pub struct PrivacyKey {
     /// The 32-byte spending secret key
     spend_sk: Hash32,
@@ -25,7 +24,6 @@ pub struct PrivacyKey {
     pk: Hash32,
 }
 
-#[allow(dead_code)]
 impl PrivacyKey {
     /// Create a PrivacyKey from a hex string
     ///
@@ -109,6 +107,7 @@ impl PrivacyKey {
     }
 
     /// Get the derived public key
+    #[allow(dead_code)]
     pub fn pk(&self) -> &Hash32 {
         &self.pk
     }
@@ -140,6 +139,7 @@ impl PrivacyKey {
     /// - privacy_address: bech32m string for user-facing display
     /// - recipient: 32-byte hash used in note commitments
     /// - nf_key: Optional 32-byte hash used in nullifier derivation (None if no spend_sk)
+    #[allow(dead_code)]
     pub fn derive_all(&self, domain: &Hash32) -> (String, Hash32, Option<Hash32>) {
         let privacy_address = self.privacy_address().to_string();
         let recipient = self.recipient(domain);
@@ -151,11 +151,13 @@ impl PrivacyKey {
     /// Get the spending secret key as a hex string
     ///
     /// Returns None if this PrivacyKey was created from an address (no spend_sk)
+    #[allow(dead_code)]
     pub fn spend_sk_hex(&self) -> Option<String> {
         self.spend_sk().map(|sk| hex::encode(sk))
     }
 
     /// Get the public key as a hex string
+    #[allow(dead_code)]
     pub fn pk_hex(&self) -> String {
         hex::encode(&self.pk)
     }

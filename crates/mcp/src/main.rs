@@ -41,13 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Indexer URL: {}", cfg.indexer_url);
     tracing::info!("[mcp] Initializing wallet from private key...");
 
-    // Create wallet from private key hex string (no files needed!)
     let wallet_ctx = WalletContext::from_private_key_hex(&cfg.wallet_private_key)?;
     let wallet_address = wallet_ctx.get_address();
     tracing::info!("[mcp] Wallet address: {}", wallet_address);
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
-    // Initialize RPC provider (separate from wallet)
     tracing::info!("[mcp] Connecting to rollup RPC, verifier service, and indexer...");
     let provider = Provider::new(
         cfg.rollup_rpc_url.as_str(),
@@ -69,12 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ligero = Arc::new(Ligero::new(
         Some(cfg.ligero_prover_binary_path.clone()),
-        None, // verifier not needed for MCP server
+        None,
         Some(cfg.ligero_shader_path.clone()),
         Some(cfg.ligero_program_path.clone()),
     ));
 
-    // Initialize authority VFK if provided
     let authority_vfk = if let Some(ref vfk_hex) = cfg.authority_vfk {
         tracing::info!("[mcp] Initializing authority VFK from environment variable");
         match AuthorityVfk::from_hex(vfk_hex) {
@@ -93,10 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Initialize privacy key (REQUIRED)
     tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
 
-    // Try to parse as bech32m address first, then as hex
     let privacy_key = if cfg.privpool_spend_key.starts_with("privpool1") {
         PrivacyKey::from_address(&cfg.privpool_spend_key)
     } else {
@@ -124,8 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
     );
-
-    // Create streamable HTTP service with local session manager
     let service = StreamableHttpService::new(
         move || {
             Ok(CryptoServer::new(
@@ -133,17 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_ctx.clone(),
                 ligero.clone(),
                 authority_vfk.clone(),
-                privacy_key.clone(), // Always present, required for server startup
+                privacy_key.clone(),
             ))
         },
         LocalSessionManager::default().into(),
         Default::default(),
     );
 
-    // Create Axum router and nest the service at the base path
     let router = axum::Router::new().nest_service("/mcp", service);
-
-    // Bind to the configured address
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
 
     tracing::info!(
@@ -155,7 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.mcp_server_bind_address
     );
 
-    // Serve with graceful shutdown on Ctrl+C
     let _ = axum::serve(tcp_listener, router)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();

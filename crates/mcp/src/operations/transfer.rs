@@ -1,6 +1,4 @@
 //! Transfer operation for Midnight Privacy module
-//!
-//! Provides functionality for creating shielded transfers within the privacy pool using ZK proofs.
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
@@ -27,7 +25,6 @@ use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
 
-// Use the same spec types as the MCP server
 pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
@@ -40,18 +37,13 @@ const INCLUSION_LOG_INTERVAL_SECS: u64 = 5;
 const MERKLE_FETCH_LOG_EVERY: usize = 10;
 const NOTE_SEARCH_LOG_EVERY: usize = 10;
 
-/// Result of a transfer operation
 #[derive(Debug)]
 pub struct TransferResult {
-    /// Transaction hash from the rollup
     pub tx_hash: String,
-    /// New random nonce for the output note
     pub new_rho: [u8; 32],
-    /// New recipient binding for the output note
     pub new_recipient: [u8; 32],
 }
 
-/// Tree state response from the rollup API
 #[derive(Deserialize, Clone)]
 struct TreeState {
     root: Vec<u8>,
@@ -418,25 +410,6 @@ async fn create_transfer_unsigned_tx(
 }
 
 /// Transfer funds within the Midnight Privacy shielded pool
-///
-/// This operation:
-/// 1. Fetches the current Merkle tree state
-/// 2. Finds the input note to spend (using rho/recipient from previous deposit/transfer)
-/// 3. Generates a ZK proof for the spend using Ligero
-/// 4. Creates new output note with the same value
-/// 5. Submits the transaction and polls for inclusion
-///
-/// # Parameters
-/// * `ligero` - Ligero prover for ZK proof generation
-/// * `provider` - Provider for rollup connection
-/// * `wallet` - Wallet context for signing
-/// * `value` - Value of the note to transfer
-/// * `input_rho` - Rho (nonce) of the input note to spend
-/// * `input_recipient` - Recipient of the input note to spend
-/// * `output_recipient` - Recipient for the new output note
-///
-/// # Returns
-/// TransferResult containing the transaction hash and new note parameters
 pub async fn transfer(
     ligero: &Ligero,
     provider: &Provider,

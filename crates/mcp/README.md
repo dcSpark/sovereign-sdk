@@ -1,35 +1,33 @@
 # MCP Server
 
-Model Context Protocol (MCP) server for interacting with the Sovereign SDK L2 rollup.
+Model Context Protocol (MCP) server for the Sovereign SDK L2 rollup.
 
 ## Overview
 
-This server exposes L2 wallet operations through the MCP protocol, enabling AI assistants and other clients to interact with the rollup network. It handles wallet management, transaction submission, and ZK proof generation using the Ligero adapter.
+This server exposes L2 wallet operations through the MCP protocol, enabling AI assistants and other clients to interact with the rollup network. Features include wallet management, transaction submission, and privacy-preserving transfers with ZK proof generation.
 
 ## Running the Server
 
 ### Prerequisites
 
 - Rust toolchain
-- A running Sovereign SDK L2 rollup node
+- Running Sovereign SDK L2 rollup node
 - Ligero prover binaries and shader files
 
 ### Configuration
 
-Create a `.env` file based on `.env.example`:
-
-```bash
-cp .env.example .env
-```
-
-Configure the following variables:
+Configure the following environment variables:
 
 - `MCP_SERVER_BIND_ADDRESS` - Server bind address (default: `127.0.0.1:3000`)
 - `WALLET_PRIVATE_KEY` - Hex-encoded private key for wallet operations
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
+- `VERIFIER_URL` - Transaction verifier service endpoint
+- `INDEXER_URL` - Transaction indexer endpoint
 - `LIGERO_PROGRAM_PATH` - Path to Ligero program WASM
 - `LIGERO_PROVER_BINARY_PATH` - Path to Ligero prover binary
 - `LIGERO_SHADER_PATH` - Path to shader directory
+- `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
+- `AUTHORITY_VFK` - Optional authority viewing key for note decryption
 
 ### Start the Server
 
@@ -37,19 +35,21 @@ Configure the following variables:
 cargo run -p mcp
 ```
 
-The server will start on the configured address. The MCP endpoint will be available at:
+The MCP endpoint will be available at `http://<bind_address>/mcp`.
 
-```
-http://<bind_address>/mcp
-```
+## API Endpoints
 
-### Logging
+The server exposes the following MCP tools:
 
-Set the `RUST_LOG` environment variable to control log verbosity:
-
-```bash
-RUST_LOG=debug cargo run -p mcp
-```
+- `walletAddress` - Get wallet address and privacy pool address
+- `walletBalance` - Get complete balance state (transparent L2 + privacy pool balances, unspent notes, transaction counts)
+- `getWalletConfig` - Retrieve wallet configuration (includes default token ID)
+- `sendFunds` - Send tokens to another address on the L2 (standard Bank transfer)
+- `deposit` - Deposit funds into the privacy pool
+- `transfer` - Transfer funds within the privacy pool (requires ZK proof)
+- `getTransaction` - Retrieve transaction details by hash
+- `getTransactions` - List all transactions for a wallet
+- `getTransactionWithSelectivePrivacy` - Decrypt privacy transaction notes (requires authority VFK)
 
 ## Testing
 
@@ -58,3 +58,5 @@ Run the test suite:
 ```bash
 cargo test -p mcp
 ```
+
+Set `RUST_LOG=debug` for verbose logging during development.
