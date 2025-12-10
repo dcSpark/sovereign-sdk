@@ -301,14 +301,32 @@ pub struct UnspentNoteInfo {
     pub kind: String,
 }
 
+// Types for CreateWallet
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateWalletRequest {}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct CreateWalletResult {
+    /// New wallet private key (hex string)
+    pub wallet_private_key: String,
+    /// New wallet address
+    pub wallet_address: String,
+    /// New authority VFK (hex string)
+    pub authority_vfk: String,
+    /// New privacy pool spending key (hex string)
+    pub privacy_spend_key: String,
+    /// New privacy pool address
+    pub privacy_address: String,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     ligero_prover: Option<Arc<LigeroProver>>,
-    authority_vfk: Option<Arc<AuthorityVfk>>,
-    privacy_key: Arc<PrivacyKey>,
+    authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+    privacy_key: Arc<RwLock<PrivacyKey>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -318,8 +336,8 @@ impl CryptoServer {
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
-        authority_vfk: Option<Arc<AuthorityVfk>>,
-        privacy_key: Arc<PrivacyKey>,
+        authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+        privacy_key: Arc<RwLock<PrivacyKey>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -410,7 +428,8 @@ impl CryptoServer {
             )
         })?;
 
-        let viewing_key_bytes = if let Some(ref authority_vfk) = self.authority_vfk {
+        let authority_vfk_guard = self.authority_vfk.read().await;
+        let viewing_key_bytes = if let Some(ref authority_vfk) = *authority_vfk_guard {
             *authority_vfk.as_bytes()
         } else {
             return Err(ErrorData::invalid_params(
@@ -422,12 +441,13 @@ impl CryptoServer {
         let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
 
         let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
 
         let unified_result = crate::operations::get_unified_balance(
             provider,
             &*ctx,
             DEFAULT_TOKEN_ID,
-            &self.privacy_key,
+            &*privacy_key_guard,
             &viewing_key,
         )
         .await
@@ -482,7 +502,8 @@ impl CryptoServer {
         let address = crate::operations::get_default_address(&*ctx)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let privacy_address = self.privacy_key.privacy_address().to_string();
+        let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_address = privacy_key_guard.privacy_address().to_string();
 
         let result = GetWalletAddressResult {
             address,
@@ -619,8 +640,9 @@ impl CryptoServer {
         })?;
 
         let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
 
-        let config = crate::operations::get_wallet_config(provider, &*ctx, &self.privacy_key)
+        let config = crate::operations::get_wallet_config(provider, &*ctx, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -669,7 +691,9 @@ impl CryptoServer {
             ErrorData::invalid_params("Invalid amount format. Must be a valid u128 number.", None)
         })?;
 
-        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &self.privacy_key)
+        let privacy_key_guard = self.privacy_key.read().await;
+
+        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -819,9 +843,10 @@ impl CryptoServer {
             )
         })?;
 
+        let authority_vfk_guard = self.authority_vfk.read().await;
         let vfk_hex = if let Some(ref provided) = params.vfk {
             provided.clone()
-        } else if let Some(ref authority_vfk) = self.authority_vfk {
+        } else if let Some(ref authority_vfk) = *authority_vfk_guard {
             hex::encode(authority_vfk.as_bytes())
         } else {
             return Err(ErrorData::invalid_params(
@@ -853,6 +878,87 @@ impl CryptoServer {
                 .collect(),
             decrypted_count: decrypt_result.decrypted_count,
             total_encrypted_notes: decrypt_result.total_encrypted_notes,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Create a new wallet with new keys.
+    /// Generates new wallet private key, authority VFK, and privacy pool spending key.
+    /// All subsequent transactions will use the new keys.
+    #[tool(
+        name = "createWallet",
+        description = "Create a new wallet with new keys. Generates new wallet private key, authority VFK, and privacy pool spending key. All subsequent operations will use the new keys."
+    )]
+    async fn create_wallet(
+        &self,
+        Parameters(_params): Parameters<CreateWalletRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use rand::RngCore;
+
+        // Generate all random bytes first (before any async operations)
+        // This ensures the RNG is dropped before any await points
+        let (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex) = {
+            let mut rng = rand::thread_rng();
+
+            // Generate new wallet private key (32 bytes)
+            let mut wallet_private_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut wallet_private_key_bytes);
+            let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
+
+            // Generate new authority VFK (32 bytes)
+            let mut authority_vfk_bytes = [0u8; 32];
+            rng.fill_bytes(&mut authority_vfk_bytes);
+            let authority_vfk_hex = hex::encode(&authority_vfk_bytes);
+
+            // Generate new privacy spend key (32 bytes)
+            let mut privacy_spend_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut privacy_spend_key_bytes);
+            let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
+
+            (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex)
+        }; // RNG is dropped here
+
+        // Create new wallet context from the private key
+        let new_wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None))?;
+
+        let wallet_address = new_wallet_ctx.get_address().to_string();
+
+        // Create new authority VFK
+        let new_authority_vfk = AuthorityVfk::from_hex(&authority_vfk_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None))?;
+
+        // Create new privacy key
+        let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
+
+        let privacy_address = new_privacy_key.privacy_address().to_string();
+
+        // Replace the existing keys with the new ones
+        if let Some(ref wallet_ctx) = self.wallet_context {
+            let mut ctx_guard = wallet_ctx.write().await;
+            *ctx_guard = new_wallet_ctx;
+        }
+
+        let mut authority_vfk_guard = self.authority_vfk.write().await;
+        *authority_vfk_guard = Some(new_authority_vfk);
+
+        let mut privacy_key_guard = self.privacy_key.write().await;
+        *privacy_key_guard = new_privacy_key;
+
+        tracing::info!("[createWallet] New wallet created successfully");
+        tracing::info!("[createWallet] Wallet address: {}", wallet_address);
+        tracing::info!("[createWallet] Privacy address: {}", privacy_address);
+
+        let result = CreateWalletResult {
+            wallet_private_key: wallet_private_key_hex,
+            wallet_address,
+            authority_vfk: authority_vfk_hex,
+            privacy_spend_key: privacy_spend_key_hex,
+            privacy_address,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
