@@ -53,6 +53,10 @@ pub async fn backfill_index(
                 ev_json,
             )
             .await?;
+            // Skip if event already exists (duplicate tx_hash)
+            let Some(event_id) = event_id else {
+                continue;
+            };
             // Try to decrypt encrypted notes using the VFK registry
             let encrypted_notes: Option<serde_json::Value> = row
                 .encrypted_notes_json
@@ -101,6 +105,10 @@ pub async fn backfill_index(
                     ev_json,
                 )
                 .await?;
+                // Skip if event already exists (duplicate tx_hash)
+                let Some(event_id) = event_id else {
+                    continue;
+                };
                 let view_att: Option<serde_json::Value> = row
                     .view_attestations_json
                     .as_deref()
@@ -151,6 +159,10 @@ pub async fn backfill_index(
                 ev_json,
             )
             .await?;
+            // Skip if event already exists (duplicate tx_hash)
+            let Some(event_id) = event_id else {
+                continue;
+            };
             let view_att: Option<serde_json::Value> = row
                 .view_attestations_json
                 .as_deref()
