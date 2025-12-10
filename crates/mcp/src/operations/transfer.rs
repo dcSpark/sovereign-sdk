@@ -41,6 +41,7 @@ const NOTE_SEARCH_LOG_EVERY: usize = 10;
 pub struct TransferResult {
     pub tx_hash: String,
     pub new_rho: [u8; 32],
+    #[allow(dead_code)]
     pub new_recipient: [u8; 32],
 }
 

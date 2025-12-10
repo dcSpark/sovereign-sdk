@@ -26,6 +26,7 @@ const DOMAIN: [u8; 32] = [1u8; 32];
 pub struct DepositResult {
     pub tx_hash: String,
     pub rho: [u8; 32],
+    #[allow(dead_code)]
     pub recipient: [u8; 32],
 }
 

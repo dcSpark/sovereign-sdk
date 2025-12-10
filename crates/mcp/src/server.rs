@@ -211,7 +211,7 @@ pub struct DepositResult {
     pub tx_hash: String,
     /// Random nonce (rho) used for the note
     pub rho: String,
-    /// Recipient binding used for the note
+    /// Recipient privacy address (bech32 format: privpool1...)
     pub recipient: String,
 }
 
@@ -222,9 +222,9 @@ pub struct TransferRequest {
     pub value: String,
     /// Rho (nonce) of the input note to spend (hex string)
     pub input_rho: String,
-    /// Recipient of the input note to spend (hex string)
+    /// Recipient of the input note to spend (bech32 privacy address: privpool1...)
     pub input_recipient: String,
-    /// Recipient for the output note (hex string)
+    /// Recipient for the output note (bech32 privacy address: privpool1...)
     pub output_recipient: String,
 }
 
@@ -234,7 +234,7 @@ pub struct TransferResult {
     pub tx_hash: String,
     /// New random nonce (rho) for the output note
     pub new_rho: String,
-    /// New recipient binding for the output note
+    /// New recipient for the output note (bech32 privacy address: privpool1...)
     pub new_recipient: String,
 }
 
@@ -697,10 +697,12 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let recipient = privacy_key_guard.privacy_address().to_string();
+
         let result = DepositResult {
             tx_hash: deposit_result.tx_hash,
             rho: hex::encode(&deposit_result.rho),
-            recipient: hex::encode(&deposit_result.recipient),
+            recipient,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -712,12 +714,13 @@ impl CryptoServer {
     /// Creates a ZK proof to spend an existing note and creates a new output note.
     #[tool(
         name = "transfer",
-        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note. Requires `output_recipient` (32-byte hex) to direct the output to the desired recipient."
+        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note. Requires privacy addresses in bech32 format (privpool1...)."
     )]
     async fn transfer(
         &self,
         Parameters(params): Parameters<TransferRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::{PrivacyAddress, recipient_from_pk};
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
@@ -765,42 +768,28 @@ impl CryptoServer {
         let mut input_rho = [0u8; 32];
         input_rho.copy_from_slice(&input_rho_bytes);
 
-        // Parse input_recipient from hex string
-        let input_recipient_hex = params.input_recipient.trim_start_matches("0x");
-        let input_recipient_bytes = hex::decode(input_recipient_hex).map_err(|_| {
-            ErrorData::invalid_params(
-                "Invalid input_recipient format. Must be a valid hex string.",
+        // Parse input recipient (bech32 privacy address)
+        let input_privacy_addr: PrivacyAddress = params.input_recipient.parse()
+            .map_err(|e| ErrorData::invalid_params(
+                format!("Invalid input_recipient format. Must be a valid bech32 privacy address (privpool1...): {}", e),
                 None,
-            )
-        })?;
+            ))?;
 
-        if input_recipient_bytes.len() != 32 {
-            return Err(ErrorData::invalid_params(
-                "input_recipient must be exactly 32 bytes (64 hex characters).",
+        // Derive input recipient hash from the privacy address
+        const DOMAIN: [u8; 32] = [1u8; 32];
+        let input_pk = input_privacy_addr.to_pk();
+        let input_recipient = recipient_from_pk(&DOMAIN, &input_pk);
+
+        // Parse output recipient (bech32 privacy address)
+        let output_privacy_addr: PrivacyAddress = params.output_recipient.parse()
+            .map_err(|e| ErrorData::invalid_params(
+                format!("Invalid output_recipient format. Must be a valid bech32 privacy address (privpool1...): {}", e),
                 None,
-            ));
-        }
+            ))?;
 
-        let mut input_recipient = [0u8; 32];
-        input_recipient.copy_from_slice(&input_recipient_bytes);
-
-        let out_recipient_hex = params.output_recipient.trim_start_matches("0x");
-        let out_recipient_bytes = hex::decode(out_recipient_hex).map_err(|_| {
-            ErrorData::invalid_params(
-                "Invalid output_recipient format. Must be a valid hex string.",
-                None,
-            )
-        })?;
-
-        if out_recipient_bytes.len() != 32 {
-            return Err(ErrorData::invalid_params(
-                "output_recipient must be exactly 32 bytes (64 hex characters).",
-                None,
-            ));
-        }
-
-        let mut output_recipient = [0u8; 32];
-        output_recipient.copy_from_slice(&out_recipient_bytes);
+        // Derive output recipient hash from the privacy address
+        let output_pk = output_privacy_addr.to_pk();
+        let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
 
         let transfer_result = crate::operations::transfer(
             ligero,
@@ -814,10 +803,11 @@ impl CryptoServer {
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        // Return the output privacy address in bech32 format
         let result = TransferResult {
             tx_hash: transfer_result.tx_hash,
             new_rho: hex::encode(&transfer_result.new_rho),
-            new_recipient: hex::encode(&transfer_result.new_recipient),
+            new_recipient: output_privacy_addr.to_string(),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
