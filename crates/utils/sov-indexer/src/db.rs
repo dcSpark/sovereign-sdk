@@ -51,6 +51,14 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
+    // VFK registry table for multi-address decryption support
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::vfk_registry::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
     Ok(())
 }
 
@@ -181,6 +189,7 @@ pub async fn insert_midnight_deposit(
     sender: Option<String>,
     view_fvks: Option<JsonValue>,
     encrypted_notes: Option<JsonValue>,
+    decrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_deposit::Entity::insert(idx::midnight_deposit::ActiveModel {
         event_id: Set(event_id),
@@ -190,6 +199,7 @@ pub async fn insert_midnight_deposit(
         sender: Set(sender),
         view_fvks: Set(view_fvks),
         encrypted_notes: Set(encrypted_notes),
+        decrypted_notes: Set(decrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -206,6 +216,7 @@ pub async fn insert_midnight_withdraw(
     sender: Option<String>,
     view_attestations: Option<JsonValue>,
     encrypted_notes: Option<JsonValue>,
+    decrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_withdraw::Entity::insert(idx::midnight_withdraw::ActiveModel {
         event_id: Set(event_id),
@@ -216,6 +227,7 @@ pub async fn insert_midnight_withdraw(
         sender: Set(sender),
         view_attestations: Set(view_attestations),
         encrypted_notes: Set(encrypted_notes),
+        decrypted_notes: Set(decrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -228,16 +240,20 @@ pub async fn insert_midnight_transfer(
     anchor_root: Option<String>,
     nullifier: Option<String>,
     sender: Option<String>,
+    recipient: Option<String>,
     view_attestations: Option<JsonValue>,
     encrypted_notes: Option<JsonValue>,
+    decrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_transfer::Entity::insert(idx::midnight_transfer::ActiveModel {
         event_id: Set(event_id),
         anchor_root: Set(anchor_root),
         nullifier: Set(nullifier),
         sender: Set(sender),
+        recipient: Set(recipient),
         view_attestations: Set(view_attestations),
         encrypted_notes: Set(encrypted_notes),
+        decrypted_notes: Set(decrypted_notes),
     })
     .exec(idx_db)
     .await?;
@@ -331,9 +347,13 @@ pub async fn list_wallet_txs_sync(
         });
     }
 
-    // Transfers by sender
+    // Transfers by sender or recipient
     let tfs = idx::midnight_transfer::Entity::find()
-        .filter(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+        .filter(
+            Condition::any()
+                .add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+                .add(idx::midnight_transfer::Column::Recipient.eq(address.to_string())),
+        )
         .all(db)
         .await?;
     for mt in tfs {
@@ -355,7 +375,7 @@ pub async fn list_wallet_txs_sync(
             timestamp_ms: ev.created_at.timestamp_millis(),
             kind: ev.kind.clone(),
             sender: mt.sender.clone(),
-            recipient: None,
+            recipient: mt.recipient.clone(),
             amount: None,
             anchor_root: mt.anchor_root.clone(),
             nullifier: mt.nullifier.clone(),
@@ -614,6 +634,7 @@ pub async fn list_txs(
                     .await?
                 {
                     sender = mt.sender;
+                    recipient = mt.recipient;
                     anchor_root = mt.anchor_root;
                     nullifier = mt.nullifier;
                     view_attestations = mt.view_attestations;
@@ -760,6 +781,7 @@ pub async fn get_tx(
                 .await?
             {
                 sender = mt.sender;
+                recipient = mt.recipient;
                 anchor_root = mt.anchor_root;
                 nullifier = mt.nullifier;
                 view_attestations = mt.view_attestations;

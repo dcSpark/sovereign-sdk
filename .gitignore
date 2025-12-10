@@ -64,3 +64,7 @@ proof_cache/
 .env
 examples/rollup-ligero/output.log
 cache_l2.txt
+examples/output.log
+examples/rollup-ligero/examples/rollup-ligero/output.log
+wallet_index.sqlite
+crates/utils/sov-indexer/vfk_config.json

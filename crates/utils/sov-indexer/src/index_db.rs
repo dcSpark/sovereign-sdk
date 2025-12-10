@@ -39,6 +39,9 @@ pub mod midnight_deposit {
         pub view_fvks: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
+        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        #[sea_orm(nullable, column_type = "Json")]
+        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -70,6 +73,9 @@ pub mod midnight_withdraw {
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
+        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        #[sea_orm(nullable, column_type = "Json")]
+        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -108,10 +114,16 @@ pub mod midnight_transfer {
         pub nullifier: Option<String>,
         #[sea_orm(nullable)]
         pub sender: Option<String>,
+        /// Recipient address (bech32m format, e.g., privpool1...)
+        #[sea_orm(nullable)]
+        pub recipient: Option<String>,
         #[sea_orm(nullable, column_type = "Json")]
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
+        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        #[sea_orm(nullable, column_type = "Json")]
+        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -122,5 +134,30 @@ pub mod midnight_transfer {
         )]
         Events,
     }
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Registry of known VFKs for decryption.
+/// Maps fvk_commitment -> (vfk, shielded_address) for looking up which key to use.
+pub mod vfk_registry {
+    use super::*;
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "vfk_registry")]
+    pub struct Model {
+        /// FVK commitment: H("FVK_COMMIT_V1" || vfk) - primary key for lookups
+        #[sea_orm(primary_key, auto_increment = false, column_type = "String(StringLen::N(64))")]
+        pub fvk_commitment: String,
+        /// The actual VFK (32 bytes hex-encoded)
+        #[sea_orm(column_type = "String(StringLen::N(64))")]
+        pub vfk: String,
+        /// The shielded address associated with this VFK (bech32 or hex, optional)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub shielded_address: Option<String>,
+        /// When this entry was added
+        #[sea_orm(column_type = "TimestampWithTimeZone")]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
     impl ActiveModelBehavior for ActiveModel {}
 }
