@@ -90,8 +90,10 @@ impl From<InvolvementItem> for Transaction {
 /// let transactions = get_transactions(provider, wallet).await?;
 /// println!("Found {} transactions", transactions.len());
 /// for tx in transactions {
-///     println!("Transaction {}: {} {} at {}",
-///         tx.tx_hash, tx.kind, tx.direction, tx.timestamp_ms);
+///     println!(
+///         "Transaction {}: {} at {} (status: {:?})",
+///         tx.tx_hash, tx.kind, tx.timestamp_ms, tx.status
+///     );
 /// }
 /// # Ok(())
 /// # }

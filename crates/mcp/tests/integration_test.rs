@@ -2,12 +2,14 @@
 //!
 //! These tests require a running rollup node, sequencer, and verifier service.
 //! Make sure all services are running before executing these tests.
-//! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL) should be set in .env.
+//! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL, PRIVPOOL_SPEND_KEY)
+//! should be set in .env (INDEXER_URL is optional, defaults to http://localhost:13100).
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
 use mcp::ligero::Ligero;
 use mcp::operations::{deposit, transfer};
+use mcp::privacy_key::PrivacyKey;
 use mcp::provider::Provider;
 use mcp::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
@@ -84,6 +86,7 @@ fn create_test_ligero() -> Ligero {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
 async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Load .env file
     let _ = dotenvy::dotenv();
@@ -98,6 +101,8 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let privpool_spend_key = std::env::var("PRIVPOOL_SPEND_KEY")
+        .expect("PRIVPOOL_SPEND_KEY must be set in .env (hex or privpool1... address)");
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
@@ -107,6 +112,15 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
+
+    // Parse privacy key from either raw spend key hex or bech32m address
+    let privacy_key = if privpool_spend_key.starts_with("privpool1") {
+        PrivacyKey::from_address(&privpool_spend_key)
+    } else {
+        PrivacyKey::from_hex(&privpool_spend_key)
+    }
+    .expect("Failed to parse PRIVPOOL_SPEND_KEY");
+    tracing::info!("Using privacy address: {}", privacy_key.privacy_address());
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");
@@ -149,7 +163,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Step 4: Perform deposit
     tracing::info!("Step 4: Performing deposit of 100 tokens");
     let deposit_amount = 100u128;
-    let deposit_result = deposit(&provider, &wallet, deposit_amount).await?;
+    let deposit_result = deposit(&provider, &wallet, deposit_amount, &privacy_key).await?;
 
     tracing::info!("Deposit successful!");
     tracing::info!("  Transaction hash: {}", deposit_result.tx_hash);
@@ -268,6 +282,7 @@ async fn test_wallet_address_format() -> Result<()> {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+#[ignore = "requires running rollup/verifier/indexer services"]
 async fn test_balance_check() -> Result<()> {
     let _ = dotenvy::dotenv();
 

@@ -53,10 +53,24 @@ The server exposes the following MCP tools:
 
 ## Testing
 
-Run the test suite:
+Run the fast, self-contained tests:
 
 ```bash
 cargo test -p mcp
 ```
+
+Integration tests (rollup/indexer/verifier + Ligero) are ignored by default. Run them explicitly with:
+
+```bash
+cargo test --all-targets -- --ignored
+```
+
+Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be reported as "filtered out". To run everything, execute both commands above. The integration suite expects these env vars/files to exist (the defaults are relative to this repo):
+
+- `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
+- `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
+- `LIGERO_PROGRAM_PATH` (default: `../adapters/ligero/guest/bins/programs/note_spend_guest.wasm`)
+- `LIGERO_PROVER_BINARY_PATH` (default: `../adapters/ligero/bins/macos/bin/webgpu_prover`)
+- `LIGERO_SHADER_PATH` (default: `../adapters/ligero/bins/macos/shader`)
 
 Set `RUST_LOG=debug` for verbose logging during development.

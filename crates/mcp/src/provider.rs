@@ -286,7 +286,7 @@ impl Provider {
     /// Check if the rollup is healthy and responding
     ///
     /// Queries the `/healthcheck` endpoint to verify the rollup is available.
-    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)] // Used by integration tests to gate network-dependent flows
     pub async fn is_healthy(&self) -> bool {
         let health_url = format!("{}/healthcheck", self.rpc_url);
 

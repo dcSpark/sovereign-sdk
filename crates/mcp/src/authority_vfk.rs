@@ -19,11 +19,6 @@ impl AuthorityVfk {
     ///
     /// # Parameters
     /// * `vfk_hex` - VFK as hex string (with or without "0x" prefix)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let authority_vfk = AuthorityVfk::from_hex("fd3f0fc84254bcbe06977154d4db171a952201685f6ff8d5afe4a3c6e083f2b1")?;
-    /// ```
     pub fn from_hex(vfk_hex: impl AsRef<str>) -> Result<Self> {
         let hex_str = vfk_hex.as_ref().trim();
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);

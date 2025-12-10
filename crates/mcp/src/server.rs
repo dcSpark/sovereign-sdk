@@ -361,10 +361,7 @@ impl CryptoServer {
         })?;
 
         let token_id: sov_bank::TokenId = DEFAULT_TOKEN_ID.parse().map_err(|e| {
-            ErrorData::invalid_params(
-                format!("Invalid token_id format: {}", e),
-                None,
-            )
+            ErrorData::invalid_params(format!("Invalid token_id format: {}", e), None)
         })?;
 
         let amount_obj = sov_modules_api::Amount::from(amount);
@@ -862,7 +859,6 @@ impl CryptoServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
-
 }
 
 #[tool_handler]
