@@ -23,13 +23,52 @@ pub struct ChainData {
     pub chain_name: String,
 }
 
-/// Transaction status from the sequencer
+/// Transaction involvement item from the indexer
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct TransactionStatus {
-    /// Transaction hash ID
-    pub id: String,
-    /// Transaction status (e.g., "pending", "confirmed", "failed")
-    pub status: String,
+pub struct InvolvementItem {
+    /// Transaction hash
+    pub tx_hash: String,
+    /// Timestamp in milliseconds
+    pub timestamp_ms: i64,
+    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
+    pub kind: String,
+    /// Sender address (if available)
+    pub sender: Option<String>,
+    /// Recipient address (if available)
+    pub recipient: Option<String>,
+    /// Transaction amount (if available)
+    pub amount: Option<String>,
+    /// Anchor root for privacy transactions
+    pub anchor_root: Option<String>,
+    /// Nullifier for privacy transactions
+    pub nullifier: Option<String>,
+    /// View Full Viewing Keys (FVKs) for note decryption
+    #[serde(default)]
+    pub view_fvks: Option<serde_json::Value>,
+    /// View attestations for privacy proofs
+    #[serde(default)]
+    pub view_attestations: Option<serde_json::Value>,
+    /// Transaction events from the rollup
+    #[serde(default)]
+    pub events: Option<serde_json::Value>,
+    /// Transaction status (e.g., "Success", "Failed")
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Encrypted notes for privacy transactions
+    #[serde(default)]
+    pub encrypted_notes: Option<serde_json::Value>,
+    /// Full transaction payload
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Response from the indexer's list transactions endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ListTransactionsResponse {
+    /// List of transaction items
+    pub items: Vec<InvolvementItem>,
+    /// Cursor for pagination (optional)
+    pub next: Option<String>,
 }
 
 /// Provider for RPC communication with the Sovereign rollup
@@ -40,11 +79,14 @@ pub struct TransactionStatus {
 pub struct Provider {
     client: Arc<NodeClient>,
     rpc_url: String,
+    verifier_url: String,
+    indexer_url: String,
+    http_client: reqwest::Client,
 }
 
 impl Provider {
-    /// Create a new provider connected to the given RPC URL
-    pub async fn new(rpc_url: &str) -> Result<Self> {
+    /// Create a new provider connected to the given RPC URL, verifier service, and indexer
+    pub async fn new(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> Result<Self> {
         let client = NodeClient::new(rpc_url)
             .await
             .with_context(|| format!("Failed to connect to rollup node at {}", rpc_url))?;
@@ -52,6 +94,9 @@ impl Provider {
         Ok(Self {
             client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
+            verifier_url: verifier_url.to_string(),
+            indexer_url: indexer_url.to_string(),
+            http_client: reqwest::Client::new(),
         })
     }
 
@@ -155,52 +200,82 @@ impl Provider {
         Ok(tx_hash.to_string())
     }
 
-    /// Get the status of a transaction by its hash
+    /// Submit a midnight-privacy transaction to the verifier service
     ///
-    /// This queries the `/sequencer/txs/{txHash}/status` endpoint to check
-    /// if a transaction has been received and what its current status is.
-    ///
-    /// # Parameters
-    /// * `tx_hash` - The transaction hash (with or without 0x prefix)
-    ///
-    /// # Returns
-    /// Transaction status containing the ID and status string
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
-    /// let status = provider.get_transaction_status("0x1234...").await?;
-    /// println!("Transaction status: {}", status.status);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn get_transaction_status(&self, tx_hash: &str) -> Result<TransactionStatus> {
-        // Remove 0x prefix if present
-        let tx_hash_clean = tx_hash.to_string(); // .strip_prefix("0x").unwrap_or(tx_hash);
+    /// This method submits a borsh-serialized transaction to the verifier service,
+    /// which will verify the proof and then submit to the sequencer.
+    /// Returns the transaction hash from the verifier response.
+    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
 
-        let status_url = format!("{}/sequencer/txs/{}/status", self.rpc_url, tx_hash_clean);
+        let tx_b64 = BASE64_STANDARD.encode(&raw_tx);
+        // Trim trailing slash from verifier_url to avoid double slashes
+        let base_url = self.verifier_url.trim_end_matches('/');
+        let endpoint = format!("{}/midnight-privacy", base_url);
 
-        tracing::debug!("Fetching transaction status from: {}", status_url);
+        tracing::info!("Submitting transaction to verifier service at {}", endpoint);
+        tracing::debug!(
+            "Transaction size: {} bytes, base64 size: {} bytes",
+            raw_tx.len(),
+            tx_b64.len()
+        );
 
-        let response = reqwest::get(&status_url)
+        let resp = self
+            .http_client
+            .post(&endpoint)
+            .json(&serde_json::json!({ "body": tx_b64 }))
+            .send()
             .await
-            .with_context(|| format!("Failed to fetch transaction status from {}", status_url))?;
+            .context("Failed to send transaction to verifier service")?;
 
-        if !response.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::error!(
+                "Verifier service error - URL: {}, Status: {}, Body: {}",
+                endpoint,
+                status,
+                body
+            );
             anyhow::bail!(
-                "Transaction status endpoint returned error status: {}",
-                response.status()
+                "Verifier service returned error status {}: {}",
+                status,
+                body
             );
         }
 
-        let tx_status: TransactionStatus = response
-            .json()
+        let body = resp
+            .text()
             .await
-            .context("Failed to parse transaction status JSON")?;
+            .context("Failed to read verifier response")?;
 
-        tracing::debug!("Transaction {} status: {}", tx_status.id, tx_status.status);
+        #[derive(serde::Deserialize)]
+        struct VerifierResponse {
+            success: bool,
+            tx_hash: Option<String>,
+            error: Option<String>,
+        }
 
-        Ok(tx_status)
+        let verifier_resp: VerifierResponse =
+            serde_json::from_str(&body).context("Failed to parse verifier response")?;
+
+        if !verifier_resp.success {
+            anyhow::bail!(
+                "Verifier service reported failure: {}",
+                verifier_resp
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string())
+            );
+        }
+
+        let tx_hash = verifier_resp
+            .tx_hash
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+
+        tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
+
+        Ok(tx_hash)
     }
 
     /// Get the RPC URL this provider is connected to
@@ -211,7 +286,7 @@ impl Provider {
     /// Check if the rollup is healthy and responding
     ///
     /// Queries the `/healthcheck` endpoint to verify the rollup is available.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by integration tests to gate network-dependent flows
     pub async fn is_healthy(&self) -> bool {
         let health_url = format!("{}/healthcheck", self.rpc_url);
 
@@ -219,5 +294,236 @@ impl Provider {
             Ok(response) => response.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    /// Get transaction details from the indexer
+    ///
+    /// This queries the indexer API to retrieve full transaction details including
+    /// all privacy-related fields, events, status, and payload.
+    ///
+    /// # Parameters
+    /// * `tx_hash` - The transaction hash (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// Full transaction details if found, None if not found
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// let tx = provider.get_transaction("0x1234...").await?;
+    /// if let Some(tx) = tx {
+    ///     println!("Transaction {}: {} at {}",
+    ///         tx.tx_hash, tx.kind, tx.timestamp_ms);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<InvolvementItem>> {
+        // Trim trailing slash from indexer_url to avoid double slashes
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/txs/{}", base_url, tx_hash);
+
+        tracing::debug!("Fetching transaction details from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch transaction from indexer at {}", url))?;
+
+        let status = response.status();
+
+        // Handle 404 as "not found" rather than an error
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!("Transaction {} not found in indexer", tx_hash);
+            return Ok(None);
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
+        }
+
+        let tx: InvolvementItem = response
+            .json()
+            .await
+            .context("Failed to parse transaction details from indexer")?;
+
+        tracing::debug!(
+            "Fetched transaction {} from indexer: kind={}, status={:?}",
+            tx.tx_hash,
+            tx.kind,
+            tx.status
+        );
+
+        Ok(Some(tx))
+    }
+
+    /// Query a REST endpoint and deserialize the response
+    ///
+    /// Generic method to query any REST endpoint on the rollup node.
+    pub async fn query_rest_endpoint<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+    ) -> Result<T> {
+        self.client
+            .query_rest_endpoint(endpoint)
+            .await
+            .with_context(|| format!("Failed to query REST endpoint: {}", endpoint))
+    }
+
+    /// Get transactions for a specific wallet address from the indexer
+    ///
+    /// This queries the indexer API to retrieve all transactions associated with
+    /// the given wallet address. The indexer tracks both incoming and outgoing
+    /// transactions, including deposits, withdrawals, and transfers.
+    ///
+    /// # Parameters
+    /// * `address` - The wallet address to query transactions for
+    /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
+    /// * `cursor` - Optional cursor for pagination
+    /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
+    ///
+    /// # Returns
+    /// A list of transactions with their details
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// let address = "0x1234...";
+    /// let transactions = provider.get_wallet_transactions(address, None, None, None).await?;
+    /// println!("Found {} transactions", transactions.items.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_wallet_transactions(
+        &self,
+        address: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        tx_type: Option<&str>,
+    ) -> Result<ListTransactionsResponse> {
+        // Trim trailing slash from indexer_url to avoid double slashes
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let mut url = format!("{}/wallets/{}", base_url, address);
+
+        // Build query parameters
+        let mut query_params = Vec::new();
+        if let Some(limit) = limit {
+            query_params.push(format!("limit={}", limit));
+        }
+        if let Some(cursor) = cursor {
+            query_params.push(format!("cursor={}", cursor));
+        }
+        if let Some(tx_type) = tx_type {
+            query_params.push(format!("type={}", tx_type));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        tracing::debug!("Fetching transactions from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
+        }
+
+        let tx_list: ListTransactionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse indexer response")?;
+
+        tracing::debug!(
+            "Fetched {} transactions for address {}",
+            tx_list.items.len(),
+            address
+        );
+
+        Ok(tx_list)
+    }
+
+    /// Get all transactions from the indexer (global list, not filtered by address)
+    ///
+    /// This is used for privacy pool balance calculation, where we need to scan all
+    /// transactions to find notes that belong to the user.
+    ///
+    /// # Parameters
+    /// * `limit` - Optional limit on number of transactions per page (default: 100)
+    /// * `offset` - Optional offset for pagination (default: 0)
+    ///
+    /// # Returns
+    /// A list of all transactions from the indexer
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
+    /// println!("Found {} transactions", transactions.items.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_all_transactions(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListTransactionsResponse> {
+        // Trim trailing slash from indexer_url to avoid double slashes
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let mut url = format!("{}/txs", base_url);
+
+        // Build query parameters
+        let mut query_params = Vec::new();
+        if let Some(limit) = limit {
+            query_params.push(format!("limit={}", limit));
+        }
+        if let Some(offset) = offset {
+            query_params.push(format!("offset={}", offset));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        tracing::debug!("Fetching all transactions from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Indexer returned error status {}: {}", status, body);
+        }
+
+        let tx_list: ListTransactionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse transactions list from indexer")?;
+
+        tracing::debug!(
+            "Fetched {} transactions from indexer (offset: {:?}, limit: {:?})",
+            tx_list.items.len(),
+            offset,
+            limit
+        );
+
+        Ok(tx_list)
     }
 }

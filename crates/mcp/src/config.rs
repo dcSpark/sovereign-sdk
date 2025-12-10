@@ -21,6 +21,14 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub rollup_rpc_url: Url,
 
+    /// Verifier service URL for midnight-privacy transactions (env: VERIFIER_URL, required)
+    #[validate(custom(function = "validate_http_url"))]
+    pub verifier_url: Url,
+
+    /// Indexer service URL for querying transaction history (env: INDEXER_URL, required)
+    #[validate(custom(function = "validate_http_url"))]
+    pub indexer_url: Url,
+
     /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_program_path: PathBuf,
@@ -32,6 +40,17 @@ pub struct Config {
     /// Path to Ligero shader directory (env: LIGERO_SHADER_PATH, required)
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_shader_path: PathBuf,
+
+    /// Authority Viewing Full Key (VFK) for decrypting privacy pool notes (env: AUTHORITY_VFK, optional)
+    /// 32-byte hex string with or without 0x prefix
+    #[serde(default)]
+    pub authority_vfk: Option<String>,
+
+    /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
+    /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
+    /// This is REQUIRED to start the MCP server - deposits can only be made to your own privacy address
+    #[validate(length(min = 1))]
+    pub privpool_spend_key: String,
 }
 
 fn default_server_bind_address() -> String {
