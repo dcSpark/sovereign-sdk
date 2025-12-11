@@ -254,14 +254,14 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             CallMessage::Transfer {
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 view_ciphertexts,
                 gas,
-            } => Ok(self.transfer(proof, anchor_root, nullifier, view_ciphertexts, gas, context, state)?),
+            } => Ok(self.transfer(proof, anchor_root, nullifiers, view_ciphertexts, gas, context, state)?),
             CallMessage::Withdraw {
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 withdraw_amount,
                 to,
                 view_ciphertexts,
@@ -269,7 +269,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             } => Ok(self.withdraw(
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 withdraw_amount,
                 to,
                 view_ciphertexts,

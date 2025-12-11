@@ -432,10 +432,15 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            if proof_outputs.nullifier != nullifier_array {
+            // For backward compatibility, check if the provided nullifier matches the first one
+            // Multi-input transactions have multiple nullifiers; we validate the first one here
+            let first_nullifier = proof_outputs.nullifiers.first().ok_or_else(|| {
+                errors::bad_request_400("Invalid proof outputs", "No nullifiers in proof")
+            })?;
+            if *first_nullifier != nullifier_array {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
-                    "nullifier does not match",
+                    "nullifier does not match (first nullifier checked)",
                 ));
             }
             if proof_outputs.withdraw_amount != withdraw_amount {
@@ -491,10 +496,15 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            if proof_outputs.nullifier != nullifier_array {
+            // For backward compatibility, check if the provided nullifier matches the first one
+            // Multi-input transactions have multiple nullifiers; we validate the first one here
+            let first_nullifier = proof_outputs.nullifiers.first().ok_or_else(|| {
+                errors::bad_request_400("Invalid proof outputs", "No nullifiers in proof")
+            })?;
+            if *first_nullifier != nullifier_array {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
-                    "nullifier does not match",
+                    "nullifier does not match (first nullifier checked)",
                 ));
             }
             // For transfers, withdraw_amount must be 0

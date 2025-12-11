@@ -109,7 +109,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
-            nullifier: nf,
+            nullifiers: vec![nf],
             withdraw_amount: 0,
             output_commitments: vec![out],
             view_attestations: None,
@@ -147,7 +147,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: pub_inputs[i].anchor_root,
-                nullifier: pub_inputs[i].nullifier,
+                nullifiers: pub_inputs[i].nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -261,7 +261,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
 
     // Clean up cache
     for pub_input in &pub_inputs {
-        clear_pre_verified_spend(&pub_input.nullifier);
+        clear_pre_verified_spend(&pub_input.nullifiers[0]);
     }
 }
 
@@ -324,7 +324,7 @@ fn sequential_execution_works_with_slot_based_storage() {
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
-            nullifier: nf,
+            nullifiers: vec![nf],
             withdraw_amount: 0,
             output_commitments: vec![out],
             view_attestations: None,
@@ -357,7 +357,7 @@ fn sequential_execution_works_with_slot_based_storage() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: pub_input.anchor_root,
-                nullifier: pub_input.nullifier,
+                nullifiers: pub_input.nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -401,6 +401,6 @@ fn sequential_execution_works_with_slot_based_storage() {
 
     // Clean up
     for pub_input in &pub_inputs {
-        clear_pre_verified_spend(&pub_input.nullifier);
+        clear_pre_verified_spend(&pub_input.nullifiers[0]);
     }
 }

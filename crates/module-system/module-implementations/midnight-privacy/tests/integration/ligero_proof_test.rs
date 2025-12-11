@@ -44,6 +44,7 @@
 use anyhow::{bail, Context, Result};
 use midnight_privacy::{
     note_commitment, nullifier, root_from_path, Hash32, MerkleTree, SpendPublic,
+    recipient_from_sk, nf_key_from_sk,
 };
 use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroVerifier};
@@ -277,7 +278,7 @@ fn test_simple_note_spend() -> Result<()> {
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
     let public_output = SpendPublic {
         anchor_root: anchor,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -368,7 +369,7 @@ fn test_simple_note_spend() -> Result<()> {
 
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
-    assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.nullifiers[0], nf, "Nullifier mismatch!");
     assert_eq!(verified_output.withdraw_amount, withdraw_amount);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
@@ -379,7 +380,7 @@ fn test_simple_note_spend() -> Result<()> {
     );
     println!(
         "  - Nullifier: {}",
-        hex::encode(&verified_output.nullifier[..8])
+        hex::encode(&verified_output.nullifiers[0][..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
     println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
@@ -486,7 +487,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
     let public_output = SpendPublic {
         anchor_root: anchor,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -499,7 +500,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     );
     println!(
         "  - Nullifier:        {}",
-        hex::encode(public_output.nullifier)
+        hex::encode(public_output.nullifiers[0])
     );
     println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
     println!("  - Output commitments: {}", public_output.output_commitments.len());
@@ -584,7 +585,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
-    assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.nullifiers[0], nf, "Nullifier mismatch!");
     assert_eq!(verified_output.withdraw_amount, withdraw_amount);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
@@ -595,7 +596,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     );
     println!(
         "  - Nullifier: {}",
-        hex::encode(&verified_output.nullifier[..8])
+        hex::encode(&verified_output.nullifiers[0][..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
     println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
@@ -705,8 +706,9 @@ const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
 /// The guest program must implement:
 /// 1. Verify Merkle path: root_from_path(cm, pos, siblings) == anchor
 /// 2. Derive nullifier: nullifier(domain, nf_key, rho) [PRF-based, position-agnostic]
-/// 3. Commit public output: (anchor_root, nullifier, withdraw_amount)
+/// 3. Commit public output: (anchor_root, nullifiers, withdraw_amount)
 #[test]
+#[ignore = "Requires WebGPU hardware and takes 60+ seconds - run manually with: cargo test test_note_spend_with_real_ligero_proof -- --ignored"]
 fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     println!("\n=== REAL Note Spend Proof with Ligero ===\n");
 
@@ -755,9 +757,11 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     let domain: Hash32 = [1u8; 32];
     let value: u128 = 42;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET - never revealed
+    let spend_sk: Hash32 = [4u8; 32]; // Spending secret key - SECRET
 
+    // Derive recipient from spend_sk (same owner for multi-input)
+    let recipient = recipient_from_sk(&domain, &spend_sk);
+    
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let pos: u64 = 0;
 
@@ -780,50 +784,69 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     assert_eq!(recomputed, anchor, "Merkle path verification failed!");
     println!("✓ Merkle path verified ({} siblings)", siblings.len());
 
-    // ---- 2) Derive nullifier (PRF-based) ----
+    // ---- 2) Derive nullifier (PRF-based using nf_key derived from spend_sk) ----
     println!("\nStep 2: Deriving nullifier (PRF-based, no position)...");
 
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: {}", hex32(&nf));
 
-    // ---- 3) Build JSON config for REAL prover ----
-    println!("\nStep 3: Building prover configuration...");
+    // ---- 3) Build JSON config for REAL prover (NEW MULTI-INPUT ABI) ----
+    println!("\nStep 3: Building prover configuration (multi-input ABI)...");
 
-    // Guest program arguments (using string format for Ligero interface)
-    // Argument order must match what the guest program expects:
-    // 1. domain (public)
-    // 2. commitment (public - derived from private note data)
-    // 3. nf_key (PRIVATE - SECRET nullifier key)
-    // 4. position (PRIVATE - CRITICAL for privacy, reveals which leaf)
-    // 5. tree_depth (public)
-    // 6..6+depth-1: siblings (PRIVATE - Merkle authentication path)
-    // 6+depth: anchor (public)
-    // 7+depth: nullifier (public)
+    // New multi-input ABI argument order:
+    // [1] domain (PUBLIC)
+    // [2] spend_sk (PRIVATE) - spending secret key
+    // [3] depth (PUBLIC)
+    // [4] anchor (PUBLIC)
+    // [5] n_in (PUBLIC) - number of inputs
+    // For each input i:
+    //   value_in_i (PRIVATE), rho_in_i (PRIVATE), pos_in_i (PRIVATE), 
+    //   siblings_i[depth] (PRIVATE), nullifier_i (PUBLIC)
+    // Then:
+    // withdraw_amount (PUBLIC)
+    // n_out (PUBLIC) - number of outputs
+    // For each output j:
+    //   value_out_j (PRIVATE), rho_out_j (PRIVATE), pk_out_j (PRIVATE), cm_out_j (PUBLIC)
+
+    let n_in: u32 = 1;
+    let withdraw_amount: u128 = value; // Full withdrawal, no outputs
+    let n_out: u32 = 0;
 
     let mut args: Vec<serde_json::Value> = Vec::new();
-    args.push(json!({"str": hex32(&domain)})); // 1: PUBLIC
-    args.push(json!({"str": hex32(&cm)})); // 2: PUBLIC (but derived from private data)
-    args.push(json!({"str": hex32(&nf_key)})); // 3: PRIVATE
-    args.push(json!({"str": pos.to_string()})); // 4: PRIVATE
-    args.push(json!({"str": TREE_DEPTH.to_string()})); // 5: PUBLIC
+    args.push(json!({"str": hex32(&domain)}));        // [1] domain (PUBLIC)
+    args.push(json!({"str": hex32(&spend_sk)}));      // [2] spend_sk (PRIVATE)
+    args.push(json!({"str": TREE_DEPTH.to_string()})); // [3] depth (PUBLIC)
+    args.push(json!({"str": hex32(&anchor)}));        // [4] anchor (PUBLIC)
+    args.push(json!({"str": n_in.to_string()}));      // [5] n_in (PUBLIC)
 
-    // Add all siblings (PRIVATE)
+    // Input 0: value, rho, pos, siblings[], nullifier
+    args.push(json!({"str": value.to_string()}));     // value_in_0 (PRIVATE)
+    args.push(json!({"str": hex32(&rho)}));           // rho_in_0 (PRIVATE)
+    args.push(json!({"str": pos.to_string()}));       // pos_in_0 (PRIVATE)
     for s in &siblings {
-        args.push(json!({"str": hex32(s)})); // 6..6+depth-1: PRIVATE
+        args.push(json!({"str": hex32(s)}));          // siblings_0[k] (PRIVATE)
     }
+    args.push(json!({"str": hex32(&nf)}));            // nullifier_0 (PUBLIC)
 
-    args.push(json!({"str": hex32(&anchor)})); // 6+depth: PUBLIC
-    args.push(json!({"str": hex32(&nf)})); // 7+depth: PUBLIC
+    // Withdraw and outputs
+    args.push(json!({"str": withdraw_amount.to_string()})); // withdraw_amount (PUBLIC)
+    args.push(json!({"str": n_out.to_string()}));           // n_out (PUBLIC)
+    // No outputs for full withdrawal
 
-    // Mark private indices (1-based indexing)
-    let first_sibling_idx = 6usize;
-    let mut private_indices = vec![
-        3usize, // nf_key - SECRET nullifier key
-        4usize, // pos - position in tree (CRITICAL for privacy!)
-    ];
-    for i in 0..(TREE_DEPTH as usize) {
-        private_indices.push(first_sibling_idx + i); // all siblings (Merkle path)
+    // Mark private indices (1-based indexing for Ligero)
+    // Private: spend_sk(2), and for input 0: value(6), rho(7), pos(8), siblings(9..9+depth-1)
+    let mut private_indices: Vec<usize> = vec![2]; // spend_sk
+    
+    // Input 0 private fields start at index 6
+    let input_start = 6usize;
+    private_indices.push(input_start);     // value_in_0
+    private_indices.push(input_start + 1); // rho_in_0
+    private_indices.push(input_start + 2); // pos_in_0
+    for k in 0..(TREE_DEPTH as usize) {
+        private_indices.push(input_start + 3 + k); // siblings_0[k]
     }
+    // nullifier is PUBLIC, so not in private_indices
 
     println!("✓ Arguments prepared: {} total", args.len());
     println!("✓ Private indices: {:?}", private_indices);
@@ -864,14 +887,15 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    // Redact ALL private arguments (nf_key, position, and all siblings)
+    // Redact ALL private arguments based on private_indices
     // The verifier must not see these witness values!
     let mut redacted_args = args.clone();
-    redacted_args[2] = json!({"str": "x".repeat(64)}); // redact nf_key (index 3, zero-based 2)
-    redacted_args[3] = json!({"str": "0"}); // redact position (index 4, zero-based 3)
-    for i in 0..(TREE_DEPTH as usize) {
-        let idx = (first_sibling_idx - 1) + i; // zero-based for vector
-        redacted_args[idx] = json!({"str": "x".repeat(64)}); // redact siblings
+    for &idx in &private_indices {
+        // idx is 1-based, convert to 0-based for vector access
+        let vec_idx = idx - 1;
+        if vec_idx < redacted_args.len() {
+            redacted_args[vec_idx] = json!({"str": "x".repeat(64)});
+        }
     }
 
     let verify_cfg = json!({
@@ -1142,7 +1166,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     let public = SpendPublic {
         anchor_root: anchor,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -1159,7 +1183,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("✅ Proof verified successfully");
     println!("   Balance satisfied: {} == {} + {} + {}", value, withdraw_amount, out1_value, out2_value);
     assert_eq!(verified.anchor_root, anchor);
-    assert_eq!(verified.nullifier, nf);
+    assert_eq!(verified.nullifiers[0], nf);
     assert_eq!(verified.output_commitments.len(), 2);
 
     println!("\n✓ Value-burning protection: Circuit enforces balance equation");
@@ -1242,7 +1266,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 
     let public = SpendPublic {
         anchor_root: anchor,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount,
         output_commitments: vec![],
         view_attestations: None,
@@ -1384,7 +1408,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
-        nullifier: deposit_nf,
+        nullifiers: vec![deposit_nf],
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -1405,7 +1429,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         .context("Phase 2 proof verification failed")?;
     let verify_time2 = verify_start2.elapsed().as_secs_f64();
     
-    assert_eq!(verified2.nullifier, deposit_nf);
+    assert_eq!(verified2.nullifiers[0], deposit_nf);
     assert_eq!(verified2.output_commitments.len(), 2);
     assert_eq!(verified2.output_commitments[0], out1_cm);
     assert_eq!(verified2.output_commitments[1], out2_cm);
@@ -1481,7 +1505,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
-        nullifier: out1_nf,
+        nullifiers: vec![out1_nf],
         withdraw_amount: withdraw_amount_phase3,
         output_commitments: vec![change_cm],
         view_attestations: None,
@@ -1502,7 +1526,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         .context("Phase 3 proof verification failed")?;
     let verify_time3 = verify_start3.elapsed().as_secs_f64();
     
-    assert_eq!(verified3.nullifier, out1_nf);
+    assert_eq!(verified3.nullifiers[0], out1_nf);
     assert_eq!(verified3.withdraw_amount, withdraw_amount_phase3);
     assert_eq!(verified3.output_commitments.len(), 1);
     assert_eq!(verified3.output_commitments[0], change_cm);
@@ -1648,7 +1672,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
-        nullifier: deposit_nf,
+        nullifiers: vec![deposit_nf],
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -1712,7 +1736,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
-        nullifier: out1_nf,
+        nullifiers: vec![out1_nf],
         withdraw_amount: malicious_withdraw,
         output_commitments: vec![],
         view_attestations: None,

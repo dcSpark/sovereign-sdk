@@ -176,8 +176,8 @@ impl std::error::Error for PrivacyAddressError {}
 pub struct SpendPublic {
     /// Anchor root used for membership checks.
     pub anchor_root: Hash32,
-    /// Nullifier of the consumed note (PRF-based; no position).
-    pub nullifier: Hash32,
+    /// Nullifiers of the consumed notes (1-4 inputs, PRF-based; no position).
+    pub nullifiers: Vec<Hash32>,
     /// For a single native token, the transparent withdrawal amount authorized by the circuit.
     pub withdraw_amount: u128,
     /// Commitments of new shielded outputs (0..=2), in order.

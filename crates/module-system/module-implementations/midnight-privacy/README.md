@@ -19,7 +19,7 @@ The MidnightPrivacy module provides a Zcash-style shielded pool that enables pri
 
 Moves transparent tokens into the shielded pool:
 
-```rust
+```rust,ignore
 CallMessage::Deposit {
     amount: 1000,        // Amount to deposit
     rho: [random],       // Random nonce
@@ -42,13 +42,12 @@ The core privacy-preserving operation that atomically:
 3. Creates output note commitments (from proof)
 4. Optionally withdraws transparent value
 
-```rust
+```rust,ignore
 CallMessage::Transfer {
     proof: proof_bytes,           // Ligero proof (2-4MB)
     anchor_root: [root],          // Historical Merkle root
-    nullifier: [nf],              // Derived nullifier
-    withdraw_amount: 200,         // 0 for pure shielded transfer
-    to: Some(recipient_address),  // None if no withdrawal
+    nullifiers: vec![[nf]],       // Derived nullifiers (1-4 inputs)
+    view_ciphertexts: None,       // Optional viewer ciphertexts
     gas: Some(gas),
 }
 ```
@@ -65,34 +64,35 @@ CallMessage::Transfer {
 #### Transfer Examples
 
 **Pure Shielded Transfer (2 outputs):**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 600 + 400 units
 Transfer {
     proof: proof_with_2_outputs,
-    withdraw_amount: 0,
-    to: None,  // No transparent withdrawal
+    nullifiers: vec![nf],  // 1-4 input nullifiers
     ...
 }
 ```
 
 **Partial Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 400 units + Withdraw: 600 units
-Transfer {
+Withdraw {
     proof: proof_with_1_output,
+    nullifiers: vec![nf],
     withdraw_amount: 600,
-    to: Some(recipient),
+    to: recipient,
     ...
 }
 ```
 
 **Full Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Withdraw: 1000 units (no outputs)
-Transfer {
+Withdraw {
     proof: proof_with_no_outputs,
+    nullifiers: vec![nf],
     withdraw_amount: 1000,
-    to: Some(recipient),
+    to: recipient,
     ...
 }
 ```
@@ -108,9 +108,9 @@ The proof demonstrates (in zero-knowledge):
 
 **Public inputs:**
 - `anchor_root`: Historical Merkle root
-- `nullifier`: Derived nullifier
+- `nullifiers`: Derived nullifiers (1-4 for multi-input transactions)
 - `withdraw_amount`: Transparent withdrawal amount
-- `output_commitments`: Array of output note commitments
+- `output_commitments`: Array of output note commitments (0-2)
 
 **Private inputs (witness):**
 - `value`, `rho`, `recipient`: Note opening
@@ -123,7 +123,7 @@ The proof demonstrates (in zero-knowledge):
 #### 1. Nullifier-Based Double-Spend Prevention
 
 Each note can only be spent once. The nullifier is derived as:
-```
+```text
 nullifier = PRF(domain, nf_key, rho)
 ```
 
@@ -141,7 +141,7 @@ This enables Zcash ZIP-221 style long-range anchors: proofs can reference any hi
 
 To prevent "unbound journal" attacks, critical values are passed as explicit transaction fields:
 - `anchor_root`
-- `nullifier`  
+- `nullifiers` (1-4 for multi-input transactions)
 - `withdraw_amount`
 
 The guest program verifies these match its computed values, ensuring cryptographic binding.
@@ -149,7 +149,7 @@ The guest program verifies these match its computed values, ensuring cryptograph
 #### 4. Value Conservation
 
 The circuit enforces:
-```
+```text
 input_value = sum(output_values) + withdraw_amount
 ```
 
@@ -199,43 +199,33 @@ This prevents "trust me bro" scenarios where senders could lie about note values
 
 ## Usage Example
 
-```rust
+```rust,ignore
 // 1. Deposit 1000 tokens into shielded pool
 let deposit_msg = CallMessage::Deposit {
     amount: 1000,
     rho: random_hash(),
     recipient: recipient_hash(),
+    view_fvks: None,
     gas: Some(gas),
 };
 
-// 2. Later, spend the note to create 2 outputs (600 + 400)
+// 2. Later, spend the note to create 2 outputs (600 + 400) - pure shielded transfer
 let transfer_msg = CallMessage::Transfer {
-    proof: generate_proof(
-        input_note,     // 1000 units
-        outputs: [
-            (600, out1_rho, out1_recipient),
-            (400, out2_rho, out2_recipient),
-        ],
-        withdraw_amount: 0,  // Pure shielded transfer
-    ),
+    proof: proof_bytes,
     anchor_root: historical_root,
-    nullifier: derived_nullifier,
-    withdraw_amount: 0,
-    to: None,
+    nullifiers: vec![derived_nullifier],  // 1-4 input nullifiers
+    view_ciphertexts: None,
     gas: Some(gas),
 };
 
 // 3. Later, spend one output with partial withdrawal
-let transfer_msg = CallMessage::Transfer {
-    proof: generate_proof(
-        input_note,     // 600 units
-        outputs: [(400, change_rho, change_recipient)],
-        withdraw_amount: 200,
-    ),
+let withdraw_msg = CallMessage::Withdraw {
+    proof: proof_bytes,
     anchor_root: historical_root,
-    nullifier: derived_nullifier,
+    nullifiers: vec![derived_nullifier],  // 1-4 input nullifiers
     withdraw_amount: 200,
-    to: Some(recipient_address),
+    to: recipient_address,
+    view_ciphertexts: None,
     gas: Some(gas),
 };
 ```

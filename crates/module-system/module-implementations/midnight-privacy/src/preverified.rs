@@ -29,13 +29,21 @@ fn map() -> &'static Mutex<PreVerifiedMap> {
 pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
     match fetch_proof_outputs(tx_hash) {
         Ok(Some(public)) => {
-            let mut guard = map().lock().unwrap();
-            guard.insert(public.nullifier, public.clone());
-            tracing::debug!(
-                target: "midnight_privacy::preverified",
-                "[PRE-VERIFIED] hydrated proof outputs from DB for tx_hash={tx_hash} (nullifier={:?})",
-                public.nullifier
-            );
+            if let Some(first_nf) = public.nullifiers.first() {
+                let mut guard = map().lock().unwrap();
+                guard.insert(*first_nf, public.clone());
+                tracing::debug!(
+                    target: "midnight_privacy::preverified",
+                    "[PRE-VERIFIED] hydrated proof outputs from DB for tx_hash={tx_hash} (first_nullifier={:?}, n_nullifiers={})",
+                    first_nf,
+                    public.nullifiers.len()
+                );
+            } else {
+                tracing::warn!(
+                    target: "midnight_privacy::preverified",
+                    "[PRE-VERIFIED] proof_outputs for tx_hash={tx_hash} has no nullifiers"
+                );
+            }
         }
         Ok(None) => {
             tracing::debug!(
@@ -52,25 +60,35 @@ pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
     }
 }
 
-/// Caches pre-verified spend outputs keyed by their nullifier.
-/// This remains for compatibility with existing call sites that already have the public outputs.
+/// Caches pre-verified spend outputs keyed by their first nullifier.
+/// For multi-input transactions, the first nullifier is used as the cache key.
 pub fn cache_pre_verified_spend(public: SpendPublic) {
-    let mut guard = map().lock().unwrap();
-    guard.insert(public.nullifier, public.clone());
-    tracing::debug!(
-        target: "midnight_privacy::preverified",
-        "[PRE-VERIFIED] cached pre-verified spend for nullifier={:?}, map_len={}",
-        public.nullifier,
-        guard.len(),
-    );
+    if let Some(first_nf) = public.nullifiers.first() {
+        let mut guard = map().lock().unwrap();
+        guard.insert(*first_nf, public.clone());
+        tracing::debug!(
+            target: "midnight_privacy::preverified",
+            "[PRE-VERIFIED] cached pre-verified spend for first_nullifier={:?}, n_nullifiers={}, map_len={}",
+            first_nf,
+            public.nullifiers.len(),
+            guard.len(),
+        );
+    } else {
+        tracing::warn!(
+            target: "midnight_privacy::preverified",
+            "[PRE-VERIFIED] attempted to cache spend with no nullifiers"
+        );
+    }
 }
 
 /// Retrieves a cached spend output for the provided nullifier, if any.
+/// For multi-input transactions, use the first nullifier as the lookup key.
 pub fn get_pre_verified_spend(nullifier: &Hash32) -> Option<SpendPublic> {
     map().lock().unwrap().get(nullifier).cloned()
 }
 
 /// Removes any cached spend output associated with the provided nullifier.
+/// For multi-input transactions, use the first nullifier as the lookup key.
 pub fn clear_pre_verified_spend(nullifier: &Hash32) {
     if let Some(lock) = PRE_VERIFIED_SPENDS.get() {
         lock.lock().unwrap().remove(nullifier);

@@ -118,7 +118,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
 
     let pub1 = SpendPublic {
         anchor_root: initial_root,
-        nullifier: nf1,
+        nullifiers: vec![nf1],
         withdraw_amount: 0,
         output_commitments: vec![out1, out2],
         view_attestations: None,
@@ -130,7 +130,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         CallMessage::Transfer {
             proof: Default::default(),
             anchor_root: pub1.anchor_root,
-            nullifier: pub1.nullifier,
+            nullifiers: pub1.nullifiers.clone(),
             view_ciphertexts: None,
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
@@ -176,7 +176,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf2: Hash32 = make_nf(&domain, 0x9A, 0x22);
     let pub2 = SpendPublic {
         anchor_root: fake_same_block_root,
-        nullifier: nf2,
+        nullifiers: vec![nf2],
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 789, 0x23, 0x33)],
         view_attestations: None,
@@ -188,7 +188,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: pub2.anchor_root,
-                nullifier: pub2.nullifier,
+                nullifiers: pub2.nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -278,7 +278,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf2_new: Hash32 = make_nf(&domain, 0x9C, 0x25);
     let pub2_new = SpendPublic {
         anchor_root: final_root,
-        nullifier: nf2_new,
+        nullifiers: vec![nf2_new],
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 789, 0x25, 0x35)],
         view_attestations: None,
@@ -289,7 +289,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         CallMessage::Transfer {
             proof: Default::default(),
             anchor_root: pub2_new.anchor_root,
-            nullifier: pub2_new.nullifier,
+            nullifiers: pub2_new.nullifiers.clone(),
             view_ciphertexts: None,
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
@@ -313,7 +313,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf3: Hash32 = make_nf(&domain, 0x9B, 0x24);
     let pub3 = SpendPublic {
         anchor_root: foreign_root_1,
-        nullifier: nf3,
+        nullifiers: vec![nf3],
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 111, 0x24, 0x34)],
         view_attestations: None,
@@ -324,7 +324,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: pub3.anchor_root,
-                nullifier: pub3.nullifier,
+                nullifiers: pub3.nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -339,8 +339,8 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     );
 
     // Clean up cache
-    clear_pre_verified_spend(&pub1.nullifier);
-    clear_pre_verified_spend(&pub2.nullifier);
-    clear_pre_verified_spend(&pub2_new.nullifier);
-    clear_pre_verified_spend(&pub3.nullifier);
+    clear_pre_verified_spend(&pub1.nullifiers[0]);
+    clear_pre_verified_spend(&pub2.nullifiers[0]);
+    clear_pre_verified_spend(&pub2_new.nullifiers[0]);
+    clear_pre_verified_spend(&pub3.nullifiers[0]);
 }

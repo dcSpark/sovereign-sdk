@@ -48,31 +48,31 @@ pub enum CallMessage<S: Spec> {
     ///
     /// This is the pure privacy-preserving transaction that atomically:
     /// 1. Verifies a ZK proof
-    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 2. Consumes all input notes' nullifiers (prevents double-spending)
     /// 3. Creates output note commitments from the proof
     ///
     /// The proof demonstrates:
-    /// - Knowledge of a note in the tree (via Merkle path)
-    /// - Proper nullifier derivation
-    /// - Value conservation: input_value = sum(output_values)
+    /// - Knowledge of 1-4 notes in the tree (via Merkle paths)
+    /// - Proper nullifier derivation for each input
+    /// - Value conservation: sum(input_values) = sum(output_values)
     ///
-    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// SECURITY: anchor_root and nullifiers are passed as explicit transaction fields
     /// (NOT extracted from public_output) and are validated by the guest.
     /// This prevents public-output tampering attacks.
     ///
     /// # Examples
     ///
-    /// - Split 1000 → 600 + 400 (two outputs)
-    /// - Consolidate multiple notes into one
-    /// - Send shielded payment to another recipient
+    /// - Split 1000 → 600 + 400 (1 input, 2 outputs)
+    /// - Consolidate 4 notes into 1 (4 inputs, 1 output)
+    /// - Multi-input payment (2 inputs → payment + change)
     Transfer {
         /// Serialized Ligero proof package (bincode-encoded)
         /// Note: Ligero proofs are typically 2-4MB in size
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
-        /// Nullifier that the proof derives (must be fresh)
-        nullifier: Hash32,
+        /// Nullifiers that the proof derives (1-4, must all be fresh)
+        nullifiers: Vec<Hash32>,
         /// Optional viewer ciphertexts (created off-chain by the prover).
         /// Each EncryptedNote must have `enc.cm` equal to one of the produced output commitments.
         view_ciphertexts: Option<Vec<EncryptedNote>>,
@@ -84,30 +84,31 @@ pub enum CallMessage<S: Spec> {
     ///
     /// This call atomically:
     /// 1. Verifies a ZK proof
-    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 2. Consumes all input notes' nullifiers (prevents double-spending)
     /// 3. Creates output note commitments from the proof (for change/split)
     /// 4. Transfers transparent tokens to the recipient
     ///
     /// The proof demonstrates:
-    /// - Knowledge of a note in the tree
-    /// - Proper nullifier derivation
-    /// - Value conservation: input_value = sum(output_values) + withdraw_amount
+    /// - Knowledge of 1-4 notes in the tree
+    /// - Proper nullifier derivation for each input
+    /// - Value conservation: sum(input_values) = sum(output_values) + withdraw_amount
     ///
-    /// SECURITY: anchor_root, nullifier, and withdraw_amount are explicit transaction
+    /// SECURITY: anchor_root, nullifiers, and withdraw_amount are explicit transaction
     /// fields validated by the guest to prevent tampering.
     ///
     /// # Examples
     ///
-    /// - Full withdrawal: Input 1000 → Withdraw 1000 (no outputs)
-    /// - Partial withdrawal: Input 1000 → Withdraw 600 + Change 400 (one output)
+    /// - Full withdrawal: 1 input 1000 → Withdraw 1000 (no outputs)
+    /// - Partial withdrawal: 1 input 1000 → Withdraw 600 + Change 400 (one output)
+    /// - Multi-input withdrawal: 4 inputs → Withdraw sum (consolidate + withdraw)
     Withdraw {
         /// Serialized Ligero proof package (bincode-encoded)
         /// Note: Ligero proofs are typically 2-4MB in size
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
-        /// Nullifier that the proof derives (must be fresh)
-        nullifier: Hash32,
+        /// Nullifiers that the proof derives (1-4, must all be fresh)
+        nullifiers: Vec<Hash32>,
         /// Withdrawal amount authorized by the proof
         withdraw_amount: u128,
         /// Recipient address for the withdrawn tokens
@@ -150,6 +151,15 @@ pub enum MidnightPrivacyError<S: Spec> {
     #[error("Nullifier already spent: {}", hex::encode(.0))]
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     NullifierAlreadySpent(Hash32),
+
+    /// Duplicate nullifier within the same transaction (double-counting attack).
+    #[error("Duplicate nullifier in transaction: {}", hex::encode(.0))]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    DuplicateNullifierInTx(Hash32),
+
+    /// Invalid number of nullifiers provided.
+    #[error("Invalid nullifier count: {0} (expected 1-4)")]
+    InvalidNullifierCount(usize),
 
     /// The anchor root is not in the recent roots window.
     #[error("Invalid anchor root: {}", hex::encode(.0))]
@@ -315,19 +325,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ///
     /// This method atomically:
     /// 1. Verifies a ZK proof
-    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 2. Consumes all input notes' nullifiers (prevents double-spending)
     /// 3. Creates output note commitments from the proof
     ///
     /// All value stays shielded. For transparent withdrawals, use `withdraw()`.
     ///
-    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// SECURITY: anchor_root and nullifiers are passed as explicit transaction fields
     /// and validated against the proof to prevent tampering.
     pub(crate) fn transfer(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifiers: Vec<Hash32>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         view_ciphertexts: Option<Vec<EncryptedNote>>,
         gas: Option<S::Gas>,
@@ -347,12 +357,28 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
+            // Validate nullifier count (1-4 inputs supported)
+            const MAX_INPUTS: usize = 4;
+            if nullifiers.is_empty() || nullifiers.len() > MAX_INPUTS {
+                return Err(MidnightPrivacyError::<S>::InvalidNullifierCount(nullifiers.len()).into());
+            }
+
+            // Check for duplicate nullifiers within the transaction (prevents double-counting)
+            let mut seen_nullifiers: HashSet<Hash32> = HashSet::new();
+            for nf in &nullifiers {
+                if !seen_nullifiers.insert(*nf) {
+                    return Err(MidnightPrivacyError::<S>::DuplicateNullifierInTx(*nf).into());
+                }
+            }
+
+            // Use the first nullifier for pre-verification cache lookup
             let credential_check_start = std::time::Instant::now();
-            let cached_public = crate::get_pre_verified_spend(&nullifier);
+            let cached_public = crate::get_pre_verified_spend(&nullifiers[0]);
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
                 has_pre_verified = cached_public.is_some(),
+                num_nullifiers = nullifiers.len(),
                 "Transfer: checked for pre-verified proof outputs"
             );
 
@@ -378,7 +404,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
-            if public.anchor_root != anchor_root || public.nullifier != nullifier {
+            // All nullifiers must match exactly (order matters)
+            if public.anchor_root != anchor_root || public.nullifiers != nullifiers {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
             }
 
@@ -407,20 +434,25 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
 
-            // 2) Consume nullifier
-            let nk = NullifierKey(public.nullifier);
-            if self.nullifier_set.get(&nk, st)?.is_some() {
-                return Err(
-                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
-                );
+            // 2) Consume all nullifiers atomically
+            for nf in &public.nullifiers {
+                let nk = NullifierKey(*nf);
+                if self.nullifier_set.get(&nk, st)?.is_some() {
+                    return Err(
+                        MidnightPrivacyError::<S>::NullifierAlreadySpent(*nf).into(),
+                    );
+                }
             }
-            self.nullifier_set.set(&nk, &true, st)?;
-            // Stats: bump spent nullifier count
+            // All nullifiers are fresh - mark them as spent
+            for nf in &public.nullifiers {
+                let nk = NullifierKey(*nf);
+                self.nullifier_set.set(&nk, &true, st)?;
+                // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
+                self.append_nullifier(*nf, st)?;
+            }
+            // Stats: bump spent nullifier count by number of inputs
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
-            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
-
-            // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            self.append_nullifier(public.nullifier, st)?;
+            self.spent_nullifier_count.set(&(n_spent + public.nullifiers.len() as u64), st)?;
 
             // 3) Queue all output commitments for end-of-block processing
             let outputs: Vec<Hash32> = public.output_commitments.clone();
@@ -428,14 +460,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 self.add_commitment(*cm, st)?;
             }
 
-            // Emit spent event
-            self.emit_event(
-                st,
-                Event::NoteSpent {
-                    nullifier: public.nullifier,
-                    anchor_root: public.anchor_root,
-                },
-            );
+            // Emit spent event for each nullifier
+            for nf in &public.nullifiers {
+                self.emit_event(
+                    st,
+                    Event::NoteSpent {
+                        nullifier: *nf,
+                        anchor_root: public.anchor_root,
+                    },
+                );
+            }
 
             // Level B: Viewer attestation verification
             if let Some(vcs) = view_ciphertexts {
@@ -519,7 +553,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.emit_event(
                 st,
                 Event::PoolTransfer {
-                    nullifier: public.nullifier,
+                    nullifiers: public.nullifiers.clone(),
                     anchor_root: public.anchor_root,
                     outputs,
                     viewer_bindings,
@@ -534,18 +568,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ///
     /// This method atomically:
     /// 1. Verifies a ZK proof
-    /// 2. Consumes the input note's nullifier (prevents double-spending)
+    /// 2. Consumes all input notes' nullifiers (prevents double-spending)
     /// 3. Creates output note commitments from the proof (for change)
     /// 4. Transfers transparent tokens to the recipient
     ///
-    /// SECURITY: anchor_root, nullifier, and withdraw_amount are explicit transaction
+    /// SECURITY: anchor_root, nullifiers, and withdraw_amount are explicit transaction
     /// fields validated against the proof to prevent tampering.
     pub(crate) fn withdraw(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifiers: Vec<Hash32>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
@@ -567,12 +601,28 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
+            // Validate nullifier count (1-4 inputs supported)
+            const MAX_INPUTS: usize = 4;
+            if nullifiers.is_empty() || nullifiers.len() > MAX_INPUTS {
+                return Err(MidnightPrivacyError::<S>::InvalidNullifierCount(nullifiers.len()).into());
+            }
+
+            // Check for duplicate nullifiers within the transaction (prevents double-counting)
+            let mut seen_nullifiers: HashSet<Hash32> = HashSet::new();
+            for nf in &nullifiers {
+                if !seen_nullifiers.insert(*nf) {
+                    return Err(MidnightPrivacyError::<S>::DuplicateNullifierInTx(*nf).into());
+                }
+            }
+
+            // Use the first nullifier for pre-verification cache lookup
             let credential_check_start = std::time::Instant::now();
-            let cached_public = crate::get_pre_verified_spend(&nullifier);
+            let cached_public = crate::get_pre_verified_spend(&nullifiers[0]);
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
                 has_pre_verified = cached_public.is_some(),
+                num_nullifiers = nullifiers.len(),
                 "Withdraw: checked for pre-verified proof outputs"
             );
 
@@ -595,8 +645,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
+            // All nullifiers must match exactly (order matters)
             if public.anchor_root != anchor_root
-                || public.nullifier != nullifier
+                || public.nullifiers != nullifiers
                 || public.withdraw_amount != withdraw_amount
             {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
@@ -610,8 +661,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 .into());
             }
 
-            // Limit change outputs to at most 1 (per requirements)
-            const MAX_OUTPUTS_WITHDRAW: usize = 1;
+            // Limit change outputs to at most 2 (to match transfer)
+            const MAX_OUTPUTS_WITHDRAW: usize = 2;
             if public.output_commitments.len() > MAX_OUTPUTS_WITHDRAW {
                 return Err(MidnightPrivacyError::<S>::TooManyOutputs(
                     public.output_commitments.len(),
@@ -627,20 +678,25 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
 
-            // 2) Consume nullifier
-            let nk = NullifierKey(public.nullifier);
-            if self.nullifier_set.get(&nk, st)?.is_some() {
-                return Err(
-                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
-                );
+            // 2) Consume all nullifiers atomically
+            for nf in &public.nullifiers {
+                let nk = NullifierKey(*nf);
+                if self.nullifier_set.get(&nk, st)?.is_some() {
+                    return Err(
+                        MidnightPrivacyError::<S>::NullifierAlreadySpent(*nf).into(),
+                    );
+                }
             }
-            self.nullifier_set.set(&nk, &true, st)?;
-            // Stats: bump spent nullifier count
+            // All nullifiers are fresh - mark them as spent
+            for nf in &public.nullifiers {
+                let nk = NullifierKey(*nf);
+                self.nullifier_set.set(&nk, &true, st)?;
+                // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
+                self.append_nullifier(*nf, st)?;
+            }
+            // Stats: bump spent nullifier count by number of inputs
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
-            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
-
-            // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            self.append_nullifier(public.nullifier, st)?;
+            self.spent_nullifier_count.set(&(n_spent + public.nullifiers.len() as u64), st)?;
 
             // 3) Queue change outputs for end-of-block processing
             let change_outputs: Vec<Hash32> = public.output_commitments.clone();
@@ -666,14 +722,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.bank
                 .transfer_from(self.id.to_payable(), &to, coins, st)?;
 
-            // Emit events
-            self.emit_event(
-                st,
-                Event::NoteSpent {
-                    nullifier: public.nullifier,
-                    anchor_root: public.anchor_root,
-                },
-            );
+            // Emit spent event for each nullifier
+            for nf in &public.nullifiers {
+                self.emit_event(
+                    st,
+                    Event::NoteSpent {
+                        nullifier: *nf,
+                        anchor_root: public.anchor_root,
+                    },
+                );
+            }
 
             // Update withdrawal statistics
             let total_withdrawn = self.total_withdrawn.get(st)?.unwrap_or(0);
@@ -765,7 +823,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 st,
                 Event::PoolWithdraw {
                     amount: public.withdraw_amount,
-                    nullifier: public.nullifier,
+                    nullifiers: public.nullifiers.clone(),
                     anchor_root: public.anchor_root,
                     change: change_outputs,
                     viewer_bindings,

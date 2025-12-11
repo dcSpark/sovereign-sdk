@@ -66,8 +66,8 @@ pub enum Event {
     /// 
     /// **Note:** Output positions are provisional. Final positions assigned at flush.
     PoolTransfer {
-        /// The nullifier that was spent
-        nullifier: Hash32,
+        /// The nullifiers that were spent (1-4 inputs)
+        nullifiers: Vec<Hash32>,
         /// The anchor root used
         anchor_root: Hash32,
         /// Output note commitments added by this transfer
@@ -77,14 +77,14 @@ pub enum Event {
         /// Each binding indicates which viewer (by fvk_commitment) can decrypt a specific output (by cm).
         viewer_bindings: Option<Vec<ViewerBinding>>,
     },
-    /// Tokens were withdrawn from the pool after consuming a nullifier.
+    /// Tokens were withdrawn from the pool after consuming nullifiers.
     /// 
     /// **Note:** Change output positions are provisional.
     PoolWithdraw {
         /// Amount withdrawn
         amount: u128,
-        /// The nullifier
-        nullifier: Hash32,
+        /// The nullifiers that were spent (1-4 inputs)
+        nullifiers: Vec<Hash32>,
         /// The anchor root used
         anchor_root: Hash32,
         /// Change output commitments created (often 0 or 1)
