@@ -7079,6 +7079,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-external"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.4",
+ "base64 0.22.1",
+ "bincode",
+ "borsh",
+ "demo-stf",
+ "dirs 6.0.0",
+ "dotenvy",
+ "envy",
+ "hex",
+ "midnight-privacy",
+ "rand 0.8.5",
+ "reqwest 0.12.23",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sov-address",
+ "sov-api-spec",
+ "sov-bank",
+ "sov-cli",
+ "sov-ligero-adapter",
+ "sov-mock-da",
+ "sov-mock-zkvm",
+ "sov-modules-api",
+ "sov-modules-stf-blueprint",
+ "sov-node-client",
+ "sov-value-setter-zk",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber 0.3.20",
+ "tracing-test",
+ "url",
+ "uuid 1.18.1",
+ "validator",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11625,6 +11667,12 @@ dependencies = [
  "cpufeatures",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -16241,6 +16289,7 @@ dependencies = [
  "getrandom 0.3.3",
  "js-sys",
  "serde",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
