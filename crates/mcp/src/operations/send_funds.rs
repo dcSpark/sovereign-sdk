@@ -31,7 +31,11 @@ pub async fn send_funds(
     token_id: &TokenId,
     amount: Amount,
 ) -> Result<SendFundsResult> {
-    tracing::info!("Sending {} to address: {}", amount, to_address);
+    tracing::info!(
+        "Sending {} to address: {}",
+        amount,
+        to_address
+    );
 
     let to_address_parsed: <McpSpec as sov_modules_api::Spec>::Address = to_address
         .parse()
