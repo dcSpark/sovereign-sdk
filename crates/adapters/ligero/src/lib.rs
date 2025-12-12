@@ -383,9 +383,30 @@ impl LigeroVerifier {
     /// Redact private arguments in place (replace with dummy values).
     ///
     /// This is used before returning args to callers and before verification.
-    /// The verifier re-executes with redacted values, so the values must remain
-    /// parseable AND non-zero (guest rejects zero values).
-    /// Uses "01" pattern for hex to avoid X25519 low-order point issues.
+    /// Redact a decimal string to "000...001" (parses as 1, never overflows u64).
+    fn redact_decimal(len: usize) -> String {
+        match len {
+            0 => String::new(),
+            1 => "1".to_string(),
+            _ => format!("{}{}", "0".repeat(len - 1), "1"), // "000...001" -> parses as 1
+        }
+    }
+
+    /// Redact a hex string with non-zero bytes throughout.
+    /// Uses "01" pattern to avoid X25519 low-order point issues.
+    /// For odd lengths, pads with leading "0" to preserve exact length.
+    fn redact_hex(len: usize) -> String {
+        match len {
+            0 => String::new(),
+            1 => "1".to_string(),
+            _ if len % 2 == 0 => "01".repeat(len / 2),     // Even: "0101...01"
+            _ => format!("0{}", "01".repeat(len / 2)),     // Odd: "00101...01"
+        }
+    }
+
+    /// Redact private arguments in place.
+    /// - Decimals: "000...001" (parses as 1, never overflows)
+    /// - Hex: "0101...01" pattern (non-zero bytes, avoids X25519 low-order issues)
     fn redact_args_in_place(args: &mut [LigeroArg], private_indices: &[usize]) {
         for &idx in private_indices {
             if idx == 0 || idx > args.len() {
@@ -394,17 +415,11 @@ impl LigeroVerifier {
             let i = idx - 1; // 1-based -> 0-based
             args[i] = match &args[i] {
                 LigeroArg::String { str: s } => {
-                    let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-                    if is_decimal {
-                        LigeroArg::String { str: "1".repeat(s.len()) }
-                    } else {
-                        LigeroArg::String { str: "1".repeat(s.len()) }
-                    }
+                    LigeroArg::String { str: Self::redact_decimal(s.len()) }
                 }
                 LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 1 },
                 LigeroArg::Hex { hex: h } => LigeroArg::Hex {
-                    // Use "01" pattern to avoid all-zero issues
-                    hex: "01".repeat(h.len() / 2),
+                    hex: Self::redact_hex(h.len()),
                 },
             };
         }
@@ -783,32 +798,9 @@ mod native {
             fs::read_dir(temp_dir.path()).unwrap().collect::<Vec<_>>()
         );
 
-        // Redact private arguments (replace with dummy values)
-        // Ligero supports private args: verifier can use obscured values as long as
-        // type and length are preserved (per Ligero docs).
-        // Use "1"s for decimals (non-zero, guest rejects zero values)
-        // Use "1"s for hex (non-zero, avoids potential low-order point issues in X25519)
-        for &idx in &private_indices {
-            if idx > 0 && idx <= args.len() {
-                let arg_idx = idx - 1; // 1-based indexing
-                args[arg_idx] = match &args[arg_idx] {
-                    crate::LigeroArg::String { str: s } => {
-                        let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-                        if is_decimal {
-                            // Use "1"s for non-zero (guest rejects zero-value inputs)
-                            crate::LigeroArg::String { str: "1".repeat(s.len()) }
-                        } else {
-                            crate::LigeroArg::String { str: "1".repeat(s.len()) }
-                        }
-                    }
-                    crate::LigeroArg::I64 { .. } => crate::LigeroArg::I64 { i64: 1 },
-                    crate::LigeroArg::Hex { hex: h } => {
-                        // Use "01" pattern repeated (non-zero, valid hex)
-                        crate::LigeroArg::Hex { hex: "01".repeat(h.len() / 2) }
-                    }
-                };
-            }
-        }
+        // Redact private arguments using shared helpers.
+        // Uses "000...001" pattern: parses as 1, never overflows, non-zero.
+        crate::LigeroVerifier::redact_args_in_place(&mut args, &private_indices);
 
         let config = paths.to_config(args, private_indices);
         let config_json =

@@ -306,11 +306,29 @@ impl LigeroHost {
         Ok(stdout.contains("Final Verify Result:                 true"))
     }
 
+    /// Redact a decimal string to "000...001" (parses as 1, never overflows u64).
+    fn redact_decimal(len: usize) -> String {
+        match len {
+            0 => String::new(),
+            1 => "1".to_string(),
+            _ => format!("{}{}", "0".repeat(len - 1), "1"),
+        }
+    }
+
+    /// Redact a hex string with non-zero bytes throughout.
+    /// Uses "01" pattern to avoid X25519 low-order point issues.
+    fn redact_hex(len: usize) -> String {
+        match len {
+            0 => String::new(),
+            1 => "1".to_string(),
+            _ if len % 2 == 0 => "01".repeat(len / 2),
+            _ => format!("0{}", "01".repeat(len / 2)),
+        }
+    }
+
     /// Redact private arguments, replacing their values with dummy data.
-    ///
-    /// This is used before serializing args into the proof package to prevent
-    /// private witness values from leaking into transaction calldata.
-    #[allow(dead_code)]
+    /// - Decimals: "000...001" (parses as 1, never overflows)
+    /// - Hex: "0101...01" pattern (non-zero bytes, avoids X25519 issues)
     fn redact_args(&self) -> Vec<LigeroArg> {
         let mut args = self.config.args.clone();
         for &idx in &self.config.private_indices {
@@ -320,19 +338,11 @@ impl LigeroHost {
             let i = idx - 1; // 1-based -> 0-based
             args[i] = match &args[i] {
                 LigeroArg::String { str: s } => {
-                    // Check if it looks like a decimal number
-                    let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-                    if is_decimal {
-                        // Replace with all 1s (parseable as non-zero decimal)
-                        LigeroArg::String { str: "1".repeat(s.len()) }
-                    } else {
-                        LigeroArg::String { str: "1".repeat(s.len()) }
-                    }
+                    LigeroArg::String { str: Self::redact_decimal(s.len()) }
                 }
                 LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 1 },
                 LigeroArg::Hex { hex: h } => LigeroArg::Hex {
-                    // Use "01" pattern repeated (non-zero, valid hex)
-                    hex: "01".repeat(h.len() / 2),
+                    hex: Self::redact_hex(h.len()),
                 },
             };
         }
