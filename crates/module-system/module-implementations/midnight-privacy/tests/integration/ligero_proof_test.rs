@@ -49,13 +49,10 @@ use midnight_privacy::{
     recipient_from_sk, nf_key_from_sk, recipient_from_pk, pk_from_sk, pk_ivk_from_sk,
     encrypt_note_for_recipient_with_sender, ct_hash, esk_from_rho_cm, Note,
 };
-use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroVerifier};
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, Zkvm, ZkvmHost};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
-use tempfile::tempdir;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 // ================================================================================================
@@ -777,119 +774,25 @@ fn hex32(h: &Hash32) -> String {
     hex::encode(h)
 }
 
-
-/// Helper to discover guest program path and platform-specific binaries
-fn program_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LIGERO_PROGRAM_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Try to discover it based on project structure
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    // For note spending, we'd need a different guest program
-    // For now, return the note_spend_guest as the implementation
-    Ok(repo_root.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"))
-}
-
-/// Helper to get platform-specific binary paths
-fn get_platform_bin_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-    // Detect OS and choose correct binary path
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux-amd64"
-    } else {
-        bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
-    };
-
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
-
-    Ok((
-        bin_dir.join("webgpu_prover"),
-        bin_dir.join("webgpu_verifier"),
-        shader_dir,
-    ))
-}
-
 const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
 
-/// Test the full note lifecycle with REAL Ligero proofs
+/// Test the full note lifecycle with REAL Ligero proofs (full withdrawal variant)
 ///
-/// This test generates ACTUAL zero-knowledge proofs using WebGPU prover/verifier binaries.
-/// No simulation or shortcuts - this is the real deal!
+/// This test generates ACTUAL zero-knowledge proofs using WebGPU.
+/// It demonstrates a full withdrawal scenario (no shielded outputs).
 ///
-/// Requirements:
-/// - LIGERO_PROVER_BIN: path to webgpu_prover
-/// - LIGERO_VERIFIER_BIN: path to webgpu_verifier  
-/// - LIGERO_SHADER_PATH: path to shader directory
-/// - LIGERO_PROGRAM_PATH: path to note_spend.wasm guest program (needs to be implemented)
-/// - LIGERO_PACKING: FFT packing parameter (default: 8192)
-///
-/// The guest program must implement:
-/// 1. Verify Merkle path: root_from_path(cm, pos, siblings) == anchor
-/// 2. Derive nullifier: nullifier(domain, nf_key, rho) [PRF-based, position-agnostic]
-/// 3. Commit public output: (anchor_root, nullifiers, withdraw_amount)
+/// The guest program verifies:
+/// 1. Merkle path: root_from_path(cm, pos, siblings) == anchor
+/// 2. Nullifier derivation: nullifier(domain, nf_key_from_sk(spend_sk), rho)
+/// 3. Balance: input_value == withdraw_amount (since n_out = 0)
 #[test]
-#[ignore = "Requires WebGPU hardware and takes 60+ seconds - run manually with: cargo test test_note_spend_with_real_ligero_proof -- --ignored"]
 fn test_note_spend_with_real_ligero_proof() -> Result<()> {
-    println!("\n=== REAL Note Spend Proof with Ligero ===\n");
+    println!("\n=== REAL Note Spend Proof with Ligero (Full Withdrawal) ===\n");
 
-    // ---- 0) Setup environment (automatically discovers paths) ----
+    // ---- 0) Setup environment ----
     println!("Step 0: Setting up Ligero environment...");
-
-    setup_ligero_env().context("Failed to setup Ligero environment")?;
-
-    // Use platform-specific paths or environment overrides
-    let (default_prover, default_verifier, default_shader_path) = get_platform_bin_paths()?;
-    
-    let prover = if let Ok(path) = std::env::var("LIGERO_PROVER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_prover
-    };
-    
-    let verifier = if let Ok(path) = std::env::var("LIGERO_VERIFIER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_verifier
-    };
-    
-    let shader_path = if let Ok(path) = std::env::var("LIGERO_SHADER_PATH") {
-        path
-    } else {
-        default_shader_path.to_string_lossy().to_string()
-    };
-    
-    let packing: u32 = std::env::var("LIGERO_PACKING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192);
-    let program =
-        program_path().context("Set LIGERO_PROGRAM_PATH to note_spend.wasm guest program")?;
-
-    println!("✓ Prover:      {}", prover.display());
-    println!("✓ Verifier:    {}", verifier.display());
-    println!("✓ Shaders:     {}", shader_path);
-    println!("✓ Packing:     {}", packing);
-    println!("✓ Program:     {}", program.display());
+    let program_path = setup_ligero_env()?;
+    println!("✓ Program: {}", program_path);
 
     // ---- 1) Create a note + tree ----
     println!("\nStep 1: Creating note and building Merkle tree...");
@@ -899,8 +802,9 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     let rho: Hash32 = [2u8; 32];
     let spend_sk: Hash32 = [4u8; 32]; // Spending secret key - SECRET
 
-    // Derive recipient from spend_sk (same owner for multi-input)
+    // Derive recipient from spend_sk
     let recipient = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let pos: u64 = 0;
@@ -924,192 +828,94 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     assert_eq!(recomputed, anchor, "Merkle path verification failed!");
     println!("✓ Merkle path verified ({} siblings)", siblings.len());
 
-    // ---- 2) Derive nullifier (PRF-based using nf_key derived from spend_sk) ----
-    println!("\nStep 2: Deriving nullifier (PRF-based, no position)...");
+    // ---- 2) Derive nullifier ----
+    println!("\nStep 2: Deriving nullifier (PRF-based)...");
 
-    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: {}", hex32(&nf));
 
-    // ---- 3) Build JSON config for REAL prover (NEW MULTI-INPUT ABI) ----
-    println!("\nStep 3: Building prover configuration (multi-input ABI)...");
-
-    // New multi-input ABI argument order:
-    // [1] domain (PUBLIC)
-    // [2] spend_sk (PRIVATE) - spending secret key
-    // [3] depth (PUBLIC)
-    // [4] anchor (PUBLIC)
-    // [5] n_in (PUBLIC) - number of inputs
-    // For each input i:
-    //   value_in_i (PRIVATE), rho_in_i (PRIVATE), pos_in_i (PRIVATE), 
-    //   siblings_i[depth] (PRIVATE), nullifier_i (PUBLIC)
-    // Then:
-    // withdraw_amount (PUBLIC)
-    // n_out (PUBLIC) - number of outputs
-    // For each output j:
-    //   value_out_j (PRIVATE), rho_out_j (PRIVATE), pk_out_j (PRIVATE), cm_out_j (PUBLIC)
+    // ---- 3) Prepare proof arguments ----
+    println!("\nStep 3: Building prover configuration...");
 
     let n_in: u32 = 1;
     let withdraw_amount: u128 = value; // Full withdrawal, no outputs
     let n_out: u32 = 0;
 
-    let mut args: Vec<serde_json::Value> = Vec::new();
-    args.push(json!({"str": hex32(&domain)}));        // [1] domain (PUBLIC)
-    args.push(json!({"str": hex32(&spend_sk)}));      // [2] spend_sk (PRIVATE)
-    args.push(json!({"str": TREE_DEPTH.to_string()})); // [3] depth (PUBLIC)
-    args.push(json!({"str": hex32(&anchor)}));        // [4] anchor (PUBLIC)
-    args.push(json!({"str": n_in.to_string()}));      // [5] n_in (PUBLIC)
-
-    // Input 0: value, rho, pos, siblings[], nullifier
-    args.push(json!({"str": value.to_string()}));     // value_in_0 (PRIVATE)
-    args.push(json!({"str": hex32(&rho)}));           // rho_in_0 (PRIVATE)
-    args.push(json!({"str": pos.to_string()}));       // pos_in_0 (PRIVATE)
-    for s in &siblings {
-        args.push(json!({"str": hex32(s)}));          // siblings_0[k] (PRIVATE)
-    }
-    args.push(json!({"str": hex32(&nf)}));            // nullifier_0 (PUBLIC)
-
-    // Withdraw and outputs
-    args.push(json!({"str": withdraw_amount.to_string()})); // withdraw_amount (PUBLIC)
-    args.push(json!({"str": n_out.to_string()}));           // n_out (PUBLIC)
-    // No outputs for full withdrawal
-
-    // Mark private indices (1-based indexing for Ligero)
-    // Private: spend_sk(2), and for input 0: value(6), rho(7), pos(8), siblings(9..9+depth-1)
-    let mut private_indices: Vec<usize> = vec![2]; // spend_sk
-    
-    // Input 0 private fields start at index 6
-    let input_start = 6usize;
-    private_indices.push(input_start);     // value_in_0
-    private_indices.push(input_start + 1); // rho_in_0
-    private_indices.push(input_start + 2); // pos_in_0
-    for k in 0..(TREE_DEPTH as usize) {
-        private_indices.push(input_start + 3 + k); // siblings_0[k]
-    }
-    // nullifier is PUBLIC, so not in private_indices
-
-    println!("✓ Arguments prepared: {} total", args.len());
+    // Private indices for full withdrawal (no outputs)
+    let private_indices = private_indices_join_split(TREE_DEPTH as usize, n_in as usize, n_out as usize);
     println!("✓ Private indices: {:?}", private_indices);
 
-    let prove_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
-        "packing": packing,
-        "private-indices": private_indices,
-        "args": args,
-    });
+    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
+        .with_private_indices(private_indices);
 
-    // ---- 4) Run REAL prover (writes proof.data) ----
-    println!("\nStep 4: Generating REAL proof with WebGPU prover...");
-    println!("⏳ This may take a while (proof generation is compute-intensive)...");
+    // Add arguments in NEW ABI order
+    host.add_hex_arg(hex::encode(domain));                    // 1: domain (PUBLIC)
+    host.add_hex_arg(hex::encode(spend_sk));                  // 2: spend_sk (PRIVATE)
+    host.add_str_arg((TREE_DEPTH as u64).to_string());        // 3: depth (PUBLIC)
+    host.add_hex_arg(hex::encode(anchor));                    // 4: anchor (PUBLIC)
+    host.add_str_arg(n_in.to_string());                       // 5: n_in (PUBLIC)
 
-    let tmp = tempdir()?;
-    let out = Command::new(&prover)
-        .arg(serde_json::to_string(&prove_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_prover - is WebGPU available?")?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !stdout.contains("Final prove result:") || !stdout.contains("true")
-    {
-        eprintln!("❌ Prover output:\n{}", stdout);
-        eprintln!(
-            "❌ Prover stderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        bail!("Ligero prover failed to produce a valid proof");
+    // Input 0
+    host.add_str_arg((value as u64).to_string());             // value_in_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(rho));                       // rho_in_0 (PRIVATE)
+    host.add_str_arg(pos.to_string());                        // pos_in_0 (PRIVATE)
+    for sibling in &siblings {
+        host.add_hex_arg(hex::encode(sibling));               // siblings (PRIVATE)
     }
+    host.add_hex_arg(hex::encode(nf));                        // nullifier_0 (PUBLIC)
 
-    println!("✓ REAL proof generated successfully!");
-    println!("  Prover output: {}", stdout.lines().last().unwrap_or(""));
+    host.add_str_arg((withdraw_amount as u64).to_string());   // withdraw (PUBLIC)
+    host.add_str_arg(n_out.to_string());                      // n_out (PUBLIC)
+    // No outputs for full withdrawal
 
-    // ---- 5) Run REAL verifier (must redact private args) ----
+    // Set public output
+    let public_output = SpendPublic {
+        anchor_root: anchor,
+        nullifiers: vec![nf],
+        withdraw_amount,
+        output_commitments: vec![],
+        view_attestations: None,
+        recipient_attestations: None,
+    };
+    host.set_public_output(&public_output)?;
+
+    let code_commitment = host.code_commitment();
+    println!("✓ Code commitment: {}", hex::encode(code_commitment.encode()));
+
+    // ---- 4) Generate REAL proof ----
+    println!("\nStep 4: Generating REAL proof with WebGPU prover...");
+
+    let proof_start = Instant::now();
+    let proof_data = host.run(true).context("Failed to generate proof")?;
+    let proof_time = proof_start.elapsed().as_secs_f64();
+
+    println!("✓ REAL proof generated: {} bytes ({:.3}s)", proof_data.len(), proof_time);
+
+    // ---- 5) Verify REAL proof ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    // Redact ALL private arguments based on private_indices
-    // The verifier must not see these witness values!
-    // IMPORTANT: Preserve original string length for verifier compatibility
-    let mut redacted_args = args.clone();
-    for &idx in &private_indices {
-        let vec_idx = idx - 1;
-        if vec_idx >= redacted_args.len() {
-            continue;
-        }
-        // Preserve original string length for verifier compatibility
-        if let Some(s) = redacted_args[vec_idx].get("str").and_then(|v| v.as_str()) {
-            // Check if it looks like a decimal (for parseability)
-            let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-            if is_decimal {
-                // Use zeros for decimals (parseable)
-                let redacted = if s.len() == 1 {
-                    "0".to_string()
-                } else {
-                    format!("1{}", "0".repeat(s.len() - 1))
-                };
-                redacted_args[vec_idx] = json!({"str": redacted});
-            } else {
-                // For hex strings, use zeros (same length)
-                redacted_args[vec_idx] = json!({"str": "0".repeat(s.len())});
-            }
-        }
-    }
+    let verify_start = Instant::now();
+    let verified_output: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)
+        .context("Proof verification failed")?;
+    let verify_time = verify_start.elapsed().as_secs_f64();
 
-    let verify_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
-        "packing": packing,
-        "private-indices": private_indices,
-        "args": redacted_args,
-    });
+    println!("✓ REAL proof verified ({:.3}s)", verify_time);
 
-    let out_v = Command::new(&verifier)
-        .arg(serde_json::to_string(&verify_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_verifier")?;
-
-    let vstdout = String::from_utf8_lossy(&out_v.stdout);
-    if !out_v.status.success()
-        || !vstdout.contains("Final Verify Result:")
-        || !vstdout.contains("true")
-    {
-        eprintln!("❌ Verifier output:\n{}", vstdout);
-        eprintln!(
-            "❌ Verifier stderr:\n{}",
-            String::from_utf8_lossy(&out_v.stderr)
-        );
-        bail!("Ligero verifier rejected the proof");
-    }
-
-    println!("✓ REAL proof verified successfully!");
-    println!(
-        "  Verifier output: {}",
-        vstdout.lines().last().unwrap_or("")
-    );
-
-    // ---- 6) Local sanity checks ----
+    // ---- 6) Validate proof correctness ----
     println!("\nStep 6: Validating proof correctness...");
 
-    // Recompute anchor and nullifier locally to confirm they match
-    assert_eq!(
-        anchor,
-        root_from_path(&cm, pos, &siblings, TREE_DEPTH),
-        "Anchor mismatch!"
-    );
-    assert_eq!(nf, nullifier(&domain, &nf_key, &rho), "Nullifier mismatch!");
+    assert_eq!(verified_output.anchor_root, anchor, "Anchor mismatch!");
+    assert_eq!(verified_output.nullifiers[0], nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.withdraw_amount, withdraw_amount, "Withdraw amount mismatch!");
+    assert_eq!(verified_output.output_commitments.len(), 0, "Should have no outputs!");
 
     println!("✓ Anchor root matches: {}", hex32(&anchor));
     println!("✓ Nullifier matches:   {}", hex32(&nf));
+    println!("✓ Withdraw amount:     {}", withdraw_amount);
+    println!("✓ Output commitments:  {} (full withdrawal)", verified_output.output_commitments.len());
 
     // ---- 7) Simulate on-chain validation ----
     println!("\nStep 7: Simulating on-chain spend validation...");
-
-    // In a real module, these checks would happen on-chain:
-    // 1. Anchor is in recent roots window ✓
-    // 2. Nullifier hasn't been used before ✓
-    // 3. Proof verifies against method_id ✓
-    // 4. Mark nullifier as used ✓
 
     println!("✓ Anchor {} is valid", hex::encode(&anchor[..8]));
     println!("✓ Nullifier {} is fresh", hex::encode(&nf[..8]));
@@ -1119,9 +925,9 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     println!("\n=== SUCCESS ===");
     println!("✓ Created note with Poseidon2 commitment");
     println!("✓ Updated Merkle tree root");
-    println!("✓ Generated REAL Ligero proof with WebGPU");
-    println!("✓ Verified proof with REAL verifier");
-    println!("✓ Consumed note via nullifier");
+    println!("✓ Generated REAL Ligero proof ({:.3}s)", proof_time);
+    println!("✓ Verified REAL proof ({:.3}s)", verify_time);
+    println!("✓ Full withdrawal of {} units complete", value);
     println!("\n🎉 Full privacy-preserving note spend complete with REAL ZK proofs!");
 
     Ok(())
