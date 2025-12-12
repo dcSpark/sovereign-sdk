@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match AuthorityVfk::from_hex(vfk_hex) {
             Ok(vfk) => {
                 tracing::info!("[mcp] Authority VFK initialized successfully");
-                Some(Arc::new(vfk))
+                Some(vfk)
             }
             Err(e) => {
                 tracing::warn!("[mcp] Failed to initialize authority VFK: {}", e);
@@ -89,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("[mcp] No AUTHORITY_VFK provided, note decryption will not be available");
         None
     };
+
+    let authority_vfk = Arc::new(RwLock::new(authority_vfk));
 
     tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
 
@@ -113,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         privacy_key.privacy_address()
     );
 
-    let privacy_key = Arc::new(privacy_key);
+    let privacy_key = Arc::new(RwLock::new(privacy_key));
 
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",

@@ -39,12 +39,6 @@ where
     ///
     /// # Parameters
     /// * `private_key_hex` - Private key as hex string (with or without "0x" prefix)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let wallet = WalletContext::from_private_key_hex("your_private_key_hex_here")?;
-    /// // That's it! Now you can sign transactions
-    /// ```
     pub fn from_private_key_hex(private_key_hex: impl AsRef<str>) -> Result<Self> {
         let hex_str = private_key_hex.as_ref().trim();
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
@@ -146,8 +140,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use demo_stf::runtime::Runtime;
     use sov_address::MultiAddressEvm;
     use sov_ligero_adapter::Ligero;

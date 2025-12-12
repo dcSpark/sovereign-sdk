@@ -29,11 +29,6 @@ impl PrivacyKey {
     ///
     /// # Parameters
     /// * `spend_sk_hex` - Spending secret key as hex string (with or without "0x" prefix)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let privacy_key = PrivacyKey::from_hex("1234567890abcdef...")?;
-    /// ```
     pub fn from_hex(spend_sk_hex: impl AsRef<str>) -> Result<Self> {
         let hex_str = spend_sk_hex.as_ref().trim();
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
@@ -71,11 +66,6 @@ impl PrivacyKey {
     ///
     /// # Parameters
     /// * `address` - Privacy address in bech32m format (e.g., "privpool1...")
-    ///
-    /// # Example
-    /// ```ignore
-    /// let privacy_key = PrivacyKey::from_address("privpool1qypqxpq9qcrsszg2pvxq6rs...")?;
-    /// ```
     pub fn from_address(address: impl AsRef<str>) -> Result<Self> {
         let privacy_addr: PrivacyAddress = address
             .as_ref()

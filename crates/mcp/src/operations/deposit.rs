@@ -25,7 +25,9 @@ const DOMAIN: [u8; 32] = [1u8; 32];
 #[derive(Debug)]
 pub struct DepositResult {
     pub tx_hash: String,
+    #[allow(dead_code)]
     pub rho: [u8; 32],
+    #[allow(dead_code)]
     pub recipient: [u8; 32],
 }
 
@@ -147,74 +149,4 @@ pub async fn deposit(
         rho,
         recipient,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_utils::TEST_PRIVATE_KEY_HEX;
-
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn test_deposit() {
-        use crate::test_utils::is_rollup_available;
-
-        if !is_rollup_available().await {
-            eprintln!("⚠️  Skipping test: Rollup is not available at ROLLUP_RPC_URL");
-            eprintln!("   Start the rollup or set ROLLUP_RPC_URL to run this test");
-            return;
-        }
-
-        let amount = 100u128;
-
-        tracing::info!("Creating wallet from private key");
-        let wallet =
-            WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(TEST_PRIVATE_KEY_HEX)
-                .expect("Failed to create wallet");
-
-        // Create a test privacy key
-        let test_spend_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let privacy_key =
-            PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
-
-        tracing::info!("Privacy address: {}", privacy_key.privacy_address());
-
-        let rpc_url = std::env::var("ROLLUP_RPC_URL")
-            .unwrap_or_else(|_| "http://localhost:12346".to_string());
-        let verifier_url =
-            std::env::var("VERIFIER_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let indexer_url =
-            std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
-
-        tracing::info!("Connecting to rollup at: {}", rpc_url);
-        let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url)
-            .await
-            .expect("Failed to connect to rollup");
-
-        tracing::info!("Calling deposit with amount: {}", amount);
-
-        let result = deposit(&provider, &wallet, amount, &privacy_key).await;
-
-        assert!(result.is_ok(), "deposit should succeed: {:?}", result.err());
-
-        let deposit_result = result.unwrap();
-
-        assert!(
-            !deposit_result.tx_hash.is_empty(),
-            "tx_hash should not be empty"
-        );
-        assert_ne!(deposit_result.rho, [0u8; 32], "rho should be random");
-
-        // Recipient should match the privacy key's derived recipient
-        let expected_recipient = privacy_key.recipient(&DOMAIN);
-        assert_eq!(
-            deposit_result.recipient, expected_recipient,
-            "recipient should match privacy key's derived recipient"
-        );
-
-        tracing::info!("✅ Deposit transaction submitted successfully!");
-        tracing::info!("   Transaction hash: {}", deposit_result.tx_hash);
-        tracing::info!("   Rho: {}", hex::encode(&deposit_result.rho));
-        tracing::info!("   Recipient: {}", hex::encode(&deposit_result.recipient));
-    }
 }

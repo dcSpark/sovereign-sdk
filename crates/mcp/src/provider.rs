@@ -287,6 +287,7 @@ impl Provider {
     ///
     /// Queries the `/healthcheck` endpoint to verify the rollup is available.
     #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
     pub async fn is_healthy(&self) -> bool {
         let health_url = format!("{}/healthcheck", self.rpc_url);
 

@@ -40,8 +40,20 @@ const NOTE_SEARCH_LOG_EVERY: usize = 10;
 #[derive(Debug)]
 pub struct TransferResult {
     pub tx_hash: String,
-    pub new_rho: [u8; 32],
-    pub new_recipient: [u8; 32],
+    /// Amount sent to destination
+    pub amount_sent: u128,
+    /// Rho for the output note
+    pub output_rho: [u8; 32],
+    /// Recipient of the output note
+    #[allow(dead_code)]
+    pub output_recipient: [u8; 32],
+    /// Change amount (if partial transfer)
+    pub change_amount: Option<u128>,
+    /// Rho for change note (if partial transfer)
+    pub change_rho: Option<[u8; 32]>,
+    /// Recipient of change note (if partial transfer)
+    #[allow(dead_code)]
+    pub change_recipient: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -410,16 +422,48 @@ async fn create_transfer_unsigned_tx(
 }
 
 /// Transfer funds within the Midnight Privacy shielded pool
+/// 
+/// If `send_amount` < `note_value`, creates 2 outputs:
+///   - Output 0: `send_amount` → `output_recipient` (destination)
+///   - Output 1: `note_value - send_amount` → `change_recipient` (change back to sender)
+/// 
+/// If `send_amount` == `note_value`, creates 1 output (full transfer, no change).
 pub async fn transfer(
     ligero: &Ligero,
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
-    value: u128,
+    note_value: u128,
+    send_amount: u128,
     input_rho: [u8; 32],
     input_recipient: [u8; 32],
     output_recipient: [u8; 32],
+    change_recipient: Option<[u8; 32]>,
 ) -> Result<TransferResult> {
-    tracing::info!("Starting transfer for value: {}", value);
+    // Validate amounts
+    if send_amount == 0 {
+        anyhow::bail!("send_amount must be greater than 0");
+    }
+    if send_amount > note_value {
+        anyhow::bail!(
+            "send_amount ({}) exceeds note value ({})",
+            send_amount,
+            note_value
+        );
+    }
+
+    let has_change = send_amount < note_value;
+    let change_amount = if has_change { note_value - send_amount } else { 0 };
+
+    if has_change && change_recipient.is_none() {
+        anyhow::bail!("change_recipient is required when send_amount < note_value");
+    }
+
+    tracing::info!(
+        "Starting transfer: note_value={}, send_amount={}, change_amount={}",
+        note_value,
+        send_amount,
+        change_amount
+    );
     let overall_start = StdInstant::now();
 
     // Step 1: Fetch Merkle tree and find the note
@@ -430,11 +474,11 @@ pub async fn transfer(
         "Merkle tree fetch and rebuild completed"
     );
 
-    let input_cm = note_commitment(&DOMAIN, value, &input_rho, &input_recipient);
+    let input_cm = note_commitment(&DOMAIN, note_value, &input_rho, &input_recipient);
     tracing::info!(
         "Looking for note with commitment: {}, computed from value={}, rho={}, recipient={}",
         hex::encode(&input_cm),
-        value,
+        note_value,
         hex::encode(&input_rho),
         hex::encode(&input_recipient)
     );
@@ -468,31 +512,60 @@ pub async fn transfer(
         "Anchor root ready"
     );
 
-    // Step 3: Generate new output note parameters
-    let out_rho: [u8; 32] = rand::random();
-    let out_recipient: [u8; 32] = output_recipient;
-    let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
+    // Step 3: Generate output note parameters
+    // Output 0: send_amount → output_recipient (destination)
+    let out_rho_0: [u8; 32] = rand::random();
+    let out_recipient_0: [u8; 32] = output_recipient;
+    let cm_out_0 = note_commitment(&DOMAIN, send_amount, &out_rho_0, &out_recipient_0);
+
+    // Output 1 (optional): change → change_recipient (back to sender)
+    let (out_rho_1, out_recipient_1, cm_out_1) = if has_change {
+        let rho: [u8; 32] = rand::random();
+        let recipient = change_recipient.unwrap();
+        let cm = note_commitment(&DOMAIN, change_amount, &rho, &recipient);
+        (Some(rho), Some(recipient), Some(cm))
+    } else {
+        (None, None, None)
+    };
+
+    let num_outputs: u32 = if has_change { 2 } else { 1 };
 
     // Step 4: Compute nullifier
     let nf = nullifier(&DOMAIN, &NF_KEY, &input_rho);
 
-    // Step 4b: Load authority VFK and create viewer bundle if configured
+    // Step 4b: Load authority VFK and create viewer bundles if configured
     let authority_vfk = viewer::load_authority_vfk();
     let (view_attestations, view_ciphertexts) = if let Some(vfk) = authority_vfk {
         tracing::info!(
-            "Authority VFK configured: generating viewer attestation and encrypted note for compliance"
+            "Authority VFK configured: generating viewer attestations for {} output(s)",
+            num_outputs
         );
+        
         // sender_id for transfers is the input_recipient (spender's address)
-        let (attestation, encrypted_note) = viewer::make_viewer_bundle(
+        let (att_0, enc_0) = viewer::make_viewer_bundle(
             &vfk,
             &DOMAIN,
-            value,
-            &out_rho,
-            &out_recipient,
+            send_amount,
+            &out_rho_0,
+            &out_recipient_0,
             &input_recipient,
-            &cm_out,
+            &cm_out_0,
         );
-        (Some(vec![attestation]), Some(vec![encrypted_note]))
+
+        if has_change {
+            let (att_1, enc_1) = viewer::make_viewer_bundle(
+                &vfk,
+                &DOMAIN,
+                change_amount,
+                out_rho_1.as_ref().unwrap(),
+                out_recipient_1.as_ref().unwrap(),
+                &input_recipient,
+                cm_out_1.as_ref().unwrap(),
+            );
+            (Some(vec![att_0, att_1]), Some(vec![enc_0, enc_1]))
+        } else {
+            (Some(vec![att_0]), Some(vec![enc_0]))
+        }
     } else {
         tracing::debug!(
             "No authority VFK configured: transfer will not include viewer attestation"
@@ -504,11 +577,10 @@ pub async fn transfer(
     // (SpendPublic) internally, so we don't need to create it here.
 
     // Step 5: Generate ZK proof
-    tracing::info!("Generating ZK proof...");
+    tracing::info!("Generating ZK proof with {} output(s)...", num_outputs);
 
     let siblings = tree.open(position as usize);
     let depth = siblings.len() as u32;
-    let num_outputs = 1u32;
 
     // Build private indices for Ligero (0-indexed, matching continuous_transfers.rs)
     // Indices 2-6: value, in_rho, in_recipient, nf_key, position
@@ -517,9 +589,12 @@ pub async fn transfer(
     for j in 0..depth {
         private_indices.push(7 + j);
     }
-    // Outputs start at 11+depth; mark value/rho/recipient for output 0 as private
+    // Outputs start at 11+depth; mark value/rho/recipient for each output as private
     let output_base = 11 + depth;
-    private_indices.extend_from_slice(&[output_base, output_base + 1, output_base + 2]);
+    for out_idx in 0..num_outputs {
+        let base = output_base + 4 * out_idx;
+        private_indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
 
     // Viewer section: vfk is private (if authority VFK is configured)
     if authority_vfk.is_some() {
@@ -535,8 +610,8 @@ pub async fn transfer(
             hex: hex::encode(DOMAIN),
         }, // domain
         LigeroProgramArguments::STR {
-            str: value.to_string(),
-        }, // value
+            str: note_value.to_string(),
+        }, // value (input note value)
         LigeroProgramArguments::HEX {
             hex: hex::encode(input_rho),
         }, // in_rho
@@ -575,19 +650,41 @@ pub async fn transfer(
         LigeroProgramArguments::STR {
             str: num_outputs.to_string(),
         }, // num_outputs
-        LigeroProgramArguments::STR {
-            str: value.to_string(),
-        }, // output value
-        LigeroProgramArguments::HEX {
-            hex: hex::encode(out_rho),
-        }, // output rho
-        LigeroProgramArguments::HEX {
-            hex: hex::encode(out_recipient),
-        }, // output recipient
-        LigeroProgramArguments::HEX {
-            hex: hex::encode(cm_out),
-        }, // output commitment
     ]);
+
+    // Output 0: destination (send_amount → output_recipient)
+    proof_args.extend_from_slice(&[
+        LigeroProgramArguments::STR {
+            str: send_amount.to_string(),
+        }, // output 0 value
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(out_rho_0),
+        }, // output 0 rho
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(out_recipient_0),
+        }, // output 0 recipient
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(cm_out_0),
+        }, // output 0 commitment
+    ]);
+
+    // Output 1: change (if partial transfer)
+    if has_change {
+        proof_args.extend_from_slice(&[
+            LigeroProgramArguments::STR {
+                str: change_amount.to_string(),
+            }, // output 1 value
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(out_rho_1.unwrap()),
+            }, // output 1 rho
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(out_recipient_1.unwrap()),
+            }, // output 1 recipient
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(cm_out_1.unwrap()),
+            }, // output 1 commitment
+        ]);
+    }
 
     // Add viewer section arguments if authority VFK is configured
     if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
@@ -631,11 +728,15 @@ pub async fn transfer(
     );
 
     // Package proof with public outputs (SpendPublic) for verifier compatibility
+    let mut output_commitments = vec![cm_out_0];
+    if has_change {
+        output_commitments.push(cm_out_1.unwrap());
+    }
     let public_output = SpendPublic {
         anchor_root,
         nullifier: nf,
         withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
-        output_commitments: vec![cm_out],
+        output_commitments,
         view_attestations,
     };
 
@@ -706,7 +807,11 @@ pub async fn transfer(
 
     Ok(TransferResult {
         tx_hash,
-        new_rho: out_rho,
-        new_recipient: out_recipient,
+        amount_sent: send_amount,
+        output_rho: out_rho_0,
+        output_recipient: out_recipient_0,
+        change_amount: if has_change { Some(change_amount) } else { None },
+        change_rho: out_rho_1,
+        change_recipient: out_recipient_1,
     })
 }

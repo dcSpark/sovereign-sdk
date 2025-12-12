@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::ligero::Ligero;
 
 /// Helper function to get the platform-specific binary directory
+#[allow(dead_code)]
 pub fn get_platform_bin_dir() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
@@ -16,6 +17,7 @@ pub fn get_platform_bin_dir() -> &'static str {
 }
 
 /// Helper function to create a Ligero instance for testing
+#[allow(dead_code)]
 pub fn create_test_ligero() -> Ligero {
     let platform_dir = get_platform_bin_dir();
 

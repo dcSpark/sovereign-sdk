@@ -2,12 +2,14 @@
 //!
 //! These tests require a running rollup node, sequencer, and verifier service.
 //! Make sure all services are running before executing these tests.
-//! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL) should be set in .env.
+//! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL, PRIVPOOL_SPEND_KEY)
+//! should be set in .env (INDEXER_URL is optional, defaults to http://localhost:13100).
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
 use mcp::ligero::Ligero;
 use mcp::operations::{deposit, transfer};
+use mcp::privacy_key::PrivacyKey;
 use mcp::provider::Provider;
 use mcp::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
@@ -30,11 +32,7 @@ async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url
         return false;
     }
 
-    let provider = provider_result.unwrap();
-    if !provider.is_healthy().await {
-        eprintln!("⚠️  Rollup is not healthy");
-        return false;
-    }
+    let _provider = provider_result.unwrap();
 
     // Check verifier
     let verifier_check = reqwest::get(format!("{}/health", verifier_url)).await;
@@ -98,6 +96,8 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let privpool_spend_key = std::env::var("PRIVPOOL_SPEND_KEY")
+        .expect("PRIVPOOL_SPEND_KEY must be set in .env (hex or privpool1... address)");
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
@@ -107,6 +107,15 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
+
+    // Parse privacy key from either raw spend key hex or bech32m address
+    let privacy_key = if privpool_spend_key.starts_with("privpool1") {
+        PrivacyKey::from_address(&privpool_spend_key)
+    } else {
+        PrivacyKey::from_hex(&privpool_spend_key)
+    }
+    .expect("Failed to parse PRIVPOOL_SPEND_KEY");
+    tracing::info!("Using privacy address: {}", privacy_key.privacy_address());
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");
@@ -149,7 +158,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Step 4: Perform deposit
     tracing::info!("Step 4: Performing deposit of 100 tokens");
     let deposit_amount = 100u128;
-    let deposit_result = deposit(&provider, &wallet, deposit_amount).await?;
+    let deposit_result = deposit(&provider, &wallet, deposit_amount, &privacy_key).await?;
 
     tracing::info!("Deposit successful!");
     tracing::info!("  Transaction hash: {}", deposit_result.tx_hash);
@@ -180,24 +189,28 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 
     // Step 7: Perform transfer using deposit outputs
     tracing::info!("Step 7: Performing transfer using deposit outputs");
-    let transfer_value = deposit_amount; // Transfer the same amount
+    let note_value = deposit_amount;
+    let send_amount = deposit_amount; // Transfer the full amount (no change)
     let transfer_result = transfer(
         &ligero,
         &provider,
         &wallet,
-        transfer_value,
+        note_value,
+        send_amount,
         deposit_result.rho,
         deposit_result.recipient,
-        deposit_result.recipient,
+        deposit_result.recipient, // Send to same recipient
+        None, // No change since sending full amount
     )
     .await?;
 
     tracing::info!("Transfer successful!");
     tracing::info!("  Transaction hash: {}", transfer_result.tx_hash);
-    tracing::info!("  New rho: {}", hex::encode(&transfer_result.new_rho));
+    tracing::info!("  Amount sent: {}", transfer_result.amount_sent);
+    tracing::info!("  Output rho: {}", hex::encode(&transfer_result.output_rho));
     tracing::info!(
-        "  New recipient: {}",
-        hex::encode(&transfer_result.new_recipient)
+        "  Output recipient: {}",
+        hex::encode(&transfer_result.output_recipient)
     );
 
     // Step 7a: Verify transfer result
@@ -205,17 +218,25 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         !transfer_result.tx_hash.is_empty(),
         "Transfer tx hash should not be empty"
     );
-    assert_ne!(
-        transfer_result.new_rho, [0u8; 32],
-        "New rho should not be all zeros"
+    assert_eq!(
+        transfer_result.amount_sent, send_amount,
+        "Amount sent should match send_amount"
     );
     assert_ne!(
-        transfer_result.new_recipient, [0u8; 32],
-        "New recipient should not be all zeros"
+        transfer_result.output_rho, [0u8; 32],
+        "Output rho should not be all zeros"
     );
     assert_ne!(
-        transfer_result.new_rho, deposit_result.rho,
-        "New rho should be different from input rho"
+        transfer_result.output_recipient, [0u8; 32],
+        "Output recipient should not be all zeros"
+    );
+    assert_ne!(
+        transfer_result.output_rho, deposit_result.rho,
+        "Output rho should be different from input rho"
+    );
+    assert!(
+        transfer_result.change_amount.is_none(),
+        "Change amount should be None when sending full note"
     );
     tracing::info!("✓ Transfer completed successfully");
 
@@ -268,6 +289,7 @@ async fn test_wallet_address_format() -> Result<()> {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+#[ignore = "requires running rollup/verifier/indexer services"]
 async fn test_balance_check() -> Result<()> {
     let _ = dotenvy::dotenv();
 

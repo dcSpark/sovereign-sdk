@@ -209,33 +209,44 @@ pub struct DepositRequest {
 pub struct DepositResult {
     /// Transaction hash from the rollup
     pub tx_hash: String,
-    /// Random nonce (rho) used for the note
-    pub rho: String,
-    /// Recipient binding used for the note
+    /// VFK commitment (H("FVK_COMMIT_V1" || fvk)) - used to identify which viewing key can decrypt the note
+    pub vfk_commitment: String,
+    /// Recipient privacy address (bech32 format: privpool1...)
     pub recipient: String,
 }
 
 // Types for Transfer
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct TransferRequest {
-    /// Value of the note to transfer
-    pub value: String,
-    /// Rho (nonce) of the input note to spend (hex string)
-    pub input_rho: String,
-    /// Recipient of the input note to spend (hex string)
-    pub input_recipient: String,
-    /// Recipient for the output note (hex string)
-    pub output_recipient: String,
+    /// Transaction hash of the note to spend (from unspent_notes in walletBalance)
+    pub note_tx_hash: String,
+    /// Destination privacy address (bech32 format: privpool1...)
+    pub destination_address: String,
+    /// Amount to send. If less than note value, change is returned to your privacy address.
+    /// If not provided, sends the full note value.
+    #[serde(default)]
+    pub amount: Option<String>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct TransferResult {
     /// Transaction hash from the rollup
     pub tx_hash: String,
-    /// New random nonce (rho) for the output note
-    pub new_rho: String,
-    /// New recipient binding for the output note
-    pub new_recipient: String,
+    /// Amount sent to destination
+    pub amount_sent: String,
+    /// Rho for the output note sent to destination
+    pub output_rho: String,
+    /// Recipient of the output note (bech32 privacy address: privpool1...)
+    pub output_recipient: String,
+    /// Change amount returned to sender (if partial transfer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_amount: Option<String>,
+    /// Rho for the change note (if partial transfer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_rho: Option<String>,
+    /// Recipient of change note - your privacy address (if partial transfer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_recipient: Option<String>,
 }
 
 // Types for DecryptTransaction
@@ -301,14 +312,51 @@ pub struct UnspentNoteInfo {
     pub kind: String,
 }
 
+// Types for CreateWallet
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateWalletRequest {}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct CreateWalletResult {
+    /// New wallet private key (hex string)
+    pub wallet_private_key: String,
+    /// New wallet address
+    pub wallet_address: String,
+    /// New authority VFK (hex string)
+    pub authority_vfk: String,
+    /// New privacy pool spending key (hex string)
+    pub privacy_spend_key: String,
+    /// New privacy pool address
+    pub privacy_address: String,
+}
+
+// Types for RestoreWallet
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreWalletRequest {
+    /// Wallet private key (hex string, with or without 0x prefix)
+    pub wallet_private_key: String,
+    /// Authority VFK (hex string, with or without 0x prefix)
+    pub authority_vfk: String,
+    /// Privacy pool spending key (hex string, with or without 0x prefix)
+    pub privacy_spend_key: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct RestoreWalletResult {
+    /// Restored wallet address
+    pub wallet_address: String,
+    /// Restored privacy pool address
+    pub privacy_address: String,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     ligero_prover: Option<Arc<LigeroProver>>,
-    authority_vfk: Option<Arc<AuthorityVfk>>,
-    privacy_key: Arc<PrivacyKey>,
+    authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+    privacy_key: Arc<RwLock<PrivacyKey>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -318,8 +366,8 @@ impl CryptoServer {
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
-        authority_vfk: Option<Arc<AuthorityVfk>>,
-        privacy_key: Arc<PrivacyKey>,
+        authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+        privacy_key: Arc<RwLock<PrivacyKey>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -413,7 +461,8 @@ impl CryptoServer {
             )
         })?;
 
-        let viewing_key_bytes = if let Some(ref authority_vfk) = self.authority_vfk {
+        let authority_vfk_guard = self.authority_vfk.read().await;
+        let viewing_key_bytes = if let Some(ref authority_vfk) = *authority_vfk_guard {
             *authority_vfk.as_bytes()
         } else {
             return Err(ErrorData::invalid_params(
@@ -425,12 +474,13 @@ impl CryptoServer {
         let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
 
         let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
 
         let unified_result = crate::operations::get_unified_balance(
             provider,
             &*ctx,
             DEFAULT_TOKEN_ID,
-            &self.privacy_key,
+            &*privacy_key_guard,
             &viewing_key,
         )
         .await
@@ -485,7 +535,8 @@ impl CryptoServer {
         let address = crate::operations::get_default_address(&*ctx)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let privacy_address = self.privacy_key.privacy_address().to_string();
+        let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_address = privacy_key_guard.privacy_address().to_string();
 
         let result = GetWalletAddressResult {
             address,
@@ -541,9 +592,10 @@ impl CryptoServer {
     }
 
     /// Get all transactions for the wallet.
+    /// Queries both the normal wallet address (for deposits) and privacy address (for transfers).
     #[tool(
         name = "getTransactions",
-        description = "Get all transactions for the wallet. Retrieves a list of all transactions associated with the wallet."
+        description = "Get all transactions for the wallet. Retrieves deposits from the L2 wallet address and transfers from/to the privacy address."
     )]
     async fn get_transactions(
         &self,
@@ -564,8 +616,9 @@ impl CryptoServer {
         })?;
 
         let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
 
-        let transactions = crate::operations::get_transactions(provider, &*ctx)
+        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -622,8 +675,9 @@ impl CryptoServer {
         })?;
 
         let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
 
-        let config = crate::operations::get_wallet_config(provider, &*ctx, &self.privacy_key)
+        let config = crate::operations::get_wallet_config(provider, &*ctx, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -672,14 +726,29 @@ impl CryptoServer {
             ErrorData::invalid_params("Invalid amount format. Must be a valid u128 number.", None)
         })?;
 
-        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &self.privacy_key)
+        let privacy_key_guard = self.privacy_key.read().await;
+
+        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let recipient = privacy_key_guard.privacy_address().to_string();
+
+        // Compute vfk_commitment from the authority VFK
+        let authority_vfk_guard = self.authority_vfk.read().await;
+        let vfk_commitment_hex = if let Some(ref authority_vfk) = *authority_vfk_guard {
+            let fvk = midnight_privacy::FullViewingKey(*authority_vfk.as_bytes());
+            let vfk_commitment = midnight_privacy::fvk_commitment(&fvk);
+            hex::encode(&vfk_commitment)
+        } else {
+            // No authority VFK configured - return empty string
+            String::new()
+        };
+
         let result = DepositResult {
             tx_hash: deposit_result.tx_hash,
-            rho: hex::encode(&deposit_result.rho),
-            recipient: hex::encode(&deposit_result.recipient),
+            vfk_commitment: vfk_commitment_hex,
+            recipient,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -689,14 +758,16 @@ impl CryptoServer {
 
     /// Transfer funds within the Midnight Privacy shielded pool.
     /// Creates a ZK proof to spend an existing note and creates a new output note.
+    /// Simply provide the tx_hash of the note to spend (from walletBalance unspent_notes) and the destination address.
     #[tool(
         name = "transfer",
-        description = "Transfer funds within the Midnight Privacy shielded pool. Uses ZK proofs to spend a note and create a new output note. Requires `output_recipient` (32-byte hex) to direct the output to the desired recipient."
+        description = "Transfer funds within the Midnight Privacy shielded pool. Provide the tx_hash of the note to spend (from walletBalance unspent_notes) and the destination privacy address (privpool1...)."
     )]
     async fn transfer(
         &self,
         Parameters(params): Parameters<TransferRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::{PrivacyAddress, recipient_from_pk};
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
@@ -718,85 +789,152 @@ impl CryptoServer {
             )
         })?;
 
-        let ctx = wallet_ctx.read().await;
-
-        // Parse value from string
-        let value: u128 = params.value.parse().map_err(|_| {
-            ErrorData::invalid_params("Invalid value format. Must be a valid u128 number.", None)
-        })?;
-
-        // Parse input_rho from hex string
-        let input_rho_hex = params.input_rho.trim_start_matches("0x");
-        let input_rho_bytes = hex::decode(input_rho_hex).map_err(|_| {
-            ErrorData::invalid_params(
-                "Invalid input_rho format. Must be a valid hex string.",
-                None,
-            )
-        })?;
-
-        if input_rho_bytes.len() != 32 {
+        let authority_vfk_guard = self.authority_vfk.read().await;
+        let viewing_key_bytes = if let Some(ref authority_vfk) = *authority_vfk_guard {
+            *authority_vfk.as_bytes()
+        } else {
             return Err(ErrorData::invalid_params(
-                "input_rho must be exactly 32 bytes (64 hex characters).",
+                "Viewing key not configured. Set AUTHORITY_VFK to find unspent notes.",
+                None,
+            ));
+        };
+        let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
+
+        let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
+
+        // Get the wallet's unspent notes to find the note by tx_hash
+        let unified_result = crate::operations::get_unified_balance(
+            provider,
+            &*ctx,
+            DEFAULT_TOKEN_ID,
+            &*privacy_key_guard,
+            &viewing_key,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to get unspent notes: {}", e), None))?;
+
+        // Normalize the input tx_hash (add 0x prefix if missing, lowercase)
+        let note_tx_hash = params.note_tx_hash.trim();
+        let note_tx_hash_normalized = if note_tx_hash.starts_with("0x") || note_tx_hash.starts_with("0X") {
+            note_tx_hash.to_lowercase()
+        } else {
+            format!("0x{}", note_tx_hash.to_lowercase())
+        };
+
+        // Find the note with matching tx_hash
+        let note = unified_result
+            .unspent_notes
+            .iter()
+            .find(|n| n.tx_hash.to_lowercase() == note_tx_hash_normalized)
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "Note with tx_hash {} not found in unspent notes. Use walletBalance to see available notes.",
+                        note_tx_hash_normalized
+                    ),
+                    None,
+                )
+            })?;
+
+        let note_value = note.value;
+
+        // Determine send amount: if user specified, use it; otherwise send full note
+        let send_amount: u128 = if let Some(ref amount_str) = params.amount {
+            amount_str.parse().map_err(|_| {
+                ErrorData::invalid_params("Invalid amount format. Must be a valid u128 number.", None)
+            })?
+        } else {
+            note_value
+        };
+
+        // Validate amount
+        if send_amount == 0 {
+            return Err(ErrorData::invalid_params("Amount must be greater than 0.", None));
+        }
+        if send_amount > note_value {
+            return Err(ErrorData::invalid_params(
+                format!("Amount {} exceeds note value {}", send_amount, note_value),
                 None,
             ));
         }
+
+        let has_change = send_amount < note_value;
+
+        // Parse input_rho from the note
+        let input_rho_hex = note.rho.trim_start_matches("0x");
+        let input_rho_bytes = hex::decode(input_rho_hex).map_err(|_| {
+            ErrorData::internal_error("Invalid rho in note. This should not happen.", None)
+        })?;
 
         let mut input_rho = [0u8; 32];
         input_rho.copy_from_slice(&input_rho_bytes);
 
-        // Parse input_recipient from hex string
-        let input_recipient_hex = params.input_recipient.trim_start_matches("0x");
-        let input_recipient_bytes = hex::decode(input_recipient_hex).map_err(|_| {
-            ErrorData::invalid_params(
-                "Invalid input_recipient format. Must be a valid hex string.",
+        // Input recipient is the current wallet's privacy address
+        const DOMAIN: [u8; 32] = [1u8; 32];
+        let input_recipient = privacy_key_guard.recipient(&DOMAIN);
+
+        // Parse output recipient (destination bech32 privacy address)
+        let output_privacy_addr: PrivacyAddress = params.destination_address.parse()
+            .map_err(|e| ErrorData::invalid_params(
+                format!("Invalid destination_address format. Must be a valid bech32 privacy address (privpool1...): {}", e),
                 None,
-            )
-        })?;
+            ))?;
 
-        if input_recipient_bytes.len() != 32 {
-            return Err(ErrorData::invalid_params(
-                "input_recipient must be exactly 32 bytes (64 hex characters).",
-                None,
-            ));
-        }
+        // Derive output recipient hash from the privacy address
+        let output_pk = output_privacy_addr.to_pk();
+        let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
 
-        let mut input_recipient = [0u8; 32];
-        input_recipient.copy_from_slice(&input_recipient_bytes);
+        tracing::info!(
+            "[transfer] Spending note: tx_hash={}, note_value={}, send_amount={}, rho={}",
+            note_tx_hash_normalized,
+            note_value,
+            send_amount,
+            note.rho
+        );
+        tracing::info!(
+            "[transfer] Destination: {}, has_change: {}",
+            params.destination_address,
+            has_change
+        );
 
-        let out_recipient_hex = params.output_recipient.trim_start_matches("0x");
-        let out_recipient_bytes = hex::decode(out_recipient_hex).map_err(|_| {
-            ErrorData::invalid_params(
-                "Invalid output_recipient format. Must be a valid hex string.",
-                None,
-            )
-        })?;
-
-        if out_recipient_bytes.len() != 32 {
-            return Err(ErrorData::invalid_params(
-                "output_recipient must be exactly 32 bytes (64 hex characters).",
-                None,
-            ));
-        }
-
-        let mut output_recipient = [0u8; 32];
-        output_recipient.copy_from_slice(&out_recipient_bytes);
+        // If partial transfer, change goes back to our own privacy address
+        let change_recipient = if has_change {
+            Some(input_recipient)
+        } else {
+            None
+        };
 
         let transfer_result = crate::operations::transfer(
             ligero,
             provider,
             &*ctx,
-            value,
+            note_value,
+            send_amount,
             input_rho,
             input_recipient,
             output_recipient,
+            change_recipient,
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        // Get our own privacy address for change recipient display (reuse the guard from earlier)
+        let my_privacy_address = privacy_key_guard.privacy_address().to_string();
+
+        // Return the result with output and change details
         let result = TransferResult {
             tx_hash: transfer_result.tx_hash,
-            new_rho: hex::encode(&transfer_result.new_rho),
-            new_recipient: hex::encode(&transfer_result.new_recipient),
+            amount_sent: transfer_result.amount_sent.to_string(),
+            output_rho: hex::encode(&transfer_result.output_rho),
+            output_recipient: output_privacy_addr.to_string(),
+            change_amount: transfer_result.change_amount.map(|a| a.to_string()),
+            change_rho: transfer_result.change_rho.map(|r| hex::encode(r)),
+            change_recipient: if transfer_result.change_recipient.is_some() {
+                Some(my_privacy_address)
+            } else {
+                None
+            },
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -822,9 +960,10 @@ impl CryptoServer {
             )
         })?;
 
+        let authority_vfk_guard = self.authority_vfk.read().await;
         let vfk_hex = if let Some(ref provided) = params.vfk {
             provided.clone()
-        } else if let Some(ref authority_vfk) = self.authority_vfk {
+        } else if let Some(ref authority_vfk) = *authority_vfk_guard {
             hex::encode(authority_vfk.as_bytes())
         } else {
             return Err(ErrorData::invalid_params(
@@ -856,6 +995,165 @@ impl CryptoServer {
                 .collect(),
             decrypted_count: decrypt_result.decrypted_count,
             total_encrypted_notes: decrypt_result.total_encrypted_notes,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Create a new wallet with new keys.
+    /// Generates new wallet private key, authority VFK, and privacy pool spending key.
+    /// All subsequent transactions will use the new keys.
+    #[tool(
+        name = "createWallet",
+        description = "Create a new wallet with new keys. Generates new wallet private key, authority VFK, and privacy pool spending key. All subsequent operations will use the new keys."
+    )]
+    async fn create_wallet(
+        &self,
+        Parameters(_params): Parameters<CreateWalletRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use rand::RngCore;
+
+        // Generate all random bytes first (before any async operations)
+        // This ensures the RNG is dropped before any await points
+        let (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex) = {
+            let mut rng = rand::thread_rng();
+
+            // Generate new wallet private key (32 bytes)
+            let mut wallet_private_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut wallet_private_key_bytes);
+            let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
+
+            // Generate new authority VFK (32 bytes)
+            let mut authority_vfk_bytes = [0u8; 32];
+            rng.fill_bytes(&mut authority_vfk_bytes);
+            let authority_vfk_hex = hex::encode(&authority_vfk_bytes);
+
+            // Generate new privacy spend key (32 bytes)
+            let mut privacy_spend_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut privacy_spend_key_bytes);
+            let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
+
+            (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex)
+        }; // RNG is dropped here
+
+        // Create new wallet context from the private key
+        let new_wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None))?;
+
+        let wallet_address = new_wallet_ctx.get_address().to_string();
+
+        // Create new authority VFK
+        let new_authority_vfk = AuthorityVfk::from_hex(&authority_vfk_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None))?;
+
+        // Create new privacy key
+        let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
+
+        let privacy_address = new_privacy_key.privacy_address().to_string();
+
+        // Replace the existing keys with the new ones
+        if let Some(ref wallet_ctx) = self.wallet_context {
+            let mut ctx_guard = wallet_ctx.write().await;
+            *ctx_guard = new_wallet_ctx;
+        }
+
+        let mut authority_vfk_guard = self.authority_vfk.write().await;
+        *authority_vfk_guard = Some(new_authority_vfk);
+
+        let mut privacy_key_guard = self.privacy_key.write().await;
+        *privacy_key_guard = new_privacy_key;
+
+        tracing::info!("[createWallet] New wallet created successfully");
+        tracing::info!("[createWallet] Wallet address: {}", wallet_address);
+        tracing::info!("[createWallet] Privacy address: {}", privacy_address);
+
+        let result = CreateWalletResult {
+            wallet_private_key: wallet_private_key_hex,
+            wallet_address,
+            authority_vfk: authority_vfk_hex,
+            privacy_spend_key: privacy_spend_key_hex,
+            privacy_address,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Restore a wallet from existing keys.
+    /// Loads existing wallet private key, authority VFK, and privacy pool spending key.
+    /// All subsequent transactions will use the restored keys.
+    #[tool(
+        name = "restoreWallet",
+        description = "Restore a wallet from existing keys. Loads wallet private key, authority VFK, and privacy pool spending key from hex strings. All subsequent operations will use the restored keys."
+    )]
+    async fn restore_wallet(
+        &self,
+        Parameters(params): Parameters<RestoreWalletRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Strip 0x prefix if present
+        let wallet_private_key_hex = params.wallet_private_key.trim_start_matches("0x");
+        let authority_vfk_hex = params.authority_vfk.trim_start_matches("0x");
+        let privacy_spend_key_hex = params.privacy_spend_key.trim_start_matches("0x");
+
+        // Validate hex strings are correct length (32 bytes = 64 hex chars)
+        if wallet_private_key_hex.len() != 64 {
+            return Err(ErrorData::invalid_params(
+                "wallet_private_key must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+        if authority_vfk_hex.len() != 64 {
+            return Err(ErrorData::invalid_params(
+                "authority_vfk must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+        if privacy_spend_key_hex.len() != 64 {
+            return Err(ErrorData::invalid_params(
+                "privacy_spend_key must be exactly 32 bytes (64 hex characters).",
+                None,
+            ));
+        }
+
+        // Create wallet context from the private key
+        let new_wallet_ctx = McpWalletContext::from_private_key_hex(wallet_private_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None))?;
+
+        let wallet_address = new_wallet_ctx.get_address().to_string();
+
+        // Create authority VFK
+        let new_authority_vfk = AuthorityVfk::from_hex(authority_vfk_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None))?;
+
+        // Create privacy key
+        let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
+
+        let privacy_address = new_privacy_key.privacy_address().to_string();
+
+        // Replace the existing keys with the restored ones
+        if let Some(ref wallet_ctx) = self.wallet_context {
+            let mut ctx_guard = wallet_ctx.write().await;
+            *ctx_guard = new_wallet_ctx;
+        }
+
+        let mut authority_vfk_guard = self.authority_vfk.write().await;
+        *authority_vfk_guard = Some(new_authority_vfk);
+
+        let mut privacy_key_guard = self.privacy_key.write().await;
+        *privacy_key_guard = new_privacy_key;
+
+        tracing::info!("[restoreWallet] Wallet restored successfully");
+        tracing::info!("[restoreWallet] Wallet address: {}", wallet_address);
+        tracing::info!("[restoreWallet] Privacy address: {}", privacy_address);
+
+        let result = RestoreWalletResult {
+            wallet_address,
+            privacy_address,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

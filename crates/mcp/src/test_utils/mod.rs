@@ -2,9 +2,9 @@
 //!
 //! This module provides common utilities for testing across the MCP crate.
 
-pub mod ligero;
-
 use crate::provider::Provider;
+
+pub mod ligero;
 
 /// Test wallet key for use in integration tests
 ///
@@ -17,6 +17,7 @@ pub const TEST_PRIVATE_KEY_HEX: &str =
 ///
 /// Returns true if the rollup is healthy, false otherwise.
 /// Tests should skip gracefully if this returns false.
+#[allow(dead_code)]
 pub async fn is_rollup_available() -> bool {
     let rpc_url =
         std::env::var("ROLLUP_RPC_URL").unwrap_or_else(|_| "http://localhost:12346".to_string());

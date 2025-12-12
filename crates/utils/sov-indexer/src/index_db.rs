@@ -5,6 +5,7 @@ use sea_orm::{entity::prelude::*, JsonValue};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true, column_type = "Integer")]
     pub id: i32,
+    #[sea_orm(unique)]
     pub tx_hash: String,
     #[sea_orm(column_type = "TimestampWithTimeZone")]
     pub created_at: chrono::DateTime<chrono::Utc>,

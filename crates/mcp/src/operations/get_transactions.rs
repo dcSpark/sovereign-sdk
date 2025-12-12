@@ -3,10 +3,12 @@
 //! This module provides functionality for retrieving a list of all transactions
 //! associated with the wallet from the indexer API.
 
+use crate::privacy_key::PrivacyKey;
 use crate::provider::{InvolvementItem, Provider};
 use crate::wallet::WalletContext;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Transaction information from indexer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,11 +67,16 @@ impl From<InvolvementItem> for Transaction {
 /// Get all transactions for the wallet
 ///
 /// Retrieves a list of all transactions associated with the wallet from the indexer API.
+/// This queries both:
+/// - The normal wallet address (for deposits from L2)
+/// - The privacy address (for transfers from/to the shielded pool)
+///
 /// The indexer tracks all wallet activity including deposits, withdrawals, and transfers.
 ///
 /// # Parameters
 /// * `provider` - The RPC provider with indexer access
 /// * `wallet` - The wallet context containing the address
+/// * `privacy_key` - The privacy key for deriving the privacy address
 ///
 /// # Returns
 /// A vector of transactions with full details from the indexer
@@ -78,7 +85,8 @@ impl From<InvolvementItem> for Transaction {
 /// ```rust,no_run
 /// # async fn example<Tx, S>(
 /// #     provider: &mcp::provider::Provider,
-/// #     wallet: &mcp::wallet::WalletContext<Tx, S>
+/// #     wallet: &mcp::wallet::WalletContext<Tx, S>,
+/// #     privacy_key: &mcp::privacy_key::PrivacyKey,
 /// # ) -> anyhow::Result<()>
 /// # where
 /// #     Tx: sov_modules_api::DispatchCall,
@@ -87,11 +95,13 @@ impl From<InvolvementItem> for Transaction {
 /// # {
 /// use mcp::operations::get_transactions;
 ///
-/// let transactions = get_transactions(provider, wallet).await?;
+/// let transactions = get_transactions(provider, wallet, privacy_key).await?;
 /// println!("Found {} transactions", transactions.len());
 /// for tx in transactions {
-///     println!("Transaction {}: {} {} at {}",
-///         tx.tx_hash, tx.kind, tx.direction, tx.timestamp_ms);
+///     println!(
+///         "Transaction {}: {} at {} (status: {:?})",
+///         tx.tx_hash, tx.kind, tx.timestamp_ms, tx.status
+///     );
 /// }
 /// # Ok(())
 /// # }
@@ -99,33 +109,71 @@ impl From<InvolvementItem> for Transaction {
 pub async fn get_transactions<Tx, S>(
     provider: &Provider,
     wallet: &WalletContext<Tx, S>,
+    privacy_key: &PrivacyKey,
 ) -> Result<Vec<Transaction>>
 where
     Tx: sov_modules_api::DispatchCall,
     Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
     S: sov_modules_api::Spec,
 {
-    // Get the wallet address and convert to string
+    // Get the wallet address and privacy address
     let address = wallet.get_address();
     let address_str = address.to_string();
+    let privacy_address = privacy_key.privacy_address().to_string();
 
-    tracing::debug!("Fetching transactions for wallet address: {}", address_str);
+    tracing::debug!(
+        "Fetching transactions for wallet address: {} and privacy address: {}",
+        address_str,
+        privacy_address
+    );
 
-    // Query the indexer for transactions
-    // Using default limit (50) and no pagination for now
-    let response = provider
+    // Query the indexer for transactions from the normal wallet address (deposits)
+    let normal_response = provider
         .get_wallet_transactions(&address_str, None, None, None)
         .await?;
 
     tracing::info!(
-        "Retrieved {} transactions for wallet {}",
-        response.items.len(),
-        address
+        "Retrieved {} transactions for normal wallet {}",
+        normal_response.items.len(),
+        address_str
     );
 
-    // Convert InvolvementItems to Transaction structs
-    let transactions: Vec<Transaction> =
-        response.items.into_iter().map(Transaction::from).collect();
+    // Query the indexer for transactions from the privacy address (transfers)
+    let privacy_response = provider
+        .get_wallet_transactions(&privacy_address, None, None, None)
+        .await?;
 
-    Ok(transactions)
+    tracing::info!(
+        "Retrieved {} transactions for privacy address {}",
+        privacy_response.items.len(),
+        privacy_address
+    );
+
+    // Merge and deduplicate transactions by tx_hash
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+    let mut all_transactions: Vec<Transaction> = Vec::new();
+
+    // Add transactions from normal wallet
+    for item in normal_response.items {
+        if seen_hashes.insert(item.tx_hash.clone()) {
+            all_transactions.push(Transaction::from(item));
+        }
+    }
+
+    // Add transactions from privacy address (skip duplicates)
+    for item in privacy_response.items {
+        if seen_hashes.insert(item.tx_hash.clone()) {
+            all_transactions.push(Transaction::from(item));
+        }
+    }
+
+    // Sort by timestamp (newest first)
+    all_transactions.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+
+    tracing::info!(
+        "Total unique transactions after merging: {}",
+        all_transactions.len()
+    );
+
+    Ok(all_transactions)
 }

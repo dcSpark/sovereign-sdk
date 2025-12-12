@@ -164,7 +164,7 @@ pub async fn insert_event(
     payload: &str,
     status: Option<String>,
     events: Option<JsonValue>,
-) -> Result<i32> {
+) -> Result<Option<i32>> {
     let res = idx::Entity::insert(idx::ActiveModel {
         tx_hash: Set(tx_hash.to_string()),
         created_at: Set(created_at),
@@ -175,9 +175,19 @@ pub async fn insert_event(
         payload: Set(payload.to_string()),
         ..Default::default()
     })
+    .on_conflict(
+        OnConflict::column(idx::Column::TxHash)
+            .do_nothing()
+            .to_owned(),
+    )
     .exec(idx_db)
-    .await?;
-    Ok(res.last_insert_id)
+    .await;
+
+    match res {
+        Ok(r) => Ok(Some(r.last_insert_id)),
+        Err(sea_orm::DbErr::RecordNotInserted) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn insert_midnight_deposit(
