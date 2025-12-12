@@ -300,6 +300,117 @@ pub struct LigeroProofPackage {
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct LigeroVerifier;
 
+/// Verified public inputs returned from proof verification.
+///
+/// This struct contains the args that were actually verified by the Ligero proof,
+/// with private args redacted. Callers should derive their public output from these
+/// verified args rather than trusting `LigeroProofPackage.public_output`.
+///
+/// # Security
+///
+/// The Ligero verifier only binds `(program, packing, args, private_indices, proof)`.
+/// The `public_output` field in `LigeroProofPackage` is NOT verified - it's just
+/// metadata carried alongside the proof. This struct provides a safe way to extract
+/// the verified public inputs.
+#[cfg(feature = "native")]
+#[derive(Debug, Clone)]
+pub struct LigeroVerifiedInputs {
+    /// Args that were used as public inputs to verification, with private indices redacted.
+    /// Safe to use for parsing/deriving public outputs.
+    pub args: Vec<LigeroArg>,
+    /// 1-based indices of private args (these have been redacted in `args`).
+    pub private_indices: Vec<usize>,
+}
+
+#[cfg(feature = "native")]
+impl LigeroVerifier {
+    /// Verify proof validity and return the verified args (with private args redacted).
+    ///
+    /// This is the recommended way to extract public outputs from Ligero proofs.
+    /// Instead of trusting `LigeroProofPackage.public_output` (which is NOT verified),
+    /// callers should use this method to get the args that were actually bound by the proof,
+    /// then derive their public output from those verified args.
+    ///
+    /// # Security
+    ///
+    /// The Ligero verifier only validates `(program, packing, args, private_indices, proof)`.
+    /// The `public_output` field in `LigeroProofPackage` is an unsigned memo that anyone
+    /// can replace without invalidating the proof. This method closes that vulnerability
+    /// by returning only the cryptographically verified inputs.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let verified = LigeroVerifier::verify_and_get_verified_args(&proof, &method_id)?;
+    /// let public = parse_spend_public_from_args(&verified.args)?;
+    /// ```
+    pub fn verify_and_get_verified_args(
+        serialized_proof: &[u8],
+        code_commitment: &LigeroCodeCommitment,
+    ) -> anyhow::Result<LigeroVerifiedInputs> {
+        let package: LigeroProofPackage = bincode::deserialize(serialized_proof)?;
+
+        // Deserialize args from JSON
+        let mut args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
+        let private_indices = package.private_indices.clone();
+
+        // Redact private args before returning (verifier doesn't need witness values)
+        Self::redact_args_in_place(&mut args, &private_indices);
+
+        // Check if LIGERO_SKIP_VERIFICATION env var is set (for testing)
+        if std::env::var("LIGERO_SKIP_VERIFICATION").is_ok() {
+            tracing::debug!("Ligero: Skipping verification (LIGERO_SKIP_VERIFICATION set)");
+            return Ok(LigeroVerifiedInputs { args, private_indices });
+        }
+
+        // Verify against the actual Ligero verifier binary
+        let paths = native::VerifierPaths::discover_with_commitment(Some(code_commitment))
+            .map_err(|e| anyhow::anyhow!("Ligero verifier configuration error: {e}"))?;
+
+        native::ensure_code_commitment(&paths, code_commitment)?;
+
+        // verify_proof will also redact (idempotent), then run the verifier
+        native::verify_proof(
+            &paths,
+            &package.proof,
+            args.clone(),
+            private_indices.clone(),
+        )?;
+
+        Ok(LigeroVerifiedInputs { args, private_indices })
+    }
+
+    /// Redact private arguments in place (replace with dummy values).
+    ///
+    /// This is used before returning args to callers and before verification.
+    /// The verifier re-executes with redacted values, so the values must remain
+    /// parseable AND non-zero (guest rejects zero values).
+    /// Uses "01" pattern for hex to avoid X25519 low-order point issues.
+    fn redact_args_in_place(args: &mut [LigeroArg], private_indices: &[usize]) {
+        for &idx in private_indices {
+            if idx == 0 || idx > args.len() {
+                continue;
+            }
+            let i = idx - 1; // 1-based -> 0-based
+            args[i] = match &args[i] {
+                LigeroArg::String { str: s } => {
+                    let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                    if is_decimal {
+                        LigeroArg::String { str: "1".repeat(s.len()) }
+                    } else {
+                        LigeroArg::String { str: "1".repeat(s.len()) }
+                    }
+                }
+                LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 1 },
+                LigeroArg::Hex { hex: h } => LigeroArg::Hex {
+                    // Use "01" pattern to avoid all-zero issues
+                    hex: "01".repeat(h.len() / 2),
+                },
+            };
+        }
+    }
+}
+
 impl ZkVerifier for LigeroVerifier {
     type CodeCommitment = LigeroCodeCommitment;
     type CryptoSpec = LigeroCryptoSpec;
@@ -673,28 +784,27 @@ mod native {
         );
 
         // Redact private arguments (replace with dummy values)
-        // IMPORTANT: Keep the same argument type and length as the original
-        // (Ligero verifier requires type consistency)
+        // Ligero supports private args: verifier can use obscured values as long as
+        // type and length are preserved (per Ligero docs).
+        // Use "1"s for decimals (non-zero, guest rejects zero values)
+        // Use "1"s for hex (non-zero, avoids potential low-order point issues in X25519)
         for &idx in &private_indices {
             if idx > 0 && idx <= args.len() {
-                // 1-based indexing
-                let arg_idx = idx - 1;
+                let arg_idx = idx - 1; // 1-based indexing
                 args[arg_idx] = match &args[arg_idx] {
                     crate::LigeroArg::String { str: s } => {
-                        // Replace with 'x' repeated to match original length
-                        crate::LigeroArg::String {
-                            str: "x".repeat(s.len()),
+                        let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                        if is_decimal {
+                            // Use "1"s for non-zero (guest rejects zero-value inputs)
+                            crate::LigeroArg::String { str: "1".repeat(s.len()) }
+                        } else {
+                            crate::LigeroArg::String { str: "1".repeat(s.len()) }
                         }
                     }
-                    crate::LigeroArg::I64 { .. } => {
-                        // Replace with 0
-                        crate::LigeroArg::I64 { i64: 0 }
-                    }
+                    crate::LigeroArg::I64 { .. } => crate::LigeroArg::I64 { i64: 1 },
                     crate::LigeroArg::Hex { hex: h } => {
-                        // Replace with '0' repeated to match original length
-                        crate::LigeroArg::Hex {
-                            hex: "0".repeat(h.len()),
-                        }
+                        // Use "01" pattern repeated (non-zero, valid hex)
+                        crate::LigeroArg::Hex { hex: "01".repeat(h.len() / 2) }
                     }
                 };
             }

@@ -8,6 +8,8 @@ mod call;
 mod event;
 mod genesis;
 mod hash;
+#[cfg(feature = "native")]
+mod ligero_args;
 mod merkle;
 mod preverified;
 mod types;

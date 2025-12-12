@@ -305,6 +305,39 @@ impl LigeroHost {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.contains("Final Verify Result:                 true"))
     }
+
+    /// Redact private arguments, replacing their values with dummy data.
+    ///
+    /// This is used before serializing args into the proof package to prevent
+    /// private witness values from leaking into transaction calldata.
+    #[allow(dead_code)]
+    fn redact_args(&self) -> Vec<LigeroArg> {
+        let mut args = self.config.args.clone();
+        for &idx in &self.config.private_indices {
+            if idx == 0 || idx > args.len() {
+                continue;
+            }
+            let i = idx - 1; // 1-based -> 0-based
+            args[i] = match &args[i] {
+                LigeroArg::String { str: s } => {
+                    // Check if it looks like a decimal number
+                    let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                    if is_decimal {
+                        // Replace with all 1s (parseable as non-zero decimal)
+                        LigeroArg::String { str: "1".repeat(s.len()) }
+                    } else {
+                        LigeroArg::String { str: "1".repeat(s.len()) }
+                    }
+                }
+                LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 1 },
+                LigeroArg::Hex { hex: h } => LigeroArg::Hex {
+                    // Use "01" pattern repeated (non-zero, valid hex)
+                    hex: "01".repeat(h.len() / 2),
+                },
+            };
+        }
+        args
+    }
 }
 
 impl ZkvmHost for LigeroHost {
@@ -340,6 +373,11 @@ impl ZkvmHost for LigeroHost {
     }
 
     fn run(&mut self, with_proof: bool) -> Result<Vec<u8>> {
+        // Redact private args before including in proof package.
+        // Ligero supports private args - verifier can work with obscured values
+        // as long as type and length are preserved.
+        let redacted_args = self.redact_args();
+
         if with_proof {
             let public_output = self
                 .public_output
@@ -361,7 +399,7 @@ impl ZkvmHost for LigeroHost {
             let package = LigeroProofPackage {
                 proof,
                 public_output,
-                args_json: serde_json::to_vec(&self.config.args)?,
+                args_json: serde_json::to_vec(&redacted_args)?,
                 private_indices: self.config.private_indices.clone(),
             };
 
@@ -391,7 +429,7 @@ impl ZkvmHost for LigeroHost {
             let package = LigeroProofPackage {
                 proof: vec![],
                 public_output,
-                args_json: serde_json::to_vec(&self.config.args)?,
+                args_json: serde_json::to_vec(&redacted_args)?,
                 private_indices: self.config.private_indices.clone(),
             };
             Ok(bincode::serialize(&package)?)

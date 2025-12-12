@@ -375,7 +375,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg(feature = "native")]
         {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+            use sov_rollup_interface::zk::CodeCommitment;
 
             // Validate nullifier count (1-4 inputs supported)
             const MAX_INPUTS: usize = 4;
@@ -417,10 +417,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                     .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-                // Verify the proof and extract public output
-                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
-                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
-                })?
+                // SECURITY FIX: Use verify_and_get_verified_args to get the args that were
+                // actually verified by the proof, then derive SpendPublic from those args.
+                // This closes the public_output tampering vulnerability where an attacker
+                // could replace the unverified public_output blob without invalidating the proof.
+                let verified = LigeroVerifier::verify_and_get_verified_args(&proof, &method_id)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+
+                // Derive SpendPublic from the verified args (cryptographically bound to proof)
+                crate::ligero_args::spend_public_from_verified_args(&verified.args)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(
+                        format!("Failed to parse SpendPublic from verified args: {}", e)
+                    ))?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -724,7 +732,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg(feature = "native")]
         {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+            use sov_rollup_interface::zk::CodeCommitment;
 
             // Validate nullifier count (1-4 inputs supported)
             const MAX_INPUTS: usize = 4;
@@ -765,8 +773,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                     .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-                LigeroVerifier::verify(&proof, &method_id)
-                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+                // SECURITY FIX: Use verify_and_get_verified_args to get the args that were
+                // actually verified by the proof, then derive SpendPublic from those args.
+                // This closes the public_output tampering vulnerability where an attacker
+                // could replace the unverified public_output blob without invalidating the proof.
+                let verified = LigeroVerifier::verify_and_get_verified_args(&proof, &method_id)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?;
+
+                // Derive SpendPublic from the verified args (cryptographically bound to proof)
+                crate::ligero_args::spend_public_from_verified_args(&verified.args)
+                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(
+                        format!("Failed to parse SpendPublic from verified args: {}", e)
+                    ))?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values

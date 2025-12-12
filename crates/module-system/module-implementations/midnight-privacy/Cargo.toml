@@ -28,6 +28,7 @@ serde_json = { workspace = true }
 sov-bank = { workspace = true, features = ["native", "test-utils"] }
 sov-kernels = { workspace = true }
 sov-mock-da = { workspace = true }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dependencies]
 anyhow = { workspace = true }

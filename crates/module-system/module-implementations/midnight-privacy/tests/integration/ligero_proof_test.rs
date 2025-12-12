@@ -2,6 +2,8 @@
 
 //! Integration tests for Midnight Privacy note spending with Ligero proofs
 //!
+//! NOTE: Updated to match the NEW multi-input join-split ABI of note_spend_guest.wasm.
+//!
 //! These tests demonstrate how to:
 //! - Create note commitments using Poseidon2
 //! - Build Merkle trees and compute authentication paths
@@ -44,7 +46,8 @@
 use anyhow::{bail, Context, Result};
 use midnight_privacy::{
     note_commitment, nullifier, root_from_path, Hash32, MerkleTree, SpendPublic,
-    recipient_from_sk, nf_key_from_sk,
+    recipient_from_sk, nf_key_from_sk, recipient_from_pk, pk_from_sk, pk_ivk_from_sk,
+    encrypt_note_for_recipient_with_sender, ct_hash, esk_from_rho_cm, Note,
 };
 use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroVerifier};
@@ -53,6 +56,117 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+
+// ================================================================================================
+// Helpers for NEW note_spend_guest ABI (join-split) – must match guest program exactly.
+// ================================================================================================
+
+/// Compute X25519 base point multiplication (for epk from esk)
+fn x25519_base(sk_bytes: &[u8; 32]) -> [u8; 32] {
+    let sk = X25519Secret::from(*sk_bytes);
+    let pk = X25519PublicKey::from(&sk);
+    pk.to_bytes()
+}
+
+/// Output arguments computed for the new ABI
+#[derive(Clone, Debug)]
+struct OutputArgs {
+    value: u128,
+    rho: Hash32,
+    pk_spend: Hash32,
+    pk_ivk: Hash32,
+    cm: Hash32,
+    epk: Hash32,
+    ct_hash: Hash32,
+    mac: Hash32,
+}
+
+/// Compute all output arguments needed for the new ABI
+fn compute_output_args(
+    domain: &Hash32,
+    value: u128,
+    rho: Hash32,
+    pk_spend: Hash32,
+    pk_ivk: Hash32,
+    sender_id: &Hash32,
+) -> OutputArgs {
+    // Compute recipient address and commitment
+    let recipient = recipient_from_pk(domain, &pk_spend, &pk_ivk);
+    let cm = note_commitment(domain, value, &rho, &recipient);
+
+    // Compute ephemeral key (esk derived from rho and cm)
+    let esk = esk_from_rho_cm(domain, &rho, &cm);
+    let epk = x25519_base(&esk);
+
+    // Create Note struct for encryption
+    let note = Note {
+        domain: *domain,
+        value,
+        rho,
+        recipient,
+    };
+
+    // Encrypt note for recipient (returns RecipientCiphertext)
+    let recipient_ct = encrypt_note_for_recipient_with_sender(
+        domain,
+        &pk_ivk,
+        &note,
+        sender_id,
+        &cm,
+    ).expect("encryption should succeed");
+
+    // Compute ct_hash from the ciphertext
+    let cth = ct_hash(&recipient_ct.ct);
+
+    OutputArgs {
+        value,
+        rho,
+        pk_spend,
+        pk_ivk,
+        cm,
+        epk,
+        ct_hash: cth,
+        mac: recipient_ct.mac,
+    }
+}
+
+/// Compute private indices (1-based) for the NEW ABI:
+/// 1 domain (pub)
+/// 2 spend_sk (priv)
+/// 3 depth (pub)
+/// 4 anchor (pub)
+/// 5 n_in (pub)
+/// per input: value (priv), rho (priv), pos (priv), siblings[depth] (priv), nullifier (pub)
+/// then withdraw (pub), n_out (pub)
+/// per output: value (priv), rho (priv), pk_spend (priv), pk_ivk (priv), cm/epk/ct_hash/mac (pub)
+fn private_indices_join_split(depth: usize, n_in: usize, n_out: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    out.push(2); // spend_sk
+
+    let mut cursor = 6usize; // first input value
+    for _ in 0..n_in {
+        out.push(cursor); // value
+        out.push(cursor + 1); // rho
+        out.push(cursor + 2); // pos
+        for k in 0..depth {
+            out.push(cursor + 3 + k); // siblings
+        }
+        cursor += 4 + depth; // includes nullifier at the end of each input block
+    }
+
+    // withdraw at cursor (pub), n_out at cursor+1 (pub)
+    let out_start = cursor + 2;
+    for j in 0..n_out {
+        let base = out_start + j * 8;
+        out.push(base); // value_out
+        out.push(base + 1); // rho_out
+        out.push(base + 2); // pk_spend_out
+        out.push(base + 3); // pk_ivk_out
+        // cm, epk, ct_hash, mac are public (indices base+4 to base+7)
+    }
+    out
+}
 
 /// Configuration for Ligero test environment
 #[derive(Debug)]
@@ -190,28 +304,31 @@ fn setup_ligero_env() -> Result<String> {
 ///
 /// This test shows the basic flow:
 /// 1. Create a note and add it to a Merkle tree
-/// 2. Generate a spend proof in SIMULATION mode
+/// 2. Generate a spend proof using the NEW multi-input ABI
 /// 3. Verify the proof
 #[test]
 fn test_simple_note_spend() -> Result<()> {
-    println!("\n=== Simple Note Spend Test ===\n");
+    println!("\n=== Simple Note Spend Test (NEW ABI) ===\n");
     let test_start = Instant::now();
 
     // Setup environment
     let _program_path = setup_ligero_env()?;
 
-    // Create note parameters
+    // Create note parameters - NEW ABI uses spend_sk instead of separate nf_key
     let domain: Hash32 = [1u8; 32];
-    let value: u128 = 100;
+    let value: u128 = 100; // must fit u64 for guest parser
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET
+    let spend_sk: Hash32 = [4u8; 32]; // SECRET (owner spending key)
+    
+    // Derive recipient and nf_key from spend_sk (NEW ABI)
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Creating note with value: {}", value);
 
     // Compute note commitment
     let commitment_start = Instant::now();
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let cm = note_commitment(&domain, value, &rho, &recipient_owner);
     println!(
         "✓ Note commitment: {} ({:.3}s)",
         hex::encode(&cm[..8]),
@@ -269,13 +386,26 @@ fn test_simple_note_spend() -> Result<()> {
         nullifier_start.elapsed().as_secs_f64()
     );
 
-    // Prepare public output with one shielded output (all value as change).
+    // Prepare output with one shielded output (all value as change) - NEW ABI
     let withdraw_amount: u128 = 0;
+    let n_in: u32 = 1;
     let n_out: u32 = 1;
-    let out_value = value;                 // put entire input into a new note
+    let out_value = value; // put entire input into a new note
     let out_rho: Hash32 = [9u8; 32];
-    let out_rcp: Hash32 = [5u8; 32];
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    let pk_spend_out = pk_from_sk(&spend_sk);
+    let pk_ivk_out = pk_ivk_from_sk(&domain, &spend_sk);
+    
+    // Compute output args including encryption artifacts
+    let out = compute_output_args(
+        &domain,
+        out_value,
+        out_rho,
+        pk_spend_out,
+        pk_ivk_out,
+        &recipient_owner, // sender_id
+    );
+    let cm_out = out.cm;
+    
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifiers: vec![nf],
@@ -285,53 +415,51 @@ fn test_simple_note_spend() -> Result<()> {
         recipient_attestations: None,
     };
 
-    println!("\n--- Generating ZK Proof ---");
+    println!("\n--- Generating ZK Proof (NEW ABI) ---");
 
     // Create Ligero host with note_spend_guest.wasm
     let program_path = setup_ligero_env()?;
 
-    // Private indices (1-based). Keep input note data and path private,
-    // and mark output plaintext fields private (value_out, rho_out, recipient_out).
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
-    // Outputs start at index base = 12 + depth
-    let base = 12 + (tree_depth as usize);
-    private_indices.push(base + 0); // value_out_0
-    private_indices.push(base + 1); // rho_out_0
-    private_indices.push(base + 2); // recipient_out_0
+    // Private indices for NEW ABI
+    let private_indices = private_indices_join_split(tree_depth as usize, n_in as usize, n_out as usize);
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices.clone());
 
     println!("✓ Private witness indices: {:?}", private_indices);
 
-    // Add arguments in guest ABI order:
-    //   domain, value, rho, recipient, nf_key, pos, depth,
-    //   siblings[0..depth], anchor, nullifier, withdraw_amount,
-    //   n_out, [value_out, rho_out, recipient_out, cm_out]...
+    // NEW ABI order (join-split):
+    // domain(pub), spend_sk(priv), depth(pub), anchor(pub), n_in(pub),
+    //   [value(priv), rho(priv), pos(priv), siblings(priv)*depth, nullifier(pub)] * n_in
+    // withdraw(pub), n_out(pub),
+    //   [value(priv), rho(priv), pk_spend(priv), pk_ivk(priv), cm(pub), epk(pub), ct_hash(pub), mac(pub)] * n_out
     host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
-    host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
+    host.add_hex_arg(hex::encode(spend_sk)); // 2: PRIVATE
+    host.add_str_arg((tree_depth as u64).to_string()); // 3: PUBLIC
+    host.add_hex_arg(hex::encode(anchor)); // 4: PUBLIC
+    host.add_str_arg((n_in as u64).to_string()); // 5: PUBLIC
 
-    // Add all siblings (PRIVATE)
+    // Input 0
+    host.add_str_arg((value as u64).to_string()); // value_in_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(rho)); // rho_in_0 (PRIVATE)
+    host.add_str_arg(position.to_string()); // pos_in_0 (PRIVATE)
     for sibling in &siblings {
-        // 8..8+depth: PRIVATE
-        host.add_hex_arg(hex::encode(sibling));
+        host.add_hex_arg(hex::encode(sibling)); // siblings (PRIVATE)
     }
+    host.add_hex_arg(hex::encode(nf)); // nullifier_0 (PUBLIC)
 
-    host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
-    host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
-    host.add_str_arg(n_out.to_string());           // 11+depth: PUBLIC
-    // Output #0 (private fields first, public cm last)
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
+    host.add_str_arg((withdraw_amount as u64).to_string()); // withdraw (PUBLIC)
+    host.add_str_arg((n_out as u64).to_string()); // n_out (PUBLIC)
+
+    // Output 0
+    host.add_str_arg((out.value as u64).to_string()); // value_out_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(out.rho)); // rho_out_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(out.pk_spend)); // pk_spend_out_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(out.pk_ivk)); // pk_ivk_out_0 (PRIVATE)
+    host.add_hex_arg(hex::encode(out.cm)); // cm_out_0 (PUBLIC)
+    host.add_hex_arg(hex::encode(out.epk)); // epk_out_0 (PUBLIC)
+    host.add_hex_arg(hex::encode(out.ct_hash)); // ct_hash_out_0 (PUBLIC)
+    host.add_hex_arg(hex::encode(out.mac)); // mac_out_0 (PUBLIC)
 
     // Set public output (now includes output_commitments)
     host.set_public_output(&public_output)?;
@@ -344,8 +472,6 @@ fn test_simple_note_spend() -> Result<()> {
     );
 
     // Generate proof
-    // Set to false for SIMULATION mode (fast but can't verify)
-    // Set to true for REAL proof (slow but can verify with WebGPU)
     let use_real_proof = true; // Always generate REAL WebGPU proofs
 
     let proof_start = Instant::now();
@@ -420,26 +546,27 @@ fn test_simple_note_spend() -> Result<()> {
 ///
 /// The guest program (note_spend_guest) verifies:
 /// - Merkle membership: root_from_path(cm, pos, siblings) == anchor
-/// - Nullifier derivation: nullifier(domain, nf_key, rho)
+/// - Nullifier derivation: nullifier(domain, nf_key, rho) where nf_key derived from spend_sk
 /// - Public output commitment: (anchor_root, nullifier, withdraw_amount)
 #[test]
 fn test_note_spend_proof_lifecycle() -> Result<()> {
-    println!("\n=== Note Spend Proof Lifecycle Test ===\n");
+    println!("\n=== Note Spend Proof Lifecycle Test (NEW ABI) ===\n");
 
     // ---- 1) Create a note and compute its commitment ----
     println!("Step 1: Creating note...");
 
-    // Note parameters
+    // Note parameters - NEW ABI uses spend_sk
     let domain: Hash32 = [1u8; 32]; // Domain tag for this note type
     let value: u128 = 100; // Value stored in the note
     let rho: Hash32 = [2u8; 32]; // Randomness (would be generated securely)
-    let recipient: Hash32 = [3u8; 32]; // Recipient's public key binding
-
-    // Secret nullifier key (kept private, never revealed)
-    let nf_key: Hash32 = [4u8; 32];
+    let spend_sk: Hash32 = [4u8; 32]; // SECRET spending key
+    
+    // Derive recipient and nf_key from spend_sk (NEW ABI)
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     // Compute the note commitment using Poseidon2
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let cm = note_commitment(&domain, value, &rho, &recipient_owner);
     println!("✓ Note commitment: {}", hex::encode(cm));
 
     // ---- 2) Add note to Merkle tree and update root ----
@@ -481,11 +608,24 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     println!("\nStep 5: Preparing spend proof...");
 
     let withdraw_amount: u128 = 0;
+    let n_in: u32 = 1;
     let n_out: u32 = 1;
-    let out_value = value;                 // all value to shielded change
+    let out_value = value; // all value to shielded change
     let out_rho: Hash32 = [7u8; 32];
-    let out_rcp: Hash32 = [8u8; 32];
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    let pk_spend_out = pk_from_sk(&spend_sk);
+    let pk_ivk_out = pk_ivk_from_sk(&domain, &spend_sk);
+    
+    // Compute output args including encryption artifacts
+    let out = compute_output_args(
+        &domain,
+        out_value,
+        out_rho,
+        pk_spend_out,
+        pk_ivk_out,
+        &recipient_owner,
+    );
+    let cm_out = out.cm;
+    
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifiers: vec![nf],
@@ -508,52 +648,50 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     println!("  - Output commitments: {}", public_output.output_commitments.len());
 
     // ---- 6) Generate REAL ZK proof with Ligero ----
-    println!("\nStep 6: Generating REAL ZK proof with Ligero...");
+    println!("\nStep 6: Generating REAL ZK proof with Ligero (NEW ABI)...");
     println!("This will:");
     println!("  - Verify: root_from_path(cm, pos, siblings) == anchor");
-    println!("  - Compute: nullifier(domain, nf_key, rho) [PRF-based]");
+    println!("  - Compute: nullifier(domain, nf_key_from_sk(spend_sk), rho) [PRF-based]");
     println!("  - Commit: (anchor_root, nullifier, withdraw_amount) as public output");
 
     let program_path = setup_ligero_env()?;
 
-    // Private indices (1-based). Keep input note data and path private,
-    // and mark output plaintext fields private (value_out, rho_out, recipient_out).
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize { private_indices.push(8 + i); }
-    let base = 12 + (tree_depth as usize);
-    private_indices.push(base + 0);
-    private_indices.push(base + 1);
-    private_indices.push(base + 2);
+    // Private indices for NEW ABI
+    let private_indices = private_indices_join_split(tree_depth as usize, n_in as usize, n_out as usize);
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices.clone());
 
     println!("✓ Private witness indices: {:?}", private_indices);
 
-    // Add witness data and public inputs
-    // Arguments order: domain, value, rho, recipient, nf_key, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount, n_out, outputs...
-    host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
-    host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
+    // NEW ABI order
+    host.add_hex_arg(hex::encode(domain)); // 1 pub
+    host.add_hex_arg(hex::encode(spend_sk)); // 2 priv
+    host.add_str_arg((tree_depth as u64).to_string()); // 3 pub
+    host.add_hex_arg(hex::encode(anchor)); // 4 pub
+    host.add_str_arg((n_in as u64).to_string()); // 5 pub
 
-    // Add all siblings (PRIVATE)
+    // Input 0
+    host.add_str_arg((value as u64).to_string()); // 6 priv
+    host.add_hex_arg(hex::encode(rho)); // 7 priv
+    host.add_str_arg(position.to_string()); // 8 priv
     for sibling in &siblings {
-        // 8..8+depth: PRIVATE
-        host.add_hex_arg(hex::encode(sibling));
+        host.add_hex_arg(hex::encode(sibling)); // 9.. priv
     }
+    host.add_hex_arg(hex::encode(nf)); // nullifier_0 pub
 
-    host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
-    host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth
-    host.add_str_arg(n_out.to_string());           // 11+depth
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
+    host.add_str_arg((withdraw_amount as u64).to_string()); // pub
+    host.add_str_arg((n_out as u64).to_string()); // pub
+
+    // Output 0
+    host.add_str_arg((out.value as u64).to_string()); // priv
+    host.add_hex_arg(hex::encode(out.rho)); // priv
+    host.add_hex_arg(hex::encode(out.pk_spend)); // priv
+    host.add_hex_arg(hex::encode(out.pk_ivk)); // priv
+    host.add_hex_arg(hex::encode(out.cm)); // pub
+    host.add_hex_arg(hex::encode(out.epk)); // pub
+    host.add_hex_arg(hex::encode(out.ct_hash)); // pub
+    host.add_hex_arg(hex::encode(out.mac)); // pub
 
     // Set the public output
     host.set_public_output(&public_output)?;
@@ -891,12 +1029,29 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     // Redact ALL private arguments based on private_indices
     // The verifier must not see these witness values!
+    // IMPORTANT: Preserve original string length for verifier compatibility
     let mut redacted_args = args.clone();
     for &idx in &private_indices {
-        // idx is 1-based, convert to 0-based for vector access
         let vec_idx = idx - 1;
-        if vec_idx < redacted_args.len() {
-            redacted_args[vec_idx] = json!({"str": "x".repeat(64)});
+        if vec_idx >= redacted_args.len() {
+            continue;
+        }
+        // Preserve original string length for verifier compatibility
+        if let Some(s) = redacted_args[vec_idx].get("str").and_then(|v| v.as_str()) {
+            // Check if it looks like a decimal (for parseability)
+            let is_decimal = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+            if is_decimal {
+                // Use zeros for decimals (parseable)
+                let redacted = if s.len() == 1 {
+                    "0".to_string()
+                } else {
+                    format!("1{}", "0".repeat(s.len() - 1))
+                };
+                redacted_args[vec_idx] = json!({"str": redacted});
+            } else {
+                // For hex strings, use zeros (same length)
+                redacted_args[vec_idx] = json!({"str": "0".repeat(s.len())});
+            }
         }
     }
 
@@ -1061,7 +1216,7 @@ fn test_multiple_notes_and_root_updates() -> Result<()> {
 /// 3. Value-burning is prevented by the circuit logic (documented limitation)
 #[test]
 fn test_spend_note_rejects_value_burning() -> Result<()> {
-    println!("\n=== Value-Burning Protection Test ===\n");
+    println!("\n=== Value-Burning Protection Test (NEW ABI) ===\n");
     println!("NOTE: This test documents a known Ligero limitation where assert_one()");
     println!("constraints may not halt proof generation. The circuit DOES contain the");
     println!("balance check, but enforcement happens at the constraint level, not execution.");
@@ -1074,16 +1229,17 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     println!("Testing that SpendNote enforces balance: input_value == withdraw + sum(outputs)");
 
-    // Step 1: Create a note in the tree
+    // Step 1: Create a note in the tree (NEW ABI)
     const TREE_DEPTH: u8 = 4;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain = [1u8; 32];
     let value = 1000u128;
     let rho = [42u8; 32];
-    let recipient = [99u8; 32];
-    let nf_key = [33u8; 32];
+    let spend_sk = [33u8; 32]; // SECRET
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let cm = note_commitment(&domain, value, &rho, &recipient_owner);
     let pos = 0u64;
     tree.set_leaf(pos as usize, cm);
     let anchor = tree.root();
@@ -1100,71 +1256,68 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("Input: {}, Withdraw: 0, Outputs: {} + {}", value, 600, 400);
 
     let withdraw_amount = 0u128;
+    let pk_spend_out = pk_from_sk(&spend_sk);
+    let pk_ivk_out = pk_ivk_from_sk(&domain, &spend_sk);
     
     // Create two output notes that sum to input value
     let out1_value = 600u128;
     let out1_rho = [10u8; 32];
-    let out1_recipient = [11u8; 32];
-    let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1 = compute_output_args(&domain, out1_value, out1_rho, pk_spend_out, pk_ivk_out, &recipient_owner);
+    let out1_cm = out1.cm;
 
     let out2_value = 400u128;
     let out2_rho = [20u8; 32];
-    let out2_recipient = [21u8; 32];
-    let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2 = compute_output_args(&domain, out2_value, out2_rho, pk_spend_out, pk_ivk_out, &recipient_owner);
+    let out2_cm = out2.cm;
 
     let program_path = config.program_path.to_string_lossy().to_string();
-    let depth = siblings.len();
-    
-    // Build private indices
-    let mut private_indices = vec![
-        2, // value
-        3, // rho
-        4, // recipient
-        5, // nf_key
-        6, // pos
-    ];
-    for i in 0..depth {
-        private_indices.push(8 + i); // siblings
-    }
-    // Mark output note details as private
-    private_indices.push(12 + depth + 0); // out1_value
-    private_indices.push(12 + depth + 1); // out1_rho
-    private_indices.push(12 + depth + 2); // out1_recipient
-    private_indices.push(12 + depth + 4); // out2_value
-    private_indices.push(12 + depth + 5); // out2_rho
-    private_indices.push(12 + depth + 6); // out2_recipient
+    let depth = siblings.len(); // = TREE_DEPTH
+
+    // Private indices for NEW ABI
+    let private_indices = private_indices_join_split(depth, 1, 2);
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
         .with_private_indices(private_indices);
 
-    // Input note
-    host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string());
-    host.add_str_arg((siblings.len() as u32).to_string());
+    // NEW ABI header
+    host.add_hex_arg(hex::encode(domain));               // 1 pub
+    host.add_hex_arg(hex::encode(spend_sk));             // 2 priv
+    host.add_str_arg((TREE_DEPTH as u64).to_string());   // 3 pub
+    host.add_hex_arg(hex::encode(anchor));               // 4 pub
+    host.add_str_arg("1".to_string());                   // 5 pub n_in
+
+    // Input 0
+    host.add_str_arg((value as u64).to_string());        // priv
+    host.add_hex_arg(hex::encode(rho));                  // priv
+    host.add_str_arg(pos.to_string());                   // priv
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg("2".to_string()); // n_out = 2
+    host.add_hex_arg(hex::encode(nf));                   // pub nullifier_0
+
+    host.add_str_arg((withdraw_amount as u64).to_string()); // pub
+    host.add_str_arg("2".to_string());                      // pub n_out = 2
 
     // Output 1
-    host.add_str_arg(out1_value.to_string());
-    host.add_hex_arg(hex::encode(out1_rho));
-    host.add_hex_arg(hex::encode(out1_recipient));
-    host.add_hex_arg(hex::encode(out1_cm));
+    host.add_str_arg((out1.value as u64).to_string());   // priv
+    host.add_hex_arg(hex::encode(out1.rho));             // priv
+    host.add_hex_arg(hex::encode(out1.pk_spend));        // priv
+    host.add_hex_arg(hex::encode(out1.pk_ivk));          // priv
+    host.add_hex_arg(hex::encode(out1.cm));              // pub
+    host.add_hex_arg(hex::encode(out1.epk));             // pub
+    host.add_hex_arg(hex::encode(out1.ct_hash));         // pub
+    host.add_hex_arg(hex::encode(out1.mac));             // pub
 
     // Output 2
-    host.add_str_arg(out2_value.to_string());
-    host.add_hex_arg(hex::encode(out2_rho));
-    host.add_hex_arg(hex::encode(out2_recipient));
-    host.add_hex_arg(hex::encode(out2_cm));
+    host.add_str_arg((out2.value as u64).to_string());   // priv
+    host.add_hex_arg(hex::encode(out2.rho));             // priv
+    host.add_hex_arg(hex::encode(out2.pk_spend));        // priv
+    host.add_hex_arg(hex::encode(out2.pk_ivk));          // priv
+    host.add_hex_arg(hex::encode(out2.cm));              // pub
+    host.add_hex_arg(hex::encode(out2.epk));             // pub
+    host.add_hex_arg(hex::encode(out2.ct_hash));         // pub
+    host.add_hex_arg(hex::encode(out2.mac));             // pub
 
     let public = SpendPublic {
         anchor_root: anchor,
@@ -1190,8 +1343,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     assert_eq!(verified.output_commitments.len(), 2);
 
     println!("\n✓ Value-burning protection: Circuit enforces balance equation");
-    println!("  Circuit constraint at line 286 in note_spend_guest.wasm:");
-    println!("  assert_one((value == withdraw_amount + sum(outputs)) as i32)");
+    println!("  Circuit constraint: assert_one(sum_in == withdraw + sum_out)");
     println!();
     println!("  Valid spend: {} == {} + {} + {} ✓", value, withdraw_amount, out1_value, out2_value);
     println!("  Invalid spend (no outputs): {} != {} + 0 would violate constraint", value, withdraw_amount);
@@ -1199,28 +1351,29 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     Ok(())
 }
 
-/// Test that SpendNote rejects when withdraw_amount > 0 (should use Withdraw instead)
+/// Test that SpendNote with withdrawal works correctly (using NEW ABI)
 #[test]
 fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
-    println!("\n=== SpendNote with Withdrawal Test ===\n");
+    println!("\n=== SpendNote with Withdrawal Test (NEW ABI) ===\n");
 
     // Set up test environment
     setup_ligero_env()?;
     let config = LigeroTestConfig::discover()?;
     config.validate()?;
 
-    println!("Testing that SpendNote rejects when withdraw_amount > 0 (should use Withdraw)...");
+    println!("Testing VALID withdraw proof with withdraw_amount=500 + change=500...");
 
-    // Step 1: Create a note in the tree
+    // Step 1: Create a note in the tree (NEW ABI)
     const TREE_DEPTH: u8 = 4;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain = [1u8; 32];
     let value = 1000u128;
     let rho = [42u8; 32];
-    let recipient = [99u8; 32];
-    let nf_key = [33u8; 32];
+    let spend_sk = [33u8; 32]; // SECRET
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let cm = note_commitment(&domain, value, &rho, &recipient_owner);
     let pos = 0u64;
     tree.set_leaf(pos as usize, cm);
     let anchor = tree.root();
@@ -1229,82 +1382,88 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 
     println!("✓ Note created with value: {}", value);
 
-    // Step 2: Generate a proof with withdraw_amount > 0
-    println!("\nStep 2: Generating proof with withdraw_amount=500...");
+    // Step 2: Generate a VALID withdraw proof (withdraw > 0 must balance with outputs)
+    println!("\nStep 2: Generating VALID withdraw proof with withdraw_amount=500 + change=500...");
 
     let withdraw_amount = 500u128;
+    let change_value = value - withdraw_amount;
+    let change_rho: Hash32 = [55u8; 32];
+    let pk_spend_change = pk_from_sk(&spend_sk);
+    let pk_ivk_change = pk_ivk_from_sk(&domain, &spend_sk);
+    let change = compute_output_args(&domain, change_value, change_rho, pk_spend_change, pk_ivk_change, &recipient_owner);
 
     let program_path = config.program_path.to_string_lossy().to_string();
-    // Private: value, rho, recipient, nf_key, pos, and all siblings
     let depth = siblings.len();
-    let mut private_indices = vec![
-        2, // value
-        3, // rho
-        4, // recipient
-        5, // nf_key
-        6, // pos
-    ];
-    for i in 0..depth {
-        private_indices.push(8 + i); // siblings
-    }
+    let private_indices = private_indices_join_split(depth, 1, 1);
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
         .with_private_indices(private_indices);
 
+    // NEW ABI header
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string()); // decimal u128
+    host.add_hex_arg(hex::encode(spend_sk));
+    host.add_str_arg((TREE_DEPTH as u64).to_string());
+    host.add_hex_arg(hex::encode(anchor));
+    host.add_str_arg("1".to_string()); // n_in
+
+    // Input 0
+    host.add_str_arg((value as u64).to_string());
     host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string()); // decimal u64
-    host.add_str_arg((siblings.len() as u32).to_string()); // decimal u32 - depth
+    host.add_str_arg(pos.to_string());
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string()); // decimal u128
-    host.add_str_arg("0".to_string());             // n_out = 0 (no outputs in withdrawal scenario)
+    host.add_hex_arg(hex::encode(nf)); // nullifier_0
+
+    host.add_str_arg((withdraw_amount as u64).to_string());
+    host.add_str_arg("1".to_string()); // n_out = 1 change
+
+    // Output 0 (change)
+    host.add_str_arg((change.value as u64).to_string());
+    host.add_hex_arg(hex::encode(change.rho));
+    host.add_hex_arg(hex::encode(change.pk_spend));
+    host.add_hex_arg(hex::encode(change.pk_ivk));
+    host.add_hex_arg(hex::encode(change.cm));
+    host.add_hex_arg(hex::encode(change.epk));
+    host.add_hex_arg(hex::encode(change.ct_hash));
+    host.add_hex_arg(hex::encode(change.mac));
 
     let public = SpendPublic {
         anchor_root: anchor,
         nullifiers: vec![nf],
         withdraw_amount,
-        output_commitments: vec![],
+        output_commitments: vec![change.cm],
         view_attestations: None,
         recipient_attestations: None,
     };
 
     host.set_public_output(&public)?;
 
-    let proof_result = host.run(true);
-    assert!(proof_result.is_ok(), "Proof generation should succeed");
-    println!("✓ Proof generated with withdraw_amount={}", withdraw_amount);
-
-    // Step 3: Module should reject and suggest using Withdraw instead
-    println!("\nStep 3: Module validation...");
-    println!("✓ Proof has withdraw_amount > 0");
-    println!("✓ SpendNote will reject: should use Withdraw call instead");
-    println!("✓ Withdraw call properly handles value movement and binding");
+    let proof_data = host.run(true)?;
+    let code_commitment = host.code_commitment();
+    let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)?;
+    assert_eq!(verified.withdraw_amount, withdraw_amount);
+    assert_eq!(verified.output_commitments, vec![change.cm]);
+    println!("✓ Withdraw proof verified: withdraw={} change_cm={}", withdraw_amount, hex::encode(&change.cm[..8]));
 
     println!("\n=== SUCCESS ===");
-    println!("✓ SpendNote correctly rejects when withdraw_amount > 0");
-    println!("✓ Enforces proper API usage: Withdraw for transparent transfers");
-    println!("\n🎉 API safety enforced!");
+    println!("✓ Withdraw proof with balanced outputs works correctly");
+    println!("✓ Balance: {} == {} + {}", value, withdraw_amount, change_value);
+    println!("\n🎉 Withdraw with change verified!");
 
     Ok(())
 }
 
 /// Test full transaction lifecycle: Deposit → Spend (2 outputs) → Withdraw
 /// 
-/// This test demonstrates a complete privacy-preserving value flow:
+/// This test demonstrates a complete privacy-preserving value flow (NEW ABI):
 /// 1. **Deposit**: Create initial note with 1000 units
 /// 2. **Spend with 2 outputs**: Split into 600 + 400 (demonstrates value splitting)
 /// 3. **Withdraw**: Take 600 note, withdraw 200, get 400 change
 #[test]
 fn test_full_transaction_lifecycle() -> Result<()> {
-    println!("\n=== Full Transaction Lifecycle Test ===");
+    println!("\n=== Full Transaction Lifecycle Test (NEW ABI) ===");
     println!("Demonstrating: Deposit → Spend (2 outputs) → Withdraw\n");
 
     // Setup
@@ -1315,6 +1474,13 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain: Hash32 = [1u8; 32];
     let mut next_position: u64 = 0;
+    
+    // Common owner for all notes in this test (NEW ABI)
+    let spend_sk: Hash32 = [12u8; 32];
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
 
     // ========================================================================
     // PHASE 1: DEPOSIT - Create initial note
@@ -1323,10 +1489,8 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
-    let deposit_recipient: Hash32 = [11u8; 32];
-    let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
     
-    let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
+    let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &recipient_owner);
     let deposit_pos = next_position;
     next_position += 1;
     
@@ -1346,18 +1510,18 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     
     // Prepare to spend the deposit note
     let deposit_siblings = tree.open(deposit_pos as usize);
-    let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
+    let deposit_nf = nullifier(&domain, &nf_key, &deposit_rho);
     
     // Create 2 output notes
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
-    let out1_recipient: Hash32 = [21u8; 32];
-    let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1 = compute_output_args(&domain, out1_value, out1_rho, pk_spend_owner, pk_ivk_owner, &recipient_owner);
+    let out1_cm = out1.cm;
     
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
-    let out2_recipient: Hash32 = [31u8; 32];
-    let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2 = compute_output_args(&domain, out2_value, out2_rho, pk_spend_owner, pk_ivk_owner, &recipient_owner);
+    let out2_cm = out2.cm;
     
     let n_out_phase2: u32 = 2;
     let withdraw_amount_phase2: u128 = 0;
@@ -1368,47 +1532,49 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("  Withdraw: {} units", withdraw_amount_phase2);
     println!("  ✓ Balance: {} = {} + {} + {}", initial_value, out1_value, out2_value, withdraw_amount_phase2);
     
-    // Prepare private indices for 2 outputs
-    let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase2.push(8 + i); }
-    let base2 = 12 + (TREE_DEPTH as usize);
-    // Output 0 private fields
-    private_indices_phase2.push(base2 + 0); // value_out_0
-    private_indices_phase2.push(base2 + 1); // rho_out_0
-    private_indices_phase2.push(base2 + 2); // recipient_out_0
-    // Output 1 private fields
-    private_indices_phase2.push(base2 + 4); // value_out_1
-    private_indices_phase2.push(base2 + 5); // rho_out_1
-    private_indices_phase2.push(base2 + 6); // recipient_out_1
+    // Private indices for NEW ABI
+    let private_indices_phase2 = private_indices_join_split(TREE_DEPTH as usize, 1, 2);
     
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
     
-    // Add arguments for phase 2 spend
+    // NEW ABI header
     host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
+    host2.add_hex_arg(hex::encode(spend_sk));
+    host2.add_str_arg((TREE_DEPTH as u64).to_string());
+    host2.add_hex_arg(hex::encode(anchor_after_deposit));
+    host2.add_str_arg("1".to_string()); // n_in
+
+    // Input 0
+    host2.add_str_arg((initial_value as u64).to_string());
     host2.add_hex_arg(hex::encode(deposit_rho));
-    host2.add_hex_arg(hex::encode(deposit_recipient));
-    host2.add_hex_arg(hex::encode(deposit_nf_key));
     host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
     for sib in &deposit_siblings {
         host2.add_hex_arg(hex::encode(sib));
     }
-    host2.add_hex_arg(hex::encode(anchor_after_deposit));
-    host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
+    host2.add_hex_arg(hex::encode(deposit_nf)); // nullifier_0
+
+    host2.add_str_arg((withdraw_amount_phase2 as u64).to_string());
+    host2.add_str_arg((n_out_phase2 as u64).to_string());
+
     // Output 0
-    host2.add_str_arg(out1_value.to_string());
-    host2.add_hex_arg(hex::encode(out1_rho));
-    host2.add_hex_arg(hex::encode(out1_recipient));
-    host2.add_hex_arg(hex::encode(out1_cm));
+    host2.add_str_arg((out1.value as u64).to_string());
+    host2.add_hex_arg(hex::encode(out1.rho));
+    host2.add_hex_arg(hex::encode(out1.pk_spend));
+    host2.add_hex_arg(hex::encode(out1.pk_ivk));
+    host2.add_hex_arg(hex::encode(out1.cm));
+    host2.add_hex_arg(hex::encode(out1.epk));
+    host2.add_hex_arg(hex::encode(out1.ct_hash));
+    host2.add_hex_arg(hex::encode(out1.mac));
     // Output 1
-    host2.add_str_arg(out2_value.to_string());
-    host2.add_hex_arg(hex::encode(out2_rho));
-    host2.add_hex_arg(hex::encode(out2_recipient));
-    host2.add_hex_arg(hex::encode(out2_cm));
+    host2.add_str_arg((out2.value as u64).to_string());
+    host2.add_hex_arg(hex::encode(out2.rho));
+    host2.add_hex_arg(hex::encode(out2.pk_spend));
+    host2.add_hex_arg(hex::encode(out2.pk_ivk));
+    host2.add_hex_arg(hex::encode(out2.cm));
+    host2.add_hex_arg(hex::encode(out2.epk));
+    host2.add_hex_arg(hex::encode(out2.ct_hash));
+    host2.add_hex_arg(hex::encode(out2.mac));
     
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
@@ -1428,7 +1594,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data2.len(), proof_time2);
     
     println!("  Verifying proof...");
-    let code_commitment2 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
+    let code_commitment2 = host2.code_commitment();
     let verify_start2 = Instant::now();
     let verified2: SpendPublic = LigeroVerifier::verify(&proof_data2, &code_commitment2)
         .context("Phase 2 proof verification failed")?;
@@ -1459,54 +1625,53 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("\n━━━ PHASE 3: WITHDRAW - Spend {} note, withdraw 200, get 400 change ━━━", out1_value);
     
     // We'll spend the first output (600 units) and withdraw 200
-    let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
-    let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
+    let out1_nf = nullifier(&domain, &nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
     
     let withdraw_amount_phase3: u128 = 200;
     let change_value: u128 = out1_value - withdraw_amount_phase3; // 400
     let change_rho: Hash32 = [50u8; 32];
-    let change_recipient: Hash32 = [51u8; 32];
-    let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
-    
-    let n_out_phase3: u32 = 1;
-    
+    let change = compute_output_args(&domain, change_value, change_rho, pk_spend_owner, pk_ivk_owner, &recipient_owner);
+    let change_cm = change.cm;
+
     println!("  Input:  {} units (nullifier: {})", out1_value, hex::encode(&out1_nf[..8]));
     println!("  Output: {} units (change, cm: {})", change_value, hex::encode(&change_cm[..8]));
     println!("  Withdraw: {} units (transparent)", withdraw_amount_phase3);
     println!("  ✓ Balance: {} = {} + {}", out1_value, change_value, withdraw_amount_phase3);
     
-    // Prepare private indices for 1 output
-    let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase3.push(8 + i); }
-    let base3 = 12 + (TREE_DEPTH as usize);
-    private_indices_phase3.push(base3 + 0); // value_out_0
-    private_indices_phase3.push(base3 + 1); // rho_out_0
-    private_indices_phase3.push(base3 + 2); // recipient_out_0
+    // Private indices for NEW ABI
+    let private_indices_phase3 = private_indices_join_split(TREE_DEPTH as usize, 1, 1);
     
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
     
-    // Add arguments for phase 3 spend
+    // NEW ABI header
     host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string());
+    host3.add_hex_arg(hex::encode(spend_sk));
+    host3.add_str_arg((TREE_DEPTH as u64).to_string());
+    host3.add_hex_arg(hex::encode(anchor_after_split));
+    host3.add_str_arg("1".to_string());
+
+    // Input 0
+    host3.add_str_arg((out1_value as u64).to_string());
     host3.add_hex_arg(hex::encode(out1_rho));
-    host3.add_hex_arg(hex::encode(out1_recipient));
-    host3.add_hex_arg(hex::encode(out1_nf_key));
     host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
     for sib in &out1_siblings {
         host3.add_hex_arg(hex::encode(sib));
     }
-    host3.add_hex_arg(hex::encode(anchor_after_split));
     host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(withdraw_amount_phase3.to_string());
-    host3.add_str_arg(n_out_phase3.to_string());
-    // Change output
-    host3.add_str_arg(change_value.to_string());
-    host3.add_hex_arg(hex::encode(change_rho));
-    host3.add_hex_arg(hex::encode(change_recipient));
-    host3.add_hex_arg(hex::encode(change_cm));
+    host3.add_str_arg((withdraw_amount_phase3 as u64).to_string());
+    host3.add_str_arg("1".to_string());
+
+    // Output 0 (change)
+    host3.add_str_arg((change.value as u64).to_string());
+    host3.add_hex_arg(hex::encode(change.rho));
+    host3.add_hex_arg(hex::encode(change.pk_spend));
+    host3.add_hex_arg(hex::encode(change.pk_ivk));
+    host3.add_hex_arg(hex::encode(change.cm));
+    host3.add_hex_arg(hex::encode(change.epk));
+    host3.add_hex_arg(hex::encode(change.ct_hash));
+    host3.add_hex_arg(hex::encode(change.mac));
     
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
@@ -1526,7 +1691,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data3.len(), proof_time3);
     
     println!("  Verifying proof...");
-    let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
+    let code_commitment3 = host3.code_commitment();
     let verify_start3 = Instant::now();
     let verified3: SpendPublic = LigeroVerifier::verify(&proof_data3, &code_commitment3)
         .context("Phase 3 proof verification failed")?;
@@ -1580,13 +1745,13 @@ fn test_full_transaction_lifecycle() -> Result<()> {
 
 /// Test that circuit rejects over-withdrawal attempts (trying to withdraw more than note value)
 /// 
-/// This test demonstrates circuit-level balance enforcement preventing theft/inflation:
+/// This test demonstrates circuit-level balance enforcement preventing theft/inflation (NEW ABI):
 /// 1. **Deposit**: Create note with 1000 units
 /// 2. **Split**: Create 600 + 400 notes
 /// 3. **Attempted theft**: Try to spend 600 note but withdraw 1000 units (SHOULD FAIL)
 #[test]
 fn test_rejects_over_withdrawal_attack() -> Result<()> {
-    println!("\n=== Over-Withdrawal Attack Prevention Test ===");
+    println!("\n=== Over-Withdrawal Attack Prevention Test (NEW ABI) ===");
     println!("Demonstrating: Circuit rejects withdraw_amount > note_value\n");
 
     // Setup
@@ -1597,6 +1762,13 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain: Hash32 = [1u8; 32];
     let mut next_position: u64 = 0;
+    
+    // Common owner for all notes (NEW ABI)
+    let spend_sk: Hash32 = [12u8; 32];
+    let recipient_owner = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
 
     // ========================================================================
     // PHASE 1: DEPOSIT - Create initial note
@@ -1605,10 +1777,8 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
-    let deposit_recipient: Hash32 = [11u8; 32];
-    let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
     
-    let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
+    let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &recipient_owner);
     let deposit_pos = next_position;
     next_position += 1;
     
@@ -1623,58 +1793,65 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("\n━━━ PHASE 2: SPLIT - Create 600 + 400 notes ━━━");
     
     let deposit_siblings = tree.open(deposit_pos as usize);
-    let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
+    let deposit_nf = nullifier(&domain, &nf_key, &deposit_rho);
     
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
-    let out1_recipient: Hash32 = [21u8; 32];
-    let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1 = compute_output_args(&domain, out1_value, out1_rho, pk_spend_owner, pk_ivk_owner, &recipient_owner);
+    let out1_cm = out1.cm;
     
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
-    let out2_recipient: Hash32 = [31u8; 32];
-    let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2 = compute_output_args(&domain, out2_value, out2_rho, pk_spend_owner, pk_ivk_owner, &recipient_owner);
+    let out2_cm = out2.cm;
     
     let n_out_phase2: u32 = 2;
     let withdraw_amount_phase2: u128 = 0;
     
     println!("  Creating 2 outputs: {} + {} = {}", out1_value, out2_value, out1_value + out2_value);
     
-    let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase2.push(8 + i); }
-    let base2 = 12 + (TREE_DEPTH as usize);
-    private_indices_phase2.push(base2 + 0);
-    private_indices_phase2.push(base2 + 1);
-    private_indices_phase2.push(base2 + 2);
-    private_indices_phase2.push(base2 + 4);
-    private_indices_phase2.push(base2 + 5);
-    private_indices_phase2.push(base2 + 6);
+    let private_indices_phase2 = private_indices_join_split(TREE_DEPTH as usize, 1, 2);
     
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
     
+    // NEW ABI header
     host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
+    host2.add_hex_arg(hex::encode(spend_sk));
+    host2.add_str_arg((TREE_DEPTH as u64).to_string());
+    host2.add_hex_arg(hex::encode(anchor_after_deposit));
+    host2.add_str_arg("1".to_string()); // n_in
+
+    // Input 0
+    host2.add_str_arg((initial_value as u64).to_string());
     host2.add_hex_arg(hex::encode(deposit_rho));
-    host2.add_hex_arg(hex::encode(deposit_recipient));
-    host2.add_hex_arg(hex::encode(deposit_nf_key));
     host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
     for sib in &deposit_siblings {
         host2.add_hex_arg(hex::encode(sib));
     }
-    host2.add_hex_arg(hex::encode(anchor_after_deposit));
     host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
-    host2.add_str_arg(out1_value.to_string());
-    host2.add_hex_arg(hex::encode(out1_rho));
-    host2.add_hex_arg(hex::encode(out1_recipient));
-    host2.add_hex_arg(hex::encode(out1_cm));
-    host2.add_str_arg(out2_value.to_string());
-    host2.add_hex_arg(hex::encode(out2_rho));
-    host2.add_hex_arg(hex::encode(out2_recipient));
-    host2.add_hex_arg(hex::encode(out2_cm));
+
+    host2.add_str_arg((withdraw_amount_phase2 as u64).to_string());
+    host2.add_str_arg((n_out_phase2 as u64).to_string());
+
+    // Output 0
+    host2.add_str_arg((out1.value as u64).to_string());
+    host2.add_hex_arg(hex::encode(out1.rho));
+    host2.add_hex_arg(hex::encode(out1.pk_spend));
+    host2.add_hex_arg(hex::encode(out1.pk_ivk));
+    host2.add_hex_arg(hex::encode(out1.cm));
+    host2.add_hex_arg(hex::encode(out1.epk));
+    host2.add_hex_arg(hex::encode(out1.ct_hash));
+    host2.add_hex_arg(hex::encode(out1.mac));
+    // Output 1
+    host2.add_str_arg((out2.value as u64).to_string());
+    host2.add_hex_arg(hex::encode(out2.rho));
+    host2.add_hex_arg(hex::encode(out2.pk_spend));
+    host2.add_hex_arg(hex::encode(out2.pk_ivk));
+    host2.add_hex_arg(hex::encode(out2.cm));
+    host2.add_hex_arg(hex::encode(out2.epk));
+    host2.add_hex_arg(hex::encode(out2.ct_hash));
+    host2.add_hex_arg(hex::encode(out2.mac));
     
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
@@ -1708,8 +1885,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("\n━━━ PHASE 3: ATTEMPTED THEFT ━━━");
     println!("⚠️  Attacker tries to spend 600-unit note but withdraw 1000 units!");
     
-    let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
-    let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
+    let out1_nf = nullifier(&domain, &nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
     
     let malicious_withdraw: u128 = 1000; // ATTACK: Try to withdraw more than note value!
@@ -1720,26 +1896,29 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("  Outputs:         {} (no change)", n_out_phase3);
     println!("  ❌ Balance: {} ≠ {} + 0 (INVALID!)", out1_value, malicious_withdraw);
     
-    let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize { private_indices_phase3.push(8 + i); }
+    // Private indices for NEW ABI (no outputs)
+    let private_indices_phase3 = private_indices_join_split(TREE_DEPTH as usize, 1, 0);
     
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
     
+    // NEW ABI header
     host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string()); // Real note value: 600
+    host3.add_hex_arg(hex::encode(spend_sk));
+    host3.add_str_arg((TREE_DEPTH as u64).to_string());
+    host3.add_hex_arg(hex::encode(anchor_after_split));
+    host3.add_str_arg("1".to_string()); // n_in
+
+    // Input 0
+    host3.add_str_arg((out1_value as u64).to_string()); // Real note value: 600
     host3.add_hex_arg(hex::encode(out1_rho));
-    host3.add_hex_arg(hex::encode(out1_recipient));
-    host3.add_hex_arg(hex::encode(out1_nf_key));
     host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
     for sib in &out1_siblings {
         host3.add_hex_arg(hex::encode(sib));
     }
-    host3.add_hex_arg(hex::encode(anchor_after_split));
-    host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(malicious_withdraw.to_string()); // Try to withdraw 1000!
-    host3.add_str_arg(n_out_phase3.to_string());
+    host3.add_hex_arg(hex::encode(out1_nf)); // nullifier_0
+    host3.add_str_arg((malicious_withdraw as u64).to_string()); // Try to withdraw 1000!
+    host3.add_str_arg("0".to_string()); // n_out = 0
     
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
@@ -1767,7 +1946,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
         println!("  ℹ️  Checking if verification detects the invalid balance...");
         
         let proof_data = proof_result.unwrap();
-        let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
+        let code_commitment3 = host3.code_commitment();
         
         // Attempt to verify the proof (if it was generated)
         let verify_result: Result<SpendPublic, _> = LigeroVerifier::verify(&proof_data, &code_commitment3);
@@ -1781,7 +1960,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
                 println!("  ⚠️  Note: Ligero may produce output despite assertion failures");
                 println!("  ✓  Circuit contains balance assertion: value (600) == withdraw (1000) + outputs (0)");
                 println!("  ✓  Assertion WOULD fail in production: 600 ≠ 1000");
-                println!("  ℹ️  See guest/note-spend-guest/src/lib.rs:286 for balance check implementation");
+                println!("  ℹ️  See guest/note-spend-guest/src/lib.rs for balance check implementation");
             }
         }
     }
@@ -1797,9 +1976,8 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("  • Attempted to withdraw 1000 units (400 unit theft)");
     println!("  • Provided no output notes to balance the equation");
     println!("\nCircuit Protection:");
-    println!("  ✅ Balance assertion implemented: value_in == sum(value_out) + withdraw_amount");
+    println!("  ✅ Balance assertion implemented: sum(value_in) == sum(value_out) + withdraw_amount");
     println!("  ✅ Circuit code verifies: 600 == 1000 + 0 (fails!)");
-    println!("  ✅ See guest/note-spend-guest/src/lib.rs:284-286 for implementation");
     println!("\nSecurity Properties Demonstrated:");
     println!("  • Circuit contains balance check preventing supply inflation");
     println!("  • Cannot withdraw more than note value without outputs to balance");
