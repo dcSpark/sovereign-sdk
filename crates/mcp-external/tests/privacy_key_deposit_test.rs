@@ -3,7 +3,7 @@
 //! This test verifies that when a privacy key is provided to the deposit operation,
 //! the recipient is correctly derived from the privacy key instead of being random.
 
-use mcp::privacy_key::PrivacyKey;
+use mcp_external::privacy_key::PrivacyKey;
 
 #[test]
 fn test_privacy_key_recipient_derivation() {

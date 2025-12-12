@@ -110,7 +110,7 @@ impl Provider {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let chain_data = provider.get_chain_data().await?;
     /// println!("Chain ID: {}", chain_data.chain_id);
     /// println!("Chain Name: {}", chain_data.chain_name);
@@ -337,7 +337,7 @@ impl Provider {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let tx = provider.get_transaction("0x1234...").await?;
     /// if let Some(tx) = tx {
     ///     println!("Transaction {}: {} at {}",
@@ -418,7 +418,7 @@ impl Provider {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
     /// let transactions = provider.get_wallet_transactions(address, None, None, None).await?;
     /// println!("Found {} transactions", transactions.items.len());
@@ -507,7 +507,7 @@ impl Provider {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
+    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())

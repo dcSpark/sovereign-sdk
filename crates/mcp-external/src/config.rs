@@ -52,9 +52,9 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub privpool_spend_key: String,
 
-    /// Optional amount to deposit into the privacy pool when creating a new wallet (env: STARTUP_DEPOSIT_AMOUNT, optional)
-    #[serde(default)]
-    pub startup_deposit_amount: Option<String>,
+    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT)
+    #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
+    pub auto_fund_deposit_amount: Option<String>,
 }
 
 fn default_server_bind_address() -> String {

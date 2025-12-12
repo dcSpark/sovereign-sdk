@@ -28,7 +28,7 @@ Configure the following environment variables:
 - `LIGERO_SHADER_PATH` - Path to shader directory
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
 - `AUTHORITY_VFK` - Optional authority viewing key for note decryption
-- `STARTUP_DEPOSIT_AMOUNT` - Optional amount (in dust) to deposit into the privacy pool when creating a new wallet (best-effort)
+- `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
 
 ### Start the Server
 
@@ -53,7 +53,7 @@ The server exposes the following MCP tools:
 - `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
-If `STARTUP_DEPOSIT_AMOUNT` is set, calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`), calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
 
 ### Local transaction store
 

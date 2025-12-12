@@ -3,7 +3,7 @@
 //! This test verifies that the getWalletConfig operation returns the privacy pool address
 //! so users can share it with others for receiving transfers.
 
-use mcp::privacy_key::PrivacyKey;
+use mcp_external::privacy_key::PrivacyKey;
 
 #[test]
 fn test_privacy_address_format() {

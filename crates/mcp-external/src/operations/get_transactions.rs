@@ -83,16 +83,16 @@ impl From<InvolvementItem> for Transaction {
 /// # Example
 /// ```rust,no_run
 /// # async fn example<Tx, S>(
-/// #     provider: &mcp::provider::Provider,
-/// #     wallet: &mcp::wallet::WalletContext<Tx, S>,
-/// #     privacy_key: &mcp::privacy_key::PrivacyKey,
+/// #     provider: &mcp_external::provider::Provider,
+/// #     wallet: &mcp_external::wallet::WalletContext<Tx, S>,
+/// #     privacy_key: &mcp_external::privacy_key::PrivacyKey,
 /// # ) -> anyhow::Result<()>
 /// # where
 /// #     Tx: sov_modules_api::DispatchCall,
 /// #     Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
 /// #     S: sov_modules_api::Spec,
 /// # {
-/// use mcp::operations::get_transactions;
+/// use mcp_external::operations::get_transactions;
 ///
 /// let transactions = get_transactions(provider, wallet, privacy_key).await?;
 /// println!("Found {} transactions", transactions.len());

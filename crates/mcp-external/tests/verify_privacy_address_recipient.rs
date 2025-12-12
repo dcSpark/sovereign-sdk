@@ -2,7 +2,7 @@
 //!
 //! This test checks that a given privacy address correctly converts to the expected recipient hash.
 
-use mcp::privacy_key::PrivacyKey;
+use mcp_external::privacy_key::PrivacyKey;
 
 /// Domain constant matching the one used in deposit.rs
 const DOMAIN: [u8; 32] = [1u8; 32];

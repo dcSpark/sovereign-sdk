@@ -3,7 +3,7 @@
 //! This test verifies that the walletAddress operation returns both the transparent
 //! wallet address and the privacy pool address.
 
-use mcp::privacy_key::PrivacyKey;
+use mcp_external::privacy_key::PrivacyKey;
 
 #[test]
 fn test_privacy_address_included_in_response() {

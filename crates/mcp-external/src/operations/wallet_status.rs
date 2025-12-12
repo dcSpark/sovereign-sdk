@@ -85,9 +85,9 @@ pub struct WalletStatus {
 /// # Example
 /// ```rust,no_run
 /// # async fn example<Tx, S>(
-/// #     provider: &mcp::provider::Provider,
-/// #     wallet: &mcp::wallet::WalletContext<Tx, S>,
-/// #     privacy_key: &mcp::privacy_key::PrivacyKey,
+/// #     provider: &mcp_external::provider::Provider,
+/// #     wallet: &mcp_external::wallet::WalletContext<Tx, S>,
+/// #     privacy_key: &mcp_external::privacy_key::PrivacyKey,
 /// #     privacy_balance: u128
 /// # ) -> anyhow::Result<()>
 /// # where
@@ -95,7 +95,7 @@ pub struct WalletStatus {
 /// #     Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
 /// #     S: sov_modules_api::Spec,
 /// # {
-/// use mcp::operations::wallet_status::get_wallet_status;
+/// use mcp_external::operations::wallet_status::get_wallet_status;
 ///
 /// let status = get_wallet_status(provider, wallet, privacy_key, privacy_balance).await?;
 /// println!("Wallet ready: {}", status.ready);

@@ -3,10 +3,10 @@
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
-use mcp::operations::{deposit, get_transaction_status};
-use mcp::privacy_key::PrivacyKey;
-use mcp::provider::Provider;
-use mcp::wallet::WalletContext;
+use mcp_external::operations::{deposit, get_transaction_status};
+use mcp_external::privacy_key::PrivacyKey;
+use mcp_external::provider::Provider;
+use mcp_external::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;

@@ -2,7 +2,7 @@
 
 use std::{env, path::PathBuf};
 
-use mcp::ligero::{Ligero, LigeroProgramArguments};
+use mcp_external::ligero::{Ligero, LigeroProgramArguments};
 
 const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";
 const DEFAULT_PROVER_REL: &str = "../adapters/ligero/bins/macos/bin/webgpu_prover";

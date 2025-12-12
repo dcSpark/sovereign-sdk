@@ -73,8 +73,8 @@ impl From<InvolvementItem> for TransactionDetails {
 ///
 /// # Example
 /// ```rust,no_run
-/// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
-/// use mcp::operations::get_transaction_status;
+/// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
+/// use mcp_external::operations::get_transaction_status;
 ///
 /// let details = get_transaction_status(provider, "0x1234...").await?;
 /// println!("Transaction {} status: {}", details.tx_hash, details.status);

@@ -137,15 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In-memory transaction store
     let tx_store = Arc::new(TransactionStore::new_in_memory().await?);
 
-    let startup_deposit_amount = cfg
-        .startup_deposit_amount
+    let auto_fund_deposit_amount = cfg
+        .auto_fund_deposit_amount
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<u128>().map_err(|e| {
                 tracing::warn!(
-                    "[startup-fund] Invalid STARTUP_DEPOSIT_AMOUNT '{}': {}",
+                    "[auto-fund] Invalid AUTO_FUND_DEPOSIT_AMOUNT '{}': {}",
                     s,
                     e
                 );
@@ -154,13 +154,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .and_then(Result::ok);
 
-    if let Some(amount) = startup_deposit_amount {
+    if let Some(amount) = auto_fund_deposit_amount {
         tracing::info!(
-            "[startup-fund] Configured startup deposit amount: {}",
+            "[auto-fund] Configured auto-fund deposit amount: {}",
             amount
         );
     } else {
-        tracing::info!("[startup-fund] No STARTUP_DEPOSIT_AMOUNT configured; skipping auto-funding on wallet creation");
+        tracing::info!(
+            "[auto-fund] No AUTO_FUND_DEPOSIT_AMOUNT configured; skipping auto-funding on wallet creation"
+        );
     }
 
     tracing::info!(
@@ -174,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let privacy_key_for_service = privacy_key.clone();
     let tx_store_for_service = tx_store.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
-    let startup_deposit_amount_for_service = startup_deposit_amount;
+    let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
 
     let service = StreamableHttpService::new(
         move || {
@@ -186,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 privacy_key_for_service.clone(),
                 tx_store_for_service.clone(),
                 log_path_string.clone(),
-                startup_deposit_amount_for_service,
+                auto_fund_deposit_amount_for_service,
             ))
         },
         LocalSessionManager::default().into(),

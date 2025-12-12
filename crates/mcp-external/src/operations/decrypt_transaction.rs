@@ -62,8 +62,8 @@ pub struct DecryptTransactionResult {
 ///
 /// # Example
 /// ```rust,no_run
-/// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
-/// use mcp::operations::decrypt_transaction;
+/// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
+/// use mcp_external::operations::decrypt_transaction;
 ///
 /// let vfk_hex = "0x1234..."; // Authority VFK
 /// let result = decrypt_transaction(provider, "0xabcd...", vfk_hex).await?;

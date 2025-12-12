@@ -487,7 +487,7 @@ pub struct CryptoServer {
     privacy_key: Arc<RwLock<PrivacyKey>>,
     tx_store: Arc<TransactionStore>,
     log_path: String,
-    startup_deposit_amount: Option<u128>,
+    auto_fund_deposit_amount: Option<u128>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -501,7 +501,7 @@ impl CryptoServer {
         privacy_key: Arc<RwLock<PrivacyKey>>,
         tx_store: Arc<TransactionStore>,
         log_path: String,
-        startup_deposit_amount: Option<u128>,
+        auto_fund_deposit_amount: Option<u128>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -512,7 +512,7 @@ impl CryptoServer {
             privacy_key,
             tx_store,
             log_path,
-            startup_deposit_amount,
+            auto_fund_deposit_amount,
         }
     }
 
@@ -1279,19 +1279,19 @@ impl CryptoServer {
         tracing::info!("[createWallet] Wallet address: {}", wallet_address);
         tracing::info!("[createWallet] Privacy address: {}", privacy_address);
 
-        // Best-effort funding when configured via STARTUP_DEPOSIT_AMOUNT
-        if let Some(amount) = self.startup_deposit_amount {
+        // Best-effort funding when configured via AUTO_FUND_DEPOSIT_AMOUNT
+        if let Some(amount) = self.auto_fund_deposit_amount {
             if let (Some(provider), Some(funding_ctx)) =
                 (self.provider.clone(), previous_wallet_ctx.clone())
             {
                 let dest_privacy_key = new_privacy_key_for_deposit.clone();
                 tracing::info!(
-                    "[startup-fund/createWallet] Attempting startup deposit of {} (best-effort) using previous wallet context",
+                    "[auto-fund/createWallet] Attempting auto-fund deposit of {} (best-effort) using previous wallet context",
                     amount
                 );
                 tokio::spawn(async move {
                     tracing::info!(
-                        "[startup-fund/createWallet] Submitting deposit of {} to {}",
+                        "[auto-fund/createWallet] Submitting deposit of {} to {}",
                         amount,
                         dest_privacy_key.privacy_address()
                     );
@@ -1304,18 +1304,18 @@ impl CryptoServer {
                     .await
                     {
                         Ok(res) => tracing::info!(
-                            "[startup-fund/createWallet] Deposit submitted: {}",
+                            "[auto-fund/createWallet] Deposit submitted: {}",
                             res.tx_hash
                         ),
                         Err(e) => tracing::warn!(
-                            "[startup-fund/createWallet] Deposit attempt failed: {}",
+                            "[auto-fund/createWallet] Deposit attempt failed: {}",
                             e
                         ),
                     }
                 });
             } else {
                 tracing::warn!(
-                    "[startup-fund/createWallet] Startup deposit configured but no funding wallet/provider available; skipping"
+                    "[auto-fund/createWallet] Auto-fund deposit configured but no funding wallet/provider available; skipping"
                 );
             }
         }

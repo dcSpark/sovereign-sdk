@@ -64,8 +64,8 @@ pub struct VerifyTransactionResult {
 ///
 /// # Example
 /// ```rust,no_run
-/// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
-/// use mcp::operations::verify_transaction;
+/// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
+/// use mcp_external::operations::verify_transaction;
 ///
 /// let result = verify_transaction(provider, "0xabcd...", Some("0x1234...")).await?;
 /// println!("Transaction exists: {}", result.exists);
