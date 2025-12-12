@@ -47,17 +47,7 @@ pub struct SyncSummary {
 
 impl TransactionStore {
     pub async fn new_in_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:?cache=shared")?
-            .create_if_missing(true)
-            .disable_statement_logging();
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
-
-        sqlx::query(
-            r#"
+        const CREATE_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS transactions (
                 id TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
@@ -69,10 +59,27 @@ impl TransactionStore {
                 updated_at INTEGER NOT NULL,
                 error_message TEXT
             );
-            "#,
-        )
-        .execute(&pool)
-        .await?;
+        "#;
+
+        let options = SqliteConnectOptions::from_str("sqlite::memory:?cache=shared")?
+            .create_if_missing(true)
+            .disable_statement_logging();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query(CREATE_SQL).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+
+        sqlx::query(CREATE_SQL).execute(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -156,6 +163,7 @@ impl TransactionStore {
         Ok(row)
     }
 
+    #[allow(dead_code)]
     pub async fn list_all(&self) -> Result<Vec<StoredTransaction>> {
         let rows = sqlx::query_as::<_, StoredTransaction>(
             r#"

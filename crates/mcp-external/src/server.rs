@@ -344,10 +344,6 @@ pub struct CreateWalletRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct CreateWalletResult {
-    /// New wallet private key (hex string)
-    pub wallet_private_key: String,
-    /// New wallet address
-    pub wallet_address: String,
     /// New authority VFK (hex string)
     pub authority_vfk: String,
     /// New privacy pool spending key (hex string)
@@ -378,7 +374,8 @@ pub struct RestoreWalletResult {
 // Types for VerifyTransaction
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct VerifyTransactionRequest {
-    /// The transaction identifier to verify
+    /// The transaction hash (tx_hash) to verify. This is the rollup transaction hash returned from send/deposit operations.
+    /// Can be provided with or without the '0x' prefix.
     pub identifier: String,
 }
 
@@ -596,10 +593,37 @@ impl CryptoServer {
         let output_pk = output_privacy_addr.to_pk();
         let viewing_key = midnight_privacy::FullViewingKey(authority_vfk_bytes);
         let privacy_key = self.privacy_key.clone();
+        let authority_vfk_for_transfer = Some(authority_vfk_bytes);
 
         tokio::spawn(async move {
             let ctx_guard = wallet_ctx.read().await;
             let privacy_guard = privacy_key.read().await;
+
+            // Parse the requested send amount first
+            let send_amount = match params.amount.parse::<u128>() {
+                Ok(amt) => amt,
+                Err(e) => {
+                    let _ = tx_store
+                        .mark_failed(
+                            &id,
+                            &format!("Invalid amount format: {}", e),
+                            current_timestamp_ms(),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            if send_amount == 0 {
+                let _ = tx_store
+                    .mark_failed(
+                        &id,
+                        "Amount must be greater than 0",
+                        current_timestamp_ms(),
+                    )
+                    .await;
+                return;
+            }
 
             let unified = match crate::operations::get_unified_balance(
                 &provider,
@@ -623,19 +647,66 @@ impl CryptoServer {
                 }
             };
 
-            let note = match unified.unspent_notes.first() {
-                Some(n) => n,
-                None => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            "No unspent notes available to send.",
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
+            if unified.unspent_notes.is_empty() {
+                let _ = tx_store
+                    .mark_failed(
+                        &id,
+                        "No unspent notes available to send.",
+                        current_timestamp_ms(),
+                    )
+                    .await;
+                return;
+            }
+
+            // Smart note selection: choose the best note based on the amount
+            // Strategy:
+            // 1. Look for exact match (no change needed)
+            // 2. If no exact match, find smallest note >= send_amount (minimize change)
+            // 3. If no note is large enough, fail with insufficient funds error
+            let note = {
+                let mut exact_match = None;
+                let mut smallest_sufficient = None;
+                let mut smallest_sufficient_value = u128::MAX;
+
+                for n in &unified.unspent_notes {
+                    if n.value == send_amount {
+                        // Perfect match found
+                        exact_match = Some(n);
+                        break;
+                    } else if n.value > send_amount && n.value < smallest_sufficient_value {
+                        // Track smallest note that's larger than needed
+                        smallest_sufficient = Some(n);
+                        smallest_sufficient_value = n.value;
+                    }
+                }
+
+                match exact_match.or(smallest_sufficient) {
+                    Some(n) => n,
+                    None => {
+                        let total_balance: u128 = unified.unspent_notes.iter().map(|n| n.value).sum();
+                        let _ = tx_store
+                            .mark_failed(
+                                &id,
+                                &format!(
+                                    "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
+                                    send_amount,
+                                    total_balance,
+                                    unified.unspent_notes.len()
+                                ),
+                                current_timestamp_ms(),
+                            )
+                            .await;
+                        return;
+                    }
                 }
             };
+
+            tracing::info!(
+                "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
+                note.value,
+                note.tx_hash,
+                if note.value == send_amount { "exact match" } else { "smallest sufficient" }
+            );
 
             let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
                 Ok(bytes) if bytes.len() == 32 => bytes,
@@ -666,17 +737,43 @@ impl CryptoServer {
             let input_recipient = privacy_guard.recipient(&DOMAIN);
             let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
 
+            tracing::info!(
+                "[send] Input note - value: {}, rho: {}, recipient: {}",
+                note.value,
+                hex::encode(&input_rho),
+                hex::encode(&input_recipient)
+            );
+            tracing::info!(
+                "[send] Output recipient (destination): {}",
+                hex::encode(&output_recipient)
+            );
+
+            // Set change_recipient to sender's address to receive change
+            let change_recipient = if send_amount < note.value {
+                let change_amt = note.value - send_amount;
+                tracing::info!(
+                    "[send] Creating change note - amount: {}, recipient: {}",
+                    change_amt,
+                    hex::encode(&input_recipient)
+                );
+                Some(input_recipient)
+            } else {
+                tracing::info!("[send] No change needed - sending full note value");
+                None
+            };
+
             let send_res = if let Some(ligero_ref) = ligero.as_ref() {
                 crate::operations::transfer(
                     ligero_ref,
                     &provider,
                     &*ctx_guard,
                     note.value,
-                    note.value,
+                    send_amount,
                     input_rho,
                     input_recipient,
                     output_recipient,
-                    None,
+                    change_recipient,
+                    authority_vfk_for_transfer,
                 )
                 .await
             } else {
@@ -693,7 +790,7 @@ impl CryptoServer {
                             state: "sent".to_string(),
                             from_address: Some(from_address.clone()),
                             to_address: Some(destination_address.clone()),
-                            amount: Some(note.value.to_string()),
+                            amount: Some(send_amount.to_string()),
                             tx_identifier: Some(transfer_result.tx_hash.clone()),
                             created_at: note.timestamp_ms,
                             updated_at: current_timestamp_ms(),
@@ -991,11 +1088,11 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get all transactions for the wallet.
-    /// Queries both the normal wallet address (for deposits) and privacy address (for transfers).
+    /// Get all transactions for the privacy pool.
+    /// Returns transactions from the local database, filtered by the current privacy pool address.
     #[tool(
         name = "getTransactions",
-        description = "Get all transactions for the wallet. Retrieves deposits from the L2 wallet address and transfers from/to the privacy address."
+        description = "Get all transactions for the privacy pool. Retrieves all transactions (deposits, transfers, withdrawals) associated with the current privacy pool address."
     )]
     async fn get_transactions(
         &self,
@@ -1018,17 +1115,39 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
+        // Sync with indexer (this now only syncs privacy pool transactions)
         self.sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
             .await?;
 
+        // Get current privacy pool address
+        let privacy_address = privacy_key_guard.privacy_address().to_string();
+
+        // Get all transactions from DB
         let stored = self
             .tx_store
             .list_all()
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let transaction_records: Vec<TransactionRecord> =
-            stored.into_iter().map(stored_to_record).collect();
+        // Filter to only include transactions for the current privacy pool address
+        let transaction_records: Vec<TransactionRecord> = stored
+            .into_iter()
+            .filter(|tx| {
+                // Include transaction if from_address or to_address matches privacy pool address
+                let from_matches = tx
+                    .from_address
+                    .as_ref()
+                    .map(|addr| addr == &privacy_address)
+                    .unwrap_or(false);
+                let to_matches = tx
+                    .to_address
+                    .as_ref()
+                    .map(|addr| addr == &privacy_address)
+                    .unwrap_or(false);
+                from_matches || to_matches
+            })
+            .map(stored_to_record)
+            .collect();
 
         let result = GetTransactionsResult {
             transactions: transaction_records,
@@ -1149,12 +1268,7 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address().to_string();
 
-        // Replace the existing keys with the new ones
-        if let Some(ref wallet_ctx) = self.wallet_context {
-            let mut ctx_guard = wallet_ctx.write().await;
-            *ctx_guard = new_wallet_ctx;
-        }
-
+        // Replace the privacy keys (but not the wallet context)
         let mut authority_vfk_guard = self.authority_vfk.write().await;
         *authority_vfk_guard = Some(new_authority_vfk);
 
@@ -1207,8 +1321,6 @@ impl CryptoServer {
         }
 
         let result = CreateWalletResult {
-            wallet_private_key: wallet_private_key_hex,
-            wallet_address,
             authority_vfk: authority_vfk_hex,
             privacy_spend_key: privacy_spend_key_hex,
             privacy_address,
@@ -1394,7 +1506,7 @@ impl CryptoServer {
     /// Verifies the status of a transaction and attempts to decrypt it to extract the amount.
     #[tool(
         name = "verifyTransaction",
-        description = "Verify if a transaction has been received. Verifies the status of a transaction using an identifier. This can be used to confirm if a payment has been received."
+        description = "Verify if a transaction has been received. Takes a transaction hash (tx_hash) and checks if it exists in the indexer. Attempts to decrypt the transaction to extract the amount if encrypted notes are present. Use this to confirm if a payment has been received."
     )]
     async fn verify_transaction(
         &self,

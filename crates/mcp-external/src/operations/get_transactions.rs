@@ -1,14 +1,13 @@
-//! Get all transactions for the wallet
+//! Get all transactions for the privacy pool
 //!
 //! This module provides functionality for retrieving a list of all transactions
-//! associated with the wallet from the indexer API.
+//! associated with the privacy pool address from the indexer API.
 
 use crate::privacy_key::PrivacyKey;
 use crate::provider::{InvolvementItem, Provider};
 use crate::wallet::WalletContext;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Transaction information from indexer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,14 +63,14 @@ impl From<InvolvementItem> for Transaction {
     }
 }
 
-/// Get all transactions for the wallet
+/// Get all transactions for the privacy pool
 ///
-/// Retrieves a list of all transactions associated with the wallet from the indexer API.
-/// This queries both:
-/// - The normal wallet address (for deposits from L2)
-/// - The privacy address (for transfers from/to the shielded pool)
+/// Retrieves a list of all transactions associated with the privacy pool address from the indexer API.
+/// As per CLAUDE.md, this MCP operates inside the privacy pool, so only privacy pool transactions
+/// (deposits, transfers, and withdrawals) are returned.
 ///
-/// The indexer tracks all wallet activity including deposits, withdrawals, and transfers.
+/// The indexer tracks all privacy pool activity including deposits into the pool,
+/// transfers within the pool, and withdrawals from the pool.
 ///
 /// # Parameters
 /// * `provider` - The RPC provider with indexer access
@@ -108,7 +107,7 @@ impl From<InvolvementItem> for Transaction {
 /// ```
 pub async fn get_transactions<Tx, S>(
     provider: &Provider,
-    wallet: &WalletContext<Tx, S>,
+    _wallet: &WalletContext<Tx, S>,
     privacy_key: &PrivacyKey,
 ) -> Result<Vec<Transaction>>
 where
@@ -116,62 +115,37 @@ where
     Tx::Decodable: serde::Serialize + serde::de::DeserializeOwned,
     S: sov_modules_api::Spec,
 {
-    // Get the wallet address and privacy address
-    let address = wallet.get_address();
-    let address_str = address.to_string();
+    // Get the privacy pool address (as per CLAUDE.md: this MCP operates inside the privacy pool)
     let privacy_address = privacy_key.privacy_address().to_string();
 
     tracing::debug!(
-        "Fetching transactions for wallet address: {} and privacy address: {}",
-        address_str,
+        "Fetching transactions for privacy pool address: {}",
         privacy_address
     );
 
-    // Query the indexer for transactions from the normal wallet address (deposits)
-    let normal_response = provider
-        .get_wallet_transactions(&address_str, None, None, None)
-        .await?;
-
-    tracing::info!(
-        "Retrieved {} transactions for normal wallet {}",
-        normal_response.items.len(),
-        address_str
-    );
-
-    // Query the indexer for transactions from the privacy address (transfers)
+    // Query the indexer for transactions from the privacy pool address only
     let privacy_response = provider
         .get_wallet_transactions(&privacy_address, None, None, None)
         .await?;
 
     tracing::info!(
-        "Retrieved {} transactions for privacy address {}",
+        "Retrieved {} transactions for privacy pool address {}",
         privacy_response.items.len(),
         privacy_address
     );
 
-    // Merge and deduplicate transactions by tx_hash
-    let mut seen_hashes: HashSet<String> = HashSet::new();
-    let mut all_transactions: Vec<Transaction> = Vec::new();
-
-    // Add transactions from normal wallet
-    for item in normal_response.items {
-        if seen_hashes.insert(item.tx_hash.clone()) {
-            all_transactions.push(Transaction::from(item));
-        }
-    }
-
-    // Add transactions from privacy address (skip duplicates)
-    for item in privacy_response.items {
-        if seen_hashes.insert(item.tx_hash.clone()) {
-            all_transactions.push(Transaction::from(item));
-        }
-    }
+    // Convert to Transaction type
+    let mut all_transactions: Vec<Transaction> = privacy_response
+        .items
+        .into_iter()
+        .map(Transaction::from)
+        .collect();
 
     // Sort by timestamp (newest first)
     all_transactions.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
 
     tracing::info!(
-        "Total unique transactions after merging: {}",
+        "Total transactions for privacy pool: {}",
         all_transactions.len()
     );
 

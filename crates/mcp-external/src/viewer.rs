@@ -21,6 +21,7 @@ pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
 /// - Environment variable is not set
 /// - Hex decoding fails
 /// - Length is not exactly 32 bytes
+#[allow(dead_code)]
 pub fn load_authority_vfk() -> Option<Hash32> {
     let raw = std::env::var("AUTHORITY_VFK").ok()?;
     let s = raw.trim();

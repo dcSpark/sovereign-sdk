@@ -161,15 +161,37 @@ impl Provider {
         address: &S::Address,
         token_id: &TokenId,
     ) -> Result<Amount> {
-        self.client
+        match self
+            .client
             .get_balance::<S>(address, token_id, None)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to get balance for token {} at address {:?}",
-                    token_id, address
-                )
-            })
+        {
+            Ok(amount) => Ok(amount),
+            Err(e) => {
+                // If the error is a reqwest 404, return 0
+                if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+                    if let Some(status) = reqwest_err.status() {
+                        if status == reqwest::StatusCode::NOT_FOUND {
+                            tracing::warn!(
+                                "Token {} does not exist at address {:?} (HTTP 404); returning 0.",
+                                token_id,
+                                address
+                            );
+                            // Amount implements From<u64>
+                            return Ok(Amount::from(0u64));
+                        }
+                    }
+                }
+                tracing::error!(
+                    "Failed to get balance for token {} at address {:?}: {}",
+                    token_id, address, e
+                );
+                Err(anyhow::anyhow!(
+                    "Failed to get balance for token {} at address {:?}: {}",
+                    token_id, address, e
+                ))
+            }
+        }
     }
 
     /// Get the nonce for a public key

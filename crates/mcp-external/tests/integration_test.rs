@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
-use mcp::ligero::Ligero;
-use mcp::operations::{deposit, transfer};
-use mcp::privacy_key::PrivacyKey;
-use mcp::provider::Provider;
-use mcp::wallet::WalletContext;
+use mcp_external::ligero::Ligero;
+use mcp_external::operations::{deposit, transfer};
+use mcp_external::privacy_key::PrivacyKey;
+use mcp_external::provider::Provider;
+use mcp_external::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
 use sov_bank::{config_gas_token_id, TokenId};
 use sov_ligero_adapter::Ligero as LigeroAdapter;
@@ -194,24 +194,44 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 
     // Step 7: Perform transfer using deposit outputs
     tracing::info!("Step 7: Performing transfer using deposit outputs");
-    let transfer_value = deposit_amount; // Transfer the same amount
+    let note_value = deposit_amount; // Note value from deposit
+    let send_amount = deposit_amount; // Transfer the full amount
+    // Load authority VFK from environment for test
+    let authority_vfk = std::env::var("AUTHORITY_VFK")
+        .ok()
+        .and_then(|s| {
+            let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+            hex::decode(trimmed).ok()
+        })
+        .and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
     let transfer_result = transfer(
         &ligero,
         &provider,
         &wallet,
-        transfer_value,
+        note_value,
+        send_amount,
         deposit_result.rho,
         deposit_result.recipient,
         deposit_result.recipient,
+        None, // No change since sending full amount
+        authority_vfk,
     )
     .await?;
 
     tracing::info!("Transfer successful!");
     tracing::info!("  Transaction hash: {}", transfer_result.tx_hash);
-    tracing::info!("  New rho: {}", hex::encode(&transfer_result.new_rho));
+    tracing::info!("  Output rho: {}", hex::encode(&transfer_result.output_rho));
     tracing::info!(
-        "  New recipient: {}",
-        hex::encode(&transfer_result.new_recipient)
+        "  Output recipient: {}",
+        hex::encode(&transfer_result.output_recipient)
     );
 
     // Step 7a: Verify transfer result
@@ -220,16 +240,16 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         "Transfer tx hash should not be empty"
     );
     assert_ne!(
-        transfer_result.new_rho, [0u8; 32],
-        "New rho should not be all zeros"
+        transfer_result.output_rho, [0u8; 32],
+        "Output rho should not be all zeros"
     );
     assert_ne!(
-        transfer_result.new_recipient, [0u8; 32],
-        "New recipient should not be all zeros"
+        transfer_result.output_recipient, [0u8; 32],
+        "Output recipient should not be all zeros"
     );
     assert_ne!(
-        transfer_result.new_rho, deposit_result.rho,
-        "New rho should be different from input rho"
+        transfer_result.output_rho, deposit_result.rho,
+        "Output rho should be different from input rho"
     );
     tracing::info!("✓ Transfer completed successfully");
 
@@ -315,6 +335,184 @@ async fn test_balance_check() -> Result<()> {
     );
 
     tracing::info!("✅ Balance check passed");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
+async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
+    use midnight_privacy::FullViewingKey;
+    use rand::RngCore;
+
+    // Load .env file
+    let _ = dotenvy::dotenv();
+
+    tracing::info!("Starting wallet creation, deposit, and send integration test");
+
+    // Get configuration from environment
+    let wallet_private_key =
+        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
+    let rpc_url = std::env::var("ROLLUP_RPC_URL").expect("ROLLUP_RPC_URL must be set in .env");
+    let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
+    let indexer_url =
+        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let startup_deposit_amount = 1000u128; // Test deposit amount
+
+    assert!(
+        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
+        "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
+    );
+
+    tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
+    tracing::info!("Using VERIFIER_URL: {}", verifier_url);
+    tracing::info!("Using INDEXER_URL: {}", indexer_url);
+    tracing::info!("Test deposit amount: {}", startup_deposit_amount);
+
+    // Step 1: Create funding wallet from private key
+    tracing::info!("Step 1: Creating funding wallet");
+    let funding_wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
+    let funding_address = funding_wallet.get_address();
+    tracing::info!("Funding wallet address: {}", funding_address);
+
+    // Step 2: Connect to provider
+    tracing::info!("Step 2: Connecting to rollup and verifier");
+    let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
+    tracing::info!("✓ Connected to services");
+
+    // Step 3: Generate new privacy key for test wallet
+    tracing::info!("Step 3: Generating new privacy key");
+    let mut rng = rand::thread_rng();
+    let mut spend_key_bytes = [0u8; 32];
+    rng.fill_bytes(&mut spend_key_bytes);
+    let new_privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
+    let new_privacy_address = new_privacy_key.privacy_address().to_string();
+    tracing::info!("✓ New privacy address: {}", new_privacy_address);
+
+    // Step 4: Generate new authority VFK
+    tracing::info!("Step 4: Generating new authority VFK");
+    let mut vfk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut vfk_bytes);
+    let viewing_key = FullViewingKey(vfk_bytes);
+    tracing::info!("✓ Authority VFK generated");
+
+    // Step 5: Perform deposit to the new privacy address
+    tracing::info!("Step 5: Depositing {} tokens to new privacy address", startup_deposit_amount);
+    let deposit_result = deposit(&provider, &funding_wallet, startup_deposit_amount, &new_privacy_key).await?;
+    tracing::info!("✓ Deposit successful");
+    tracing::info!("  Transaction hash: {}", deposit_result.tx_hash);
+    tracing::info!("  Rho: {}", hex::encode(&deposit_result.rho));
+
+    // Step 6: Wait for deposit to be included
+    tracing::info!("Step 6: Waiting for deposit to be included (10 seconds)");
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    tracing::info!("✓ Wait completed");
+
+    // Step 7: Get initial wallet balance using get_unified_balance
+    tracing::info!("Step 7: Getting initial wallet balance");
+    let initial_balance_result = mcp_external::operations::get_unified_balance(
+        &provider,
+        &funding_wallet,
+        mcp_external::server::DEFAULT_TOKEN_ID,
+        &new_privacy_key,
+        &viewing_key,
+    )
+    .await?;
+
+    let initial_balance: u128 = initial_balance_result.privacy_balance.parse()?;
+    tracing::info!("✓ Initial privacy balance: {}", initial_balance);
+
+    // Validate initial balance matches deposit
+    assert_eq!(
+        initial_balance, startup_deposit_amount,
+        "Initial balance {} should equal deposit amount {}",
+        initial_balance, startup_deposit_amount
+    );
+
+    // Step 8: Send 50 tokens using transfer
+    tracing::info!("Step 8: Sending 50 tokens");
+    let send_amount = 50u128;
+
+    // Initialize Ligero prover
+    let ligero = create_test_ligero();
+
+    // Get the deposited note details for transfer
+    let note = initial_balance_result.unspent_notes.first()
+        .expect("Should have at least one unspent note from deposit");
+
+    // Parse rho from the note
+    let input_rho_bytes = hex::decode(note.rho.trim_start_matches("0x"))?;
+    let mut input_rho = [0u8; 32];
+    input_rho.copy_from_slice(&input_rho_bytes);
+
+    const DOMAIN: [u8; 32] = [1u8; 32];
+    let input_recipient = new_privacy_key.recipient(&DOMAIN);
+    let output_recipient = input_recipient; // Send to ourselves
+    let change_recipient = Some(input_recipient); // Change back to ourselves
+
+    // Use the viewing key bytes as authority VFK for the transfer
+    let authority_vfk_for_transfer = Some(viewing_key.0);
+
+    let transfer_result = transfer(
+        &ligero,
+        &provider,
+        &funding_wallet,
+        note.value,
+        send_amount,
+        input_rho,
+        input_recipient,
+        output_recipient,
+        change_recipient,
+        authority_vfk_for_transfer,
+    )
+    .await?;
+
+    tracing::info!("✓ Transfer successful");
+    tracing::info!("  Transaction hash: {}", transfer_result.tx_hash);
+    tracing::info!("  Amount sent: {}", transfer_result.amount_sent);
+
+    // Step 9: Wait for transfer to complete
+    tracing::info!("Step 9: Waiting for transfer to be included (10 seconds)");
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    tracing::info!("✓ Wait completed");
+
+    // Step 10: Get final wallet balance
+    tracing::info!("Step 10: Getting final wallet balance");
+    let final_balance_result = mcp_external::operations::get_unified_balance(
+        &provider,
+        &funding_wallet,
+        mcp_external::server::DEFAULT_TOKEN_ID,
+        &new_privacy_key,
+        &viewing_key,
+    )
+    .await?;
+
+    let final_balance: u128 = final_balance_result.privacy_balance.parse()?;
+    tracing::info!("✓ Final privacy balance: {}", final_balance);
+
+    // Step 11: Validate final balance
+    // Since we sent to ourselves, balance should still be the same
+    assert_eq!(
+        final_balance, initial_balance,
+        "Final balance {} should equal initial balance {} (sent to ourselves)",
+        final_balance, initial_balance
+    );
+
+    tracing::info!("✓ Balance validation passed");
+
+    // Final summary
+    tracing::info!("==========================================");
+    tracing::info!("✅ ALL TESTS PASSED!");
+    tracing::info!("==========================================");
+    tracing::info!("Summary:");
+    tracing::info!("  - New privacy address: {}", new_privacy_address);
+    tracing::info!("  - Deposit amount: {}", startup_deposit_amount);
+    tracing::info!("  - Initial balance: {}", initial_balance);
+    tracing::info!("  - Amount sent: {}", send_amount);
+    tracing::info!("  - Final balance: {}", final_balance);
+    tracing::info!("  - Unspent notes: {}", final_balance_result.unspent_notes.len());
+    tracing::info!("==========================================");
 
     Ok(())
 }

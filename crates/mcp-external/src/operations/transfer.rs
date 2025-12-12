@@ -442,6 +442,7 @@ pub async fn transfer(
     input_recipient: [u8; 32],
     output_recipient: [u8; 32],
     change_recipient: Option<[u8; 32]>,
+    authority_vfk: Option<[u8; 32]>,
 ) -> Result<TransferResult> {
     // Validate amounts
     if send_amount == 0 {
@@ -541,8 +542,7 @@ pub async fn transfer(
     // Step 4: Compute nullifier
     let nf = nullifier(&DOMAIN, &NF_KEY, &input_rho);
 
-    // Step 4b: Load authority VFK and create viewer bundles if configured
-    let authority_vfk = viewer::load_authority_vfk();
+    // Step 4b: Create viewer bundles if authority VFK is provided
     let (view_attestations, view_ciphertexts) = if let Some(vfk) = authority_vfk {
         tracing::info!(
             "Authority VFK configured: generating viewer attestations for {} output(s)",
