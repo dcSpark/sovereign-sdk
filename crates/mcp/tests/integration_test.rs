@@ -32,11 +32,7 @@ async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url
         return false;
     }
 
-    let provider = provider_result.unwrap();
-    if !provider.is_healthy().await {
-        eprintln!("⚠️  Rollup is not healthy");
-        return false;
-    }
+    let _provider = provider_result.unwrap();
 
     // Check verifier
     let verifier_check = reqwest::get(format!("{}/health", verifier_url)).await;
@@ -86,7 +82,6 @@ fn create_test_ligero() -> Ligero {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
 async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Load .env file
     let _ = dotenvy::dotenv();
@@ -194,24 +189,28 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 
     // Step 7: Perform transfer using deposit outputs
     tracing::info!("Step 7: Performing transfer using deposit outputs");
-    let transfer_value = deposit_amount; // Transfer the same amount
+    let note_value = deposit_amount;
+    let send_amount = deposit_amount; // Transfer the full amount (no change)
     let transfer_result = transfer(
         &ligero,
         &provider,
         &wallet,
-        transfer_value,
+        note_value,
+        send_amount,
         deposit_result.rho,
         deposit_result.recipient,
-        deposit_result.recipient,
+        deposit_result.recipient, // Send to same recipient
+        None, // No change since sending full amount
     )
     .await?;
 
     tracing::info!("Transfer successful!");
     tracing::info!("  Transaction hash: {}", transfer_result.tx_hash);
-    tracing::info!("  New rho: {}", hex::encode(&transfer_result.new_rho));
+    tracing::info!("  Amount sent: {}", transfer_result.amount_sent);
+    tracing::info!("  Output rho: {}", hex::encode(&transfer_result.output_rho));
     tracing::info!(
-        "  New recipient: {}",
-        hex::encode(&transfer_result.new_recipient)
+        "  Output recipient: {}",
+        hex::encode(&transfer_result.output_recipient)
     );
 
     // Step 7a: Verify transfer result
@@ -219,17 +218,25 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         !transfer_result.tx_hash.is_empty(),
         "Transfer tx hash should not be empty"
     );
-    assert_ne!(
-        transfer_result.new_rho, [0u8; 32],
-        "New rho should not be all zeros"
+    assert_eq!(
+        transfer_result.amount_sent, send_amount,
+        "Amount sent should match send_amount"
     );
     assert_ne!(
-        transfer_result.new_recipient, [0u8; 32],
-        "New recipient should not be all zeros"
+        transfer_result.output_rho, [0u8; 32],
+        "Output rho should not be all zeros"
     );
     assert_ne!(
-        transfer_result.new_rho, deposit_result.rho,
-        "New rho should be different from input rho"
+        transfer_result.output_recipient, [0u8; 32],
+        "Output recipient should not be all zeros"
+    );
+    assert_ne!(
+        transfer_result.output_rho, deposit_result.rho,
+        "Output rho should be different from input rho"
+    );
+    assert!(
+        transfer_result.change_amount.is_none(),
+        "Change amount should be None when sending full note"
     );
     tracing::info!("✓ Transfer completed successfully");
 

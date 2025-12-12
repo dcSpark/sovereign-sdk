@@ -68,10 +68,12 @@ where
     // Calculate total balance
     // Convert Amount to string, then parse to u128
     let transparent_balance_str = transparent_amount.to_string();
-    let transparent_balance_value: u128 = transparent_balance_str.parse().unwrap_or_else(|_| {
-        tracing::warn!("Failed to parse transparent balance, using 0");
-        0
-    });
+    let transparent_balance_value: u128 = transparent_balance_str
+        .parse()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Failed to parse transparent balance, using 0");
+            0
+        });
     let privacy_balance_value = privacy_result.balance;
     let total_balance_value = transparent_balance_value + privacy_balance_value;
 

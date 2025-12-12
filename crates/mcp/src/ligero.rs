@@ -331,3 +331,28 @@ impl Ligero {
         Ok(proof)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::ligero::create_test_ligero;
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_generate_proof() {
+        let ligero = create_test_ligero();
+
+        let proof = ligero
+            .generate_proof(
+                8192,
+                Some(8000),
+                vec![1],
+                vec![
+                    LigeroProgramArguments::I64 { i64: 1 },
+                    LigeroProgramArguments::I64 { i64: 1 },
+                ],
+            )
+            .unwrap();
+        assert!(!proof.is_empty());
+    }
+}
