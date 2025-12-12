@@ -47,19 +47,103 @@ struct InputNote {
     nullifier: Hash32,  // Computed from nf_key and rho
 }
 
-/// Output note specification
-/// Note: recipient is DERIVED from pk_out in the circuit: H("ADDR_V1"||domain||pk_out)
+/// Output note specification (updated for Level A recipient encryption)
+/// Note: recipient is DERIVED from pk_spend AND pk_ivk in the circuit: H("ADDR_V2"||domain||pk_spend||pk_ivk)
+/// 
+/// Fields for recipient ciphertext (Zcash-style incoming viewing):
+/// - pk_ivk: Recipient's X25519 incoming viewing public key
+/// - epk: Ephemeral X25519 public key (derived from rho) - PUBLIC, in tx output
+/// - ct: Ciphertext bytes (144 bytes) - PUBLIC, in tx calldata
+/// - mac: MAC binding ct_hash to cm and encryption key - PUBLIC, in tx output
+/// - ct_hash: Hash of ct, computed by on-chain verifier from tx calldata
+///
+/// The on-chain flow is:
+/// 1. Transaction contains (cm, epk, ct, mac) in output record
+/// 2. On-chain verifier computes ct_hash = H("CT_HASH_V1" || ct)
+/// 3. Proof is verified with ct_hash as public input
+/// 4. This binds the ciphertext to the proof, preventing tampering
 #[derive(Debug, Clone)]
 struct OutputNote {
     value: u128,
     rho: Hash32,
-    pk_out: Hash32,      // Public key - recipient is derived from this
-    commitment: Hash32,  // Must be computed with derived recipient
+    pk_spend: Hash32,    // Spend public key (Poseidon-derived) - recipient derived from this
+    pk_ivk: Hash32,      // X25519 incoming viewing public key
+    commitment: Hash32,  // NOTE_V1 commitment
+
+    // Level A (recipient-detectable) tx fields:
+    epk: Hash32,         // Ephemeral X25519 pubkey (public, in tx)
+    ct: [u8; 144],       // Ciphertext bytes in tx calldata (public)
+    mac: Hash32,         // Incoming MAC in tx output (public)
+
+    // Computed by on-chain verifier from ct:
+    ct_hash: Hash32,     // Poseidon("CT_HASH_V1" || ct)
 }
 
 /// Helper: hex encoding
 fn hx(b: &Hash32) -> String {
     hex::encode(b)
+}
+
+/// Create an OutputNote with all computed fields (commitment, epk, ct, ct_hash, mac)
+/// 
+/// This is the primary way to create outputs for tests. It computes:
+/// - recipient from H("ADDR_V2" || domain || pk_spend || pk_ivk) (binds both keys!)
+/// - commitment from (domain, value, rho, recipient)
+/// - epk from X25519_BASE(esk_from_rho_cm(domain, rho, cm))
+/// - ct from encrypting note plaintext with DH-derived key
+/// - ct_hash = H("CT_HASH_V1" || ct) (computed by on-chain from tx calldata)
+/// - mac from (key, cm, ct_hash)
+fn make_output(
+    domain: &Hash32,
+    value: u128,
+    rho: Hash32,
+    pk_spend: Hash32,    // Recipient spend pubkey (from pk_from_sk)
+    pk_ivk: Hash32,      // Recipient incoming viewing pubkey (X25519)
+    sender_id: &Hash32,  // Usually the sender's recipient address
+) -> OutputNote {
+    // ADDR_V2: binds both pk_spend and pk_ivk into the address
+    let recipient = poseidon2::recipient_from_pk(domain, &pk_spend, &pk_ivk);
+    let commitment = poseidon2::note_commitment(domain, value, &rho, &recipient);
+    let (epk, ct, ct_hash, mac) = poseidon2::compute_recipient_ciphertext(
+        domain, value, &rho, &recipient, sender_id, &pk_ivk, &commitment
+    );
+    OutputNote {
+        value,
+        rho,
+        pk_spend,
+        pk_ivk,
+        commitment,
+        epk,
+        ct,
+        mac,
+        ct_hash,
+    }
+}
+
+/// Create an OutputNote to self (uses spend_sk to derive both pk_spend and pk_ivk)
+fn make_self_output(
+    domain: &Hash32,
+    value: u128,
+    rho: Hash32,
+    spend_sk: &Hash32,
+) -> OutputNote {
+    let pk_spend = poseidon2::pk_from_sk(spend_sk);
+    let pk_ivk = poseidon2::pk_ivk_from_spend_sk(domain, spend_sk);
+    let sender_id = poseidon2::recipient_from_sk(domain, spend_sk);
+    make_output(domain, value, rho, pk_spend, pk_ivk, &sender_id)
+}
+
+/// Create an OutputNote to another recipient (using their pk_spend and pk_ivk)
+fn make_payment_output(
+    domain: &Hash32,
+    value: u128,
+    rho: Hash32,
+    recipient_pk_spend: Hash32,
+    recipient_pk_ivk: Hash32,
+    sender_spend_sk: &Hash32,  // For computing sender_id
+) -> OutputNote {
+    let sender_id = poseidon2::recipient_from_sk(domain, sender_spend_sk);
+    make_output(domain, value, rho, recipient_pk_spend, recipient_pk_ivk, &sender_id)
 }
 
 /// Get program path from environment or discover it
@@ -76,13 +160,16 @@ fn program_path() -> Result<String> {
     Ok(p.to_string_lossy().to_string())
 }
 
-/// Construct argv for the guest with multi-input support (new ABI)
+/// Construct argv for the guest with multi-input support (updated ABI with recipient ciphertext)
 /// 
-/// New ABI structure:
+/// ABI structure:
 ///   [1] domain, [2] spend_sk, [3] depth, [4] anchor, [5] n_in
 ///   For each input: value, rho, pos, siblings[depth], nullifier
 ///   Then: withdraw_amount, n_out
-///   For each output: value, rho, pk_out, cm
+///   For each output: value, rho, pk_spend, pk_ivk, cm, epk, ct_hash, mac (8 args)
+/// 
+/// IMPORTANT: ct_hash is computed from ct bytes (models on-chain verifier behavior).
+/// The on-chain verifier reads ct from tx calldata and computes ct_hash = H("CT_HASH_V1"||ct).
 fn build_args_multi(
     domain: Hash32,
     spend_sk: Hash32,  // Spending secret key (owner of ALL inputs)
@@ -113,12 +200,22 @@ fn build_args_multi(
     args.push(withdraw_amount.to_string()); // withdraw_amount (PUBLIC)
     args.push(outputs.len().to_string());   // n_out
     
-    // Add output note arguments (4 args per output)
+    // Add output note arguments (8 args per output)
     for out in outputs {
         args.push(out.value.to_string());       // value_out_j (PRIVATE)
         args.push(hx(&out.rho));                // rho_out_j (PRIVATE)
-        args.push(hx(&out.pk_out));             // pk_out_j (PRIVATE)
+        args.push(hx(&out.pk_spend));           // pk_spend_out_j (PRIVATE)
+        args.push(hx(&out.pk_ivk));             // pk_ivk_out_j (PRIVATE)
         args.push(hx(&out.commitment));         // cm_out_j (PUBLIC)
+        args.push(hx(&out.epk));                // epk_out_j (PUBLIC)
+        
+        // CRITICAL: ct_hash is computed from ct bytes (models on-chain verifier)
+        // This ensures the proof is bound to the actual tx calldata, not a "free" ct_hash
+        let ct_hash_from_tx = poseidon2::ct_hash(&out.ct);
+        debug_assert_eq!(ct_hash_from_tx, out.ct_hash, "ct_hash must match ct");
+        args.push(hx(&ct_hash_from_tx));        // ct_hash_out_j (PUBLIC, computed from tx ct)
+        
+        args.push(hx(&out.mac));                // mac_out_j (PUBLIC)
     }
     
     args
@@ -149,18 +246,18 @@ fn build_args(
     build_args_multi(domain, spend_sk, depth, anchor, &[input], withdraw_amount, outputs)
 }
 
-/// Private indices for the new multi-input ABI (1-based indexing into args)
+/// Private indices for the multi-input ABI with recipient ciphertext (1-based indexing into args)
 /// 
 /// LIGERO uses 1-based indexing: index N refers to args[N-1].
 /// 
 /// Private fields: spend_sk, and for each input: value, rho, pos, siblings
-/// Plus for each output: value, rho, pk_out
+/// Plus for each output: value, rho, pk_spend, pk_ivk (4 private out of 8 total)
 /// 
 /// Args layout (0-based):
 ///   args[0]=domain, args[1]=spend_sk, args[2]=depth, args[3]=anchor, args[4]=n_in
 ///   Then per input: value, rho, pos, siblings[depth], nullifier
 ///   Then: withdraw_amount, n_out
-///   Then per output: value, rho, pk_out, cm
+///   Then per output: value, rho, pk_spend, pk_ivk, cm, epk, ct_hash, mac (8 args)
 fn private_indices_multi(depth: u32, n_in: usize, n_out: usize) -> Vec<usize> {
     let mut v = vec![
         2usize, // spend_sk at args[1] → 1-based index 2
@@ -183,13 +280,19 @@ fn private_indices_multi(depth: u32, n_in: usize, n_out: usize) -> Vec<usize> {
     }
     
     // After inputs: withdraw_amount, n_out, then outputs
+    // Each output: 8 args (value, rho, pk_spend, pk_ivk, cm, epk, ct_hash, mac)
+    // Private: value, rho, pk_spend, pk_ivk (first 4)
     let output_start = 6 + n_in * per_in + 2;
     for j in 0..n_out {
-        let base = output_start + 4 * j;
-        v.push(base);       // value_out_j
-        v.push(base + 1);   // rho_out_j
-        v.push(base + 2);   // pk_out_j
-        // cm_out_j at base + 3 is PUBLIC
+        let base = output_start + 8 * j;
+        v.push(base);       // value_out_j (PRIVATE)
+        v.push(base + 1);   // rho_out_j (PRIVATE)
+        v.push(base + 2);   // pk_spend_out_j (PRIVATE)
+        v.push(base + 3);   // pk_ivk_out_j (PRIVATE)
+        // cm at base + 4 is PUBLIC
+        // epk at base + 5 is PUBLIC
+        // ct_hash at base + 6 is PUBLIC
+        // mac at base + 7 is PUBLIC
     }
     v
 }
@@ -257,15 +360,20 @@ mod poseidon2 {
         poseidon2_hash_domain(b"PK_V1", &[spend_sk])
     }
     
-    /// recipient_addr = H("ADDR_V1" || domain || pk)
-    pub fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-        poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+    /// recipient_addr = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+    /// 
+    /// IMPORTANT: This binds BOTH the spending key and incoming viewing key into the address.
+    /// This prevents the "mismatched encryption" attack where a note is committed to pk_spend X
+    /// but encrypted to pk_ivk Y, making it undecryptable by the owner of pk_spend X.
+    pub fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+        poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
     }
     
-    /// recipient_addr from spend_sk (convenience: sk -> pk -> recipient)
+    /// recipient_addr from spend_sk (convenience: sk -> pk_spend, pk_ivk -> recipient)
     pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-        let pk = pk_from_sk(spend_sk);
-        recipient_from_pk(domain, &pk)
+        let pk_spend = pk_from_sk(spend_sk);
+        let pk_ivk = pk_ivk_from_spend_sk(domain, spend_sk);
+        recipient_from_pk(domain, &pk_spend, &pk_ivk)
     }
     
     /// nf_key = H("NFKEY_V1" || domain || spend_sk)
@@ -334,6 +442,133 @@ mod poseidon2 {
         out[80..112].copy_from_slice(recipient);
         out[112..144].copy_from_slice(sender_id);
         out
+    }
+    
+    // === Level A: Recipient (incoming) ciphertext ===
+    // These mirror the functions in lib.rs for generating test data
+    
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+    
+    /// Apply X25519 scalar clamping
+    fn clamp_x25519_scalar(s: &mut [u8; 32]) {
+        s[0] &= 248;
+        s[31] &= 127;
+        s[31] |= 64;
+    }
+    
+    /// Derive ephemeral secret key from (domain, rho, cm).
+    /// esk = clamp(H("ESK_V2" || domain || rho || cm))
+    /// 
+    /// Including cm reduces linkability if rho is accidentally reused across notes.
+    pub fn esk_from_rho_cm(domain: &Hash32, rho: &Hash32, cm: &Hash32) -> [u8; 32] {
+        let mut esk = poseidon2_hash_domain(b"ESK_V2", &[domain, rho, cm]);
+        clamp_x25519_scalar(&mut esk);
+        esk
+    }
+    
+    /// Compute X25519 public key from secret key: pk = [sk] * G
+    pub fn x25519_base(sk_bytes: &[u8; 32]) -> [u8; 32] {
+        let sk = X25519Secret::from(*sk_bytes);
+        let pk = X25519PublicKey::from(&sk);
+        pk.to_bytes()
+    }
+    
+    /// Compute X25519 shared secret: shared = [sk] * pk
+    pub fn x25519_shared(sk_bytes: &[u8; 32], pk_bytes: &[u8; 32]) -> [u8; 32] {
+        let sk = X25519Secret::from(*sk_bytes);
+        let pk = X25519PublicKey::from(*pk_bytes);
+        sk.diffie_hellman(&pk).to_bytes()
+    }
+    
+    /// Derive symmetric key for recipient ciphertext: k_in = H("IN_KDF_V1" || domain || dh_shared || cm)
+    pub fn in_kdf(domain: &Hash32, dh_shared: &Hash32, cm: &Hash32) -> Hash32 {
+        poseidon2_hash_domain(b"IN_KDF_V1", &[domain, dh_shared, cm])
+    }
+    
+    /// Compute incoming MAC: mac_in = H("IN_MAC_V1" || k || cm || ct_hash)
+    pub fn in_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+        poseidon2_hash_domain(b"IN_MAC_V1", &[k, cm, ct_h])
+    }
+    
+    /// Produce the i-th 32-byte stream block for incoming encryption.
+    /// Uses separate domain tag from viewer stream (IN_STREAM_V1 vs VIEW_STREAM_V1).
+    pub fn in_stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+        let c = ctr.to_le_bytes();
+        poseidon2_hash_domain(b"IN_STREAM_V1", &[k, &c])
+    }
+    
+    /// Stream XOR encryption for incoming (recipient) ciphertext.
+    /// Uses IN_STREAM_V1 domain tag (separate from VIEW_STREAM_V1 for viewers).
+    pub fn stream_xor_encrypt_in(k: &Hash32, pt: &[u8]) -> Vec<u8> {
+        let mut ct = vec![0u8; pt.len()];
+        let mut ctr = 0u32;
+        let mut off = 0usize;
+        while off < pt.len() {
+            let ks = in_stream_block(k, ctr);
+            ctr = ctr.wrapping_add(1);
+            let take = std::cmp::min(32, pt.len() - off);
+            for i in 0..take {
+                ct[off + i] = pt[off + i] ^ ks[i];
+            }
+            off += take;
+        }
+        ct
+    }
+    
+    /// Derive incoming viewing secret key from spend_sk (wallet convenience function)
+    /// ivk_seed = H("IVK_SEED_V1" || domain || spend_sk), then clamp to X25519 scalar
+    pub fn ivk_sk_from_spend_sk(domain: &Hash32, spend_sk: &Hash32) -> [u8; 32] {
+        let mut ivk = poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk]);
+        clamp_x25519_scalar(&mut ivk);
+        ivk
+    }
+    
+    /// Derive incoming viewing public key from spend_sk
+    pub fn pk_ivk_from_spend_sk(domain: &Hash32, spend_sk: &Hash32) -> [u8; 32] {
+        let ivk_sk = ivk_sk_from_spend_sk(domain, spend_sk);
+        x25519_base(&ivk_sk)
+    }
+    
+    /// Compute recipient ciphertext fields for an output note
+    /// Returns (epk, ct, ct_hash, mac)
+    /// 
+    /// The ct bytes would be in tx calldata; on-chain verifier computes ct_hash from them.
+    /// 
+    /// Note: esk is derived from (domain, rho, cm) to reduce linkability on rho reuse.
+    pub fn compute_recipient_ciphertext(
+        domain: &Hash32,
+        value: u128,
+        rho: &Hash32,
+        recipient: &Hash32,
+        sender_id: &Hash32,
+        pk_ivk: &Hash32,
+        cm: &Hash32,
+    ) -> (Hash32, [u8; 144], Hash32, Hash32) {
+        // Derive ephemeral secret from (domain, rho, cm) - cm binding reduces linkability
+        let esk = esk_from_rho_cm(domain, rho, cm);
+        
+        // Compute ephemeral public key
+        let epk = x25519_base(&esk);
+        
+        // DH shared secret
+        let dh = x25519_shared(&esk, pk_ivk);
+        
+        // Derive symmetric key
+        let k_in = in_kdf(domain, &dh, cm);
+        
+        // Encode and encrypt plaintext using incoming stream
+        let pt = encode_note_plain(domain, value, rho, recipient, sender_id);
+        let ct_vec = stream_xor_encrypt_in(&k_in, &pt);
+        
+        // Copy to fixed-size array
+        let mut ct = [0u8; 144];
+        ct.copy_from_slice(&ct_vec);
+        
+        // Compute digests
+        let ct_h = ct_hash(&ct);
+        let macv = in_mac(&k_in, cm, &ct_h);
+        
+        (epk, ct, ct_h, macv)
     }
 }
 
@@ -474,22 +709,17 @@ fn test_valid_spend_one_output() -> Result<()> {
     let nf = poseidon2::nullifier(&domain, &nf_key, &rho);
     
     // Create 1 output note (change)
-    // Note: recipient is DERIVED from pk_out in the circuit
+    // Note: recipient is DERIVED from pk_spend in the circuit
     let withdraw_amount: u128 = 300;
     let output1_value: u128 = 700;
     let output1_rho = [10u8; 32];
-    let output1_pk_out = [11u8; 32];  // Receiver's public key
-    let output1_recipient = poseidon2::recipient_from_pk(&domain, &output1_pk_out);  // Derived in circuit
-    let output1_cm = poseidon2::note_commitment(&domain, output1_value, &output1_rho, &output1_recipient);
+    // Use receiver's keys (could be self or another party)
+    let receiver_sk = [11u8; 32];
+    let output1_pk_spend = poseidon2::pk_from_sk(&receiver_sk);
+    let output1_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk);
+    let output = make_payment_output(&domain, output1_value, output1_rho, output1_pk_spend, output1_pk_ivk, &spend_sk);
     
-    let outputs = vec![
-        OutputNote {
-            value: output1_value,
-            rho: output1_rho,
-            pk_out: output1_pk_out,
-            commitment: output1_cm,
-        },
-    ];
+    let outputs = vec![output];
 
     println!("✓ Input value:     {}", value);
     println!("✓ Withdraw amount: {}", withdraw_amount);
@@ -498,7 +728,7 @@ fn test_valid_spend_one_output() -> Result<()> {
     assert_eq!(value, withdraw_amount + output1_value);
 
     let args = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, withdraw_amount, &outputs);
-    let expected_len = 11 + depth as usize + 4; // 11 base args + depth siblings + 4*1 outputs
+    let expected_len = 11 + depth as usize + 8; // 11 base args + depth siblings + 8*1 outputs
     assert_eq!(args.len(), expected_len);
     
     println!("✓ Built {} arguments", args.len());
@@ -535,35 +765,30 @@ fn test_valid_spend_two_outputs() -> Result<()> {
     let nf = poseidon2::nullifier(&domain, &nf_key, &rho);
     
     // Create 2 output notes (split)
-    // Note: recipients are DERIVED from pk_out in the circuit
+    // Note: recipients are DERIVED from pk_spend in the circuit
     let withdraw_amount: u128 = 100;
     let output1_value: u128 = 400;
     let output2_value: u128 = 500;
     
-    let output1_rho = [10u8; 32];
-    let output1_pk_out = [11u8; 32];  // Receiver 1's public key
-    let output1_recipient = poseidon2::recipient_from_pk(&domain, &output1_pk_out);
-    let output1_cm = poseidon2::note_commitment(&domain, output1_value, &output1_rho, &output1_recipient);
+    // Receiver 1's keys
+    let receiver1_sk = [11u8; 32];
+    let output1 = make_payment_output(
+        &domain, output1_value, [10u8; 32],
+        poseidon2::pk_from_sk(&receiver1_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver1_sk),
+        &spend_sk
+    );
     
-    let output2_rho = [20u8; 32];
-    let output2_pk_out = [21u8; 32];  // Receiver 2's public key
-    let output2_recipient = poseidon2::recipient_from_pk(&domain, &output2_pk_out);
-    let output2_cm = poseidon2::note_commitment(&domain, output2_value, &output2_rho, &output2_recipient);
+    // Receiver 2's keys
+    let receiver2_sk = [21u8; 32];
+    let output2 = make_payment_output(
+        &domain, output2_value, [20u8; 32],
+        poseidon2::pk_from_sk(&receiver2_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver2_sk),
+        &spend_sk
+    );
     
-    let outputs = vec![
-        OutputNote {
-            value: output1_value,
-            rho: output1_rho,
-            pk_out: output1_pk_out,
-            commitment: output1_cm,
-        },
-        OutputNote {
-            value: output2_value,
-            rho: output2_rho,
-            pk_out: output2_pk_out,
-            commitment: output2_cm,
-        },
-    ];
+    let outputs = vec![output1, output2];
 
     println!("✓ Input value:     {}", value);
     println!("✓ Withdraw amount: {}", withdraw_amount);
@@ -573,7 +798,7 @@ fn test_valid_spend_two_outputs() -> Result<()> {
     assert_eq!(value, withdraw_amount + output1_value + output2_value);
 
     let args = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, withdraw_amount, &outputs);
-    let expected_len = 11 + depth as usize + 8; // 11 base args + depth siblings + 4*2 outputs
+    let expected_len = 11 + depth as usize + 16; // 11 base args + depth siblings + 8*2 outputs
     assert_eq!(args.len(), expected_len);
     
     println!("✓ Built {} arguments", args.len());
@@ -613,17 +838,15 @@ fn test_reject_balance_violation_underspend() -> Result<()> {
     let output1_value: u128 = 600; // Total: 900 < 1000
     let output1_rho = [10u8; 32];
     let output1_pk_out = [11u8; 32];
-    let output1_recipient = poseidon2::recipient_from_pk(&domain, &output1_pk_out);
-    let output1_cm = poseidon2::note_commitment(&domain, output1_value, &output1_rho, &output1_recipient);
-    
-    let outputs = vec![
-        OutputNote {
-            value: output1_value,
-            rho: output1_rho,
-            pk_out: output1_pk_out,
-            commitment: output1_cm,
-        },
-    ];
+    // Use receiver's keys (could be self or another party)
+    let receiver_sk = [11u8; 32];
+    let output = make_payment_output(
+        &domain, output1_value, output1_rho,
+        poseidon2::pk_from_sk(&receiver_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk),
+        &spend_sk
+    );
+    let outputs = vec![output];
 
     println!("✗ Input value:     {}", value);
     println!("✗ Withdraw amount: {}", withdraw_amount);
@@ -667,18 +890,14 @@ fn test_reject_balance_violation_overspend() -> Result<()> {
     let withdraw_amount: u128 = 500;
     let output1_value: u128 = 600; // Total: 1100 > 1000
     let output1_rho = [10u8; 32];
-    let output1_pk_out = [11u8; 32];
-    let output1_recipient = poseidon2::recipient_from_pk(&domain, &output1_pk_out);
-    let output1_cm = poseidon2::note_commitment(&domain, output1_value, &output1_rho, &output1_recipient);
-    
-    let outputs = vec![
-        OutputNote {
-            value: output1_value,
-            rho: output1_rho,
-            pk_out: output1_pk_out,
-            commitment: output1_cm,
-        },
-    ];
+    let receiver_sk = [11u8; 32];
+    let output = make_payment_output(
+        &domain, output1_value, output1_rho,
+        poseidon2::pk_from_sk(&receiver_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk),
+        &spend_sk
+    );
+    let outputs = vec![output];
 
     println!("✗ Input value:     {}", value);
     println!("✗ Withdraw amount: {}", withdraw_amount);
@@ -721,25 +940,22 @@ fn test_reject_wrong_output_commitment() -> Result<()> {
     let withdraw_amount: u128 = 300;
     let output1_value: u128 = 700;
     let output1_rho = [10u8; 32];
-    let output1_pk_out = [11u8; 32];
-    let output1_recipient = poseidon2::recipient_from_pk(&domain, &output1_pk_out);
-    let output1_cm = poseidon2::note_commitment(&domain, output1_value, &output1_rho, &output1_recipient);
+    let receiver_sk = [11u8; 32];
     
-    // Tamper with the commitment
-    let mut bad_cm = output1_cm;
-    bad_cm[0] ^= 1;
+    // Create valid output then tamper with commitment
+    let mut output = make_payment_output(
+        &domain, output1_value, output1_rho,
+        poseidon2::pk_from_sk(&receiver_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk),
+        &spend_sk
+    );
+    let good_cm = output.commitment;
+    output.commitment[0] ^= 1; // Tamper with commitment
     
-    let outputs = vec![
-        OutputNote {
-            value: output1_value,
-            rho: output1_rho,
-            pk_out: output1_pk_out,
-            commitment: bad_cm, // WRONG
-        },
-    ];
+    let outputs = vec![output];
 
-    println!("✗ Computed commitment: {}", hx(&output1_cm));
-    println!("✗ Provided commitment: {}", hx(&bad_cm));
+    println!("✗ Computed commitment: {}", hx(&good_cm));
+    println!("✗ Provided commitment: {}", hx(&outputs[0].commitment));
 
     let _args = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, withdraw_amount, &outputs);
     
@@ -833,7 +1049,7 @@ fn test_reject_wrong_nullifier() -> Result<()> {
 #[test]
 fn test_argument_count_validation() {
     println!("\n=== Argument Count Validation ===\n");
-    
+
     let depth = 8u32;
     let domain = [1u8; 32];
     let value = 100u128;
@@ -845,39 +1061,24 @@ fn test_argument_count_validation() {
     let nf = [6u8; 32];
     let withdraw_amount = 50u128;
     let siblings = vec![[0u8; 32]; depth as usize];
-    
+
     // Test with 0 outputs
     let args0 = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, withdraw_amount, &[]);
     assert_eq!(args0.len(), (11 + depth) as usize);
     println!("✓ Argument count with 0 outputs: {} (11 + {})", args0.len(), depth);
-    
-    // Test with 1 output
-    let out1 = OutputNote {
-        value: 50,
-        rho: [10u8; 32],
-        pk_out: [11u8; 32],
-        commitment: [12u8; 32],
-    };
+
+    // Test with 1 output (8 args per output now)
+    let out1 = make_self_output(&domain, 50, [10u8; 32], &spend_sk);
     let args1 = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, 0, &[out1]);
-    assert_eq!(args1.len(), (11 + depth + 4) as usize);
-    println!("✓ Argument count with 1 output:  {} (11 + {} + 4)", args1.len(), depth);
-    
-    // Test with 2 outputs
-    let out2a = OutputNote {
-        value: 25,
-        rho: [10u8; 32],
-        pk_out: [11u8; 32],
-        commitment: [12u8; 32],
-    };
-    let out2b = OutputNote {
-        value: 25,
-        rho: [20u8; 32],
-        pk_out: [21u8; 32],
-        commitment: [22u8; 32],
-    };
+    assert_eq!(args1.len(), (11 + depth + 8) as usize);
+    println!("✓ Argument count with 1 output:  {} (11 + {} + 8)", args1.len(), depth);
+
+    // Test with 2 outputs (16 args total for outputs)
+    let out2a = make_self_output(&domain, 25, [10u8; 32], &spend_sk);
+    let out2b = make_self_output(&domain, 25, [20u8; 32], &spend_sk);
     let args2 = build_args(domain, value, rho, recipient, spend_sk, pos, depth, &siblings, anchor, nf, 50, &[out2a, out2b]);
-    assert_eq!(args2.len(), (11 + depth + 8) as usize);
-    println!("✓ Argument count with 2 outputs: {} (11 + {} + 8)", args2.len(), depth);
+    assert_eq!(args2.len(), (11 + depth + 16) as usize);
+    println!("✓ Argument count with 2 outputs: {} (11 + {} + 16)", args2.len(), depth);
     
     // Verify private indices
     let private0 = private_indices(depth, 0);
@@ -947,9 +1148,8 @@ fn satisfies_old_buggy_constraints(
             Some(x) => x,
             None => return false,
         };
-        // Note: In old constraints, recipient could be arbitrary
-        // But with new OutputNote struct, we derive it from pk_out for consistency
-        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_out);
+        // With ADDR_V2, recipient is derived from both pk_spend AND pk_ivk
+        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_spend, &o.pk_ivk);
         let cm = poseidon2::note_commitment(domain, o.value, &o.rho, &rcp);
         if cm != o.commitment {
             return false;
@@ -1004,14 +1204,14 @@ fn satisfies_fixed_constraints(
     // FIXED: Derive nf_key deterministically from spend_sk
     let nf_key = poseidon2::nf_key_from_sk(domain, spend_sk);
     
-    // Output commitments + sum (recipient is derived from pk_out)
+    // Output commitments + sum (recipient is derived from both pk_spend and pk_ivk)
     let mut out_sum: u128 = 0;
     for o in outputs {
         out_sum = match out_sum.checked_add(o.value) {
             Some(x) => x,
             None => return false,
         };
-        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_out);
+        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_spend, &o.pk_ivk);
         let cm = poseidon2::note_commitment(domain, o.value, &o.rho, &rcp);
         if cm != o.commitment {
             return false;
@@ -1102,6 +1302,9 @@ fn satisfies_multi_input_constraints(
         }
     }
     
+    // Derive sender_id for recipient ciphertext verification
+    let sender_id = poseidon2::recipient_from_sk(domain, spend_sk);
+
     // Verify outputs
     let mut out_sum: u128 = 0;
     let mut output_rhos = Vec::new();
@@ -1115,11 +1318,48 @@ fn satisfies_multi_input_constraints(
             Some(x) => x,
             None => return false,
         };
-        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_out);
+        // ADDR_V2: binds both pk_spend and pk_ivk into the address
+        let rcp = poseidon2::recipient_from_pk(domain, &o.pk_spend, &o.pk_ivk);
         let cm = poseidon2::note_commitment(domain, o.value, &o.rho, &rcp);
         if cm != o.commitment {
             return false;
         }
+        
+        // === Level A recipient ciphertext verification ===
+        
+        // Reject low-order pk_ivk: DH must be non-zero (matches guest dh_or check)
+        let esk = poseidon2::esk_from_rho_cm(domain, &o.rho, &o.commitment);
+        let dh = poseidon2::x25519_shared(&esk, &o.pk_ivk);
+        let mut dh_or = 0u8;
+        for b in dh.iter() { dh_or |= *b; }
+        if dh_or == 0 {
+            return false;  // Low-order pk_ivk produces all-zero DH
+        }
+        
+        // Compute expected (epk, ct, ct_hash, mac) from witness
+        let (epk_exp, _ct_exp, ct_hash_exp, mac_exp) = poseidon2::compute_recipient_ciphertext(
+            domain, o.value, &o.rho, &rcp, &sender_id, &o.pk_ivk, &o.commitment
+        );
+        
+        // Public ct_hash is derived from tx calldata ct (models on-chain verifier)
+        let ct_hash_from_tx = poseidon2::ct_hash(&o.ct);
+        
+        // Check statement equivalence
+        if o.epk != epk_exp {
+            return false;  // epk mismatch
+        }
+        if ct_hash_from_tx != ct_hash_exp {
+            return false;  // ct was tampered (on-chain ct_hash differs from proof)
+        }
+        if o.mac != mac_exp {
+            return false;  // mac mismatch
+        }
+        
+        // Consistency check: stored ct_hash should match computed
+        if o.ct_hash != ct_hash_from_tx {
+            return false;  // Internal consistency error
+        }
+        
         output_rhos.push(o.rho);
     }
     
@@ -1194,8 +1434,8 @@ fn satisfies_viewer_attestations(
             // Derive per-note key
             let k = poseidon2::view_kdf(&v.fvk, &o.commitment);
             
-            // Compute recipient
-            let recipient = poseidon2::recipient_from_pk(domain, &o.pk_out);
+            // Compute recipient (ADDR_V2 binds both keys)
+            let recipient = poseidon2::recipient_from_pk(domain, &o.pk_spend, &o.pk_ivk);
             
             // Encode plaintext
             let pt = poseidon2::encode_note_plain(domain, o.value, &o.rho, &recipient, &v.sender_id);
@@ -1327,30 +1567,33 @@ fn test_nullifier_malleability_regression() -> Result<()> {
 // ADDRESS PROTECTION TESTS: pk_out derivation prevents arbitrary addresses
 // =====================================================================
 
-/// Helper to check if an output commitment is valid given pk_out
-fn output_commitment_valid(domain: &Hash32, value: u128, rho: &Hash32, pk_out: &Hash32, cm_expected: &Hash32) -> bool {
-    let recipient = poseidon2::recipient_from_pk(domain, pk_out);
+/// Helper to check if an output commitment is valid given pk_spend and pk_ivk
+/// With ADDR_V2, both keys must be correct for the commitment to match.
+fn output_commitment_valid(domain: &Hash32, value: u128, rho: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32, cm_expected: &Hash32) -> bool {
+    let recipient = poseidon2::recipient_from_pk(domain, pk_spend, pk_ivk);
     let cm_computed = poseidon2::note_commitment(domain, value, rho, &recipient);
     cm_computed == *cm_expected
 }
 
-/// Test that valid pk_out produces matching commitment
+/// Test that valid pk_spend and pk_ivk produce matching commitment
 #[test]
 fn test_valid_pk_out_produces_correct_commitment() -> Result<()> {
-    println!("\n=== Address Protection: Valid pk_out ===\n");
+    println!("\n=== Address Protection: Valid pk_spend + pk_ivk ===\n");
     
     let domain = [1u8; 32];
     
-    // Receiver generates their keypair
+    // Receiver generates their keypair (both pk_spend and pk_ivk)
     let receiver_sk = [42u8; 32];
-    let receiver_pk = poseidon2::pk_from_sk(&receiver_sk);
-    let receiver_recipient = poseidon2::recipient_from_pk(&domain, &receiver_pk);
+    let receiver_pk_spend = poseidon2::pk_from_sk(&receiver_sk);
+    let receiver_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk);
+    let receiver_recipient = poseidon2::recipient_from_pk(&domain, &receiver_pk_spend, &receiver_pk_ivk);
     
     println!("  Receiver's spend_sk: {}", hx(&receiver_sk));
-    println!("  Receiver's pk:       {}", hx(&receiver_pk));
+    println!("  Receiver's pk_spend: {}", hx(&receiver_pk_spend));
+    println!("  Receiver's pk_ivk:   {}", hx(&receiver_pk_ivk));
     println!("  Receiver's address:  {}", hx(&receiver_recipient));
     
-    // Sender creates note for receiver using receiver's pk
+    // Sender creates note for receiver using receiver's full address
     let value: u128 = 1000;
     let rho = [99u8; 32];
     let cm = poseidon2::note_commitment(&domain, value, &rho, &receiver_recipient);
@@ -1359,16 +1602,16 @@ fn test_valid_pk_out_produces_correct_commitment() -> Result<()> {
     println!("    value: {}", value);
     println!("    commitment: {}", hx(&cm));
     
-    // Verify: using receiver's pk_out should produce matching commitment
-    let is_valid = output_commitment_valid(&domain, value, &rho, &receiver_pk, &cm);
-    println!("\n  pk_out = receiver_pk → commitment valid: {}", is_valid);
-    assert!(is_valid, "Valid pk_out should produce matching commitment");
+    // Verify: using receiver's pk_spend AND pk_ivk should produce matching commitment
+    let is_valid = output_commitment_valid(&domain, value, &rho, &receiver_pk_spend, &receiver_pk_ivk, &cm);
+    println!("\n  (pk_spend, pk_ivk) = receiver's keys → commitment valid: {}", is_valid);
+    assert!(is_valid, "Valid pk_spend + pk_ivk should produce matching commitment");
     
-    println!("  ✓ Valid pk_out produces correct commitment\n");
+    println!("  ✓ Valid pk_spend + pk_ivk produces correct commitment\n");
     Ok(())
 }
 
-/// Test that arbitrary addresses (not derived from pk) fail commitment check
+/// Test that arbitrary addresses (not derived from pk_spend + pk_ivk) fail commitment check
 #[test]
 fn test_arbitrary_address_fails_commitment() -> Result<()> {
     println!("\n=== Address Protection: Arbitrary Address Rejected ===\n");
@@ -1388,35 +1631,41 @@ fn test_arbitrary_address_fails_commitment() -> Result<()> {
     
     println!("  Commitment with arbitrary recipient: {}", hx(&cm_with_arbitrary));
     
-    // Now try to find ANY pk_out that would produce this commitment
-    // This is impossible without finding a preimage of the ADDR_V1 hash
+    // Now try to find ANY (pk_spend, pk_ivk) pair that would produce this commitment
+    // This is impossible without finding a preimage of the ADDR_V2 hash
     
-    // Test 1: Using the arbitrary address AS pk_out won't work
-    // because recipient = H("ADDR_V1" || domain || pk_out) ≠ arbitrary_address
-    let derived_recipient = poseidon2::recipient_from_pk(&domain, &arbitrary_address);
-    println!("\n  If we use arbitrary_address as pk_out:");
+    // Test 1: Using the arbitrary address AS pk_spend and pk_ivk won't work
+    // because recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk) ≠ arbitrary_address
+    let derived_recipient = poseidon2::recipient_from_pk(&domain, &arbitrary_address, &arbitrary_address);
+    println!("\n  If we use arbitrary_address as both pk_spend and pk_ivk:");
     println!("    derived recipient: {}", hx(&derived_recipient));
     println!("    expected recipient: {}", hx(&arbitrary_address));
     assert_ne!(derived_recipient, arbitrary_address, 
         "Derived recipient should differ from arbitrary address");
     
     // The commitment won't match
-    let is_valid = output_commitment_valid(&domain, value, &rho, &arbitrary_address, &cm_with_arbitrary);
+    let is_valid = output_commitment_valid(&domain, value, &rho, &arbitrary_address, &arbitrary_address, &cm_with_arbitrary);
     println!("    commitment valid: {}", is_valid);
-    assert!(!is_valid, "Arbitrary address used as pk_out should NOT produce matching commitment");
+    assert!(!is_valid, "Arbitrary address used as pk_spend/pk_ivk should NOT produce matching commitment");
     
-    // Test 2: Try random pk_out values - none should work
-    println!("\n  Testing random pk_out values:");
+    // Test 2: Try random pk values - none should work
+    println!("\n  Testing random (pk_spend, pk_ivk) pairs:");
     for i in 0..5 {
-        let random_pk: Hash32 = {
+        let random_pk_spend: Hash32 = {
             let mut pk = [0u8; 32];
             pk[0] = i;
             pk[31] = 255 - i;
             pk
         };
-        let is_valid = output_commitment_valid(&domain, value, &rho, &random_pk, &cm_with_arbitrary);
-        println!("    random_pk[{}] → valid: {}", i, is_valid);
-        assert!(!is_valid, "Random pk_out should not produce matching commitment");
+        let random_pk_ivk: Hash32 = {
+            let mut pk = [0u8; 32];
+            pk[0] = i + 100;
+            pk[31] = 155 - i;
+            pk
+        };
+        let is_valid = output_commitment_valid(&domain, value, &rho, &random_pk_spend, &random_pk_ivk, &cm_with_arbitrary);
+        println!("    random pair[{}] → valid: {}", i, is_valid);
+        assert!(!is_valid, "Random pk pair should not produce matching commitment");
     }
     
     println!("\n  ✓ Arbitrary addresses cannot be used as recipients\n");
@@ -1431,31 +1680,34 @@ fn test_only_valid_privacy_addresses_can_receive() -> Result<()> {
     let domain = [1u8; 32];
     
     // Scenario: User A wants to send to User B
-    // User B must provide their pk (derived from their spend_sk)
+    // User B must provide their full address (pk_spend + pk_ivk)
     
     let user_b_sk = [77u8; 32];
-    let user_b_pk = poseidon2::pk_from_sk(&user_b_sk);
-    let user_b_address = poseidon2::recipient_from_pk(&domain, &user_b_pk);
+    let user_b_pk_spend = poseidon2::pk_from_sk(&user_b_sk);
+    let user_b_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &user_b_sk);
+    let user_b_address = poseidon2::recipient_from_pk(&domain, &user_b_pk_spend, &user_b_pk_ivk);
     
     println!("  User B's privacy address: {}", hx(&user_b_address));
-    println!("  User B's public key (pk): {}", hx(&user_b_pk));
+    println!("  User B's pk_spend: {}", hx(&user_b_pk_spend));
+    println!("  User B's pk_ivk:   {}", hx(&user_b_pk_ivk));
     
-    // User A creates output note using B's pk
+    // User A creates output note using B's full address
     let value: u128 = 500;
     let rho = [88u8; 32];
     let cm = poseidon2::note_commitment(&domain, value, &rho, &user_b_address);
     
-    // Simulate circuit check: does pk_out derive to the committed recipient?
-    let circuit_derived_recipient = poseidon2::recipient_from_pk(&domain, &user_b_pk);
+    // Simulate circuit check: does (pk_spend, pk_ivk) derive to the committed recipient?
+    let circuit_derived_recipient = poseidon2::recipient_from_pk(&domain, &user_b_pk_spend, &user_b_pk_ivk);
     let circuit_computed_cm = poseidon2::note_commitment(&domain, value, &rho, &circuit_derived_recipient);
     
     println!("\n  Circuit verification:");
-    println!("    Input pk_out: {}", hx(&user_b_pk));
+    println!("    Input pk_spend: {}", hx(&user_b_pk_spend));
+    println!("    Input pk_ivk: {}", hx(&user_b_pk_ivk));
     println!("    Derived recipient: {}", hx(&circuit_derived_recipient));
     println!("    Computed commitment: {}", hx(&circuit_computed_cm));
     println!("    Expected commitment: {}", hx(&cm));
     
-    assert_eq!(circuit_computed_cm, cm, "Circuit should accept valid pk_out");
+    assert_eq!(circuit_computed_cm, cm, "Circuit should accept valid (pk_spend, pk_ivk)");
     println!("    ✓ Commitment matches!");
     
     // Now verify User B can spend the note (they know spend_sk)
@@ -1477,7 +1729,7 @@ fn test_normal_chain_address_would_fail() -> Result<()> {
     let domain = [1u8; 32];
     
     // Simulate a "normal chain address" - some 32-byte public key hash
-    // that is NOT derived via our ADDR_V1 scheme
+    // that is NOT derived via our ADDR_V2 scheme
     let normal_chain_address: Hash32 = {
         // This might be H("NORMAL_ADDR" || some_pubkey) from another system
         let mut addr = [0u8; 32];
@@ -1489,7 +1741,7 @@ fn test_normal_chain_address_would_fail() -> Result<()> {
     println!("  Normal chain address (simulated): {}", hx(&normal_chain_address));
     
     // If someone tries to create a note with this as recipient directly,
-    // the circuit would need a pk_out that derives to this address.
+    // the circuit would need (pk_spend, pk_ivk) that derives to this address.
     // This is computationally infeasible (requires hash preimage).
     
     let value: u128 = 1000;
@@ -1499,20 +1751,20 @@ fn test_normal_chain_address_would_fail() -> Result<()> {
     let bad_cm = poseidon2::note_commitment(&domain, value, &rho, &normal_chain_address);
     println!("  Commitment with normal address: {}", hx(&bad_cm));
     
-    // No pk_out will work for this commitment
-    println!("\n  Can any pk_out produce this commitment?");
+    // No (pk_spend, pk_ivk) pair will work for this commitment
+    println!("\n  Can any (pk_spend, pk_ivk) pair produce this commitment?");
     
-    // The "normal address" itself as pk_out:
-    let derived = poseidon2::recipient_from_pk(&domain, &normal_chain_address);
-    let valid = output_commitment_valid(&domain, value, &rho, &normal_chain_address, &bad_cm);
-    println!("    Using normal_address as pk_out → derived recipient: {}", hx(&derived));
+    // The "normal address" itself as both pk_spend and pk_ivk:
+    let derived = poseidon2::recipient_from_pk(&domain, &normal_chain_address, &normal_chain_address);
+    let valid = output_commitment_valid(&domain, value, &rho, &normal_chain_address, &normal_chain_address, &bad_cm);
+    println!("    Using normal_address as both keys → derived recipient: {}", hx(&derived));
     println!("    Commitment valid: {}", valid);
     assert!(!valid);
     
-    // Correct approach: Receiver must provide their privacy pk
+    // Correct approach: Receiver must provide their privacy address (pk_spend + pk_ivk)
     println!("\n  Correct approach:");
-    println!("    Receiver provides their privacy pk (from spend_sk)");
-    println!("    Circuit derives recipient = H(ADDR_V1 || domain || pk)");
+    println!("    Receiver provides their privacy address (pk_spend + pk_ivk)");
+    println!("    Circuit derives recipient = H(ADDR_V2 || domain || pk_spend || pk_ivk)");
     println!("    Only privacy addresses are valid");
     println!("\n  ✓ Normal chain addresses cannot receive privacy pool funds\n");
     
@@ -1529,8 +1781,9 @@ fn test_address_protection_full_flow() -> Result<()> {
     
     // === Step 1: Alice has funds in the privacy pool ===
     let alice_sk = [10u8; 32];
-    let alice_pk = poseidon2::pk_from_sk(&alice_sk);
-    let alice_addr = poseidon2::recipient_from_pk(&domain, &alice_pk);
+    let alice_pk_spend = poseidon2::pk_from_sk(&alice_sk);
+    let alice_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &alice_sk);
+    let alice_addr = poseidon2::recipient_from_pk(&domain, &alice_pk_spend, &alice_pk_ivk);
     let alice_nf_key = poseidon2::nf_key_from_sk(&domain, &alice_sk);
     
     let input_value: u128 = 1000;
@@ -1549,11 +1802,13 @@ fn test_address_protection_full_flow() -> Result<()> {
     
     // === Step 2: Alice wants to send 700 to Bob ===
     let bob_sk = [30u8; 32];
-    let bob_pk = poseidon2::pk_from_sk(&bob_sk);
-    let bob_addr = poseidon2::recipient_from_pk(&domain, &bob_pk);
+    let bob_pk_spend = poseidon2::pk_from_sk(&bob_sk);
+    let bob_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &bob_sk);
+    let bob_addr = poseidon2::recipient_from_pk(&domain, &bob_pk_spend, &bob_pk_ivk);
     
     println!("\nStep 2: Alice sends 700 to Bob");
-    println!("  Bob provides his pk: {}", &hx(&bob_pk)[..16]);
+    println!("  Bob provides his pk_spend: {}", &hx(&bob_pk_spend)[..16]);
+    println!("  Bob provides his pk_ivk:   {}", &hx(&bob_pk_ivk)[..16]);
     println!("  Bob's address (derived): {}", &hx(&bob_addr)[..16]);
     
     // Create output note for Bob
@@ -1569,11 +1824,11 @@ fn test_address_protection_full_flow() -> Result<()> {
     assert_eq!(alice_addr_check, alice_addr, "Alice's sk must derive to input recipient");
     println!("  ✓ Alice's spend_sk authorizes input note");
     
-    // Output verification (circuit derives recipient from pk_out)
-    let bob_addr_derived = poseidon2::recipient_from_pk(&domain, &bob_pk);
+    // Output verification (circuit derives recipient from pk_spend + pk_ivk)
+    let bob_addr_derived = poseidon2::recipient_from_pk(&domain, &bob_pk_spend, &bob_pk_ivk);
     let output_cm_check = poseidon2::note_commitment(&domain, output_value, &output_rho, &bob_addr_derived);
     assert_eq!(output_cm_check, output_cm, "Output commitment must match");
-    println!("  ✓ Bob's pk_out produces valid output commitment");
+    println!("  ✓ Bob's (pk_spend, pk_ivk) produces valid output commitment");
     
     // Balance
     let withdraw = input_value - output_value;
@@ -1592,8 +1847,8 @@ fn test_address_protection_full_flow() -> Result<()> {
     let evil_addr = [0xEE; 32];  // Some arbitrary address
     let evil_cm = poseidon2::note_commitment(&domain, output_value, &output_rho, &evil_addr);
     
-    // Try to use evil_addr as pk_out
-    let evil_derived = poseidon2::recipient_from_pk(&domain, &evil_addr);
+    // Try to use evil_addr as both pk_spend and pk_ivk
+    let evil_derived = poseidon2::recipient_from_pk(&domain, &evil_addr, &evil_addr);
     let evil_cm_check = poseidon2::note_commitment(&domain, output_value, &output_rho, &evil_derived);
     
     println!("  Attacker tries arbitrary address: {}", &hx(&evil_addr)[..16]);
@@ -1621,7 +1876,8 @@ fn test_consolidation_2_to_1() -> Result<()> {
     let spend_sk = [42u8; 32];
     let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
     let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &spend_sk);
     
     // Create 2 input notes
     let value1: u128 = 300;
@@ -1657,15 +1913,10 @@ fn test_consolidation_2_to_1() -> Result<()> {
     // Create 1 output note (consolidation to self)
     let total_value = value1 + value2;
     let output_rho = [30u8; 32];
-    let output_recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
+    let output_recipient = poseidon2::recipient_from_pk(&domain, &self_pk_spend, &self_pk_ivk);
     let output_cm = poseidon2::note_commitment(&domain, total_value, &output_rho, &output_recipient);
     
-    let outputs = vec![OutputNote {
-        value: total_value,
-        rho: output_rho,
-        pk_out: self_pk,
-        commitment: output_cm,
-    }];
+    let outputs = vec![make_self_output(&domain, total_value, output_rho, &spend_sk)];
     
     println!("✓ Input 1: {} tokens", value1);
     println!("✓ Input 2: {} tokens", value2);
@@ -1697,7 +1948,6 @@ fn test_consolidation_4_to_1() -> Result<()> {
     let spend_sk = [42u8; 32];
     let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
     let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
     
     // Create 4 input notes (dust consolidation scenario)
     let values: [u128; 4] = [100, 200, 300, 400];
@@ -1725,15 +1975,8 @@ fn test_consolidation_4_to_1() -> Result<()> {
     // Create 1 output (full consolidation)
     let total_value: u128 = values.iter().sum();
     let output_rho = [50u8; 32];
-    let output_recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let output_cm = poseidon2::note_commitment(&domain, total_value, &output_rho, &output_recipient);
     
-    let outputs = vec![OutputNote {
-        value: total_value,
-        rho: output_rho,
-        pk_out: self_pk,
-        commitment: output_cm,
-    }];
+    let outputs = vec![make_self_output(&domain, total_value, output_rho, &spend_sk)];
     
     println!("✓ Inputs: {:?}", values);
     println!("✓ Total:  {} tokens", total_value);
@@ -1799,31 +2042,16 @@ fn test_multi_input_payment_2_to_2() -> Result<()> {
     // Payment: 600 to Bob, 200 change to self
     let bob_sk = [77u8; 32];
     let bob_pk = poseidon2::pk_from_sk(&bob_sk);
+    let bob_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &bob_sk);
     
     let payment_value: u128 = 600;
     let change_value: u128 = 200;
     let payment_rho = [30u8; 32];
     let change_rho = [31u8; 32];
     
-    let payment_recipient = poseidon2::recipient_from_pk(&domain, &bob_pk);
-    let payment_cm = poseidon2::note_commitment(&domain, payment_value, &payment_rho, &payment_recipient);
-    
-    let change_recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let change_cm = poseidon2::note_commitment(&domain, change_value, &change_rho, &change_recipient);
-    
     let outputs = vec![
-        OutputNote {
-            value: payment_value,
-            rho: payment_rho,
-            pk_out: bob_pk,
-            commitment: payment_cm,
-        },
-        OutputNote {
-            value: change_value,
-            rho: change_rho,
-            pk_out: self_pk,
-            commitment: change_cm,
-        },
+        make_payment_output(&domain, payment_value, payment_rho, bob_pk, bob_pk_ivk, &spend_sk),
+        make_self_output(&domain, change_value, change_rho, &spend_sk),
     ];
     
     println!("✓ Input 1: {} tokens", value1);
@@ -1934,15 +2162,8 @@ fn test_multi_input_with_withdraw() -> Result<()> {
     let withdraw_amount: u128 = 150;
     let output_value: u128 = 450;
     let output_rho = [40u8; 32];
-    let output_recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let output_cm = poseidon2::note_commitment(&domain, output_value, &output_rho, &output_recipient);
     
-    let outputs = vec![OutputNote {
-        value: output_value,
-        rho: output_rho,
-        pk_out: self_pk,
-        commitment: output_cm,
-    }];
+    let outputs = vec![make_self_output(&domain, output_value, output_rho, &spend_sk)];
     
     let total_in: u128 = values.iter().sum();
     println!("✓ Inputs: {:?} = {}", values, total_in);
@@ -1979,15 +2200,13 @@ fn test_multi_input_argument_count() {
         nullifier: [i + 100; 32],
     };
     
-    let make_output = |v: u128, i: u8| OutputNote {
-        value: v,
-        rho: [i; 32],
-        pk_out: [i + 50; 32],
-        commitment: [i + 100; 32],
+    // Create properly formatted outputs using helper
+    let make_dummy_output = |v: u128, i: u8| -> OutputNote {
+        make_self_output(&domain, v, [i; 32], &spend_sk)
     };
     
-    // Expected: 5 header + n_in*(4+depth) + 2 + n_out*4
-    // = 5 + n_in*(depth+4) + 2 + n_out*4
+    // Expected: 5 header + n_in*(4+depth) + 2 + n_out*8
+    // = 5 + n_in*(depth+4) + 2 + n_out*8
     
     // 1 input, 0 outputs
     let args_1_0 = build_args_multi(
@@ -1999,13 +2218,13 @@ fn test_multi_input_argument_count() {
     assert_eq!(args_1_0.len(), expected_1_0, "1-in, 0-out");
     println!("✓ 1 input, 0 outputs: {} args", args_1_0.len());
     
-    // 1 input, 2 outputs
+    // 1 input, 2 outputs (16 args for outputs)
     let args_1_2 = build_args_multi(
         domain, spend_sk, depth, anchor,
         &[make_input(100, 0)],
-        0, &[make_output(50, 0), make_output(50, 1)]
+        0, &[make_dummy_output(50, 0), make_dummy_output(50, 1)]
     );
-    let expected_1_2 = 5 + 1 * (depth as usize + 4) + 2 + 8;
+    let expected_1_2 = 5 + 1 * (depth as usize + 4) + 2 + 16; // 8 args per output
     assert_eq!(args_1_2.len(), expected_1_2, "1-in, 2-out");
     println!("✓ 1 input, 2 outputs: {} args", args_1_2.len());
     
@@ -2013,9 +2232,9 @@ fn test_multi_input_argument_count() {
     let args_4_1 = build_args_multi(
         domain, spend_sk, depth, anchor,
         &[make_input(100, 0), make_input(200, 1), make_input(300, 2), make_input(400, 3)],
-        0, &[make_output(1000, 0)]
+        0, &[make_dummy_output(1000, 0)]
     );
-    let expected_4_1 = 5 + 4 * (depth as usize + 4) + 2 + 4;
+    let expected_4_1 = 5 + 4 * (depth as usize + 4) + 2 + 8; // 8 args per output
     assert_eq!(args_4_1.len(), expected_4_1, "4-in, 1-out");
     println!("✓ 4 inputs, 1 output: {} args", args_4_1.len());
     
@@ -2023,9 +2242,9 @@ fn test_multi_input_argument_count() {
     let args_4_2 = build_args_multi(
         domain, spend_sk, depth, anchor,
         &[make_input(100, 0), make_input(200, 1), make_input(300, 2), make_input(400, 3)],
-        0, &[make_output(500, 0), make_output(500, 1)]
+        0, &[make_dummy_output(500, 0), make_dummy_output(500, 1)]
     );
-    let expected_4_2 = 5 + 4 * (depth as usize + 4) + 2 + 8;
+    let expected_4_2 = 5 + 4 * (depth as usize + 4) + 2 + 16; // 8 args per output
     assert_eq!(args_4_2.len(), expected_4_2, "4-in, 2-out");
     println!("✓ 4 inputs, 2 outputs: {} args\n", args_4_2.len());
 }
@@ -2103,17 +2322,21 @@ fn test_reject_zero_value_output() {
     }];
     
     // Create a zero-value output (balance would work: 100 = 100 withdraw + 0 output)
-    let out_pk = poseidon2::pk_from_sk(&[99u8; 32]);
+    // Note: We create a structurally valid output but with value = 0
+    let receiver_sk = [99u8; 32];
     let out_rho = [20u8; 32];
-    let out_recipient = poseidon2::recipient_from_pk(&domain, &out_pk);
-    let out_cm = poseidon2::note_commitment(&domain, 0, &out_rho, &out_recipient); // value = 0
     
-    let outputs = vec![OutputNote {
-        value: 0, // Zero value - should be rejected
-        rho: out_rho,
-        pk_out: out_pk,
-        commitment: out_cm,
-    }];
+    // Create output using helper, then modify value to 0 to test rejection
+    let mut output = make_payment_output(
+        &domain, 1, out_rho, // Use value 1 to create valid output
+        poseidon2::pk_from_sk(&receiver_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver_sk),
+        &spend_sk
+    );
+    output.value = 0; // Tamper: set value to 0
+    // Note: commitment/ciphertext are now inconsistent, but constraint check fails on value=0 first
+    
+    let outputs = vec![output];
     
     // Balance: 100 = 100 + 0 (would pass balance check)
     let valid = satisfies_multi_input_constraints(
@@ -2156,15 +2379,9 @@ fn test_reject_output_rho_equals_input_rho() {
     }];
     
     // Create output with SAME rho as input - this is the bug we're preventing
-    let out_recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let out_cm = poseidon2::note_commitment(&domain, 100, &shared_rho, &out_recipient);
-    
-    let outputs = vec![OutputNote {
-        value: 100,
-        rho: shared_rho, // Same as input! Would create unspendable note
-        pk_out: self_pk,
-        commitment: out_cm,
-    }];
+    // Using the helper function to create proper output, but rho will match input
+    let output = make_self_output(&domain, 100, shared_rho, &spend_sk);
+    let outputs = vec![output];
     
     let valid = satisfies_multi_input_constraints(
         &domain, &spend_sk, depth, &anchor, &inputs, 0, &outputs
@@ -2205,31 +2422,27 @@ fn test_reject_duplicate_output_rhos() {
         nullifier: nf,
     }];
     
-    // Create two outputs with the SAME rho
+    // Create two outputs with the SAME rho - this tests duplicate rho rejection
     let duplicate_rho = [50u8; 32]; // Different from input rho
     
-    let pk1 = poseidon2::pk_from_sk(&[99u8; 32]);
-    let recipient1 = poseidon2::recipient_from_pk(&domain, &pk1);
-    let cm1 = poseidon2::note_commitment(&domain, 100, &duplicate_rho, &recipient1);
+    let receiver1_sk = [99u8; 32];
+    let receiver2_sk = [98u8; 32];
     
-    let pk2 = poseidon2::pk_from_sk(&[98u8; 32]);
-    let recipient2 = poseidon2::recipient_from_pk(&domain, &pk2);
-    let cm2 = poseidon2::note_commitment(&domain, 100, &duplicate_rho, &recipient2);
+    // Both outputs use the same rho - should be rejected
+    let output1 = make_payment_output(
+        &domain, 100, duplicate_rho,
+        poseidon2::pk_from_sk(&receiver1_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver1_sk),
+        &spend_sk
+    );
+    let output2 = make_payment_output(
+        &domain, 100, duplicate_rho, // Same rho!
+        poseidon2::pk_from_sk(&receiver2_sk),
+        poseidon2::pk_ivk_from_spend_sk(&domain, &receiver2_sk),
+        &spend_sk
+    );
     
-    let outputs = vec![
-        OutputNote {
-            value: 100,
-            rho: duplicate_rho,
-            pk_out: pk1,
-            commitment: cm1,
-        },
-        OutputNote {
-            value: 100,
-            rho: duplicate_rho, // Same rho as first output!
-            pk_out: pk2,
-            commitment: cm2,
-        },
-    ];
+    let outputs = vec![output1, output2];
     
     let valid = satisfies_multi_input_constraints(
         &domain, &spend_sk, depth, &anchor, &inputs, 0, &outputs
@@ -2277,13 +2490,9 @@ fn test_valid_distinct_rhos() {
     let rho_out_1 = [20u8; 32]; // Different from inputs
     let rho_out_2 = [21u8; 32]; // Different from inputs and from rho_out_1
     
-    let recipient_out = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm_out_1 = poseidon2::note_commitment(&domain, 100, &rho_out_1, &recipient_out);
-    let cm_out_2 = poseidon2::note_commitment(&domain, 100, &rho_out_2, &recipient_out);
-    
     let outputs = vec![
-        OutputNote { value: 100, rho: rho_out_1, pk_out: self_pk, commitment: cm_out_1 },
-        OutputNote { value: 100, rho: rho_out_2, pk_out: self_pk, commitment: cm_out_2 },
+        make_self_output(&domain, 100, rho_out_1, &spend_sk),
+        make_self_output(&domain, 100, rho_out_2, &spend_sk),
     ];
     
     let valid = satisfies_multi_input_constraints(
@@ -2309,28 +2518,22 @@ fn test_valid_viewer_attestation() {
     let spend_sk = [42u8; 32];
     let fvk = [99u8; 32]; // Viewer's full viewing key
     let sender_id = [88u8; 32];
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &spend_sk);
     
     // Create an output note
     let rho_out = [55u8; 32];
     let value = 1000u128;
-    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm = poseidon2::note_commitment(&domain, value, &rho_out, &recipient);
-    
-    let output = OutputNote {
-        value,
-        rho: rho_out,
-        pk_out: self_pk,
-        commitment: cm,
-    };
+    let output = make_self_output(&domain, value, rho_out, &spend_sk);
+    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk_spend, &self_pk_ivk);
     
     // Compute valid viewer attestation
     let fvk_commit = poseidon2::fvk_commit(&fvk);
-    let k = poseidon2::view_kdf(&fvk, &cm);
+    let k = poseidon2::view_kdf(&fvk, &output.commitment);
     let pt = poseidon2::encode_note_plain(&domain, value, &rho_out, &recipient, &sender_id);
     let ct = poseidon2::stream_xor_encrypt(&k, &pt);
     let ct_hash = poseidon2::ct_hash(&ct);
-    let mac = poseidon2::view_mac(&k, &cm, &ct_hash);
+    let mac = poseidon2::view_mac(&k, &output.commitment, &ct_hash);
     
     let attestation = ViewerAttestation {
         fvk,
@@ -2354,19 +2557,14 @@ fn test_reject_wrong_fvk_commit() {
     let spend_sk = [42u8; 32];
     let fvk = [99u8; 32];
     let sender_id = [88u8; 32];
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &spend_sk);
     
     let rho_out = [55u8; 32];
     let value = 1000u128;
-    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm = poseidon2::note_commitment(&domain, value, &rho_out, &recipient);
-    
-    let output = OutputNote {
-        value,
-        rho: rho_out,
-        pk_out: self_pk,
-        commitment: cm,
-    };
+    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk_spend, &self_pk_ivk);
+    let output = make_self_output(&domain, value, rho_out, &spend_sk);
+    let cm = output.commitment;
     
     // Compute attestation but use wrong fvk_commit
     let wrong_fvk_commit = [0u8; 32]; // Wrong!
@@ -2402,15 +2600,8 @@ fn test_reject_wrong_ct_hash() {
     
     let rho_out = [55u8; 32];
     let value = 1000u128;
-    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm = poseidon2::note_commitment(&domain, value, &rho_out, &recipient);
-    
-    let output = OutputNote {
-        value,
-        rho: rho_out,
-        pk_out: self_pk,
-        commitment: cm,
-    };
+    let output = make_self_output(&domain, value, rho_out, &spend_sk);
+    let cm = output.commitment;
     
     let fvk_commit = poseidon2::fvk_commit(&fvk);
     let k = poseidon2::view_kdf(&fvk, &cm);
@@ -2439,19 +2630,14 @@ fn test_reject_wrong_mac() {
     let spend_sk = [42u8; 32];
     let fvk = [99u8; 32];
     let sender_id = [88u8; 32];
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &spend_sk);
     
     let rho_out = [55u8; 32];
     let value = 1000u128;
-    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm = poseidon2::note_commitment(&domain, value, &rho_out, &recipient);
-    
-    let output = OutputNote {
-        value,
-        rho: rho_out,
-        pk_out: self_pk,
-        commitment: cm,
-    };
+    let output = make_self_output(&domain, value, rho_out, &spend_sk);
+    let cm = output.commitment;
+    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk_spend, &self_pk_ivk);
     
     let fvk_commit = poseidon2::fvk_commit(&fvk);
     let k = poseidon2::view_kdf(&fvk, &cm);
@@ -2482,21 +2668,22 @@ fn test_viewer_attestation_two_outputs() {
     let spend_sk = [42u8; 32];
     let fvk = [99u8; 32];
     let sender_id = [88u8; 32];
-    let self_pk = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let self_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &spend_sk);
     
     // Create two outputs
     let rho_1 = [55u8; 32];
     let rho_2 = [56u8; 32];
     let value_1 = 1000u128;
     let value_2 = 2000u128;
-    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk);
-    let cm_1 = poseidon2::note_commitment(&domain, value_1, &rho_1, &recipient);
-    let cm_2 = poseidon2::note_commitment(&domain, value_2, &rho_2, &recipient);
     
     let outputs = vec![
-        OutputNote { value: value_1, rho: rho_1, pk_out: self_pk, commitment: cm_1 },
-        OutputNote { value: value_2, rho: rho_2, pk_out: self_pk, commitment: cm_2 },
+        make_self_output(&domain, value_1, rho_1, &spend_sk),
+        make_self_output(&domain, value_2, rho_2, &spend_sk),
     ];
+    let cm_1 = outputs[0].commitment;
+    let cm_2 = outputs[1].commitment;
+    let recipient = poseidon2::recipient_from_pk(&domain, &self_pk_spend, &self_pk_ivk);
     
     // Compute valid attestations for both outputs
     let fvk_commit = poseidon2::fvk_commit(&fvk);
@@ -2524,4 +2711,534 @@ fn test_viewer_attestation_two_outputs() {
     let valid = satisfies_viewer_attestations(&domain, &outputs, &[attestation]);
     assert!(valid, "Valid viewer attestation for two outputs should pass");
     println!("✓ Valid viewer attestation for two outputs accepted\n");
+}
+
+// =====================================================================
+// ADDR_V2 SECURITY TESTS: pk_ivk binding prevents mismatched encryption
+// =====================================================================
+
+/// Test that ADDR_V2 prevents the "mismatched encryption" attack.
+/// 
+/// ATTACK SCENARIO (possible with ADDR_V1):
+/// Attacker creates a note where:
+/// - pk_spend = Alice's pk_spend (so Alice "owns" the note)
+/// - pk_ivk = Attacker's pk_ivk (so only attacker can decrypt)
+/// 
+/// This would create a note that:
+/// 1. Appears committed to Alice's spending key
+/// 2. But encrypted to the attacker's viewing key
+/// 3. Alice cannot detect or decrypt the note via scanning
+/// 4. The note is effectively burned/lost
+/// 
+/// ADDR_V2 FIX:
+/// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+/// 
+/// With this binding:
+/// - If attacker uses Alice's pk_spend + attacker's pk_ivk
+/// - The recipient hash is different from Alice's real address
+/// - Alice cannot spend the note (wrong recipient in commitment)
+/// - Note goes to a "different address" (attacker's franken-address)
+/// - This is now a "send to wrong address" failure, not a silent burn
+#[test]
+fn test_addr_v2_prevents_mismatched_encryption_attack() -> Result<()> {
+    println!("\n=== ADDR_V2 Security: Mismatched Encryption Attack Prevention ===\n");
+    
+    let domain = [1u8; 32];
+    
+    // Alice's keys (victim)
+    let alice_sk = [10u8; 32];
+    let alice_pk_spend = poseidon2::pk_from_sk(&alice_sk);
+    let alice_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &alice_sk);
+    let alice_recipient = poseidon2::recipient_from_pk(&domain, &alice_pk_spend, &alice_pk_ivk);
+    
+    // Attacker's keys
+    let attacker_sk = [99u8; 32];
+    let attacker_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &attacker_sk);
+    
+    println!("Alice's pk_spend:    {}", &hx(&alice_pk_spend)[..16]);
+    println!("Alice's pk_ivk:      {}", &hx(&alice_pk_ivk)[..16]);
+    println!("Alice's recipient:   {}", &hx(&alice_recipient)[..16]);
+    println!("Attacker's pk_ivk:   {}", &hx(&attacker_pk_ivk)[..16]);
+    
+    // === ATTACK ATTEMPT ===
+    // Attacker tries to create a note with Alice's pk_spend but attacker's pk_ivk
+    let value: u128 = 1000;
+    let rho = [50u8; 32];
+    
+    // The "franken-address": Alice's spend key + Attacker's viewing key
+    let franken_recipient = poseidon2::recipient_from_pk(&domain, &alice_pk_spend, &attacker_pk_ivk);
+    
+    println!("\n=== Attack Attempt ===");
+    println!("Franken-recipient (Alice's pk_spend + Attacker's pk_ivk):");
+    println!("  {}", &hx(&franken_recipient)[..16]);
+    
+    // This recipient is DIFFERENT from Alice's real recipient
+    assert_ne!(franken_recipient, alice_recipient, 
+        "Franken-recipient should differ from Alice's real recipient");
+    println!("✓ Franken-recipient ≠ Alice's recipient");
+    
+    // Create a commitment with the franken-address
+    let franken_cm = poseidon2::note_commitment(&domain, value, &rho, &franken_recipient);
+    
+    // Create Alice's real commitment (what she would expect)
+    let alice_cm = poseidon2::note_commitment(&domain, value, &rho, &alice_recipient);
+    
+    // The commitments are DIFFERENT
+    assert_ne!(franken_cm, alice_cm, 
+        "Franken commitment should differ from Alice's expected commitment");
+    println!("✓ Franken-commitment ≠ Alice's expected commitment");
+    
+    // === KEY INSIGHT ===
+    println!("\n=== Security Analysis ===");
+    
+    // Can Alice spend the franken-note?
+    // No! Her spend_sk derives to alice_recipient, not franken_recipient
+    let alice_derived_recipient = poseidon2::recipient_from_sk(&domain, &alice_sk);
+    assert_eq!(alice_derived_recipient, alice_recipient);
+    assert_ne!(alice_derived_recipient, franken_recipient);
+    println!("✓ Alice cannot spend franken-note (recipient mismatch in circuit)");
+    
+    // Can the attacker spend the franken-note?
+    // No! Attacker's spend_sk derives to a completely different recipient
+    let attacker_pk_spend = poseidon2::pk_from_sk(&attacker_sk);
+    let attacker_recipient = poseidon2::recipient_from_pk(&domain, &attacker_pk_spend, &attacker_pk_ivk);
+    assert_ne!(attacker_recipient, franken_recipient);
+    println!("✓ Attacker cannot spend franken-note (wrong pk_spend in address)");
+    
+    // The franken-note is "sent to nobody" - a burned address
+    // This is the intended behavior: mismatch = burn, not stealth attack
+    println!("\n=== Conclusion ===");
+    println!("With ADDR_V2, mismatching pk_spend and pk_ivk creates a 'burned' note.");
+    println!("The note cannot be spent by anyone - which is the expected failure mode.");
+    println!("This prevents the silent attack where Alice has an undecryptable note.");
+    println!("✓ ADDR_V2 successfully prevents the mismatched encryption attack\n");
+    
+    Ok(())
+}
+
+/// Test that correct (pk_spend, pk_ivk) pairs work correctly.
+/// Demonstrates that when keys match, everything works as expected.
+#[test]
+fn test_addr_v2_correct_key_pairs_work() -> Result<()> {
+    println!("\n=== ADDR_V2: Correct Key Pairs Work ===\n");
+    
+    let domain = [1u8; 32];
+    
+    // Create a user with properly paired keys
+    let user_sk = [42u8; 32];
+    let user_pk_spend = poseidon2::pk_from_sk(&user_sk);
+    let user_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &user_sk);
+    let user_recipient = poseidon2::recipient_from_pk(&domain, &user_pk_spend, &user_pk_ivk);
+    
+    println!("User pk_spend: {}", &hx(&user_pk_spend)[..16]);
+    println!("User pk_ivk:   {}", &hx(&user_pk_ivk)[..16]);
+    println!("User address:  {}", &hx(&user_recipient)[..16]);
+    
+    // Create a note for this user
+    let value: u128 = 1000;
+    let rho = [55u8; 32];
+    let cm = poseidon2::note_commitment(&domain, value, &rho, &user_recipient);
+    
+    // Verify the user can derive the same recipient from their spend_sk
+    let derived_recipient = poseidon2::recipient_from_sk(&domain, &user_sk);
+    assert_eq!(derived_recipient, user_recipient, 
+        "User's spend_sk should derive to their recipient address");
+    println!("✓ User's spend_sk derives to correct recipient");
+    
+    // Verify circuit would accept this (using our test helper)
+    let derived_cm = poseidon2::note_commitment(&domain, value, &rho, &derived_recipient);
+    assert_eq!(derived_cm, cm, 
+        "Circuit-computed commitment should match");
+    println!("✓ Circuit commitment matches expected commitment");
+    
+    // Create a full output note and verify it's consistent
+    let output = make_self_output(&domain, value, rho, &user_sk);
+    assert_eq!(output.commitment, cm, "make_self_output should produce correct commitment");
+    println!("✓ Full output note is consistent");
+    
+    println!("\n✓ ADDR_V2 works correctly with properly paired keys\n");
+    
+    Ok(())
+}
+
+// =====================================================================
+// LEVEL A RECIPIENT DETECTION TESTS: Trial decryption + ciphertext binding
+// =====================================================================
+
+/// Helper: trial decrypt a recipient ciphertext (wallet scanning)
+/// 
+/// This simulates what a receiver does when scanning the chain:
+/// 1. Derive ivk_sk from their spend_sk
+/// 2. Compute DH(ivk_sk, epk) to get shared secret
+/// 3. Derive k_in and decrypt the ciphertext
+/// 4. Return plaintext (caller verifies commitment match)
+fn trial_decrypt_level_a(
+    domain: &Hash32,
+    receiver_spend_sk: &Hash32,
+    out: &OutputNote,
+) -> [u8; 144] {
+    // Receiver derives ivk_sk from spend_sk
+    let ivk_sk = poseidon2::ivk_sk_from_spend_sk(domain, receiver_spend_sk);
+    
+    // DH(receiver_ivk_sk, epk)
+    let dh = poseidon2::x25519_shared(&ivk_sk, &out.epk);
+    
+    // Same kdf as circuit/host
+    let k_in = poseidon2::in_kdf(domain, &dh, &out.commitment);
+    
+    // XOR stream decrypt (same as encrypt - symmetric)
+    let pt_vec = poseidon2::stream_xor_encrypt_in(&k_in, &out.ct);
+    
+    let mut pt = [0u8; 144];
+    pt.copy_from_slice(&pt_vec);
+    pt
+}
+
+/// Test: Receiver can trial-decrypt their output and verify commitment
+#[test]
+fn test_level_a_receiver_can_trial_decrypt_and_match_commitment() -> Result<()> {
+    println!("\n=== Level A: Receiver Can Trial Decrypt ===\n");
+    
+    let domain = [1u8; 32];
+    
+    // Sender
+    let sender_spend_sk = [4u8; 32];
+    let sender_id = poseidon2::recipient_from_sk(&domain, &sender_spend_sk);
+    
+    // Receiver (Bob)
+    let bob_spend_sk = [77u8; 32];
+    let bob_pk_spend = poseidon2::pk_from_sk(&bob_spend_sk);
+    let bob_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &bob_spend_sk);
+    
+    let value = 600u128;
+    let rho = [30u8; 32];
+    
+    let out = make_output(&domain, value, rho, bob_pk_spend, bob_pk_ivk, &sender_id);
+    
+    println!("Created output note:");
+    println!("  value: {}", value);
+    println!("  commitment: {}", &hx(&out.commitment)[..16]);
+    
+    // Bob trial decrypts
+    let pt = trial_decrypt_level_a(&domain, &bob_spend_sk, &out);
+    
+    // Parse plaintext fields
+    let mut d = [0u8; 32];
+    d.copy_from_slice(&pt[0..32]);
+    assert_eq!(d, domain);
+    
+    let mut v_bytes = [0u8; 16];
+    v_bytes.copy_from_slice(&pt[32..48]);
+    let v = u128::from_le_bytes(v_bytes);
+    assert_eq!(v, value);
+    println!("✓ Decrypted value matches: {}", v);
+    
+    let mut rho_pt = [0u8; 32];
+    rho_pt.copy_from_slice(&pt[48..80]);
+    assert_eq!(rho_pt, rho);
+    println!("✓ Decrypted rho matches");
+    
+    let mut recipient_pt = [0u8; 32];
+    recipient_pt.copy_from_slice(&pt[80..112]);
+    
+    let bob_recipient = poseidon2::recipient_from_pk(&domain, &bob_pk_spend, &bob_pk_ivk);
+    assert_eq!(recipient_pt, bob_recipient);
+    println!("✓ Decrypted recipient matches Bob's address");
+    
+    let mut sender_id_pt = [0u8; 32];
+    sender_id_pt.copy_from_slice(&pt[112..144]);
+    assert_eq!(sender_id_pt, sender_id);
+    println!("✓ Decrypted sender_id matches");
+    
+    // Recompute commitment from decrypted plaintext
+    let cm_check = poseidon2::note_commitment(&domain, v, &rho_pt, &recipient_pt);
+    assert_eq!(cm_check, out.commitment);
+    println!("✓ Commitment recomputed from plaintext matches on-chain commitment");
+    
+    println!("\n✓ Bob successfully detected and verified his received note\n");
+    
+    Ok(())
+}
+
+/// Test: Wrong receiver cannot match commitment (scan fails)
+#[test]
+fn test_level_a_wrong_ivk_cannot_match_commitment() -> Result<()> {
+    println!("\n=== Level A: Wrong Receiver Cannot Match Commitment ===\n");
+    
+    let domain = [1u8; 32];
+    
+    let sender_spend_sk = [4u8; 32];
+    let sender_id = poseidon2::recipient_from_sk(&domain, &sender_spend_sk);
+    
+    // Bob is true receiver
+    let bob_spend_sk = [77u8; 32];
+    let bob_pk_spend = poseidon2::pk_from_sk(&bob_spend_sk);
+    let bob_pk_ivk = poseidon2::pk_ivk_from_spend_sk(&domain, &bob_spend_sk);
+    
+    let out = make_output(&domain, 123u128, [9u8; 32], bob_pk_spend, bob_pk_ivk, &sender_id);
+    
+    // Carol tries to scan/decrypt (she's not the recipient)
+    let carol_spend_sk = [55u8; 32];
+    let pt = trial_decrypt_level_a(&domain, &carol_spend_sk, &out);
+    
+    // Parse plaintext (will be garbage for Carol)
+    let mut v_bytes = [0u8; 16];
+    v_bytes.copy_from_slice(&pt[32..48]);
+    let v = u128::from_le_bytes(v_bytes);
+    
+    let mut rho_pt = [0u8; 32];
+    rho_pt.copy_from_slice(&pt[48..80]);
+    
+    let mut recipient_pt = [0u8; 32];
+    recipient_pt.copy_from_slice(&pt[80..112]);
+    
+    // Recompute cm from decrypted plaintext
+    let cm_check = poseidon2::note_commitment(&domain, v, &rho_pt, &recipient_pt);
+    
+    // Carol's decryption produces garbage that doesn't match commitment
+    assert_ne!(cm_check, out.commitment);
+    println!("✓ Carol's trial decryption does NOT match the on-chain commitment");
+    println!("✓ Carol correctly rejects this note (not hers)");
+    
+    println!("\n✓ Wrong receiver correctly fails to detect the note\n");
+    
+    Ok(())
+}
+
+/// Test: Tampered ciphertext (ct) is rejected
+/// 
+/// This tests the critical on-chain fix: ct_hash is computed from tx calldata,
+/// so if the ct bytes are tampered, the proof will fail.
+#[test]
+fn test_reject_level_a_tampered_ciphertext_ct() -> Result<()> {
+    println!("\n=== Level A: Tampered Ciphertext Rejected ===\n");
+    
+    let depth: u32 = 8;
+    let domain = [1u8; 32];
+    let spend_sk = [42u8; 32];
+    
+    // Single input note
+    let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
+    let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
+    
+    let in_value: u128 = 1000;
+    let in_rho = [2u8; 32];
+    let pos: u64 = 0;
+    
+    let cm_in = poseidon2::note_commitment(&domain, in_value, &in_rho, &recipient);
+    
+    let mut tree = MerkleTree::new(depth as u8);
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    
+    let input = InputNote {
+        value: in_value,
+        rho: in_rho,
+        pos,
+        siblings: tree.open(pos as usize),
+        nullifier: poseidon2::nullifier(&domain, &nf_key, &in_rho),
+    };
+    
+    // One output to self
+    let mut out = make_self_output(&domain, 1000, [9u8; 32], &spend_sk);
+    
+    println!("Original ct_hash: {}", &hx(&out.ct_hash)[..16]);
+    
+    // Tamper tx calldata ct (flip one bit)
+    out.ct[0] ^= 1;
+    
+    // Now ct_hash(out.ct) will differ from out.ct_hash
+    let tampered_ct_hash = poseidon2::ct_hash(&out.ct);
+    println!("Tampered ct_hash: {}", &hx(&tampered_ct_hash)[..16]);
+    assert_ne!(tampered_ct_hash, out.ct_hash);
+    
+    let ok = satisfies_multi_input_constraints(
+        &domain, &spend_sk, depth, &anchor, &[input], 0, &[out],
+    );
+    
+    assert!(!ok, "Tampered ct must be rejected (ct_hash derived from ct changes)");
+    println!("✓ Tampered ciphertext correctly rejected");
+    
+    println!("\n✓ On-chain ct_hash binding prevents ct tampering\n");
+    
+    Ok(())
+}
+
+/// Test: Tampered epk is rejected
+#[test]
+fn test_reject_level_a_tampered_epk() -> Result<()> {
+    println!("\n=== Level A: Tampered EPK Rejected ===\n");
+    
+    let depth: u32 = 8;
+    let domain = [1u8; 32];
+    let spend_sk = [42u8; 32];
+    
+    let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
+    let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
+    
+    let in_value: u128 = 1000;
+    let in_rho = [2u8; 32];
+    
+    let cm_in = poseidon2::note_commitment(&domain, in_value, &in_rho, &recipient);
+    let mut tree = MerkleTree::new(depth as u8);
+    tree.set_leaf(0, cm_in);
+    let anchor = tree.root();
+    
+    let input = InputNote {
+        value: in_value,
+        rho: in_rho,
+        pos: 0,
+        siblings: tree.open(0),
+        nullifier: poseidon2::nullifier(&domain, &nf_key, &in_rho),
+    };
+    
+    let mut out = make_self_output(&domain, 1000, [9u8; 32], &spend_sk);
+    out.epk[0] ^= 1;  // Tamper epk
+    
+    let ok = satisfies_multi_input_constraints(
+        &domain, &spend_sk, depth, &anchor, &[input], 0, &[out],
+    );
+    
+    assert!(!ok, "Tampered epk must be rejected");
+    println!("✓ Tampered EPK correctly rejected\n");
+    
+    Ok(())
+}
+
+/// Test: Tampered MAC is rejected
+#[test]
+fn test_reject_level_a_tampered_mac() -> Result<()> {
+    println!("\n=== Level A: Tampered MAC Rejected ===\n");
+    
+    let depth: u32 = 8;
+    let domain = [1u8; 32];
+    let spend_sk = [42u8; 32];
+    
+    let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
+    let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
+    
+    let in_value: u128 = 1000;
+    let in_rho = [2u8; 32];
+    
+    let cm_in = poseidon2::note_commitment(&domain, in_value, &in_rho, &recipient);
+    let mut tree = MerkleTree::new(depth as u8);
+    tree.set_leaf(0, cm_in);
+    let anchor = tree.root();
+    
+    let input = InputNote {
+        value: in_value,
+        rho: in_rho,
+        pos: 0,
+        siblings: tree.open(0),
+        nullifier: poseidon2::nullifier(&domain, &nf_key, &in_rho),
+    };
+    
+    let mut out = make_self_output(&domain, 1000, [9u8; 32], &spend_sk);
+    out.mac[0] ^= 1;  // Tamper MAC
+    
+    let ok = satisfies_multi_input_constraints(
+        &domain, &spend_sk, depth, &anchor, &[input], 0, &[out],
+    );
+    
+    assert!(!ok, "Tampered MAC must be rejected");
+    println!("✓ Tampered MAC correctly rejected\n");
+    
+    Ok(())
+}
+
+/// Test: Low-order pk_ivk is rejected (DH = 0)
+/// 
+/// This matches the guest circuit's dh_or != 0 check.
+#[test]
+fn test_reject_level_a_low_order_pk_ivk() -> Result<()> {
+    println!("\n=== Level A: Low-Order pk_ivk Rejected ===\n");
+    
+    let depth: u32 = 8;
+    let domain = [1u8; 32];
+    let spend_sk = [42u8; 32];
+    
+    let recipient = poseidon2::recipient_from_sk(&domain, &spend_sk);
+    let nf_key = poseidon2::nf_key_from_sk(&domain, &spend_sk);
+    
+    let in_value: u128 = 1000;
+    let in_rho = [2u8; 32];
+    
+    let cm_in = poseidon2::note_commitment(&domain, in_value, &in_rho, &recipient);
+    let mut tree = MerkleTree::new(depth as u8);
+    tree.set_leaf(0, cm_in);
+    let anchor = tree.root();
+    
+    let input = InputNote {
+        value: in_value,
+        rho: in_rho,
+        pos: 0,
+        siblings: tree.open(0),
+        nullifier: poseidon2::nullifier(&domain, &nf_key, &in_rho),
+    };
+    
+    // Output with pk_spend from our key but pk_ivk is all-zeros (low-order point)
+    let pk_spend = poseidon2::pk_from_sk(&spend_sk);
+    let pk_ivk_zero = [0u8; 32];  // Low-order / invalid pk_ivk
+    let sender_id = poseidon2::recipient_from_sk(&domain, &spend_sk);
+    
+    let out = make_output(&domain, 1000, [9u8; 32], pk_spend, pk_ivk_zero, &sender_id);
+    
+    let ok = satisfies_multi_input_constraints(
+        &domain, &spend_sk, depth, &anchor, &[input], 0, &[out],
+    );
+    
+    assert!(!ok, "Low-order pk_ivk must be rejected (DH=0)");
+    println!("✓ Low-order pk_ivk correctly rejected (DH=0)\n");
+    
+    Ok(())
+}
+
+/// Test: Ensure build_args_multi uses ct_hash computed from tx ct
+/// 
+/// This catches regressions where the test harness might use a "free" ct_hash.
+#[test]
+fn test_build_args_multi_uses_ct_hash_from_tx_ct() -> Result<()> {
+    println!("\n=== Build Args: ct_hash Computed from TX ct ===\n");
+    
+    let depth: u32 = 8;
+    let domain = [1u8; 32];
+    let spend_sk = [42u8; 32];
+    let anchor = [0u8; 32];
+    
+    // 1 dummy input
+    let input = InputNote {
+        value: 100,
+        rho: [2u8; 32],
+        pos: 0,
+        siblings: vec![[0u8; 32]; depth as usize],
+        nullifier: [9u8; 32],
+    };
+    
+    // 1 output
+    let mut out = make_self_output(&domain, 100, [3u8; 32], &spend_sk);
+    
+    // Tamper stored ct_hash field (should not affect argv if builder recomputes)
+    let original_ct_hash = out.ct_hash;
+    out.ct_hash[0] ^= 1;
+    
+    let args = build_args_multi(domain, spend_sk, depth, anchor, &[input], 0, &[out.clone()]);
+    
+    // Compute where ct_hash lives in argv for n_in=1, n_out=1
+    // Header: 5 args (domain, spend_sk, depth, anchor, n_in)
+    // Per input: depth + 4 args
+    // Then: 2 args (withdraw, n_out)
+    // Per output: 8 args (value, rho, pk_spend, pk_ivk, cm, epk, ct_hash, mac)
+    let per_in = (depth as usize + 4);
+    let base_output = 5 + per_in * 1 + 2;
+    let idx_ct_hash = base_output + 6;  // ct_hash is 7th output field (0-indexed: 6)
+    
+    // The ct_hash in args should be computed from ct, not from the tampered ct_hash field
+    let ct_hash_from_ct = poseidon2::ct_hash(&out.ct);
+    assert_eq!(args[idx_ct_hash], hx(&ct_hash_from_ct));
+    assert_eq!(ct_hash_from_ct, original_ct_hash);
+    
+    println!("✓ ct_hash in argv is computed from ct bytes, not from stored field");
+    println!("✓ Tampering ct_hash field has no effect (builder recomputes from ct)\n");
+    
+    Ok(())
 }

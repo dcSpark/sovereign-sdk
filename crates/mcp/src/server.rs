@@ -881,9 +881,10 @@ impl CryptoServer {
                 None,
             ))?;
 
-        // Derive output recipient hash from the privacy address
-        let output_pk = output_privacy_addr.to_pk();
-        let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
+        // Derive output recipient hash from the privacy address (ADDR_V2 binds both keys)
+        let output_pk_spend = output_privacy_addr.pk_spend();
+        let output_pk_ivk = output_privacy_addr.pk_ivk();
+        let output_recipient = recipient_from_pk(&DOMAIN, output_pk_spend, output_pk_ivk);
 
         tracing::info!(
             "[transfer] Spending note: tx_hash={}, note_value={}, send_amount={}, rho={}",

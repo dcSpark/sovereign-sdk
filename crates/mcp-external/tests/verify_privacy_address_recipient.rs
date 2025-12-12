@@ -99,7 +99,7 @@ fn test_show_privacy_address_components() {
     println!("   Recipient:       {}", recipient_hex);
     println!();
     println!("How it works:");
-    println!("   1. Privacy address (bech32m) → Public Key (pk)");
-    println!("   2. pk + domain → Recipient (via H('ADDR_V1' || domain || pk))");
+    println!("   1. Privacy address (bech32m) → (pk_spend, pk_ivk)");
+    println!("   2. (pk_spend, pk_ivk) + domain → Recipient (via H('ADDR_V2' || domain || pk_spend || pk_ivk))");
     println!("   3. Recipient is what's stored in the note commitment on-chain");
 }

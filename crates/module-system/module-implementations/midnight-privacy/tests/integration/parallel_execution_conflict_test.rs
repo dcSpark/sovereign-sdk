@@ -13,6 +13,7 @@
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
     Hash32, SpendPublic, ValueMidnightPrivacy, MidnightPrivacyConfig, PendingCommitmentKey,
+    RecipientAttestation, RecipientCiphertext,
 };
 use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::capabilities::mocks::MockKernel;
@@ -37,6 +38,36 @@ fn make_nf(domain: &Hash32, nfkey_byte: u8, rho_byte: u8) -> Hash32 {
     let nf_key = [nfkey_byte; 32];
     let rho = [rho_byte; 32];
     nullifier(domain, &nf_key, &rho)
+}
+
+/// Create mock attestations and ciphertexts for a list of commitments
+fn mock_recipient_data(cms: &[Hash32]) -> (Vec<RecipientAttestation>, Vec<RecipientCiphertext>) {
+    use midnight_privacy::viewing::ct_hash;
+    
+    let mut atts = Vec::with_capacity(cms.len());
+    let mut cts = Vec::with_capacity(cms.len());
+    
+    for cm in cms {
+        let ct_bytes = vec![0u8; 112];
+        let ct_h = ct_hash(&ct_bytes);
+        
+        let att = RecipientAttestation {
+            cm: *cm,
+            epk: [1u8; 32],
+            ct_hash: ct_h,
+            mac: [3u8; 32],
+        };
+        let ct = RecipientCiphertext {
+            cm: *cm,
+            epk: att.epk,
+            ct: ct_bytes,
+            mac: att.mac,
+        };
+        atts.push(att);
+        cts.push(ct);
+    }
+    
+    (atts, cts)
 }
 
 /// This test verifies that the parallel-safe storage pattern works correctly.
@@ -101,11 +132,14 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     let num_parallel_txs = 3usize;
     let mut outputs = Vec::new();
     let mut pub_inputs = Vec::new();
+    let mut recip_ciphertexts = Vec::new();
 
     for i in 0..num_parallel_txs {
         let out = make_cm(&domain, 100 + i as u128, 0x20 + i as u8, 0x30 + i as u8);
         let nf = make_nf(&domain, 0x90 + i as u8, 0x20 + i as u8);
         outputs.push(out);
+        
+        let (recip_atts, recip_cts) = mock_recipient_data(&[out]);
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
@@ -113,9 +147,11 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
             withdraw_amount: 0,
             output_commitments: vec![out],
             view_attestations: None,
+            recipient_attestations: Some(recip_atts),
         };
         cache_pre_verified_spend(pub_input.clone());
         pub_inputs.push(pub_input);
+        recip_ciphertexts.push(recip_cts);
     }
 
     // SIMULATE PARALLEL EXECUTION:
@@ -149,6 +185,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
                 anchor_root: pub_inputs[i].anchor_root,
                 nullifiers: pub_inputs[i].nullifiers.clone(),
                 view_ciphertexts: None,
+                recipient_ciphertexts: Some(recip_ciphertexts[i].clone()),
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,
@@ -316,11 +353,14 @@ fn sequential_execution_works_with_slot_based_storage() {
     let num_txs = 3usize;
     let mut outputs = Vec::new();
     let mut pub_inputs = Vec::new();
+    let mut recip_ciphertexts = Vec::new();
 
     for i in 0..num_txs {
         let out = make_cm(&domain, 200 + i as u128, 0x40 + i as u8, 0x50 + i as u8);
         let nf = make_nf(&domain, 0xA0 + i as u8, 0x40 + i as u8);
         outputs.push(out);
+        
+        let (recip_atts, recip_cts) = mock_recipient_data(&[out]);
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
@@ -328,9 +368,11 @@ fn sequential_execution_works_with_slot_based_storage() {
             withdraw_amount: 0,
             output_commitments: vec![out],
             view_attestations: None,
+            recipient_attestations: Some(recip_atts),
         };
         cache_pre_verified_spend(pub_input.clone());
         pub_inputs.push(pub_input);
+        recip_ciphertexts.push(recip_cts);
     }
 
     let sender = <TestSpec as Spec>::Address::from([0xA1; 28]);
@@ -359,6 +401,7 @@ fn sequential_execution_works_with_slot_based_storage() {
                 anchor_root: pub_input.anchor_root,
                 nullifiers: pub_input.nullifiers.clone(),
                 view_ciphertexts: None,
+                recipient_ciphertexts: Some(recip_ciphertexts[i].clone()),
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,

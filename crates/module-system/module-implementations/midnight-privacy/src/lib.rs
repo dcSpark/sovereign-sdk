@@ -26,9 +26,14 @@ pub use preverified::{
 };
 pub use types::*;
 pub use viewing::{
+    // Viewer encryption (FVK-based)
     decrypt_and_verify_note, decrypt_and_verify_note_with_sender,
     encrypt_note_for_fvk, encrypt_note_for_fvk_with_sender,
     ct_hash, fvk_commitment, view_kdf, view_mac,
+    // Recipient encryption (X25519-based incoming viewing)
+    encrypt_note_for_recipient, encrypt_note_for_recipient_with_sender,
+    decrypt_and_verify_recipient_note, decrypt_recipient_note_unchecked,
+    esk_from_rho_cm, epk_from_rho_cm, in_kdf, in_mac,
 };
 
 #[cfg(feature = "native")]
@@ -256,8 +261,9 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 anchor_root,
                 nullifiers,
                 view_ciphertexts,
+                recipient_ciphertexts,
                 gas,
-            } => Ok(self.transfer(proof, anchor_root, nullifiers, view_ciphertexts, gas, context, state)?),
+            } => Ok(self.transfer(proof, anchor_root, nullifiers, view_ciphertexts, recipient_ciphertexts, gas, context, state)?),
             CallMessage::Withdraw {
                 proof,
                 anchor_root,
@@ -265,6 +271,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 withdraw_amount,
                 to,
                 view_ciphertexts,
+                recipient_ciphertexts,
                 gas,
             } => Ok(self.withdraw(
                 proof,
@@ -273,6 +280,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
                 withdraw_amount,
                 to,
                 view_ciphertexts,
+                recipient_ciphertexts,
                 gas,
                 context,
                 state,

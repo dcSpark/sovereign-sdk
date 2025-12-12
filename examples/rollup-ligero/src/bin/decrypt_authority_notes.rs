@@ -144,9 +144,13 @@ struct DecryptedNote {
     sender_bech32: Option<String>,
 }
 
-/// Convert a 32-byte hash to a bech32 privacy address string
+/// Convert a 32-byte hash to a bech32m string for display purposes.
+/// Note: This is NOT a valid PrivacyAddress (which requires 64 bytes for pk_spend + pk_ivk).
+/// This is just for displaying raw 32-byte hashes like recipient or sender_id.
 fn hash_to_bech32(hash: &Hash32) -> String {
-    PrivacyAddress::from_pk(hash).to_string()
+    use bech32::{Bech32m, Hrp};
+    let hrp = Hrp::parse("privhash").expect("valid HRP");
+    bech32::encode::<Bech32m>(hrp, hash).expect("encoding succeeds")
 }
 
 /// Parse a hex string to 32 bytes

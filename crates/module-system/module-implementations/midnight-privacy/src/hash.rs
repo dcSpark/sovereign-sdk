@@ -341,8 +341,9 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
 // The circuit uses these to bind spending authorization to note ownership.
 
 const PK_TAG: &[u8; 5] = b"PK_V1";
-const ADDR_TAG: &[u8; 7] = b"ADDR_V1";
+const ADDR_TAG: &[u8; 7] = b"ADDR_V2";
 const NFKEY_TAG: &[u8; 8] = b"NFKEY_V1";
+const IVK_SEED_TAG: &[u8; 11] = b"IVK_SEED_V1";
 
 /// Derive public key from spending secret key.
 /// pk = H("PK_V1" || spend_sk)
@@ -354,26 +355,34 @@ pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
-/// Derive privacy recipient address from domain and public key.
-/// recipient = H("ADDR_V1" || domain || pk)
+/// Derive privacy recipient address from domain and both public keys.
+/// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+/// 
+/// IMPORTANT: This binds BOTH the spending key and incoming viewing key into the address.
+/// This prevents the "mismatched encryption" attack where a note is committed to pk_spend X
+/// but encrypted to pk_ivk Y, making it undecryptable by the owner of pk_spend X.
 /// 
 /// This is the internal 32-byte "recipient" value used in note commitments.
-/// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
+/// For the user-facing bech32 address, use PrivacyAddress::new(pk_spend, pk_ivk).
 #[inline]
-pub fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 7 + 32 + 32];
+pub fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    // Fixed-size buffer: tag (7 bytes) + domain (32 bytes) + pk_spend (32 bytes) + pk_ivk (32 bytes) = 103 bytes
+    let mut buf = [0u8; 7 + 32 + 32 + 32];
     buf[..7].copy_from_slice(ADDR_TAG);
     buf[7..39].copy_from_slice(domain);
-    buf[39..].copy_from_slice(pk);
+    buf[39..71].copy_from_slice(pk_spend);
+    buf[71..].copy_from_slice(pk_ivk);
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
 }
 
 /// Derive privacy recipient address from domain and spending secret key.
-/// This is a convenience function: recipient = H("ADDR_V1" || domain || pk_from_sk(spend_sk))
+/// This is a convenience function that derives both pk_spend and pk_ivk from spend_sk:
+/// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
 #[inline]
 pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    let pk = pk_from_sk(spend_sk);
-    recipient_from_pk(domain, &pk)
+    let pk_spend = pk_from_sk(spend_sk);
+    let pk_ivk = pk_ivk_from_sk(domain, spend_sk);
+    recipient_from_pk(domain, &pk_spend, &pk_ivk)
 }
 
 /// Derive nullifier key from domain and spending secret key.
@@ -385,6 +394,45 @@ pub fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
     buf[8..40].copy_from_slice(domain);
     buf[40..].copy_from_slice(spend_sk);
     POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+}
+
+/// Derive incoming viewing key secret from domain and spending secret key.
+/// ivk_sk = H("IVK_SEED_V1" || domain || spend_sk)
+/// 
+/// This is the X25519 secret key used for incoming note encryption.
+/// The receiver uses this to decrypt notes sent to them.
+#[inline]
+pub fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 11 + 32 + 32];
+    buf[..11].copy_from_slice(IVK_SEED_TAG);
+    buf[11..43].copy_from_slice(domain);
+    buf[43..].copy_from_slice(spend_sk);
+    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+}
+
+/// Clamp a 32-byte array for X25519 scalar use (per RFC 7748).
+#[inline]
+pub fn clamp_x25519_scalar(mut s: [u8; 32]) -> [u8; 32] {
+    s[0] &= 248;
+    s[31] &= 127;
+    s[31] |= 64;
+    s
+}
+
+/// Derive the incoming viewing public key (pk_ivk) from spend_sk and domain.
+/// pk_ivk = X25519_BASE(clamp(ivk_sk_from_sk(domain, spend_sk)))
+/// 
+/// This is the X25519 public key that senders encrypt to. It's included in the
+/// payment address alongside pk_spend.
+#[inline]
+pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    
+    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
+    let clamped = clamp_x25519_scalar(ivk_sk);
+    let secret = StaticSecret::from(clamped);
+    let public = PublicKey::from(&secret);
+    *public.as_bytes()
 }
 
 /// Recompute the Merkle root from a leaf using its authentication path.

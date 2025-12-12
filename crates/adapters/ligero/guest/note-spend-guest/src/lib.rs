@@ -15,6 +15,78 @@
  *      (Prevents creating self-owned notes with reused rho that become unspendable)
  *   8) No zero-value notes (inputs or outputs)
  *   9) Viewer attestations only allowed when n_out > 0
+ *  10) Recipient ciphertext binding: for each output, verify epk, ct_hash, mac match
+ *      the encrypted note plaintext using X25519 DH with recipient's ivk pubkey
+ *
+ * RECIPIENT DETECTION (Zcash-style incoming viewing):
+ *   - Each output includes an ephemeral public key (epk) and ciphertext digests
+ *   - Receivers scan by trial-decrypting with their incoming viewing key (ivk_sk)
+ *   - The proof binds epk and ciphertext hash/mac to prevent malformed ciphertexts
+ *   - Actual ciphertext (ct) is NOT a proof argument; it's in tx calldata
+ *   - On-chain verifier computes ct_hash from tx calldata and passes it to proof
+ *
+ * KEY DERIVATION (wallet-side):
+ *   - ivk_seed = Poseidon("IVK_SEED_V1" || domain || spend_sk)
+ *   - ivk_sk = clamp_x25519(ivk_seed)  -- incoming viewing secret key
+ *   - pk_ivk = X25519_BASE(ivk_sk)     -- incoming viewing public key
+ *   - Address shared with senders: (pk_spend, pk_ivk)
+ *
+ * ADDRESS FORMAT (ADDR_V2):
+ *   - recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+ *   - BOTH keys are bound into the address, preventing "mismatched encryption" attacks
+ *   - A sender cannot commit to one pk_spend while encrypting to a different pk_ivk
+ *
+ * =============================================================================
+ * SECURITY NOTES
+ * =============================================================================
+ *
+ * 1) RHO GENERATION (CRITICAL - WALLET RESPONSIBILITY):
+ *    - Wallets MUST generate rho as 32 bytes from a cryptographically secure RNG.
+ *    - Use OS-provided sources: getrandom(), /dev/urandom, or equivalent.
+ *    - With 256 bits of entropy, collision probability is negligible (~2^-256 per pair).
+ *    - Weak RNG or counter-based rho is CATASTROPHIC for privacy.
+ *    - The circuit enforces rho uniqueness WITHIN a transaction only.
+ *
+ * 2) EPK DERIVATION (Defense-in-Depth):
+ *    - epk = X25519_BASE(esk) where esk = H("ESK_V2" || domain || rho || cm)
+ *    - Including cm provides a second layer: even if rho somehow repeats,
+ *      as long as cm differs (different value/recipient), epk will be unique.
+ *    - This eliminates the "rho reuse → public linkability" concern for
+ *      distinct notes, even in hypothetical RNG failure scenarios.
+ *
+ * 3) SENDER IDENTITY IN ENCRYPTED PLAINTEXT (visible after decryption):
+ *    - sender_id = recipient_from_sk(domain, spend_sk) is DERIVED inside the circuit.
+ *    - NOT publicly visible: only the recipient (with ivk_sk) or designated viewers
+ *      (with fvk) can decrypt and see sender_id.
+ *    - CANNOT BE FAKED: sender_id is derived from the same spend_sk that proves
+ *      ownership of input notes, so it's authentically the sender's address.
+ *    - This is INTENTIONAL: allows recipients to cryptographically verify who paid them.
+ *    - Recipients can correlate payments from the same sender.
+ *    - Sender anonymity requires protocol-level changes (not currently supported).
+ *
+ * 4) DOMAIN SEPARATION:
+ *    - pk_spend = H("PK_V1" || spend_sk) does NOT include domain.
+ *    - pk_ivk = H("IVK_SEED_V1" || domain || spend_sk) DOES include domain.
+ *    - If a user reuses spend_sk across domains, senders can correlate via pk_spend.
+ *    - If cross-domain unlinkability is required, use different spend_sk per domain.
+ *
+ * 5) LOW-ORDER POINT DEFENSE (X25519):
+ *    - DH outputs are checked for all-zeros (dh_or != 0).
+ *    - This rejects low-order/small-subgroup pk_ivk values (RFC 7748 recommended).
+ *    - epk is also checked for all-zeros as a sanity guard.
+ *
+ * 6) POSEIDON HASH INJECTIVITY:
+ *    - All security bindings (ct_hash, MACs, commitments) depend on Poseidon hashing.
+ *    - The qp-poseidon-core crate uses injective byte→felt encoding with end markers.
+ *    - On-chain verifier MUST use the exact same Poseidon implementation and encoding.
+ *    - All hash inputs are fixed-length; variable-length would require length prefixes.
+ *
+ * 7) CIPHERTEXT BINDING (On-Chain Requirement):
+ *    - ct_hash is a PUBLIC proof input, but ct bytes are in tx calldata (not proven).
+ *    - The on-chain verifier MUST compute ct_hash = H("CT_HASH_V1" || ct) from calldata.
+ *    - If verifier trusts prover-supplied ct_hash, binding is broken.
+ *
+ * =============================================================================
  *
  * AMOUNT-CAP INTERACTION:
  *   - Each input/output value is bounded by u64::MAX
@@ -43,12 +115,16 @@
  *     n_out_dec           — u64 decimal in {0,1,2}
  *
  *   For each output j in [0..n_out):
- *     value_out_j_dec    — u64 decimal       [PRIVATE]
- *     rho_out_j_hex      — 32-byte hex       [PRIVATE]
- *     pk_out_j_hex       — 32-byte hex       [PRIVATE] - recipient derived from this
- *     cm_out_j_hex       — 32-byte hex       [PUBLIC; must equal computed]
+ *     value_out_j_dec      — u64 decimal       [PRIVATE]
+ *     rho_out_j_hex        — 32-byte hex       [PRIVATE]
+ *     pk_spend_out_j_hex   — 32-byte hex       [PRIVATE] - recipient spend pubkey (Poseidon-derived)
+ *     pk_ivk_out_j_hex     — 32-byte hex       [PRIVATE] - recipient incoming viewing pubkey (X25519)
+ *     cm_out_j_hex         — 32-byte hex       [PUBLIC; must equal computed]
+ *     epk_out_j_hex        — 32-byte hex       [PUBLIC; ephemeral DH pubkey for this output]
+ *     ct_hash_out_j_hex    — 32-byte hex       [PUBLIC; hash of recipient ciphertext]
+ *     mac_out_j_hex        — 32-byte hex       [PUBLIC; MAC binding ct_hash to cm and key]
  *
- *   Optional viewer attestations (unchanged from before):
+ *   Optional viewer attestations (Level B - for designated third-party viewers):
  *     n_viewers_dec      — u32 in {0..=8}
  *     For each viewer:
  *       fvk_commit_hex   — 32-byte hex [PUBLIC]
@@ -65,7 +141,7 @@
  *
  * Hashing uses qp_poseidon_core::Poseidon2Core exactly like on-chain.
  *
- * Viewer plaintexts (Level B) include an attested sender_id:
+ * Plaintexts (both Level A recipient and Level B viewer) include an attested sender_id:
  *   [ domain | value | rho | recipient | sender_id ]
  * 
  * Copyright (C) 2023-2025 Sovereign Labs
@@ -73,6 +149,7 @@
  */
 
 use core::mem::MaybeUninit;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -261,17 +338,40 @@ fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     poseidon2_hash_domain(b"PK_V1", &[spend_sk])
 }
 
-/// recipient_addr = H("ADDR_V1" || domain || pk)
+/// recipient_addr = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+/// 
+/// IMPORTANT: This binds BOTH the spending key and incoming viewing key into the address.
+/// This prevents the "mismatched encryption" attack where a note is committed to pk_spend X
+/// but encrypted to pk_ivk Y, making it undecryptable by the owner of pk_spend X.
 #[inline(always)]
-fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
 }
 
-/// recipient_addr from spend_sk (convenience: sk -> pk -> recipient)
+/// recipient_addr from spend_sk (convenience: sk -> pk_spend, pk_ivk -> recipient)
+/// Derives both pk_spend and pk_ivk from spend_sk and computes the bound address.
 #[inline(always)]
 fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    let pk = pk_from_sk(spend_sk);
-    recipient_from_pk(domain, &pk)
+    let pk_spend = pk_from_sk(spend_sk);
+    let pk_ivk = pk_ivk_from_sk(domain, spend_sk);
+    recipient_from_pk(domain, &pk_spend, &pk_ivk)
+}
+
+/// Derive incoming viewing key secret from domain and spending secret key.
+/// ivk_sk = clamp(H("IVK_SEED_V1" || domain || spend_sk))
+#[inline(always)]
+fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> [u8; 32] {
+    let mut ivk = poseidon2_hash_domain(b"IVK_SEED_V1", &[domain, spend_sk]);
+    clamp_x25519_scalar(&mut ivk);
+    ivk
+}
+
+/// Derive incoming viewing public key from spend_sk.
+/// pk_ivk = X25519_BASE(ivk_sk_from_sk(domain, spend_sk))
+#[inline(always)]
+fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
+    x25519_base(&ivk_sk)
 }
 
 /// nf_key = H("NFKEY_V1" || domain || spend_sk)
@@ -351,6 +451,95 @@ fn encode_note_plain(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Has
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+}
+
+// === Level A: Recipient (incoming) ciphertext ===
+// These enable receivers to scan the chain and detect notes addressed to them
+// using trial decryption with their incoming viewing key (ivk).
+
+/// Derive symmetric key for recipient ciphertext: k_in = H("IN_KDF_V1" || domain || dh_shared || cm)
+#[inline(always)]
+fn in_kdf(domain: &Hash32, dh_shared: &Hash32, cm: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"IN_KDF_V1", &[domain, dh_shared, cm])
+}
+
+/// Compute incoming MAC: mac_in = H("IN_MAC_V1" || k || cm || ct_hash)
+#[inline(always)]
+fn in_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"IN_MAC_V1", &[k, cm, ct_h])
+}
+
+/// Produce the i-th 32-byte stream block for incoming encryption.
+/// Uses separate domain tag from viewer stream to keep cryptographic domains clean.
+#[inline(always)]
+fn in_stream_block(k: &Hash32, ctr: u32) -> Hash32 {
+    let c = ctr.to_le_bytes();
+    poseidon2_hash_domain(b"IN_STREAM_V1", &[k, &c])
+}
+
+/// SNARK-friendly deterministic encryption for incoming (recipient) ciphertext.
+/// Uses IN_STREAM_V1 domain tag (separate from VIEW_STREAM_V1 used for viewer attestations).
+fn stream_xor_encrypt_in(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
+    debug_assert_eq!(pt.len(), ct_out.len());
+    let mut ctr = 0u32;
+    let mut off = 0usize;
+    while off < pt.len() {
+        let ks = in_stream_block(k, ctr);
+        ctr = ctr.wrapping_add(1);
+
+        let take = core::cmp::min(32, pt.len() - off);
+        for i in 0..take {
+            ct_out[off + i] = pt[off + i] ^ ks[i];
+        }
+        off += take;
+    }
+}
+
+/// Derive ephemeral secret key from (domain, rho, cm).
+/// esk = clamp(H("ESK_V2" || domain || rho || cm))
+///
+/// SECURITY: Including `cm` in the derivation provides defense-in-depth:
+/// - If `rho` is accidentally reused across different notes, `cm` will differ,
+///   so `esk` (and thus `epk`) will still be unique.
+/// - This reduces public linkability: without `cm`, reusing `rho` would cause
+///   `epk` to repeat publicly, linking outputs even if commitments differ.
+/// - The circuit enforces rho uniqueness within a transaction, but cannot
+///   enforce global uniqueness across all transactions.
+/// - Including `cm` makes the encryption bound to the specific note.
+///
+/// WALLET REQUIREMENT: Wallets MUST generate `rho` as 32 bytes of uniform
+/// randomness. Weak RNG or counter-based rho generation is CATASTROPHIC
+/// for privacy even with this cm binding.
+#[inline(always)]
+fn esk_from_rho_cm(domain: &Hash32, rho: &Hash32, cm: &Hash32) -> [u8; 32] {
+    let mut esk = poseidon2_hash_domain(b"ESK_V2", &[domain, rho, cm]);
+    clamp_x25519_scalar(&mut esk);
+    esk
+}
+
+/// Apply X25519 scalar clamping to a 32-byte array.
+/// This ensures the scalar is in the proper form for Curve25519 operations.
+#[inline(always)]
+fn clamp_x25519_scalar(s: &mut [u8; 32]) {
+    s[0] &= 248;
+    s[31] &= 127;
+    s[31] |= 64;
+}
+
+/// Compute X25519 public key from secret key: pk = [sk] * G
+#[inline(always)]
+fn x25519_base(sk_bytes: &[u8; 32]) -> [u8; 32] {
+    let sk = X25519Secret::from(*sk_bytes);
+    let pk = X25519PublicKey::from(&sk);
+    pk.to_bytes()
+}
+
+/// Compute X25519 shared secret: shared = [sk] * pk
+#[inline(always)]
+fn x25519_shared(sk_bytes: &[u8; 32], pk_bytes: &[u8; 32]) -> [u8; 32] {
+    let sk = X25519Secret::from(*sk_bytes);
+    let pk = X25519PublicKey::from(*pk_bytes);
+    sk.diffie_hellman(&pk).to_bytes()
 }
 
 const MAX_ARGS: usize = 512;
@@ -522,9 +711,10 @@ pub unsafe extern "C" fn _start() -> ! {
     arg_idx += 1;
 
     // ========== EARLY ARGC CHECK: OUTPUTS ==========
-    // Per output: 4 args (value, rho, pk, cm)
+    // Per output: 8 args (value, rho, pk_spend, pk_ivk, cm, epk, ct_hash, mac)
+    const OUT_ARGS_PER_OUT: u32 = 8;
     let expected_base = expected_min_to_n_out
-        .checked_add(4u32.checked_mul(n_out_u32).unwrap_or_else(|| proc_exit(71))).unwrap_or_else(|| proc_exit(71));
+        .checked_add(OUT_ARGS_PER_OUT.checked_mul(n_out_u32).unwrap_or_else(|| proc_exit(71))).unwrap_or_else(|| proc_exit(71));
     if argc < expected_base { proc_exit(71); }
 
     // Store output data for viewer encryption
@@ -538,6 +728,10 @@ pub unsafe extern "C" fn _start() -> ! {
         OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
         OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
     ];
+
+    // Work buffer for note plaintext and ciphertext (used for recipient + viewer encryption)
+    let mut pt_buf = [0u8; NOTE_PLAIN_LEN];
+    let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
 
     let mut out_sum: u128 = 0;
     for j in 0..n_out {
@@ -556,14 +750,21 @@ pub unsafe extern "C" fn _start() -> ! {
         let rho_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
         arg_idx += 1;
 
-        // pk_out_j (PRIVATE) - recipient is derived from this
+        // pk_spend_out_j (PRIVATE) - recipient spend pubkey (Poseidon-derived)
         let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
         if n == tmp.len() { proc_exit(71); } // reject truncation
-        let pk_out_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        let pk_spend_out_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
         arg_idx += 1;
 
-        // Derive recipient from pk_out_j
-        let rcp_j = recipient_from_pk(&domain, &pk_out_j);
+        // pk_ivk_out_j (PRIVATE) - recipient incoming viewing pubkey (X25519)
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        if n == tmp.len() { proc_exit(71); } // reject truncation
+        let pk_ivk_out_j = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // Derive recipient address from pk_spend_out_j AND pk_ivk_out_j
+        // This binds both keys into the address, preventing mismatched encryption attacks
+        let rcp_j = recipient_from_pk(&domain, &pk_spend_out_j, &pk_ivk_out_j);
 
         // cm_out_j (PUBLIC) - must equal computed
         let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
@@ -574,6 +775,63 @@ pub unsafe extern "C" fn _start() -> ! {
         let cm_cmp = note_commitment(&domain, vj, &rho_j, &rcp_j);
         assert_one(eq_bytes(&cm_cmp, &cm_arg) as i32);
 
+        // epk_out_j (PUBLIC) - ephemeral DH pubkey
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        if n == tmp.len() { proc_exit(71); } // reject truncation
+        let epk_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // Defensive check: reject all-zero epk (should never happen with valid esk derivation)
+        let mut epk_or = 0u8;
+        for b in epk_arg.iter() { epk_or |= *b; }
+        assert_one((epk_or != 0) as i32);
+
+        // ct_hash_out_j (PUBLIC) - hash of recipient ciphertext
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        if n == tmp.len() { proc_exit(71); } // reject truncation
+        let ct_hash_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // mac_out_j (PUBLIC) - MAC binding ct_hash to cm and key
+        let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);
+        if n == tmp.len() { proc_exit(71); } // reject truncation
+        let mac_arg = parse_hex32(&tmp[..n]).unwrap_or_else(|| proc_exit(71));
+        arg_idx += 1;
+
+        // ========== RECIPIENT CIPHERTEXT VERIFICATION (Level A) ==========
+        // This binds the on-chain ciphertext to the note, enabling receiver trial decryption.
+
+        // Derive ephemeral secret from (domain, rho, cm) - cm binding reduces linkability
+        let esk = esk_from_rho_cm(&domain, &rho_j, &cm_arg);
+
+        // Compute epk = X25519_BASE(esk) and verify it matches the public epk_arg
+        let epk_cmp = x25519_base(&esk);
+        assert_one(eq_bytes(&epk_cmp, &epk_arg) as i32);
+
+        // DH shared secret: esk * pk_ivk_out_j
+        let dh = x25519_shared(&esk, &pk_ivk_out_j);
+
+        // Safety check: reject all-zero DH output (invalid public key)
+        let mut dh_or = 0u8;
+        for b in dh.iter() { dh_or |= *b; }
+        assert_one((dh_or != 0) as i32);
+
+        // Derive symmetric key from (domain, dh, cm)
+        let k_in = in_kdf(&domain, &dh, &cm_arg);
+
+        // Encrypt the note plaintext using incoming stream (separate from viewer stream)
+        encode_note_plain(&domain, vj, &rho_j, &rcp_j, &sender_id, &mut pt_buf);
+        stream_xor_encrypt_in(&k_in, &pt_buf, &mut ct_buf);
+
+        // Compute digests that must match public inputs
+        let ct_h = ct_hash(&ct_buf);
+        let macv = in_mac(&k_in, &cm_arg, &ct_h);
+
+        // Verify ct_hash and mac match the public arguments
+        assert_one(eq_bytes(&ct_h, &ct_hash_arg) as i32);
+        assert_one(eq_bytes(&macv, &mac_arg) as i32);
+
+        // Store output for viewer attestations and rho checks
         outs[j] = OutPlain { v: vj, rho: rho_j, rcp: rcp_j, cm: cm_arg };
     }
 
@@ -627,10 +885,7 @@ pub unsafe extern "C" fn _start() -> ! {
         .checked_add((n_viewers as u32).checked_mul(extra_per_viewer as u32).unwrap_or_else(|| proc_exit(71))).unwrap_or_else(|| proc_exit(71));
     if argc != expected_argc_b { proc_exit(71); }
 
-    // Work buffer for note plaintext and ciphertext
-    let mut pt_buf = [0u8; NOTE_PLAIN_LEN];
-    let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
-
+    // Reuse pt_buf and ct_buf from output loop for viewer encryption
     for _v in 0..n_viewers {
         // 1) Public fvk_commitment
         let n = read_cstr(ptrs[arg_idx] as *const u8, &mut tmp);

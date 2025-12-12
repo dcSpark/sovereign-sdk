@@ -590,7 +590,8 @@ impl CryptoServer {
         let ligero = self.ligero_prover.clone();
         let tx_store = self.tx_store.clone();
         let destination_address = params.destination_address.clone();
-        let output_pk = output_privacy_addr.to_pk();
+        let output_pk_spend = *output_privacy_addr.pk_spend();
+        let output_pk_ivk = *output_privacy_addr.pk_ivk();
         let viewing_key = midnight_privacy::FullViewingKey(authority_vfk_bytes);
         let privacy_key = self.privacy_key.clone();
         let authority_vfk_for_transfer = Some(authority_vfk_bytes);
@@ -735,7 +736,7 @@ impl CryptoServer {
             let mut input_rho = [0u8; 32];
             input_rho.copy_from_slice(&rho_bytes);
             let input_recipient = privacy_guard.recipient(&DOMAIN);
-            let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
+            let output_recipient = recipient_from_pk(&DOMAIN, &output_pk_spend, &output_pk_ivk);
 
             tracing::info!(
                 "[send] Input note - value: {}, rho: {}, recipient: {}",

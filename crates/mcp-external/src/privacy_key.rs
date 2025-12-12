@@ -5,24 +5,33 @@
 //! for privacy pool operations.
 //!
 //! The spending secret key (spend_sk) enables:
-//! - Deriving public key: pk = H("PK_V1" || spend_sk)
-//! - Deriving recipient: recipient = H("ADDR_V1" || domain || pk)
+//! - Deriving public key: pk_spend = H("PK_V1" || spend_sk)
+//! - Deriving recipient: recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
 //! - Deriving nullifier key: nf_key = H("NFKEY_V1" || domain || spend_sk)
+//! - Deriving incoming viewing key: ivk_sk = H("IVK_SEED_V1" || domain || spend_sk)
+//! - Deriving incoming viewing public key: pk_ivk = X25519_BASE(clamp(ivk_sk))
 
 use anyhow::{Context, Result};
-use midnight_privacy::{nf_key_from_sk, pk_from_sk, recipient_from_pk, Hash32, PrivacyAddress};
+use midnight_privacy::{nf_key_from_sk, pk_from_sk, pk_ivk_from_sk, recipient_from_pk, Hash32, PrivacyAddress};
+
+/// Default domain for key derivation (used for pk_ivk)
+/// This should match the domain used in the guest program.
+const DEFAULT_DOMAIN: Hash32 = [0u8; 32];
 
 /// Privacy key context that manages the spending secret key for privacy operations
 ///
 /// The spending secret key is a 32-byte key that can be used to:
 /// - Receive funds (via derived public key and recipient address)
 /// - Spend notes (via derived nullifier key)
+/// - Decrypt incoming notes (via derived incoming viewing key)
 #[derive(Clone)]
 pub struct PrivacyKey {
     /// The 32-byte spending secret key
     spend_sk: Hash32,
-    /// Cached public key derived from spend_sk
-    pk: Hash32,
+    /// Cached spending public key derived from spend_sk
+    pk_spend: Hash32,
+    /// Cached incoming viewing public key (X25519) derived from spend_sk
+    pk_ivk: Hash32,
 }
 
 impl PrivacyKey {
@@ -48,21 +57,24 @@ impl PrivacyKey {
         let mut spend_sk = [0u8; 32];
         spend_sk.copy_from_slice(&spend_sk_bytes);
 
-        // Derive public key once during initialization
-        let pk = pk_from_sk(&spend_sk);
+        // Derive public keys once during initialization
+        let pk_spend = pk_from_sk(&spend_sk);
+        let pk_ivk = pk_ivk_from_sk(&DEFAULT_DOMAIN, &spend_sk);
 
         tracing::info!("Privacy key initialized");
         tracing::debug!("Spend SK: 0x{}", hex::encode(&spend_sk));
-        tracing::debug!("Derived PK: 0x{}", hex::encode(&pk));
+        tracing::debug!("Derived PK_spend: 0x{}", hex::encode(&pk_spend));
+        tracing::debug!("Derived PK_ivk: 0x{}", hex::encode(&pk_ivk));
 
-        Ok(Self { spend_sk, pk })
+        Ok(Self { spend_sk, pk_spend, pk_ivk })
     }
 
     /// Create a PrivacyKey from a bech32m privacy address string
     ///
-    /// Note: This only stores the public key (pk_out), not the spending secret key.
-    /// With only the public key, you can:
+    /// Note: This only stores the public keys, not the spending secret key.
+    /// With only the public keys, you can:
     /// - Derive recipient addresses (for receiving)
+    /// - Encrypt notes to this recipient
     /// - NOT spend notes (requires spend_sk)
     ///
     /// # Parameters
@@ -73,21 +85,23 @@ impl PrivacyKey {
             .parse()
             .context("Failed to parse privacy address")?;
 
-        let pk = privacy_addr.to_pk();
+        let (pk_spend, pk_ivk) = privacy_addr.keys();
 
-        tracing::info!("Privacy key initialized from address (public key only)");
-        tracing::debug!("PK: 0x{}", hex::encode(&pk));
+        tracing::info!("Privacy key initialized from address (public keys only)");
+        tracing::debug!("PK_spend: 0x{}", hex::encode(pk_spend));
+        tracing::debug!("PK_ivk: 0x{}", hex::encode(pk_ivk));
         tracing::warn!("Note: Without spend_sk, spending operations will not be possible");
 
         Ok(Self {
             spend_sk: [0u8; 32], // Zero spend_sk when created from address
-            pk,
+            pk_spend: *pk_spend,
+            pk_ivk: *pk_ivk,
         })
     }
 
     /// Get the raw spending secret key bytes
     ///
-    /// Returns None if this PrivacyKey was created from an address (public key only)
+    /// Returns None if this PrivacyKey was created from an address (public keys only)
     pub fn spend_sk(&self) -> Option<&Hash32> {
         // Check if spend_sk is all zeros (created from address)
         if self.spend_sk == [0u8; 32] {
@@ -97,22 +111,34 @@ impl PrivacyKey {
         }
     }
 
-    /// Get the derived public key
+    /// Get the derived spending public key
     #[allow(dead_code)]
     pub fn pk(&self) -> &Hash32 {
-        &self.pk
+        &self.pk_spend
+    }
+
+    /// Get the derived spending public key (explicit name)
+    #[allow(dead_code)]
+    pub fn pk_spend(&self) -> &Hash32 {
+        &self.pk_spend
+    }
+
+    /// Get the derived incoming viewing public key (X25519)
+    #[allow(dead_code)]
+    pub fn pk_ivk(&self) -> &Hash32 {
+        &self.pk_ivk
     }
 
     /// Get the privacy address (bech32m format)
     pub fn privacy_address(&self) -> PrivacyAddress {
-        PrivacyAddress::from_pk(&self.pk)
+        PrivacyAddress::new(&self.pk_spend, &self.pk_ivk)
     }
 
     /// Derive the recipient address for a given domain
     ///
-    /// recipient = H("ADDR_V1" || domain || pk)
+    /// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
     pub fn recipient(&self, domain: &Hash32) -> Hash32 {
-        recipient_from_pk(domain, &self.pk)
+        recipient_from_pk(domain, &self.pk_spend, &self.pk_ivk)
     }
 
     /// Derive the nullifier key for a given domain
@@ -147,10 +173,16 @@ impl PrivacyKey {
         self.spend_sk().map(|sk| hex::encode(sk))
     }
 
-    /// Get the public key as a hex string
+    /// Get the spending public key as a hex string
     #[allow(dead_code)]
     pub fn pk_hex(&self) -> String {
-        hex::encode(&self.pk)
+        hex::encode(&self.pk_spend)
+    }
+
+    /// Get the incoming viewing public key as a hex string
+    #[allow(dead_code)]
+    pub fn pk_ivk_hex(&self) -> String {
+        hex::encode(&self.pk_ivk)
     }
 }
 
@@ -303,8 +335,9 @@ mod tests {
         // Now create a key from just the address
         let key_from_addr = PrivacyKey::from_address(&addr_str).unwrap();
 
-        // Public key should match
-        assert_eq!(key_from_addr.pk(), key_with_sk.pk());
+        // Both public keys should match
+        assert_eq!(key_from_addr.pk_spend(), key_with_sk.pk_spend());
+        assert_eq!(key_from_addr.pk_ivk(), key_with_sk.pk_ivk());
 
         // But spend_sk should be None
         assert!(
@@ -324,5 +357,20 @@ mod tests {
             key_from_addr.nf_key(&domain).is_none(),
             "Should not be able to derive nf_key without spend_sk"
         );
+    }
+
+    #[test]
+    fn test_pk_ivk_derivation() {
+        let key = PrivacyKey::from_hex(TEST_SPEND_SK_HEX).unwrap();
+        
+        // pk_ivk should be 32 bytes
+        assert_eq!(key.pk_ivk().len(), 32, "PK_ivk should be 32 bytes");
+        
+        // pk_ivk should be deterministic
+        let key2 = PrivacyKey::from_hex(TEST_SPEND_SK_HEX).unwrap();
+        assert_eq!(key.pk_ivk(), key2.pk_ivk(), "PK_ivk derivation should be deterministic");
+        
+        // pk_ivk should be different from pk_spend
+        assert_ne!(key.pk_spend(), key.pk_ivk(), "PK_spend and PK_ivk should be different");
     }
 }

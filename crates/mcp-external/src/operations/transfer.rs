@@ -385,8 +385,9 @@ async fn create_transfer_unsigned_tx(
     let transfer_call = MidnightCallMessage::<McpSpec>::Transfer {
         proof: safe_proof,
         anchor_root,
-        nullifier,
+        nullifiers: vec![nullifier],
         view_ciphertexts,
+        recipient_ciphertexts: None, // TODO: Add recipient ciphertext support
         gas: None,
     };
 
@@ -742,10 +743,11 @@ pub async fn transfer(
     }
     let public_output = SpendPublic {
         anchor_root,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
         output_commitments,
         view_attestations,
+        recipient_attestations: None, // TODO: Add recipient attestation support
     };
 
     let proof_package = LigeroProofPackage {

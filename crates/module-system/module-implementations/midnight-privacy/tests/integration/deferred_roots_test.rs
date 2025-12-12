@@ -13,7 +13,7 @@
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
     Hash32, SpendPublic, ValueMidnightPrivacy, MidnightPrivacyConfig, PendingRootKey,
-    PendingCommitmentKey,
+    PendingCommitmentKey, RecipientAttestation, RecipientCiphertext,
 };
 use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::capabilities::mocks::MockKernel;
@@ -38,6 +38,37 @@ fn make_nf(domain: &Hash32, nfkey_byte: u8, rho_byte: u8) -> Hash32 {
     let nf_key = [nfkey_byte; 32];
     let rho = [rho_byte; 32];
     nullifier(domain, &nf_key, &rho)
+}
+
+/// Create mock attestations and ciphertexts for a list of commitments
+fn mock_recipient_data(cms: &[Hash32]) -> (Vec<RecipientAttestation>, Vec<RecipientCiphertext>) {
+    // Use the real ct_hash function to create matching pairs
+    use midnight_privacy::viewing::ct_hash;
+    
+    let mut atts = Vec::with_capacity(cms.len());
+    let mut cts = Vec::with_capacity(cms.len());
+    
+    for cm in cms {
+        let ct_bytes = vec![0u8; 112]; // minimal dummy ciphertext
+        let ct_h = ct_hash(&ct_bytes);
+        
+        let att = RecipientAttestation {
+            cm: *cm,
+            epk: [1u8; 32],
+            ct_hash: ct_h,
+            mac: [3u8; 32],
+        };
+        let ct = RecipientCiphertext {
+            cm: *cm,
+            epk: att.epk,
+            ct: ct_bytes,
+            mac: att.mac,
+        };
+        atts.push(att);
+        cts.push(ct);
+    }
+    
+    (atts, cts)
 }
 
 #[test]
@@ -115,6 +146,9 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let out1 = make_cm(&domain, 123, 0x21, 0x31);
     let out2 = make_cm(&domain, 456, 0x22, 0x32);
     let nf1: Hash32 = make_nf(&domain, 0x99, 0x21);
+    
+    // Create mock recipient data for the outputs
+    let (recip_atts1, recip_cts1) = mock_recipient_data(&[out1, out2]);
 
     let pub1 = SpendPublic {
         anchor_root: initial_root,
@@ -122,6 +156,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         withdraw_amount: 0,
         output_commitments: vec![out1, out2],
         view_attestations: None,
+        recipient_attestations: Some(recip_atts1),
     };
     cache_pre_verified_spend(pub1.clone());
 
@@ -132,6 +167,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             anchor_root: pub1.anchor_root,
             nullifiers: pub1.nullifiers.clone(),
             view_ciphertexts: None,
+            recipient_ciphertexts: Some(recip_cts1),
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
         &ctx,
@@ -174,12 +210,15 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     
     // Prepare another pre-verified transfer anchored to fake root - must fail.
     let nf2: Hash32 = make_nf(&domain, 0x9A, 0x22);
+    let out2_cm = make_cm(&domain, 789, 0x23, 0x33);
+    let (recip_atts2, recip_cts2) = mock_recipient_data(&[out2_cm]);
     let pub2 = SpendPublic {
         anchor_root: fake_same_block_root,
         nullifiers: vec![nf2],
         withdraw_amount: 0,
-        output_commitments: vec![make_cm(&domain, 789, 0x23, 0x33)],
+        output_commitments: vec![out2_cm],
         view_attestations: None,
+        recipient_attestations: Some(recip_atts2),
     };
     cache_pre_verified_spend(pub2.clone());
 
@@ -190,6 +229,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
                 anchor_root: pub2.anchor_root,
                 nullifiers: pub2.nullifiers.clone(),
                 view_ciphertexts: None,
+                recipient_ciphertexts: Some(recip_cts2),
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,
@@ -276,12 +316,15 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     
     // Prepare a new transfer anchored to final_root
     let nf2_new: Hash32 = make_nf(&domain, 0x9C, 0x25);
+    let out2_new_cm = make_cm(&domain, 789, 0x25, 0x35);
+    let (recip_atts2_new, recip_cts2_new) = mock_recipient_data(&[out2_new_cm]);
     let pub2_new = SpendPublic {
         anchor_root: final_root,
         nullifiers: vec![nf2_new],
         withdraw_amount: 0,
-        output_commitments: vec![make_cm(&domain, 789, 0x25, 0x35)],
+        output_commitments: vec![out2_new_cm],
         view_attestations: None,
+        recipient_attestations: Some(recip_atts2_new),
     };
     cache_pre_verified_spend(pub2_new.clone());
     
@@ -291,6 +334,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
             anchor_root: pub2_new.anchor_root,
             nullifiers: pub2_new.nullifiers.clone(),
             view_ciphertexts: None,
+            recipient_ciphertexts: Some(recip_cts2_new),
             gas: Some(<TestSpec as Spec>::Gas::zero()),
         },
         &ctx,
@@ -311,12 +355,15 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
 
     // Attempting to anchor to a foreign-height root must still fail (not recorded in recent/all).
     let nf3: Hash32 = make_nf(&domain, 0x9B, 0x24);
+    let out3_cm = make_cm(&domain, 111, 0x24, 0x34);
+    let (recip_atts3, recip_cts3) = mock_recipient_data(&[out3_cm]);
     let pub3 = SpendPublic {
         anchor_root: foreign_root_1,
         nullifiers: vec![nf3],
         withdraw_amount: 0,
-        output_commitments: vec![make_cm(&domain, 111, 0x24, 0x34)],
+        output_commitments: vec![out3_cm],
         view_attestations: None,
+        recipient_attestations: Some(recip_atts3),
     };
     cache_pre_verified_spend(pub3.clone());
     let err_foreign_anchor = mp
@@ -326,6 +373,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
                 anchor_root: pub3.anchor_root,
                 nullifiers: pub3.nullifiers.clone(),
                 view_ciphertexts: None,
+                recipient_ciphertexts: Some(recip_cts3),
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
             &ctx,

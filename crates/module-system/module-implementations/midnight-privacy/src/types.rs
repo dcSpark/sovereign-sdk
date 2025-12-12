@@ -12,40 +12,77 @@ use crate::hash::Hash32;
 /// Human-readable prefix for privacy pool addresses
 pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 
-/// A privacy pool address (bech32m-encoded public key).
+/// A privacy pool address (bech32m-encoded payment address).
 /// 
-/// This is the user-facing format for privacy recipients. The inner value is
-/// a 32-byte public key (`pk_out`) which is used to derive the actual recipient:
-/// `recipient = H("ADDR_V1" || domain || pk_out)`
+/// This is the user-facing format for privacy recipients. The inner value contains
+/// two 32-byte public keys:
+/// - `pk_spend` (bytes 0..32): Spending authorization key
+/// - `pk_ivk` (bytes 32..64): X25519 public key for incoming note encryption
 /// 
-/// Format: `privpool1<bech32m-encoded-32-bytes>`
+/// Both keys are bound into the note recipient address:
+///   `recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)`
+/// 
+/// This binding prevents the "mismatched encryption" attack where a note is
+/// committed to one pk_spend but encrypted to a different pk_ivk.
+/// 
+/// Format: `privpool1<bech32m-encoded-64-bytes>`
 /// 
 /// # Example
 /// ```ignore
-/// let addr = PrivacyAddress::from_pk(&pk);
+/// let addr = PrivacyAddress::new(&pk_spend, &pk_ivk);
 /// println!("Send to: {}", addr); // privpool1qypqxpq9qcrsszg2pvxq6rs...
 /// 
 /// // Parse from string
 /// let addr: PrivacyAddress = "privpool1qypqxpq9qcrsszg2pvxq6rs...".parse()?;
-/// let pk = addr.to_pk();
+/// let (pk_spend, pk_ivk) = addr.keys();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct PrivacyAddress(pub [u8; 32]);
+pub struct PrivacyAddress {
+    /// Spending public key - used to derive note recipient
+    pub pk_spend: [u8; 32],
+    /// Incoming viewing public key - X25519 key for note encryption
+    pub pk_ivk: [u8; 32],
+}
 
 impl PrivacyAddress {
-    /// Create a PrivacyAddress from a 32-byte public key
-    pub fn from_pk(pk: &Hash32) -> Self {
-        Self(*pk)
+    /// Create a PrivacyAddress from both public keys
+    pub fn new(pk_spend: &Hash32, pk_ivk: &Hash32) -> Self {
+        Self {
+            pk_spend: *pk_spend,
+            pk_ivk: *pk_ivk,
+        }
     }
 
-    /// Get the underlying 32-byte public key
-    pub fn to_pk(&self) -> Hash32 {
-        self.0
+    /// Get the spending public key (used for recipient derivation)
+    pub fn pk_spend(&self) -> &Hash32 {
+        &self.pk_spend
     }
 
-    /// Get reference to the underlying bytes
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+    /// Get the incoming viewing public key (used for note encryption)
+    pub fn pk_ivk(&self) -> &Hash32 {
+        &self.pk_ivk
+    }
+
+    /// Get both keys as a tuple
+    pub fn keys(&self) -> (&Hash32, &Hash32) {
+        (&self.pk_spend, &self.pk_ivk)
+    }
+
+    /// Serialize to 64 bytes (pk_spend || pk_ivk)
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&self.pk_spend);
+        bytes[32..].copy_from_slice(&self.pk_ivk);
+        bytes
+    }
+
+    /// Deserialize from 64 bytes
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let mut pk_spend = [0u8; 32];
+        let mut pk_ivk = [0u8; 32];
+        pk_spend.copy_from_slice(&bytes[..32]);
+        pk_ivk.copy_from_slice(&bytes[32..]);
+        Self { pk_spend, pk_ivk }
     }
 }
 
@@ -53,7 +90,8 @@ impl fmt::Display for PrivacyAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use bech32::{Bech32m, Hrp};
         let hrp = Hrp::parse(PRIVACY_ADDRESS_HRP).expect("valid HRP");
-        let encoded = bech32::encode::<Bech32m>(hrp, &self.0).expect("encoding succeeds");
+        let bytes = self.to_bytes();
+        let encoded = bech32::encode::<Bech32m>(hrp, &bytes).expect("encoding succeeds");
         write!(f, "{}", encoded)
     }
 }
@@ -80,16 +118,16 @@ impl FromStr for PrivacyAddress {
         let _: String = bech32::encode::<Bech32m>(hrp, &data)
             .map_err(|_| PrivacyAddressError::NotBech32m)?;
         
-        if data.len() != 32 {
+        if data.len() != 64 {
             return Err(PrivacyAddressError::WrongLength {
-                expected: 32,
+                expected: 64,
                 got: data.len(),
             });
         }
         
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(&data);
-        Ok(PrivacyAddress(pk))
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(&data);
+        Ok(PrivacyAddress::from_bytes(&bytes))
     }
 }
 
@@ -123,7 +161,10 @@ impl JsonSchema for PrivacyAddress {
         let mut obj = SchemaObject::default();
         obj.instance_type = Some(InstanceType::String.into());
         obj.string = Some(Box::new(StringValidation {
+            // Pattern for bech32m with 64 bytes of data
             pattern: Some(format!("^{}1[a-z0-9]+$", PRIVACY_ADDRESS_HRP)),
+            // Approximate min length: prefix(8) + separator(1) + data(~103) = ~112
+            min_length: Some(100),
             ..Default::default()
         }));
 
@@ -184,6 +225,10 @@ pub struct SpendPublic {
     pub output_commitments: Vec<Hash32>,
     /// Optional viewer attestations (Level B): binds ciphertexts to proof outputs
     pub view_attestations: Option<Vec<ViewAttestation>>,
+    /// Optional recipient attestations: binds incoming ciphertexts to outputs.
+    /// Each output can have exactly one recipient attestation (for the intended receiver).
+    /// The on-chain verifier computes ct_hash from actual ct bytes and verifies it matches.
+    pub recipient_attestations: Option<Vec<RecipientAttestation>>,
 }
 
 /// A single viewer attestation binding (output_cm, viewer_fvk_commitment, ct_hash, mac).
@@ -199,6 +244,138 @@ pub struct ViewAttestation {
     pub ct_hash: Hash32,
     /// MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
     pub mac: Hash32,
+}
+
+/// A single recipient attestation binding for incoming note encryption.
+/// 
+/// This enables receivers to detect and decrypt notes sent to them without
+/// leaking information about the recipient on-chain. The proof binds:
+/// - `epk`: Ephemeral public key (derived from rho, so deterministic)
+/// - `ct_hash`: Hash of the encrypted note plaintext
+/// - `mac`: MAC binding the ciphertext to (cm, receiver's pk_ivk)
+/// 
+/// The on-chain verifier MUST:
+/// 1. Read `ct` bytes from the transaction output
+/// 2. Compute `ct_hash_chain = H("CT_HASH_V1" || ct)`
+/// 3. Verify `ct_hash_chain == ct_hash` from proof
+/// 4. Store `(epk, ct, mac)` in the output record for receivers to scan
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize, UniversalWallet)]
+pub struct RecipientAttestation {
+    /// Output commitment this attestation is bound to
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub cm: Hash32,
+    /// Ephemeral X25519 public key: X25519_BASE(esk_from_rho_cm(domain, rho, cm))
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub epk: Hash32,
+    /// Hash of the recipient ciphertext: H("CT_HASH_V1" || ct)
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub ct_hash: Hash32,
+    /// MAC: H("IN_MAC_V1" || k_in || cm || ct_hash)
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub mac: Hash32,
+}
+
+impl JsonSchema for RecipientAttestation {
+    fn schema_name() -> String {
+        "RecipientAttestation".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::Object.into());
+
+        let mut properties = std::collections::BTreeMap::new();
+        for field in ["cm", "epk", "ct_hash", "mac"] {
+            properties.insert(
+                field.to_string(),
+                Schema::Object(SchemaObject {
+                    instance_type: Some(InstanceType::String.into()),
+                    format: Some("hex".to_string()),
+                    ..Default::default()
+                }),
+            );
+        }
+
+        obj.object = Some(Box::new(ObjectValidation {
+            properties,
+            required: ["cm", "epk", "ct_hash", "mac"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }));
+
+        Schema::Object(obj)
+    }
+}
+
+/// Encrypted note for the recipient (incoming encryption).
+/// 
+/// This is the on-chain data that enables receivers to detect and decrypt notes.
+/// The receiver scans by:
+/// 1. Compute `dh = X25519(ivk_sk, epk)`
+/// 2. If `dh` is all-zero, skip (low-order point)
+/// 3. Derive `k_in = H("IN_KDF_V1" || domain || dh || cm)`
+/// 4. Decrypt `pt = ct XOR stream(k_in)`
+/// 5. Verify `mac == H("IN_MAC_V1" || k_in || cm || H("CT_HASH_V1" || ct))`
+/// 6. Parse note from `pt` and verify `cm` matches
+/// 7. **CRITICAL**: Verify `recipient_in_note == H("ADDR_V2" || domain || my_pk_spend || my_pk_ivk)`
+/// 
+/// With ADDR_V2, both pk_spend and pk_ivk are bound into the address. This prevents
+/// the "mismatched encryption" attack where an attacker uses your `pk_ivk` but a
+/// different `pk_spend`. If keys don't match, the commitment won't match (step 6 fails).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize, UniversalWallet)]
+pub struct RecipientCiphertext {
+    /// The on-chain commitment this ciphertext is bound to
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub cm: Hash32,
+    /// Ephemeral X25519 public key for DH key agreement
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub epk: Hash32,
+    /// Encrypted note plaintext (Poseidon-stream XOR with IN_STREAM_V1)
+    pub ct: Vec<u8>,
+    /// MAC: H("IN_MAC_V1" || k_in || cm || ct_hash)
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub mac: Hash32,
+}
+
+impl JsonSchema for RecipientCiphertext {
+    fn schema_name() -> String {
+        "RecipientCiphertext".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::Object.into());
+
+        let mut properties = std::collections::BTreeMap::new();
+        for field in ["cm", "epk", "mac"] {
+            properties.insert(
+                field.to_string(),
+                Schema::Object(SchemaObject {
+                    instance_type: Some(InstanceType::String.into()),
+                    format: Some("hex".to_string()),
+                    ..Default::default()
+                }),
+            );
+        }
+        properties.insert(
+            "ct".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::Array.into()),
+                ..Default::default()
+            }),
+        );
+
+        obj.object = Some(Box::new(ObjectValidation {
+            properties,
+            required: ["cm", "epk", "ct", "mac"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }));
+
+        Schema::Object(obj)
+    }
 }
 
 /// Witness for a single-input spend (simple demo).

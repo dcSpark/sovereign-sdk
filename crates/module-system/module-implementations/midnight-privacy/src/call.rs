@@ -76,6 +76,13 @@ pub enum CallMessage<S: Spec> {
         /// Optional viewer ciphertexts (created off-chain by the prover).
         /// Each EncryptedNote must have `enc.cm` equal to one of the produced output commitments.
         view_ciphertexts: Option<Vec<EncryptedNote>>,
+        /// Recipient ciphertexts for incoming note detection (MANDATORY when outputs exist).
+        /// - MUST have exactly one ciphertext per output (1:1 mapping)
+        /// - Max 2 ciphertexts (matches max 2 outputs)
+        /// - Each `enc.cm` must equal one of the produced output commitments
+        /// - The on-chain verifier computes ct_hash from ct bytes and verifies it matches the proof
+        /// - None is only valid when there are zero outputs
+        recipient_ciphertexts: Option<Vec<crate::types::RecipientCiphertext>>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
@@ -116,6 +123,11 @@ pub enum CallMessage<S: Spec> {
         /// Optional viewer ciphertexts (created off-chain by the prover).
         /// Each EncryptedNote must have `enc.cm` equal to one of the produced *change* outputs.
         view_ciphertexts: Option<Vec<EncryptedNote>>,
+        /// Recipient ciphertexts for change output detection (MANDATORY when change outputs exist).
+        /// - MUST have exactly one ciphertext per change output (1:1 mapping)
+        /// - Max 2 ciphertexts (matches max 2 outputs)
+        /// - None is only valid when there are zero change outputs (full withdrawal)
+        recipient_ciphertexts: Option<Vec<crate::types::RecipientCiphertext>>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
     },
@@ -263,6 +275,12 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         st.charge_gas(&gas)?;
 
+        // Reject zero-value deposits - they create unspendable notes
+        // (guest program rejects zero-value inputs, so depositing 0 would waste a tree slot)
+        if amount == 0 {
+            return Err(anyhow::anyhow!("cannot deposit zero amount").into());
+        }
+
         // Convert amount into the bank's amount type (u64 -> Amount)
         let amount_u64: u64 = amount
             .try_into()
@@ -340,6 +358,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifiers: Vec<Hash32>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+        recipient_ciphertexts: Option<Vec<crate::types::RecipientCiphertext>>,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -539,6 +559,109 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 }
             }
 
+            // Recipient ciphertext verification (MANDATORY when outputs exist)
+            // Every output must have exactly one recipient ciphertext for detection/decryption.
+            {
+                use crate::viewing::ct_hash as compute_ct_hash;
+                
+                let outputs_set: HashSet<Hash32> = outputs.iter().copied().collect();
+                let n_outputs = outputs.len();
+                
+                // MANDATORY: If there are outputs, recipient_ciphertexts MUST be provided
+                if n_outputs > 0 && recipient_ciphertexts.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "recipient_ciphertexts are required when outputs exist ({} outputs)",
+                        n_outputs
+                    ).into());
+                }
+                
+                if let Some(rcs) = recipient_ciphertexts {
+                    // Enforce max 2 ciphertexts (matches max 2 outputs)
+                    if rcs.len() > 2 {
+                        return Err(anyhow::anyhow!(
+                            "too many recipient ciphertexts: {} (max 2)",
+                            rcs.len()
+                        ).into());
+                    }
+                    
+                    // Enforce 1:1 mapping: ciphertexts.len() == outputs.len()
+                    if rcs.len() != n_outputs {
+                        return Err(anyhow::anyhow!(
+                            "recipient ciphertext count ({}) must match output count ({})",
+                            rcs.len(),
+                            n_outputs
+                        ).into());
+                    }
+                    
+                    // Require recipient attestations in proof
+                    let attestations = public.recipient_attestations.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "recipient ciphertexts require proof to include recipient_attestations"
+                        )
+                    })?;
+                    
+                    // Build attestation lookup: cm -> (epk, ct_hash, mac)
+                    let mut att_map: std::collections::HashMap<Hash32, (Hash32, Hash32, Hash32)> =
+                        std::collections::HashMap::new();
+                    for att in attestations {
+                        att_map.insert(att.cm, (att.epk, att.ct_hash, att.mac));
+                    }
+                    
+                    for enc in rcs.into_iter() {
+                        // 1. Check cm is in outputs
+                        if !outputs_set.contains(&enc.cm) {
+                            return Err(anyhow::anyhow!(
+                                "recipient ciphertext cm does not match any transfer outputs"
+                            )
+                            .into());
+                        }
+                        
+                        // 2. Check cm exists in attestations
+                        let (expected_epk, expected_ct_hash, expected_mac) = att_map.get(&enc.cm).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "recipient ciphertext cm={} not attested by proof",
+                                hex::encode(enc.cm),
+                            )
+                        })?;
+                        
+                        // 3. Verify epk matches proof attestation
+                        if &enc.epk != expected_epk {
+                            return Err(anyhow::anyhow!(
+                                "epk mismatch: tx {} != proof {}",
+                                hex::encode(enc.epk),
+                                hex::encode(expected_epk)
+                            )
+                            .into());
+                        }
+                        
+                        // 4. Recompute ct_hash from actual ciphertext bytes
+                        let ct_h = compute_ct_hash(&enc.ct);
+                        
+                        // 5. Verify ct_hash matches proof attestation
+                        if &ct_h != expected_ct_hash {
+                            return Err(anyhow::anyhow!(
+                                "recipient ct_hash mismatch: computed {} != proof {}",
+                                hex::encode(ct_h),
+                                hex::encode(expected_ct_hash)
+                            )
+                            .into());
+                        }
+                        
+                        // 6. Verify mac matches proof attestation
+                        if &enc.mac != expected_mac {
+                            return Err(anyhow::anyhow!(
+                                "recipient mac mismatch: tx {} != proof {}",
+                                hex::encode(enc.mac),
+                                hex::encode(expected_mac)
+                            )
+                            .into());
+                        }
+                        
+                        // All checks passed - ciphertext is properly bound to proof
+                    }
+                }
+            }
+
             // Aggregate event (positions are provisional, assigned at flush)
             // Convert view attestations to lightweight viewer bindings for the event
             let viewer_bindings = public.view_attestations.map(|atts| {
@@ -584,6 +707,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+        recipient_ciphertexts: Option<Vec<crate::types::RecipientCiphertext>>,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -805,6 +930,97 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
                     // All checks passed: emit event
                     self.emit_event(st, Event::NoteEncrypted { enc });
+                }
+            }
+
+            // Recipient ciphertext verification for change outputs (MANDATORY when change outputs exist)
+            {
+                use crate::viewing::ct_hash as compute_ct_hash;
+                
+                let outputs_set: HashSet<Hash32> = change_outputs.iter().copied().collect();
+                let n_outputs = change_outputs.len();
+                
+                // MANDATORY: If there are change outputs, recipient_ciphertexts MUST be provided
+                if n_outputs > 0 && recipient_ciphertexts.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "recipient_ciphertexts are required when change outputs exist ({} outputs)",
+                        n_outputs
+                    ).into());
+                }
+                
+                if let Some(rcs) = recipient_ciphertexts {
+                    // Enforce max 2 ciphertexts (matches max 2 outputs)
+                    if rcs.len() > 2 {
+                        return Err(anyhow::anyhow!(
+                            "too many recipient ciphertexts: {} (max 2)",
+                            rcs.len()
+                        ).into());
+                    }
+                    
+                    // Enforce 1:1 mapping: ciphertexts.len() == outputs.len()
+                    if rcs.len() != n_outputs {
+                        return Err(anyhow::anyhow!(
+                            "recipient ciphertext count ({}) must match change output count ({})",
+                            rcs.len(),
+                            n_outputs
+                        ).into());
+                    }
+                    
+                    let attestations = public.recipient_attestations.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "recipient ciphertexts require proof to include recipient_attestations"
+                        )
+                    })?;
+                    
+                    let mut att_map: std::collections::HashMap<Hash32, (Hash32, Hash32, Hash32)> =
+                        std::collections::HashMap::new();
+                    for att in attestations {
+                        att_map.insert(att.cm, (att.epk, att.ct_hash, att.mac));
+                    }
+                    
+                    for enc in rcs.into_iter() {
+                        if !outputs_set.contains(&enc.cm) {
+                            return Err(anyhow::anyhow!(
+                                "recipient ciphertext cm does not match any change outputs"
+                            )
+                            .into());
+                        }
+                        
+                        let (expected_epk, expected_ct_hash, expected_mac) = att_map.get(&enc.cm).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "recipient ciphertext cm={} not attested by proof",
+                                hex::encode(enc.cm),
+                            )
+                        })?;
+                        
+                        if &enc.epk != expected_epk {
+                            return Err(anyhow::anyhow!(
+                                "epk mismatch: tx {} != proof {}",
+                                hex::encode(enc.epk),
+                                hex::encode(expected_epk)
+                            )
+                            .into());
+                        }
+                        
+                        let ct_h = compute_ct_hash(&enc.ct);
+                        if &ct_h != expected_ct_hash {
+                            return Err(anyhow::anyhow!(
+                                "recipient ct_hash mismatch: computed {} != proof {}",
+                                hex::encode(ct_h),
+                                hex::encode(expected_ct_hash)
+                            )
+                            .into());
+                        }
+                        
+                        if &enc.mac != expected_mac {
+                            return Err(anyhow::anyhow!(
+                                "recipient mac mismatch: tx {} != proof {}",
+                                hex::encode(enc.mac),
+                                hex::encode(expected_mac)
+                            )
+                            .into());
+                        }
+                    }
                 }
             }
 
