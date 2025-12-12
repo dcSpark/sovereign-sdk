@@ -26,7 +26,13 @@ where
     // Parse the token ID
     let token_id_parsed: TokenId = token_id
         .parse()
-        .with_context(|| format!("Invalid token ID format: {}", token_id))?;
+        .with_context(|| {
+            tracing::error!(
+                "Invalid token ID format: {}",
+                token_id,
+            );
+            format!("Invalid token ID format: {}", token_id)
+        })?;
 
     // Get the default address from wallet
     let address = wallet.get_address();
@@ -35,12 +41,17 @@ where
     let balance = provider
         .get_balance::<S>(&address, &token_id_parsed)
         .await
-        .with_context(|e| {
+        .inspect_err(|e| {
             tracing::error!(
                 "Failed to get balance for token {} at address {}: {}",
                 token_id, address, e
             );
-            e.to_string()
+        })
+        .with_context(|| {
+            format!(
+                "Failed to get balance for token {} at address {}",
+                token_id, address
+            )
         })?;
 
     Ok((address.to_string(), balance))
