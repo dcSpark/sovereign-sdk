@@ -24,7 +24,8 @@ else
 fi
 
 # Set Ligero verification environment variables
-export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/programs/value_validator.wasm"
+# For midnight privacy proofs, use note_spend_guest.wasm (not value_validator.wasm)
+export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 export LIGERO_SHADER_PATH="$BINS_DIR/shader"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
@@ -36,7 +37,7 @@ if [ ! -f "$LIGERO_VERIFIER_BIN" ]; then
 fi
 
 if [ ! -f "$LIGERO_PROGRAM_PATH" ]; then
-    echo "❌ Error: value_validator.wasm not found at: $LIGERO_PROGRAM_PATH"
+    echo "❌ Error: note_spend_guest.wasm not found at: $LIGERO_PROGRAM_PATH"
     echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
     exit 1
 fi
@@ -56,7 +57,7 @@ echo ""
 
 # Default values for the verifier service
 METHOD_ID="${METHOD_ID:-0x698c44527e4fa3f934471015da3caa61da1f4e167107dbba9df71a6545396fb3}"
-MIDNIGHT_METHOD_ID="${MIDNIGHT_METHOD_ID:-0xd898d7673a91c7f18fda48b9ec6af8cba58edc4103c9d8e9a7a365aa04b62050}"
+MIDNIGHT_METHOD_ID="${MIDNIGHT_METHOD_ID:-0x2744a2f79061dca7ff35598a8d72a2ae3444428a19720b0f05ef9b20ae078dad}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 NODE_RPC_URL="${NODE_RPC_URL:-http://127.0.0.1:12346}"
 SIGNING_KEY_PATH="${SIGNING_KEY_PATH:-$WORKSPACE_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
