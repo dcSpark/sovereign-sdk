@@ -44,7 +44,7 @@
 use clap::Parser;
 use midnight_privacy::{
     viewing::{fvk_commitment as mp_fvk_commitment, view_kdf as mp_view_kdf, ct_hash as mp_ct_hash, view_mac as mp_view_mac},
-    FullViewingKey, Hash32, PrivacyAddress,
+    FullViewingKey, Hash32,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
