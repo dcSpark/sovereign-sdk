@@ -3,6 +3,7 @@ pub mod node;
 pub mod process;
 pub mod verifier;
 pub mod viewer;
+pub mod bench_shared;
 pub mod e2e_runner;
 pub mod continuous_transfers;
 

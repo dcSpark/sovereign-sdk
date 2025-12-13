@@ -1,10 +1,12 @@
 //! Host implementation for Ligero zkVM
 
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sov_rollup_interface::zk::ZkvmHost;
 
@@ -14,6 +16,26 @@ use crate::{LigeroCodeCommitment, LigeroGuest, LigeroProofPackage};
 /// The WebGPU device can fail with "Device Disconnected" errors when multiple
 /// concurrent proof generations attempt to use the GPU simultaneously.
 static GPU_PROVER_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Inter-process GPU lock file path.
+/// Both prover and verifier use this to serialize GPU access across processes.
+const GPU_LOCK_FILE: &str = "/tmp/ligero_gpu.lock";
+
+/// Acquire an exclusive inter-process lock on the GPU.
+/// Returns the lock file which must be held until GPU operation completes.
+fn acquire_gpu_lock() -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(GPU_LOCK_FILE)
+        .context("Failed to open GPU lock file")?;
+    
+    file.lock_exclusive()
+        .context("Failed to acquire exclusive GPU lock")?;
+    
+    Ok(file)
+}
 
 /// Argument type for Ligero prover
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +255,10 @@ impl LigeroHost {
         let _gpu_guard = GPU_PROVER_MUTEX.lock().map_err(|e| {
             anyhow::anyhow!("Failed to acquire GPU mutex for Ligero prover: {}", e)
         })?;
+
+        // Acquire inter-process GPU lock to prevent concurrent GPU access from verifier service
+        let _gpu_file_lock = acquire_gpu_lock()
+            .context("Failed to acquire inter-process GPU lock for prover")?;
 
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)

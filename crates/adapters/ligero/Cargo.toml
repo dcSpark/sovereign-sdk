@@ -19,6 +19,7 @@ arbitrary = { workspace = true, features = ["derive"], optional = true }
 borsh = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
 digest = { workspace = true, features = ["alloc"] }
+fs2 = { version = "0.4", optional = true }
 hex = { workspace = true }
 proptest = { workspace = true, features = ["alloc", "std"], optional = true }
 rand = { workspace = true, optional = true }
@@ -58,6 +59,7 @@ required-features = ["native", "arbitrary"]
 [features]
 default = []
 native = [
+    "fs2",
     "rand",
     "tempfile",
     "sov-rollup-interface/native",

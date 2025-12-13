@@ -1,11 +1,8 @@
+mod stack;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
-use std::io::{self, Write};
-use std::fs;
 
 use chrono::{DateTime, Local};
 
@@ -14,9 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
-    EncryptedNote, RecipientAttestation, Note,
-    viewing::{encrypt_note_for_recipient_with_sender, ct_hash as compute_ct_hash},
+    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree,
     pk_ivk_from_sk, ivk_sk_from_sk, pk_from_sk, recipient_from_pk, nf_key_from_sk,
 };
 use rand::Rng;
@@ -24,52 +19,48 @@ use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
-use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_api_spec::types as api_types;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
-use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tempfile::TempDir;
-use toml::Value as TomlValue;
 
 use crate::{
-    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
-    LigeroEnv, load_authority_fvk, make_viewer_bundle,
+    setup_ligero_env, wait_for_ready,
+    load_authority_fvk,
+};
+use crate::bench_shared::{
+    DemoRollupSpec, DOMAIN, TREE_DEPTH, INITIAL_DEPOSIT_AMOUNT,
+    TREE_REBUILD_MAX_RETRIES, TREE_REBUILD_RETRY_DELAY_MS,
+    MISSING_NOTE_RETRY_MAX, MISSING_NOTE_RETRY_DELAY_MS,
+    rollup_crate_dir, fetch_note_positions as shared_fetch_note_positions,
+    NotesResp, TreeState, RootsResp, VerifierMetrics,
+    generate_transfer_proof, TransferProofInput, build_recipient_ciphertext,
+    build_authority_view_ciphertexts,
 };
 
-type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
-
-const TREE_DEPTH: u8 = 16;
-const TREE_REBUILD_MAX_RETRIES: usize = 5;
-const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
-const MISSING_NOTE_RETRY_MAX: usize = 10;
-const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
-const DOMAIN: [u8; 32] = [1u8; 32];
-const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
+use self::stack::{confirm_and_wipe_demo_data, start_managed_stack, ManagedStack};
 
 #[derive(Clone, Debug)]
-struct ContinuousConfig {
-    num_wallets: usize,
-    initial_deposit: bool,
-    per_tx_delay_ms: u64,
-    cycle_delay_ms: u64,
-    external_node_url: Option<String>,
-    external_verifier_url: Option<String>,
-    max_concurrent_proofs: usize,
-    detailed_wallet_logs: bool,
-    continuous: bool,
-    managed_mode: bool,
+pub(crate) struct ContinuousConfig {
+    pub(crate) num_wallets: usize,
+    pub(crate) initial_deposit: bool,
+    pub(crate) per_tx_delay_ms: u64,
+    pub(crate) cycle_delay_ms: u64,
+    pub(crate) external_node_url: Option<String>,
+    pub(crate) external_verifier_url: Option<String>,
+    pub(crate) max_concurrent_proofs: usize,
+    pub(crate) detailed_wallet_logs: bool,
+    pub(crate) continuous: bool,
+    pub(crate) managed_mode: bool,
     /// Authority Full Viewing Key for Level-B compliance.
     /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
-    authority_fvk: Option<Hash32>,
+    pub(crate) authority_fvk: Option<Hash32>,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
-    max_cycles: Option<u64>,
+    pub(crate) max_cycles: Option<u64>,
 }
 
 impl ContinuousConfig {
@@ -165,280 +156,19 @@ struct WalletState {
     pk_spend: Hash32,
 }
 
-fn rollup_crate_dir() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .ancestors()
-        .find(|p| p.join("Cargo.toml").exists() && p.join("examples/rollup-ligero").exists())
-        .ok_or_else(|| anyhow!("Could not find repository root"))?;
-    Ok(repo_root.join("examples/rollup-ligero"))
-}
-
-fn confirm_and_wipe_demo_data(crate_dir: &Path) -> Result<()> {
-    let demo_data = crate_dir.join("demo_data");
-    if !demo_data.exists() {
-        return Ok(());
-    }
-
-    // Check if we should skip the confirmation prompt
-    let skip_confirm = std::env::var("MANAGED_MODE_SKIP_CONFIRM")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
-
-    eprintln!(
-        "[managed-mode] This will DELETE all data under {}",
-        demo_data.display()
-    );
-
-    if !skip_confirm {
-        eprint!("Type 'yes' to continue (anything else aborts): ");
-        io::stdout().flush().ok();
-
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read confirmation")?;
-        let trimmed = input.trim().to_ascii_lowercase();
-        if trimmed != "yes" {
-            bail!("Aborted by user; demo_data preserved");
-        }
-    } else {
-        eprintln!("[managed-mode] MANAGED_MODE_SKIP_CONFIRM=1 set, proceeding without confirmation");
-    }
-
-    fs::remove_dir_all(&demo_data)
-        .with_context(|| format!("Failed to delete {}", demo_data.display()))?;
-    fs::create_dir_all(&demo_data)
-        .with_context(|| format!("Failed to recreate {}", demo_data.display()))?;
-
-    Ok(())
-}
-
-struct ManagedStack {
-    api_url: String,
-    verifier_url: String,
-    chain_hash: [u8; 32],
-    _temp_dir: TempDir,
-    _child_guard: ChildGuard,
-}
-
-fn make_temp_config(base_config: &str, crate_dir: &Path) -> String {
-    // Rewrite DA connection to point at the real demo_data in the repo so managed mode works from any CWD.
-    let da_conn = format!(
-        "connection_string = \"sqlite://{}/demo_data/da.sqlite?mode=rwc\"",
-        crate_dir.display()
-    );
-
-    let mut out = String::with_capacity(base_config.len() + 64);
-    for line in base_config.lines() {
-        let l = line.trim_start();
-        if l.starts_with("connection_string = ") {
-            out.push_str(&da_conn);
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    out
-}
-
-async fn start_managed_stack(
-    ligero_env: &LigeroEnv,
-    config: &ContinuousConfig,
-) -> Result<ManagedStack> {
-    let crate_dir = rollup_crate_dir()?;
-    let bin_path = find_rollup_binary()?;
-
-    let base_cfg_path = crate_dir.join("rollup_config.toml");
-    let base_cfg = std::fs::read_to_string(&base_cfg_path)
-        .with_context(|| format!("Failed to read base config at {}", base_cfg_path.display()))?;
-
-    let temp = tempfile::tempdir()?;
-    let new_cfg = make_temp_config(&base_cfg, &crate_dir);
-    let cfg_path = temp.path().join("rollup_config.toml");
-    std::fs::write(&cfg_path, new_cfg)?;
-
-    // Parse bind_host/bind_port and DA connection string from the (verbatim) config.
-    let cfg_value: TomlValue = toml::from_str(&base_cfg)
-        .with_context(|| "Failed to parse rollup_config.toml for managed mode")?;
-    let bind_host = cfg_value
-        .get("runner")
-        .and_then(|r| r.get("http_config"))
-        .and_then(|h| h.get("bind_host"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("127.0.0.1");
-    let bind_port = cfg_value
-        .get("runner")
-        .and_then(|r| r.get("http_config"))
-        .and_then(|h| h.get("bind_port"))
-        .and_then(|v| v.as_integer())
-        .unwrap_or(12346);
-    let da_connection_string = format!(
-        "sqlite://{}/demo_data/da.sqlite?mode=rwc",
-        crate_dir.display()
-    );
-
-    let mut child = Command::new(bin_path)
-        .current_dir(crate_dir)
-        .arg("--rollup-config-path")
-        .arg(cfg_path.as_os_str())
-        .arg("--prometheus-exporter-bind")
-        .arg("127.0.0.1:0")
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-        )
-        .env("LIGERO_PROGRAM_PATH", &ligero_env.program_path)
-        .env("LIGERO_VERIFIER_BIN", &ligero_env.verifier_bin)
-        .env("LIGERO_PROVER_BIN", &ligero_env.prover_bin)
-        .env("LIGERO_SHADER_PATH", &ligero_env.shader_dir)
-        .env("LIGERO_PACKING", "8192")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn sov-rollup-ligero")?;
-
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().flatten() {
-                eprintln!("[node stdout] {}", line);
-            }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                eprintln!("[node stderr] {}", line);
-            }
-        });
-    }
-
-    let api_host = if bind_host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        bind_host
-    };
-    let api_url = format!("http://{}:{}", api_host, bind_port);
-    let client = NodeClient::new_unchecked(&api_url);
-    wait_for_ready(&client, Duration::from_secs(90)).await?;
-
-    #[derive(Deserialize)]
-    struct SchemaRespLocal {
-        chain_hash: String,
-    }
-    let schema: SchemaRespLocal = client
-        .query_rest_endpoint("/rollup/schema")
-        .await
-        .context("Failed to fetch /rollup/schema from managed node")?;
-    let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
-    let chain_hash_vec =
-        hex::decode(chain_hash_hex).with_context(|| "Invalid chain_hash returned by node")?;
-    if chain_hash_vec.len() != 32 {
-        bail!("chain_hash must be 32 bytes");
-    }
-    let mut chain_hash = [0u8; 32];
-    chain_hash.copy_from_slice(&chain_hash_vec);
-
-    let verifier_parallelism = std::cmp::max(4, config.max_concurrent_proofs);
-    let verifier_url = start_local_verifier(
-        &api_url,
-        ligero_env.method_id,
-        &da_connection_string,
-        verifier_parallelism,
-        false,
-    )
-    .await?;
-
-    Ok(ManagedStack {
-        api_url,
-        verifier_url,
-        chain_hash,
-        _temp_dir: temp,
-        _child_guard: ChildGuard::new(child),
-    })
-}
-
-#[derive(Deserialize, Clone)]
-struct TreeState {
-    root: Vec<u8>,
-    next_position: u64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    depth: Option<u8>,
-}
-
-#[derive(Deserialize, Clone)]
-struct NoteInfo {
-    position: u64,
-    commitment: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct NotesResp {
-    notes: Vec<NoteInfo>,
-    #[serde(default)]
-    current_root: Option<Vec<u8>>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    count: Option<u64>,
-}
-
+/// Local fetch_note_positions wrapper that adds logging.
 async fn fetch_note_positions(
     client: &NodeClient,
     detailed_wallet_logs: bool,
 ) -> Result<HashMap<[u8; 32], u64>> {
-    let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
-    let batch_size = 1000;
-    let mut offset = 0;
-
-    loop {
-        let endpoint = format!(
-            "/modules/midnight-privacy/notes?limit={}&offset={}",
-            batch_size, offset
-        );
-        let batch_resp: NotesResp = client
-            .query_rest_endpoint(&endpoint)
-            .await
-            .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
-
-        for n in batch_resp.notes.iter() {
-            if n.commitment.len() == 32 {
-                let mut cm = [0u8; 32];
-                cm.copy_from_slice(&n.commitment);
-                pos_by_cm.insert(cm, n.position);
-            }
-        }
-
-        let len = batch_resp.notes.len();
-        if len < batch_size {
-            break;
-        }
-        offset += batch_size;
-    }
-
+    let pos_by_cm = shared_fetch_note_positions(client).await?;
     if detailed_wallet_logs {
         eprintln!(
             "[cycle] refreshed note positions: count={}",
             pos_by_cm.len()
         );
     }
-
     Ok(pos_by_cm)
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct VerifierMetrics {
-    deserialize_ms: f64,
-    parse_ms: f64,
-    signature_verify_ms: f64,
-    proof_verify_ms: f64,
-    tx_creation_ms: f64,
-    node_submit_ms: f64,
-    total_ms: f64,
 }
 
 #[derive(Deserialize)]
@@ -451,11 +181,6 @@ struct VerifierResponse {
     #[allow(dead_code)]
     error: Option<String>,
     metrics: VerifierMetrics,
-}
-
-#[derive(Deserialize, Clone)]
-struct RootsResp {
-    recent_roots: Vec<Hash32>,
 }
 
 #[derive(Clone, Debug)]
@@ -1361,15 +1086,9 @@ async fn perform_transfer_cycle(
         wallet_idx: usize,
         value: u128,
         rho: Hash32,
-        recipient: Hash32,
         position: u64,
-        /// Spend secret key (PRIVATE witness)
+        /// Spend secret key (PRIVATE witness) - all other keys are derived from this
         spend_sk: Hash32,
-        /// Derived nullifier key
-        nf_key: Hash32,
-        /// Wallet's keys for output
-        pk_ivk: Hash32,
-        pk_spend: Hash32,
     }
 
     let mut inputs: Vec<TransferInput> = Vec::new();
@@ -1397,12 +1116,8 @@ async fn perform_transfer_cycle(
                 wallet_idx: idx,
                 value: wallet.value,
                 rho: wallet.rho,
-                recipient: wallet.recipient,
                 position,
                 spend_sk: wallet.spend_sk,
-                nf_key: wallet.nf_key,
-                pk_ivk: wallet.pk_ivk,
-                pk_spend: wallet.pk_spend,
             });
         } else {
             eprintln!(
@@ -1441,9 +1156,6 @@ async fn perform_transfer_cycle(
     );
     let proof_generation_start = Instant::now();
 
-    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
-
-    let depth_usize = TREE_DEPTH as usize;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config.max_concurrent_proofs,
     ));
@@ -1454,172 +1166,36 @@ async fn perform_transfer_cycle(
         let account_idx = input.wallet_idx;
         let value = input.value;
         let in_rho = input.rho;
-        let sender_id = input.recipient; // derived ADDR_V2 for this wallet
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
         let authority_fvk = authority_fvk; // Copy for closure
-        // Keys from input
         let spend_sk = input.spend_sk;
-        let nf_key = input.nf_key;
-        let out_pk_ivk = input.pk_ivk;
-        let out_pk_spend = input.pk_spend;
+        
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32)> {
                 // New output note (same value, fresh rho, send to self)
                 let out_rho: Hash32 = rand::thread_rng().gen();
-                // Use wallet's own address as recipient (self-transfer)
-                let out_recipient = recipient_from_pk(&DOMAIN, &out_pk_spend, &out_pk_ivk);
-                let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
-                // Compute nullifier using derived nf_key
-                let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
-
-                // Compute recipient ciphertext binding data for the proof
-                // The guest expects 144-byte plaintext: [domain|value|rho|recipient|sender_id]
-                let out_note = Note {
-                    domain: DOMAIN,
+                // Build proof input and generate proof using shared function
+                let proof_input = TransferProofInput {
+                    spend_sk,
                     value,
-                    rho: out_rho,
-                    recipient: out_recipient,
+                    in_rho,
+                    position,
+                    siblings,
+                    anchor,
+                    out_rho,
+                    authority_fvk,
                 };
-                let rec_ct = encrypt_note_for_recipient_with_sender(&DOMAIN, &out_pk_ivk, &out_note, &sender_id, &cm_out)
-                    .context("Failed to encrypt note for recipient")?;
-                let out_epk = rec_ct.epk;
-                let out_ct_hash = compute_ct_hash(&rec_ct.ct);
-                let out_mac = rec_ct.mac;
-
-                // Build recipient attestation for SpendPublic
-                let recipient_attestations = Some(vec![RecipientAttestation {
-                    cm: cm_out,
-                    epk: out_epk,
-                    ct_hash: out_ct_hash,
-                    mac: out_mac,
-                }]);
-
-                // Build viewer attestation if authority FVK is set
-                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
-                    let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id, &cm_out,
-                    );
-                    (Some(vec![att.clone()]), Some((fvk, att)))
-                } else {
-                    (None, None)
-                };
-
-                let public = SpendPublic {
-                    anchor_root: anchor,
-                    nullifiers: vec![nf],
-                    withdraw_amount: 0,
-                    output_commitments: vec![cm_out],
-                    view_attestations,
-                    recipient_attestations,
-                };
-
-                // === NEW GUEST ABI: private indices ===
-                // [1] domain (PUBLIC)
-                // [2] spend_sk (PRIVATE)
-                // [3] depth (PUBLIC)
-                // [4] anchor (PUBLIC)
-                // [5] n_in (PUBLIC)
-                // Per input: value(PRIV), rho(PRIV), pos(PRIV), siblings[depth](PRIV), nullifier(PUBLIC) = depth + 4 args
-                // After inputs: withdraw_amount(PUBLIC), n_out(PUBLIC)
-                // Per output: value(PRIV), rho(PRIV), pk_spend(PRIV), pk_ivk(PRIV), cm(PUB), epk(PUB), ct_hash(PUB), mac(PUB) = 8 args
-                // Viewer section: n_viewers, then per viewer: fvk_commit(PUB), fvk(PRIV), per output: ct_hash(PUB), mac(PUB)
-                let n_in: usize = 1;
-                let n_out: usize = 1;
-                // Per input: value, rho, pos, siblings[depth], nullifier = depth + 4 total args
-                let per_in = depth_usize + 4;
                 
-                let mut private_indices = Vec::new();
-                private_indices.push(2); // spend_sk
+                let out = generate_transfer_proof(&program_path, &proof_input)?;
                 
-                // Input private indices (1-based): value=6, rho=7, pos=8, siblings=9..9+depth
-                let in_base = 6; // First input starts at arg 6
-                private_indices.push(in_base);     // value_in
-                private_indices.push(in_base + 1); // rho_in
-                private_indices.push(in_base + 2); // pos_in
-                for k in 0..depth_usize {
-                    private_indices.push(in_base + 3 + k); // siblings
-                }
-                // nullifier at in_base + 3 + depth is PUBLIC
-                
-                // Output value index (1-based):
-                // 5 base args + n_in*(depth+4) input args + nullifier(1) + withdraw(1) + n_out(1) = first output value
-                // Actually: 5 + n_in*per_in + 2 (withdraw, n_out) + 1 = out_base
-                // Simplified: out_base = 5 + n_in * per_in + 3
-                let out_base = 5 + n_in * per_in + 3;
-                
-                // Output private indices: value, rho, pk_spend, pk_ivk (first 4 of 8 per output)
-                private_indices.push(out_base);     // value_out
-                private_indices.push(out_base + 1); // rho_out
-                private_indices.push(out_base + 2); // pk_spend_out
-                private_indices.push(out_base + 3); // pk_ivk_out
-                // cm, epk, ct_hash, mac are PUBLIC (out_base + 4..7)
-
-                // Viewer section: fvk is private
-                if viewer_data.is_some() {
-                    // After outputs: n_out * 8 args per output
-                    let viewer_section_start = out_base + n_out * 8;
-                    // n_viewers at viewer_section_start, fvk_commit at +1, fvk at +2
-                    private_indices.push(viewer_section_start + 2); // fvk
-                }
-
-                let mut host =
-                    <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
-                        .with_private_indices(private_indices);
-
-                // Debug: log wallet and position for debugging
-                eprintln!("[proof] wallet={} position={}", account_idx, position);
-
-                // === NEW GUEST ABI arguments ===
-                host.add_hex_arg(hex::encode(DOMAIN));              // [1] domain (PUBLIC)
-                host.add_hex_arg(hex::encode(spend_sk));            // [2] spend_sk (PRIVATE)
-                host.add_str_arg((TREE_DEPTH as u8).to_string());   // [3] depth
-                host.add_hex_arg(hex::encode(anchor));              // [4] anchor (PUBLIC)
-                host.add_str_arg("1".to_string());                  // [5] n_in (PUBLIC)
-
-                // Input[0]
-                host.add_str_arg(value.to_string());                // value_in (PRIVATE)
-                host.add_hex_arg(hex::encode(in_rho));              // rho_in (PRIVATE)
-                host.add_str_arg((position as u64).to_string());    // pos (PRIVATE)
-                for s in &siblings {
-                    host.add_hex_arg(hex::encode(s));               // siblings (PRIVATE)
-                }
-                host.add_hex_arg(hex::encode(nf));                  // nullifier (PUBLIC)
-
-                host.add_str_arg("0".to_string());                  // withdraw_amount (PUBLIC)
-                host.add_str_arg("1".to_string());                  // n_out (PUBLIC)
-
-                // Output[0]: 8 args
-                host.add_str_arg(value.to_string());                // value_out (PRIVATE)
-                host.add_hex_arg(hex::encode(out_rho));             // rho_out (PRIVATE)
-                host.add_hex_arg(hex::encode(out_pk_spend));        // pk_spend_out (PRIVATE)
-                host.add_hex_arg(hex::encode(out_pk_ivk));          // pk_ivk_out (PRIVATE)
-                host.add_hex_arg(hex::encode(cm_out));              // cm_out (PUBLIC)
-                host.add_hex_arg(hex::encode(out_epk));             // epk_out (PUBLIC)
-                host.add_hex_arg(hex::encode(out_ct_hash));         // ct_hash_out (PUBLIC)
-                host.add_hex_arg(hex::encode(out_mac));             // mac_out (PUBLIC)
-
-                // Viewer section (Level-B)
-                if let Some((fvk, att)) = viewer_data {
-                    host.add_str_arg("1".to_string());              // n_viewers
-                    host.add_hex_arg(hex::encode(att.fvk_commitment));
-                    host.add_hex_arg(hex::encode(fvk));             // fvk (PRIVATE)
-                    host.add_hex_arg(hex::encode(att.ct_hash));
-                    host.add_hex_arg(hex::encode(att.mac));
-                }
-
-                host.set_public_output(&public)
-                    .context("set public output")?;
-
-                let proof_data =
-                    host.run(true).context("generate transfer proof")?;
-                // Return just the new rho (recipient is fixed to wallet.recipient)
-                Ok((account_idx, proof_data, out_rho))
+                // Return wallet idx, proof bytes, and the new rho for tx building
+                Ok((account_idx, out.proof_bytes, out_rho))
             })
             .await
             .expect("spawn_blocking join failed")
@@ -1682,29 +1258,19 @@ async fn perform_transfer_cycle(
             // Output recipient is fixed (ADDR_V2 derived from spend_sk)
             let out_recipient = wallet.recipient;
             let out_pk_ivk = wallet.pk_ivk;
-            let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
             // Build recipient ciphertext for incoming note detection (mandatory)
-            // The guest expects 144-byte plaintext: [domain|value|rho|recipient|sender_id]
             // sender_id is the wallet's own address (the spender)
             let sender_id = wallet.recipient;
-            let out_note = Note {
-                domain: DOMAIN,
-                value,
-                rho: out_rho,
-                recipient: out_recipient,
-            };
-            let rec_ct = encrypt_note_for_recipient_with_sender(&DOMAIN, &out_pk_ivk, &out_note, &sender_id, &cm_out)
-                .context("Failed to encrypt note for recipient in tx building")?;
+            let rec_ct = build_recipient_ciphertext(
+                &out_pk_ivk, value, &out_rho, &out_recipient, &sender_id,
+            ).context("Failed to build recipient ciphertext")?;
             let recipient_ciphertexts = Some(vec![rec_ct]);
 
             // Build encrypted note for authority if configured
-            let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
-                let (_att, enc) = make_viewer_bundle(
-                    &fvk, &DOMAIN, value, &out_rho, &out_recipient, &wallet.recipient, &cm_out,
-                );
-                vec![enc]
-            });
+            let view_ciphertexts = build_authority_view_ciphertexts(
+                authority_fvk, value, &out_rho, &out_recipient, &wallet.recipient,
+            );
 
             let call =
                 RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {

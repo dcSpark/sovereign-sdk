@@ -559,8 +559,9 @@ mod tests {
 mod native {
     use super::{LigeroCodeCommitment, LigeroConfig};
     use anyhow::{Context, Result};
+    use fs2::FileExt;
     use sha2::{Digest, Sha256};
-    use std::fs;
+    use std::fs::{self, File, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Mutex;
@@ -570,6 +571,26 @@ mod native {
     /// The WebGPU device can fail with "Device Disconnected" errors when multiple
     /// concurrent verifications attempt to use the GPU simultaneously.
     static GPU_VERIFIER_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Inter-process GPU lock file path.
+    /// Both prover and verifier use this to serialize GPU access across processes.
+    const GPU_LOCK_FILE: &str = "/tmp/ligero_gpu.lock";
+
+    /// Acquire an exclusive inter-process lock on the GPU.
+    /// Returns the lock file which must be held until GPU operation completes.
+    fn acquire_gpu_lock() -> Result<File> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(GPU_LOCK_FILE)
+            .context("Failed to open GPU lock file")?;
+        
+        file.lock_exclusive()
+            .context("Failed to acquire exclusive GPU lock")?;
+        
+        Ok(file)
+    }
 
     #[derive(Debug)]
     pub struct VerifierPaths {
@@ -824,6 +845,10 @@ mod native {
         let _gpu_guard = GPU_VERIFIER_MUTEX.lock().map_err(|e| {
             anyhow::anyhow!("Failed to acquire GPU mutex for Ligero verification: {}", e)
         })?;
+
+        // Acquire inter-process GPU lock to prevent concurrent GPU access from prover
+        let _gpu_file_lock = acquire_gpu_lock()
+            .context("Failed to acquire inter-process GPU lock for verifier")?;
 
         let output = Command::new(&paths.verifier_bin)
             .arg(&config_json)

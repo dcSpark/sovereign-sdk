@@ -1,38 +1,44 @@
+mod stack;
+mod ledger_stats;
+
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
-    EncryptedNote,
+    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree,
+    SpendPublic,
+    pk_from_sk, pk_ivk_from_sk, recipient_from_pk, nf_key_from_sk,
 };
 use num_cpus;
-use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_modules_api::execution_mode::Native;
 use sov_modules_api::gas::UnlimitedGasMeter;
 use sov_modules_api::transaction::Transaction;
-use sov_modules_api::Spec;
-use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
 use crate::{
-    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
-    load_authority_fvk, make_viewer_bundle,
+    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready,
+    load_authority_fvk,
 };
-use sov_rollup_ligero::MockDemoRollup;
+use crate::bench_shared::{
+    DemoRollupSpec, DOMAIN, TREE_DEPTH, rollup_crate_dir,
+    fetch_chain_hash, fetch_all_notes, TreeState, ModuleStats, NotesResp,
+    VerifierMetrics, VerifierSubmitResponse, submit_to_verifier_with_sync_retry,
+    flush_verifier_queue, load_demo_genesis_keypairs,
+    generate_transfer_proof, TransferProofInput, build_recipient_ciphertext,
+    build_authority_view_ciphertexts,
+};
 
-// Match the spec used by the demo rollup binary
-type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
+use self::stack::{ExternalConfig, prepare_environment};
+use self::ledger_stats::{collect_batch_gas_stats, collect_batch_sizes, format_gas};
 
 /// Configuration for running the E2E benchmark.
 #[derive(Clone, Debug)]
@@ -119,174 +125,6 @@ impl RunnerConfig {
     }
 }
 
-// We no longer rely on the compiled CHAIN_HASH; fetch from /rollup/schema instead.
-
-fn rollup_crate_dir() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .ancestors()
-        .find(|p| p.join("Cargo.toml").exists() && p.join("examples/rollup-ligero").exists())
-        .ok_or_else(|| anyhow!("Could not find repository root"))?;
-    Ok(repo_root.join("examples/rollup-ligero"))
-}
-
-fn make_temp_config(base_config: &str, data_dir: &std::path::Path, http_port: u16) -> String {
-    let da_conn = format!(
-        "connection_string = \"sqlite://{}/da.sqlite?mode=rwc\"",
-        data_dir.display()
-    );
-    let storage_path = format!("path = \"{}\"", data_dir.display());
-    let bind_port = format!("bind_port = {}", http_port);
-
-    let mut out = String::with_capacity(base_config.len() + 256);
-    for line in base_config.lines() {
-        let l = line.trim_start();
-        if l.starts_with("connection_string = ") {
-            out.push_str(&da_conn);
-        } else if l.starts_with("path = ") && !l.contains("target/") {
-            out.push_str(&storage_path);
-        } else if l.starts_with("bind_port = ") {
-            out.push_str(&bind_port);
-        } else if l.starts_with("finalization = ") {
-            // Speed up readiness for tests
-            out.push_str("finalization = 0");
-        } else if l.starts_with("block_time_ms = ") {
-            // Faster mock DA blocks
-            out.push_str("block_time_ms = 200");
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    out
-}
-
-#[derive(Clone, Debug)]
-struct ExternalConfig {
-    node_url: String,
-    verifier_url: String,
-}
-
-impl ExternalConfig {
-    fn from_config(config: &RunnerConfig) -> Result<Option<Self>> {
-        match (&config.external_node_url, &config.external_verifier_url) {
-            (Some(node_url), Some(verifier_url)) => Ok(Some(Self {
-                node_url: node_url.clone(),
-                verifier_url: verifier_url.clone(),
-            })),
-            (None, None) => Ok(None),
-            _ => anyhow::bail!(
-                "Both external node and verifier URLs must be provided to use external services"
-            ),
-        }
-    }
-}
-
-struct TestEnvironment {
-    api_url: String,
-    da_connection_string: Option<String>,
-    #[allow(dead_code)]
-    temp_dir: Option<tempfile::TempDir>,
-    child_guard: Option<ChildGuard>,
-}
-
-impl TestEnvironment {
-    fn external(api_url: String) -> Self {
-        Self {
-            api_url,
-            da_connection_string: None,
-            temp_dir: None,
-            child_guard: None,
-        }
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(mut guard) = self.child_guard.take() {
-            let _ = guard.0.kill();
-            let _ = guard.0.wait();
-        }
-    }
-}
-
-fn prepare_environment(
-    crate_dir: &Path,
-    bin_path: &str,
-    program_path: &str,
-    verifier_bin: &str,
-    prover_bin: &str,
-    shader_dir: &str,
-    external: Option<ExternalConfig>,
-) -> Result<TestEnvironment> {
-    if let Some(cfg) = external {
-        return Ok(TestEnvironment::external(cfg.node_url));
-    }
-
-    let base_cfg_path = crate_dir.join("rollup_config.toml");
-    let base_cfg = std::fs::read_to_string(&base_cfg_path)
-        .with_context(|| format!("Failed to read base config at {}", base_cfg_path.display()))?;
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let http_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let temp = tempfile::tempdir()?;
-    let data_dir = temp.path().join("demo_data");
-    std::fs::create_dir_all(&data_dir)?;
-    let new_cfg = make_temp_config(&base_cfg, &data_dir, http_port);
-    let cfg_path = temp.path().join("rollup_config.toml");
-    std::fs::write(&cfg_path, new_cfg)?;
-
-    let mut child = Command::new(bin_path)
-        .current_dir(crate_dir)
-        .arg("--rollup-config-path")
-        .arg(cfg_path.as_os_str())
-        .arg("--prometheus-exporter-bind")
-        .arg("127.0.0.1:0")
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-        )
-        .env("LIGERO_PROGRAM_PATH", program_path)
-        .env("LIGERO_VERIFIER_BIN", verifier_bin)
-        .env("LIGERO_PROVER_BIN", prover_bin)
-        .env("LIGERO_SHADER_PATH", shader_dir)
-        .env("LIGERO_PACKING", "8192")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn sov-rollup-ligero")?;
-
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().flatten() {
-                eprintln!("[node stdout] {}", line);
-            }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                eprintln!("[node stderr] {}", line);
-            }
-        });
-    }
-
-    let api_url = format!("http://127.0.0.1:{}", http_port);
-    let da_connection_string = format!("sqlite://{}/da.sqlite?mode=rwc", data_dir.display());
-
-    Ok(TestEnvironment {
-        api_url,
-        da_connection_string: Some(da_connection_string),
-        temp_dir: Some(temp),
-        child_guard: Some(ChildGuard::new(child)),
-    })
-}
-
 /// Runs the full E2E benchmark, optionally connecting to external services.
 pub async fn run(config: RunnerConfig) -> Result<()> {
     // Arrange: prepare isolated config or connect to existing services
@@ -315,20 +153,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     wait_for_ready(&client, Duration::from_secs(90)).await?;
 
     // Fetch the authoritative chain_hash from the node's schema endpoint (used for verifier + signing)
-    #[derive(serde::Deserialize)]
-    struct SchemaResp {
-        chain_hash: String,
-    }
-    let schema: SchemaResp = client
-        .query_rest_endpoint("/rollup/schema")
-        .await
-        .context("Failed to fetch /rollup/schema")?;
-    let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
-    let chain_hash_vec = hex::decode(chain_hash_hex)
-        .with_context(|| format!("Invalid chain_hash returned by node: {}", schema.chain_hash))?;
-    anyhow::ensure!(chain_hash_vec.len() == 32, "chain_hash must be 32 bytes");
-    let mut chain_hash = [0u8; 32];
-    chain_hash.copy_from_slice(&chain_hash_vec);
+    let chain_hash = fetch_chain_hash(&client).await?;
 
     // Log authority viewing key status
     let authority_fvk = config.authority_fvk;
@@ -374,32 +199,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
 
     // Load the generated keypairs file
-    let keypairs_path = crate_dir
-        .parent()
-        .unwrap() // examples/
-        .join("test-data/genesis/demo/mock/generated_keypairs.json");
-
-    if !keypairs_path.exists() {
-        anyhow::bail!(
-            "Generated keypairs file not found at {}. Please run: cargo run --bin generate-genesis-keys",
-            keypairs_path.display()
-        );
-    }
-
-    let keypairs_json = std::fs::read_to_string(&keypairs_path).with_context(|| {
-        format!(
-            "Failed to read keypairs file at {}",
-            keypairs_path.display()
-        )
-    })?;
-
-    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
-        serde_json::from_str(&keypairs_json).with_context(|| {
-            format!(
-                "Failed to parse keypairs file at {}",
-                keypairs_path.display()
-            )
-        })?;
+    let all_keypairs = load_demo_genesis_keypairs(&crate_dir)?;
 
     if all_keypairs.len() < num_deposits {
         anyhow::bail!(
@@ -419,58 +219,14 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
 
     // Capture initial module state for robust delta checks
-    #[derive(serde::Deserialize, Clone, Debug)]
-    struct TreeState {
-        root: Vec<u8>,
-        next_position: u64,
-    }
-    #[derive(serde::Deserialize, Clone, Copy, Debug, Default)]
-    struct Stats {
-        #[serde(default)]
-        deposit_count: u64,
-        #[serde(default)]
-        nullifiers_spent: u64,
-    }
     let initial_tree: TreeState = client
         .query_rest_endpoint("/modules/midnight-privacy/tree/state")
         .await
         .context("Failed to query initial midnight-privacy tree state")?;
-    let initial_stats: Stats = client
+    let initial_stats: ModuleStats = client
         .query_rest_endpoint("/modules/midnight-privacy/stats")
         .await
         .unwrap_or_default();
-
-    #[derive(Debug, Clone, serde::Deserialize)]
-    struct VerifierMetrics {
-        #[serde(default)]
-        deserialize_ms: f64,
-        #[serde(default)]
-        parse_ms: f64,
-        #[serde(default)]
-        signature_verify_ms: f64,
-        #[serde(default)]
-        proof_verify_ms: f64,
-        #[serde(default)]
-        tx_creation_ms: f64,
-        #[serde(default)]
-        node_submit_ms: f64,
-        #[serde(default)]
-        total_ms: f64,
-    }
-
-    #[derive(Debug, Clone, serde::Deserialize)]
-    struct VerifierSubmitResponse {
-        #[serde(default)]
-        success: bool,
-        #[serde(default)]
-        tx_hash: Option<String>,
-        #[serde(default)]
-        sequencer_response: Option<serde_json::Value>,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        metrics: Option<VerifierMetrics>,
-    }
 
     fn log_submission_timing(
         kind: &str,
@@ -524,80 +280,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
 
-    async fn submit_to_verifier_with_sync_retry(
-        client: &reqwest::Client,
-        verifier_url: &str,
-        body_b64: &str,
-        label: &str,
-        idx: usize,
-    ) -> anyhow::Result<(VerifierSubmitResponse, f64)> {
-        let mut backoff = Duration::from_millis(50);
-        let max_backoff = Duration::from_secs(2);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let submit_start = std::time::Instant::now();
-            let resp = client
-                .post(format!("{}/midnight-privacy", verifier_url))
-                .json(&serde_json::json!({"body": body_b64}))
-                .send()
-                .await
-                .with_context(|| format!("{} #{} request failed", label, idx))?;
-            let http_elapsed_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .with_context(|| format!("{} #{} failed to read response body", label, idx))?;
-
-            // If verifier itself errors (e.g., 503), consider retry
-            if status.as_u16() == 503 && text.contains("Syncing") {
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "{} #{} retried but node still Syncing (HTTP 503): {}",
-                        label,
-                        idx,
-                        text
-                    );
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
-                continue;
-            }
-
-            // Normal JSON response
-            let parsed: VerifierSubmitResponse = serde_json::from_str(&text)
-                .with_context(|| format!("{} #{} invalid JSON: {}", label, idx, text))?;
-
-            // If sequencer reported Syncing through the verifier (success=false but error present), retry
-            if !parsed.success {
-                let syncing = parsed
-                    .error
-                    .as_deref()
-                    .map(|e| e.contains("\"Syncing\"") || e.contains("fell out of sync"))
-                    .unwrap_or(false);
-                if syncing && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
-                    continue;
-                }
-            }
-
-            return Ok((parsed, http_elapsed_ms));
-        }
-    }
-
-    async fn flush_verifier_queue(http: &reqwest::Client, verifier_url: &str) -> anyhow::Result<()> {
+    /// Wrapper for flush_verifier_queue that adds logging.
+    async fn flush_verifier_queue_with_logs(http: &reqwest::Client, verifier_url: &str) -> anyhow::Result<()> {
         eprintln!("[flush] Flushing queued worker transactions to sequencer...");
-        let resp = http
-            .post(format!("{}/midnight-privacy/flush", verifier_url))
-            .send()
-            .await
-            .context("flush request failed")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "".to_string());
-        if !status.is_success() {
-            anyhow::bail!("flush endpoint returned {}: {}", status, body);
-        }
+        flush_verifier_queue(http, verifier_url).await?;
         eprintln!("[flush] Flushed queued worker transactions to sequencer");
         Ok(())
     }
@@ -687,9 +373,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     let http = reqwest::Client::new();
     let mut tx_hashes_hex: Vec<String> = Vec::with_capacity(num_deposits);
-    // (account_idx, tx_hash, amount, rho, recipient) - track which account made each deposit
-    let mut deposit_secrets: Vec<(usize, String, u128, Hash32, Hash32)> =
+    // (account_idx, tx_hash, amount, rho, recipient, spend_sk) - track which account made each deposit
+    // spend_sk is needed to derive the correct nf_key and other keys for spending
+    let mut deposit_secrets: Vec<(usize, String, u128, Hash32, Hash32, Hash32)> =
         Vec::with_capacity(num_deposits);
+    
     let mut deposit_http_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_node_submit_timings: Vec<f64> = Vec::with_capacity(num_deposits);
     let mut deposit_stf_execution_ms: Vec<f64> = Vec::with_capacity(num_deposits);
@@ -708,9 +396,16 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let account = &accounts[i]; // Each deposit uses a different account
 
         // Build a midnight deposit tx for demo runtime
+        // Generate privacy keys: spend_sk is the master secret, recipient is derived
         let amount: u128 = 100;
         let rho: Hash32 = rand::random();
-        let recipient: Hash32 = rand::random();
+        let spend_sk: Hash32 = rand::random();
+        
+        // Derive recipient address from spend_sk (ADDR_V2 format binding pk_spend + pk_ivk)
+        let pk_spend = pk_from_sk(&spend_sk);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
+        let recipient = recipient_from_pk(&DOMAIN, &pk_spend, &pk_ivk);
+        
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
             amount,
             rho,
@@ -743,7 +438,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         // Submit to the verifier service (preferred) with fallback to sequencer direct
         let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
         let mut submitted_via_verifier = false;
-        match submit_to_verifier_with_sync_retry(&http, &verifier_url, &tx_b64, "deposit", i + 1)
+        match submit_to_verifier_with_sync_retry(&http, &verifier_url, &tx_b64, "deposit", i + 1, Duration::from_secs(30))
             .await
         {
             Ok((parsed, http_elapsed_ms)) => {
@@ -820,7 +515,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             hex::encode(&rho[..8]),
             hex::encode(&recipient[..8])
         );
-        deposit_secrets.push((i, tx_hash_str.clone(), amount, rho, recipient));
+        deposit_secrets.push((i, tx_hash_str.clone(), amount, rho, recipient, spend_sk));
         tx_hashes_hex.push(tx_hash_str);
     }
 
@@ -828,7 +523,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     if config.defer_sequencer_submission {
         eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
         sleep(Duration::from_secs(5)).await;        
-        flush_verifier_queue(&http, &verifier_url).await?;
+        flush_verifier_queue_with_logs(&http, &verifier_url).await?;
     }
 
     // Debug: fetch tx receipt for the last deposit and print
@@ -877,7 +572,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             .http_get(&format!("/ledger/txs/{}?children=1", hash_hex))
                             .await
                             .unwrap_or_else(|e| format!("<failed to fetch ledger json: {e}>"));
-                        if let Some((_, _, amt, rho, recp)) =
+                        if let Some((_, _, amt, rho, recp, _)) =
                             deposit_secrets.iter().find(|(_, h, ..)| h == hash_hex)
                         {
                             eprintln!(
@@ -991,10 +686,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let stats_target = initial_stats.deposit_count + num_deposits as u64;
     let stats_start = std::time::Instant::now();
     let stats_timeout = Duration::from_secs(10);
-    let mut final_stats: Stats = initial_stats;
+    let mut final_stats: ModuleStats = initial_stats;
     loop {
         match client
-            .query_rest_endpoint::<Stats>("/modules/midnight-privacy/stats")
+            .query_rest_endpoint::<ModuleStats>("/modules/midnight-privacy/stats")
             .await
         {
             Ok(s) => {
@@ -1026,28 +721,14 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     // Fetch notes and rebuild Merkle tree to compute sibling paths
     // CRITICAL: Use the tree depth from genesis config, not from API response!
-    // The API might not return depth, causing it to default to 0
-    const TREE_DEPTH: u8 = 16; // Must match ValueSetterZkConfig in genesis (demo/mock/midnight_privacy.json)
-
     eprintln!("\n[proof] Fetching tree state and notes for proof generation...");
-
-    // Define note types
-    #[derive(serde::Deserialize, Clone)]
-    struct NoteInfo {
-        position: u64,
-        commitment: Vec<u8>,
-    }
-    #[derive(serde::Deserialize)]
-    struct NotesResp {
-        notes: Vec<NoteInfo>,
-    }
 
     // Poll until we have the right number of notes in the tree
     // Sometimes epilogue hasn't flushed yet
     let tree_fetch_start = std::time::Instant::now();
     let tree_fetch_timeout = Duration::from_secs(15);
     let mut state: TreeState;
-    let mut notes_resp: NotesResp;
+    let notes_resp: NotesResp;
 
     loop {
         state = client
@@ -1055,39 +736,24 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .await
             .context("Failed to query tree state for proofs")?;
 
-        // Fetch all notes using pagination (API caps at 1000 per request)
-        let mut all_notes = Vec::new();
-        let batch_size = 1000;
-        let mut offset = 0;
-        
-        loop {
-            let batch_resp: NotesResp = client
-                .query_rest_endpoint(&format!("/modules/midnight-privacy/notes?limit={}&offset={}", batch_size, offset))
-                .await
-                .context("Failed to query notes batch")?;
-            
-            let batch_len = batch_resp.notes.len();
-            all_notes.extend(batch_resp.notes);
-            
-            // If we got fewer notes than requested, we've reached the end
-            if batch_len < batch_size {
-                break;
-            }
-            
-            offset += batch_size;
-        }
-        
-        notes_resp = NotesResp { notes: all_notes };
+        // Fetch all notes using shared pagination helper
+        let all_notes = fetch_all_notes(&client).await?;
 
         eprintln!(
             "  [proof] Tree state: next_position={}, notes_count={}, root={}",
             state.next_position,
-            notes_resp.notes.len(),
+            all_notes.len(),
             hex::encode(&state.root[..8])
         );
 
         // We need at least num_deposits notes
-        if notes_resp.notes.len() >= num_deposits && state.next_position >= num_deposits as u64 {
+        if all_notes.len() >= num_deposits && state.next_position >= num_deposits as u64 {
+            // Store notes for later use
+            notes_resp = NotesResp { 
+                notes: all_notes, 
+                current_root: None, 
+                count: None 
+            };
             break;
         }
 
@@ -1095,7 +761,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             anyhow::bail!(
                 "Timeout waiting for tree to contain {} notes. Got {} notes, next_position={}",
                 num_deposits,
-                notes_resp.notes.len(),
+                all_notes.len(),
                 state.next_position
             );
         }
@@ -1103,7 +769,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         eprintln!(
             "  [proof] Waiting for tree to flush notes... (need {} notes, have {})",
             num_deposits,
-            notes_resp.notes.len()
+            all_notes.len()
         );
         sleep(Duration::from_millis(200)).await;
     }
@@ -1119,10 +785,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     sorted_notes.sort_by_key(|n| n.position);
 
     // Compare expected commitments (from our deposits) with API commitments
-    let domain: [u8; 32] = [1u8; 32]; // Must match genesis config!
     eprintln!("\n[tree] Comparing expected vs API commitments:");
-    for (account_idx, txh, amount, rho, recp) in &deposit_secrets {
-        let expected_cm = note_commitment(&domain, *amount, rho, recp);
+    for (account_idx, txh, amount, rho, recp, _spend_sk) in &deposit_secrets {
+        let expected_cm = note_commitment(&DOMAIN, *amount, rho, recp);
         if let Some(api_cm) = deposit_cm_by_hash.get(txh) {
             let match_str = if &expected_cm == api_cm {
                 "✓ MATCH"
@@ -1192,24 +857,24 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     }
 
     // Build transfer proof tasks for each deposit
-    let domain: [u8; 32] = [1u8; 32]; // Must match genesis config!
-    let nf_key: [u8; 32] = [4u8; 32];
     let shared_anchor: [u8; 32] = {
         let mut a = [0u8; 32];
         a.copy_from_slice(&state.root);
         a
     };
 
-    // Collect per-deposit inputs
+    // Collect per-deposit inputs (includes spend_sk for correct key derivation)
     struct DepInput {
         account_idx: usize,
         value: u128,
         rho: Hash32,
         recipient: Hash32,
         position: u64,
+        /// Spend secret key - used to derive nf_key, pk_spend, pk_ivk for proof generation
+        spend_sk: Hash32,
     }
     let mut dep_inputs: Vec<DepInput> = Vec::with_capacity(num_deposits);
-    for (account_idx, txh, amount, rho, recp) in &deposit_secrets {
+    for (account_idx, txh, amount, rho, recp, spend_sk) in &deposit_secrets {
         if let Some(cm) = deposit_cm_by_hash.get(txh) {
             if let Some(&position) = pos_by_cm.get(cm) {
                 eprintln!(
@@ -1225,6 +890,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     rho: *rho,
                     recipient: *recp,
                     position,
+                    spend_sk: *spend_sk,
                 });
             } else {
                 eprintln!(
@@ -1253,8 +919,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     };
 
     // Check cache and generate proofs in parallel (with concurrency limit)
-    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
-    let depth_usize = TREE_DEPTH as usize;
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
     let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
 
@@ -1293,9 +957,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
         let account_idx = input.account_idx;
         let value = input.value;
-        let rho = input.rho;
-        let recipient = input.recipient;
+        let in_rho = input.rho;
         let position = input.position;
+        let spend_sk = input.spend_sk;
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
         let sem = semaphore.clone();
@@ -1304,7 +968,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         proof_tasks.push(tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await.expect("semaphore closed");
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
+            // Return (original_idx, account_idx, proof_bytes) to preserve alignment
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize, Vec<u8>)> {
                 eprintln!(
                     "  [proof] gen_proof idx={} account={} pos={} value={} sib_len={} anchor={} viewer={}",
                     i,
@@ -1315,144 +980,55 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     hex::encode(anchor),
                     authority_fvk.is_some()
                 );
-                // Transfer to self: one input → one output (same value)
-                // Keep the same value (no splitting)
-                let out_value = value;
-                let mut out_rho = [0u8; 32];
-                out_rho[0] = (i as u8).wrapping_add(100); // Different rho for output note
-                let mut out_recipient = [0u8; 32];
-                out_recipient[0] = (i as u8).wrapping_add(101); // Different recipient for output note
-                let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
-
-                // Compute nullifier
-                let nf = nullifier(&domain, &nf_key, &rho);
-
-                // Build viewer attestation if authority FVK is set
-                // sender_id = recipient (the input note's owner / spender's address)
-                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
-                    let (att, _enc) = make_viewer_bundle(
-                        &fvk, &domain, out_value, &out_rho, &out_recipient, &recipient, &cm_out,
-                    );
-                    (Some(vec![att.clone()]), Some((fvk, att)))
-                } else {
-                    (None, None)
+                
+                // Generate deterministic output rho for reproducibility
+                let mut out_rho: Hash32 = [0u8; 32];
+                out_rho[0] = (i as u8).wrapping_add(100);
+                
+                // Build proof input and generate proof using shared function
+                let proof_input = TransferProofInput {
+                    spend_sk,
+                    value,
+                    in_rho,
+                    position,
+                    siblings,
+                    anchor,
+                    out_rho,
+                    authority_fvk,
                 };
-
-                // Public output with view_attestations populated
-                let public = midnight_privacy::SpendPublic {
-                    anchor_root: anchor,
-                    nullifiers: vec![nf],
-                    withdraw_amount: 0,
-                    output_commitments: vec![cm_out], // ONE output
-                    view_attestations,
-                    recipient_attestations: None,
-                };
-
-                // Private indices for 1 output (match guest ABI)
-                // Arguments: 0:domain 1:value 2:rho 3:recipient 4:nf_key 5:pos 6:depth 7..7+depth:siblings
-                //            7+depth:anchor 8+depth:nf 9+depth:withdraw 10+depth:n_out
-                //            11+depth..:outputs
-                let n_out: usize = 1;
-                let mut private_indices = vec![2, 3, 4, 5, 6]; // rho, recipient, nf_key, pos, depth
-                for j in 0..depth_usize {
-                    private_indices.push(7 + j); // siblings
-                }
-                // Output section starts at 11 + depth
-                let out_base = 11 + depth_usize;
-                // For the output, mark private: value, rho, recipient (skip cm which is public)
-                private_indices.extend_from_slice(&[
-                    out_base + 0, // out value
-                    out_base + 1, // out rho
-                    out_base + 2, // out recipient
-                                  // skip out_base + 3 (cm is public)
-                ]);
-
-                // Viewer section: fvk is private
-                if viewer_data.is_some() {
-                    // After outputs: base index for m_viewers
-                    // Layout: 12 + depth + 4*n_out = base_after_outs
-                    // Then: m_viewers, then per viewer: fvk_commit(public), fvk(private), (ct_hash, mac)*n_out
-                    let base_after_outs = 12 + depth_usize + 4 * n_out;
-                    // m_viewers is at base_after_outs, fvk_commit at +1, fvk at +2
-                    let fvk_arg_index = base_after_outs + 2; // fvk itself is private
-                    private_indices.push(fvk_arg_index);
-                }
-
+                
                 let program_path = program_path_for_host.as_ref().clone();
-                let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
-                    .with_private_indices(private_indices);
-
-                // Base args (same as before)
-                host.add_hex_arg(hex::encode(domain));
-                host.add_str_arg(value.to_string());
-                host.add_hex_arg(hex::encode(rho));
-                host.add_hex_arg(hex::encode(recipient));
-                host.add_hex_arg(hex::encode(nf_key));
-                host.add_str_arg((position as u64).to_string());
-                host.add_str_arg((depth_usize as u8).to_string());
-                for s in &siblings {
-                    host.add_hex_arg(hex::encode(s));
-                }
-                host.add_hex_arg(hex::encode(anchor));
-                host.add_hex_arg(hex::encode(nf));
-                host.add_str_arg("0".to_string()); // withdraw_amount
-                host.add_str_arg("1".to_string()); // ONE output
-
-                // Output 0
-                host.add_str_arg(out_value.to_string());
-                host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_recipient));
-                host.add_hex_arg(hex::encode(cm_out));
-
-                // Viewer section (Level-B) - add viewer args if authority FVK is set
-                if let Some((fvk, att)) = viewer_data {
-                    // m_viewers
-                    host.add_str_arg("1".to_string());
-                    // public fvk_commitment
-                    host.add_hex_arg(hex::encode(att.fvk_commitment));
-                    // private fvk
-                    host.add_hex_arg(hex::encode(fvk));
-                    // per-output (only j=0 here): ct_hash, mac
-                    host.add_hex_arg(hex::encode(att.ct_hash));
-                    host.add_hex_arg(hex::encode(att.mac));
-                }
-
-                host.set_public_output(&public)
-                    .context("set public output")?;
-                let proof_data = host.run(true).context("generate transfer proof")?;
+                let out = generate_transfer_proof(&program_path, &proof_input)?;
+                
                 eprintln!(
                     "  [proof] gen_proof ok idx={} account={} pos={} bytes={} nullifier={} out_cm={} viewer={}",
                     i,
                     account_idx,
                     position,
-                    proof_data.len(),
-                    hex::encode(nf),
-                    hex::encode(cm_out),
+                    out.proof_bytes.len(),
+                    hex::encode(out.nullifier),
+                    hex::encode(out.cm_out),
                     authority_fvk.is_some()
                 );
-                Ok((account_idx, proof_data))
+                Ok((i, account_idx, out.proof_bytes))
             })
             .await
             .expect("spawn_blocking join failed")
         }));
     }
 
-    // Await generated proofs and merge with cached proofs
-    let mut generated_proofs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(proof_tasks.len());
+    // Await generated proofs and place them in correct slots (indexed by original dep_inputs position)
+    // Use the same cached_proofs vec for both cached and generated to maintain alignment
+    let mut generated_count = 0;
     for t in proof_tasks {
-        generated_proofs.push(t.await??);
-    }
-
-    eprintln!(
-        "[ok] generated {} transfer proofs in parallel",
-        generated_proofs.len()
-    );
-
-    // Save newly generated proofs to cache
-    if let Some(ref cache_dir) = cache_dir {
-        for (account_idx, proof_bytes) in &generated_proofs {
+        let (original_idx, account_idx, proof_bytes) = t.await??;
+        cached_proofs[original_idx] = Some((account_idx, proof_bytes.clone()));
+        generated_count += 1;
+        
+        // Save to cache
+        if let Some(ref cache_dir) = cache_dir {
             let cache_file = cache_dir.join(format!("transfer_{}.proof", account_idx));
-            match std::fs::write(&cache_file, proof_bytes) {
+            match std::fs::write(&cache_file, &proof_bytes) {
                 Ok(_) => {
                     eprintln!(
                         "  [cache] saved proof for account {} to {}",
@@ -1470,16 +1046,21 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
 
-    // Merge cached and generated proofs
+    eprintln!(
+        "[ok] generated {} transfer proofs in parallel",
+        generated_count
+    );
+
+    // Convert to final proofs vec, maintaining dep_inputs order
     let mut proofs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(dep_inputs.len());
-    let mut cached_count = 0;
-    for i in 0..dep_inputs.len() {
-        if let Some(cached) = cached_proofs[i].take() {
-            proofs.push(cached);
-            cached_count += 1;
-        }
+    for (i, slot) in cached_proofs.into_iter().enumerate() {
+        let (account_idx, proof_bytes) = slot.expect(&format!(
+            "missing proof for dep_inputs[{}] (account {})",
+            i, dep_inputs[i].account_idx
+        ));
+        proofs.push((account_idx, proof_bytes));
     }
-    proofs.extend(generated_proofs);
+    let cached_count = dep_inputs.len() - generated_count;
 
     eprintln!(
         "[ok] using {} proofs total ({} from cache, {} newly generated)",
@@ -1503,7 +1084,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             let input = &dep_inputs[i];
             match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
-                    let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                    // Derive nf_key from spend_sk for verification
+                    let nf_key = nf_key_from_sk(&DOMAIN, &input.spend_sk);
+                    let nf_exp = nullifier(&DOMAIN, &nf_key, &input.rho);
                     if public.anchor_root != shared_anchor
                         || public.nullifiers != vec![nf_exp]
                         || public.withdraw_amount != 0
@@ -1576,25 +1159,31 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             1u64
         };
 
-        // Same nullifier as before
-        let nf = nullifier(&domain, &nf_key, &input.rho);
+        // Derive nf_key from spend_sk (matching the proof generation)
+        let nf_key = nf_key_from_sk(&DOMAIN, &input.spend_sk);
+        let nf = nullifier(&DOMAIN, &nf_key, &input.rho);
 
         // Reconstruct the *same* output note layout used in the proof
         let out_value = input.value;
-        let mut out_rho = [0u8; 32];
+        let mut out_rho: Hash32 = [0u8; 32];
         out_rho[0] = (i as u8).wrapping_add(100);
-        let mut out_recipient = [0u8; 32];
-        out_recipient[0] = (i as u8).wrapping_add(101);
-        let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
+        
+        // Derive output recipient keys from spend_sk (same as proof generation)
+        let out_pk_spend = pk_from_sk(&input.spend_sk);
+        let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &input.spend_sk);
+        let out_recipient = recipient_from_pk(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+
+        // Build recipient ciphertext for incoming note detection (mandatory for new ABI)
+        // sender_id = input.recipient (the spender's address)
+        let rec_ct = build_recipient_ciphertext(
+            &out_pk_ivk, out_value, &out_rho, &out_recipient, &input.recipient,
+        ).context("Failed to build recipient ciphertext")?;
+        let recipient_ciphertexts = Some(vec![rec_ct]);
 
         // Build EncryptedNote for the authority, if configured
-        // sender_id = input.recipient (the spender's address)
-        let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
-            let (_att, enc) = make_viewer_bundle(
-                &fvk, &domain, out_value, &out_rho, &out_recipient, &input.recipient, &cm_out,
-            );
-            vec![enc]
-        });
+        let view_ciphertexts = build_authority_view_ciphertexts(
+            authority_fvk, out_value, &out_rho, &out_recipient, &input.recipient,
+        );
 
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
             proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
@@ -1602,7 +1191,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             anchor_root: shared_anchor,
             nullifiers: vec![nf],
             view_ciphertexts,
-            recipient_ciphertexts: None,
+            recipient_ciphertexts,
             gas: None,
         });
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
@@ -1656,6 +1245,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 &body_b64,
                 "transfer",
                 display_idx,
+                Duration::from_secs(30),
             )
             .await?;
             Ok((idx, parsed, http_elapsed_ms))
@@ -1735,7 +1325,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     if config.defer_sequencer_submission {
         eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
         sleep(Duration::from_secs(5)).await;
-        flush_verifier_queue(&http, &verifier_url).await?;
+        flush_verifier_queue_with_logs(&http, &verifier_url).await?;
     }
 
     // Verify ledger inclusion for transfers
@@ -1797,7 +1387,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     );
 
     // Stats: nullifiers_spent advanced
-    let stats_after: Stats = client
+    let stats_after: ModuleStats = client
         .query_rest_endpoint("/modules/midnight-privacy/stats")
         .await
         .unwrap_or_default();
@@ -1993,125 +1583,4 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     env.shutdown();
 
     Ok(())
-}
-
-type DemoGas = <DemoRollupSpec as Spec>::Gas;
-
-async fn collect_batch_gas_stats(
-    client: &NodeClient,
-    batch_ids: &BTreeSet<u64>,
-) -> Result<HashMap<u64, DemoGas>> {
-    let mut per_batch = HashMap::new();
-
-    for batch_id in batch_ids {
-        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
-        match client
-            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
-            .await
-        {
-            Ok(batch) => match decode_batch_gas(&batch.receipt) {
-                Ok(Some(gas)) => {
-                    per_batch.insert(*batch_id, gas);
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "[gas] Batch {} did not expose gas data in its receipt payload",
-                        batch_id
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[gas] Failed to parse gas data for batch {}: {err:?}",
-                        batch_id
-                    );
-                }
-            },
-            Err(err) => {
-                eprintln!(
-                    "[gas] Failed to fetch batch {} from ledger: {err:?}",
-                    batch_id
-                );
-            }
-        }
-    }
-
-    Ok(per_batch)
-}
-
-fn decode_batch_gas(receipt: &api_types::AnyJsonValue) -> Result<Option<DemoGas>> {
-    let value = any_json_to_value(receipt);
-    if let Some(obj) = value.as_object() {
-        if let Some(gas_value) = obj.get("gas_used") {
-            return Ok(Some(gas_from_array(gas_value)?));
-        }
-    }
-    Ok(None)
-}
-
-// Compute serialized batch size as enforced by BatchSizeTracker:
-// size = 8 (sequence_number) + 1 (visible_slots_to_advance) + 4 (tx vec len)
-//      + sum_over_txs(4 (borsh vec elem overhead) + tx_body.len())
-async fn collect_batch_sizes(
-    client: &NodeClient,
-    batch_ids: &BTreeSet<u64>,
-) -> Result<HashMap<u64, usize>> {
-    let mut per_batch = HashMap::new();
-    for batch_id in batch_ids {
-        let endpoint = format!("/ledger/batches/{}?children=1", batch_id);
-        match client
-            .query_rest_endpoint::<api_types::LedgerBatch>(&endpoint)
-            .await
-        {
-            Ok(batch) => {
-                let mut total: usize = 8 + 1 + 4; // overhead
-                // Generated type exposes `txs` as a Vec; it may be empty when children are not included
-                for tx in &batch.txs {
-                    // borsh vec element overhead (4 bytes) + body bytes
-                    total += 4 + tx.body.len();
-                }
-                per_batch.insert(*batch_id, total);
-            }
-            Err(err) => {
-                eprintln!(
-                    "[bytes] Failed to fetch batch {} from ledger: {err:?}",
-                    batch_id
-                );
-            }
-        }
-    }
-    Ok(per_batch)
-}
-
-fn any_json_to_value(value: &api_types::AnyJsonValue) -> JsonValue {
-    match value {
-        api_types::AnyJsonValue::String(s) => JsonValue::String(s.clone()),
-        api_types::AnyJsonValue::Number(n) => serde_json::Number::from_f64(*n)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        api_types::AnyJsonValue::Boolean(b) => JsonValue::Bool(*b),
-        api_types::AnyJsonValue::Array(values) => JsonValue::Array(values.clone()),
-        api_types::AnyJsonValue::Object(map) => JsonValue::Object(map.clone()),
-    }
-}
-
-fn gas_from_array(value: &JsonValue) -> Result<DemoGas> {
-    let array = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("gas_used must be an array"))?;
-    let mut limbs = Vec::with_capacity(array.len());
-    for item in array {
-        if let Some(num) = item.as_u64() {
-            limbs.push(num);
-        } else if let Some(text) = item.as_str() {
-            limbs.push(text.parse::<u64>().context("Failed to parse gas limb")?);
-        } else {
-            bail!("gas limb must be a number");
-        }
-    }
-    DemoGas::try_from(limbs).context("Failed to construct gas value")
-}
-
-fn format_gas(gas: &DemoGas) -> String {
-    let limbs: Vec<String> = gas.as_ref().iter().map(|v| v.to_string()).collect();
-    format!("[{}]", limbs.join(", "))
 }
