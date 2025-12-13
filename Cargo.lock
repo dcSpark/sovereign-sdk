@@ -12635,6 +12635,7 @@ dependencies = [
  "bincode",
  "borsh",
  "digest 0.10.7",
+ "fs2",
  "hex",
  "proptest",
  "rand 0.8.5",

@@ -72,3 +72,4 @@ crates/mcp-external/logs/mcp-external.log
 circuit.txt
 refactor_script.txt
 benchmark.txt
+full_benchmark.txt
