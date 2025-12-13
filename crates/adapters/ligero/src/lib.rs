@@ -563,7 +563,13 @@ mod native {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// Global mutex to serialize GPU access for the WebGPU-based Ligero verifier.
+    /// The WebGPU device can fail with "Device Disconnected" errors when multiple
+    /// concurrent verifications attempt to use the GPU simultaneously.
+    static GPU_VERIFIER_MUTEX: Mutex<()> = Mutex::new(());
 
     #[derive(Debug)]
     pub struct VerifierPaths {
@@ -812,6 +818,12 @@ mod native {
             temp_dir.path().display()
         );
         tracing::debug!("Verifier binary: {}", paths.verifier_bin.display());
+
+        // Acquire GPU mutex to serialize WebGPU access and prevent device disconnection errors.
+        // Multiple concurrent verifier invocations can cause WebGPU device instability.
+        let _gpu_guard = GPU_VERIFIER_MUTEX.lock().map_err(|e| {
+            anyhow::anyhow!("Failed to acquire GPU mutex for Ligero verification: {}", e)
+        })?;
 
         let output = Command::new(&paths.verifier_bin)
             .arg(&config_json)

@@ -393,20 +393,30 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
             // Use the first nullifier for pre-verification cache lookup
             let credential_check_start = std::time::Instant::now();
+            tracing::info!(
+                tx_nullifier = %hex::encode(&nullifiers[0][..8]),
+                "[TRANSFER] Looking up pre-verified cache by nullifier"
+            );
             let cached_public = crate::get_pre_verified_spend(&nullifiers[0]);
             let credential_check_duration = credential_check_start.elapsed();
-            debug!(
+            tracing::info!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
                 has_pre_verified = cached_public.is_some(),
                 num_nullifiers = nullifiers.len(),
-                "Transfer: checked for pre-verified proof outputs"
+                "[TRANSFER] checked for pre-verified proof outputs"
             );
 
             let public = if let Some(public) = cached_public {
-                debug!("Using pre-verified path (skipping Ligero proof verification)");
+                tracing::info!(
+                    anchor = %hex::encode(&public.anchor_root[..8]),
+                    nullifiers = public.nullifiers.len(),
+                    outputs = public.output_commitments.len(),
+                    output_cms = ?public.output_commitments.iter().map(|o| hex::encode(&o[..8])).collect::<Vec<_>>(),
+                    "[TRANSFER] Using pre-verified path (skipping Ligero proof verification)"
+                );
                 public
             } else {
-                info!("No pre-verified credential, performing full Ligero proof verification");
+                tracing::info!("[TRANSFER] No pre-verified credential, performing full Ligero proof verification");
 
                 // Only load and decode method_id when we really need to verify a proof.
                 let method_id_bytes = self
@@ -523,8 +533,15 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 for enc in vcs.into_iter().take(MAX_VIEW_CT) {
                     // 1. Check cm is in outputs
                     if !outputs_set.contains(&enc.cm) {
-                        return Err(anyhow::anyhow!(
+                        tracing::error!(
+                            enc_cm = %hex::encode(enc.cm),
+                            outputs = ?outputs.iter().map(|o| hex::encode(o)).collect::<Vec<_>>(),
                             "viewer ciphertext cm does not match any transfer outputs"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "viewer ciphertext cm does not match any transfer outputs (enc_cm={}, outputs={})",
+                            hex::encode(enc.cm),
+                            outputs.iter().map(|o| hex::encode(o)).collect::<Vec<_>>().join(",")
                         )
                         .into());
                     }

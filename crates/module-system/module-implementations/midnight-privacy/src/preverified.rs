@@ -66,12 +66,13 @@ pub fn cache_pre_verified_spend(public: SpendPublic) {
     if let Some(first_nf) = public.nullifiers.first() {
         let mut guard = map().lock().unwrap();
         guard.insert(*first_nf, public.clone());
-        tracing::debug!(
+        tracing::info!(
             target: "midnight_privacy::preverified",
-            "[PRE-VERIFIED] cached pre-verified spend for first_nullifier={:?}, n_nullifiers={}, map_len={}",
-            first_nf,
-            public.nullifiers.len(),
-            guard.len(),
+            first_nullifier = %hex::encode(&first_nf[..8]),
+            n_nullifiers = public.nullifiers.len(),
+            n_outputs = public.output_commitments.len(),
+            cache_size = guard.len(),
+            "[PRE-VERIFIED] cache_pre_verified_spend INSERTED"
         );
     } else {
         tracing::warn!(
@@ -84,7 +85,16 @@ pub fn cache_pre_verified_spend(public: SpendPublic) {
 /// Retrieves a cached spend output for the provided nullifier, if any.
 /// For multi-input transactions, use the first nullifier as the lookup key.
 pub fn get_pre_verified_spend(nullifier: &Hash32) -> Option<SpendPublic> {
-    map().lock().unwrap().get(nullifier).cloned()
+    let guard = map().lock().unwrap();
+    let result = guard.get(nullifier).cloned();
+    tracing::info!(
+        target: "midnight_privacy::preverified",
+        nullifier = %hex::encode(&nullifier[..8]),
+        found = result.is_some(),
+        cache_size = guard.len(),
+        "[PRE-VERIFIED] get_pre_verified_spend lookup"
+    );
+    result
 }
 
 /// Removes any cached spend output associated with the provided nullifier.

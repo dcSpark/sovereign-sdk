@@ -13,6 +13,14 @@
 use crate::hash::Hash32;
 use crate::types::{RecipientAttestation, SpendPublic, ViewAttestation};
 
+/// Helper to get an arg with bounds checking.
+fn get_arg(args: &[sov_ligero_adapter::LigeroArg], i: usize) -> anyhow::Result<&sov_ligero_adapter::LigeroArg> {
+    args.get(i).ok_or_else(|| anyhow::anyhow!(
+        "args out of bounds: index {} but len is {} (expected more args in note_spend_guest ABI)",
+        i, args.len()
+    ))
+}
+
 /// Parse a 32-byte hex string (with optional 0x prefix) into a Hash32.
 fn parse_hex32(s: &str) -> anyhow::Result<Hash32> {
     let s = s.strip_prefix("0x").unwrap_or(s);
@@ -102,22 +110,22 @@ pub fn spend_public_from_verified_args(
     let mut i = 0usize;
 
     // [1] domain (pub) - not used in SpendPublic, but part of ABI
-    let _domain: Hash32 = arg_h32(&args[i])?;
+    let _domain: Hash32 = arg_h32(get_arg(args, i)?)?;
     i += 1;
 
     // [2] spend_sk (priv/redacted) - skip
     i += 1;
 
     // [3] depth (pub)
-    let depth = arg_u64(&args[i])? as usize;
+    let depth = arg_u64(get_arg(args, i)?)? as usize;
     i += 1;
 
     // [4] anchor (pub)
-    let anchor_root: Hash32 = arg_h32(&args[i])?;
+    let anchor_root: Hash32 = arg_h32(get_arg(args, i)?)?;
     i += 1;
 
     // [5] n_in (pub)
-    let n_in = arg_u64(&args[i])? as usize;
+    let n_in = arg_u64(get_arg(args, i)?)? as usize;
     i += 1;
     anyhow::ensure!((1..=4).contains(&n_in), "n_in out of range: {}", n_in);
 
@@ -133,17 +141,17 @@ pub fn spend_public_from_verified_args(
         // siblings[depth] (priv) - skip all
         i += depth;
         // nullifier (pub)
-        let nf: Hash32 = arg_h32(&args[i])?;
+        let nf: Hash32 = arg_h32(get_arg(args, i)?)?;
         i += 1;
         nullifiers.push(nf);
     }
 
     // withdraw (pub)
-    let withdraw_amount = arg_u64(&args[i])? as u128;
+    let withdraw_amount = arg_u64(get_arg(args, i)?)? as u128;
     i += 1;
 
     // n_out (pub)
-    let n_out = arg_u64(&args[i])? as usize;
+    let n_out = arg_u64(get_arg(args, i)?)? as usize;
     i += 1;
     anyhow::ensure!(n_out <= 2, "n_out out of range: {}", n_out);
 
@@ -166,16 +174,16 @@ pub fn spend_public_from_verified_args(
         i += 1;
 
         // cm_out (pub)
-        let cm: Hash32 = arg_h32(&args[i])?;
+        let cm: Hash32 = arg_h32(get_arg(args, i)?)?;
         i += 1;
         // epk_out (pub)
-        let epk: Hash32 = arg_h32(&args[i])?;
+        let epk: Hash32 = arg_h32(get_arg(args, i)?)?;
         i += 1;
         // ct_hash_out (pub)
-        let ct_hash: Hash32 = arg_h32(&args[i])?;
+        let ct_hash: Hash32 = arg_h32(get_arg(args, i)?)?;
         i += 1;
         // mac_out (pub)
-        let mac: Hash32 = arg_h32(&args[i])?;
+        let mac: Hash32 = arg_h32(get_arg(args, i)?)?;
         i += 1;
 
         output_commitments.push(cm);
@@ -192,7 +200,7 @@ pub fn spend_public_from_verified_args(
 
     // Optional viewer attestations section
     let view_attestations = if i < args.len() {
-        let n_viewers = arg_u64(&args[i])? as usize;
+        let n_viewers = arg_u64(get_arg(args, i)?)? as usize;
         i += 1;
         anyhow::ensure!(n_viewers <= 8, "n_viewers out of range: {}", n_viewers);
 
@@ -204,17 +212,17 @@ pub fn spend_public_from_verified_args(
 
             for _ in 0..n_viewers {
                 // fvk_commitment (pub)
-                let fvk_commitment: Hash32 = arg_h32(&args[i])?;
+                let fvk_commitment: Hash32 = arg_h32(get_arg(args, i)?)?;
                 i += 1;
                 // fvk (priv) - skip
                 i += 1;
 
                 for j in 0..n_out {
                     // ct_hash (pub)
-                    let ct_hash: Hash32 = arg_h32(&args[i])?;
+                    let ct_hash: Hash32 = arg_h32(get_arg(args, i)?)?;
                     i += 1;
                     // mac (pub)
-                    let mac: Hash32 = arg_h32(&args[i])?;
+                    let mac: Hash32 = arg_h32(get_arg(args, i)?)?;
                     i += 1;
 
                     atts.push(ViewAttestation {
@@ -306,3 +314,4 @@ mod tests {
         assert!(public.recipient_attestations.is_none());
     }
 }
+

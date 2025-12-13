@@ -99,7 +99,7 @@ impl<S: Spec> ValueSetterZk<S> {
 
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier, LigeroArg};
 
             let method_id_bytes = self
                 .method_id
@@ -109,12 +109,38 @@ impl<S: Spec> ValueSetterZk<S> {
             let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                 .map_err(|e| anyhow::anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-            let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
+            // SECURITY: Use verify_and_get_verified_args() instead of verify().
+            // The verify() method returns T by deserializing public_output, which is NOT
+            // cryptographically bound to the proof. verify_and_get_verified_args() returns
+            // only the args that were actually verified by Ligero.
+            let verified = LigeroVerifier::verify_and_get_verified_args(&proof, &method_id)
                 .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?;
 
-            if public.value != value {
+            // Extract proven value from verified args
+            // value_validator.wasm ABI: arg[0] = proven value
+            if verified.args.is_empty() {
+                return Err(SetValueZkError::<S>::ProofVerificationFailed(
+                    "No args in verified proof".to_string()
+                ).into());
+            }
+
+            let proven_value: u32 = match &verified.args[0] {
+                LigeroArg::I64 { i64: v } => *v as u32,
+                LigeroArg::String { str: s } => s.parse::<u32>()
+                    .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(
+                        format!("Bad value arg: {}", e)
+                    ))?,
+                LigeroArg::Hex { hex: _ } => {
+                    // value_validator.wasm uses i32/String for value, not hex
+                    return Err(SetValueZkError::<S>::ProofVerificationFailed(
+                        "Unexpected hex format for value arg".to_string()
+                    ).into());
+                }
+            };
+
+            if proven_value != value {
                 return Err(SetValueZkError::<S>::ValueMismatch {
-                    journal_value: public.value,
+                    journal_value: proven_value,
                     requested_value: value,
                 }
                 .into());

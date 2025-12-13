@@ -379,6 +379,13 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                 "[PARALLEL] Worker starting transaction execution"
                             );
 
+                            // Load pre-verified SpendPublic from DB into in-memory cache.
+                            // This is critical for worker transactions where the proof is stripped
+                            // and the module relies on the preverified cache to skip re-verification.
+                            #[cfg(feature = "native")]
+                            {
+                                midnight_privacy::prime_pre_verified_spend(&request.tx_hash);
+                            }
 
                             // Process the transaction using our executor
                             use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
@@ -463,11 +470,11 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     }
                                 }
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::error!(
                         worker_id,
                         tx_hash = %request.tx_hash,
                         %err,
-                        "Parallel worker failed to execute transaction"
+                        "[PARALLEL] Worker failed to execute transaction"
                     );
                     // Notify the main sequencer so it can clean up the HTTP waiter
                     // and decrement the in-flight parallel counter, instead of

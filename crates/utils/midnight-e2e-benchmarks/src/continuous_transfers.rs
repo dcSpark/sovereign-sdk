@@ -15,7 +15,9 @@ use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
     note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
-    EncryptedNote,
+    EncryptedNote, RecipientAttestation, Note,
+    viewing::{encrypt_note_for_recipient_with_sender, ct_hash as compute_ct_hash},
+    pk_ivk_from_sk, ivk_sk_from_sk, pk_from_sk, recipient_from_pk, nf_key_from_sk,
 };
 use rand::Rng;
 use reqwest::Client as HttpClient;
@@ -49,7 +51,6 @@ const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
 const MISSING_NOTE_RETRY_MAX: usize = 10;
 const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
 
 #[derive(Clone, Debug)]
@@ -151,6 +152,17 @@ struct WalletState {
     value: u128,
     rho: Hash32,
     recipient: Hash32,
+    /// Spend secret key (PRIVATE witness for guest)
+    spend_sk: Hash32,
+    /// Derived nullifier key: nf_key_from_sk(domain, spend_sk)
+    nf_key: Hash32,
+    /// Secret key for incoming viewing (X25519 clamped scalar)
+    #[allow(dead_code)]
+    ivk_sk: Hash32,
+    /// Public key for incoming viewing (X25519 base point * ivk_sk)
+    pk_ivk: Hash32,
+    /// Spending public key derived from spend_sk
+    pk_spend: Hash32,
 }
 
 fn rollup_crate_dir() -> Result<PathBuf> {
@@ -600,6 +612,7 @@ pub async fn run() -> Result<()> {
         }
         let mut chain_hash_arr = [0u8; 32];
         chain_hash_arr.copy_from_slice(&chain_hash_vec);
+        eprintln!("[debug] chain_hash from node: 0x{}", hex::encode(&chain_hash_arr));
         chain_hash_arr
     };
 
@@ -655,12 +668,25 @@ pub async fn run() -> Result<()> {
             );
         }
 
+        // Generate privacy keys for this wallet (must persist across cycles)
+        let spend_sk: Hash32 = rand::random();
+        let pk_spend = pk_from_sk(&spend_sk);
+        let ivk_sk = ivk_sk_from_sk(&DOMAIN, &spend_sk);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
+        let recipient = recipient_from_pk(&DOMAIN, &pk_spend, &pk_ivk);
+        let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
+
         wallets.push(WalletState {
             account,
             nonce,
             value: 0,
             rho: [0u8; 32],
-            recipient: [0u8; 32],
+            recipient,
+            spend_sk,
+            nf_key,
+            ivk_sk,
+            pk_ivk,
+            pk_spend,
         });
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
@@ -984,7 +1010,9 @@ async fn perform_initial_deposits(
     for (i, wallet) in wallets.iter_mut().enumerate() {
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
-        let recipient: Hash32 = rand::random();
+        // IMPORTANT: recipient must be the derived ADDR_V2 for this wallet
+        // so the guest can recompute the same commitment using spend_sk
+        let recipient: Hash32 = wallet.recipient;
 
         let call =
             RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
@@ -1310,16 +1338,22 @@ async fn perform_transfer_cycle(
         attempts_made
     );
 
+    // Always anchor to the exact root that matches the tree we just rebuilt.
+    // Using /roots/recent.last() is unsafe because the endpoint returns newest-first,
+    // so .last() would give the oldest root in the window.
+    let mut anchor_root = [0u8; 32];
+    anchor_root.copy_from_slice(&state.root);
+
+    // Sanity check: verify our anchor is in the recent roots window
     let roots_state: RootsResp = client
         .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
         .await
         .context("Failed to query recent roots")?;
-
-    let mut anchor_root = [0u8; 32];
-    if let Some(last_root) = roots_state.recent_roots.last() {
-        anchor_root = *last_root;
-    } else {
-        anchor_root.copy_from_slice(&state.root);
+    if !roots_state.recent_roots.contains(&anchor_root) {
+        eprintln!(
+            "[cycle] WARNING: current tree root is not in /roots/recent (len={}); using /tree/state root anyway",
+            roots_state.recent_roots.len()
+        );
     }
 
     #[derive(Clone)]
@@ -1329,6 +1363,13 @@ async fn perform_transfer_cycle(
         rho: Hash32,
         recipient: Hash32,
         position: u64,
+        /// Spend secret key (PRIVATE witness)
+        spend_sk: Hash32,
+        /// Derived nullifier key
+        nf_key: Hash32,
+        /// Wallet's keys for output
+        pk_ivk: Hash32,
+        pk_spend: Hash32,
     }
 
     let mut inputs: Vec<TransferInput> = Vec::new();
@@ -1358,6 +1399,10 @@ async fn perform_transfer_cycle(
                 rho: wallet.rho,
                 recipient: wallet.recipient,
                 position,
+                spend_sk: wallet.spend_sk,
+                nf_key: wallet.nf_key,
+                pk_ivk: wallet.pk_ivk,
+                pk_spend: wallet.pk_spend,
             });
         } else {
             eprintln!(
@@ -1409,28 +1454,56 @@ async fn perform_transfer_cycle(
         let account_idx = input.wallet_idx;
         let value = input.value;
         let in_rho = input.rho;
-        let in_recipient = input.recipient;
+        let sender_id = input.recipient; // derived ADDR_V2 for this wallet
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
         let authority_fvk = authority_fvk; // Copy for closure
+        // Keys from input
+        let spend_sk = input.spend_sk;
+        let nf_key = input.nf_key;
+        let out_pk_ivk = input.pk_ivk;
+        let out_pk_spend = input.pk_spend;
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
-                // New output note (same value, fresh rho/recipient)
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32)> {
+                // New output note (same value, fresh rho, send to self)
                 let out_rho: Hash32 = rand::thread_rng().gen();
-                let out_recipient: Hash32 = rand::thread_rng().gen();
+                // Use wallet's own address as recipient (self-transfer)
+                let out_recipient = recipient_from_pk(&DOMAIN, &out_pk_spend, &out_pk_ivk);
                 let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
 
-                let nf = nullifier(&DOMAIN, &NF_KEY, &in_rho);
+                // Compute nullifier using derived nf_key
+                let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
+
+                // Compute recipient ciphertext binding data for the proof
+                // The guest expects 144-byte plaintext: [domain|value|rho|recipient|sender_id]
+                let out_note = Note {
+                    domain: DOMAIN,
+                    value,
+                    rho: out_rho,
+                    recipient: out_recipient,
+                };
+                let rec_ct = encrypt_note_for_recipient_with_sender(&DOMAIN, &out_pk_ivk, &out_note, &sender_id, &cm_out)
+                    .context("Failed to encrypt note for recipient")?;
+                let out_epk = rec_ct.epk;
+                let out_ct_hash = compute_ct_hash(&rec_ct.ct);
+                let out_mac = rec_ct.mac;
+
+                // Build recipient attestation for SpendPublic
+                let recipient_attestations = Some(vec![RecipientAttestation {
+                    cm: cm_out,
+                    epk: out_epk,
+                    ct_hash: out_ct_hash,
+                    mac: out_mac,
+                }]);
 
                 // Build viewer attestation if authority FVK is set
-                // sender_id = in_recipient (the spender's address)
                 let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &in_recipient, &cm_out,
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id, &cm_out,
                     );
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
@@ -1439,72 +1512,121 @@ async fn perform_transfer_cycle(
 
                 let public = SpendPublic {
                     anchor_root: anchor,
-                    nullifier: nf,
+                    nullifiers: vec![nf],
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out],
                     view_attestations,
+                    recipient_attestations,
                 };
 
+                // === NEW GUEST ABI: private indices ===
+                // [1] domain (PUBLIC)
+                // [2] spend_sk (PRIVATE)
+                // [3] depth (PUBLIC)
+                // [4] anchor (PUBLIC)
+                // [5] n_in (PUBLIC)
+                // Per input: value(PRIV), rho(PRIV), pos(PRIV), siblings[depth](PRIV), nullifier(PUBLIC) = depth + 4 args
+                // After inputs: withdraw_amount(PUBLIC), n_out(PUBLIC)
+                // Per output: value(PRIV), rho(PRIV), pk_spend(PRIV), pk_ivk(PRIV), cm(PUB), epk(PUB), ct_hash(PUB), mac(PUB) = 8 args
+                // Viewer section: n_viewers, then per viewer: fvk_commit(PUB), fvk(PRIV), per output: ct_hash(PUB), mac(PUB)
+                let n_in: usize = 1;
                 let n_out: usize = 1;
-                let mut private_indices = vec![2, 3, 4, 5, 6];
-                for j in 0..depth_usize {
-                    private_indices.push(7 + j);
+                // Per input: value, rho, pos, siblings[depth], nullifier = depth + 4 total args
+                let per_in = depth_usize + 4;
+                
+                let mut private_indices = Vec::new();
+                private_indices.push(2); // spend_sk
+                
+                // Input private indices (1-based): value=6, rho=7, pos=8, siblings=9..9+depth
+                let in_base = 6; // First input starts at arg 6
+                private_indices.push(in_base);     // value_in
+                private_indices.push(in_base + 1); // rho_in
+                private_indices.push(in_base + 2); // pos_in
+                for k in 0..depth_usize {
+                    private_indices.push(in_base + 3 + k); // siblings
                 }
-                let out_base = 11 + depth_usize;
-                private_indices.extend_from_slice(&[out_base + 0, out_base + 1, out_base + 2]);
+                // nullifier at in_base + 3 + depth is PUBLIC
+                
+                // Output value index (1-based):
+                // 5 base args + n_in*(depth+4) input args + nullifier(1) + withdraw(1) + n_out(1) = first output value
+                // Actually: 5 + n_in*per_in + 2 (withdraw, n_out) + 1 = out_base
+                // Simplified: out_base = 5 + n_in * per_in + 3
+                let out_base = 5 + n_in * per_in + 3;
+                
+                // Output private indices: value, rho, pk_spend, pk_ivk (first 4 of 8 per output)
+                private_indices.push(out_base);     // value_out
+                private_indices.push(out_base + 1); // rho_out
+                private_indices.push(out_base + 2); // pk_spend_out
+                private_indices.push(out_base + 3); // pk_ivk_out
+                // cm, epk, ct_hash, mac are PUBLIC (out_base + 4..7)
 
                 // Viewer section: fvk is private
                 if viewer_data.is_some() {
-                    let base_after_outs = 12 + depth_usize + 4 * n_out;
-                    let fvk_arg_index = base_after_outs + 2;
-                    private_indices.push(fvk_arg_index);
+                    // After outputs: n_out * 8 args per output
+                    let viewer_section_start = out_base + n_out * 8;
+                    // n_viewers at viewer_section_start, fvk_commit at +1, fvk at +2
+                    private_indices.push(viewer_section_start + 2); // fvk
                 }
 
                 let mut host =
                     <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                         .with_private_indices(private_indices);
 
-                host.add_hex_arg(hex::encode(DOMAIN));
-                host.add_str_arg(value.to_string());
-                host.add_hex_arg(hex::encode(in_rho));
-                host.add_hex_arg(hex::encode(in_recipient));
-                host.add_hex_arg(hex::encode(NF_KEY));
-                host.add_str_arg((position as u64).to_string());
-                host.add_str_arg((TREE_DEPTH as u8).to_string());
+                // Debug: log wallet and position for debugging
+                eprintln!("[proof] wallet={} position={}", account_idx, position);
+
+                // === NEW GUEST ABI arguments ===
+                host.add_hex_arg(hex::encode(DOMAIN));              // [1] domain (PUBLIC)
+                host.add_hex_arg(hex::encode(spend_sk));            // [2] spend_sk (PRIVATE)
+                host.add_str_arg((TREE_DEPTH as u8).to_string());   // [3] depth
+                host.add_hex_arg(hex::encode(anchor));              // [4] anchor (PUBLIC)
+                host.add_str_arg("1".to_string());                  // [5] n_in (PUBLIC)
+
+                // Input[0]
+                host.add_str_arg(value.to_string());                // value_in (PRIVATE)
+                host.add_hex_arg(hex::encode(in_rho));              // rho_in (PRIVATE)
+                host.add_str_arg((position as u64).to_string());    // pos (PRIVATE)
                 for s in &siblings {
-                    host.add_hex_arg(hex::encode(s));
+                    host.add_hex_arg(hex::encode(s));               // siblings (PRIVATE)
                 }
-                host.add_hex_arg(hex::encode(anchor));
-                host.add_hex_arg(hex::encode(nf));
-                host.add_str_arg("0".to_string()); // withdraw_amount
-                host.add_str_arg("1".to_string()); // ONE output
-                host.add_str_arg(value.to_string());
-                host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_recipient));
-                host.add_hex_arg(hex::encode(cm_out));
+                host.add_hex_arg(hex::encode(nf));                  // nullifier (PUBLIC)
+
+                host.add_str_arg("0".to_string());                  // withdraw_amount (PUBLIC)
+                host.add_str_arg("1".to_string());                  // n_out (PUBLIC)
+
+                // Output[0]: 8 args
+                host.add_str_arg(value.to_string());                // value_out (PRIVATE)
+                host.add_hex_arg(hex::encode(out_rho));             // rho_out (PRIVATE)
+                host.add_hex_arg(hex::encode(out_pk_spend));        // pk_spend_out (PRIVATE)
+                host.add_hex_arg(hex::encode(out_pk_ivk));          // pk_ivk_out (PRIVATE)
+                host.add_hex_arg(hex::encode(cm_out));              // cm_out (PUBLIC)
+                host.add_hex_arg(hex::encode(out_epk));             // epk_out (PUBLIC)
+                host.add_hex_arg(hex::encode(out_ct_hash));         // ct_hash_out (PUBLIC)
+                host.add_hex_arg(hex::encode(out_mac));             // mac_out (PUBLIC)
 
                 // Viewer section (Level-B)
                 if let Some((fvk, att)) = viewer_data {
-                    host.add_str_arg("1".to_string()); // m_viewers
+                    host.add_str_arg("1".to_string());              // n_viewers
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
-                    host.add_hex_arg(hex::encode(fvk));
+                    host.add_hex_arg(hex::encode(fvk));             // fvk (PRIVATE)
                     host.add_hex_arg(hex::encode(att.ct_hash));
                     host.add_hex_arg(hex::encode(att.mac));
                 }
 
                 host.set_public_output(&public)
-                    .context("set public output (round 2)")?;
+                    .context("set public output")?;
 
                 let proof_data =
-                    host.run(true).context("generate second-round transfer proof")?;
-                Ok((account_idx, proof_data, out_rho, out_recipient))
+                    host.run(true).context("generate transfer proof")?;
+                // Return just the new rho (recipient is fixed to wallet.recipient)
+                Ok((account_idx, proof_data, out_rho))
             })
             .await
             .expect("spawn_blocking join failed")
         }));
     }
 
-    let mut proofs: Vec<(usize, Vec<u8>, Hash32, Hash32)> = Vec::with_capacity(inputs.len());
+    let mut proofs: Vec<(usize, Vec<u8>, Hash32)> = Vec::with_capacity(inputs.len());
     for t in proof_tasks {
         proofs.push(t.await??);
     }
@@ -1546,7 +1668,7 @@ async fn perform_transfer_cycle(
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
-    for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
+    for (i, (wallet_idx, proof_bytes, out_rho)) in proofs.into_iter().enumerate() {
         let wallet = wallets[wallet_idx].clone();
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
@@ -1554,12 +1676,30 @@ async fn perform_transfer_cycle(
         let authority_fvk = authority_fvk; // Copy for closure
         let value = wallet.value; // The output value (same as input for pure transfer)
         build_tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<BuiltTransfer> {
-            let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
+            // Use wallet's derived nf_key (not fixed NF_KEY)
+            let nf = nullifier(&DOMAIN, &wallet.nf_key, &wallet.rho);
+            
+            // Output recipient is fixed (ADDR_V2 derived from spend_sk)
+            let out_recipient = wallet.recipient;
+            let out_pk_ivk = wallet.pk_ivk;
+            let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
+
+            // Build recipient ciphertext for incoming note detection (mandatory)
+            // The guest expects 144-byte plaintext: [domain|value|rho|recipient|sender_id]
+            // sender_id is the wallet's own address (the spender)
+            let sender_id = wallet.recipient;
+            let out_note = Note {
+                domain: DOMAIN,
+                value,
+                rho: out_rho,
+                recipient: out_recipient,
+            };
+            let rec_ct = encrypt_note_for_recipient_with_sender(&DOMAIN, &out_pk_ivk, &out_note, &sender_id, &cm_out)
+                .context("Failed to encrypt note for recipient in tx building")?;
+            let recipient_ciphertexts = Some(vec![rec_ct]);
 
             // Build encrypted note for authority if configured
-            // sender_id = wallet.recipient (the spender's address)
             let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
-                let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
                 let (_att, enc) = make_viewer_bundle(
                     &fvk, &DOMAIN, value, &out_rho, &out_recipient, &wallet.recipient, &cm_out,
                 );
@@ -1571,8 +1711,9 @@ async fn perform_transfer_cycle(
                     proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
                         .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                     anchor_root,
-                    nullifier: nf,
+                    nullifiers: vec![nf],
                     view_ciphertexts,
+                    recipient_ciphertexts,
                     gas: None,
                 });
 
@@ -1610,7 +1751,7 @@ async fn perform_transfer_cycle(
                 tx_b64,
                 new_nonce: wallet.nonce + 1,
                 new_rho: out_rho,
-                new_recipient: out_recipient,
+                new_recipient: wallet.recipient, // Fixed: recipient is stable (ADDR_V2 derived from spend_sk)
             })
         }));
     }
@@ -1701,8 +1842,9 @@ async fn perform_transfer_cycle(
                 let body = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
                     last_err = Some(anyhow::anyhow!(
-                        "transfer #{} verifier returned status {}: {}",
+                        "transfer #{} (wallet={}) verifier returned status {}: {}",
                         display_idx,
+                        wallet_idx,
                         status,
                         body
                     ));

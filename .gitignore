@@ -70,3 +70,5 @@ wallet_index.sqlite
 crates/utils/sov-indexer/vfk_config.json
 crates/mcp-external/logs/mcp-external.log
 circuit.txt
+refactor_script.txt
+benchmark.txt

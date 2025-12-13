@@ -392,17 +392,26 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 .try_into()
                 .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
 
-            let nullifier_hex = withdraw
-                .get("nullifier")
-                .and_then(|v| v.as_str())
+            // Parse nullifiers array (multi-input support)
+            let nullifiers_array: Vec<[u8; 32]> = withdraw
+                .get("nullifiers")
+                .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifiers")
+                })?
+                .iter()
+                .map(|nf| {
+                    let nf_hex = nf.as_str().ok_or_else(|| {
+                        errors::bad_request_400("Invalid nullifier", "Not a string")
                 })?;
-            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
+                    let nf_vec = Vec::from_hex(nf_hex.trim_start_matches("0x"))
                 .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
-            let nullifier_array: [u8; 32] = nullifier_vec
+                    let nf_arr: [u8; 32] = nf_vec
                 .try_into()
                 .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+                    Ok(nf_arr)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             let withdraw_amount = withdraw
                 .get("withdraw_amount")
@@ -432,15 +441,11 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            // For backward compatibility, check if the provided nullifier matches the first one
-            // Multi-input transactions have multiple nullifiers; we validate the first one here
-            let first_nullifier = proof_outputs.nullifiers.first().ok_or_else(|| {
-                errors::bad_request_400("Invalid proof outputs", "No nullifiers in proof")
-            })?;
-            if *first_nullifier != nullifier_array {
+            // Validate that all nullifiers match between transaction and proof outputs
+            if proof_outputs.nullifiers != nullifiers_array {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
-                    "nullifier does not match (first nullifier checked)",
+                    "nullifiers do not match",
                 ));
             }
             if proof_outputs.withdraw_amount != withdraw_amount {
@@ -467,17 +472,26 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 .try_into()
                 .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
 
-            let nullifier_hex = transfer
-                .get("nullifier")
-                .and_then(|v| v.as_str())
+            // Parse nullifiers array (multi-input support)
+            let nullifiers_array: Vec<[u8; 32]> = transfer
+                .get("nullifiers")
+                .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifiers")
+                })?
+                .iter()
+                .map(|nf| {
+                    let nf_hex = nf.as_str().ok_or_else(|| {
+                        errors::bad_request_400("Invalid nullifier", "Not a string")
                 })?;
-            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
+                    let nf_vec = Vec::from_hex(nf_hex.trim_start_matches("0x"))
                 .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
-            let nullifier_array: [u8; 32] = nullifier_vec
+                    let nf_arr: [u8; 32] = nf_vec
                 .try_into()
                 .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+                    Ok(nf_arr)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             let proof_outputs_str = model.proof_outputs.trim();
             if proof_outputs_str.is_empty() || proof_outputs_str == "{}" {
@@ -496,15 +510,11 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            // For backward compatibility, check if the provided nullifier matches the first one
-            // Multi-input transactions have multiple nullifiers; we validate the first one here
-            let first_nullifier = proof_outputs.nullifiers.first().ok_or_else(|| {
-                errors::bad_request_400("Invalid proof outputs", "No nullifiers in proof")
-            })?;
-            if *first_nullifier != nullifier_array {
+            // Validate that all nullifiers match between transaction and proof outputs
+            if proof_outputs.nullifiers != nullifiers_array {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
-                    "nullifier does not match (first nullifier checked)",
+                    "nullifiers do not match",
                 ));
             }
             // For transfers, withdraw_amount must be 0

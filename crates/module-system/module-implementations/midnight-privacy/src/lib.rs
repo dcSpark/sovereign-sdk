@@ -41,6 +41,9 @@ pub use viewing::{
 #[cfg(feature = "native")]
 pub use query::*;
 
+#[cfg(feature = "native")]
+pub use ligero_args::spend_public_from_verified_args;
+
 use sov_modules_api::{
     Context, DaSpec, GenesisState, Module, ModuleId, ModuleInfo, ModuleRestApi, Spec, StateMap,
     StateValue, TxState,

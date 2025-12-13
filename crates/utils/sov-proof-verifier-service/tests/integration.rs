@@ -31,7 +31,7 @@ fn sample_midnight_withdraw_transaction(
 ) -> Transaction<DemoRuntime<RollupSpec>, RollupSpec> {
     let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
     let anchor_root = [42u8; 32];
-    let nullifier = [7u8; 32];
+    let nullifiers = vec![[7u8; 32]];
     let withdraw_amount = 123_456u128;
     let to = MultiAddressEvm::Vm(
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
@@ -42,9 +42,11 @@ fn sample_midnight_withdraw_transaction(
     let call = MidnightCallMessage::<RollupSpec>::Withdraw {
         proof,
         anchor_root,
-        nullifier,
+        nullifiers,
         withdraw_amount,
         to,
+        view_ciphertexts: None,
+        recipient_ciphertexts: None,
         gas: None,
     };
 
@@ -89,12 +91,12 @@ fn test_value_setter_call_serialization() {
 #[test]
 fn test_parse_midnight_withdraw_call_roundtrips() {
     let tx = sample_midnight_withdraw_transaction(0);
-    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
+    let (proof_bytes, anchor_root, nullifiers, withdraw_amount, recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("parse succeeds");
 
     assert_eq!(proof_bytes.len(), 16);
     assert_eq!(anchor_root, [42u8; 32]);
-    assert_eq!(nullifier, [7u8; 32]);
+    assert_eq!(nullifiers, vec![[7u8; 32]]);
     assert_eq!(withdraw_amount, 123_456u128);
     assert_eq!(
         recipient,
@@ -141,17 +143,19 @@ async fn test_store_verified_midnight_transaction_upsert() {
     let full_blob = "base64encodedtransaction";
     let mut proof_public = SpendPublic {
         anchor_root: [1u8; 32],
-        nullifier: [2u8; 32],
+        nullifiers: vec![[2u8; 32]],
         withdraw_amount: 55,
         output_commitments: vec![],
+        view_attestations: None,
+        recipient_attestations: None,
     };
 
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None, None)
         .await
         .unwrap();
 
     proof_public.withdraw_amount = 99;
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None, None)
         .await
         .unwrap();
 
@@ -169,7 +173,7 @@ async fn test_store_verified_midnight_transaction_upsert() {
     let proof_outputs: SpendPublic = serde_json::from_str(&record.proof_outputs).unwrap();
     assert_eq!(proof_outputs.withdraw_amount, proof_public.withdraw_amount);
     assert_eq!(proof_outputs.anchor_root, proof_public.anchor_root);
-    assert_eq!(proof_outputs.nullifier, proof_public.nullifier);
+    assert_eq!(proof_outputs.nullifiers, proof_public.nullifiers);
     assert_eq!(record.transaction_data, tx_json);
 }
 
@@ -194,6 +198,7 @@ async fn test_store_deposit_transaction_without_proof() {
         transaction_data,
         full_blob,
         None,       // No pre-auth data in test
+        None,       // No view ciphertexts
     )
     .await
     .unwrap();
@@ -216,15 +221,16 @@ async fn test_store_deposit_transaction_without_proof() {
 async fn test_verify_midnight_withdraw_proof_invalid_payload() {
     let proof = vec![0u8; 4];
     let anchor_root = [3u8; 32];
-    let nullifier = [4u8; 32];
+    let nullifiers = vec![[4u8; 32]];
     let withdraw_amount = 77u128;
 
     match verify_midnight_withdraw_proof(
         Some([0u8; 32]).as_ref(),
         &proof,
         anchor_root,
-        nullifier,
+        nullifiers,
         withdraw_amount,
+        None,  // view_ciphertexts
     )
     .await
     {
@@ -263,7 +269,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     println!("\n✓ Step 2: Creating transaction (like midnight-tx-generator)");
     
     let anchor_root = [0u8; 32]; // All zeros like the script default
-    let nullifier = [0u8; 32];
+    let nullifiers = vec![[0u8; 32]];
     let withdraw_amount = 500u128; // Matches script default
     let recipient = MultiAddressEvm::Vm(
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
@@ -278,9 +284,11 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let call = MidnightCallMessage::<RollupSpec>::Withdraw {
         proof: dummy_proof,
         anchor_root,
-        nullifier,
+        nullifiers: nullifiers.clone(),
         withdraw_amount,
         to: recipient.clone(),
+        view_ciphertexts: None,
+        recipient_ciphertexts: None,
         gas: None,
     };
 
@@ -307,7 +315,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let tx_hash = tx.hash().to_string();
     println!("  Transaction Hash: {}", tx_hash);
     println!("  Anchor Root: 0x{}", hex::encode(anchor_root));
-    println!("  Nullifier: 0x{}", hex::encode(nullifier));
+    println!("  Nullifiers: {:?}", nullifiers.iter().map(hex::encode).collect::<Vec<_>>());
     println!("  Withdraw Amount: {}", withdraw_amount);
     println!("  Recipient: {:?}", recipient);
 
@@ -324,14 +332,14 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         .expect("Signature should be valid");
     println!("  ✓ Signature verified successfully!");
 
-    // Step 5: Parse the transaction (extract proof, anchor_root, nullifier, etc.)
+    // Step 5: Parse the transaction (extract proof, anchor_root, nullifiers, etc.)
     println!("\n✓ Step 5: Testing transaction parsing");
-    let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient) =
+    let (proof_bytes, parsed_anchor_root, parsed_nullifiers, parsed_amount, parsed_recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("Should parse transaction");
     
     assert_eq!(proof_bytes.len(), 32, "Proof should be our dummy 32 bytes");
     assert_eq!(parsed_anchor_root, anchor_root, "Anchor root should match");
-    assert_eq!(parsed_nullifier, nullifier, "Nullifier should match");
+    assert_eq!(parsed_nullifiers, nullifiers, "Nullifiers should match");
     assert_eq!(parsed_amount, withdraw_amount, "Withdraw amount should match");
     assert_eq!(parsed_recipient, recipient, "Recipient should match");
     println!("  ✓ All fields parsed correctly!");
@@ -342,9 +350,11 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     println!("\n✓ Step 6: Simulating proof verification");
     let simulated_proof_output = SpendPublic {
         anchor_root,
-        nullifier,
+        nullifiers: nullifiers.clone(),
         withdraw_amount,
         output_commitments: vec![],
+        view_attestations: None,
+        recipient_attestations: None,
     };
     println!("  ✓ Proof verification simulated (would verify with Ligero in production)");
     
@@ -362,6 +372,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64, // full transaction blob
         None,          // No pre-auth data in test
+        None,          // No view ciphertexts
     )
     .await
     .expect("Should store to database");
@@ -386,7 +397,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let stored_proof_output: SpendPublic = serde_json::from_str(&record.proof_outputs)
         .expect("Should deserialize proof outputs");
     assert_eq!(stored_proof_output.anchor_root, anchor_root, "Stored anchor root should match");
-    assert_eq!(stored_proof_output.nullifier, nullifier, "Stored nullifier should match");
+    assert_eq!(stored_proof_output.nullifiers, nullifiers, "Stored nullifiers should match");
     assert_eq!(stored_proof_output.withdraw_amount, withdraw_amount, "Stored amount should match");
     
     // Verify transaction data (without proof)
@@ -416,6 +427,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64,
         None,  // No pre-auth data in test
+        None,  // No view ciphertexts
     )
     .await
     .expect("Should update existing record");

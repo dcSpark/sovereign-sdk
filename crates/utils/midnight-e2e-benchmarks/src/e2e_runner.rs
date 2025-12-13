@@ -1341,10 +1341,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // Public output with view_attestations populated
                 let public = midnight_privacy::SpendPublic {
                     anchor_root: anchor,
-                    nullifier: nf,
+                    nullifiers: vec![nf],
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
                     view_attestations,
+                    recipient_attestations: None,
                 };
 
                 // Private indices for 1 output (match guest ABI)
@@ -1504,7 +1505,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 Ok(public) => {
                     let nf_exp = nullifier(&domain, &nf_key, &input.rho);
                     if public.anchor_root != shared_anchor
-                        || public.nullifier != nf_exp
+                        || public.nullifiers != vec![nf_exp]
                         || public.withdraw_amount != 0
                     {
                         eprintln!(
@@ -1512,7 +1513,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             i,
                             account_idx,
                             public.anchor_root == shared_anchor,
-                            public.nullifier == nf_exp,
+                            public.nullifiers == vec![nf_exp],
                             public.withdraw_amount == 0
                         );
                         eprintln!(
@@ -1521,9 +1522,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             hex::encode(nf_exp)
                         );
                         eprintln!(
-                            "         proof anchor={} nullifier={} withdraw={}",
+                            "         proof anchor={} nullifiers={:?} withdraw={}",
                             hex::encode(public.anchor_root),
-                            hex::encode(public.nullifier),
+                            public.nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
                             public.withdraw_amount
                         );
                     }
@@ -1599,8 +1600,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
-            nullifier: nf,
+            nullifiers: vec![nf],
             view_ciphertexts,
+            recipient_ciphertexts: None,
             gas: None,
         });
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =

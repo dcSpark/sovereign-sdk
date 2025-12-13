@@ -2,12 +2,18 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sov_rollup_interface::zk::ZkvmHost;
 
 use crate::{LigeroCodeCommitment, LigeroGuest, LigeroProofPackage};
+
+/// Global mutex to serialize GPU access for the WebGPU-based Ligero prover.
+/// The WebGPU device can fail with "Device Disconnected" errors when multiple
+/// concurrent proof generations attempt to use the GPU simultaneously.
+static GPU_PROVER_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Argument type for Ligero prover
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +227,12 @@ impl LigeroHost {
         );
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
+
+        // Acquire GPU mutex to serialize WebGPU access and prevent device disconnection errors.
+        // Multiple concurrent prover invocations can cause WebGPU device instability.
+        let _gpu_guard = GPU_PROVER_MUTEX.lock().map_err(|e| {
+            anyhow::anyhow!("Failed to acquire GPU mutex for Ligero prover: {}", e)
+        })?;
 
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
