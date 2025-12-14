@@ -243,6 +243,26 @@ impl LigeroHost {
 
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Check WASM exit code - reject if non-zero (indicates WASM program failure)
+        for line in stdout.lines() {
+            if line.contains("Exit with code") {
+                // Parse exit code from line like "Exit with code 71"
+                if let Some(code_str) = line.strip_prefix("Exit with code ") {
+                    if let Ok(code) = code_str.trim().parse::<i32>() {
+                        if code != 0 {
+                            let _ = std::fs::remove_dir_all(&unique_proof_dir);
+                            eprintln!("WASM program exited with non-zero code {}. This indicates a program failure (e.g., parse error, assertion failure). Proof would be invalid.", code);
+                            anyhow::bail!(
+                                "WASM program exited with non-zero code {}. This indicates a program failure (e.g., parse error, assertion failure). Proof would be invalid.",
+                                code
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if !stdout.contains("Final prove result:                  true") {
             // Clean up the temporary directory on failure
             let _ = std::fs::remove_dir_all(&unique_proof_dir);
