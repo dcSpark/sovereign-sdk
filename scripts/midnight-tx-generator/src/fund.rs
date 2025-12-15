@@ -11,6 +11,8 @@ use sov_node_client::NodeClient;
 use sov_rollup_interface::crypto::PublicKey as _; // for credential_id()
 use sov_test_utils::default_test_signed_transaction;
 use serde::Deserialize;
+use base64::Engine;
+use reqwest::Client;
 use std::fs;
 use std::str::FromStr;
 
@@ -29,10 +31,8 @@ struct DedupResponse {
 }
 
 async fn fetch_next_generation(node_url: &str, credential_id: &str) -> Option<u64> {
-    let url = format!(
-        "{}/rollup/addresses/{}/dedup?select=generation",
-        node_url, credential_id
-    );
+    let base = node_url.trim_end_matches('/');
+    let url = format!("{}/rollup/addresses/{}/dedup?select=generation", base, credential_id);
     let resp = reqwest::get(url).await.ok()?;
     resp.json::<DedupResponse>().await.ok()?.generation
 }
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
     let credential_id = funder.private_key.pub_key().credential_id().to_string();
 
     let client = NodeClient::new_unchecked(&node_url);
+    let http_client = Client::new();
 
     // Determine base nonce for the funder (allow override via FUND_NONCE)
     let nonce_override: Option<u64> = std::env::var("FUND_NONCE").ok().map(|s| {
@@ -119,10 +120,33 @@ async fn main() -> Result<()> {
 
         let tx_hash = tx.hash().to_string();
         let tx_bytes = to_vec(&tx)?;
-        match client
-            .send_transactions_to_sequencer(vec![tx_bytes], true)
-            .await
-        {
+        let submit_res = if node_url.starts_with("https://") {
+            let base = node_url.trim_end_matches('/');
+            let url = format!("{}/sequencer/txs", base);
+            let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+            let body = serde_json::json!({ "body": tx_b64 });
+            match http_client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    Err(anyhow::anyhow!(
+                        "HTTPS submit to {} failed with status {} body: {}",
+                        url,
+                        status,
+                        text
+                    ))
+                }
+                Err(err) => Err(err.into()),
+            }
+        } else {
+            client
+                .send_transactions_to_sequencer(vec![tx_bytes], true)
+                .await
+                .map(|_| ())
+        };
+
+        match submit_res {
             Ok(_) => {
                 println!(
                     "✓ Funding tx submitted: {tx_hash} (generation {nonce}, attempt {})",
