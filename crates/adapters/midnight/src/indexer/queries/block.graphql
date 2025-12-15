@@ -1,0 +1,8 @@
+query BlockQuery($offset: BlockOffset) {
+    block(offset: $offset) {
+        height
+        hash
+        timestamp
+        author
+    }
+}
