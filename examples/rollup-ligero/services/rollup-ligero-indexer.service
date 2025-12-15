@@ -1,0 +1,16 @@
+[Unit]
+Description=Sovereign SDK Ligero Indexer Service
+After=network.target rollup-ligero.service
+
+[Service]
+Type=simple
+User=replace_for_linux_user
+WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/crates/utils/sov-indexer
+EnvironmentFile=-/home/replace_for_linux_user/sovereign-sdk/crates/utils/sov-indexer/.env
+ExecStart=/usr/bin/env cargo run -p sov-indexer --release
+Restart=on-failure
+Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target
