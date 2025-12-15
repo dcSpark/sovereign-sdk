@@ -14,6 +14,7 @@ use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
+use serde::Deserialize;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -22,6 +23,33 @@ mod demo_generated {
 }
 
 const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
+
+#[derive(Deserialize)]
+struct NotesResponse {
+    notes: Vec<NoteEntry>,
+    current_root: Option<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+struct NoteEntry {
+    position: u64,
+    commitment: Vec<u8>,
+}
+
+fn load_notes_from_source() -> Option<NotesResponse> {
+    if let Ok(path) = std::env::var("NOTES_FILE") {
+        let data = fs::read_to_string(path).ok()?;
+        return serde_json::from_str(&data).ok();
+    }
+
+    if let Ok(node_url) = std::env::var("NODE_API_URL") {
+        let url = format!("{}/modules/midnight-privacy/notes?limit=200&reverse=true", node_url);
+        if let Ok(resp) = reqwest::blocking::get(url) {
+            return resp.json::<NotesResponse>().ok();
+        }
+    }
+    None
+}
 
 fn main() -> Result<()> {
     let domain: Hash32 = hex::decode(std::env::var("OUT1_DOMAIN")?)?
@@ -43,17 +71,41 @@ fn main() -> Result<()> {
     let recipient_addr: String = std::env::var("RECIPIENT")?;
 
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("TRANSFER_ROOT")?)?;
-    let anchor: Hash32 = anchor_bytes
+    let mut anchor: Hash32 = anchor_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
     let cm = note_commitment(&domain, value, &rho, &recipient_hash);
     let nf = nullifier(&domain, &nf_key, &rho);
 
-    // Build tree - note was inserted at OUT1_POSITION during transfer
+    // Build tree from on-chain notes when available; otherwise fall back to single-leaf tree.
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
-    tree.set_leaf(position as usize, cm);
+    if let Some(notes_resp) = load_notes_from_source() {
+        for note in notes_resp.notes {
+            if note.position >= (1u64 << tree_depth) {
+                continue;
+            }
+            if let Ok(commitment) = note.commitment.clone().try_into() {
+                tree.set_leaf(note.position as usize, commitment);
+            }
+        }
+        // Ensure our note is present (in case not returned due to limit/filter)
+        tree.set_leaf(position as usize, cm);
+
+        let computed_root: Hash32 = tree
+            .root()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Computed root has invalid length"))?;
+        if computed_root != anchor {
+            println!(
+                "ℹ️  Recomputed anchor from notes differs from provided anchor; using computed root"
+            );
+            anchor = computed_root;
+        }
+    } else {
+        tree.set_leaf(position as usize, cm);
+    }
     let siblings = tree.open(position as usize);
 
     println!(
