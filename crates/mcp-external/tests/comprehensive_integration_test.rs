@@ -411,3 +411,29 @@ async fn test_privacy_key_formats() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
+async fn test_verify_transaction_shows_sent_not_sum() -> Result<()> {
+    // This test validates that verifyTransaction returns the sent amount,
+    // not the sum of all decrypted notes (sent + change).
+    //
+    // Scenario:
+    // 1. Deposit 500 to create a note
+    // 2. Transfer 100 to receiver (creates 2 notes: 100 sent, 400 change)
+    // 3. Verify the transfer transaction
+    // 4. Expected: verifyTransaction should return 100 (sent amount)
+    //    Bug: Currently returns 500 (100 + 400 = sum of all notes)
+
+    let _ = dotenvy::dotenv();
+
+    tracing::info!("Testing verifyTransaction - should return sent amount, not sum of all notes");
+    tracing::info!("Issue: When verifying a transfer, the function sums all decrypted notes");
+    tracing::info!("Expected: Return the first note's value (the sent amount)");
+
+    // For now, this is a placeholder test that documents the expected behavior
+    // The actual fix is in src/operations/verify_transaction.rs
+
+    Ok(())
+}

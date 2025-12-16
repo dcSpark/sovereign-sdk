@@ -54,6 +54,12 @@ pub struct VerifyTransactionResult {
 /// 3. If decryption fails or no VFK is provided, returns "encrypted"
 /// 4. Returns sync status (mocked as fully synced)
 ///
+/// **Important**: For transfer transactions with multiple encrypted notes, this returns
+/// the FIRST successfully decrypted note's value (the sent amount), NOT the sum of all notes.
+/// This is correct because:
+/// - For deposits: only one note exists (the deposited amount)
+/// - For transfers: Output 0 (first note) is the sent amount, Output 1 is change back to sender
+///
 /// # Parameters
 /// * `provider` - Provider for indexer connection
 /// * `identifier` - Transaction hash to verify
@@ -128,6 +134,9 @@ pub async fn verify_transaction(
 }
 
 /// Extract amount from encrypted notes by attempting to decrypt them
+///
+/// Returns the FIRST successfully decrypted note's value, not the sum of all notes.
+/// This is the correct behavior for verifying the sent amount in transfers.
 async fn extract_amount_from_transaction(
     encrypted_notes_field: &Option<serde_json::Value>,
     vfk_hex: &str,
@@ -158,16 +167,21 @@ async fn extract_amount_from_transaction(
         return "encrypted".to_string();
     }
 
-    // Try to decrypt notes and sum the amounts
-    let mut total_amount: u128 = 0;
-    let mut decrypted_any = false;
+    // Decrypt notes and return the FIRST successfully decrypted note's value.
+    // This is correct because:
+    // - For deposits: only one note exists (the deposited amount)
+    // - For transfers: Output 0 (first note) is always the sent amount, Output 1 is change
+    // We should NOT sum all notes, as that would return the original note value instead of the sent amount.
 
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
         match viewer::decrypt_note(&vfk, encrypted_note) {
             Ok((_domain, value, _rho, _recipient, _sender_id)) => {
-                tracing::info!("Successfully decrypted note {}: value={}", idx, value);
-                total_amount += value;
-                decrypted_any = true;
+                tracing::info!(
+                    "Successfully decrypted note {}: value={} (using this as transaction amount)",
+                    idx,
+                    value
+                );
+                return value.to_string();
             }
             Err(e) => {
                 tracing::warn!(
@@ -179,12 +193,8 @@ async fn extract_amount_from_transaction(
         }
     }
 
-    if decrypted_any {
-        total_amount.to_string()
-    } else {
-        tracing::info!("Could not decrypt any notes, marking amount as encrypted");
-        "encrypted".to_string()
-    }
+    tracing::info!("Could not decrypt any notes, marking amount as encrypted");
+    "encrypted".to_string()
 }
 
 /// Parse a VFK from a hex string (with or without 0x prefix)

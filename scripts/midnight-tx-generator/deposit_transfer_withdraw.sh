@@ -59,6 +59,7 @@ echo "  3. Withdraw $WITHDRAW_AMOUNT from first output (shielded → transparent
 echo ""
 echo "Parameters:"
 echo "  Nonce: $NONCE"
+echo "  Sequencer: $NODE_API_URL"
 echo "  Worker:    $VERIFIER_ENDPOINT"
 echo ""
 
@@ -89,6 +90,7 @@ if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
     RECIPIENT="$RECIPIENT" \
     FUND_AMOUNT="$FUND_AMOUNT" \
     FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
+    NONCE_STATE_FILE="$NONCE_STATE_FILE" \
     ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
     "$GENERATOR_DIR/target/debug/fund"
   echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"

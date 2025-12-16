@@ -8,7 +8,12 @@ use sov_modules_api::transaction::Transaction;
 use sov_modules_api::PrivateKey;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
+use sov_rollup_interface::crypto::PublicKey as _; // for credential_id()
 use sov_test_utils::default_test_signed_transaction;
+use serde::Deserialize;
+use base64::Engine;
+use reqwest::Client;
+use std::fs;
 use std::str::FromStr;
 
 type DemoRollupSpec = <sov_rollup_ligero::MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
@@ -18,6 +23,19 @@ mod demo_generated {
 }
 
 const DEFAULT_TOKEN_ID: &str = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
+
+#[derive(Deserialize)]
+struct DedupResponse {
+    nonce: Option<u64>,
+    generation: Option<u64>,
+}
+
+async fn fetch_next_generation(node_url: &str, credential_id: &str) -> Option<u64> {
+    let base = node_url.trim_end_matches('/');
+    let url = format!("{}/rollup/addresses/{}/dedup?select=generation", base, credential_id);
+    let resp = reqwest::get(url).await.ok()?;
+    resp.json::<DedupResponse>().await.ok()?.generation
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +50,7 @@ async fn main() -> Result<()> {
     let token_id = std::env::var("FUND_TOKEN_ID").unwrap_or_else(|_| DEFAULT_TOKEN_ID.to_string());
     let key_path = std::env::var("FUNDER_KEY_FILE")
         .unwrap_or_else(|_| "examples/test-data/keys/token_deployer_private_key.json".to_string());
+    let nonce_state_path = std::env::var("NONCE_STATE_FILE").ok();
 
     println!("Funding address {recipient} with {amount} of {token_id}");
     println!("Using funder key: {key_path}");
@@ -40,14 +59,37 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read key file at {}", key_path))?;
     let funder: PrivateKeyAndAddress<DemoRollupSpec> =
         serde_json::from_str(&key_json).with_context(|| "Failed to parse funder key file")?;
+    let credential_id = funder.private_key.pub_key().credential_id().to_string();
 
     let client = NodeClient::new_unchecked(&node_url);
+    let http_client = Client::new();
 
     // Determine base nonce for the funder (allow override via FUND_NONCE)
     let nonce_override: Option<u64> = std::env::var("FUND_NONCE").ok().map(|s| {
         s.parse()
             .expect("Invalid FUND_NONCE override (must be u64)")
     });
+
+    // Fetch next generation from sequencer dedup if no override is provided
+    let base_generation = if let Some(n) = nonce_override {
+        n
+    } else {
+        match fetch_next_generation(&node_url, &credential_id).await {
+            Some(gen) => {
+                println!(
+                    "Fetched next generation for {} from sequencer dedup: {}",
+                    credential_id, gen
+                );
+                gen
+            }
+            None => {
+                eprintln!(
+                    "⚠️  Could not fetch next generation from sequencer; falling back to 0"
+                );
+                0
+            }
+        }
+    };
 
     let token =
         TokenId::from_str(&token_id).with_context(|| format!("Invalid token id {}", token_id))?;
@@ -60,19 +102,12 @@ async fn main() -> Result<()> {
         mint_to_address: recipient.parse().context("Invalid RECIPIENT address")?,
     });
 
-    // Submit with nonce fetched from node; on uniqueness errors, re-fetch and retry.
+    // Submit with dedup generation fetched from the sequencer; on uniqueness errors, bump and retry.
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..5 {
         let nonce = match nonce_override {
             Some(n) => n + attempt,
-            None => {
-                let current = client
-                    .get_nonce_for_public_key::<DemoRollupSpec>(&funder.private_key.pub_key())
-                    .await
-                    .unwrap_or(0);
-                // Use next nonce beyond what the node reports, then bump per attempt.
-                current.saturating_add(1 + attempt as u64)
-            }
+            None => base_generation + attempt,
         };
 
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
@@ -85,15 +120,45 @@ async fn main() -> Result<()> {
 
         let tx_hash = tx.hash().to_string();
         let tx_bytes = to_vec(&tx)?;
-        match client
-            .send_transactions_to_sequencer(vec![tx_bytes], true)
-            .await
-        {
+        let submit_res = if node_url.starts_with("https://") {
+            let base = node_url.trim_end_matches('/');
+            let url = format!("{}/sequencer/txs", base);
+            let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+            let body = serde_json::json!({ "body": tx_b64 });
+            match http_client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    Err(anyhow::anyhow!(
+                        "HTTPS submit to {} failed with status {} body: {}",
+                        url,
+                        status,
+                        text
+                    ))
+                }
+                Err(err) => Err(err.into()),
+            }
+        } else {
+            client
+                .send_transactions_to_sequencer(vec![tx_bytes], true)
+                .await
+                .map(|_| ())
+        };
+
+        match submit_res {
             Ok(_) => {
                 println!(
-                    "✓ Funding tx submitted: {tx_hash} (nonce {nonce}, attempt {})",
+                    "✓ Funding tx submitted: {tx_hash} (generation {nonce}, attempt {})",
                     attempt + 1
                 );
+                if let Some(ref path) = nonce_state_path {
+                    if let Err(e) = fs::write(path, nonce.to_string()) {
+                        eprintln!("⚠️  Failed to write funding nonce to {}: {}", path, e);
+                    } else {
+                        println!("Saved funding generation {} to {}", nonce, path);
+                    }
+                }
                 return Ok(());
             }
             Err(e) => {

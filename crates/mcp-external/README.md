@@ -59,6 +59,14 @@ If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`), c
 
 An in-memory SQLite database (`sqlite::memory:?cache=shared`) tracks all wallet transactions and is kept in sync with the indexer every ~30 seconds. `send` inserts an `initiated` row immediately and continues in the background; indexer-derived records are upserted by `tx_identifier` to avoid uniqueness conflicts. The `id` returned by `send`/`getTransactions` is a local UUID; the blockchain hash is exposed as `txIdentifier` once known.
 
+## Docker
+
+Build the Docker image from the repo root (uses `crates/mcp-external/Dockerfile`):
+
+```bash
+docker build -f crates/mcp-external/Dockerfile -t dcspark/integration-e8d6e6728 -t dcspark/integration-e8d6e6728:latest .
+```
+
 ## Testing
 
 Run the fast, self-contained tests:

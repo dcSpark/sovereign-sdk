@@ -60,7 +60,7 @@ echo ""
 # Build generators if needed
 echo -e "${YELLOW}Building generators...${NC}"
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator --bin withdraw-with-tree 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 echo ""
 
@@ -178,11 +178,10 @@ NOTE_NF_KEY=$(cat "$NOTE_DETAILS_FILE" | jq -r '.nf_key')
 
 # Build the withdrawal generator if needed and run it
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin withdraw-with-tree 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 
-# Set environment and generate withdrawal
-# Set LIGERO environment for proof generation
+# Set environment and generate withdrawal using withdraw_generator.rs (same as transfer flow)
 export LIGERO_PROGRAM_PATH="$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 export LIGERO_PACKING=8192
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -191,15 +190,21 @@ else
     export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/linux-amd64/shader"
 fi
 
-export NOTE_DOMAIN NOTE_VALUE NOTE_RHO NOTE_RECIPIENT NOTE_NF_KEY
-export WITHDRAW_AMOUNT RECIPIENT
-export NOTE_POSITION
-export ANCHOR_ROOT
+# Map deposit note details into withdraw-generator inputs
+export OUT1_DOMAIN="$NOTE_DOMAIN"
+export OUT1_VALUE="$NOTE_VALUE"
+export OUT1_RHO="$NOTE_RHO"
+export OUT1_RECIPIENT="$NOTE_RECIPIENT"
+export OUT1_NF_KEY="$NOTE_NF_KEY"
+export OUT1_POSITION="$NOTE_POSITION"
+export TRANSFER_ROOT="$ANCHOR_ROOT"
 export NONCE=$WITHDRAW_NONCE
 export PRIVATE_KEY_FILE
+export NODE_API_URL
+export WITHDRAW_AMOUNT RECIPIENT
 
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/withdraw-with-tree" 2>&1 | tee /tmp/withdraw.log
+"$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
 # Send withdrawal to proof verifier (which forwards to sequencer)
