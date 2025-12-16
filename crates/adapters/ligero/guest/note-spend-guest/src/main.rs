@@ -7,15 +7,14 @@
  *   3) Output note commitments (0..=2): Poseidon2("NOTE_V1" || domain || value || rho || recipient)
  *   4) Balance: input_value == withdraw_amount + sum(output_values)
  *
- * OPTIMIZED BINARY ABI (Ligero typed args):
- * ==========================================
- * All arguments are passed as typed binary data, NOT strings:
+ * ARGUMENT LAYOUT (WASI args_get, 1-indexed):
+ * ============================================
+ * Mixed ABI - hex args for 32-byte values, i64 for integers, str for field elements:
  *   - LigeroArg::Hex { hex: "0x..." }  → Raw 32 bytes (unhexed by prover)
  *   - LigeroArg::I64 { i64: N }        → 8 bytes little-endian
+ *   - String arg                       → Parsed as field element via Bn254Fr::from_c_str
  *
- * This eliminates expensive per-byte/per-nibble parsing from the zkVM trace.
- *
- * Arguments (WASI args_get):
+ * Arguments:
  *   [1]  domain         — hex arg → 32 bytes
  *   [2]  value          — i64 arg → 8 bytes (input note value as u64)
  *   [3]  rho            — hex arg → 32 bytes
@@ -24,27 +23,28 @@
  *   [5]  spend_sk       — hex arg → 32 bytes  [PRIVATE]
  *                        Used to (a) authorize spend via recipient binding
  *                        and (b) derive nf_key := H("NFKEY_V1"||domain||spend_sk)
- *   [6]  pos            — i64 arg → 8 bytes   [PRIVATE]
- *   [7]  depth          — i64 arg → 8 bytes
- *   [8..8+depth) siblings[i] — hex arg → 32 bytes each  [PRIVATE]
- *   [8+depth]   anchor       — hex arg → 32 bytes (expected Merkle root)
- *   [9+depth]   nullifier    — hex arg → 32 bytes (expected nullifier)
- *   [10+depth]  withdraw_amount — i64 arg → 8 bytes
- *   [11+depth]  n_out           — i64 arg → 8 bytes (0, 1, or 2)
+ *   [6]  depth          — i64 arg → 8 bytes
+ *   [7..7+depth)        — pos_bits[i] — hex arg → 32 bytes each  [PRIVATE]
+ *                        Position bits as field elements (0x00...00 or 0x00...01)
+ *   [7+depth..7+2*depth) — siblings[i] — hex arg → 32 bytes each  [PRIVATE]
+ *   [7+2*depth]  anchor       — str arg → field element (expected Merkle root)
+ *   [8+2*depth]  nullifier    — str arg → field element (expected nullifier)
+ *   [9+2*depth]  withdraw_amount — i64 arg → 8 bytes
+ *   [10+2*depth] n_out           — i64 arg → 8 bytes (0, 1, or 2)
  *   For each j in [0..n_out):
- *     [12+depth + 4*j + 0] value_out_j  — i64 arg → 8 bytes   [PRIVATE]
- *     [12+depth + 4*j + 1] rho_out_j    — hex arg → 32 bytes  [PRIVATE]
- *     [12+depth + 4*j + 2] pk_out_j     — hex arg → 32 bytes  [PRIVATE]
- *                                        recipient is DERIVED: H("ADDR_V1"||domain||pk_out)
- *     [12+depth + 4*j + 3] cm_out_j     — hex arg → 32 bytes (PUBLIC; must equal computed)
+ *     [11+2*depth + 4*j + 0] value_out_j  — i64 arg → 8 bytes   [PRIVATE]
+ *     [11+2*depth + 4*j + 1] rho_out_j    — hex arg → 32 bytes  [PRIVATE]
+ *     [11+2*depth + 4*j + 2] pk_out_j     — hex arg → 32 bytes  [PRIVATE]
+ *                                          recipient is DERIVED: H("ADDR_V1"||domain||pk_out)
+ *     [11+2*depth + 4*j + 3] cm_out_j     — hex arg → 32 bytes (PUBLIC; must equal computed)
  *
- * Expected argc = 12 + depth + 4*n_out (argc includes argv[0]).
+ * Expected argc = 11 + 2*depth + 4*n_out (argc includes argv[0]).
  *
- * PERFORMANCE OPTIMIZATIONS:
- *   1) Binary ABI: Direct memory reads instead of string parsing
- *   2) Oblivious Merkle path: No secret-dependent branching (uses cswap32)
- *   3) Reduced MAX_BUF: 8KB instead of 128KB (sufficient for binary args)
- *   4) Single hasher instance: Reused for all Poseidon2 calls
+ * SECURITY NOTES:
+ *   1) All validation paths inject UNSAT constraints before exit (hard_fail)
+ *   2) Balance check uses field-level constraint, not runtime boolean comparison
+ *   3) Position bits are constrained to be boolean (0 or 1)
+ *   4) Merkle path uses field-level MUX to avoid witness-dependent constraints
  *
  * Hashing uses Ligetron's Poseidon2 via bn254fr host functions (Ligero-compatible).
  *
@@ -59,7 +59,7 @@
 // =============================================================================
 
 // Ligetron SDK imports
-use ligetron::api::{get_args, assert_one, ArgHolder};
+use ligetron::api::{get_args, ArgHolder};
 use ligetron::bn254fr::{Bn254Fr, addmod_checked, submod_checked};
 use ligetron::poseidon2::poseidon2_hash_bytes;
 
@@ -84,6 +84,22 @@ fn fail_with_code(code: u32) -> ! {
 #[cfg(not(feature = "diagnostics"))]
 fn fail_with_code(_code: u32) -> ! {
     exit_with_code(71)
+}
+
+/// Hard failure that injects an UNSAT constraint before exiting.
+/// 
+/// SECURITY: This is critical for soundness! Without the UNSAT constraint,
+/// a malicious prover could trigger a failure path and still get a valid proof
+/// for a "truncated" circuit (if the zkVM doesn't enforce exit code checks).
+/// 
+/// The constraint 0 == 1 is unsatisfiable, ensuring the proof will fail verification.
+#[inline(always)]
+fn hard_fail(code: u32) -> ! {
+    // Force UNSAT: 0 == 1
+    let zero = Bn254Fr::new();
+    let one = Bn254Fr::from_u32(1);
+    Bn254Fr::assert_equal(&zero, &one);
+    fail_with_code(code)
 }
 
 type Hash32 = [u8; 32];
@@ -200,8 +216,12 @@ fn read_position_bit(args: &ArgHolder, index: usize) -> Bn254Fr {
     if bytes.len() == 32 {
         out.copy_from_slice(bytes);
     } else {
-        // Fallback: decode hex if needed (skip 2-byte prefix)
-        let hex_bytes = if bytes.len() >= 2 { &bytes[2..] } else { bytes };
+        // Fallback: decode hex if needed (check for 0x prefix properly)
+        let hex_bytes = if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+            &bytes[2..]
+        } else {
+            bytes
+        };
         for i in 0..32 {
             let idx = i * 2;
             let hi = if idx < hex_bytes.len() { hex_char_to_nibble(hex_bytes[idx]) } else { 0 };
@@ -218,17 +238,6 @@ fn read_position_bit(args: &ArgHolder, index: usize) -> Bn254Fr {
 // Values are encoded to 16-byte LE with zero-extension for protocol compatibility.
 // ============================================================================
 
-
-fn eq_bytes_32(a: &Hash32, b: &Hash32) -> bool {
-    let mut acc = 0u8;
-    // Unrolled loop for 32 bytes - no length check needed
-    let mut i = 0;
-    while i < 32 {
-        acc |= a[i] ^ b[i];
-        i += 1;
-    }
-    acc == 0
-}
 
 // ============================================================================
 // ARGUMENT HELPERS: Read typed args from ArgHolder.
@@ -276,9 +285,12 @@ fn read_hash32(args: &ArgHolder, index: usize) -> Hash32 {
         return out;
     }
 
-    // Fallback: decode ASCII hex (assume it's "0x" + 64 chars as produced by host).
-    // Skip 2-byte prefix unconditionally for our inputs (host always supplies 0x...).
-    let hex_bytes = if bytes.len() >= 2 { &bytes[2..] } else { bytes };
+    // Fallback: decode ASCII hex (check for 0x prefix properly).
+    let hex_bytes = if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+        &bytes[2..]
+    } else {
+        bytes
+    };
 
     for i in 0..32 {
         let idx = i * 2;
@@ -294,7 +306,7 @@ fn read_hash32(args: &ArgHolder, index: usize) -> Hash32 {
 #[inline(always)]
 fn read_u64(args: &ArgHolder, index: usize, fail_code: u32) -> u64 {
     let v = args.get_as_int(index);
-    if v < 0 { fail_with_code(fail_code); }
+    if v < 0 { hard_fail(fail_code); }
     v as u64
 }
 
@@ -302,7 +314,7 @@ fn read_u64(args: &ArgHolder, index: usize, fail_code: u32) -> u64 {
 #[inline(always)]
 fn read_u32(args: &ArgHolder, index: usize, fail_code: u32) -> u32 {
     let v = args.get_as_int(index);
-    if v < 0 || v > u32::MAX as i64 { fail_with_code(fail_code); }
+    if v < 0 || v > u32::MAX as i64 { hard_fail(fail_code); }
     v as u32
 }
 
@@ -437,7 +449,7 @@ fn cswap32(a: &mut [u8; 32], b: &mut [u8; 32], bit: u8) {
 /// Kept for reference - use root_from_path_field_level instead.
 #[allow(dead_code)]
 fn root_from_path_oblivious_old(h: &Poseidon2Core, leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u32) -> (Bn254Fr, Hash32) {
-    if depth == 0 { fail_with_code(77); }
+    if depth == 0 { hard_fail(77); }
     let mut cur = *leaf;
     let mut idx = pos;
     let mut lvl = 0u32;
@@ -460,9 +472,10 @@ fn root_from_path_oblivious_old(h: &Poseidon2Core, leaf: &Hash32, pos: u64, sibl
 /// This version works with private position bits and siblings!
 /// 
 /// Arguments:
-/// - leaf: The leaf commitment (as field element and bytes)
+/// - h: Poseidon2 hasher instance
+/// - leaf_bytes: The leaf commitment as 32-byte hash
 /// - pos_bits: Position bits as field elements (0 or 1 each), one per level
-/// - siblings: Sibling hashes as field elements, one per level
+/// - siblings_fr: Sibling hashes as field elements, one per level
 /// - depth: Number of levels in the Merkle path
 /// 
 /// The position bits determine which side the current node is on at each level:
@@ -470,25 +483,21 @@ fn root_from_path_oblivious_old(h: &Poseidon2Core, leaf: &Hash32, pos: u64, sibl
 /// - bit=1: current is right child, sibling is left child
 fn root_from_path_field_level(
     h: &Poseidon2Core,
-    leaf_fr: &Bn254Fr,
     leaf_bytes: &Hash32,
     pos_bits: &[Bn254Fr],
     siblings_fr: &[Bn254Fr],
-    siblings_bytes: &[Hash32],
     depth: u32,
 ) -> (Bn254Fr, Hash32) {
-    if depth == 0 { fail_with_code(77); }
+    if depth == 0 { hard_fail(77); }
     
-    // Initialize current node from leaf (can't use copy since Bn254Fr doesn't implement Copy)
-    let mut cur_fr = Bn254Fr::new();
-    cur_fr.set_bytes_big(leaf_bytes);
+    // Initialize current node from leaf
+    let mut cur_fr = bn254fr_from_hash32_be(leaf_bytes);
     let mut cur_bytes = *leaf_bytes;
     
     let mut lvl = 0u32;
     while lvl < depth {
         let bit = &pos_bits[lvl as usize];
         let sib_fr = &siblings_fr[lvl as usize];
-        let sib_bytes = &siblings_bytes[lvl as usize];
         
         // Field-level MUX for left/right selection
         // if bit == 0: left = cur, right = sib
@@ -684,7 +693,7 @@ fn main() {
 
     // 6) depth [i64 arg -> 8 bytes] - now comes BEFORE position bits
     let depth_u32 = read_u32(&args, 6, 77);
-    if depth_u32 > MAX_DEPTH as u32 { fail_with_code(77); }
+    if depth_u32 > MAX_DEPTH as u32 { hard_fail(77); }
     let depth = depth_u32 as usize;
 
     // 7 to 7+depth-1) position bits [PRIVATE] [hex args -> field elements]
@@ -719,7 +728,7 @@ fn main() {
 
     // 10+2*depth) n_out in {0,1,2} [i64 arg -> 8 bytes]
     let n_out_u32 = read_u32(&args, 10 + 2 * depth, 83);
-    if n_out_u32 > MAX_OUTS as u32 { fail_with_code(83); }
+    if n_out_u32 > MAX_OUTS as u32 { hard_fail(83); }
     let n_out = n_out_u32 as usize;
 
     // Expected argc without viewers
@@ -730,7 +739,7 @@ fn main() {
     let expected_base = 11u32 + 2 * depth_u32 + 4u32 * n_out_u32;
     
     // Must have at least the base args
-    if argc < expected_base { fail_with_code(84); }
+    if argc < expected_base { hard_fail(84); }
 
     // Store output data for viewer encryption — use u64 for values
     struct OutPlain {
@@ -752,7 +761,7 @@ fn main() {
 
         // value_out_j [PRIVATE] [i64 arg -> 8 bytes]
         let vj = read_u64(&args, base + 0, 85);
-        out_sum = out_sum.checked_add(vj).unwrap_or_else(|| fail_with_code(86));
+        out_sum = out_sum.checked_add(vj).unwrap_or_else(|| hard_fail(86));
 
         // rho_out_j [PRIVATE] [hex arg -> 32 bytes]
         let rho_j = read_hash32(&args, base + 1);
@@ -777,16 +786,14 @@ fn main() {
     // Compute input note commitment and anchor using FIELD-LEVEL Merkle path
     // Uses MUX operations that work with private position bits and siblings!
     // Use recipient_expected (derived from spend_sk) instead of recipient arg
-    let (cm_in_fr, cm_in_bytes) = note_commitment(&h, &domain, value, &rho, &recipient_expected);
+    let (_cm_in_fr, cm_in_bytes) = note_commitment(&h, &domain, value, &rho, &recipient_expected);
     
     // Use field-level Merkle path computation
     let (anchor_computed_fr, _anchor_computed_bytes) = root_from_path_field_level(
         &h,
-        &cm_in_fr,
         &cm_in_bytes,
         &pos_bits[..depth],
         &siblings_fr[..depth],
-        &siblings_bytes[..depth],
         depth_u32,
     );
     // Use field-level constraint: anchor_computed == anchor (from string arg)
@@ -798,9 +805,29 @@ fn main() {
     // Use field-level constraint: nullifier_computed == nullifier (from string arg)
     Bn254Fr::assert_equal(&nf_computed_fr, &nullifier_fr);
 
-    // Balance: input value must equal withdraw + sum(outputs) — u64 arithmetic
-    let rhs = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| fail_with_code(90));
-    assert_one((value == rhs) as i32);
+    // Balance: input value must equal withdraw + sum(outputs)
+    // CRITICAL: Use FIELD-LEVEL constraint, not runtime boolean comparison!
+    // A runtime boolean like `assert_one((value == rhs) as i32)` would create
+    // witness-dependent constraints that fail verification when verifier runs
+    // with obscured private inputs.
+    //
+    // Instead, we express the balance as: value_fr == withdraw_fr + out_sum_fr
+    // This creates uniform constraints regardless of actual values.
+    
+    // First check for overflow at runtime (inject UNSAT if overflow)
+    let _rhs_check = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| hard_fail(90));
+    
+    // Convert amounts to field elements
+    let value_fr = Bn254Fr::from_u64(value);
+    let withdraw_fr = Bn254Fr::from_u64(withdraw_amount);
+    let out_sum_fr = Bn254Fr::from_u64(out_sum);
+    
+    // Compute RHS as field element: withdraw + sum(outputs)
+    let mut rhs_fr = Bn254Fr::new();
+    addmod_checked(&mut rhs_fr, &withdraw_fr, &out_sum_fr);
+    
+    // Field constraint: value == withdraw + sum(outputs)
+    Bn254Fr::assert_equal(&value_fr, &rhs_fr);
 
     // --- Level B: Viewer Attestations ---
     // If viewers are declared, verify ct_hash + mac for each (output, viewer)
@@ -816,7 +843,7 @@ fn main() {
     // n_viewers [i64 arg -> 8 bytes]
     let n_viewers: usize = {
         let v = read_u32(&args, base_after_outs, 91) as usize;
-        if v > MAX_VIEWERS { fail_with_code(91); }
+        if v > MAX_VIEWERS { hard_fail(91); }
         v
     };
 
@@ -825,7 +852,7 @@ fn main() {
     //   + m_viewers * ( 1 public fvk_commit + 1 private fvk + 2*n_out public digests )
     let extra_per_viewer = 1 + 1 + 2 * n_out;
     let expected_argc_b = expected_base + 1u32 + (n_viewers as u32) * (extra_per_viewer as u32);
-    if argc != expected_argc_b { fail_with_code(92); }
+    if argc != expected_argc_b { hard_fail(92); }
 
     // Precompute plaintexts once per output, reuse across all viewers.
     let mut out_pts: [[u8; NOTE_PLAIN_LEN]; MAX_OUTS] = [[0u8; NOTE_PLAIN_LEN]; MAX_OUTS];
