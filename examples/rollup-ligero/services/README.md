@@ -1,8 +1,8 @@
 # Rollup Ligero Services (Linux)
 
 This directory contains systemd unit files for running the Sovereign SDK
-rollup demo, its Ligero proof verifier, the indexer, and the continuous
-transfers load generator as background services on Linux.
+rollup demo, its Ligero proof verifier, the indexer, the MCP external server,
+and the continuous transfers load generator as background services on Linux.
 
 ## Prerequisites
 - A Linux host with `systemd`
@@ -21,6 +21,7 @@ transfers load generator as background services on Linux.
    sudo cp rollup-ligero-verifier.service /etc/systemd/system/
    sudo cp rollup-ligero-indexer.service /etc/systemd/system/
    sudo cp rollup-ligero-continuous-transfers.service /etc/systemd/system/
+   sudo cp rollup-ligero-mcp.service /etc/systemd/system/
    ```
 2. Reload systemd so it detects the new files:
    ```bash
@@ -32,6 +33,7 @@ transfers load generator as background services on Linux.
    sudo systemctl enable --now rollup-ligero-verifier.service
    sudo systemctl enable --now rollup-ligero-indexer.service
    sudo systemctl enable --now rollup-ligero-continuous-transfers.service
+    sudo systemctl enable --now rollup-ligero-mcp.service
    ```
 
 ## Useful Commands
@@ -57,5 +59,8 @@ transfers load generator as background services on Linux.
   Update the `Environment=` entries inside the unit file to control the number
   of wallets (`CONTINUOUS_NUM_WALLETS`) and the verifier/sequencer endpoints
   (`E2E_ROLLUP_EXTERNAL_VERIFIER_URL` and `E2E_ROLLUP_EXTERNAL_NODE_URL`).
+- The MCP external service wraps `crates/mcp-external/run_mcp.sh`. It loads
+  environment from `crates/mcp-external/.env` (or inline `Environment=` overrides)
+  for MCP address, rollup/verifier/indexer endpoints, keys, and Ligero paths.
 - Ensure that all services run under a user with permission to access the
   workspace and required key material.
