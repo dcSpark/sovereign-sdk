@@ -12,7 +12,7 @@ This guest program implements the same validation logic as `value_validator.cpp`
 ## Why Rust?
 
 Writing guest programs in Rust instead of C++ allows us to:
-- ✅ Use `qp-poseidon-core` directly for Poseidon2 hashing
+- ✅ Use Ligetron SDK for Poseidon2 hashing (consistent with the circuit)
 - ✅ Share types between the module and guest program
 - ✅ Leverage Rust's memory safety and type system
 - ✅ Access the full Rust crypto ecosystem
@@ -81,8 +81,8 @@ EOF
 If this proof-of-concept works with Ligero:
 
 1. ✅ **Confirmed**: Rust->WASM works with Ligero
-2. 🔨 **Create** `note_spend` guest in Rust
-3. 🔗 **Use** `qp-poseidon-core` for hashing
+2. ✅ **Create** `note_spend` guest in Rust (see `note-spend-guest/`)
+3. ✅ **Use** Ligetron SDK for Poseidon2 hashing
 4. 🚀 **Deploy** privacy-preserving note spending
 
 ## Implementation Notes
@@ -97,11 +97,11 @@ The current implementation:
 
 ### For Production
 
-For the actual `note_spend` circuit, we would:
-- Add `qp-poseidon-core` dependency
+For the actual `note_spend` circuit (see `note-spend-guest/`), we:
+- Use Ligetron SDK for Poseidon2 via bn254fr host functions
 - Implement proper error handling
 - Use better argument parsing
-- Possibly create FFI bindings to Ligero SDK if needed
+- Leverage Ligetron's native FFI bindings
 
 ## File Structure
 

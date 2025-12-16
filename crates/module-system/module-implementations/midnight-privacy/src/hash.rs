@@ -1,18 +1,17 @@
 //! Domain-separated Poseidon2 hash functions for privacy-preserving operations.
 //!
-//! This module uses Poseidon2, a ZK-friendly hash function optimized for zero-knowledge
-//! proof systems. Poseidon2 is significantly faster than the original Poseidon and is
-//! designed to work efficiently with arithmetic circuits.
+//! This module uses Ligetron's Poseidon2, which is compatible with the ZK circuit.
+//! Using the same Poseidon2 implementation ensures hash consistency between
+//! native Rust code and the Ligero circuit.
 //!
 //! Domain separation is achieved by prepending unique domain tags to each input type,
 //! preventing cross-domain collisions and attacks.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use qp_poseidon_core::Poseidon2Core;
+use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
 use serde::{Deserialize, Serialize};
 
 /// 32-byte hash output.
@@ -256,16 +255,11 @@ pub struct PendingNullifierPrefix {
     pub height: u64,
 }
 
-// Thread-local Poseidon2 hasher instance (deterministic with fixed seed).
-// Using thread-local instances avoids repeated allocations and initialization overhead
-// while ensuring thread-safety without synchronization overhead.
-thread_local! {
-    static POSEIDON: RefCell<Poseidon2Core> = RefCell::new(Poseidon2Core::new());
-}
-
-/// Domain-separated 32-byte Poseidon2 hash.
+/// Domain-separated 32-byte Poseidon2 hash using Ligetron's implementation.
 /// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V1", "NF_V1").
 /// This provides collision resistance between different hash use cases.
+/// 
+/// Uses Ligetron's native Poseidon2 to ensure consistency with the ZK circuit.
 pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
     // Concatenate tag and all parts
     let mut input = Vec::with_capacity(tag.len() + parts.iter().map(|p| p.len()).sum::<usize>());
@@ -274,7 +268,8 @@ pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
         input.extend_from_slice(part);
     }
 
-    POSEIDON.with(|h| h.borrow().hash_padded(&input))
+    // Use Ligetron's native Poseidon2 (consistent with the circuit)
+    ligetron_hash_bytes(&input).to_bytes_be()
 }
 
 /// Domain tags as fixed-size arrays (avoids const evaluation issues)
@@ -294,7 +289,7 @@ pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
     buf[11..43].copy_from_slice(left);
     buf[43..].copy_from_slice(right);
 
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// Compute a note commitment.
@@ -312,7 +307,7 @@ pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &H
     buf[55..87].copy_from_slice(rho);
     buf[87..].copy_from_slice(recipient);
 
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
@@ -333,7 +328,7 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
     buf[41..73].copy_from_slice(nf_key);
     buf[73..].copy_from_slice(rho);
 
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 // === Privacy Address Key Derivation ===
@@ -351,7 +346,7 @@ pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     let mut buf = [0u8; 5 + 32];
     buf[..5].copy_from_slice(PK_TAG);
     buf[5..].copy_from_slice(spend_sk);
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// Derive privacy recipient address from domain and public key.
@@ -365,7 +360,7 @@ pub fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
     buf[..7].copy_from_slice(ADDR_TAG);
     buf[7..39].copy_from_slice(domain);
     buf[39..].copy_from_slice(pk);
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// Derive privacy recipient address from domain and spending secret key.
@@ -384,7 +379,7 @@ pub fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
     buf[..8].copy_from_slice(NFKEY_TAG);
     buf[8..40].copy_from_slice(domain);
     buf[40..].copy_from_slice(spend_sk);
-    POSEIDON.with(|h| h.borrow().hash_padded(&buf))
+    ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// Recompute the Merkle root from a leaf using its authentication path.

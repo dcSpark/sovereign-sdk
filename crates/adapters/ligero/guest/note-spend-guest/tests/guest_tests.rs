@@ -130,16 +130,12 @@ fn private_indices(depth: u32, n_out: usize) -> Vec<usize> {
 }
 
 // Import the hashing functions we need for testing
+// Use Ligetron's native Poseidon2 to ensure consistency with the circuit
 mod poseidon2 {
     use super::Hash32;
-    use qp_poseidon_core::Poseidon2Core;
-    
-    fn get_hasher() -> Poseidon2Core {
-        Poseidon2Core::new()
-    }
+    use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
     
     fn poseidon2_hash_domain(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
-        let hasher = get_hasher();
         let mut buf_len = tag.len();
         for part in parts {
             buf_len += part.len();
@@ -149,7 +145,7 @@ mod poseidon2 {
         for part in parts {
             tmp.extend_from_slice(part);
         }
-        hasher.hash_padded(&tmp)
+        ligetron_hash_bytes(&tmp).to_bytes_be()
     }
     
     pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {

@@ -1464,28 +1464,29 @@ async fn perform_transfer_cycle(
                     <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                         .with_private_indices(private_indices);
 
+                // Typed binary ABI for zkVM performance
                 host.add_hex_arg(hex::encode(DOMAIN));
-                host.add_str_arg(value.to_string());
+                host.add_u64_arg(value);
                 host.add_hex_arg(hex::encode(in_rho));
                 host.add_hex_arg(hex::encode(in_recipient));
                 host.add_hex_arg(hex::encode(NF_KEY));
-                host.add_str_arg((position as u64).to_string());
-                host.add_str_arg((TREE_DEPTH as u8).to_string());
+                host.add_u64_arg(position as u64);
+                host.add_u64_arg(TREE_DEPTH as u64);
                 for s in &siblings {
                     host.add_hex_arg(hex::encode(s));
                 }
                 host.add_hex_arg(hex::encode(anchor));
                 host.add_hex_arg(hex::encode(nf));
-                host.add_str_arg("0".to_string()); // withdraw_amount
-                host.add_str_arg("1".to_string()); // ONE output
-                host.add_str_arg(value.to_string());
+                host.add_u64_arg(0); // withdraw_amount
+                host.add_u64_arg(1); // ONE output
+                host.add_u64_arg(value);
                 host.add_hex_arg(hex::encode(out_rho));
                 host.add_hex_arg(hex::encode(out_recipient));
                 host.add_hex_arg(hex::encode(cm_out));
 
                 // Viewer section (Level-B)
                 if let Some((fvk, att)) = viewer_data {
-                    host.add_str_arg("1".to_string()); // m_viewers
+                    host.add_u64_arg(1); // m_viewers
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
                     host.add_hex_arg(hex::encode(fvk));
                     host.add_hex_arg(hex::encode(att.ct_hash));

@@ -106,13 +106,14 @@ fn main() -> Result<()> {
         .with_packing(packing)
         .with_private_indices(private_indices);
 
+    // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(value);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(position.to_string());
-    host.add_str_arg(tree_depth.to_string());
+    host.add_u64_arg(position);
+    host.add_u64_arg(tree_depth as u64);
 
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
@@ -120,17 +121,17 @@ fn main() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg("0".to_string()); // withdraw_amount = 0
-    host.add_str_arg("2".to_string()); // n_out = 2
+    host.add_u64_arg(0); // withdraw_amount = 0
+    host.add_u64_arg(2); // n_out = 2
 
     // Output 1
-    host.add_str_arg(out1_value.to_string());
+    host.add_u64_arg(out1_value);
     host.add_hex_arg(hex::encode(out1_rho));
     host.add_hex_arg(hex::encode(out1_recipient));
     host.add_hex_arg(hex::encode(cm_out1));
 
     // Output 2
-    host.add_str_arg(out2_value.to_string());
+    host.add_u64_arg(out2_value);
     host.add_hex_arg(hex::encode(out2_rho));
     host.add_hex_arg(hex::encode(out2_recipient));
     host.add_hex_arg(hex::encode(cm_out2));

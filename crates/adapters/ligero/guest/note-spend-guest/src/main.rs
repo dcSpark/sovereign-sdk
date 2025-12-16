@@ -90,7 +90,7 @@ type Hash32 = [u8; 32];
 
 // =============================================================================
 // Ligetron-compatible Poseidon2Core shim
-// Replaces qp_poseidon_core::Poseidon2Core, while keeping the rest of the circuit unchanged.
+// Uses Ligetron's Poseidon2 implementation via bn254fr host functions.
 // Uses Ligetron's Poseidon2 implementation via bn254fr host functions.
 // =============================================================================
 

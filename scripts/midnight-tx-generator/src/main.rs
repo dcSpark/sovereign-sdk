@@ -159,14 +159,14 @@ fn main() -> Result<()> {
         .with_packing(ligero_config.packing)
         .with_private_indices(private_indices);
 
-    // Add arguments in exact test order
+    // Add arguments using typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(value);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(position.to_string());
-    host.add_str_arg(tree_depth.to_string());
+    host.add_u64_arg(position);
+    host.add_u64_arg(tree_depth as u64);
 
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
@@ -174,9 +174,9 @@ fn main() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg(n_out.to_string());
-    host.add_str_arg(out_value.to_string());
+    host.add_u64_arg(withdraw_amount);
+    host.add_u64_arg(n_out as u64);
+    host.add_u64_arg(out_value);
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_rcp));
     host.add_hex_arg(hex::encode(cm_out));

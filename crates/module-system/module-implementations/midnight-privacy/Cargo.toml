@@ -42,7 +42,8 @@ sov-state = { workspace = true }
 bincode = { workspace = true }
 hex = { workspace = true }
 bech32 = { workspace = true }
-qp-poseidon-core = { version = "0.9.5", features = ["std"] }
+# Ligetron SDK with native field arithmetic (same Poseidon2 as circuit!)
+ligetron = { path = "../../../adapters/ligero/guest/note-spend-guest/sdk/rust", features = ["native"] }
 sov-bank = { workspace = true }
 once_cell = { workspace = true }
 chacha20poly1305 = { version = "0.10", features = ["std"] }

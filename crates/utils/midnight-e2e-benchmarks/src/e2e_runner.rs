@@ -1381,24 +1381,24 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                     .with_private_indices(private_indices);
 
-                // Base args (same as before)
+                // Base args (typed binary ABI for zkVM performance)
                 host.add_hex_arg(hex::encode(domain));
-                host.add_str_arg(value.to_string());
+                host.add_u64_arg(value);
                 host.add_hex_arg(hex::encode(rho));
                 host.add_hex_arg(hex::encode(recipient));
                 host.add_hex_arg(hex::encode(nf_key));
-                host.add_str_arg((position as u64).to_string());
-                host.add_str_arg((depth_usize as u8).to_string());
+                host.add_u64_arg(position as u64);
+                host.add_u64_arg(depth_usize as u64);
                 for s in &siblings {
                     host.add_hex_arg(hex::encode(s));
                 }
                 host.add_hex_arg(hex::encode(anchor));
                 host.add_hex_arg(hex::encode(nf));
-                host.add_str_arg("0".to_string()); // withdraw_amount
-                host.add_str_arg("1".to_string()); // ONE output
+                host.add_u64_arg(0); // withdraw_amount
+                host.add_u64_arg(1); // ONE output
 
                 // Output 0
-                host.add_str_arg(out_value.to_string());
+                host.add_u64_arg(out_value);
                 host.add_hex_arg(hex::encode(out_rho));
                 host.add_hex_arg(hex::encode(out_recipient));
                 host.add_hex_arg(hex::encode(cm_out));
@@ -1406,7 +1406,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // Viewer section (Level-B) - add viewer args if authority FVK is set
                 if let Some((fvk, att)) = viewer_data {
                     // m_viewers
-                    host.add_str_arg("1".to_string());
+                    host.add_u64_arg(1);
                     // public fvk_commitment
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
                     // private fvk
