@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 graphql_client = { version = "0.15.0", features = ["reqwest"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 thiserror.workspace = true
 url = "2"

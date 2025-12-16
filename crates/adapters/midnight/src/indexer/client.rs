@@ -16,6 +16,15 @@ pub type HexEncoded = String;
 )]
 pub struct BlockQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/indexer/schema.graphql",
+    query_path = "src/indexer/queries/contract_state.graphql",
+    response_derives = "Debug, Clone, Deserialize, Serialize",
+    scalar = "HexEncoded = String"
+)]
+pub struct ContractStateQuery;
+
 /// GraphQL client tailored to the Midnight indexer data service.
 #[derive(Debug, Clone)]
 pub struct IndexerClient {
@@ -59,6 +68,26 @@ impl IndexerClient {
         let data = extract_graphql_data(response)?;
         Ok(data.block)
     }
+
+    /// Fetch the latest contract action (including state) for a contract, optionally scoped by offset.
+    pub async fn get_contract_state(
+        &self,
+        address: impl Into<HexEncoded>,
+        offset: Option<contract_state_query::ContractActionOffset>,
+    ) -> Result<
+        Option<contract_state_query::ContractStateQueryContractAction>,
+        MidnightGraphqlClientError,
+    > {
+        let variables = contract_state_query::Variables {
+            address: address.into(),
+            offset,
+        };
+        let response =
+            post_graphql::<ContractStateQuery, _>(&self.http, self.endpoint.clone(), variables)
+                .await?;
+        let data = extract_graphql_data(response)?;
+        Ok(data.contract_action)
+    }
 }
 
 fn extract_graphql_data<T>(response: Response<T>) -> Result<T, MidnightGraphqlClientError> {
@@ -89,7 +118,8 @@ pub enum MidnightGraphqlClientBuilderError {
 mod tests {
     use super::*;
 
-    const INDEXER_URL: &str = "https://indexer.testnet-02.midnight.network/api/v1/graphql";
+    //const INDEXER_URL: &str = "https://indexer.testnet-02.midnight.network/api/v1/graphql";
+    const INDEXER_URL: &str = "http://localhost:32797/api/v1/graphql";
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a running Midnight indexer instance"]
@@ -108,6 +138,31 @@ mod tests {
             }
             None => {
                 panic!("indexer returned no block");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a running Midnight indexer instance"]
+    async fn contract_state_query_smoke_test() {
+        // This needs to be an actual deployed (bridge) contract address.
+        const CONTRACT_ADDRESS: &str =
+            "0002007d57c06ebb943774a87fe28b7ed6c7a4e176890a9ea12f4c4679afe09ae7c19d";
+
+        let client = IndexerClient::try_new(INDEXER_URL)
+            .expect("hardcoded Midnight indexer URL should parse");
+
+        let state = client
+            .get_contract_state(CONTRACT_ADDRESS.to_owned(), None)
+            .await
+            .expect("contract state query should succeed when an indexer is running");
+
+        match state {
+            Some(action) => {
+                println!("Fetched contract action {action:#?}");
+            }
+            None => {
+                println!("contract not found or has no state");
             }
         }
     }

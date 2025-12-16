@@ -1,0 +1,21 @@
+query ContractStateQuery($address: HexEncoded!, $offset: ContractActionOffset) {
+    contractAction(address: $address, offset: $offset) {
+        __typename
+        ... on ContractDeploy {
+            address
+            state
+            chainState
+        }
+        ... on ContractCall {
+            address
+            state
+            chainState
+            entryPoint
+        }
+        ... on ContractUpdate {
+            address
+            state
+            chainState
+        }
+    }
+}
