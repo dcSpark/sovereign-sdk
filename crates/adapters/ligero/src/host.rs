@@ -186,13 +186,79 @@ impl LigeroHost {
         self.config.args.push(LigeroArg::I64 { i64: value });
     }
 
+    /// Add a u64 argument (stored as i64, guest checks for non-negative)
+    /// Panics if value > i64::MAX
+    pub fn add_u64_arg(&mut self, value: u64) {
+        assert!(value <= i64::MAX as u64, "u64 value too large for i64 encoding");
+        self.config.args.push(LigeroArg::I64 { i64: value as i64 });
+    }
+
     /// Add a hex argument
+    ///
+    /// Uses LigeroArg::Hex - the prover adds 0x prefix and passes as ASCII.
     pub fn add_hex_arg(&mut self, value: String) {
-        self.config.args.push(LigeroArg::Hex { hex: value });
+        // Strip 0x prefix if present - LigeroArg::Hex doesn't include it
+        let hex = if value.starts_with("0x") || value.starts_with("0X") {
+            value[2..].to_string()
+        } else {
+            value
+        };
+        self.config.args.push(LigeroArg::Hex { hex });
+    }
+
+    /// Get the program path
+    pub fn program_path(&self) -> &str {
+        &self.config.program
+    }
+
+    /// Get the shader path
+    pub fn shader_path(&self) -> &str {
+        &self.config.shader_path
+    }
+
+    /// Get the packing value
+    pub fn packing(&self) -> u32 {
+        self.config.packing
+    }
+
+    /// Get the verifier binary path
+    pub fn verifier_bin(&self) -> &PathBuf {
+        &self.verifier_bin
+    }
+
+    /// Get the bins directory
+    pub fn bins_dir(&self) -> &PathBuf {
+        &self.bins_dir
+    }
+
+    /// Run the prover with detailed logging output, returning the packaged proof
+    pub fn run_with_logging(&mut self) -> Result<(Vec<u8>, String)> {
+        let public_output = self
+            .public_output
+            .clone()
+            .ok_or_else(|| anyhow!("Ligero public output not set; call set_public_output before generating a proof"))?;
+
+        let (proof, stdout, _) = self.run_prover_internal(true)?;
+
+        let package = LigeroProofPackage {
+            proof,
+            public_output,
+            args_json: serde_json::to_vec(&self.config.args)?,
+            private_indices: self.config.private_indices.clone(),
+        };
+
+        let serialized = bincode::serialize(&package)?;
+        Ok((serialized, stdout))
     }
 
     /// Run the prover and generate a proof
     fn run_prover(&self) -> Result<Vec<u8>> {
+        let (proof, _, _) = self.run_prover_internal(false)?;
+        Ok(proof)
+    }
+
+    /// Internal prover implementation
+    fn run_prover_internal(&self, _capture_output: bool) -> Result<(Vec<u8>, String, String)> {
         let config_json =
             serde_json::to_string(&self.config).context("Failed to serialize Ligero config")?;
 
@@ -244,7 +310,9 @@ impl LigeroHost {
         // Check if the output indicates success
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Check WASM exit code - reject if non-zero (indicates WASM program failure)
+        // Check WASM exit code - reject if ANY non-zero exit code appears
+        // Exit code 71 means the guest program hit an error path (parse failure, assertion, etc.)
+        // We cannot trust a proof generated from a failed execution
         for line in stdout.lines() {
             if line.contains("Exit with code") {
                 // Parse exit code from line like "Exit with code 71"
@@ -253,6 +321,8 @@ impl LigeroHost {
                         if code != 0 {
                             let _ = std::fs::remove_dir_all(&unique_proof_dir);
                             eprintln!("WASM program exited with non-zero code {}. This indicates a program failure (e.g., parse error, assertion failure). Proof would be invalid.", code);
+                            eprintln!("Full prover stdout:\n{}", stdout);
+                            eprintln!("Prover config was: {}", config_json);
                             anyhow::bail!(
                                 "WASM program exited with non-zero code {}. This indicates a program failure (e.g., parse error, assertion failure). Proof would be invalid.",
                                 code
@@ -300,8 +370,50 @@ impl LigeroHost {
         if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
             tracing::warn!("Failed to clean up temporary proof directory: {}", e);
         }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Ok((proof, stdout.to_string(), stderr))
+    }
+
+    /// Run the verifier with detailed logging output
+    #[cfg(feature = "native")]
+    pub fn run_verifier_with_logging(&self, proof_dir: &std::path::Path) -> Result<(bool, String)> {
+        // Create verifier config with obscured private args
+        let mut verifier_config = self.config.clone();
         
-        Ok(proof)
+        // Obscure private args (replace with zeros/empty values)
+        // Using 1-based indexing (matching Ligero's native format)
+        for &idx in &self.config.private_indices {
+            if idx > 0 && idx <= verifier_config.args.len() {
+                let arg_idx = idx - 1;
+                verifier_config.args[arg_idx] = match &verifier_config.args[arg_idx] {
+                    LigeroArg::String { str: s } => {
+                        // Replace string with same-length placeholder
+                        LigeroArg::String { str: "_".repeat(s.len()) }
+                    }
+                    LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 0 },
+                    LigeroArg::Hex { hex: h } => {
+                        // Replace with zeros of same length
+                        LigeroArg::Hex { hex: "0".repeat(h.len()) }
+                    }
+                };
+            }
+        }
+
+        let config_json = serde_json::to_string(&verifier_config)
+            .context("Failed to serialize verifier config")?;
+
+        let output = Command::new(&self.verifier_bin)
+            .arg(&config_json)
+            .current_dir(proof_dir)
+            .output()
+            .context("Failed to execute webgpu_verifier")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let success = output.status.success() 
+            && stdout.contains("Final Verify Result:                 true");
+
+        Ok((success, stdout))
     }
 
     /// Verify a proof (used for testing)

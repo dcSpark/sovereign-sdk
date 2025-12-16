@@ -46,6 +46,7 @@ fn sample_midnight_withdraw_transaction(
         withdraw_amount,
         to,
         gas: None,
+        view_ciphertexts: None,
     };
 
     let details = TxDetails {
@@ -89,7 +90,7 @@ fn test_value_setter_call_serialization() {
 #[test]
 fn test_parse_midnight_withdraw_call_roundtrips() {
     let tx = sample_midnight_withdraw_transaction(0);
-    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
+    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("parse succeeds");
 
     assert_eq!(proof_bytes.len(), 16);
@@ -144,14 +145,15 @@ async fn test_store_verified_midnight_transaction_upsert() {
         nullifier: [2u8; 32],
         withdraw_amount: 55,
         output_commitments: vec![],
+        view_attestations: None,
     };
 
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None, None)
         .await
         .unwrap();
 
     proof_public.withdraw_amount = 99;
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None, None)
         .await
         .unwrap();
 
@@ -194,6 +196,7 @@ async fn test_store_deposit_transaction_without_proof() {
         transaction_data,
         full_blob,
         None,       // No pre-auth data in test
+        None,       // No view ciphertexts
     )
     .await
     .unwrap();
@@ -225,6 +228,7 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
         anchor_root,
         nullifier,
         withdraw_amount,
+        None,
     )
     .await
     {
@@ -282,6 +286,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         withdraw_amount,
         to: recipient.clone(),
         gas: None,
+        view_ciphertexts: None,
     };
 
     let details = TxDetails {
@@ -326,7 +331,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
 
     // Step 5: Parse the transaction (extract proof, anchor_root, nullifier, etc.)
     println!("\n✓ Step 5: Testing transaction parsing");
-    let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient) =
+    let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("Should parse transaction");
     
     assert_eq!(proof_bytes.len(), 32, "Proof should be our dummy 32 bytes");
@@ -345,6 +350,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         nullifier,
         withdraw_amount,
         output_commitments: vec![],
+        view_attestations: None,
     };
     println!("  ✓ Proof verification simulated (would verify with Ligero in production)");
     
@@ -362,6 +368,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64, // full transaction blob
         None,          // No pre-auth data in test
+        None,          // No view ciphertexts
     )
     .await
     .expect("Should store to database");
@@ -416,6 +423,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64,
         None,  // No pre-auth data in test
+        None,  // No view ciphertexts
     )
     .await
     .expect("Should update existing record");

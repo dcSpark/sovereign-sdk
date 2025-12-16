@@ -6801,6 +6801,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ligetron"
+version = "1.0.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ff 0.5.0",
+ "base64 0.22.1",
+ "hex",
+ "lazy_static",
+ "num-bigint 0.4.6",
+ "paste",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12635,6 +12648,7 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
+ "ligetron",
  "proptest",
  "rand 0.8.5",
  "schemars 0.8.22",

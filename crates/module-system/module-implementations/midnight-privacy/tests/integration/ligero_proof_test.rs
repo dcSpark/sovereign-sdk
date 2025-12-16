@@ -44,6 +44,7 @@
 use anyhow::{bail, Context, Result};
 use midnight_privacy::{
     note_commitment, nullifier, root_from_path, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk, recipient_from_pk, recipient_from_sk,
 };
 use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroVerifier};
@@ -203,8 +204,15 @@ fn test_simple_note_spend() -> Result<()> {
     let domain: Hash32 = [1u8; 32];
     let value: u128 = 100;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET
+    
+    // Spending secret key (the master secret for this note)
+    let spend_sk: Hash32 = [4u8; 32];
+    
+    // Derive recipient from spend_sk (this is how the circuit verifies ownership)
+    let recipient = recipient_from_sk(&domain, &spend_sk);
+    
+    // Derive nullifier key from spend_sk (circuit does this internally too)
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Creating note with value: {}", value);
 
@@ -273,7 +281,10 @@ fn test_simple_note_spend() -> Result<()> {
     let n_out: u32 = 1;
     let out_value = value;                 // put entire input into a new note
     let out_rho: Hash32 = [9u8; 32];
-    let out_rcp: Hash32 = [5u8; 32];
+    // Output public key - the circuit derives recipient from this
+    let out_pk: Hash32 = [5u8; 32];
+    // Derive the recipient address from the output public key (circuit does this too)
+    let out_rcp = recipient_from_pk(&domain, &out_pk);
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
     let public_output = SpendPublic {
         anchor_root: anchor,
@@ -304,16 +315,18 @@ fn test_simple_note_spend() -> Result<()> {
     println!("✓ Private witness indices: {:?}", private_indices);
 
     // Add arguments in guest ABI order:
-    //   domain, value, rho, recipient, nf_key, pos, depth,
+    //   domain, value, rho, recipient, spend_sk, pos, depth,
     //   siblings[0..depth], anchor, nullifier, withdraw_amount,
-    //   n_out, [value_out, rho_out, recipient_out, cm_out]...
+    //   n_out, [value_out, rho_out, pk_out, cm_out]...
+    // Note: guest derives nf_key from spend_sk internally
+    // Using typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
+    host.add_u64_arg(value as u64); // 2: PRIVATE - binary i64
     host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
+    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE (must equal recipient_from_sk(domain, spend_sk))
+    host.add_hex_arg(hex::encode(spend_sk)); // 5: PRIVATE (spending secret key - circuit derives nf_key from this)
+    host.add_u64_arg(position); // 6: PRIVATE (position - CRITICAL!) - binary i64
+    host.add_u64_arg(tree_depth as u64); // 7: PUBLIC - binary i64
 
     // Add all siblings (PRIVATE)
     for sibling in &siblings {
@@ -323,12 +336,12 @@ fn test_simple_note_spend() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
-    host.add_str_arg(n_out.to_string());           // 11+depth: PUBLIC
+    host.add_u64_arg(withdraw_amount as u64); // 10+depth: PUBLIC
+    host.add_u64_arg(n_out as u64);           // 11+depth: PUBLIC
     // Output #0 (private fields first, public cm last)
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
+    host.add_u64_arg(out_value as u64);       // 12+depth + 0
     host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
+    host.add_hex_arg(hex::encode(out_pk));         // 12+depth + 2 (pk_out - circuit derives recipient from this)
     host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
 
     // Set public output (now includes output_commitments)
@@ -431,10 +444,17 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     let domain: Hash32 = [1u8; 32]; // Domain tag for this note type
     let value: u128 = 100; // Value stored in the note
     let rho: Hash32 = [2u8; 32]; // Randomness (would be generated securely)
-    let recipient: Hash32 = [3u8; 32]; // Recipient's public key binding
 
-    // Secret nullifier key (kept private, never revealed)
-    let nf_key: Hash32 = [4u8; 32];
+    // Spending secret key (the master secret for this note)
+    let spend_sk: Hash32 = [4u8; 32];
+    
+    // Derive recipient from spend_sk (this is how the circuit verifies ownership)
+    let recipient = recipient_from_sk(&domain, &spend_sk);
+    println!("✓ Derived recipient from spend_sk: {}", hex::encode(recipient));
+    
+    // Derive nullifier key from spend_sk (circuit does this internally too)
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+    println!("✓ Derived nf_key from spend_sk: {}", hex::encode(nf_key));
 
     // Compute the note commitment using Poseidon2
     let cm = note_commitment(&domain, value, &rho, &recipient);
@@ -482,8 +502,12 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     let n_out: u32 = 1;
     let out_value = value;                 // all value to shielded change
     let out_rho: Hash32 = [7u8; 32];
-    let out_rcp: Hash32 = [8u8; 32];
+    // Output public key - the circuit derives recipient from this
+    let out_pk: Hash32 = [8u8; 32];
+    // Derive the recipient address from the output public key (circuit does this too)
+    let out_rcp = recipient_from_pk(&domain, &out_pk);
     let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    println!("✓ Output recipient derived from pk: {}", hex::encode(out_rcp));
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
@@ -527,15 +551,16 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     println!("✓ Private witness indices: {:?}", private_indices);
 
-    // Add witness data and public inputs
-    // Arguments order: domain, value, rho, recipient, nf_key, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount, n_out, outputs...
+    // Add witness data and public inputs (typed binary ABI)
+    // Arguments order: domain, value, rho, recipient, spend_sk, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount, n_out, outputs...
+    // Note: guest derives nf_key from spend_sk internally
     host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
+    host.add_u64_arg(value as u64); // 2: PRIVATE - binary i64
     host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
+    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE (must equal recipient_from_sk(domain, spend_sk))
+    host.add_hex_arg(hex::encode(spend_sk)); // 5: PRIVATE (spending secret key - circuit derives nf_key from this)
+    host.add_u64_arg(position); // 6: PRIVATE (position - CRITICAL!) - binary i64
+    host.add_u64_arg(tree_depth as u64); // 7: PUBLIC - binary i64
 
     // Add all siblings (PRIVATE)
     for sibling in &siblings {
@@ -545,11 +570,11 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
     host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth
-    host.add_str_arg(n_out.to_string());           // 11+depth
-    host.add_str_arg(out_value.to_string());       // 12+depth + 0
+    host.add_u64_arg(withdraw_amount as u64); // 10+depth
+    host.add_u64_arg(n_out as u64);           // 11+depth
+    host.add_u64_arg(out_value as u64);       // 12+depth + 0
     host.add_hex_arg(hex::encode(out_rho));        // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp));        // 12+depth + 2
+    host.add_hex_arg(hex::encode(out_pk));         // 12+depth + 2 (pk_out - circuit derives recipient from this)
     host.add_hex_arg(hex::encode(cm_out));         // 12+depth + 3
 
     // Set the public output
@@ -1112,30 +1137,30 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
         .with_packing(config.packing)
         .with_private_indices(private_indices);
 
-    // Input note
+    // Input note (typed binary ABI)
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(value as u64);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string());
-    host.add_str_arg((siblings.len() as u32).to_string());
+    host.add_u64_arg(pos);
+    host.add_u64_arg(siblings.len() as u64);
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg("2".to_string()); // n_out = 2
+    host.add_u64_arg(withdraw_amount as u64);
+    host.add_u64_arg(2); // n_out = 2
 
     // Output 1
-    host.add_str_arg(out1_value.to_string());
+    host.add_u64_arg(out1_value as u64);
     host.add_hex_arg(hex::encode(out1_rho));
     host.add_hex_arg(hex::encode(out1_recipient));
     host.add_hex_arg(hex::encode(out1_cm));
 
     // Output 2
-    host.add_str_arg(out2_value.to_string());
+    host.add_u64_arg(out2_value as u64);
     host.add_hex_arg(hex::encode(out2_rho));
     host.add_hex_arg(hex::encode(out2_recipient));
     host.add_hex_arg(hex::encode(out2_cm));
@@ -1225,20 +1250,21 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
         .with_packing(config.packing)
         .with_private_indices(private_indices);
 
+    // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string()); // decimal u128
+    host.add_u64_arg(value as u64); // binary i64
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string()); // decimal u64
-    host.add_str_arg((siblings.len() as u32).to_string()); // decimal u32 - depth
+    host.add_u64_arg(pos); // binary i64
+    host.add_u64_arg(siblings.len() as u64); // binary i64 - depth
     for sib in &siblings {
         host.add_hex_arg(hex::encode(sib));
     }
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string()); // decimal u128
-    host.add_str_arg("0".to_string());             // n_out = 0 (no outputs in withdrawal scenario)
+    host.add_u64_arg(withdraw_amount as u64); // binary i64
+    host.add_u64_arg(0);             // n_out = 0 (no outputs in withdrawal scenario)
 
     let public = SpendPublic {
         anchor_root: anchor,
@@ -1356,28 +1382,28 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
     
-    // Add arguments for phase 2 spend
+    // Add arguments for phase 2 spend (typed binary ABI)
     host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
+    host2.add_u64_arg(initial_value as u64);
     host2.add_hex_arg(hex::encode(deposit_rho));
     host2.add_hex_arg(hex::encode(deposit_recipient));
     host2.add_hex_arg(hex::encode(deposit_nf_key));
-    host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
+    host2.add_u64_arg(deposit_pos);
+    host2.add_u64_arg(TREE_DEPTH as u64);
     for sib in &deposit_siblings {
         host2.add_hex_arg(hex::encode(sib));
     }
     host2.add_hex_arg(hex::encode(anchor_after_deposit));
     host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
+    host2.add_u64_arg(withdraw_amount_phase2 as u64);
+    host2.add_u64_arg(n_out_phase2 as u64);
     // Output 0
-    host2.add_str_arg(out1_value.to_string());
+    host2.add_u64_arg(out1_value as u64);
     host2.add_hex_arg(hex::encode(out1_rho));
     host2.add_hex_arg(hex::encode(out1_recipient));
     host2.add_hex_arg(hex::encode(out1_cm));
     // Output 1
-    host2.add_str_arg(out2_value.to_string());
+    host2.add_u64_arg(out2_value as u64);
     host2.add_hex_arg(hex::encode(out2_rho));
     host2.add_hex_arg(hex::encode(out2_recipient));
     host2.add_hex_arg(hex::encode(out2_cm));
@@ -1458,23 +1484,23 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
     
-    // Add arguments for phase 3 spend
+    // Add arguments for phase 3 spend (typed binary ABI)
     host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string());
+    host3.add_u64_arg(out1_value as u64);
     host3.add_hex_arg(hex::encode(out1_rho));
     host3.add_hex_arg(hex::encode(out1_recipient));
     host3.add_hex_arg(hex::encode(out1_nf_key));
-    host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
+    host3.add_u64_arg(out1_pos);
+    host3.add_u64_arg(TREE_DEPTH as u64);
     for sib in &out1_siblings {
         host3.add_hex_arg(hex::encode(sib));
     }
     host3.add_hex_arg(hex::encode(anchor_after_split));
     host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(withdraw_amount_phase3.to_string());
-    host3.add_str_arg(n_out_phase3.to_string());
+    host3.add_u64_arg(withdraw_amount_phase3 as u64);
+    host3.add_u64_arg(n_out_phase3 as u64);
     // Change output
-    host3.add_str_arg(change_value.to_string());
+    host3.add_u64_arg(change_value as u64);
     host3.add_hex_arg(hex::encode(change_rho));
     host3.add_hex_arg(hex::encode(change_recipient));
     host3.add_hex_arg(hex::encode(change_cm));
@@ -1623,25 +1649,26 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
     
+    // Typed binary ABI
     host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
+    host2.add_u64_arg(initial_value as u64);
     host2.add_hex_arg(hex::encode(deposit_rho));
     host2.add_hex_arg(hex::encode(deposit_recipient));
     host2.add_hex_arg(hex::encode(deposit_nf_key));
-    host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
+    host2.add_u64_arg(deposit_pos);
+    host2.add_u64_arg(TREE_DEPTH as u64);
     for sib in &deposit_siblings {
         host2.add_hex_arg(hex::encode(sib));
     }
     host2.add_hex_arg(hex::encode(anchor_after_deposit));
     host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
-    host2.add_str_arg(out1_value.to_string());
+    host2.add_u64_arg(withdraw_amount_phase2 as u64);
+    host2.add_u64_arg(n_out_phase2 as u64);
+    host2.add_u64_arg(out1_value as u64);
     host2.add_hex_arg(hex::encode(out1_rho));
     host2.add_hex_arg(hex::encode(out1_recipient));
     host2.add_hex_arg(hex::encode(out1_cm));
-    host2.add_str_arg(out2_value.to_string());
+    host2.add_u64_arg(out2_value as u64);
     host2.add_hex_arg(hex::encode(out2_rho));
     host2.add_hex_arg(hex::encode(out2_recipient));
     host2.add_hex_arg(hex::encode(out2_cm));
@@ -1695,20 +1722,21 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
     
+    // Typed binary ABI
     host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string()); // Real note value: 600
+    host3.add_u64_arg(out1_value as u64); // Real note value: 600
     host3.add_hex_arg(hex::encode(out1_rho));
     host3.add_hex_arg(hex::encode(out1_recipient));
     host3.add_hex_arg(hex::encode(out1_nf_key));
-    host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
+    host3.add_u64_arg(out1_pos);
+    host3.add_u64_arg(TREE_DEPTH as u64);
     for sib in &out1_siblings {
         host3.add_hex_arg(hex::encode(sib));
     }
     host3.add_hex_arg(hex::encode(anchor_after_split));
     host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(malicious_withdraw.to_string()); // Try to withdraw 1000!
-    host3.add_str_arg(n_out_phase3.to_string());
+    host3.add_u64_arg(malicious_withdraw as u64); // Try to withdraw 1000!
+    host3.add_u64_arg(n_out_phase3 as u64);
     
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
