@@ -20,6 +20,7 @@ use tracing::Instrument;
 
 use crate::config::WAIT_ATTEMPT_PAUSE;
 use crate::storable::layer::{Randomizer, StorableMidnightDaLayer};
+use crate::storable::set_shared_db_connection_string;
 use crate::{
     BlockProducingConfig, MidnightAddress, MidnightBlock, MidnightBlockHeader, MidnightDaConfig, MidnightDaSpec,
     MidnightDaVerifier, RandomizationBehaviour, RandomizationConfig, DEFAULT_BLOCK_WAITING_TIME_MS,
@@ -234,6 +235,11 @@ impl StorableMidnightDaService {
 
     /// Creates new in memory [`StorableMidnightDaService`] from [`MidnightDaConfig`].
     pub async fn from_config(config: MidnightDaConfig, shutdown_receiver: watch::Receiver<()>) -> Self {
+        // Make the DA DB connection string available to other components that need to query
+        // tables in the same database (e.g. worker_verified_transactions) but don't have
+        // direct access to the DA config.
+        set_shared_db_connection_string(config.connection_string.clone());
+
         let da_layer = match config.da_layer.as_ref() {
             None => {
                 let mut da_layer = StorableMidnightDaLayer::new_from_connection(

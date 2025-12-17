@@ -6,14 +6,15 @@ set -e
 
 # Parse arguments
 MEMORY_PROFILE=0
-for arg in "$@"; do
-    case $arg in
+ROLLUP_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --memory-profile)
             MEMORY_PROFILE=1
             shift
             ;;
         --help|-h)
-            echo "Usage: $0 [OPTIONS]"
+            echo "Usage: $0 [OPTIONS] [-- <rollup-args>...]"
             echo ""
             echo "Options:"
             echo "  --memory-profile    Enable macOS memory profiling for Instruments.app"
@@ -23,11 +24,28 @@ for arg in "$@"; do
             echo ""
             echo "  --help, -h          Show this help message"
             echo ""
+            echo "Pass-through rollup args:"
+            echo "  Anything after '--' is forwarded to 'sov-rollup-ligero'."
+            echo "  Example: $0 -- --stop-at-rollup-height 1300"
+            echo ""
             echo "Environment variables:"
             echo "  SKIP_VERIFICATION           Skip Ligero proof verification"
             echo "  LIGERO_SKIP_VERIFICATION    Same as SKIP_VERIFICATION"
             echo "  DEFER_SEQUENCER_SUBMISSION  Defer sequencer submission"
             exit 0
+            ;;
+        --)
+            shift
+            # Forward all remaining args verbatim to the rollup binary
+            while [[ $# -gt 0 ]]; do
+                ROLLUP_ARGS+=("$1")
+                shift
+            done
+            ;;
+        *)
+            # Treat unknown args as rollup args (so users can omit the '--' if they want).
+            ROLLUP_ARGS+=("$1")
+            shift
             ;;
     esac
 done
@@ -135,8 +153,8 @@ else
 fi
 echo ""
 
-# Set RUST_LOG to info level to suppress debug logs
-export RUST_LOG="info"
+# Default to info level (allow overriding via env)
+export RUST_LOG="${RUST_LOG:-info}"
 
 # Run the ligero rollup from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
@@ -193,7 +211,7 @@ fi
 # Run without capturing output - ensures eprintln! and all stderr/stdout are shown
 if [ "$MEMORY_PROFILE" -eq 1 ]; then
     # Run in background briefly to get PID, then wait
-    "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1 &
+    "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" "${ROLLUP_ARGS[@]}" 2>&1 &
     ROLLUP_PID=$!
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "   📍 Process started with PID: $ROLLUP_PID"
@@ -202,5 +220,5 @@ if [ "$MEMORY_PROFILE" -eq 1 ]; then
     echo ""
     wait $ROLLUP_PID
 else
-    exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" 2>&1
+    exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" "${ROLLUP_ARGS[@]}" 2>&1
 fi

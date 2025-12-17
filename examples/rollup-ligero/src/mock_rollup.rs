@@ -85,13 +85,6 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         _da_service: &Self::DaService,
         rollup_config: &RollupConfig<<Self::Spec as Spec>::Address, Self::DaService>,
     ) -> anyhow::Result<NodeEndpoints> {
-        let worker_db_conn = rollup_config.da.connection_string.clone();
-        std::env::set_var("SOV_WORKER_TX_DB_CONNECTION_STRING", &worker_db_conn);
-        tracing::info!(
-            "Using worker_txs database connection string: {}",
-            worker_db_conn
-        );
-
         sov_modules_rollup_blueprint::register_endpoints::<Self, Native>(
             state_update_receiver.clone(),
             sync_status_receiver,
