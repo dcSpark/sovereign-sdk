@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
+use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect,
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, FromQueryResult,
+    QueryFilter, QuerySelect,
 };
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_rollup_interface::TxHash;
@@ -16,21 +17,51 @@ use crate::{Hash32, SpendPublic};
 
 type PreVerifiedMap = HashMap<Hash32, SpendPublic>;
 
+#[derive(Clone, Debug, FromQueryResult)]
+struct ProofOutputsRow {
+    proof_verified: Option<bool>,
+    proof_outputs: String,
+}
+
 static PRE_VERIFIED_SPENDS: OnceLock<Mutex<PreVerifiedMap>> = OnceLock::new();
+static PRIMED_TX_HASHES: OnceLock<Mutex<HashSet<TxHash>>> = OnceLock::new();
 static WORKER_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
+static WARN_MISSING_WORKER_DB_CONN: Once = Once::new();
 
 fn map() -> &'static Mutex<PreVerifiedMap> {
     PRE_VERIFIED_SPENDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn primed_hashes() -> &'static Mutex<HashSet<TxHash>> {
+    PRIMED_TX_HASHES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// Best-effort: hydrate the in-process cache from the persisted worker_verified_transactions table
 /// using the transaction hash as the key. This allows restarts to recover the proof outputs
 /// instead of relying on an in-memory map populated by prior requests.
 pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
+    if env::var_os("SOV_WORKER_TX_DB_CONNECTION_STRING").is_none() {
+        WARN_MISSING_WORKER_DB_CONN.call_once(|| {
+            tracing::warn!(
+                target: "midnight_privacy::preverified",
+                "SOV_WORKER_TX_DB_CONNECTION_STRING is not set; cannot hydrate pre-verified proofs from worker_verified_transactions"
+            );
+        });
+        return;
+    }
+
+    {
+        let guard = primed_hashes().lock().unwrap();
+        if guard.contains(tx_hash) {
+            return;
+        }
+    }
+
     match fetch_proof_outputs(tx_hash) {
         Ok(Some(public)) => {
             let mut guard = map().lock().unwrap();
             guard.insert(public.nullifier, public.clone());
+            primed_hashes().lock().unwrap().insert(*tx_hash);
             tracing::debug!(
                 target: "midnight_privacy::preverified",
                 "[PRE-VERIFIED] hydrated proof outputs from DB for tx_hash={tx_hash} (nullifier={:?})",
@@ -40,7 +71,7 @@ pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
         Ok(None) => {
             tracing::debug!(
                 target: "midnight_privacy::preverified",
-                "[PRE-VERIFIED] no proof_outputs found for tx_hash={tx_hash}"
+                "[PRE-VERIFIED] no verified proof_outputs available for tx_hash={tx_hash}"
             );
         }
         Err(err) => {
@@ -83,14 +114,19 @@ fn fetch_proof_outputs(tx_hash: &TxHash) -> anyhow::Result<Option<SpendPublic>> 
     let maybe_row: Result<_, sea_orm::DbErr> = block_on(async {
         worker_verified_transactions::Entity::find()
             .select_only()
+            .column(worker_verified_transactions::Column::ProofVerified)
             .column(worker_verified_transactions::Column::ProofOutputs)
             .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash_str.clone()))
+            .into_model::<ProofOutputsRow>()
             .one(conn)
             .await
     })
     .map_err(|err| anyhow!("DB query for proof_outputs failed: {err}"))?;
 
     if let Some(row) = maybe_row? {
+        if row.proof_verified != Some(true) {
+            return Ok(None);
+        }
         if row.proof_outputs.trim().is_empty() {
             return Ok(None);
         }
