@@ -5,8 +5,10 @@
 mod entity;
 pub mod layer;
 pub mod service;
+mod shared_db;
 
 pub use entity::{setup_db, worker_verified_transactions};
+pub use shared_db::{set_shared_db_connection_string, shared_db_connection_string};
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::sync::{Mutex, OnceLock};
-use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -10,6 +8,7 @@ use sea_orm::{
     QueryFilter, QuerySelect,
 };
 use sov_midnight_da::storable::worker_verified_transactions;
+use sov_midnight_da::storable::shared_db_connection_string;
 use sov_rollup_interface::TxHash;
 use tokio::{runtime::Handle, task, sync::OnceCell};
 
@@ -26,7 +25,6 @@ struct ProofOutputsRow {
 static PRE_VERIFIED_SPENDS: OnceLock<Mutex<PreVerifiedMap>> = OnceLock::new();
 static PRIMED_TX_HASHES: OnceLock<Mutex<HashSet<TxHash>>> = OnceLock::new();
 static WORKER_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
-static WARN_MISSING_WORKER_DB_CONN: Once = Once::new();
 
 fn map() -> &'static Mutex<PreVerifiedMap> {
     PRE_VERIFIED_SPENDS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -40,13 +38,7 @@ fn primed_hashes() -> &'static Mutex<HashSet<TxHash>> {
 /// using the transaction hash as the key. This allows restarts to recover the proof outputs
 /// instead of relying on an in-memory map populated by prior requests.
 pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
-    if env::var_os("SOV_WORKER_TX_DB_CONNECTION_STRING").is_none() {
-        WARN_MISSING_WORKER_DB_CONN.call_once(|| {
-            tracing::warn!(
-                target: "midnight_privacy::preverified",
-                "SOV_WORKER_TX_DB_CONNECTION_STRING is not set; cannot hydrate pre-verified proofs from worker_verified_transactions"
-            );
-        });
+    if shared_db_connection_string().is_none() {
         return;
     }
 
@@ -139,8 +131,9 @@ fn fetch_proof_outputs(tx_hash: &TxHash) -> anyhow::Result<Option<SpendPublic>> 
 }
 
 fn get_worker_db() -> anyhow::Result<&'static DatabaseConnection> {
-    let connection_string = env::var("SOV_WORKER_TX_DB_CONNECTION_STRING")
-        .map_err(|_| anyhow!("SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set"))?;
+    let connection_string = shared_db_connection_string()
+        .ok_or_else(|| anyhow!("Shared Midnight DA DB connection string is not configured"))?
+        .to_string();
 
     let conn = block_on(async {
         WORKER_DB

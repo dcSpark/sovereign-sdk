@@ -35,9 +35,7 @@ where
 
         #[cfg(feature = "native")]
         {
-            if std::env::var_os("SOV_WORKER_TX_DB_CONNECTION_STRING").is_some() {
-                midnight_privacy::prime_pre_verified_spend(&tx_and_raw_hash.raw_tx_hash);
-            }
+            midnight_privacy::prime_pre_verified_spend(&tx_and_raw_hash.raw_tx_hash);
         }
 
         Ok((tx_and_raw_hash, auth_data, runtime_call))

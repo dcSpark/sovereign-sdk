@@ -162,10 +162,6 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create demo_data directory if it doesn't exist (required for SQLite DB)
 mkdir -p demo_data
 
-# Worker-verified tx DB connection (used to hydrate pre-verified proof outputs during resync).
-# By default we point it at the same SQLite DB as the storable Midnight DA layer.
-export SOV_WORKER_TX_DB_CONNECTION_STRING="${SOV_WORKER_TX_DB_CONNECTION_STRING:-sqlite://demo_data/da.sqlite?mode=rwc}"
-
 # Memory profiling setup (macOS only)
 if [ "$MEMORY_PROFILE" -eq 1 ]; then
     if [[ "$OSTYPE" != "darwin"* ]]; then
