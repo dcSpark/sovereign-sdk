@@ -2082,122 +2082,46 @@ async fn submit_worker_tx_to_sequencer(
 
 /// Configure Ligero environment variables for value-setter verification
 fn configure_ligero_env_for_value_setter() -> Result<(), ServiceError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| ServiceError::Internal(format!("Failed to get current directory: {}", e)))?;
-    
-    let program_paths = vec![
-        current_dir.join("crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
-        current_dir.join("../crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
-        current_dir.join("../../crates/adapters/ligero/guest/bins/programs/value_validator.wasm"),
-    ];
-    
-    let program_path = program_paths
-        .iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            ServiceError::Internal(format!(
-                "Could not find value_validator.wasm. Searched:\n{}",
-                program_paths.iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        })?;
-    
-    // Find shader and verifier binary paths
-    let shader_path = find_ligero_shader_path(&current_dir)?;
-    let verifier_bin = find_ligero_verifier_bin(&current_dir)?;
-    
-    std::env::set_var("LIGERO_PROGRAM_PATH", program_path);
-    std::env::set_var("LIGERO_SHADER_PATH", shader_path);
-    std::env::set_var("LIGERO_VERIFIER_BIN", verifier_bin);
-    std::env::set_var("LIGERO_PACKING", "8192");
+    // `sov-proof-verifier-service` must not override Ligero env vars.
+    // The caller (scripts/deploy) is responsible for exporting the correct values.
+    ensure_ligero_env_is_set()?;
     
     Ok(())
 }
 
 /// Configure Ligero environment variables for midnight verification
 fn configure_ligero_env_for_midnight() -> Result<(), ServiceError> {
-    let current_dir = std::env::current_dir()
-        .map_err(|e| ServiceError::Internal(format!("Failed to get current directory: {}", e)))?;
-    
-    let program_paths = vec![
-        current_dir.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
-        current_dir.join("../crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
-        current_dir.join("../../crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"),
-    ];
-    
-    let program_path = program_paths
-        .iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            ServiceError::Internal(format!(
-                "Could not find note_spend_guest.wasm. Searched:\n{}",
-                program_paths.iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        })?;
-    
-    // Find shader and verifier binary paths
-    let shader_path = find_ligero_shader_path(&current_dir)?;
-    let verifier_bin = find_ligero_verifier_bin(&current_dir)?;
-    
-    std::env::set_var("LIGERO_PROGRAM_PATH", program_path);
-    std::env::set_var("LIGERO_SHADER_PATH", shader_path);
-    std::env::set_var("LIGERO_VERIFIER_BIN", verifier_bin);
-    std::env::set_var("LIGERO_PACKING", "8192");
+    // `sov-proof-verifier-service` must not override Ligero env vars.
+    // The caller (scripts/deploy) is responsible for exporting the correct values.
+    ensure_ligero_env_is_set()?;
     
     Ok(())
 }
 
-/// Find the Ligero shader path
-fn find_ligero_shader_path(current_dir: &Path) -> Result<PathBuf, ServiceError> {
-    let candidates = vec![
-        current_dir.join("crates/adapters/ligero/bins/macos/shader"),
-        current_dir.join("../crates/adapters/ligero/bins/macos/shader"),
-        current_dir.join("../../crates/adapters/ligero/bins/macos/shader"),
-        current_dir.join("crates/adapters/ligero/bins/linux-amd64/shader"),
-    ];
-    
-    candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .ok_or_else(|| {
+fn ensure_ligero_env_is_set() -> Result<(), ServiceError> {
+    fn required_path_var(name: &str) -> Result<PathBuf, ServiceError> {
+        let v = std::env::var(name).map_err(|_| {
             ServiceError::Internal(format!(
-                "Could not find Ligero shader directory. Searched:\n{}",
-                candidates.iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "{name} must be set (required for Ligero verification)"
             ))
-        })
-}
+        })?;
+        let p = PathBuf::from(&v);
+        if p.exists() {
+            Ok(p)
+        } else {
+            Err(ServiceError::Internal(format!(
+                "{name} is set but does not exist: {}",
+                p.display()
+            )))
+        }
+    }
 
-/// Find the Ligero verifier binary
-fn find_ligero_verifier_bin(current_dir: &Path) -> Result<PathBuf, ServiceError> {
-    let candidates = vec![
-        current_dir.join("crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
-        current_dir.join("../crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
-        current_dir.join("../../crates/adapters/ligero/bins/macos/bin/webgpu_verifier"),
-        current_dir.join("crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"),
-    ];
-    
-    candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .ok_or_else(|| {
-            ServiceError::Internal(format!(
-                "Could not find Ligero verifier binary. Searched:\n{}",
-                candidates.iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        })
+    let _verifier_bin = required_path_var("LIGERO_VERIFIER_BIN")?;
+    let _program = required_path_var("LIGERO_PROGRAM_PATH")?;
+    let _shader_path = required_path_var("LIGERO_SHADER_PATH")?;
+
+    // LIGERO_PACKING is optional; the adapter defaults to 8192 if unset.
+    Ok(())
 }
 
 /// Compute the method ID for the value_validator.wasm program
