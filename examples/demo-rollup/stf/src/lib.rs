@@ -3,6 +3,7 @@
 
 #[cfg(feature = "native")]
 pub mod genesis_config;
+mod preverified_authenticator;
 pub mod runtime;
 #[cfg(feature = "test-utils")]
 mod test_utils;

@@ -11,8 +11,15 @@ use axum::Json;
 use futures::StreamExt;
 #[cfg(feature = "test-utils")]
 use futures::TryStreamExt;
+use hex::FromHex;
+use midnight_privacy::SpendPublic;
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
+    EntityTrait, QueryFilter,
+};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
+use sov_midnight_da::storable::{shared_db_connection_string, worker_verified_transactions};
 use sov_modules_api::capabilities::TransactionAuthenticator;
 use sov_modules_api::runtime::Runtime;
 use sov_modules_api::{RawTx, RuntimeEventProcessor, RuntimeEventResponse};
@@ -24,10 +31,89 @@ use sov_rollup_interface::da::{DaBlobHash, DaSpec};
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::TxHash;
 use tokio::sync::watch::Receiver;
+use tokio::sync::OnceCell;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::common::{error_not_fully_synced, AcceptedTx, Sequencer};
+use crate::common::{
+    error_not_fully_synced, take_sequencer_metrics, AcceptedTx, Sequencer, SequencerMetrics,
+};
 use crate::TxStatus;
+
+/// Shared connection pool for the worker_txs database (worker_verified_transactions table).
+static WORKER_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
+
+/// Get a shared connection to the worker_txs database, initializing it on first use.
+async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::Response> {
+    use std::time::Duration;
+
+    const MISSING_SHARED_DB_CONN: &str =
+        "Shared Midnight DA DB connection string is not configured";
+
+    let res: Result<&'static DatabaseConnection, String> = WORKER_DB
+        .get_or_try_init(|| async {
+            let connection_string = shared_db_connection_string()
+                .ok_or_else(|| MISSING_SHARED_DB_CONN.to_string())?
+                .to_string();
+
+            if connection_string.starts_with("sqlite:") {
+                use sea_orm::sqlx::sqlite::{
+                    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+                };
+                use std::str::FromStr;
+
+                let sqlite_opts = SqliteConnectOptions::from_str(&connection_string)
+                    .map_err(|err| {
+                        format!(
+                            "Failed to parse worker DB SQLite connection string: {err}"
+                        )
+                    })?
+                    // Favor write throughput for the worker_txs DB: WAL + NORMAL
+                    // keeps fsync costs reasonable while retaining durability.
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .busy_timeout(Duration::from_millis(30_000));
+
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(5)
+                    .min_connections(1)
+                    .acquire_timeout(Duration::from_secs(30))
+                    .idle_timeout(Some(Duration::from_secs(300)))
+                    .max_lifetime(Some(Duration::from_secs(1800)))
+                    .connect_with(sqlite_opts)
+                    .await
+                    .map_err(|err| format!("Failed to connect to worker SQLite DB: {err}"))?;
+
+                Ok(DatabaseConnection::SqlxSqlitePoolConnection(pool.into()))
+            } else {
+                let mut connect_opts = ConnectOptions::new(connection_string.clone());
+                connect_opts
+                    .max_connections(40)
+                    .min_connections(5)
+                    .connect_timeout(Duration::from_secs(30))
+                    .acquire_timeout(Duration::from_secs(30))
+                    .idle_timeout(Duration::from_secs(300))
+                    .max_lifetime(Duration::from_secs(1800))
+                    .sqlx_logging(false);
+
+                tracing::info!(
+                    "Connecting to worker shared database with tuned pool settings (max_connections=40, min_connections=5)"
+                );
+
+                Database::connect(connect_opts)
+                    .await
+                    .map_err(|err| format!("Failed to connect to worker DB: {err}"))
+            }
+        })
+        .await;
+
+    res.map_err(|msg| {
+        if msg == MISSING_SHARED_DB_CONN {
+            errors::internal_server_error_response_500(MISSING_SHARED_DB_CONN)
+        } else {
+            errors::database_error_response_500(anyhow::anyhow!(msg))
+        }
+    })
+}
 
 /// [`StartFrom`] is used as a query parameter for the txs subscription
 #[derive(
@@ -63,6 +149,10 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         };
 
         let router = axum::Router::new()
+            .route(
+                "/sequencer/worker_txs/:tx_hash",
+                axum::routing::post(Self::axum_process_worker_tx),
+            )
             .route("/sequencer/txs", axum::routing::post(Self::axum_accept_tx))
             .route("/sequencer/ready", axum::routing::get(Self::axum_get_ready))
             .route(
@@ -224,6 +314,309 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         }
     }
 
+    /// Processes pre-verified worker transactions using an optimized path.
+    ///
+    /// This endpoint handles transactions that have been verified off-chain by the worker
+    /// (proof verifier service). Key optimizations:
+    ///
+    /// 1. **Avoids reading large proof blob**: Uses the optimized pre-authenticated
+    ///    `serialized_tx_base64` column (no full proof blob in DB)
+    /// 2. **Uses pre-computed hash**: Reads `tx_hash` from database instead of recomputing
+    /// 3. **Specialized accept path**: Calls `accept_serialized_pre_authenticated_tx` which skips
+    ///    decoding the large proof blob and re-authentication since verification is already done
+    ///
+    /// The proof outputs are cached for the runtime to use during execution, allowing
+    /// the transaction to execute without re-verifying the proof.
+    async fn axum_process_worker_tx(
+        State(state): State<Self>,
+        Path(tx_hash): Path<String>,
+    ) -> ApiResult<
+        TxInfoWithConfirmation<DaBlobHash<<Seq::Da as DaService>::Spec>, Seq::Confirmation>,
+    > {
+        // Use a shared connection pool for the worker transactions database.
+        let db = get_worker_db().await?;
+
+        let record = worker_verified_transactions::Entity::find()
+            .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.clone()))
+            .one(db)
+            .await
+            .map_err(|err| errors::database_error_response_500(err))?;
+
+        let Some(model) = record else {
+            return Err(errors::not_found_404("Worker transaction", tx_hash));
+        };
+
+        let transaction_data: serde_json::Value = serde_json::from_str(&model.transaction_data)
+            .map_err(|err| errors::bad_request_400("Invalid transaction_data JSON", err))?;
+
+        // Parse the pre-computed tx_hash
+        let tx_hash_hex = model.tx_hash.trim_start_matches("0x");
+        let tx_hash_bytes = Vec::from_hex(tx_hash_hex)
+            .map_err(|err| errors::bad_request_400("Invalid tx_hash in database", err))?;
+        let tx_hash_array: [u8; 32] = tx_hash_bytes
+            .try_into()
+            .map_err(|_| errors::bad_request_400("Invalid tx_hash length", "Expected 32 bytes"))?;
+        let tx_hash_value = TxHash::from(tx_hash_array);
+
+        // Require the optimized serialized pre-auth path; do not fall back to other paths.
+        let serialized_tx_base64 = match &model.serialized_tx_base64 {
+            Some(v) => v,
+            None => {
+                return Err(errors::bad_request_400(
+                    "Missing serialized_tx_base64",
+                    "Worker-verified transaction must include serialized_tx_base64 for optimized sequencer path",
+                ))
+            }
+        };
+
+        tracing::debug!(%tx_hash_value, "Using OPTIMIZED pre-authenticated path (serialized tx, no blob, no auth)");
+
+        // Decide intent based on parsed transaction data and proof outputs.
+        enum WorkerTxIntent {
+            Deposit,
+            Transfer { proof_outputs: SpendPublic },
+            Withdraw { proof_outputs: SpendPublic },
+        }
+
+        let worker_tx_intent = if let Some(withdraw) =
+            transaction_data.get("withdraw").and_then(|v| v.as_object())
+        {
+            let anchor_root_hex = withdraw
+                .get("anchor_root")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing anchor_root")
+                })?;
+            let anchor_root_vec = Vec::from_hex(anchor_root_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid anchor_root hex", err))?;
+            let anchor_root_array: [u8; 32] = anchor_root_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
+
+            let nullifier_hex = withdraw
+                .get("nullifier")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                })?;
+            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
+            let nullifier_array: [u8; 32] = nullifier_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+
+            let withdraw_amount = withdraw
+                .get("withdraw_amount")
+                .and_then(|v| match v {
+                    serde_json::Value::String(s) => s.parse::<u128>().ok(),
+                    serde_json::Value::Number(n) => n.as_u64().map(|n| n as u128),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing withdraw_amount")
+                })?;
+
+            let proof_outputs_str = model.proof_outputs.trim();
+            if proof_outputs_str.is_empty() || proof_outputs_str == "{}" {
+                return Err(errors::bad_request_400(
+                    "Proof outputs missing",
+                    "Withdraw-like transaction requires proof outputs",
+                ));
+            }
+
+            let proof_outputs: SpendPublic = serde_json::from_str(proof_outputs_str)
+                .map_err(|err| errors::bad_request_400("Invalid proof_outputs JSON", err))?;
+
+            if proof_outputs.anchor_root != anchor_root_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "anchor_root does not match",
+                ));
+            }
+            if proof_outputs.nullifier != nullifier_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "nullifier does not match",
+                ));
+            }
+            if proof_outputs.withdraw_amount != withdraw_amount {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "withdraw_amount does not match",
+                ));
+            }
+
+            midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
+            WorkerTxIntent::Withdraw { proof_outputs }
+        } else if let Some(transfer) =
+            transaction_data.get("transfer").and_then(|v| v.as_object())
+        {
+            let anchor_root_hex = transfer
+                .get("anchor_root")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing anchor_root")
+                })?;
+            let anchor_root_vec = Vec::from_hex(anchor_root_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid anchor_root hex", err))?;
+            let anchor_root_array: [u8; 32] = anchor_root_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
+
+            let nullifier_hex = transfer
+                .get("nullifier")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                })?;
+            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
+                .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
+            let nullifier_array: [u8; 32] = nullifier_vec
+                .try_into()
+                .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+
+            let proof_outputs_str = model.proof_outputs.trim();
+            if proof_outputs_str.is_empty() || proof_outputs_str == "{}" {
+                return Err(errors::bad_request_400(
+                    "Proof outputs missing",
+                    "Transfer-like transaction requires proof outputs",
+                ));
+            }
+
+            let proof_outputs: SpendPublic = serde_json::from_str(proof_outputs_str)
+                .map_err(|err| errors::bad_request_400("Invalid proof_outputs JSON", err))?;
+
+            if proof_outputs.anchor_root != anchor_root_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "anchor_root does not match",
+                ));
+            }
+            if proof_outputs.nullifier != nullifier_array {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "nullifier does not match",
+                ));
+            }
+            // For transfers, withdraw_amount must be 0
+            if proof_outputs.withdraw_amount != 0 {
+                return Err(errors::bad_request_400(
+                    "Proof outputs mismatch",
+                    "withdraw_amount must be 0 for transfers",
+                ));
+            }
+
+            midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
+            WorkerTxIntent::Transfer { proof_outputs }
+        } else if transaction_data
+            .get("deposit")
+            .and_then(|v| v.as_object())
+            .is_some()
+        {
+            let proof_outputs_str = model.proof_outputs.trim();
+            if !(proof_outputs_str.is_empty() || proof_outputs_str == "{}") {
+                return Err(errors::bad_request_400(
+                    "Unexpected proof outputs",
+                    "Deposit transactions should not include proof outputs",
+                ));
+            }
+            WorkerTxIntent::Deposit
+        } else {
+            return Err(errors::bad_request_400(
+                "Unsupported transaction",
+                "Only deposit, transfer or withdraw transactions can use this endpoint",
+            ));
+        };
+
+        // Use the OPTIMIZED path - decode serialized transaction directly
+        let result = match worker_tx_intent {
+            WorkerTxIntent::Withdraw { proof_outputs } => {
+                let proof_outputs_clone = proof_outputs.clone();
+                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
+                let sequencer = state.sequencer.clone();
+                crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
+                    sequencer
+                        .accept_serialized_pre_authenticated_tx(
+                            serialized_tx_base64.clone(),
+                            tx_hash_value,
+                        )
+                        .await
+                })
+                .await
+            }
+            WorkerTxIntent::Transfer { proof_outputs } => {
+                let proof_outputs_clone = proof_outputs.clone();
+                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
+                let sequencer = state.sequencer.clone();
+                crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
+                    sequencer
+                        .accept_serialized_pre_authenticated_tx(
+                            serialized_tx_base64.clone(),
+                            tx_hash_value,
+                        )
+                        .await
+                })
+                .await
+            }
+            WorkerTxIntent::Deposit => {
+                let sequencer = state.sequencer.clone();
+                sequencer
+                    .accept_serialized_pre_authenticated_tx(
+                        serialized_tx_base64.clone(),
+                        tx_hash_value,
+                    )
+                    .await
+            }
+        };
+
+        let tx_with_hash = match result {
+            Ok(res) => res,
+            Err(e) => {
+                crate::common::clear_tx_pre_authenticated(&tx_hash_value);
+                crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
+                // Do not clear the pre-verified spend here; allow STF to consume it.
+                if e.status.is_server_error() {
+                    tracing::error!(error = ?e, "Error accepting worker transaction");
+                }
+                return Err(IntoResponse::into_response(e));
+            }
+        };
+
+        let tx_hash_value = tx_with_hash.tx_hash.clone();
+        let confirmation = tx_with_hash.confirmation;
+        let sequencer_metrics = take_sequencer_metrics(&tx_hash_value);
+        let response_payload = TxInfoWithConfirmation {
+            id: tx_hash_value.clone(),
+            confirmation,
+            status: TxStatus::Submitted,
+            sequencer_metrics,
+        };
+
+        let serialized_response = serde_json::to_string(&response_payload).map_err(|err| {
+            errors::internal_server_error_response_500(format!(
+                "Failed to serialize sequencer response for worker tx {tx_hash_value}: {err}"
+            ))
+        })?;
+
+        let mut active_model: worker_verified_transactions::ActiveModel = model.into();
+        active_model.transaction_state =
+            Set(worker_verified_transactions::TransactionState::Accepted);
+        active_model.sequencer_status = Set(Some(serialized_response));
+
+        if let Err(err) = active_model.update(db).await {
+            crate::common::clear_tx_pre_authenticated(&tx_hash_value);
+            crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
+            // Do not clear the pre-verified spend here; allow STF to consume it.
+            return Err(errors::database_error_response_500(err));
+        }
+
+        crate::common::clear_tx_pre_authenticated(&tx_hash_value);
+        crate::common::remove_pre_verified_midnight_transaction(&tx_hash_value);
+        // Do not clear the pre-verified spend here; allow STF to consume it.
+
+        Ok(response_payload.into())
+    }
+
     async fn axum_accept_tx(
         state: State<Self>,
         tx: Json<AcceptTx>,
@@ -254,6 +647,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             id: tx_with_hash.tx_hash,
             confirmation: tx_with_hash.confirmation,
             status: TxStatus::Submitted,
+            sequencer_metrics: None,
         }
         .into())
     }
@@ -453,6 +847,9 @@ pub struct TxInfoWithConfirmation<DaTransactionId, Confirmation> {
     pub confirmation: Confirmation,
     #[serde(flatten)]
     pub status: TxStatus<DaTransactionId>,
+    /// Optional sequencer timing metrics for this transaction (when available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequencer_metrics: Option<SequencerMetrics>,
 }
 
 /// An accepted transaction, with the transaction body and confirmation data.

@@ -1,0 +1,15 @@
+---
+source: crates/adapters/midnight-da/src/config.rs
+assertion_line: 349
+expression: config
+---
+{
+  "connection_string": "sqlite:///tmp/mockda.sqlite?mode=rwc",
+  "sender_address": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "finalization_blocks": 0,
+  "block_producing": "manual",
+  "randomization": null,
+  "save_incoming_worker_txs": "none",
+  "worker_tx_path": null,
+  "worker_tx_bucket": null
+}

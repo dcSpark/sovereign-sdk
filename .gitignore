@@ -43,3 +43,29 @@ constants_output.csv
 
 # Temporary test data files
 examples/demo-rollup/tests/resync/data/.tmp*
+crates/module-system/module-implementations/midnight-privacy/proof.data
+crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
+crates/module-system/module-implementations/midnight-privacy/learn.txt
+crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
+crates/module-system/module-implementations/midnight-privacy/proof_data.gz
+proof_data.gz
+proof_outputs/
+.env
+
+.env
+parallel_debug.txt
+parallel_debug.txt
+new_privacy_debug.txt
+midnight_privacy.txt
+diff_parallel.txt
+PARALLEL_TX_EXECUTOR_GUIDE.md
+crates/full-node/sov-sequencer/test_output.log
+proof_cache/
+.env
+examples/rollup-ligero/output.log
+cache_l2.txt
+examples/output.log
+examples/rollup-ligero/examples/rollup-ligero/output.log
+wallet_index.sqlite
+crates/utils/sov-indexer/vfk_config.json
+crates/mcp-external/logs/mcp-external.log

@@ -2,6 +2,12 @@
 #![doc = include_str!("../README.md")]
 mod stf_blueprint;
 
+/// Control flow for verifying node execution against cached sequencer results.
+#[cfg(feature = "native")]
+pub mod node_tx_cache_control_flow;
+#[cfg(feature = "native")]
+pub use node_tx_cache_control_flow::NodeTxCacheControlFlow;
+
 use sequencer_mode::{registered, unregistered};
 use sov_metrics::{save_elapsed, start_timer};
 #[cfg(all(feature = "gas-constant-estimation", feature = "native"))]
@@ -363,15 +369,45 @@ where
         relevant_blobs: RelevantBlobIters<&mut [<S::Da as DaSpec>::BlobTransaction]>,
         execution_context: ExecutionContext,
     ) -> ApplySlotOutput<S::InnerZkvm, S::OuterZkvm, S::Da, Self> {
-        self.apply_slot_with_control_flow(
-            pre_state_root,
-            pre_state,
-            witness,
-            slot_header,
-            relevant_blobs,
-            execution_context,
-            NoOpControlFlow,
-        )
+        // Use NodeTxCacheControlFlow for node context to verify execution against cached results.
+        // For other contexts (Sequencer, SequencerWarmUp), use NoOpControlFlow.
+        // The NodeTxCacheControlFlow does NOT skip execution - it verifies after execution.
+        #[cfg(feature = "native")]
+        {
+            if execution_context == ExecutionContext::Node {
+                self.apply_slot_with_control_flow(
+                    pre_state_root,
+                    pre_state,
+                    witness,
+                    slot_header,
+                    relevant_blobs,
+                    execution_context,
+                    NodeTxCacheControlFlow::<S>::new(),
+                )
+            } else {
+                self.apply_slot_with_control_flow(
+                    pre_state_root,
+                    pre_state,
+                    witness,
+                    slot_header,
+                    relevant_blobs,
+                    execution_context,
+                    NoOpControlFlow,
+                )
+            }
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.apply_slot_with_control_flow(
+                pre_state_root,
+                pre_state,
+                witness,
+                slot_header,
+                relevant_blobs,
+                execution_context,
+                NoOpControlFlow,
+            )
+        }
     }
 }
 

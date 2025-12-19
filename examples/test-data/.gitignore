@@ -1,0 +1,5 @@
+# Generated keypairs contain private keys - DO NOT COMMIT
+genesis/demo/mock/generated_keypairs.json
+genesis/demo/celestia/generated_keypairs.json
+genesis/*/generated_keypairs.json
+

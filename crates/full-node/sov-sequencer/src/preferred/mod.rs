@@ -7,6 +7,7 @@ mod cache_warm_up_executor;
 mod db;
 mod executor_events;
 mod inner;
+mod parallel_tx_executor;
 mod preferred_blob_sender;
 mod replica;
 mod side_effects;
@@ -16,8 +17,10 @@ mod update_state;
 
 use crate::preferred::block_executor::RollupBlockExecutorConfig;
 use crate::preferred::cache_warm_up_executor::CacheWarmUpExecutor;
+use crate::preferred::parallel_tx_executor::ParallelTxExecutor;
 use async_trait::async_trait;
 use axum::http::StatusCode;
+use base64::Engine;
 use batch_size_tracker::BatchSizeTracker;
 use db::postgres::PostgresBackend;
 use db::rocksdb::RocksDbBackend;
@@ -36,8 +39,9 @@ use sov_modules_api::macros::config_value;
 use sov_modules_api::rest::utils::ErrorObject;
 use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::{
-    ApiTxEffect, FullyBakedTx, RejectReason, Runtime, RuntimeEventProcessor, RuntimeEventResponse,
-    Spec, StateCheckpoint, StateUpdateInfo, VersionReader, VisibleSlotNumber, *,
+    ApiTxEffect, FullyBakedTx, RawTx, RejectReason, Runtime, RuntimeEventProcessor,
+    RuntimeEventResponse, Spec, StateCheckpoint, StateUpdateInfo, VersionReader, VisibleSlotNumber,
+    *,
 };
 use sov_rest_utils::errors::internal_server_error_500;
 use sov_rest_utils::errors::{database_error_500, sequencer_overloaded_503};
@@ -61,9 +65,9 @@ use tracing::{debug, error, info, trace};
 use transaction_subscriptions::TransactionCache;
 
 use crate::common::{
-    error_not_fully_synced, generic_accept_tx_error, loop_send_tx_notifications, poll_state_update,
-    AcceptedTx, Sequencer, SequencerEventStream, StateUpdateError, StateUpdateNotification,
-    WithCachedTxHashes,
+    cache_sequencer_metrics, error_not_fully_synced, generic_accept_tx_error,
+    loop_send_tx_notifications, poll_state_update, AcceptedTx, Sequencer, SequencerEventStream,
+    SequencerMetrics, StateUpdateError, StateUpdateNotification, WithCachedTxHashes,
 };
 use crate::metrics::{track_in_progress_batch_size, PreferredSequencerFetchBatchesToReplayMetrics};
 use crate::preferred::block_executor::{RollupBlockExecutor, RollupBlockExecutorError};
@@ -236,6 +240,18 @@ where
             handles.push(worker);
         }
 
+        let (parallel_tx_executor, parallel_workers): (ParallelTxExecutor<S, Rt>, _) =
+            ParallelTxExecutor::spawn_execution_task(
+                latest_state_update.clone(),
+                rollup_exec_config.clone(),
+                config.clone(),
+            )
+            .await;
+
+        for worker in parallel_workers {
+            handles.push(worker);
+        }
+
         let tx_queue_id = Arc::new(AtomicU64::new(0));
         let (synchronized_state, synchronized_state_updator) = create(
             api_ledger_db.clone(),
@@ -252,6 +268,7 @@ where
             rollup_exec_config.clone(),
             cached_txs.write_handle(),
             cache_warm_up_executor.clone(),
+            parallel_tx_executor.clone(),
         );
 
         let synchronized_state_task = synchronized_state.start().await;
@@ -936,6 +953,140 @@ where
         }
     }
 
+    // Mark(Nico)
+    #[tracing::instrument(skip_all, level = "trace", fields(tx_hash = %tx_hash))]
+    async fn accept_serialized_pre_authenticated_tx(
+        &self,
+        serialized_tx_base64: String,
+        tx_hash: TxHash,
+    ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject> {
+        if self.shutdown_receiver.has_changed().unwrap_or(true) {
+            tracing::info!("The sequencer is shutting down. Cannot accept transactions");
+            return Err(shut_down_error());
+        }
+
+        let original_tx_queue_id = self.tx_queue_id.load(Ordering::Acquire);
+        let start = std::time::Instant::now();
+        tracing::debug!(%tx_hash, "Executing OPTIMIZED accept_serialized_pre_authenticated_tx (no deserialize, no reconstruct, no auth)");
+
+        // Decode base64 serialized transaction - this is the only overhead
+        let decode_start = std::time::Instant::now();
+        let serialized = base64::engine::general_purpose::STANDARD
+            .decode(serialized_tx_base64.as_bytes())
+            .map_err(|e| ErrorObject {
+                status: StatusCode::BAD_REQUEST,
+                message: "Invalid base64 serialized transaction".to_string(),
+                details: sov_rest_utils::json_obj!({ "error": e.to_string() }),
+            })?;
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Wrap and authenticate - no deserialization or reconstruction needed
+        let wrap_start = std::time::Instant::now();
+        let raw_tx = RawTx::new(serialized);
+        // Use pre-authenticated encoding so runtime uses original hash and skips sig verification
+        let baked_tx = Rt::Auth::encode_with_pre_authenticated(raw_tx, tx_hash);
+        let wrap_ms = wrap_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Submit directly to the state updator
+        let submit_start = std::time::Instant::now();
+        let res = match self
+            .synchronized_state_updator
+            .accept_tx_msg(
+                &baked_tx,
+                tx_hash,
+                original_tx_queue_id,
+                "accept_serialized_pre_authenticated_tx",
+            )
+            .await
+        {
+            Ok(inner_res) => inner_res,
+            Err(SequencerStateUpdatorError::Shutdown) => {
+                return Err(shut_down_error());
+            }
+            Err(SequencerStateUpdatorError::Unexpected) => {
+                return Err(internal_server_error_500(
+                    "Unexpected Error. The sequencer is unable to accept transactions.",
+                ));
+            }
+        };
+        let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
+
+        let await_start = std::time::Instant::now();
+        let result = match res {
+            Ok(rx) => rx.await.map_err(database_error_500),
+            Err(e) => match e {
+                AcceptTxError::SequencerOverloaded503 => Err(sequencer_overloaded_503()),
+                AcceptTxError::NotFullySynced(details) => {
+                    Err(crate::common::error_not_fully_synced(details))
+                }
+                AcceptTxError::BatchError {
+                    batch_creation_error,
+                    nb_of_concurrent_blob_submissions,
+                } => match batch_creation_error {
+                    BatchCreationError::NoFinalizedSlotAvailable => Err(sequencer_overloaded_503()),
+                    BatchCreationError::BlobSenderBusy => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::WaitingOnBlobSender {
+                            max_concurrent_blobs: self.config.max_concurrent_blobs,
+                            nb_of_blobs_in_flight: nb_of_concurrent_blob_submissions,
+                        },
+                    )),
+                    BatchCreationError::DatabaseError(e) => Err(database_error_500(e)),
+                    BatchCreationError::PreferredSequencerAtStopHeight {
+                        height_to_stop_at,
+                        current_height,
+                    } => Err(error_not_fully_synced(
+                        SequencerNotReadyDetails::PreferredSequencerAtStopHeight {
+                            height_to_stop_at,
+                            current_height,
+                        },
+                    )),
+                },
+                AcceptTxError::TxTooBig {
+                    current_batch_size,
+                    max_batch_size,
+                } => Err(err_cant_fit_tx(current_batch_size, max_batch_size, 0)),
+                AcceptTxError::ExecutorError(err) => {
+                    Err(RollupBlockExecutorError::into_http_error(err))
+                }
+                AcceptTxError::Shutdown => Err(shut_down_error()),
+            },
+        };
+
+        let await_ms = await_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let stf_execution_ms = result
+            .as_ref()
+            .ok()
+            .map(|accepted| accepted.confirmation.stf_execution_time_micros as f64 / 1000.0);
+
+        tracing::debug!(
+            %tx_hash,
+            decode_ms = format!("{:.2}", decode_ms),
+            wrap_ms = format!("{:.2}", wrap_ms),
+            submit_ms = format!("{:.2}", submit_ms),
+            await_ms = format!("{:.2}", await_ms),
+            total_ms = format!("{:.2}", total_ms),
+            stf_execution_ms = stf_execution_ms
+                .map(|ms| format!("{:.2}", ms))
+                .unwrap_or_else(|| "n/a".to_string()),
+            "⏱️  PreferredSequencer::accept_serialized_pre_authenticated_tx breakdown (OPTIMIZED PATH)"
+        );
+
+        if result.is_ok() {
+            let metrics = SequencerMetrics {
+                decode_ms,
+                wrap_ms,
+                submit_ms,
+                await_ms,
+                total_ms,
+                stf_execution_ms,
+            };
+            cache_sequencer_metrics(tx_hash, metrics);
+        }
+
+        result
+    }
+
     async fn tx_status(
         &self,
         _tx_hash: &TxHash,
@@ -1005,6 +1156,8 @@ where
     events: Vec<RuntimeEventResponse<<Rt as RuntimeEventProcessor>::RuntimeEvent>>,
     receipt: ApiTxEffect<TxReceiptContents<S>>,
     tx_number: u64,
+    #[serde(default)]
+    stf_execution_time_micros: u64,
 }
 
 fn get_next_sequence_number_according_to_node<S, Rt>(

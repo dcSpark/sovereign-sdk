@@ -1,10 +1,11 @@
 //! Defines the [`Sequencer`] trait and related types.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -17,13 +18,53 @@ use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::*;
 use sov_modules_stf_blueprint::{PreExecError, Runtime};
 use sov_rest_utils::{json_obj, to_json_object};
+#[cfg(feature = "native")]
+use midnight_privacy::prime_pre_verified_spend;
+use midnight_privacy::SpendPublic;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::ledger_api::{ItemOrHash, LedgerStateProvider, QueryMode};
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tokio::time::timeout;
+use tokio::task_local;
 use tracing::{info, trace};
+
+// Global cache of pre-authenticated transaction hashes
+// Transactions in this set have been verified by the worker and can skip signature verification
+static PRE_AUTHENTICATED_TXS: OnceLock<StdMutex<std::collections::HashSet<TxHash>>> = OnceLock::new();
+
+fn get_pre_auth_cache() -> &'static StdMutex<std::collections::HashSet<TxHash>> {
+    PRE_AUTHENTICATED_TXS.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+}
+
+/// Mark a transaction as pre-authenticated (signature already verified by worker)
+#[allow(dead_code)]
+pub fn mark_tx_pre_authenticated(tx_hash: TxHash) {
+    let cache = get_pre_auth_cache();
+    if let Ok(mut set) = cache.lock() {
+        set.insert(tx_hash);
+    }
+}
+
+/// Check if a transaction is pre-authenticated
+#[allow(dead_code)]
+pub fn is_tx_pre_authenticated(tx_hash: &TxHash) -> bool {
+    let cache = get_pre_auth_cache();
+    if let Ok(set) = cache.lock() {
+        set.contains(tx_hash)
+    } else {
+        false
+    }
+}
+
+/// Remove a transaction from the pre-authenticated cache
+pub fn clear_tx_pre_authenticated(tx_hash: &TxHash) {
+    let cache = get_pre_auth_cache();
+    if let Ok(mut set) = cache.lock() {
+        set.remove(tx_hash);
+    }
+}
 
 use crate::rest_api::ApiAcceptedTx;
 use crate::{SequencerNotReadyDetails, SlotNumber, TxHash, TxStatus, TxStatusManager};
@@ -40,6 +81,69 @@ pub(crate) type SequencerEventStream<Rt> = Pin<
             > + Send,
     >,
 >;
+
+task_local! {
+    static PRE_VERIFIED_MIDNIGHT_TRANSACTION: RefCell<Option<SpendPublic>>;
+}
+
+static PRE_VERIFIED_MIDNIGHT_TRANSACTIONS: OnceLock<StdMutex<HashMap<TxHash, SpendPublic>>> =
+    OnceLock::new();
+
+fn pre_verified_map() -> &'static StdMutex<HashMap<TxHash, SpendPublic>> {
+    PRE_VERIFIED_MIDNIGHT_TRANSACTIONS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn cache_pre_verified_midnight_transaction(tx_hash: TxHash, public: SpendPublic) {
+    let _ = pre_verified_map().lock().unwrap().insert(tx_hash, public);
+}
+
+pub(crate) fn remove_pre_verified_midnight_transaction(tx_hash: &TxHash) -> Option<SpendPublic> {
+    pre_verified_map().lock().unwrap().remove(tx_hash)
+}
+
+pub async fn with_pre_verified_midnight_transaction<T, Fut>(public: SpendPublic, fut: Fut) -> T
+where
+    Fut: Future<Output = T>,
+{
+    PRE_VERIFIED_MIDNIGHT_TRANSACTION
+        .scope(RefCell::new(Some(public)), fut)
+        .await
+}
+
+#[allow(dead_code)]
+pub(crate) fn take_pre_verified_midnight_transaction() -> Option<SpendPublic> {
+    PRE_VERIFIED_MIDNIGHT_TRANSACTION
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Detailed per-transaction timing metrics for the sequencer.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct SequencerMetrics {
+    pub decode_ms: f64,
+    pub wrap_ms: f64,
+    pub submit_ms: f64,
+    pub await_ms: f64,
+    pub total_ms: f64,
+    pub stf_execution_ms: Option<f64>,
+}
+
+// Global cache of per-transaction sequencer metrics keyed by tx hash.
+static SEQUENCER_METRICS: OnceLock<StdMutex<HashMap<TxHash, SequencerMetrics>>> =
+    OnceLock::new();
+
+fn sequencer_metrics_map() -> &'static StdMutex<HashMap<TxHash, SequencerMetrics>> {
+    SEQUENCER_METRICS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn cache_sequencer_metrics(tx_hash: TxHash, metrics: SequencerMetrics) {
+    let _ = sequencer_metrics_map().lock().unwrap().insert(tx_hash, metrics);
+}
+
+pub(crate) fn take_sequencer_metrics(tx_hash: &TxHash) -> Option<SequencerMetrics> {
+    sequencer_metrics_map().lock().unwrap().remove(tx_hash)
+}
 
 /// The [`Sequencer`] trait is responsible for accepting transactions and
 /// assembling them into batches.
@@ -121,6 +225,24 @@ pub trait Sequencer: Send + Sync + 'static {
         &self,
         tx: FullyBakedTx,
     ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject>;
+
+    /// OPTIMIZED: Accept a pre-authenticated transaction from serialized bytes (base64 encoded).
+    /// This is the fastest path - avoids component deserialization and reconstruction.
+    /// Saves ~12-15ms compared to accept_pre_authenticated_tx.
+    async fn accept_serialized_pre_authenticated_tx(
+        &self,
+        serialized_tx_base64: String,
+        tx_hash: TxHash,
+    ) -> Result<AcceptedTx<Self::Confirmation>, ErrorObject> {
+        let _ = (serialized_tx_base64, tx_hash);
+        Err(ErrorObject {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "Not Implemented".to_string(),
+            details: json_obj!({
+                "error": "accept_serialized_pre_authenticated_tx is not implemented for this sequencer"
+            }),
+        })
+    }
 
     /// Can be used to query and update the status of transactions.
     fn tx_status_manager(&self) -> &TxStatusManager<<Self::Spec as Spec>::Da>;
@@ -540,7 +662,16 @@ where
         }
     };
 
-    let auth_res = (auth_res.0, auth_res.1, Rt::wrap_call(auth_res.2));
+    let (auth_tx, auth_data, message) = auth_res;
+
+    #[cfg(feature = "native")]
+    {
+        if let Ok(tx_hash) = Rt::Auth::compute_tx_hash(baked_tx) {
+            prime_pre_verified_spend(&tx_hash);
+        }
+    }
+
+    let auth_res = (auth_tx, auth_data, Rt::wrap_call(message));
     let (tx_scratchpad, gas_meter) = pre_exec_ws.to_scratchpad_and_gas_meter();
 
     (tx_scratchpad, Ok((auth_res, gas_meter)))

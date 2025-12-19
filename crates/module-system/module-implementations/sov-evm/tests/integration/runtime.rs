@@ -21,6 +21,7 @@ generate_runtime! {
     auth_call_wrapper: |call| match call {
         EvmAuthenticatorInput::Evm(call) => TestRuntimeCall::Evm(call),
         EvmAuthenticatorInput::Standard(call) => call,
+        EvmAuthenticatorInput::StandardPreAuthenticated(call, _) => call,
     },
 }
 

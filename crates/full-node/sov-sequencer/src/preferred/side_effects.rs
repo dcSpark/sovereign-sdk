@@ -47,9 +47,12 @@ where
 
     /// Applies the changes to the current [`StateCheckpoint`].
     #[tracing::instrument(skip_all, level = "trace")]
-    fn update_api_state_with_changes(&self, changes: TxChangeSet) {
-        self.checkpoint_sender.send_modify(|checkpoint| {
-            checkpoint.apply_tx_changes(changes);
+    fn update_api_state_with_changes(&self, changes: &TxChangeSet) {
+        // Clone once here so the closure owns the data and can be 'static
+        // (required if send_modify sends across threads)
+        let owned = changes.clone();
+        self.checkpoint_sender.send_modify(move |checkpoint| {
+            checkpoint.apply_tx_changes(&owned);
         });
     }
 
@@ -140,7 +143,7 @@ where
                         .insert(contents.accepted_tx.clone())
                         .await;
                     // If the receiver is no longer listening, just don't send the confirmation.
-                    self.update_api_state_with_changes(contents.tx_changes);
+                    self.update_api_state_with_changes(&contents.tx_changes);
                     let _ = contents.oneshot_sender.send(contents.accepted_tx);
                 }
             }
@@ -311,6 +314,7 @@ mod tests {
                 },
             },
             tx_number: number,
+            stf_execution_time_micros: 0,
         };
         ExecutorEvent::AcceptedTx(AcceptedTxEventContents {
             accepted_tx: AcceptedTx {

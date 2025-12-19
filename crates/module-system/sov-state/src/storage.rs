@@ -239,6 +239,12 @@ impl SlotValue {
         }
     }
 
+    /// Create a SlotValue from an existing Arc.
+    /// Used for sharing memory between multiple cache entries with identical content.
+    pub fn from_arc(value: Arc<Vec<u8>>) -> Self {
+        Self { value }
+    }
+
     /// Get a debug string for an optional value suitable for logging.
     pub fn debug_show(value: Option<&Self>) -> String {
         match value {

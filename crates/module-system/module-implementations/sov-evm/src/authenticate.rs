@@ -209,6 +209,10 @@ pub enum EvmAuthenticatorInput<T = RawTx, U = RawTx> {
     /// Authenticate using the standard `sov-module` authenticator, which uses the default
     /// signature scheme and hashing algorithm defined in the rollup's [`Spec`].
     Standard(U),
+    /// Pre-authenticated standard transaction (signature and proofs validated off-chain).
+    /// Contains the lightweight standard `RawTx` bytes and the original hash computed over the
+    /// full transaction (with proofs). Used to skip signature verification and preserve hash.
+    StandardPreAuthenticated(U, TxHash),
 }
 
 /// EVM-compatible transaction authenticator. See [`TransactionAuthenticator`].
@@ -227,9 +231,13 @@ where
     fn decode_serialized_tx(
         tx: &FullyBakedTx,
     ) -> Result<Self::Decodable, sov_modules_api::capabilities::FatalError> {
-        let auth_variant: EvmAuthenticatorInput = borsh::from_slice(&tx.data).map_err(|e| {
-            sov_modules_api::capabilities::FatalError::DeserializationFailed(e.to_string())
-        })?;
+        // Streamed deserialize to be tolerant of benign trailing bytes
+        let mut buf: &[u8] = &tx.data;
+        let auth_variant: EvmAuthenticatorInput =
+            BorshDeserialize::deserialize(&mut buf).map_err(|e| {
+                sov_modules_api::capabilities::FatalError::DeserializationFailed(e.to_string())
+            })?;
+        // Ignore any remaining bytes intentionally
 
         match auth_variant {
             EvmAuthenticatorInput::Evm(raw_tx) => {
@@ -237,6 +245,11 @@ where
                 Ok(EvmAuthenticatorInput::Evm(call::CallMessage { rlp: call }))
             }
             EvmAuthenticatorInput::Standard(raw_tx) => {
+                let call = capabilities::decode_sov_tx::<S, Rt>(&raw_tx.data)?;
+                Ok(EvmAuthenticatorInput::Standard(call))
+            }
+            EvmAuthenticatorInput::StandardPreAuthenticated(raw_tx, _hash) => {
+                // For off-chain pre-verified standard txs, `Decodable` is just the standard call
                 let call = capabilities::decode_sov_tx::<S, Rt>(&raw_tx.data)?;
                 Ok(EvmAuthenticatorInput::Standard(call))
             }
@@ -250,10 +263,10 @@ where
         capabilities::AuthenticationOutput<S, Self::Decodable>,
         capabilities::AuthenticationError,
     > {
-        let input: EvmAuthenticatorInput = borsh::from_slice(&tx.data).map_err(|e| {
-            sov_modules_api::capabilities::fatal_deserialization_error::<_, S, _>(
-                &tx.data, e, state,
-            )
+        // Streamed deserialize to be tolerant to trailing bytes
+        let mut buf: &[u8] = &tx.data;
+        let input: EvmAuthenticatorInput = BorshDeserialize::deserialize(&mut buf).map_err(|e| {
+            sov_modules_api::capabilities::fatal_deserialization_error::<_, S, _>(&tx.data, e, state)
         })?;
 
         match input {
@@ -281,6 +294,22 @@ where
                     EvmAuthenticatorInput::Standard(runtime_call),
                 ))
             }
+            EvmAuthenticatorInput::StandardPreAuthenticated(tx, original_hash) => {
+                let (tx_and_raw_hash, auth_data, runtime_call) =
+                    sov_modules_api::capabilities::authenticate_pre_verified::<_, S, Rt>(
+                        &tx.data,
+                        original_hash,
+                        &Rt::CHAIN_HASH,
+                        state,
+                    )?;
+
+                Ok((
+                    tx_and_raw_hash,
+                    auth_data,
+                    // Decodable for the runtime is the standard call
+                    EvmAuthenticatorInput::Standard(runtime_call),
+                ))
+            }
         }
     }
 
@@ -288,7 +317,8 @@ where
     fn compute_tx_hash(
         tx: &sov_modules_api::FullyBakedTx,
     ) -> anyhow::Result<sov_modules_api::TxHash> {
-        let input: EvmAuthenticatorInput = borsh::from_slice(&tx.data)?;
+        let mut buf: &[u8] = &tx.data;
+        let input: EvmAuthenticatorInput = BorshDeserialize::deserialize(&mut buf)?;
 
         match input {
             EvmAuthenticatorInput::Evm(tx) => {
@@ -296,6 +326,7 @@ where
                 Ok(TxHash::new(**tx.hash()))
             }
             EvmAuthenticatorInput::Standard(tx) => Ok(capabilities::calculate_hash::<S>(&tx.data)),
+            EvmAuthenticatorInput::StandardPreAuthenticated(_tx, original_hash) => Ok(original_hash),
         }
     }
 
@@ -345,5 +376,14 @@ where
 
     fn add_standard_auth(tx: RawTx) -> Self::Input {
         EvmAuthenticatorInput::Standard(tx)
+    }
+
+    /// Encode a pre-authenticated standard transaction for the rollup.
+    /// This bypasses signature verification during execution and preserves the original hash
+    /// computed over the full tx (with proofs).
+    fn encode_with_pre_authenticated(tx: RawTx, original_hash: TxHash) -> FullyBakedTx {
+        let input: EvmAuthenticatorInput<RawTx, RawTx> =
+            EvmAuthenticatorInput::StandardPreAuthenticated(tx, original_hash);
+        FullyBakedTx::new(borsh::to_vec(&input).unwrap())
     }
 }

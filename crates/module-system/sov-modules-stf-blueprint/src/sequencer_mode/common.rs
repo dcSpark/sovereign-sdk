@@ -30,7 +30,11 @@ where
     RT: Runtime<S>,
     I: StateProvider<S>,
 {
+    let attempt_start = std::time::Instant::now();
     let tx_result = attempt_tx(tx, message, ctx, runtime, &mut working_set);
+    let attempt_time = attempt_start.elapsed();
+
+    let finalize_start = std::time::Instant::now();
     let (tx_scratchpad, receipt, transaction_consumption) = match tx_result {
         Ok(_) => {
             let (tx_scratchpad, transaction_consumption, events) = working_set.finalize();
@@ -80,6 +84,14 @@ where
             (tx_scratchpad, receipt, transaction_consumption)
         }
     };
+    let finalize_time = finalize_start.elapsed();
+
+    info!(
+        tx_hash = %raw_tx_hash,
+        attempt_ms = format!("{:.2}", attempt_time.as_secs_f64() * 1000.0),
+        finalize_ms = format!("{:.2}", finalize_time.as_secs_f64() * 1000.0),
+        "[TX TIMING] apply_tx breakdown"
+    );
 
     (
         ApplyTxResult::<S> {
@@ -97,11 +109,24 @@ fn attempt_tx<S: Spec, RT: Runtime<S>, I: StateProvider<S>>(
     runtime: &mut RT,
     state: &mut WorkingSet<S, I>,
 ) -> Result<(), Error> {
+    let pre_dispatch_start = std::time::Instant::now();
     runtime.pre_dispatch_tx_hook(tx, state)?;
+    let pre_dispatch_time = pre_dispatch_start.elapsed();
 
+    let dispatch_start = std::time::Instant::now();
     runtime.dispatch_call(message, state, ctx)?;
+    let dispatch_time = dispatch_start.elapsed();
 
+    let post_dispatch_start = std::time::Instant::now();
     runtime.post_dispatch_tx_hook(tx, ctx, state)?;
+    let post_dispatch_time = post_dispatch_start.elapsed();
+
+    info!(
+        pre_dispatch_ms = format!("{:.2}", pre_dispatch_time.as_secs_f64() * 1000.0),
+        dispatch_ms = format!("{:.2}", dispatch_time.as_secs_f64() * 1000.0),
+        post_dispatch_ms = format!("{:.2}", post_dispatch_time.as_secs_f64() * 1000.0),
+        "[TX TIMING] attempt_tx breakdown"
+    );
 
     Ok(())
 }

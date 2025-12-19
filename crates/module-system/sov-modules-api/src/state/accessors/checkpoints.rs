@@ -285,12 +285,12 @@ impl<S: Spec> StateCheckpoint<S> {
     // This TODO is not a security risk, it is used only in sequencer as intended.
     // TODO: Remove this method if we stop using `StateCheckpoint` in the sequencer
     #[cfg(feature = "native")]
-    pub fn apply_tx_changes(&mut self, changeset: TxChangeSet) {
-        for ((key, namespace), value) in changeset.writes {
+    pub fn apply_tx_changes(&mut self, changeset: &TxChangeSet) {
+        for ((key, namespace), value) in &changeset.writes {
             if let Some(value) = value {
-                self.set_value(namespace, &key, value);
+                self.set_value(*namespace, key, value.clone());
             } else {
-                self.delete_value(namespace, &key);
+                self.delete_value(*namespace, key);
             }
         }
     }
@@ -300,6 +300,16 @@ impl<S: Spec> StateCheckpoint<S> {
     pub fn advance_visible_slot_number(&mut self, advance: std::num::NonZero<u8>) {
         self.visible_slot_num.advance(advance.get().into());
         self.rollup_height.incr();
+    }
+
+    /// Returns an iterator over all User namespace writes whose key starts with the given prefix.
+    /// This is used for prefix iteration in StateMap to enumerate keys matching a pattern.
+    #[cfg(feature = "native")]
+    pub fn iter_user_prefix_writes<'a>(
+        &'a mut self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a sov_state::SlotKey, Option<sov_state::SlotValue>)> + 'a {
+        self.delta.iter_user_prefix_writes(prefix)
     }
 }
 
