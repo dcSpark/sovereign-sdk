@@ -2,6 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::prelude::SmallRng;
 use rand::{Rng, SeedableRng};
 use sov_midnight_da::storable::service::StorableMidnightDaService;
+use sov_midnight_da::IncomingWorkerTxSaveMode;
 use sov_midnight_da::MidnightDaConfig;
 use sov_rollup_interface::da::BlockHeaderTrait;
 use sov_rollup_interface::node::da::DaService;
@@ -41,6 +42,9 @@ fn bench_storable_midnight_da_service(c: &mut Criterion) {
                 },
                 da_layer: None,
                 randomization: None,
+                save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
+                worker_tx_path: None,
+                worker_tx_bucket: None,
             },
             receiver.clone(),
         )

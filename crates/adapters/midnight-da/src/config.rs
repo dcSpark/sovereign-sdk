@@ -8,6 +8,28 @@ use sov_rollup_interface::da::Time;
 use crate::storable::layer::StorableMidnightDaLayer;
 use crate::{MidnightAddress, MidnightBlock, MidnightBlockHeader, MidnightHash};
 
+/// Where to persist full incoming worker transactions (best-effort).
+///
+/// This is intended for debugging/auditing and is *separate* from the
+/// `worker_verified_transactions` DB table, which stores verification outcomes
+/// and pre-authenticated data used by the rollup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IncomingWorkerTxSaveMode {
+    /// Do not persist incoming worker transactions.
+    None,
+    /// Persist incoming worker transactions to a local directory on disk.
+    Disk,
+    /// Persist incoming worker transactions to a Google Cloud Storage bucket.
+    Gcs,
+}
+
+impl Default for IncomingWorkerTxSaveMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Time in milliseconds to wait for the next block if it is not there yet.
 /// How many times wait attempts are done depends on service configuration.
 pub const WAIT_ATTEMPT_PAUSE: Duration = Duration::from_millis(10);
@@ -171,6 +193,27 @@ pub struct MidnightDaConfig {
     pub da_layer: Option<std::sync::Arc<tokio::sync::RwLock<StorableMidnightDaLayer>>>,
     /// If specified, [`StorableMidnightDaLayer`] will add randomization to non-finalized blocks.
     pub randomization: Option<RandomizationConfig>,
+
+    /// Whether (and where) to persist full incoming worker transactions (the base64-encoded,
+    /// borsh-serialized transaction bytes as received by the verifier service).
+    ///
+    /// This is a *debug/audit* facility and should not be required for normal rollup operation.
+    #[serde(default)]
+    pub save_incoming_worker_txs: IncomingWorkerTxSaveMode,
+
+    /// Directory to write incoming worker transactions to when
+    /// `save_incoming_worker_txs = "disk"`.
+    ///
+    /// One file per transaction is written, named `<tx_hash>.json`.
+    #[serde(default)]
+    pub worker_tx_path: Option<String>,
+
+    /// GCS bucket name to write incoming worker transactions to when
+    /// `save_incoming_worker_txs = "gcs"`.
+    ///
+    /// Objects are written as `<tx_hash>.json` at the bucket root.
+    #[serde(default)]
+    pub worker_tx_bucket: Option<String>,
 }
 
 impl PartialEq for MidnightDaConfig {
@@ -179,7 +222,10 @@ impl PartialEq for MidnightDaConfig {
             && self.sender_address == other.sender_address
             && self.finalization_blocks == other.finalization_blocks
             && self.block_producing == other.block_producing
-            && self.randomization == other.randomization;
+            && self.randomization == other.randomization
+            && self.save_incoming_worker_txs == other.save_incoming_worker_txs
+            && self.worker_tx_path == other.worker_tx_path
+            && self.worker_tx_bucket == other.worker_tx_bucket;
 
         // Basic fields are not equal, no need to check da_layer field
         if !basic_eq {
@@ -207,6 +253,9 @@ impl MidnightDaConfig {
             block_producing: default_block_producing(),
             da_layer: None,
             randomization: None,
+            save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
+            worker_tx_path: None,
+            worker_tx_bucket: None,
         }
     }
 
@@ -243,6 +292,9 @@ impl MidnightDaConfig {
                 // Just to spice things up a bit
                 behaviour: RandomizationBehaviour::OutOfOrderBlobs,
             }),
+            save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
+            worker_tx_path: None,
+            worker_tx_bucket: None,
         }
     }
 
@@ -262,6 +314,9 @@ impl MidnightDaConfig {
                     adjust_head_height: -10..10,
                 },
             }),
+            save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
+            worker_tx_path: None,
+            worker_tx_bucket: None,
         }
     }
 }

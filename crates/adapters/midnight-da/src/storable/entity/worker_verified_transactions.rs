@@ -64,13 +64,14 @@ pub struct Model {
     /// Borsh-serialized transaction details (hex string) - for pre-authenticated path
     #[sea_orm(column_type = "Text", nullable)]
     pub details_hex: Option<String>,
-    /// Borsh-serialized runtime call message (hex string) - for pre-authenticated path
-    #[sea_orm(column_type = "Text", nullable)]
-    pub runtime_call_hex: Option<String>,
     /// Fully serialized transaction (base64) - optimized pre-authenticated path
     /// Contains the complete borsh-serialized Transaction, ready to wrap and authenticate
     #[sea_orm(column_type = "Text", nullable)]
     pub serialized_tx_base64: Option<String>,
+    /// Optional location (disk path or `gs://...`) where the full incoming worker transaction
+    /// blob was persisted for auditing/debugging.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub full_transaction_location: Option<String>,
     /// L2 sender address (canonical string), derived from the transaction's public key.
     #[sea_orm(column_type = "String(StringLen::None)")]
     pub sender: String,

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use axum::ServiceExt;
 use clap::Parser;
 use sov_address::MultiAddressEvm;
+use sov_midnight_da::storable::IncomingWorkerTxSaver;
 use sov_midnight_da::storable::service::StorableMidnightDaService;
 use sov_proof_verifier_service::{create_router, AppState, ServiceConfig};
 use sov_stf_runner::{from_toml_path, RollupConfig};
@@ -27,7 +28,8 @@ struct Args {
 
     /// Path to the rollup configuration TOML used by the rollup node.
     /// When set, the worker transactions DB connection string will be read from this file's
-    /// [da] section `connection_string` (same config used by rollup-ligero via --rollup-config-path).
+    /// [da] section `connection_string` and the incoming worker-tx persistence settings
+    /// (`save_incoming_worker_txs`, `worker_tx_path`, `worker_tx_bucket`) will be applied.
     #[arg(long = "rollup-config-path")]
     rollup_config_path: Option<String>,
 
@@ -78,8 +80,59 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing(&args.log_level)?;
 
+    // Load rollup config once (if provided) so we can derive both the DA DB connection
+    // string and the incoming-worker-tx persistence settings.
+    let rollup_config: Option<RollupConfig<MultiAddressEvm, StorableMidnightDaService>> =
+        if let Some(ref config_path) = args.rollup_config_path {
+            info!("Loading rollup config from {}", config_path);
+            Some(from_toml_path(config_path).with_context(|| {
+                format!("Failed to read rollup configuration from {}", config_path)
+            })?)
+        } else {
+            None
+        };
+
     // Resolve worker_txs DB connection string, preferring explicit CLI value, then rollup_config.toml, then demo default.
-    let da_connection_string = resolve_da_connection_string(&args)?;
+    let da_connection_string = match args.da_db.clone() {
+        Some(explicit) => explicit,
+        None => {
+            if let (Some(ref config_path), Some(ref rollup_config)) =
+                (args.rollup_config_path.as_ref(), rollup_config.as_ref())
+            {
+                let conn = normalize_sqlite_connection_path(
+                    config_path,
+                    rollup_config.da.connection_string.clone(),
+                )?;
+
+                info!(
+                    "Using worker_txs DB connection string from rollup config: {}",
+                    conn
+                );
+
+                conn
+            } else {
+                let default_conn =
+                    "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc"
+                        .to_string();
+                info!(
+                    "No --da-db or --rollup-config-path provided; falling back to default worker_txs DB: {}",
+                    default_conn
+                );
+                default_conn
+            }
+        }
+    };
+
+    let incoming_worker_tx_saver = if let (Some(ref config_path), Some(ref rollup_config)) =
+        (args.rollup_config_path.as_ref(), rollup_config.as_ref())
+    {
+        let config_dir = Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        IncomingWorkerTxSaver::from_config(&rollup_config.da, Some(config_dir)).await?
+    } else {
+        IncomingWorkerTxSaver::disabled()
+    };
 
     info!("Starting proof verifier service");
     info!("Bind address: {}", args.bind);
@@ -119,7 +172,8 @@ async fn main() -> Result<()> {
     };
 
     // Create application state (loads signing key at startup)
-    let state = AppState::new(config).await?;
+    let state = AppState::new_with_incoming_worker_tx_saver(config, incoming_worker_tx_saver)
+        .await?;
 
     // Create router
     let app = create_router(state);
@@ -171,53 +225,6 @@ fn parse_method_id(hex: &str) -> Result<[u8; 32]> {
     let mut method_id = [0u8; 32];
     method_id.copy_from_slice(&bytes);
     Ok(method_id)
-}
-
-/// Resolve the worker_txs DB connection string to use for the verifier service.
-///
-/// Priority:
-/// 1. Explicit `--da-db` CLI argument (if provided)
-/// 2. Value from `--rollup-config-path`'s [da] section `connection_string`
-/// 3. Built-in demo default pointing at a dedicated worker_txs SQLite database.
-fn resolve_da_connection_string(args: &Args) -> Result<String> {
-    if let Some(ref explicit) = args.da_db {
-        return Ok(explicit.clone());
-    }
-
-    if let Some(ref config_path) = args.rollup_config_path {
-        info!(
-            "No --da-db provided; loading rollup config from {}",
-            config_path
-        );
-
-        let rollup_config: RollupConfig<MultiAddressEvm, StorableMidnightDaService> =
-            from_toml_path(config_path).with_context(|| {
-                format!(
-                    "Failed to read rollup configuration from {} to resolve worker DB connection string",
-                    config_path
-                )
-            })?;
-
-        let conn = normalize_sqlite_connection_path(
-            config_path,
-            rollup_config.da.connection_string.clone(),
-        )?;
-
-        info!(
-            "Using worker_txs DB connection string from rollup config: {}",
-            conn
-        );
-
-        return Ok(conn);
-    }
-
-    let default_conn =
-        "sqlite://examples/rollup-ligero/demo_data/worker_txs.sqlite?mode=rwc".to_string();
-    info!(
-        "No --da-db or --rollup-config-path provided; falling back to default worker_txs DB: {}",
-        default_conn
-    );
-    Ok(default_conn)
 }
 
 /// Convert relative SQLite paths (e.g. `sqlite://demo_data/worker_txs.sqlite`) into absolute
