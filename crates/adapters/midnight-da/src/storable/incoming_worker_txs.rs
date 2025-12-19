@@ -18,7 +18,8 @@ enum IncomingWorkerTxSaverInner {
     Disabled,
     Disk { dir: PathBuf },
     Gcs {
-        bucket: String,
+        bucket_resource: String,
+        bucket_name: String,
         storage: google_cloud_storage::client::Storage,
     },
 }
@@ -56,20 +57,28 @@ impl IncomingWorkerTxSaver {
                 let raw_bucket = da_config.worker_tx_bucket.as_deref().context(
                     "Midnight DA config requires `worker_tx_bucket` when `save_incoming_worker_txs = \"gcs\"`",
                 )?;
-                let bucket = normalize_gcs_bucket(raw_bucket);
+                let (bucket_resource, bucket_name) = normalize_gcs_bucket(raw_bucket);
                 let storage = google_cloud_storage::client::Storage::builder()
                     .build()
                     .await
                     .context("Failed to initialize GCS client")?;
                 Ok(Self {
-                    inner: Arc::new(IncomingWorkerTxSaverInner::Gcs { bucket, storage }),
+                    inner: Arc::new(IncomingWorkerTxSaverInner::Gcs {
+                        bucket_resource,
+                        bucket_name,
+                        storage,
+                    }),
                 })
             }
         }
     }
 
     /// Persists a transaction blob according to the configured backend.
-    pub async fn save(&self, tx_hash: &str, full_transaction_blob_base64: &str) -> anyhow::Result<()> {
+    pub async fn save(
+        &self,
+        tx_hash: &str,
+        full_transaction_blob_base64: &str,
+    ) -> anyhow::Result<Option<String>> {
         let object_name = format!("{tx_hash}.json");
         let payload = serde_json::to_vec_pretty(&serde_json::json!({
             "tx_hash": tx_hash,
@@ -78,21 +87,34 @@ impl IncomingWorkerTxSaver {
         .with_context(|| format!("Failed to serialize worker tx JSON for {tx_hash}"))?;
 
         match self.inner.as_ref() {
-            IncomingWorkerTxSaverInner::Disabled => Ok(()),
+            IncomingWorkerTxSaverInner::Disabled => Ok(None),
             IncomingWorkerTxSaverInner::Disk { dir } => {
                 let path = dir.join(&object_name);
                 tokio::fs::write(&path, payload)
                     .await
-                    .with_context(|| format!("Failed to write worker tx file {}", path.display()))
+                    .with_context(|| format!("Failed to write worker tx file {}", path.display()))?;
+                Ok(Some(path.to_string_lossy().to_string()))
             }
-            IncomingWorkerTxSaverInner::Gcs { bucket, storage } => {
+            IncomingWorkerTxSaverInner::Gcs {
+                bucket_resource,
+                bucket_name,
+                storage,
+            } => {
                 storage
-                    .write_object(bucket, &object_name, bytes::Bytes::from(payload))
+                    .write_object(
+                        bucket_resource,
+                        &object_name,
+                        bytes::Bytes::from(payload),
+                    )
                     .set_content_type("application/json")
                     .send_buffered()
                     .await
-                    .with_context(|| format!("Failed to upload worker tx object gs://{bucket}/{object_name}"))?;
-                Ok(())
+                    .with_context(|| {
+                        format!(
+                            "Failed to upload worker tx object gs://{bucket_name}/{object_name}"
+                        )
+                    })?;
+                Ok(Some(format!("gs://{bucket_name}/{object_name}")))
             }
         }
     }
@@ -108,15 +130,20 @@ fn resolve_path(config_dir: Option<&Path>, raw_path: &str) -> PathBuf {
     base.join(path)
 }
 
-fn normalize_gcs_bucket(bucket: &str) -> String {
+fn normalize_gcs_bucket(bucket: &str) -> (String, String) {
     let bucket = bucket
         .strip_prefix("gs://")
         .unwrap_or(bucket)
         .trim_matches('/');
 
     if bucket.starts_with("projects/") {
-        bucket.to_string()
+        // Expected format: projects/{project}/buckets/{bucket}
+        let bucket_name = bucket
+            .rsplit_once("/buckets/")
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_else(|| bucket.to_string());
+        (bucket.to_string(), bucket_name)
     } else {
-        format!("projects/_/buckets/{bucket}")
+        (format!("projects/_/buckets/{bucket}"), bucket.to_string())
     }
 }

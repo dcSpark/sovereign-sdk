@@ -10,7 +10,7 @@ use std::str::FromStr;
 use demo_stf::runtime::Runtime as DemoRuntime;
 use midnight_privacy::{CallMessage as MidnightCallMessage, SpendPublic};
 use sov_address::MultiAddressEvm;
-use sov_midnight_da::storable::{setup_db as setup_midnight_da_db, worker_verified_transactions};
+use sov_midnight_da::storable::{setup_db as setup_midnight_da_db, worker_verified_transactions, IncomingWorkerTxSaver};
 use sov_rollup_interface::{crypto::PrivateKey, zk::CryptoSpec};
 use sov_modules_api::Spec;
 
@@ -45,6 +45,41 @@ fn sample_midnight_withdraw_transaction(
         nullifier,
         withdraw_amount,
         to,
+        view_ciphertexts: None,
+        gas: None,
+    };
+
+    let details = TxDetails {
+        max_fee: Amount::from(100_000_000_000u128),
+        max_priority_fee_bips: PriorityFeeBips(0),
+        gas_limit: None,
+        chain_id: 4321,
+    };
+
+    let runtime_call = RuntimeCall::MidnightPrivacy(call);
+    let unsigned_tx = UnsignedTransaction::new_with_details(
+        runtime_call,
+        UniquenessData::Generation(nonce),
+        details,
+    );
+
+    Transaction::<DemoRuntime<RollupSpec>, RollupSpec>::new_signed_tx(
+        &signing_key,
+        &ROLLUP_CHAIN_HASH,
+        unsigned_tx,
+    )
+}
+
+fn sample_midnight_deposit_transaction(nonce: u64) -> Transaction<DemoRuntime<RollupSpec>, RollupSpec> {
+    let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
+    let rho = [99u8; 32];
+    let recipient = [100u8; 32];
+
+    let call = MidnightCallMessage::<RollupSpec>::Deposit {
+        amount: 100u128,
+        rho,
+        recipient,
+        view_fvks: None,
         gas: None,
     };
 
@@ -89,7 +124,7 @@ fn test_value_setter_call_serialization() {
 #[test]
 fn test_parse_midnight_withdraw_call_roundtrips() {
     let tx = sample_midnight_withdraw_transaction(0);
-    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient) =
+    let (proof_bytes, anchor_root, nullifier, withdraw_amount, recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("parse succeeds");
 
     assert_eq!(proof_bytes.len(), 16);
@@ -137,21 +172,45 @@ async fn test_store_verified_midnight_transaction_upsert() {
 
     let tx = sample_midnight_withdraw_transaction(9);
     let tx_hash = tx.hash().to_string();
-    let tx_json = serde_json::to_string(&tx).unwrap();
-    let full_blob = "base64encodedtransaction";
+    let tx_json = create_transaction_without_proof(&tx).unwrap();
+    let full_blob = BASE64_STANDARD.encode(borsh::to_vec(&tx).unwrap());
     let mut proof_public = SpendPublic {
         anchor_root: [1u8; 32],
         nullifier: [2u8; 32],
         withdraw_amount: 55,
         output_commitments: vec![],
+        view_attestations: None,
     };
 
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    let saver = IncomingWorkerTxSaver::disabled();
+    store_verified_midnight_transaction(
+        &conn,
+        &saver,
+        &tx_hash,
+        Some(&proof_public),
+        true,
+        Some(true),
+        &tx_json,
+        &full_blob,
+        None,
+        None,
+    )
         .await
         .unwrap();
 
     proof_public.withdraw_amount = 99;
-    store_verified_midnight_transaction(&conn, &tx_hash, Some(&proof_public), true, Some(true), &tx_json, full_blob, None)
+    store_verified_midnight_transaction(
+        &conn,
+        &saver,
+        &tx_hash,
+        Some(&proof_public),
+        true,
+        Some(true),
+        &tx_json,
+        &full_blob,
+        None,
+        None,
+    )
         .await
         .unwrap();
 
@@ -180,20 +239,24 @@ async fn test_store_deposit_transaction_without_proof() {
     let conn = Database::connect(opts).await.unwrap();
     setup_midnight_da_db(&conn).await.unwrap();
 
-    let tx_hash = "0xdeposit123";
-    let transaction_data = r#"{"deposit":{"amount":"100","rho":"0x01...","recipient":"0x02...","gas":null}}"#;
-    let full_blob = "base64encodeddeposittransaction";
+    let tx = sample_midnight_deposit_transaction(11);
+    let tx_hash = tx.hash().to_string();
+    let transaction_data = create_transaction_without_proof(&tx).unwrap();
+    let full_blob = BASE64_STANDARD.encode(borsh::to_vec(&tx).unwrap());
 
     // Store deposit with no proof
+    let saver = IncomingWorkerTxSaver::disabled();
     store_verified_midnight_transaction(
         &conn,
-        tx_hash,
+        &saver,
+        &tx_hash,
         None,       // No proof outputs for deposits
         true,       // signature_valid
         None,       // proof_verified: NULL (transaction doesn't have a proof)
-        transaction_data,
-        full_blob,
+        &transaction_data,
+        &full_blob,
         None,       // No pre-auth data in test
+        None,
     )
     .await
     .unwrap();
@@ -225,6 +288,7 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
         anchor_root,
         nullifier,
         withdraw_amount,
+        None,
     )
     .await
     {
@@ -235,6 +299,9 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
         Err(ServiceError::Internal(msg)) if msg.contains("note_spend_guest.wasm") => {
             // Also acceptable in test environment: WASM file not found
             // This means we can't even attempt proof verification
+        }
+        Err(ServiceError::Internal(msg)) if msg.contains("LIGERO_VERIFIER_BIN") => {
+            // Also acceptable in test environment: verifier binary not configured
         }
         other => panic!("expected proof error or missing WASM file, got {other:?}"),
     }
@@ -258,6 +325,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let conn = Database::connect(db_opts).await.unwrap();
     setup_midnight_da_db(&conn).await.unwrap();
     println!("✓ Step 1: Database initialized");
+    let saver = IncomingWorkerTxSaver::disabled();
 
     // Step 2: Generate a midnight withdrawal transaction (like midnight-tx-generator does)
     println!("\n✓ Step 2: Creating transaction (like midnight-tx-generator)");
@@ -281,6 +349,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         nullifier,
         withdraw_amount,
         to: recipient.clone(),
+        view_ciphertexts: None,
         gas: None,
     };
 
@@ -326,7 +395,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
 
     // Step 5: Parse the transaction (extract proof, anchor_root, nullifier, etc.)
     println!("\n✓ Step 5: Testing transaction parsing");
-    let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient) =
+    let (proof_bytes, parsed_anchor_root, parsed_nullifier, parsed_amount, parsed_recipient, _view_ciphertexts) =
         parse_midnight_withdraw_call(&tx).expect("Should parse transaction");
     
     assert_eq!(proof_bytes.len(), 32, "Proof should be our dummy 32 bytes");
@@ -345,6 +414,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         nullifier,
         withdraw_amount,
         output_commitments: vec![],
+        view_attestations: None,
     };
     println!("  ✓ Proof verification simulated (would verify with Ligero in production)");
     
@@ -355,6 +425,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     
     store_verified_midnight_transaction(
         &conn,
+        &saver,
         &tx_hash,
         Some(&simulated_proof_output),
         true,          // signature_valid
@@ -362,6 +433,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64, // full transaction blob
         None,          // No pre-auth data in test
+        None,
     )
     .await
     .expect("Should store to database");
@@ -409,6 +481,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     
     store_verified_midnight_transaction(
         &conn,
+        &saver,
         &tx_hash,
         Some(&updated_proof_output),
         true,
@@ -416,6 +489,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64,
         None,  // No pre-auth data in test
+        None,
     )
     .await
     .expect("Should update existing record");

@@ -747,7 +747,6 @@ async fn verify_and_record_midnight_handler(
                         String::new(),
                         String::new(),
                         String::new(),
-                        String::new(),
                         req.body.clone(),
                     ))
                 }
@@ -1599,7 +1598,7 @@ pub fn create_transaction_without_proof(
 /// All components are borsh-serialized and hex-encoded for reliable reconstruction
 fn extract_pre_authenticated_data(
     tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
-) -> Result<(String, String, String, String, String, String), ServiceError> {
+) -> Result<(String, String, String, String, String), ServiceError> {
     use sov_modules_api::transaction::{VersionedTx, Version0};
     
     match &tx.versioned_tx {
@@ -1625,9 +1624,6 @@ fn extract_pre_authenticated_data(
                 &borsh::to_vec(&v0.details)
                     .map_err(|e| ServiceError::Internal(format!("Failed to serialize details: {}", e)))?
             );
-            
-            // Empty to avoid storing the 3MB proof - the lightweight version is stored in serialized_tx_base64
-            let runtime_call_hex = String::new();
             
             // OPTIMIZATION: Create a lightweight transaction WITHOUT the proof for pre-authenticated path
             // 
@@ -1713,7 +1709,13 @@ fn extract_pre_authenticated_data(
                 bytes_saved
             );
             
-            Ok((pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64))
+            Ok((
+                pub_key_hex,
+                signature_hex,
+                uniqueness_hex,
+                details_hex,
+                serialized_tx_base64,
+            ))
         }
     }
 }
@@ -1727,7 +1729,7 @@ pub async fn store_verified_midnight_transaction(
     proof_verified: Option<bool>,
     transaction_data: &str,
     full_transaction_blob: &str,
-    pre_auth_data: Option<(String, String, String, String, String, String)>,
+    pre_auth_data: Option<(String, String, String, String, String)>,
     encrypted_notes: Option<&Vec<EncryptedNote>>,
 ) -> Result<(), ServiceError> {
     use worker_verified_transactions::{
@@ -1735,14 +1737,18 @@ pub async fn store_verified_midnight_transaction(
         TransactionState,
     };
 
-    // Best-effort persistence of the full incoming worker tx blob (for auditing/debugging).
-    if let Err(err) = incoming_worker_tx_saver.save(tx_hash, full_transaction_blob).await {
-        warn!(
-            tx_hash,
-            ?err,
-            "Failed to persist full incoming worker transaction blob"
-        );
-    }
+    let full_transaction_location =
+        match incoming_worker_tx_saver.save(tx_hash, full_transaction_blob).await {
+            Ok(location) => location,
+            Err(err) => {
+                warn!(
+                    tx_hash,
+                    ?err,
+                    "Failed to persist full incoming worker transaction blob"
+                );
+                None
+            }
+        };
 
     // Serialize proof outputs to JSON (empty object if no proof)
     let proof_outputs_json = if let Some(proof) = proof_output {
@@ -1780,10 +1786,17 @@ pub async fn store_verified_midnight_transaction(
         .transpose()?;
 
     // Extract pre-authenticated data if available
-    let (pub_key_hex, signature_hex, uniqueness_hex, details_hex, runtime_call_hex, serialized_tx_base64) = match pre_auth_data {
-        Some((pk, sig, uq, det, rt, ser_tx)) => (Set(Some(pk)), Set(Some(sig)), Set(Some(uq)), Set(Some(det)), Set(Some(rt)), Set(Some(ser_tx))),
-        None => (Set(None), Set(None), Set(None), Set(None), Set(None), Set(None)),
-    };
+    let (pub_key_hex, signature_hex, uniqueness_hex, details_hex, serialized_tx_base64) =
+        match pre_auth_data {
+            Some((pk, sig, uq, det, ser_tx)) => (
+                Set(Some(pk)),
+                Set(Some(sig)),
+                Set(Some(uq)),
+                Set(Some(det)),
+                Set(Some(ser_tx)),
+            ),
+            None => (Set(None), Set(None), Set(None), Set(None), Set(None)),
+        };
     // Derive sender address (and withdraw recipient, if any) from the full transaction blob (base64-encoded borsh Transaction)
     let (sender_str, recipient_str) = (|| -> Result<(String, Option<String>), ServiceError> {
         let raw = BASE64_STANDARD
@@ -1819,8 +1832,8 @@ pub async fn store_verified_midnight_transaction(
         signature_hex,
         uniqueness_hex,
         details_hex,
-        runtime_call_hex,
         serialized_tx_base64,
+        full_transaction_location: Set(full_transaction_location),
         transaction_state: Set(TransactionState::Pending),
         sequencer_status: Set(None),
         sender: Set(sender_str),
@@ -1842,8 +1855,8 @@ pub async fn store_verified_midnight_transaction(
                 VerifiedColumn::SignatureHex,
                 VerifiedColumn::UniquenessHex,
                 VerifiedColumn::DetailsHex,
-                VerifiedColumn::RuntimeCallHex,
                 VerifiedColumn::SerializedTxBase64,
+                VerifiedColumn::FullTransactionLocation,
                 VerifiedColumn::TransactionState,
                 VerifiedColumn::SequencerStatus,
                 VerifiedColumn::Sender,
