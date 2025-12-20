@@ -1,0 +1,17 @@
+[package]
+name = "tee"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+
+[features]
+maa = []
+virtee = []
+
+[lints]
+workspace = true
