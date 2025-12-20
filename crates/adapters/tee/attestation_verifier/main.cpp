@@ -264,24 +264,11 @@ std::string to_hex(const std::uint8_t* p, std::size_t len)
 
 void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& policy)
 {
+    // The Midnight L2 state root and batch hash are not verified here,
+    // they will be verified in the Rust part directly.
+    // This function only verifies the attestation fields.
+
     nlohmann::json payload = raw;
-
-    // Get the hashes blobes from the client payload
-    std::string prev_state_root_b64 = payload["x-ms-runtime"]["client-payload"]["prev_state_root"].get<std::string>();
-    std::string post_state_root_b64 = payload["x-ms-runtime"]["client-payload"]["post_state_root"].get<std::string>();
-    std::string batch_hash = payload["x-ms-runtime"]["client-payload"]["batch_hash"].get<std::string>();
-    std::string message_queue_hash = payload["x-ms-runtime"]["client-payload"]["message_queue_hash"].get<std::string>();
-
-    // Decode base64 to binary
-    // jwt-cpp does not support decoding base64 to a vector of bytes directly,
-    // so we use our own base64_decode function.
-    // The decode has to be done twice too, due to MAA encoding the hash blobs in base64,
-    // while we already encoded them in base64 before sending them to MAA...
-    std::vector<std::uint8_t> hash_blob = base64_decode(jwt::base::decode<jwt::alphabet::base64>(hash_blob_b64));
-    std::vector<std::uint8_t> blob_exec = base64_decode(jwt::base::decode<jwt::alphabet::base64>(blob_exec_b64));
-
-    std::array<std::uint8_t, 32> sha_srs{}, sha_proof{}, sha_srs_utils{}, sha_srs_srv{};
-
     using pair = std::pair<const char*, const char*>;
     // Map of fields we want to check.
     // Made this way in order to be personalized easily.
@@ -295,12 +282,6 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
         {"microcode-svn",               "/x-ms-isolation-tee/x-ms-sevsnpvm-microcode-svn"},
         {"snpfw-svn",                   "/x-ms-isolation-tee/x-ms-sevsnpvm-snpfw-svn"},
         {"launch_measurement",          "/x-ms-isolation-tee/x-ms-sevsnpvm-launchmeasurement"},
-        {"prev_state_root",             ""},
-        {"post_state_root",             ""},
-        {"batch_hash",                  ""},
-        {"message_queue_hash",          ""},
-        {"batch_index",                 ""},
-        {"layer2_chain_id",             ""},
     };
 
     auto check_field = [&](const char* key, const std::string& expected, const std::string& actual) {
@@ -314,35 +295,21 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
     };
 
     for (auto [key, path] : map) {
-        if (key == "prev_state_root") {
-            check_field(key, policy[key].get<std::string>(), srs_hash);
-        } else if (key == "post_state_root") {
-            check_field(key, policy[key].get<std::string>(), proof_hash);
-        } else if (key == "batch_hash") {
-            check_field(key, policy[key].get<std::string>(), srs_utils_hash);
-        } else if (key == "message_queue_hash") {
-            check_field(key, policy[key].get<std::string>(), srs_srv_hash);
-        } else if (key == "batch_index") {
-            check_field(key, policy[key].get<std::string>(), srs_srv_hash);
-        } else if (key == "layer2_chain_id") {
-            check_field(key, policy[key].get<std::string>(), srs_srv_hash);
-        } else {
-            nlohmann::json::json_pointer ptr{std::string(path)};
-            if (!payload.contains(ptr))
-                throw std::runtime_error("attestation missing " + std::string(path));
-            if (payload[ptr] == policy[key])
-                printf("Policy check passed for %s: %s\n", key, payload[ptr].dump().c_str());
-            else
-                throw std::runtime_error("policy mismatch @ " + std::string(key) +
-                                        "\n  expected: " + policy[key].dump() +
-                                        "\n  got     : " + payload[ptr].dump());
-        }
+        nlohmann::json::json_pointer ptr{std::string(path)};
+        if (!payload.contains(ptr))
+            throw std::runtime_error("attestation missing " + std::string(path));
+        if (payload[ptr] == policy[key])
+            printf("Policy check passed for %s: %s\n", key, payload[ptr].dump().c_str());
+        else
+            throw std::runtime_error("policy mismatch @ " + std::string(key) +
+                                    "\n  expected: " + policy[key].dump() +
+                                    "\n  got     : " + payload[ptr].dump());
     }
     printf("Attestation compliant with the policy!\n");
 }
 
 void usage(char* programName) {
-    printf("Usage: %s -o <output_file> -h <hash_file> | -v <input_file> -p <policy_file>\n", programName);
+    printf("Usage: %s -o <output_file> | -v <input_file> -p <policy_file>\n", programName);
 }
 
 int main(int argc, char* argv[]) {
@@ -352,10 +319,10 @@ int main(int argc, char* argv[]) {
     std::string input_file;
     std::string hash_file;
     std::string policy_file;
-    bool validate_lifetime = false;
+    bool validate_lifetime = true;
 
     int opt;
-    while ((opt = getopt(argc, argv, ":o:v:a:h:t:p:")) != -1) {
+    while ((opt = getopt(argc, argv, ":o:v:a:p:")) != -1) {
         switch (opt) {
         case 'o':
             output_file.assign(optarg);
@@ -365,12 +332,6 @@ int main(int argc, char* argv[]) {
             break;
         case 'a':
             attestation_url.assign(optarg);
-            break;
-        case 'h':
-            hash_file.assign(optarg);
-            break;
-        case 't':
-            validate_lifetime = true;
             break;
         case 'p':
             policy_file.assign(optarg);
@@ -426,7 +387,26 @@ int main(int argc, char* argv[]) {
             // cryptographically binding the attestation to our data.
             attest::ClientParameters params = {};
             params.attestation_endpoint_url = (unsigned char*)attestation_url.c_str();
-            std::string payload = "{\"nonce\":\"" + nonce + "\"}";
+
+            // Midnight L2 specific client payload
+            // Hardcoded for now for testing purposes. In the future, this should be
+            // loaded from arguments and/or files.
+            std::array<unsigned char, 4> prev_state_root_placeholder = { 0xF0, 0xF0, 0xF0, 0xF0 };
+            std::array<unsigned char, 4> post_state_root_placeholder = { 0xFF, 0xFF, 0xFF, 0xFF };
+            std::string batch_hash_placeholder = "752f5b5baf20e4ea0946d712b62a634c7934a9730fffa8da480db954cc2d5ea2";
+            std::string message_queue_hash_placeholder = "640e8183f68721cee56551af77756816219a93fcee60d1246bab8b70ca3eddc2";
+            std::array<unsigned char, 1> batch_index_placeholder = { 0x02 };
+            std::string layer2_chain_id_placeholder =  "PLACEHOLDER_CHAIN_ID";
+
+            // Convert the client payloads, when necessary, to base64
+            // Unfortunately, MAA is going to encode those to base64 again,
+            // so we will have to decode them twice when verifying the attestation.
+            // This is not optimal, but it works for now.
+            std::string prev_state_root_b64 = base64_encode(prev_state_root_placeholder.data(), prev_state_root_placeholder.size());
+            std::string post_state_root_b64 = base64_encode(post_state_root_placeholder.data(), post_state_root_placeholder.size());
+            std::string batch_index_b64 = base64_encode(batch_index_placeholder.data(), batch_index_placeholder.size());
+
+            std::string payload = "{\"nonce\":\"" + nonce + "\",\"prev_state_root\":\"" + prev_state_root_b64 + "\",\"post_state_root\":\"" + post_state_root_b64 + "\",\"batch_index\":\"" + batch_index_b64 + "\",\"batch_hash\":\"" + batch_hash_placeholder + "\",\"message_queue_hash\":\"" + message_queue_hash_placeholder + "\",\"layer2_chain_id\":\"" + layer2_chain_id_placeholder + "\"}";
             params.client_payload = (unsigned char*) payload.c_str();
             params.version = CLIENT_PARAMS_VERSION; // Version 1
             unsigned char* jwt = nullptr;
