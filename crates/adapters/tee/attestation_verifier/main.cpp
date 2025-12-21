@@ -165,8 +165,8 @@ bool ValidateToken(const jwt::decoded_jwt<jwt::traits::nlohmann_json>& decoded, 
     auto header = decoded.get_header_json();
     std::string jku = header["jku"].get<std::string>();
     std::string kid = header["kid"].get<std::string>();
-    printf("Cert URL header: %s\n", jku.c_str());
-    printf("Key ID header: %s\n", kid.c_str());
+    fprintf(stderr, "Cert URL header: %s\n", jku.c_str());
+    fprintf(stderr, "Key ID header: %s\n", kid.c_str());
 
     // Calling JKU / Azure certs endpoint to key the keys
     nlohmann::json jwks_json = nlohmann::json::parse(http_get(jku));
@@ -177,7 +177,7 @@ bool ValidateToken(const jwt::decoded_jwt<jwt::traits::nlohmann_json>& decoded, 
         fprintf(stderr, "kid %s not present under %s\n", kid.c_str(), jku.c_str());
         return false;
     }
-    printf("Using platform leaf kid=%s for JWT verification\n", kid.c_str());
+    fprintf(stderr, "Using platform leaf kid=%s for JWT verification\n", kid.c_str());
     std::string pem = jwk_x5c_to_pem(*it);
 
     if (pem.empty()) {
@@ -201,11 +201,11 @@ bool ValidateToken(const jwt::decoded_jwt<jwt::traits::nlohmann_json>& decoded, 
     if (!validateLifetime) {
         // disable all time checks by giving 100 years skew
         verifier = verifier.expires_at_leeway(3153600000);
-        printf("Warning: Lifetime verification has been disabled\n");
+        fprintf(stderr, "Warning: Lifetime verification has been disabled\n");
     }
 
     try {
-        printf("Verifying the JWT...\n");
+        fprintf(stderr, "Verifying the JWT...\n");
         verifier.verify(decoded);
         return true;
     } catch (const std::exception& e) {
@@ -275,7 +275,6 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
     static const std::vector<pair> map = {
         {"attestation-type",            "/x-ms-isolation-tee/x-ms-attestation-type"},
         {"compliance-status",           "/x-ms-isolation-tee/x-ms-compliance-status"},
-        {"vm_id",                       "/x-ms-azurevm-vmid"},
         {"secureboot",                  "/secureboot"},
         {"kerneldebug-enabled",         "/x-ms-azurevm-kerneldebug-enabled"},
         {"imageId",                     "/x-ms-isolation-tee/x-ms-sevsnpvm-imageId"},
@@ -286,7 +285,7 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
 
     auto check_field = [&](const char* key, const std::string& expected, const std::string& actual) {
         if (expected == actual) {
-            printf("Policy check passed for %s: %s\n", key, actual.c_str());
+            fprintf(stderr, "Policy check passed for %s: %s\n", key, actual.c_str());
         } else {
             throw std::runtime_error("policy mismatch @ " + std::string(key) +
                                     "\n  expected: " + expected +
@@ -299,30 +298,31 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
         if (!payload.contains(ptr))
             throw std::runtime_error("attestation missing " + std::string(path));
         if (payload[ptr] == policy[key])
-            printf("Policy check passed for %s: %s\n", key, payload[ptr].dump().c_str());
+            fprintf(stderr, "Policy check passed for %s: %s\n", key, payload[ptr].dump().c_str());
         else
             throw std::runtime_error("policy mismatch @ " + std::string(key) +
                                     "\n  expected: " + policy[key].dump() +
                                     "\n  got     : " + payload[ptr].dump());
     }
-    printf("Attestation compliant with the policy!\n");
+    fprintf(stderr, "Attestation compliant with the policy!\n");
 }
 
 void usage(char* programName) {
-    printf("Usage: %s -o <output_file> | -v <input_file> -p <policy_file>\n", programName);
+    fprintf(stderr, "Usage: %s -o <output_file> -i <payload_input> | -v <input_file> -p <policy_file>\n", programName);
 }
 
 int main(int argc, char* argv[]) {
     std::string attestation_url;
     std::string nonce = "midnight-l2"; // Hardcoded nonce
-    std::string output_file;
+    std::string output_file = "";
     std::string input_file;
     std::string hash_file;
     std::string policy_file;
+    std::string midnight_payload;
     bool validate_lifetime = true;
 
     int opt;
-    while ((opt = getopt(argc, argv, ":o:v:a:p:")) != -1) {
+    while ((opt = getopt(argc, argv, ":o:v:a:p:i:")) != -1) {
         switch (opt) {
         case 'o':
             output_file.assign(optarg);
@@ -335,6 +335,9 @@ int main(int argc, char* argv[]) {
             break;
         case 'p':
             policy_file.assign(optarg);
+            break;
+        case 'i':
+            midnight_payload.assign(optarg);
             break;
         case ':':
             fprintf(stderr, "Option needs a value\n");
@@ -351,26 +354,21 @@ int main(int argc, char* argv[]) {
             attestation_url.assign(default_attestation_url);
         }
 
-        if (!output_file.empty() && !input_file.empty()) {
+        if ((!output_file.empty() && !input_file.empty()) || (!midnight_payload.empty() && !input_file.empty())) {
             fprintf(stderr, "Error: You cannot get and verify an attestation at the same time\n");
             return (1);
-        }
-
-        if (output_file.empty() && input_file.empty()) {
-            // if no output file is specified, use the default output file
-            output_file = "attestation.txt";
         }
 
         if (policy_file.empty()) {
             policy_file = "policy.json";
         }
 
-        if (!output_file.empty() && hash_file.empty()) {
-            fprintf(stderr, "Error: You must specify a hash file when generating an attestation\n");
-            exit(1);
+        if (midnight_payload.empty() && input_file.empty()) {
+            fprintf(stderr, "Error: You must specify a payload to get an attestation.\n");
+            return (1);
         }
 
-        if (!output_file.empty()) {
+        if (input_file.empty() && !midnight_payload.empty()) {
             AttestationClient* attestation_client = nullptr;
             Logger* log_handle = new Logger();
 
@@ -388,25 +386,7 @@ int main(int argc, char* argv[]) {
             attest::ClientParameters params = {};
             params.attestation_endpoint_url = (unsigned char*)attestation_url.c_str();
 
-            // Midnight L2 specific client payload
-            // Hardcoded for now for testing purposes. In the future, this should be
-            // loaded from arguments and/or files.
-            std::array<unsigned char, 4> prev_state_root_placeholder = { 0xF0, 0xF0, 0xF0, 0xF0 };
-            std::array<unsigned char, 4> post_state_root_placeholder = { 0xFF, 0xFF, 0xFF, 0xFF };
-            std::string batch_hash_placeholder = "752f5b5baf20e4ea0946d712b62a634c7934a9730fffa8da480db954cc2d5ea2";
-            std::string message_queue_hash_placeholder = "640e8183f68721cee56551af77756816219a93fcee60d1246bab8b70ca3eddc2";
-            std::array<unsigned char, 1> batch_index_placeholder = { 0x02 };
-            std::string layer2_chain_id_placeholder =  "PLACEHOLDER_CHAIN_ID";
-
-            // Convert the client payloads, when necessary, to base64
-            // Unfortunately, MAA is going to encode those to base64 again,
-            // so we will have to decode them twice when verifying the attestation.
-            // This is not optimal, but it works for now.
-            std::string prev_state_root_b64 = base64_encode(prev_state_root_placeholder.data(), prev_state_root_placeholder.size());
-            std::string post_state_root_b64 = base64_encode(post_state_root_placeholder.data(), post_state_root_placeholder.size());
-            std::string batch_index_b64 = base64_encode(batch_index_placeholder.data(), batch_index_placeholder.size());
-
-            std::string payload = "{\"nonce\":\"" + nonce + "\",\"prev_state_root\":\"" + prev_state_root_b64 + "\",\"post_state_root\":\"" + post_state_root_b64 + "\",\"batch_index\":\"" + batch_index_b64 + "\",\"batch_hash\":\"" + batch_hash_placeholder + "\",\"message_queue_hash\":\"" + message_queue_hash_placeholder + "\",\"layer2_chain_id\":\"" + layer2_chain_id_placeholder + "\"}";
+            std::string payload = "{\"nonce\":\"" + nonce + "\",\"midnight_payload\":\"" + midnight_payload + "\"}";
             params.client_payload = (unsigned char*) payload.c_str();
             params.version = CLIENT_PARAMS_VERSION; // Version 1
             unsigned char* jwt = nullptr;
@@ -425,19 +405,19 @@ int main(int argc, char* argv[]) {
         
             if (attestation_success) {
                 jwt_str = reinterpret_cast<char*>(jwt);
-                printf("Attestation generated. JWT token: %s\n\n", jwt_str.c_str());
+                fprintf(stderr, "Attestation generated. JWT token: %s\n\n", jwt_str.c_str());
                 attestation_client->Free(jwt);
                 
                 jwt::decoded_jwt<jwt::traits::nlohmann_json> decoded = jwt::decode(jwt_str);
                 jwt::traits::nlohmann_json::object_type payload = decoded.get_payload_json();
 
                 try {
-                    printf("Decoded JWT payload:\n");
+                    fprintf(stderr, "Decoded JWT payload:\n");
                     for (const auto& [key, value] : payload) {
-                        printf("  %s: %s\n", key.c_str(), value.dump().c_str());
+                        fprintf(stderr, "  %s: %s\n", key.c_str(), value.dump().c_str());
                     }
-                    printf("\n");
-                    printf("Now verifying if the attestation is from a compliant AMD-SEV-SNP CVM.\n");
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "Now verifying if the attestation is from a compliant AMD-SEV-SNP CVM.\n");
                     // Initial check to see if we truly are in a AMD-SEV-SNP
                     // environment. This check is mandatory as MAA works with multiple
                     // attestation system, such as SGX, TDX.
@@ -449,17 +429,21 @@ int main(int argc, char* argv[]) {
                         boost::iequals(compliance_status, "azure-compliant-cvm"))
                     {
                         is_cvm = true;
-                        printf("The running VM is a compliant AMD-SEV-SNP CVM.\n");
+                        fprintf(stderr, "The running VM is a compliant AMD-SEV-SNP CVM.\n");
                     }
                 }
                 catch (...) { }
             }
 
             if (is_cvm) {
-                std::ofstream attestation_file(output_file);
-                attestation_file << jwt_str;
-                attestation_file.close();
-                printf("JWT token written to %s\n", output_file.c_str());
+                // if no output file is specified, the attestation will only be printed on stdout.
+                if (!output_file.empty()) {
+                    fprintf(stderr, "Exporting attestation to %s\n", output_file.c_str());
+                    std::ofstream attestation_file(output_file);
+                    attestation_file << jwt_str;
+                    attestation_file.close();
+                }
+                printf("%s", jwt_str.c_str());
             }
             else {
                 fprintf(stderr, "Error: The running VM does not seems to be a compliant AMD-SEV-SNP CVM. The attestation cannot be safely performed\n");
@@ -469,19 +453,22 @@ int main(int argc, char* argv[]) {
             Uninitialize();
         }
         else if (!input_file.empty()) {
-            // Verify the attestation
-            std::ifstream attestation_file(input_file);
-            if (!attestation_file) {
-                fprintf(stderr, "Error: Could not open attestation file %s\n", input_file.c_str());
-                exit(1);
+            std::string jwt_str = "";
+            if (input_file.substr(input_file.length() - 4) == ".txt") {
+                std::ifstream jwt_file(input_file, std::ios::binary);
+                if (!jwt_file) {
+                    fprintf(stderr, "Error: Could not open JWT file %s\n", input_file.c_str());
+                    return (1);
+                }
+                std::stringstream buffer;
+                buffer << jwt_file.rdbuf();
+                jwt_str = buffer.str();
+                fprintf(stderr, "JWT token read from %s\n", input_file.c_str());
             }
-
-            std::string jwt_str((std::istreambuf_iterator<char>(attestation_file)),
-                                 std::istreambuf_iterator<char>());
-            attestation_file.close();
-
-            printf("JWT token read from %s\n", input_file.c_str());
-            printf("Verifying JWT token: %s\n", jwt_str.c_str());
+            else {
+                jwt_str = input_file;
+            }
+            fprintf(stderr, "Verifying JWT token: %s\n", jwt_str.c_str());
 
             jwt::decoded_jwt<jwt::traits::nlohmann_json> decoded = jwt::decode(jwt_str);
 
@@ -490,7 +477,7 @@ int main(int argc, char* argv[]) {
             // but it can be activated if you want to check the token lifetime with -t.
             bool is_valid = ValidateToken(decoded, attestation_url, validate_lifetime);
             if (is_valid) {
-                printf("JWT token is valid.\n");
+                fprintf(stderr, "JWT token is valid.\n");
             } else {
                 fprintf(stderr, "Error: JWT token is invalid.\n");
                 exit(1);
@@ -503,25 +490,33 @@ int main(int argc, char* argv[]) {
             // The rest of this CLI will only parse the x-ms-isolation-tee field.
 
             jwt::traits::nlohmann_json::object_type payload = decoded.get_payload_json();
-            std::ifstream policy(policy_file);
-            if (!policy) {
-                fprintf(stderr, "Error: Could not open policy file %s\n", policy_file.c_str());
-                fprintf(stderr, "The attestation cannot be validated fully without a policy file.");
-                exit(1);
+            std::string policy_str = "";
+            if (policy_file.substr(policy_file.length() - 5) == ".json") {
+                std::ifstream policy(policy_file);
+                if (!policy) {
+                    fprintf(stderr, "Error: Could not open policy file %s\n", policy_file.c_str());
+                    fprintf(stderr, "The attestation cannot be validated fully without a policy file.");
+                    exit(1);
+                }
+                std::stringstream buffer;
+                buffer << policy.rdbuf();
+                policy_str = buffer.str();
+                fprintf(stderr, "Policy file read from %s\n", policy_file.c_str());
+                policy.close();
             }
-            std::string policy_str((std::istreambuf_iterator<char>(policy)),
-                                std::istreambuf_iterator<char>());
-            policy.close();
+            else {
+                policy_str = policy_file;
+            }
             // Validate the policy. 
             // Not a lot of field are verified at the moment, but this can always be changed.
             nlohmann::json policy_json = nlohmann::json::parse(policy_str);
             check_policy(payload, policy_json);
-            printf("Policy check passed.\n");
+            fprintf(stderr, "Policy check passed.\n");
             printf("Attestation verified successfully.\n");
         }
     }
     catch (std::exception& e) {
-        fprintf(stderr, "Error: Exception occured. Details - %s\n", e.what());
+        fprintf(stderr, "Error: Exception occured. Details: %s\n", e.what());
         return (1);
     }
     return (0);
