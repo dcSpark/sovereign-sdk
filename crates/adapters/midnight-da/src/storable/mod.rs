@@ -3,10 +3,14 @@
 //!
 
 mod entity;
+mod incoming_worker_txs;
 pub mod layer;
 pub mod service;
+mod shared_db;
 
 pub use entity::{setup_db, worker_verified_transactions};
+pub use incoming_worker_txs::IncomingWorkerTxSaver;
+pub use shared_db::{set_shared_db_connection_string, shared_db_connection_string};
 
 #[cfg(test)]
 mod tests {
@@ -24,7 +28,7 @@ mod tests {
 
     use crate::storable::layer::StorableMidnightDaLayer;
     use crate::storable::service::StorableMidnightDaService;
-    use crate::{BlockProducingConfig, MidnightAddress, MidnightDaConfig};
+    use crate::{BlockProducingConfig, IncomingWorkerTxSaveMode, MidnightAddress, MidnightDaConfig};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn manually_triggered_blocks_are_fetched_after_await() -> anyhow::Result<()> {
@@ -37,6 +41,9 @@ mod tests {
             block_producing: BlockProducingConfig::Manual,
             da_layer: None,
             randomization: None,
+            save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
+            worker_tx_path: None,
+            worker_tx_bucket: None,
         };
         let blocks = 5;
         let start = Time::now();

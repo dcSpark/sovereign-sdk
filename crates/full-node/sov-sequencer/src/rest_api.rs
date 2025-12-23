@@ -1,6 +1,5 @@
 //! Utilities and definitions for the sequencer's REST APIs.
 
-use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use sea_orm::{
 };
 use serde_with::base64::Base64;
 use serde_with::serde_as;
-use sov_midnight_da::storable::worker_verified_transactions;
+use sov_midnight_da::storable::{shared_db_connection_string, worker_verified_transactions};
 use sov_modules_api::capabilities::TransactionAuthenticator;
 use sov_modules_api::runtime::Runtime;
 use sov_modules_api::{RawTx, RuntimeEventProcessor, RuntimeEventResponse};
@@ -47,10 +46,14 @@ static WORKER_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
 async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::Response> {
     use std::time::Duration;
 
+    const MISSING_SHARED_DB_CONN: &str =
+        "Shared Midnight DA DB connection string is not configured";
+
     let res: Result<&'static DatabaseConnection, String> = WORKER_DB
         .get_or_try_init(|| async {
-            let connection_string = env::var("SOV_WORKER_TX_DB_CONNECTION_STRING")
-                .map_err(|_| "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set".to_string())?;
+            let connection_string = shared_db_connection_string()
+                .ok_or_else(|| MISSING_SHARED_DB_CONN.to_string())?
+                .to_string();
 
             if connection_string.starts_with("sqlite:") {
                 use sea_orm::sqlx::sqlite::{
@@ -104,10 +107,8 @@ async fn get_worker_db() -> Result<&'static DatabaseConnection, axum::response::
         .await;
 
     res.map_err(|msg| {
-        if msg.contains("env var is not set") {
-            errors::internal_server_error_response_500(
-                "SOV_WORKER_TX_DB_CONNECTION_STRING env var is not set",
-            )
+        if msg == MISSING_SHARED_DB_CONN {
+            errors::internal_server_error_response_500(MISSING_SHARED_DB_CONN)
         } else {
             errors::database_error_response_500(anyhow::anyhow!(msg))
         }

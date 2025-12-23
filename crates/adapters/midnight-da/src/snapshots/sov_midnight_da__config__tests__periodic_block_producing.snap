@@ -1,5 +1,6 @@
 ---
-source: crates/adapters/mock-da/src/config.rs
+source: crates/adapters/midnight-da/src/config.rs
+assertion_line: 338
 expression: config
 ---
 {
@@ -11,5 +12,8 @@ expression: config
       "block_time_ms": 1000
     }
   },
-  "randomization": null
+  "randomization": null,
+  "save_incoming_worker_txs": "none",
+  "worker_tx_path": null,
+  "worker_tx_bucket": null
 }

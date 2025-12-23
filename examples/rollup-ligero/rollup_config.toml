@@ -10,6 +10,18 @@ connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 # It is going to be a DA address that blobs from this node will be associated with.
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
 finalization = 40
+
+# Where to persist full incoming worker transactions (for auditing/debugging).
+# Options: "none" | "disk" | "gcs"
+save_incoming_worker_txs = "disk"
+
+# If `save_incoming_worker_txs = "disk"`, writes `<tx_hash>.json` into this directory.
+# Relative paths are resolved relative to this rollup_config.toml location.
+worker_tx_path = "demo_data/midnight_tx_json"
+
+# If `save_incoming_worker_txs = "gcs"`, uploads `<tx_hash>.json` to this bucket.
+# worker_tx_bucket = "my-gcs-bucket"
+
 [da.block_producing.periodic]
 block_time_ms = 1_000
 # Disable reorg for now, for better stability
