@@ -95,8 +95,8 @@ RUST_LOG=debug
 # INDEXER_URL=http://127.0.0.1:13100
 
 # LIGERO_PROGRAM_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/guest/bins/programs/note_spend_guest.wasm
-# LIGERO_PROVER_BINARY_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/macos/bin/webgpu_prover
-# LIGERO_SHADER_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/macos/shader
+# LIGERO_PROVER_BINARY_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/macos-arm64/bin/webgpu_prover
+# LIGERO_SHADER_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/shader
 
 # This key belongs to a wallet that already exists in the L2 and has enough funds
 # WALLET_PRIVATE_KEY=75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd

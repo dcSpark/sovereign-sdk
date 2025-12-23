@@ -8,7 +8,7 @@ use crate::ligero::Ligero;
 #[allow(dead_code)]
 pub fn get_platform_bin_dir() -> &'static str {
     if cfg!(target_os = "macos") {
-        "macos"
+        "macos-arm64"
     } else if cfg!(target_os = "linux") {
         "linux-amd64"
     } else {
@@ -42,7 +42,7 @@ pub fn create_test_ligero() -> Ligero {
         ),
         Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("../adapters/ligero/bins/{}/shader", platform_dir))
+                .join("../adapters/ligero/bins/shader")
                 .canonicalize()
                 .expect("Failed to find shader directory"),
         ),

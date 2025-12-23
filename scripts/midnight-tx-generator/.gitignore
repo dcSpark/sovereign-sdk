@@ -3,3 +3,4 @@ target/
 *.json
 proof_data.gz
 !Cargo.json
+.last_nonce

@@ -364,7 +364,7 @@ curl http://localhost:12346/state/midnight_privacy/current_root
 
 **Solutions:**
 1. Run outside any sandbox that restricts GPU access
-2. Check that shader files exist: `crates/adapters/ligero/bins/*/shader/`
+2. Check that shader files exist: `crates/adapters/ligero/bins/shader/`
 3. Verify prover binary: `crates/adapters/ligero/bins/*/bin/webgpu_prover`
 
 ## Environment Requirements

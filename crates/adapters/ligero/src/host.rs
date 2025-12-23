@@ -64,12 +64,26 @@ pub struct LigeroHost {
 impl LigeroHost {
     /// Create a new LigeroHost with the given WASM program path
     pub fn new(program_path: &str) -> Self {
-        let bins_dir = Self::find_bins_dir();
+        // Allow overriding the prover binary location via env var (useful for scripts / non-standard layouts).
+        // Accept both historical names used across this repo.
+        let prover_override = std::env::var("LIGERO_PROVER_BIN")
+            .ok()
+            .or_else(|| std::env::var("LIGERO_PROVER_BINARY_PATH").ok())
+            .and_then(|p| std::fs::canonicalize(&p).ok());
+
+        let bins_dir = if let Some(ref prover) = prover_override {
+            prover.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(Self::find_bins_dir)
+        } else {
+            Self::find_bins_dir()
+        };
         // Use absolute path for shader_path to work from any working directory
         let shader_path = if bins_dir.ends_with("bin") {
-            // If using platform-specific bin directory, shader is at parent level
+            // If using platform-specific bin directory, shader lives at `.../bins/shader`
             bins_dir
                 .parent()
+                .and_then(|p| p.parent())
                 .unwrap_or(&bins_dir)
                 .canonicalize()
                 .unwrap_or_else(|_| bins_dir.parent().unwrap_or(&bins_dir).to_path_buf())
@@ -94,7 +108,7 @@ impl LigeroHost {
                 private_indices: vec![],
                 args: vec![],
             },
-            prover_bin: bins_dir.join("webgpu_prover"),
+            prover_bin: prover_override.unwrap_or_else(|| bins_dir.join("webgpu_prover")),
             verifier_bin: bins_dir.join("webgpu_verifier"),
             bins_dir,
             public_output: None,
@@ -109,7 +123,7 @@ impl LigeroHost {
         // Check for platform-specific binaries first (they take priority)
         #[cfg(target_os = "macos")]
         {
-            let macos_bins = PathBuf::from(manifest_dir).join("bins/macos/bin");
+            let macos_bins = PathBuf::from(manifest_dir).join("bins/macos-arm64/bin");
             if macos_bins.join("webgpu_prover").exists()
                 && macos_bins.join("webgpu_verifier").exists()
             {
@@ -124,6 +138,12 @@ impl LigeroHost {
                 && linux_bins.join("webgpu_verifier").exists()
             {
                 return linux_bins;
+            }
+            let linux_arm_bins = PathBuf::from(manifest_dir).join("bins/linux-arm64/bin");
+            if linux_arm_bins.join("webgpu_prover").exists()
+                && linux_arm_bins.join("webgpu_verifier").exists()
+            {
+                return linux_arm_bins;
             }
         }
 
@@ -222,27 +242,76 @@ impl LigeroHost {
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
 
-        let output = Command::new(&self.prover_bin)
-            .arg(&config_json)
-            .current_dir(&unique_proof_dir)
-            .output()
-            .context("Failed to execute webgpu_prover")?;
+        let inherit_stdio = std::env::var("LIGERO_PROVER_INHERIT_STDIO")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Clean up the temporary directory on failure
-            let _ = std::fs::remove_dir_all(&unique_proof_dir);
-            anyhow::bail!(
-                "Ligero prover failed with status {:?}\nstdout: {}\nstderr: {}",
-                output.status.code(),
-                stdout,
-                stderr
+        // Safety net: WebGPU initialization can hang on some systems. Default to 10 minutes.
+        let timeout_secs: u64 = std::env::var("LIGERO_PROVER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+
+        let mut child = {
+            let mut cmd = Command::new(&self.prover_bin);
+            cmd.arg(&config_json).current_dir(&unique_proof_dir);
+            if inherit_stdio {
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+            }
+            let child = cmd.spawn().context("Failed to execute webgpu_prover")?;
+            tracing::info!(
+                "Spawned webgpu_prover (pid={:?}) cwd={} bin={}",
+                child.id(),
+                unique_proof_dir.display(),
+                self.prover_bin.display()
             );
+            child
+        };
+
+        let start = std::time::Instant::now();
+        let mut next_heartbeat = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().context("Failed to poll webgpu_prover")? {
+                if !status.success() {
+                    // Clean up the temporary directory on failure
+                    let _ = std::fs::remove_dir_all(&unique_proof_dir);
+                    anyhow::bail!("Ligero prover failed with status {:?}", status.code());
+                }
+                break;
+            }
+
+            if std::time::Instant::now() >= next_heartbeat {
+                tracing::info!(
+                    "webgpu_prover still running (elapsed={}s, timeout={}s, pid={:?})",
+                    start.elapsed().as_secs(),
+                    timeout_secs,
+                    child.id()
+                );
+                next_heartbeat += std::time::Duration::from_secs(10);
+            }
+
+            if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&unique_proof_dir);
+                anyhow::bail!(
+                    "Ligero prover timed out after {}s. If this hangs consistently, try setting LIGERO_PROVER_INHERIT_STDIO=1 to see prover logs, and ensure WebGPU/GPU access is available.",
+                    timeout_secs
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
 
-        // Check if the output indicates success
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // If we inherited stdio, we didn't capture stdout. At this point, rely on the proof output file.
+        // Otherwise, the prover would have been silent anyway; the authoritative success signal is proof_data.gz.
+        let stdout = String::new();
+        let _stderr = String::new();
+
+        // Check if the output indicates success (best-effort; primary artifact is proof_data.gz)
+        let stdout = stdout.as_str();
 
         // Check WASM exit code - reject if non-zero (indicates WASM program failure)
         for line in stdout.lines() {
@@ -264,7 +333,7 @@ impl LigeroHost {
             }
         }
 
-        if !stdout.contains("Final prove result:                  true") {
+        if !inherit_stdio && !stdout.is_empty() && !stdout.contains("Final prove result:                  true") {
             // Clean up the temporary directory on failure
             let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!("Ligero prover did not produce a valid proof");

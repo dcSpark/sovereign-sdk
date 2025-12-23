@@ -21,14 +21,20 @@ pub fn setup_ligero_env() -> Result<LigeroEnv> {
         .ok_or_else(|| anyhow!("Could not find repository root"))?;
     let ligero_dir = repo_root.join("crates/adapters/ligero");
     let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
+        "macos-arm64"
     } else if cfg!(target_os = "linux") {
-        "linux-amd64"
+        // Prefer amd64 by default, but allow running on arm64 linux hosts too.
+        // (Users can still override via env vars if needed.)
+        if cfg!(target_arch = "aarch64") {
+            "linux-arm64"
+        } else {
+            "linux-amd64"
+        }
     } else {
         anyhow::bail!("Unsupported platform");
     };
     let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+    let shader_dir = ligero_dir.join("bins").join("shader");
     let program_path = ligero_dir.join("guest/bins/programs/note_spend_guest.wasm");
     let prover_bin = bin_dir.join("webgpu_prover");
     let verifier_bin = bin_dir.join("webgpu_verifier");

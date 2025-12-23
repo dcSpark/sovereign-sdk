@@ -5,8 +5,8 @@ use std::{env, path::PathBuf};
 use mcp::ligero::{Ligero, LigeroProgramArguments};
 
 const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";
-const DEFAULT_PROVER_REL: &str = "../adapters/ligero/bins/macos/bin/webgpu_prover";
-const DEFAULT_SHADER_REL: &str = "../adapters/ligero/bins/macos/shader";
+const DEFAULT_PROVER_REL: &str = "../adapters/ligero/bins/macos-arm64/bin/webgpu_prover";
+const DEFAULT_SHADER_REL: &str = "../adapters/ligero/bins/shader";
 
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
