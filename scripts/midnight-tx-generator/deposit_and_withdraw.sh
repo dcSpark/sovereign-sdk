@@ -173,8 +173,7 @@ NOTE_DETAILS_FILE="$GENERATOR_DIR/midnight_note_details.json"
 NOTE_DOMAIN=$(cat "$NOTE_DETAILS_FILE" | jq -r '.domain')
 NOTE_VALUE=$(cat "$NOTE_DETAILS_FILE" | jq -r '.amount')
 NOTE_RHO=$(cat "$NOTE_DETAILS_FILE" | jq -r '.rho')
-NOTE_RECIPIENT=$(cat "$NOTE_DETAILS_FILE" | jq -r '.recipient')
-NOTE_NF_KEY=$(cat "$NOTE_DETAILS_FILE" | jq -r '.nf_key')
+NOTE_SPEND_SK=$(cat "$NOTE_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Build the withdrawal generator if needed and run it
 cd "$GENERATOR_DIR"
@@ -190,8 +189,7 @@ export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
 export OUT1_DOMAIN="$NOTE_DOMAIN"
 export OUT1_VALUE="$NOTE_VALUE"
 export OUT1_RHO="$NOTE_RHO"
-export OUT1_RECIPIENT="$NOTE_RECIPIENT"
-export OUT1_NF_KEY="$NOTE_NF_KEY"
+export OUT1_SPEND_SK="$NOTE_SPEND_SK"
 export OUT1_POSITION="$NOTE_POSITION"
 export TRANSFER_ROOT="$ANCHOR_ROOT"
 export NONCE=$WITHDRAW_NONCE

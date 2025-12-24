@@ -36,8 +36,7 @@ fn sample_midnight_withdraw_transaction(
     let to = MultiAddressEvm::Vm(
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
     );
-    let proof: SafeVec<u8, 5_000_000> =
-        SafeVec::try_from(vec![9u8; 16]).expect("within SafeVec capacity");
+    let proof = SafeVec::try_from(vec![9u8; 16]).expect("within SafeVec capacity");
 
     let call = MidnightCallMessage::<RollupSpec>::Withdraw {
         proof,
@@ -336,9 +335,8 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
     );
     
-    // Use a small dummy proof (real proof would be ~3.2MB from Ligero)
-    let dummy_proof: SafeVec<u8, 5_000_000> =
-        SafeVec::try_from(vec![0u8; 32]).expect("within SafeVec capacity");
+    // Use a small dummy proof (real proof is ~8MB from Ligero)
+    let dummy_proof = SafeVec::try_from(vec![0u8; 32]).expect("within SafeVec capacity");
 
     let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
     

@@ -203,15 +203,22 @@ impl LigeroTestConfig {
 
         // Detect OS and choose correct binary path
         let platform_dir = if cfg!(target_os = "macos") {
-            "macos"
+            // Binaries are staged under `bins/macos-arm64` (Apple Silicon).
+            // Keep the string-based layout to match the on-disk structure.
+            "macos-arm64"
         } else if cfg!(target_os = "linux") {
-            "linux-amd64"
+            if cfg!(target_arch = "aarch64") {
+                "linux-arm64"
+            } else {
+                "linux-amd64"
+            }
         } else {
             bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
         };
 
         let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-        let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+        // Shaders are shared across platforms: `crates/adapters/ligero/bins/shader`.
+        let shader_dir = ligero_dir.join("bins").join("shader");
 
         let config = Self {
             program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
@@ -226,29 +233,30 @@ impl LigeroTestConfig {
 
     /// Apply this configuration to the environment
     fn apply(&self) -> Result<()> {
-        // Only set environment variables if they're not already set
-        // This allows manual overrides
-        if std::env::var("LIGERO_PROGRAM_PATH").is_err() {
-            std::env::set_var("LIGERO_PROGRAM_PATH", &self.program_path);
-            println!("Set LIGERO_PROGRAM_PATH={}", self.program_path.display());
+        // Only set environment variables if they're not already set, or if they
+        // point to paths that don't exist (common when the on-disk layout changes).
+        // This preserves manual overrides while keeping CI/dev setups resilient.
+        fn set_path_if_missing_or_invalid(var: &str, desired: &PathBuf) {
+            let should_set = match std::env::var(var) {
+                Ok(existing) => !PathBuf::from(existing).exists(),
+                Err(_) => true,
+            };
+            if should_set {
+                std::env::set_var(var, desired);
+                println!("Set {}={}", var, desired.display());
+            }
         }
 
-        if std::env::var("LIGERO_PROVER_BIN").is_err() {
-            std::env::set_var("LIGERO_PROVER_BIN", &self.prover_bin);
-            println!("Set LIGERO_PROVER_BIN={}", self.prover_bin.display());
-        }
+        set_path_if_missing_or_invalid("LIGERO_PROGRAM_PATH", &self.program_path);
+        set_path_if_missing_or_invalid("LIGERO_PROVER_BIN", &self.prover_bin);
+        set_path_if_missing_or_invalid("LIGERO_VERIFIER_BIN", &self.verifier_bin);
+        set_path_if_missing_or_invalid("LIGERO_SHADER_PATH", &self.shader_path);
 
-        if std::env::var("LIGERO_VERIFIER_BIN").is_err() {
-            std::env::set_var("LIGERO_VERIFIER_BIN", &self.verifier_bin);
-            println!("Set LIGERO_VERIFIER_BIN={}", self.verifier_bin.display());
-        }
-
-        if std::env::var("LIGERO_SHADER_PATH").is_err() {
-            std::env::set_var("LIGERO_SHADER_PATH", &self.shader_path);
-            println!("Set LIGERO_SHADER_PATH={}", self.shader_path.display());
-        }
-
-        if std::env::var("LIGERO_PACKING").is_err() {
+        let should_set_packing = match std::env::var("LIGERO_PACKING") {
+            Ok(existing) => existing.parse::<u32>().is_err(),
+            Err(_) => true,
+        };
+        if should_set_packing {
             std::env::set_var("LIGERO_PACKING", self.packing.to_string());
             println!("Set LIGERO_PACKING={}", self.packing);
         }
@@ -880,15 +888,19 @@ fn get_platform_bin_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
 
     // Detect OS and choose correct binary path
     let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
+        "macos-arm64"
     } else if cfg!(target_os = "linux") {
-        "linux-amd64"
+        if cfg!(target_arch = "aarch64") {
+            "linux-arm64"
+        } else {
+            "linux-amd64"
+        }
     } else {
         bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
     };
 
     let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+    let shader_dir = ligero_dir.join("bins").join("shader");
 
     Ok((
         bin_dir.join("webgpu_prover"),
@@ -964,8 +976,11 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     let domain: Hash32 = [1u8; 32];
     let value: u128 = 42;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET - never revealed
+    let spend_sk: Hash32 = [4u8; 32]; // SECRET - never revealed
+
+    // Recipient + nf_key are derived from spend_sk (matches the guest program).
+    let recipient = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let pos: u64 = 0;
@@ -998,41 +1013,76 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 3) Build JSON config for REAL prover ----
     println!("\nStep 3: Building prover configuration...");
 
-    // Guest program arguments (using string format for Ligero interface)
-    // Argument order must match what the guest program expects:
-    // 1. domain (public)
-    // 2. commitment (public - derived from private note data)
-    // 3. nf_key (PRIVATE - SECRET nullifier key)
-    // 4. position (PRIVATE - CRITICAL for privacy, reveals which leaf)
-    // 5. tree_depth (public)
-    // 6..6+depth-1: siblings (PRIVATE - Merkle authentication path)
-    // 6+depth: anchor (public)
-    // 7+depth: nullifier (public)
+    // Guest argument layout must match `note_spend_guest`:
+    //   1  domain (hex, 32 bytes)
+    //   2  value (i64)
+    //   3  rho (hex, 32 bytes) [PRIVATE]
+    //   4  recipient (hex, 32 bytes) [PRIVATE] (layout only; derived in-circuit)
+    //   5  spend_sk (hex, 32 bytes) [PRIVATE]
+    //   6  depth (i64)
+    //   7..7+depth-1        pos_bits (hex, 32 bytes each) [PRIVATE]
+    //   7+depth..7+2*depth-1 siblings (hex, 32 bytes each) [PRIVATE]
+    //   7+2*depth           anchor (str, field element)
+    //   8+2*depth           nullifier (str, field element)
+    //   9+2*depth           withdraw_amount (i64)
+    //   10+2*depth          n_out (i64)
+    //   outputs (4*n_out): value_out (i64), rho_out (hex), pk_out (hex), cm_out (hex)
+
+    // One-output transfer: withdraw=0, out_value=value.
+    let withdraw_amount: u64 = 0;
+    let n_out: u64 = 1;
+    let out_value: u64 = value as u64;
+    let out_rho: Hash32 = [7u8; 32];
+    let out_spend_sk: Hash32 = [8u8; 32];
+    let out_pk = pk_from_sk(&out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk);
+    let cm_out = note_commitment(&domain, value, &out_rho, &out_recipient);
 
     let mut args: Vec<serde_json::Value> = Vec::new();
-    args.push(json!({"str": hex32(&domain)})); // 1: PUBLIC
-    args.push(json!({"str": hex32(&cm)})); // 2: PUBLIC (but derived from private data)
-    args.push(json!({"str": hex32(&nf_key)})); // 3: PRIVATE
-    args.push(json!({"str": pos.to_string()})); // 4: PRIVATE
-    args.push(json!({"str": TREE_DEPTH.to_string()})); // 5: PUBLIC
+    args.push(json!({"hex": hex32(&domain)})); // 1
+    args.push(json!({"i64": value as i64})); // 2 (public)
+    args.push(json!({"hex": hex32(&rho)})); // 3 (private)
+    args.push(json!({"hex": hex32(&recipient)})); // 4 (private, layout only)
+    args.push(json!({"hex": hex32(&spend_sk)})); // 5 (private)
+    args.push(json!({"i64": TREE_DEPTH as i64})); // 6 (public)
 
-    // Add all siblings (PRIVATE)
+    // Position bits (LSB-first, one bit per level).
+    for lvl in 0..(TREE_DEPTH as usize) {
+        let bit = ((pos >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        args.push(json!({"hex": hex::encode(bit_bytes)})); // 7..7+depth-1 (private)
+    }
+
+    // Siblings (private).
     for s in &siblings {
-        args.push(json!({"str": hex32(s)})); // 6..6+depth-1: PRIVATE
+        args.push(json!({"hex": hex32(s)}));
     }
 
-    args.push(json!({"str": hex32(&anchor)})); // 6+depth: PUBLIC
-    args.push(json!({"str": hex32(&nf)})); // 7+depth: PUBLIC
+    // Anchor + nullifier are PUBLIC field elements (string args).
+    args.push(json!({"str": format!("0x{}", hex32(&anchor))}));
+    args.push(json!({"str": format!("0x{}", hex32(&nf))}));
 
-    // Mark private indices (1-based indexing)
-    let first_sibling_idx = 6usize;
-    let mut private_indices = vec![
-        3usize, // nf_key - SECRET nullifier key
-        4usize, // pos - position in tree (CRITICAL for privacy!)
-    ];
-    for i in 0..(TREE_DEPTH as usize) {
-        private_indices.push(first_sibling_idx + i); // all siblings (Merkle path)
+    // Withdraw + outputs.
+    args.push(json!({"i64": withdraw_amount as i64}));
+    args.push(json!({"i64": n_out as i64}));
+    args.push(json!({"i64": out_value as i64}));
+    args.push(json!({"hex": hex32(&out_rho)}));
+    args.push(json!({"hex": hex32(&out_pk)}));
+    args.push(json!({"hex": hex32(&cm_out)}));
+
+    // Mark private indices (1-based indexing), matching other tests in this file.
+    let depth = TREE_DEPTH as usize;
+    let mut private_indices = vec![3usize, 4usize, 5usize]; // rho, recipient, spend_sk
+    for i in 0..depth {
+        private_indices.push(7 + i); // position bits
     }
+    for i in 0..depth {
+        private_indices.push(7 + depth + i); // siblings
+    }
+    let out_base = 11 + 2 * depth;
+    private_indices.push(out_base + 1); // out_rho
+    private_indices.push(out_base + 2); // out_pk
 
     println!("✓ Arguments prepared: {} total", args.len());
     println!("✓ Private indices: {:?}", private_indices);
@@ -1073,15 +1123,24 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    // Redact ALL private arguments (nf_key, position, and all siblings)
-    // The verifier must not see these witness values!
+    // Redact ALL private arguments (rho, recipient, spend_sk, position bits, siblings, out_rho, out_pk).
+    // The verifier must not see witness values; the circuit must verify with obscured private args.
     let mut redacted_args = args.clone();
-    redacted_args[2] = json!({"str": "x".repeat(64)}); // redact nf_key (index 3, zero-based 2)
-    redacted_args[3] = json!({"str": "0"}); // redact position (index 4, zero-based 3)
-    for i in 0..(TREE_DEPTH as usize) {
-        let idx = (first_sibling_idx - 1) + i; // zero-based for vector
-        redacted_args[idx] = json!({"str": "x".repeat(64)}); // redact siblings
+    let zero32 = "00".repeat(32);
+    redacted_args[2] = json!({"hex": zero32}); // rho
+    redacted_args[3] = json!({"hex": "00".repeat(32)}); // recipient
+    redacted_args[4] = json!({"hex": "00".repeat(32)}); // spend_sk
+    for i in 0..depth {
+        redacted_args[6 + i] = json!({"hex": "00".repeat(32)}); // pos_bits (index 7..)
     }
+    for i in 0..depth {
+        redacted_args[6 + depth + i] = json!({"hex": "00".repeat(32)}); // siblings
+    }
+    // Output redaction: out_rho and out_pk live at the tail.
+    let out_rho_idx = out_base; // 0-based: out_base+1 (1-based) => out_base (0-based)
+    let out_pk_idx = out_base + 1; // 0-based
+    redacted_args[out_rho_idx] = json!({"hex": "00".repeat(32)});
+    redacted_args[out_pk_idx] = json!({"hex": "00".repeat(32)});
 
     let verify_cfg = json!({
         "program": program.to_string_lossy(),

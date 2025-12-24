@@ -308,11 +308,6 @@ impl LigeroHost {
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
 
-        let keep_proof_dir = std::env::var("LIGERO_KEEP_PROOF_DIR")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
             .current_dir(&unique_proof_dir)

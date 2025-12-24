@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use midnight_privacy::{note_commitment, CallMessage, Hash32};
+use midnight_privacy::{nf_key_from_sk, note_commitment, recipient_from_sk, CallMessage, Hash32};
 use rand;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -58,28 +58,29 @@ fn main() -> Result<()> {
     // Use fresh random parameters to avoid nullifier collisions
     let domain: Hash32 = [1u8; 32]; // Keep domain consistent
     let rho: Hash32 = rand::random(); // Random rho = unique nullifier
-    let recipient: Hash32 = rand::random(); // Random recipient binding
+    let spend_sk: Hash32 = rand::random(); // Secret spend key (note owner)
+    let recipient: Hash32 = recipient_from_sk(&domain, &spend_sk);
+    let nf_key: Hash32 = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Note parameters (for later withdrawal):");
     println!("  Domain: 0x{}", hex::encode(&domain[..8]));
     println!("  Rho: 0x{}", hex::encode(&rho[..8]));
+    println!("  Spend SK: 0x{}", hex::encode(&spend_sk[..8]));
     println!("  Recipient: 0x{}", hex::encode(&recipient[..8]));
 
     // Compute note commitment
     let cm = note_commitment(&domain, amount, &rho, &recipient);
     println!("  Commitment: 0x{}\n", hex::encode(cm));
 
-    // Save note details for later withdrawal
-    // Generate a fresh random nullifier key (SECRET!)
-    let nf_key: Hash32 = rand::random();
-
+    // Save note details for later spending (transfer/withdraw).
     let note_details = serde_json::json!({
         "domain": hex::encode(domain),
         "amount": amount,
         "rho": hex::encode(rho),
         "recipient": hex::encode(recipient),
         "commitment": hex::encode(cm),
-        "nf_key": hex::encode(nf_key)  // The secret key for nullifier derivation
+        "spend_sk": hex::encode(spend_sk),
+        "nf_key": hex::encode(nf_key) // derived from spend_sk (kept for debugging)
     });
 
     let note_file = PathBuf::from("midnight_note_details.json");

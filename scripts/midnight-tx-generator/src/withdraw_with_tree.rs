@@ -99,7 +99,7 @@ fn main() -> Result<()> {
 
     // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_u64_arg(value);
+    host.add_u64_arg(u64::try_from(value).map_err(|_| anyhow::anyhow!("NOTE_VALUE too large"))?);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
@@ -112,9 +112,13 @@ fn main() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_u64_arg(withdraw_amount);
+    host.add_u64_arg(
+        u64::try_from(withdraw_amount).map_err(|_| anyhow::anyhow!("WITHDRAW_AMOUNT too large"))?,
+    );
     host.add_u64_arg(1);
-    host.add_u64_arg(change_value);
+    host.add_u64_arg(
+        u64::try_from(change_value).map_err(|_| anyhow::anyhow!("Change value too large"))?,
+    );
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_recipient));
     host.add_hex_arg(hex::encode(cm_out));

@@ -33,7 +33,7 @@ Environment:
   CMAKE_JOB_COUNT   Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/nicarq/ligero-prover.git)
-  LIGERO_GIT_REF    Ligero prover git ref (default: 74aee0b356cf80fcc1497aec9189fcb643377295)
+  LIGERO_GIT_REF    Ligero prover git ref (default: e0f521742e5693d99abbb480a926f5c32b9040b7)
   WABT_GIT_REF      WABT git ref (default: a55fb9466f2f886cf0c5bcadab97900f1e0a5789)
 EOF
 }
@@ -71,8 +71,8 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
 fi
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
-LIGERO_REPO="${LIGERO_REPO:-https://github.com/ligeroinc/ligero-prover.git}"
-LIGERO_GIT_REF="${LIGERO_GIT_REF:-74aee0b356cf80fcc1497aec9189fcb643377295}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/nicarq/ligero-prover.git}"
+LIGERO_GIT_REF="${LIGERO_GIT_REF:-e0f521742e5693d99abbb480a926f5c32b9040b7}"
 WABT_GIT_REF="${WABT_GIT_REF:-a55fb9466f2f886cf0c5bcadab97900f1e0a5789}"
 
 JOBS="${CMAKE_JOB_COUNT:-}"
