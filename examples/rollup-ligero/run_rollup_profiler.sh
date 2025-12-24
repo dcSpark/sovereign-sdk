@@ -20,16 +20,13 @@ CARGO_PROFILE="profiling"
 # Detect platform and set appropriate binary paths
 if [[ "$OSTYPE" == "darwin"* ]]; then
     # macOS
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos/bin/webgpu_verifier"
-    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos"
+    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos-arm64/bin/webgpu_verifier"
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Linux
     export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"
-    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64"
 else
     # Fallback to guest bins for other platforms
     export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
-    BINS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins"
 fi
 
 # Set Ligero verification environment variables
@@ -42,7 +39,7 @@ fi
 # export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 # export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/value_validator.wasm"
 
-export LIGERO_SHADER_PATH="$BINS_DIR/shader"
+export LIGERO_SHADER_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/shader"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
 # Verify files exist

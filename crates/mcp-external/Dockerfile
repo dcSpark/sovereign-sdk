@@ -44,7 +44,7 @@ COPY --from=builder /app/target/release/mcp-external /usr/local/bin/mcp-external
 COPY crates/adapters/ligero/guest/bins/programs /opt/ligero/programs
 COPY crates/adapters/ligero/bins/linux-amd64/bin /opt/ligero/bin
 COPY crates/adapters/ligero/bins/linux-amd64/lib /opt/ligero/lib
-COPY crates/adapters/ligero/bins/linux-amd64/shader /opt/ligero/shader
+COPY crates/adapters/ligero/bins/shader /opt/ligero/shader
 
 RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && mkdir -p /app/logs /app/proof_outputs \

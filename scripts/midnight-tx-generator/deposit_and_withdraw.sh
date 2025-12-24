@@ -184,11 +184,7 @@ cd "$REPO_ROOT"
 # Set environment and generate withdrawal using withdraw_generator.rs (same as transfer flow)
 export LIGERO_PROGRAM_PATH="$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 export LIGERO_PACKING=8192
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/macos/shader"
-else
-    export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/linux-amd64/shader"
-fi
+export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
 
 # Map deposit note details into withdraw-generator inputs
 export OUT1_DOMAIN="$NOTE_DOMAIN"
