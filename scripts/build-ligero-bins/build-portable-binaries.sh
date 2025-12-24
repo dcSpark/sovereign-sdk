@@ -27,8 +27,10 @@ Options:
 Environment:
   DOCKER_IMAGE           Docker image for Linux builds (default: ubuntu:24.04)
   CMAKE_JOB_COUNT        Override parallel job count
-  LIGERO_REPO            Ligero prover git URL used to fetch shaders (default: https://github.com/nicarq/ligero-prover.git)
-  LIGERO_BRANCH          Ligero prover git branch used to fetch shaders (default: nico/improvements)  
+  DAWN_GIT_REF           Dawn commit ref used for builds (default: cec4482eccee45696a7c0019e750c77f101ced04)
+  LIGERO_REPO            Ligero prover git URL used to fetch shaders (default: https://github.com/ligeroinc/ligero-prover.git)
+  LIGERO_GIT_REF         Ligero prover git ref used to fetch shaders (default: 74aee0b356cf80fcc1497aec9189fcb643377295)
+  WABT_GIT_REF           WABT git ref used for builds (default: a55fb9466f2f886cf0c5bcadab97900f1e0a5789)
 EOF
 }
 
@@ -37,8 +39,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 OUT_DIR="$REPO_ROOT/crates/adapters/ligero/bins"
 DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:24.04}"
-LIGERO_REPO="${LIGERO_REPO:-https://github.com/nicarq/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-nico/improvements}"
+DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/ligeroinc/ligero-prover.git}"
+LIGERO_GIT_REF="${LIGERO_GIT_REF:-74aee0b356cf80fcc1497aec9189fcb643377295}"
+WABT_GIT_REF="${WABT_GIT_REF:-a55fb9466f2f886cf0c5bcadab97900f1e0a5789}"
 
 DEFAULT_ARCHES=("linux-amd64" "linux-arm64" "macos-arm64")
 ARCHES=("${DEFAULT_ARCHES[@]}")
@@ -122,9 +126,14 @@ ensure_shaders() {
 
   tmp="$(mktemp -d -t ligero-shader.XXXXXX)"
   trap 'rm -rf "$tmp"' RETURN
-  git clone --depth 1 -b "$LIGERO_BRANCH" "$LIGERO_REPO" "$tmp/ligero-prover"
+  mkdir -p "$tmp/ligero-prover"
+  git -C "$tmp/ligero-prover" init -q
+  git -C "$tmp/ligero-prover" remote add origin "$LIGERO_REPO"
+  # Fetch just the requested commit (works even if it's not the tip of a branch)
+  git -C "$tmp/ligero-prover" fetch -q --depth 1 origin "$LIGERO_GIT_REF"
+  git -C "$tmp/ligero-prover" checkout -q FETCH_HEAD
   if [[ ! -d "$tmp/ligero-prover/shader" ]]; then
-    echo "error: shader folder not found in $LIGERO_REPO ($LIGERO_BRANCH)" >&2
+    echo "error: shader folder not found in $LIGERO_REPO ($LIGERO_GIT_REF)" >&2
     exit 1
   fi
   rm -rf "$STAGE_DIR/shader"
@@ -167,6 +176,8 @@ build_linux() {
     -e "HOST_UID=$HOST_UID" \
     -e "HOST_GID=$HOST_GID" \
     -e "CMAKE_JOB_COUNT=${CMAKE_JOB_COUNT:-}" \
+    -e "DAWN_GIT_REF=$DAWN_GIT_REF" \
+    -e "WABT_GIT_REF=$WABT_GIT_REF" \
     -v "$OUT_DIR:/out" \
     -v "$SCRIPT_DIR/portable/linux-build-and-stage.sh:/run.sh:ro" \
     -w / \
@@ -186,7 +197,7 @@ build_macos_arm64() {
   fi
   # Standalone script; stage into our shared multi-arch output and skip its tarball
   rm -rf "$OUT_DIR/macos-arm64"
-  bash "$SCRIPT_DIR/portable/macos-build-and-stage.sh" --out "$OUT_DIR" --no-tar
+  DAWN_GIT_REF="$DAWN_GIT_REF" WABT_GIT_REF="$WABT_GIT_REF" bash "$SCRIPT_DIR/portable/macos-build-and-stage.sh" --out "$OUT_DIR" --no-tar
 }
 
 # De-dupe arches while preserving order

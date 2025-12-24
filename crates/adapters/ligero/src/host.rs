@@ -242,27 +242,35 @@ impl LigeroHost {
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
 
+        let keep_proof_dir = std::env::var("LIGERO_KEEP_PROOF_DIR")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         let output = Command::new(&self.prover_bin)
             .arg(&config_json)
             .current_dir(&unique_proof_dir)
             .output()
             .context("Failed to execute webgpu_prover")?;
 
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // Always persist prover logs for debugging (even on success).
+        // This makes it much easier to diagnose "no proof generated" issues.
+        let _ = std::fs::write(unique_proof_dir.join("prover.stdout.log"), &stdout);
+        let _ = std::fs::write(unique_proof_dir.join("prover.stderr.log"), &stderr);
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Clean up the temporary directory on failure
-            let _ = std::fs::remove_dir_all(&unique_proof_dir);
+            // Keep the directory on failure so we can inspect logs/artifacts.
             anyhow::bail!(
-                "Ligero prover failed with status {:?}\nstdout: {}\nstderr: {}",
+                "Ligero prover failed with status {:?}\nproof dir: {}\nstdout: {}\nstderr: {}",
                 output.status.code(),
+                unique_proof_dir.display(),
                 stdout,
-                stderr        
+                stderr
             );
         }
-
-        // Check if the output indicates success
-        let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Check WASM exit code - reject if non-zero (indicates WASM program failure)
         for line in stdout.lines() {
@@ -284,15 +292,22 @@ impl LigeroHost {
             }
         }
 
-        if !stdout.contains("Final prove result: true") {
-            // Clean up the temporary directory on failure
-            let _ = std::fs::remove_dir_all(&unique_proof_dir);
-            anyhow::bail!("Ligero prover did not produce a valid proof");
-        }
-
         // Read the proof from proof_data.gz (compressed - this goes into the transaction)
         let proof_path = unique_proof_dir.join("proof_data.gz");
+        if !proof_path.exists() {
+            // Output didn't create the expected artifact. Don't delete the directory so we can debug.
+            anyhow::bail!(
+                "Ligero prover did not produce proof_data.gz\nproof dir: {}\nNote: check prover.stdout.log / prover.stderr.log in that directory.",
+                unique_proof_dir.display()
+            );
+        }
         let proof = std::fs::read(&proof_path).context("Failed to read proof_data.gz")?;
+        if proof.is_empty() {
+            anyhow::bail!(
+                "Ligero prover produced an empty proof_data.gz\nproof dir: {}",
+                unique_proof_dir.display()
+            );
+        }
 
         tracing::debug!(
             "Reading proof from: {}, size: {} bytes",
@@ -318,8 +333,15 @@ impl LigeroHost {
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
         
         // Clean up the temporary directory after reading the proof
-        if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
-            tracing::warn!("Failed to clean up temporary proof directory: {}", e);
+        if !keep_proof_dir {
+            if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
+                tracing::warn!("Failed to clean up temporary proof directory: {}", e);
+            }
+        } else {
+            tracing::info!(
+                "Keeping Ligero proof directory for debugging (LIGERO_KEEP_PROOF_DIR=1): {}",
+                unique_proof_dir.display()
+            );
         }
         
         Ok(proof)

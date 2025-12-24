@@ -33,7 +33,8 @@ Environment:
   CMAKE_JOB_COUNT   Parallel build jobs
   DAWN_GIT_REF      Dawn commit (default: cec4482eccee45696a7c0019e750c77f101ced04)
   LIGERO_REPO       Ligero prover git URL (default: https://github.com/nicarq/ligero-prover.git)
-  LIGERO_BRANCH     Ligero prover git branch (default: nico/improvements)
+  LIGERO_GIT_REF    Ligero prover git ref (default: 74aee0b356cf80fcc1497aec9189fcb643377295)
+  WABT_GIT_REF      WABT git ref (default: a55fb9466f2f886cf0c5bcadab97900f1e0a5789)
 EOF
 }
 
@@ -70,8 +71,9 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
 fi
 
 DAWN_GIT_REF="${DAWN_GIT_REF:-cec4482eccee45696a7c0019e750c77f101ced04}"
-LIGERO_REPO="${LIGERO_REPO:-https://github.com/nicarq/ligero-prover.git}"
-LIGERO_BRANCH="${LIGERO_BRANCH:-nico/improvements}"
+LIGERO_REPO="${LIGERO_REPO:-https://github.com/ligeroinc/ligero-prover.git}"
+LIGERO_GIT_REF="${LIGERO_GIT_REF:-74aee0b356cf80fcc1497aec9189fcb643377295}"
+WABT_GIT_REF="${WABT_GIT_REF:-a55fb9466f2f886cf0c5bcadab97900f1e0a5789}"
 
 JOBS="${CMAKE_JOB_COUNT:-}"
 if [[ -z "$JOBS" ]]; then
@@ -161,9 +163,13 @@ cmake --build "$DAWN_BUILD" --parallel "$JOBS"
 cmake --install "$DAWN_BUILD"
 
 echo "==> Cloning wabt..."
-git clone https://github.com/WebAssembly/wabt.git "$WABT_SRC"
+mkdir -p "$WABT_SRC"
+git -C "$WABT_SRC" init -q
+git -C "$WABT_SRC" remote add origin https://github.com/WebAssembly/wabt.git
+git -C "$WABT_SRC" fetch -q --depth 1 origin "$WABT_GIT_REF"
+git -C "$WABT_SRC" checkout -q FETCH_HEAD
 cd "$WABT_SRC"
-git submodule update --init
+git submodule update --init --recursive
 
 echo "==> Building wabt..."
 cmake -S "$WABT_SRC" -B "$WABT_BUILD" \
@@ -176,14 +182,18 @@ cmake --build "$WABT_BUILD" --parallel "$JOBS"
 cmake --install "$WABT_BUILD"
 
 echo "==> Cloning ligero-prover..."
-git clone "$LIGERO_REPO" -b "$LIGERO_BRANCH" "$LIGERO_SRC"
+mkdir -p "$LIGERO_SRC"
+git -C "$LIGERO_SRC" init -q
+git -C "$LIGERO_SRC" remote add origin "$LIGERO_REPO"
+git -C "$LIGERO_SRC" fetch -q --depth 1 origin "$LIGERO_GIT_REF"
+git -C "$LIGERO_SRC" checkout -q FETCH_HEAD
 
-echo "==> Patching ligero-prover for wabt compatibility..."
-TRANSPILER_HPP="$LIGERO_SRC/include/transpiler.hpp"
-if [[ -f "$TRANSPILER_HPP" ]] && ! grep -q "transpile_wabt_type(const wabt::Var" "$TRANSPILER_HPP"; then
-  # wabt newer API uses wabt::Var for ref.null type (Var::to_type()).
-  perl -0777 -i -pe 's/\}\n\n\/\/ ------------------------------------------------------------/\}\n\n\/\/ Newer wabt represents ref-null types as `wabt::Var` (which may carry an optional type).\n\/\/ Provide an overload so we can support both wabt APIs without pinning a specific version.\nvalue_kind transpile_wabt_type(const wabt::Var& var) {\n    return transpile_wabt_type(var.to_type());\n}\n\n\/\/ ------------------------------------------------------------/s' "$TRANSPILER_HPP"
-fi
+# echo "==> Patching ligero-prover for wabt compatibility..."
+# TRANSPILER_HPP="$LIGERO_SRC/include/transpiler.hpp"
+# if [[ -f "$TRANSPILER_HPP" ]] && ! grep -q "transpile_wabt_type(const wabt::Var" "$TRANSPILER_HPP"; then
+#   # wabt newer API uses wabt::Var for ref.null type (Var::to_type()).
+#   perl -0777 -i -pe 's/\}\n\n\/\/ ------------------------------------------------------------/\}\n\n\/\/ Newer wabt represents ref-null types as `wabt::Var` (which may carry an optional type).\n\/\/ Provide an overload so we can support both wabt APIs without pinning a specific version.\nvalue_kind transpile_wabt_type(const wabt::Var& var) {\n    return transpile_wabt_type(var.to_type());\n}\n\n\/\/ ------------------------------------------------------------/s' "$TRANSPILER_HPP"
+# fi
 
 echo "==> Building ligero-prover..."
 BREW_PREFIX="$(brew --prefix)"
