@@ -614,10 +614,8 @@ mod native {
 
         fn find_shader_path(current_dir: &std::path::Path) -> Option<PathBuf> {
             let candidates = vec![
-                current_dir.join("crates/adapters/ligero/bins/macos/shader"),
-                current_dir.join("crates/adapters/ligero/bins/linux-amd64/shader"),
-                current_dir.join("../crates/adapters/ligero/bins/macos/shader"),
-                current_dir.join("../crates/adapters/ligero/bins/linux-amd64/shader"),
+                current_dir.join("crates/adapters/ligero/bins/shader"),
+                current_dir.join("../crates/adapters/ligero/bins/shader"),
             ];
 
             candidates.into_iter()
@@ -842,9 +840,13 @@ mod native {
             Some(current_dir.join("crates/adapters/ligero/guest/bins/webgpu_verifier")),
             // Platform-specific paths
             #[cfg(target_os = "macos")]
-            Some(current_dir.join("crates/adapters/ligero/bins/macos/bin/webgpu_verifier")),
+            Some(current_dir.join(
+                "crates/adapters/ligero/bins/macos-arm64/bin/webgpu_verifier",
+            )),
             #[cfg(target_os = "linux")]
             Some(current_dir.join("crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier")),
+            #[cfg(target_os = "linux")]
+            Some(current_dir.join("crates/adapters/ligero/bins/linux-arm64/bin/webgpu_verifier")),
         ];
 
         for candidate in candidates.into_iter().flatten() {

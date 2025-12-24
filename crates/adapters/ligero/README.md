@@ -194,7 +194,7 @@ If proof generation fails:
 
 1. **Check binaries exist:**
 ```bash
-ls -lh crates/adapters/ligero/bins/webgpu_{prover,verifier}
+ls -lh crates/adapters/ligero/bins/*/bin/webgpu_{prover,verifier}
 ```
 
 2. **Verify shader directory:**

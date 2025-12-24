@@ -86,8 +86,9 @@ RUN echo "=== Ligero directory structure ===" && \
 RUN cp -r /app/ligero/lib/* /usr/local/lib/ && \
     ldconfig
 
-# Copy value_validator.wasm from the repository
-COPY crates/adapters/ligero/bins/programs/value_validator.wasm /app/ligero/programs/value_validator.wasm
+# Copy shaders + value_validator.wasm from the repository
+COPY crates/adapters/ligero/bins/shader /app/ligero/shader
+COPY crates/adapters/ligero/guest/bins/programs/value_validator.wasm /app/ligero/programs/value_validator.wasm
 
 # Copy keys and setup directories
 COPY examples/test-data/keys/token_deployer_private_key.json keys/token_deployer_private_key.json

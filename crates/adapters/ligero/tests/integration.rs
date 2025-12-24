@@ -6,7 +6,7 @@ mod tests {
 
     fn get_test_program_path() -> String {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let program_path = manifest_dir.join("bins/programs/edit.wasm");
+        let program_path = manifest_dir.join("guest/bins/programs/value_validator.wasm");
         program_path.to_string_lossy().to_string()
     }
 
@@ -91,7 +91,10 @@ mod tests {
 
         // Check if webgpu_prover binary exists
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let prover_bin = manifest_dir.join("bins/webgpu_prover");
+        #[cfg(target_os = "macos")]
+        let prover_bin = manifest_dir.join("bins/macos-arm64/bin/webgpu_prover");
+        #[cfg(target_os = "linux")]
+        let prover_bin = manifest_dir.join("bins/linux-amd64/bin/webgpu_prover");
         if !prover_bin.exists() {
             eprintln!("Skipping test: webgpu_prover not found");
             return;
