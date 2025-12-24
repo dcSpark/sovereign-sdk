@@ -51,23 +51,6 @@ FUND_AMOUNT="${FUND_AMOUNT:-1000}" # clear tokens to send to sender
 # Endpoint - always send to worker (proof verifier service which forwards to sequencer)
 VERIFIER_ENDPOINT="${VERIFIER_ENDPOINT:-http://localhost:8080/midnight-privacy}"
 
-#############################################################################
-# Ligero native prover configuration (required for proof generation)
-#############################################################################
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  LIGERO_PLATFORM_DIR="macos-arm64"
-else
-  # Default to linux-amd64; override to linux-arm64 on aarch64/arm64 hosts
-  if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
-    LIGERO_PLATFORM_DIR="linux-arm64"
-  else
-    LIGERO_PLATFORM_DIR="linux-amd64"
-  fi
-fi
-
-export LIGERO_SHADER_PATH="${LIGERO_SHADER_PATH:-$REPO_ROOT/crates/adapters/ligero/bins/shader}"
-export LIGERO_PROVER_BIN="${LIGERO_PROVER_BIN:-$REPO_ROOT/crates/adapters/ligero/bins/$LIGERO_PLATFORM_DIR/bin/webgpu_prover}"
-
 echo -e "${BLUE}=== Midnight Privacy: Full Lifecycle Demo ===${NC}\n"
 echo "Flow:"
 echo "  1. Deposit $DEPOSIT_AMOUNT (transparent → shielded)"
@@ -212,7 +195,6 @@ export NONCE=$TRANSFER_NONCE
 export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
-export LIGERO_SHADER_PATH LIGERO_PROVER_BIN
 
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/transfer-generator" 2>&1 | tee /tmp/transfer.log

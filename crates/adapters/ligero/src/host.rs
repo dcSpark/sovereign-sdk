@@ -242,76 +242,27 @@ impl LigeroHost {
         tracing::debug!("Prover binary: {}", self.prover_bin.display());
         tracing::debug!("Prover config: {}", config_json);
 
-        let inherit_stdio = std::env::var("LIGERO_PROVER_INHERIT_STDIO")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let output = Command::new(&self.prover_bin)
+            .arg(&config_json)
+            .current_dir(&unique_proof_dir)
+            .output()
+            .context("Failed to execute webgpu_prover")?;
 
-        // Safety net: WebGPU initialization can hang on some systems. Default to 10 minutes.
-        let timeout_secs: u64 = std::env::var("LIGERO_PROVER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
-
-        let mut child = {
-            let mut cmd = Command::new(&self.prover_bin);
-            cmd.arg(&config_json).current_dir(&unique_proof_dir);
-            if inherit_stdio {
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit());
-            }
-            let child = cmd.spawn().context("Failed to execute webgpu_prover")?;
-            tracing::info!(
-                "Spawned webgpu_prover (pid={:?}) cwd={} bin={}",
-                child.id(),
-                unique_proof_dir.display(),
-                self.prover_bin.display()
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Clean up the temporary directory on failure
+            let _ = std::fs::remove_dir_all(&unique_proof_dir);
+            anyhow::bail!(
+                "Ligero prover failed with status {:?}\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                stdout,
+                stderr        
             );
-            child
-        };
-
-        let start = std::time::Instant::now();
-        let mut next_heartbeat = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.try_wait().context("Failed to poll webgpu_prover")? {
-                if !status.success() {
-                    // Clean up the temporary directory on failure
-                    let _ = std::fs::remove_dir_all(&unique_proof_dir);
-                    anyhow::bail!("Ligero prover failed with status {:?}", status.code());
-                }
-                break;
-            }
-
-            if std::time::Instant::now() >= next_heartbeat {
-                tracing::info!(
-                    "webgpu_prover still running (elapsed={}s, timeout={}s, pid={:?})",
-                    start.elapsed().as_secs(),
-                    timeout_secs,
-                    child.id()
-                );
-                next_heartbeat += std::time::Duration::from_secs(10);
-            }
-
-            if timeout_secs > 0 && start.elapsed().as_secs() >= timeout_secs {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&unique_proof_dir);
-                anyhow::bail!(
-                    "Ligero prover timed out after {}s. If this hangs consistently, try setting LIGERO_PROVER_INHERIT_STDIO=1 to see prover logs, and ensure WebGPU/GPU access is available.",
-                    timeout_secs
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
         }
 
-        // If we inherited stdio, we didn't capture stdout. At this point, rely on the proof output file.
-        // Otherwise, the prover would have been silent anyway; the authoritative success signal is proof_data.gz.
-        let stdout = String::new();
-        let _stderr = String::new();
-
-        // Check if the output indicates success (best-effort; primary artifact is proof_data.gz)
-        let stdout = stdout.as_str();
+        // Check if the output indicates success
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Check WASM exit code - reject if non-zero (indicates WASM program failure)
         for line in stdout.lines() {
@@ -333,7 +284,7 @@ impl LigeroHost {
             }
         }
 
-        if !inherit_stdio && !stdout.is_empty() && !stdout.contains("Final prove result:                  true") {
+        if !stdout.contains("Final prove result: true") {
             // Clean up the temporary directory on failure
             let _ = std::fs::remove_dir_all(&unique_proof_dir);
             anyhow::bail!("Ligero prover did not produce a valid proof");
