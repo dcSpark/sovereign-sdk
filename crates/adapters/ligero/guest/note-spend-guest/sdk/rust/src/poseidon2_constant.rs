@@ -24,7 +24,8 @@ use lazy_static::lazy_static;
 pub const POSEIDON2_BN254_RF: usize = 8;  // Full rounds
 pub const POSEIDON2_BN254_RP: usize = 56; // Partial rounds
 pub const POSEIDON2_BN254_T: usize = 2;   // State size
-pub const POSEIDON2_BN254_T2_RC_LEN: usize = (POSEIDON2_BN254_RF + POSEIDON2_BN254_RP) * 2;
+pub const POSEIDON2_BN254_T2_RC_LEN: usize =
+    (POSEIDON2_BN254_RF + POSEIDON2_BN254_RP) * POSEIDON2_BN254_T;
 
 /// Poseidon2 round constants for t=2 (state size 2) on BN254 curve
 /// These constants are used in the Poseidon2 hash function for field elements
