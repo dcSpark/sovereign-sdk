@@ -231,6 +231,34 @@ impl LigeroHost {
         &self.bins_dir
     }
 
+    /// Return a copy of args with private indices redacted (placeholders only).
+    /// This prevents leaking private inputs inside the proof package.
+    ///
+    /// SECURITY: The proof package is serialized and may be transmitted/stored.
+    /// Without redaction, anyone who receives the proof bytes can decode the
+    /// package and read the private values, breaking privacy even if the
+    /// verifier never sees them.
+    fn redacted_args_for_package(&self) -> Vec<LigeroArg> {
+        let mut args = self.config.args.clone();
+        // private_indices uses 1-based indexing
+        for &idx in &self.config.private_indices {
+            if idx == 0 || idx > args.len() {
+                continue;
+            }
+            let i = idx - 1;
+            args[i] = match &args[i] {
+                LigeroArg::String { str: s } => LigeroArg::String {
+                    str: "_".repeat(s.len()),
+                },
+                LigeroArg::I64 { .. } => LigeroArg::I64 { i64: 0 },
+                LigeroArg::Hex { hex: h } => LigeroArg::Hex {
+                    hex: "0".repeat(h.len()),
+                },
+            };
+        }
+        args
+    }
+
     /// Run the prover with detailed logging output, returning the packaged proof
     pub fn run_with_logging(&mut self) -> Result<(Vec<u8>, String)> {
         let public_output = self
@@ -243,7 +271,8 @@ impl LigeroHost {
         let package = LigeroProofPackage {
             proof,
             public_output,
-            args_json: serde_json::to_vec(&self.config.args)?,
+            // IMPORTANT: Redact private args to prevent leaking them in the proof artifact
+            args_json: serde_json::to_vec(&self.redacted_args_for_package())?,
             private_indices: self.config.private_indices.clone(),
         };
 
@@ -493,7 +522,8 @@ impl ZkvmHost for LigeroHost {
             let package = LigeroProofPackage {
                 proof,
                 public_output,
-                args_json: serde_json::to_vec(&self.config.args)?,
+                // IMPORTANT: Redact private args to prevent leaking them in the proof artifact
+                args_json: serde_json::to_vec(&self.redacted_args_for_package())?,
                 private_indices: self.config.private_indices.clone(),
             };
 
@@ -523,7 +553,8 @@ impl ZkvmHost for LigeroHost {
             let package = LigeroProofPackage {
                 proof: vec![],
                 public_output,
-                args_json: serde_json::to_vec(&self.config.args)?,
+                // IMPORTANT: Redact private args to prevent leaking them in the proof artifact
+                args_json: serde_json::to_vec(&self.redacted_args_for_package())?,
                 private_indices: self.config.private_indices.clone(),
             };
             Ok(bincode::serialize(&package)?)

@@ -17,7 +17,7 @@
  * Arguments:
  *   [1]  domain         — hex arg → 32 bytes
  *   [2]  value          — i64 arg → 8 bytes (input note value as u64)
- *   [3]  rho            — hex arg → 32 bytes
+ *   [3]  rho            — hex arg → 32 bytes  [PRIVATE]
  *   [4]  recipient      — hex arg → 32 bytes  [PRIVATE]
  *                        MUST equal recipient_from_sk(domain, spend_sk)
  *   [5]  spend_sk       — hex arg → 32 bytes  [PRIVATE]
@@ -29,10 +29,10 @@
  *   [7+depth..7+2*depth) — siblings[i] — hex arg → 32 bytes each  [PRIVATE]
  *   [7+2*depth]  anchor       — str arg → field element (expected Merkle root)
  *   [8+2*depth]  nullifier    — str arg → field element (expected nullifier)
- *   [9+2*depth]  withdraw_amount — i64 arg → 8 bytes
+ *   [9+2*depth]  withdraw_amount — hex arg → 32 bytes (u64 BE in last 8)  [PRIVATE]
  *   [10+2*depth] n_out           — i64 arg → 8 bytes (0, 1, or 2)
  *   For each j in [0..n_out):
- *     [11+2*depth + 4*j + 0] value_out_j  — i64 arg → 8 bytes   [PRIVATE]
+ *     [11+2*depth + 4*j + 0] value_out_j  — hex arg → 32 bytes (u64 BE in last 8)  [PRIVATE]
  *     [11+2*depth + 4*j + 1] rho_out_j    — hex arg → 32 bytes  [PRIVATE]
  *     [11+2*depth + 4*j + 2] pk_out_j     — hex arg → 32 bytes  [PRIVATE]
  *                                          recipient is DERIVED: H("ADDR_V1"||domain||pk_out)
@@ -318,6 +318,81 @@ fn read_u32(args: &ArgHolder, index: usize, fail_code: u32) -> u32 {
     v as u32
 }
 
+/// Amount represented as both bytes and field element.
+/// This allows amounts to be PRIVATE inputs - the field element is used in
+/// constraints while the bytes are used for hash preimages.
+/// 
+/// CRITICAL: We do NOT convert to Rust u64 because that would "bake" the value
+/// as a constant in the circuit. The verifier runs with obscured (zero) values,
+/// so if we used u64, the prover and verifier would generate different circuits.
+struct AmountBe32 {
+    bytes: Hash32,  // 32 bytes BE, u64 stored in last 8 bytes, leading 24 zero
+    fr: Bn254Fr,    // same numeric value as a field element (circuit witness)
+}
+
+/// Read a private amount from a 32-byte hex arg.
+/// Returns both bytes (for hash preimages) and field element (for constraints).
+/// The value is kept as a circuit witness, NOT converted to a Rust integer.
+#[inline(always)]
+fn read_amount_be32(args: &ArgHolder, index: usize, fail_code: u32) -> AmountBe32 {
+    let bytes = read_hash32(args, index);
+    
+    // Range check: require leading 24 bytes are zero (value fits in u64).
+    // This is OK as a runtime guard because valid witnesses take the same path.
+    let mut acc: u8 = 0;
+    for b in &bytes[..24] {
+        acc |= *b;
+    }
+    if acc != 0 {
+        hard_fail(fail_code);
+    }
+    
+    // Convert to field element - this stays as a circuit witness, not a constant
+    let fr = bn254fr_from_hash32_be(&bytes);
+    AmountBe32 { bytes, fr }
+}
+
+/// Convert the last 8 bytes of a BE32 amount to little-endian 8 bytes.
+/// Used for hash preimages that expect LE format.
+#[inline(always)]
+fn be32_last8_to_le8(value_be32: &Hash32) -> [u8; 8] {
+    let mut le = [0u8; 8];
+    let be8 = &value_be32[24..32];
+    // Reverse byte order: BE to LE
+    le[0] = be8[7];
+    le[1] = be8[6];
+    le[2] = be8[5];
+    le[3] = be8[4];
+    le[4] = be8[3];
+    le[5] = be8[2];
+    le[6] = be8[1];
+    le[7] = be8[0];
+    le
+}
+
+/// Read a u64 encoded as a 32-byte hex arg (big-endian in last 8 bytes).
+/// Format: bytes[0..24] must be 0x00, bytes[24..32] is u64 big-endian.
+/// 
+/// WARNING: This converts to a Rust u64, which "bakes" the value as a constant.
+/// Only use for PUBLIC inputs. For PRIVATE inputs, use read_amount_be32() instead.
+#[inline(always)]
+#[allow(dead_code)]
+fn read_u64_be32(args: &ArgHolder, index: usize, fail_code: u32) -> u64 {
+    let h = read_hash32(args, index);
+    // Validate that leading 24 bytes are zero (value fits in u64)
+    let mut acc: u8 = 0;
+    for b in &h[..24] {
+        acc |= *b;
+    }
+    if acc != 0 {
+        hard_fail(fail_code);
+    }
+    // Read u64 from last 8 bytes (big-endian)
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&h[24..32]);
+    u64::from_be_bytes(bytes)
+}
+
 // ============================================================================
 // OPTIMIZED HASH FUNCTIONS: Fixed-size buffers, single hasher instance
 // Each hash type has a dedicated function with exact buffer size.
@@ -352,7 +427,9 @@ fn mt_combine(h: &Poseidon2Core, level: u8, left: &Hash32, right: &Hash32) -> (B
 
 /// Note commitment: H("NOTE_V1" || domain || value_16 || rho || recipient)
 /// Fixed 119-byte preimage. Value is u64 zero-extended to 16 bytes.
+/// Note: This converts value to u64 which bakes it as constant. For PRIVATE values, use note_commitment_be32().
 
+#[allow(dead_code)]
 fn note_commitment(h: &Poseidon2Core, domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32) -> (Bn254Fr, Hash32) {
     let mut buf = [0u8; NOTE_CM_BUF_LEN];
     buf[..7].copy_from_slice(b"NOTE_V1");
@@ -360,6 +437,25 @@ fn note_commitment(h: &Poseidon2Core, domain: &Hash32, value: u64, rho: &Hash32,
     // Encode value as 16-byte LE (zero-extended from u64)
     buf[39..47].copy_from_slice(&value.to_le_bytes());
     // buf[47..55] already zero from initialization (zero-extension)
+    buf[55..87].copy_from_slice(rho);
+    buf[87..119].copy_from_slice(recipient);
+    let fr = h.hash_padded_fr(&buf);
+    let bytes = bn254fr_to_hash32(&fr);
+    (fr, bytes)
+}
+
+/// Note commitment using BE32 amount bytes (for PRIVATE values).
+/// This avoids converting to u64 which would bake the value as a constant.
+/// Uses the same hash format: H("NOTE_V1" || domain || value_16_le || rho || recipient)
+
+fn note_commitment_be32(h: &Poseidon2Core, domain: &Hash32, value_be32: &Hash32, rho: &Hash32, recipient: &Hash32) -> (Bn254Fr, Hash32) {
+    let mut buf = [0u8; NOTE_CM_BUF_LEN];
+    buf[..7].copy_from_slice(b"NOTE_V1");
+    buf[7..39].copy_from_slice(domain);
+    // Convert BE32 last 8 bytes to LE 8 bytes for the value field
+    let le8 = be32_last8_to_le8(value_be32);
+    buf[39..47].copy_from_slice(&le8);
+    // buf[47..55] stays zero (zero-extension to 16 bytes)
     buf[55..87].copy_from_slice(rho);
     buf[87..119].copy_from_slice(recipient);
     let fr = h.hash_padded_fr(&buf);
@@ -622,12 +718,27 @@ fn view_mac(h: &Poseidon2Core, k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> (Bn254
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
 /// Value is u64 zero-extended to 16 bytes.
 
+#[allow(dead_code)]
 fn encode_note_plain(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32, sender_id: &Hash32, out: &mut [u8; 144]) {
     out[0..32].copy_from_slice(domain);
     // Encode value as 16-byte LE (u64 zero-extended to 16 bytes)
     out[32..40].copy_from_slice(&value.to_le_bytes());
     // Explicitly zero the high 8 bytes for self-contained correctness
     // (don't rely on caller to pre-zero the buffer)
+    out[40..48].copy_from_slice(&[0u8; 8]);
+    out[48..80].copy_from_slice(rho);
+    out[80..112].copy_from_slice(recipient);
+    out[112..144].copy_from_slice(sender_id);
+}
+
+/// Encode note plaintext using BE32 value bytes (for PRIVATE values).
+/// This avoids converting to u64 which would bake the value as a constant.
+
+fn encode_note_plain_be32(domain: &Hash32, value_be32: &Hash32, rho: &Hash32, recipient: &Hash32, sender_id: &Hash32, out: &mut [u8; 144]) {
+    out[0..32].copy_from_slice(domain);
+    // Convert BE32 last 8 bytes to LE 8 bytes
+    let le8 = be32_last8_to_le8(value_be32);
+    out[32..40].copy_from_slice(&le8);
     out[40..48].copy_from_slice(&[0u8; 8]);
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
@@ -687,7 +798,7 @@ fn main() {
     //   7+depth to 7+2*depth-1: siblings [PRIVATE] (hex)
     //   7+2*depth: anchor (str)
     //   8+2*depth: nullifier (str)
-    //   9+2*depth: withdraw_amount (i64)
+    //   9+2*depth: withdraw_amount (hex - u64 BE in last 8 bytes) [PRIVATE]
     //   10+2*depth: n_out (i64)
     //   ... outputs ...
 
@@ -723,8 +834,9 @@ fn main() {
     // 8+2*depth) nullifier [str arg -> field element]
     let nullifier_fr = read_fr_str(&args, 8 + 2 * depth);
 
-    // 9+2*depth) withdraw amount [i64 arg -> 8 bytes]
-    let withdraw_amount = read_u64(&args, 9 + 2 * depth, 82);
+    // 9+2*depth) withdraw amount [PRIVATE] [hex arg -> 32 bytes (u64 BE in last 8)]
+    // Read as AmountBe32 to keep as circuit witness, NOT a Rust u64 constant
+    let withdraw_amt = read_amount_be32(&args, 9 + 2 * depth, 82);
 
     // 10+2*depth) n_out in {0,1,2} [i64 arg -> 8 bytes]
     let n_out_u32 = read_u32(&args, 10 + 2 * depth, 83);
@@ -741,27 +853,30 @@ fn main() {
     // Must have at least the base args
     if argc < expected_base { hard_fail(84); }
 
-    // Store output data for viewer encryption — use u64 for values
+    // Store output data for viewer encryption — use Hash32 for values (field-first approach)
     struct OutPlain {
-        v: u64,
+        v_bytes: Hash32,  // BE32 value bytes for hash preimages
         rho: Hash32,
         rcp: Hash32,
         cm: Hash32,
     }
     let mut outs: [OutPlain; MAX_OUTS] = [
-        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
-        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+        OutPlain { v_bytes: [0; 32], rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+        OutPlain { v_bytes: [0; 32], rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
     ];
 
-    // Parse & verify outputs — use u64 arithmetic throughout
+    // Parse & verify outputs using FIELD-LEVEL arithmetic
     // Output args start at index 11 + 2*depth
-    let mut out_sum: u64 = 0;
+    let mut out_sum_fr = Bn254Fr::new(); // starts at 0
     for j in 0..n_out {
         let base = 11 + 2 * depth + 4 * j;
 
-        // value_out_j [PRIVATE] [i64 arg -> 8 bytes]
-        let vj = read_u64(&args, base + 0, 85);
-        out_sum = out_sum.checked_add(vj).unwrap_or_else(|| hard_fail(86));
+        // value_out_j [PRIVATE] [hex arg -> 32 bytes (u64 BE in last 8)]
+        // Read as AmountBe32 to keep as circuit witness, NOT a Rust u64 constant
+        let vj_amt = read_amount_be32(&args, base + 0, 85);
+        // Sum using field arithmetic (not u64 which would bake constants)
+        let prev_sum = out_sum_fr.clone();
+        addmod_checked(&mut out_sum_fr, &prev_sum, &vj_amt.fr);
 
         // rho_out_j [PRIVATE] [hex arg -> 32 bytes]
         let rho_j = read_hash32(&args, base + 1);
@@ -775,12 +890,13 @@ fn main() {
         // cm_out_j (PUBLIC) [hex arg -> 32 bytes]
         let cm_arg = read_hash32(&args, base + 3);
 
-        let (cm_cmp_fr, _cm_cmp_bytes) = note_commitment(&h, &domain, vj, &rho_j, &rcp_j);
+        // Use note_commitment_be32 which takes bytes, not u64
+        let (cm_cmp_fr, _cm_cmp_bytes) = note_commitment_be32(&h, &domain, &vj_amt.bytes, &rho_j, &rcp_j);
         // Use field-level constraint instead of byte equality
         assert_fr_eq_hash32(&cm_cmp_fr, &cm_arg);
 
         // Store output data for later viewer encryption
-        outs[j] = OutPlain { v: vj, rho: rho_j, rcp: rcp_j, cm: cm_arg };
+        outs[j] = OutPlain { v_bytes: vj_amt.bytes, rho: rho_j, rcp: rcp_j, cm: cm_arg };
     }
 
     // Compute input note commitment and anchor using FIELD-LEVEL Merkle path
@@ -806,25 +922,21 @@ fn main() {
     Bn254Fr::assert_equal(&nf_computed_fr, &nullifier_fr);
 
     // Balance: input value must equal withdraw + sum(outputs)
-    // CRITICAL: Use FIELD-LEVEL constraint, not runtime boolean comparison!
-    // A runtime boolean like `assert_one((value == rhs) as i32)` would create
-    // witness-dependent constraints that fail verification when verifier runs
-    // with obscured private inputs.
+    // CRITICAL: Use FIELD-LEVEL constraints throughout!
     //
-    // Instead, we express the balance as: value_fr == withdraw_fr + out_sum_fr
-    // This creates uniform constraints regardless of actual values.
+    // withdraw_amt.fr and out_sum_fr are circuit witnesses (not Rust constants),
+    // so the verifier can obscure them and still generate the same constraint system.
+    //
+    // Note: We skip the u64 overflow check since we're using field arithmetic.
+    // Field overflow is not an issue for values < 2^64 in BN254.
     
-    // First check for overflow at runtime (inject UNSAT if overflow)
-    let _rhs_check = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| hard_fail(90));
-    
-    // Convert amounts to field elements
+    // Convert input value to field element (this is a PUBLIC input, so constant is OK)
     let value_fr = Bn254Fr::from_u64(value);
-    let withdraw_fr = Bn254Fr::from_u64(withdraw_amount);
-    let out_sum_fr = Bn254Fr::from_u64(out_sum);
     
     // Compute RHS as field element: withdraw + sum(outputs)
+    // Both withdraw_amt.fr and out_sum_fr are circuit witnesses
     let mut rhs_fr = Bn254Fr::new();
-    addmod_checked(&mut rhs_fr, &withdraw_fr, &out_sum_fr);
+    addmod_checked(&mut rhs_fr, &withdraw_amt.fr, &out_sum_fr);
     
     // Field constraint: value == withdraw + sum(outputs)
     Bn254Fr::assert_equal(&value_fr, &rhs_fr);
@@ -857,7 +969,8 @@ fn main() {
     // Precompute plaintexts once per output, reuse across all viewers.
     let mut out_pts: [[u8; NOTE_PLAIN_LEN]; MAX_OUTS] = [[0u8; NOTE_PLAIN_LEN]; MAX_OUTS];
     for j in 0..n_out {
-        encode_note_plain(&domain, outs[j].v, &outs[j].rho, &outs[j].rcp, &sender_id, &mut out_pts[j]);
+        // Use encode_note_plain_be32 which takes bytes, not u64
+        encode_note_plain_be32(&domain, &outs[j].v_bytes, &outs[j].rho, &outs[j].rcp, &sender_id, &mut out_pts[j]);
     }
 
     // Work buffer for ciphertext only (plaintext is precomputed above)

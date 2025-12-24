@@ -288,6 +288,14 @@ mod note_spend_tests {
         format!("0x{}", hex::encode(h))
     }
 
+    /// Encode a u64 as a 32-byte array with the value in big-endian in the last 8 bytes.
+    /// This allows amounts to be passed as hex args so they can be made private.
+    fn u64_be32(v: u64) -> Hash32 {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&v.to_be_bytes());
+        out
+    }
+
     /// Test spending with withdrawal (mixed shielded + transparent)
     ///
     /// Spends a 500-unit note, withdraws 200 units transparently, and creates
@@ -351,13 +359,13 @@ mod note_spend_tests {
             output_commitments: vec![cm_change],
         };
 
-        // === NEW ARGUMENT LAYOUT FOR FIELD-LEVEL MERKLE PATH ===
+        // === ARGUMENT LAYOUT FOR FIELD-LEVEL MERKLE PATH ===
         // Position is now passed as individual bits (one per level) instead of a single integer.
-        // This enables making position bits private without breaking constraints.
+        // Amounts are passed as 32-byte hex args (u64 BE in last 8 bytes) so they can be private.
         //
         // Layout:
         //   1: domain (hex)
-        //   2: value (i64)
+        //   2: value (i64) - input note value (public for balance verification)
         //   3: rho (hex) [PRIVATE]
         //   4: recipient (hex) [PRIVATE]
         //   5: spend_sk (hex) [PRIVATE]
@@ -366,14 +374,14 @@ mod note_spend_tests {
         //   7+depth to 6+2*depth: siblings [PRIVATE] (hex)
         //   7+2*depth: anchor (str)
         //   8+2*depth: nullifier (str)
-        //   9+2*depth: withdraw_amount (i64)
+        //   9+2*depth: withdraw_amount (hex - u64 BE in last 8 bytes) [PRIVATE]
         //   10+2*depth: n_out (i64)
-        //   Then 4 args per output: value, rho, pk, cm
+        //   Then 4 args per output: value (hex), rho (hex), pk (hex), cm (hex)
 
         // Configure private indices (1-based indexing)
-        // All private inputs: rho (3), recipient (4), spend_sk (5),
-        // position bits (7 to 7+depth-1), siblings (7+depth to 7+2*depth-1)
-        // Also change output: change_rho and change_pk
+        // Private inputs: rho (3), recipient (4), spend_sk (5),
+        // position bits (7 to 7+depth-1), siblings (7+depth to 7+2*depth-1),
+        // withdraw_amount (9+2*depth), and per-output: value, rho, pk
         let depth = tree_depth as usize;
         let mut private_indices: Vec<usize> = vec![3, 4, 5];
         // Add position bit indices (7 through 7+depth-1)
@@ -384,11 +392,19 @@ mod note_spend_tests {
         for i in 0..depth {
             private_indices.push(7 + depth + i);
         }
+        // NOTE: withdraw_amount is PUBLIC for transparent withdrawals!
+        // The proof must bind to the specific withdrawal amount so the chain knows
+        // how much to credit. If we marked it private, the proof would only say
+        // "there exists some withdraw amount" without specifying what it is.
+        // (We still pass it as hex BE32 for consistency, just not marked private)
+        
         // Add change output private fields
-        // Output args start at 11+2*depth: value, rho, pk, cm
-        // change_rho is at 11+2*depth+1, change_pk is at 11+2*depth+2
-        let change_rho_idx = 11 + 2 * depth + 1;
-        let change_pk_idx = 11 + 2 * depth + 2;
+        // Output args start at 11+2*depth: value (hex), rho (hex), pk (hex), cm (hex)
+        let output_base = 11 + 2 * depth;  // index 43 for depth=16
+        let change_value_idx = output_base + 0;
+        let change_rho_idx = output_base + 1;
+        let change_pk_idx = output_base + 2;
+        private_indices.push(change_value_idx);
         private_indices.push(change_rho_idx);
         private_indices.push(change_pk_idx);
 
@@ -427,20 +443,20 @@ mod note_spend_tests {
         host.add_str_arg(hex32(&anchor));
         // 8+2*depth: nullifier (str)
         host.add_str_arg(hex32(&nf));
-        // 9+2*depth: withdraw_amount
-        host.add_u64_arg(withdraw_amount);
+        // 9+2*depth: withdraw_amount [PRIVATE] (hex - u64 BE in last 8 bytes)
+        host.add_hex_arg(hex32(&u64_be32(withdraw_amount)));
         // 10+2*depth: n_out
         host.add_u64_arg(n_out as u64);
 
         // Output args (starting at 11+2*depth):
-        // For each output: value, rho, pk, cm
-        // 11+2*depth: change_value
-        host.add_u64_arg(change_value);
+        // For each output: value (hex), rho (hex), pk (hex), cm (hex)
+        // 11+2*depth: change_value [PRIVATE] (hex - u64 BE in last 8 bytes)
+        host.add_hex_arg(hex32(&u64_be32(change_value)));
         // 11+2*depth+1: change_rho [PRIVATE]
         host.add_hex_arg(hex32(&change_rho));
         // 11+2*depth+2: change_pk [PRIVATE]
         host.add_hex_arg(hex32(&change_pk));
-        // 11+2*depth+3: cm_change
+        // 11+2*depth+3: cm_change (PUBLIC)
         host.add_hex_arg(hex32(&cm_change));
 
         host.set_public_output(&public_output)?;
