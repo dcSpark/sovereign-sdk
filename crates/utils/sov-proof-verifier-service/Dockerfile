@@ -49,6 +49,31 @@ ENV SKIP_GUEST_BUILD=ligero \
 
 RUN cargo build --release -p sov-proof-verifier-service
 
+# ---------------------------------------------------------------------
+# Fetch Ligero runtime assets (binaries + shader) from ligero-prover
+#
+# Sovereign no longer vendors Ligero binaries/shaders, but this image
+# still needs the verifier/prover binaries and shaders at runtime.
+# ---------------------------------------------------------------------
+ARG LIGERO_PROVER_REV=1b9ba6fd83af9ef2a2d477c50f6faded0fb03876
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) LIGERO_PLATFORM="linux-amd64" ;; \
+      arm64) LIGERO_PLATFORM="linux-arm64" ;; \
+      *) echo "Unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    mkdir -p /workspace/ligero/bin /workspace/ligero/lib /workspace/ligero/shader; \
+    tmpdir="$(mktemp -d)"; \
+    curl -fsSL "https://codeload.github.com/dcSpark/ligero-prover/tar.gz/${LIGERO_PROVER_REV}" -o "${tmpdir}/ligero-prover.tar.gz"; \
+    tar -xzf "${tmpdir}/ligero-prover.tar.gz" -C "${tmpdir}"; \
+    root="$(find "${tmpdir}" -maxdepth 1 -type d -name 'ligero-prover-*' | head -n 1)"; \
+    test -n "${root}"; \
+    cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/bin/." /workspace/ligero/bin/; \
+    cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/lib/." /workspace/ligero/lib/; \
+    cp -a "${root}/shader/." /workspace/ligero/shader/; \
+    rm -rf "${tmpdir}"
+
 # Stage 2: Runtime
 FROM ubuntu:24.04 AS runtime
 
@@ -73,8 +98,8 @@ WORKDIR /app
 # Copy Rust binary
 COPY --from=rust-builder /workspace/target/release/proof-verifier /usr/local/bin/proof-verifier
 
-# Copy the pre-compiled Ligero binaries (includes bin, lib, and shader)
-COPY crates/adapters/ligero/bins/linux-amd64/ /app/ligero/
+# Copy the pre-compiled Ligero binaries + shader (downloaded from ligero-prover)
+COPY --from=rust-builder /workspace/ligero/ /app/ligero/
 RUN echo "=== Ligero directory structure ===" && \
     ls -la /app/ligero/ && \
     echo "=== Bin directory ===" && \
@@ -86,8 +111,7 @@ RUN echo "=== Ligero directory structure ===" && \
 RUN cp -r /app/ligero/lib/* /usr/local/lib/ && \
     ldconfig
 
-# Copy shaders + value_validator.wasm from the repository
-COPY crates/adapters/ligero/bins/shader /app/ligero/shader
+# Copy value_validator.wasm from the repository
 COPY crates/adapters/ligero/guest/bins/programs/value_validator.wasm /app/ligero/programs/value_validator.wasm
 
 # Copy keys and setup directories

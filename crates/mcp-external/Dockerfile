@@ -24,6 +24,31 @@ COPY . .
 
 RUN cargo build --locked --release -p mcp-external
 
+# ---------------------------------------------------------------------
+# Fetch Ligero runtime assets (binaries + shader) from ligero-prover
+#
+# Sovereign no longer vendors Ligero binaries/shaders, but downstream
+# images still need the binaries/shaders at runtime.
+# ---------------------------------------------------------------------
+ARG LIGERO_PROVER_REV=1b9ba6fd83af9ef2a2d477c50f6faded0fb03876
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) LIGERO_PLATFORM="linux-amd64" ;; \
+      arm64) LIGERO_PLATFORM="linux-arm64" ;; \
+      *) echo "Unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    mkdir -p /opt/ligero/bin /opt/ligero/lib /opt/ligero/shader; \
+    tmpdir="$(mktemp -d)"; \
+    curl -fsSL "https://codeload.github.com/dcSpark/ligero-prover/tar.gz/${LIGERO_PROVER_REV}" -o "${tmpdir}/ligero-prover.tar.gz"; \
+    tar -xzf "${tmpdir}/ligero-prover.tar.gz" -C "${tmpdir}"; \
+    root="$(find "${tmpdir}" -maxdepth 1 -type d -name 'ligero-prover-*' | head -n 1)"; \
+    test -n "${root}"; \
+    cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/bin/." /opt/ligero/bin/; \
+    cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/lib/." /opt/ligero/lib/; \
+    cp -a "${root}/shader/." /opt/ligero/shader/; \
+    rm -rf "${tmpdir}"
+
 
 FROM debian:bookworm-slim AS runtime
 
@@ -40,11 +65,11 @@ RUN groupadd --system mcp && useradd --system --no-create-home --gid mcp --home 
 
 COPY --from=builder /app/target/release/mcp-external /usr/local/bin/mcp-external
 
-# Ligero assets (Linux/amd64 build)
+# Ligero assets
 COPY crates/adapters/ligero/guest/bins/programs /opt/ligero/programs
-COPY crates/adapters/ligero/bins/linux-amd64/bin /opt/ligero/bin
-COPY crates/adapters/ligero/bins/linux-amd64/lib /opt/ligero/lib
-COPY crates/adapters/ligero/bins/shader /opt/ligero/shader
+COPY --from=builder /opt/ligero/bin /opt/ligero/bin
+COPY --from=builder /opt/ligero/lib /opt/ligero/lib
+COPY --from=builder /opt/ligero/shader /opt/ligero/shader
 
 RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && mkdir -p /app/logs /app/proof_outputs \
