@@ -1,26 +1,12 @@
 use std::{env, path::PathBuf, process::{Command, Stdio}};
-use rkyv::{rancor::Error as RancorError, Archive, Deserialize, Serialize};
+use rkyv::rancor::Error as RancorError;
 use base64::{Engine as _, engine::{self, general_purpose, general_purpose::URL_SAFE_NO_PAD}, alphabet};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use crate::common::AttestationData;
 
 // base64 engine to handle the encoding and decoding of the payload.
 const BASE64_ENGINE: engine::GeneralPurpose = engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD);
-
-// Temporary struct to contains the Midnight L2 rollup validation data.
-#[derive(Archive, Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[rkyv(
-    compare(PartialEq),
-    derive(Debug),
-)]
-pub struct AttestationData {
-    pub prev_state_root: Vec<u8>,
-    pub post_state_root: Vec<u8>,
-    pub batch_hash: String,
-    pub message_queue_hash: String,
-    pub batch_index: u64,
-    pub layer2_chain_id: String,
-}
 
 /// Function to decode the JWT payload into a JSON value.
 /// The verification of the JWT signature is not done here, as it is done by the AttestationClient.
@@ -103,6 +89,10 @@ pub fn attest(payload: AttestationData) -> Result<String> {
     Ok(stdout.to_string())
 }
 
+/// Function to verify the provided payload using the MAA service.
+/// # Arguments
+/// * `payload` - The JWT token to be verified.
+/// * `policy` - The policy JSON to be used for verification.
 pub fn verify(payload: &String, policy: String) -> Result<()> { 
     let client = attestation_client_path()?;
     let result = Command::new(client)
