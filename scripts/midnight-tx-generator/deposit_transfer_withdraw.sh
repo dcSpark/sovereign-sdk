@@ -181,20 +181,20 @@ NOTE_DETAILS_FILE="$GENERATOR_DIR/midnight_note_details.json"
 NOTE_DOMAIN=$(cat "$NOTE_DETAILS_FILE" | jq -r '.domain')
 NOTE_VALUE=$(cat "$NOTE_DETAILS_FILE" | jq -r '.amount')
 NOTE_RHO=$(cat "$NOTE_DETAILS_FILE" | jq -r '.rho')
-NOTE_RECIPIENT=$(cat "$NOTE_DETAILS_FILE" | jq -r '.recipient')
-NOTE_NF_KEY=$(cat "$NOTE_DETAILS_FILE" | jq -r '.nf_key')
+NOTE_SPEND_SK=$(cat "$NOTE_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Build transfer generator
 SKIP_GUEST_BUILD=1 cargo build --bin transfer-generator 2>&1 | grep -E "Compiling|Finished" || true
 
 # Set environment and generate transfer
-export NOTE_DOMAIN NOTE_VALUE NOTE_RHO NOTE_RECIPIENT NOTE_NF_KEY
+export NOTE_DOMAIN NOTE_VALUE NOTE_RHO NOTE_SPEND_SK
 export NOTE_POSITION ANCHOR_ROOT
 export TRANSFER_OUT1 TRANSFER_OUT2
 export NONCE=$TRANSFER_NONCE
 export PRIVATE_KEY_FILE
-export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm}"
+export LIGERO_PROGRAM_PATH="$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
+export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
 
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/transfer-generator" 2>&1 | tee /tmp/transfer.log
@@ -276,8 +276,7 @@ OUT1_DETAILS_FILE="$GENERATOR_DIR/midnight_transfer_out1_details.json"
 OUT1_DOMAIN=$(cat "$OUT1_DETAILS_FILE" | jq -r '.domain')
 OUT1_VALUE=$(cat "$OUT1_DETAILS_FILE" | jq -r '.amount')
 OUT1_RHO=$(cat "$OUT1_DETAILS_FILE" | jq -r '.rho')
-OUT1_RECIPIENT=$(cat "$OUT1_DETAILS_FILE" | jq -r '.recipient')
-OUT1_NF_KEY=$(cat "$OUT1_DETAILS_FILE" | jq -r '.nf_key')
+OUT1_SPEND_SK=$(cat "$OUT1_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Create withdrawal generator
 
@@ -286,12 +285,13 @@ OUT1_NF_KEY=$(cat "$OUT1_DETAILS_FILE" | jq -r '.nf_key')
 SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 
 # Set environment and generate withdrawal
-export OUT1_DOMAIN OUT1_VALUE OUT1_RHO OUT1_RECIPIENT OUT1_NF_KEY
+export OUT1_DOMAIN OUT1_VALUE OUT1_RHO OUT1_SPEND_SK
 export OUT1_POSITION TRANSFER_ROOT
 export WITHDRAW_AMOUNT RECIPIENT
 export NONCE=$WITHDRAW_NONCE
 export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH LIGERO_PACKING
+export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
 
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log

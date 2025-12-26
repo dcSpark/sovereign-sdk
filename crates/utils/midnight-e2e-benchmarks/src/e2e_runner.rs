@@ -9,8 +9,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
-    EncryptedNote,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
+    CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree, SpendPublic,
 };
 use num_cpus;
 use serde_json::Value as JsonValue;
@@ -33,6 +33,9 @@ use sov_rollup_ligero::MockDemoRollup;
 
 // Match the spec used by the demo rollup binary
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
+
+/// Must match the domain used by the MidnightPrivacy module (genesis config).
+const DOMAIN: Hash32 = [1u8; 32];
 
 /// Configuration for running the E2E benchmark.
 #[derive(Clone, Debug)]
@@ -687,7 +690,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     let http = reqwest::Client::new();
     let mut tx_hashes_hex: Vec<String> = Vec::with_capacity(num_deposits);
-    // (account_idx, tx_hash, amount, rho, recipient) - track which account made each deposit
+    // (account_idx, tx_hash, amount, rho, spend_sk) - track which account made each deposit
     let mut deposit_secrets: Vec<(usize, String, u128, Hash32, Hash32)> =
         Vec::with_capacity(num_deposits);
     let mut deposit_http_timings: Vec<f64> = Vec::with_capacity(num_deposits);
@@ -710,7 +713,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         // Build a midnight deposit tx for demo runtime
         let amount: u128 = 100;
         let rho: Hash32 = rand::random();
-        let recipient: Hash32 = rand::random();
+        let spend_sk: Hash32 = rand::random();
+        let recipient: Hash32 = recipient_from_sk(&DOMAIN, &spend_sk);
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
             amount,
             rho,
@@ -820,7 +824,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             hex::encode(&rho[..8]),
             hex::encode(&recipient[..8])
         );
-        deposit_secrets.push((i, tx_hash_str.clone(), amount, rho, recipient));
+        deposit_secrets.push((i, tx_hash_str.clone(), amount, rho, spend_sk));
         tx_hashes_hex.push(tx_hash_str);
     }
 
@@ -880,11 +884,12 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         if let Some((_, _, amt, rho, recp)) =
                             deposit_secrets.iter().find(|(_, h, ..)| h == hash_hex)
                         {
+                            let recipient = recipient_from_sk(&DOMAIN, recp);
                             eprintln!(
                                 "[debug] expected deposit: amount={} rho={} recipient={}",
                                 amt,
                                 hex::encode(&rho[..8]),
-                                hex::encode(&recp[..8])
+                                hex::encode(&recipient[..8])
                             );
                         }
                         eprintln!(
@@ -1119,10 +1124,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     sorted_notes.sort_by_key(|n| n.position);
 
     // Compare expected commitments (from our deposits) with API commitments
-    let domain: [u8; 32] = [1u8; 32]; // Must match genesis config!
+    let domain: Hash32 = DOMAIN; // Must match genesis config!
     eprintln!("\n[tree] Comparing expected vs API commitments:");
-    for (account_idx, txh, amount, rho, recp) in &deposit_secrets {
-        let expected_cm = note_commitment(&domain, *amount, rho, recp);
+    for (account_idx, txh, amount, rho, spend_sk) in &deposit_secrets {
+        let recipient = recipient_from_sk(&domain, spend_sk);
+        let expected_cm = note_commitment(&domain, *amount, rho, &recipient);
         if let Some(api_cm) = deposit_cm_by_hash.get(txh) {
             let match_str = if &expected_cm == api_cm {
                 "✓ MATCH"
@@ -1192,8 +1198,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     }
 
     // Build transfer proof tasks for each deposit
-    let domain: [u8; 32] = [1u8; 32]; // Must match genesis config!
-    let nf_key: [u8; 32] = [4u8; 32];
+    let domain: Hash32 = DOMAIN; // Must match genesis config!
     let shared_anchor: [u8; 32] = {
         let mut a = [0u8; 32];
         a.copy_from_slice(&state.root);
@@ -1205,11 +1210,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         account_idx: usize,
         value: u128,
         rho: Hash32,
-        recipient: Hash32,
+        spend_sk: Hash32,
         position: u64,
     }
     let mut dep_inputs: Vec<DepInput> = Vec::with_capacity(num_deposits);
-    for (account_idx, txh, amount, rho, recp) in &deposit_secrets {
+    for (account_idx, txh, amount, rho, spend_sk) in &deposit_secrets {
         if let Some(cm) = deposit_cm_by_hash.get(txh) {
             if let Some(&position) = pos_by_cm.get(cm) {
                 eprintln!(
@@ -1223,7 +1228,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     account_idx: *account_idx,
                     value: *amount,
                     rho: *rho,
-                    recipient: *recp,
+                    spend_sk: *spend_sk,
                     position,
                 });
             } else {
@@ -1294,7 +1299,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let account_idx = input.account_idx;
         let value = input.value;
         let rho = input.rho;
-        let recipient = input.recipient;
+        let spend_sk = input.spend_sk;
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
@@ -1319,19 +1324,23 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // Keep the same value (no splitting)
                 let out_value = value;
                 let mut out_rho = [0u8; 32];
-                out_rho[0] = (i as u8).wrapping_add(100); // Different rho for output note
-                let mut out_recipient = [0u8; 32];
-                out_recipient[0] = (i as u8).wrapping_add(101); // Different recipient for output note
+                out_rho[0] = (account_idx as u8).wrapping_add(100); // Different rho for output note
+                let mut out_spend_sk = [0u8; 32];
+                out_spend_sk[0] = (account_idx as u8).wrapping_add(101); // Deterministic output note owner
+                let out_pk = pk_from_sk(&out_spend_sk);
+                let out_recipient = recipient_from_pk(&domain, &out_pk);
                 let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
 
                 // Compute nullifier
+                let in_recipient = recipient_from_sk(&domain, &spend_sk);
+                let nf_key = nf_key_from_sk(&domain, &spend_sk);
                 let nf = nullifier(&domain, &nf_key, &rho);
 
                 // Build viewer attestation if authority FVK is set
-                // sender_id = recipient (the input note's owner / spender's address)
+                // sender_id = in_recipient (the spender's address)
                 let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &domain, out_value, &out_rho, &out_recipient, &recipient, &cm_out,
+                        &fvk, &domain, out_value, &out_rho, &out_recipient, &in_recipient, &cm_out,
                     );
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
@@ -1347,31 +1356,28 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     view_attestations,
                 };
 
-                // Private indices for 1 output (match guest ABI)
-                // Arguments: 0:domain 1:value 2:rho 3:recipient 4:nf_key 5:pos 6:depth 7..7+depth:siblings
-                //            7+depth:anchor 8+depth:nf 9+depth:withdraw 10+depth:n_out
-                //            11+depth..:outputs
                 let n_out: usize = 1;
-                let mut private_indices = vec![2, 3, 4, 5, 6]; // rho, recipient, nf_key, pos, depth
+                // Private indices for 1 output (match note_spend_guest ABI).
+                // Keep i64 args public for verifier compatibility.
+                let mut private_indices = vec![3, 4, 5]; // rho, recipient, spend_sk
+                // position bits
                 for j in 0..depth_usize {
-                    private_indices.push(7 + j); // siblings
+                    private_indices.push(7 + j);
                 }
-                // Output section starts at 11 + depth
-                let out_base = 11 + depth_usize;
-                // For the output, mark private: value, rho, recipient (skip cm which is public)
-                private_indices.extend_from_slice(&[
-                    out_base + 0, // out value
-                    out_base + 1, // out rho
-                    out_base + 2, // out recipient
-                                  // skip out_base + 3 (cm is public)
-                ]);
+                // siblings
+                for j in 0..depth_usize {
+                    private_indices.push(7 + depth_usize + j);
+                }
+                // Output section starts at 11 + 2*depth; private: out_rho, out_pk (cm is public)
+                let out_base = 11 + 2 * depth_usize;
+                private_indices.extend_from_slice(&[out_base + 1, out_base + 2]);
 
                 // Viewer section: fvk is private
                 if viewer_data.is_some() {
                     // After outputs: base index for m_viewers
-                    // Layout: 12 + depth + 4*n_out = base_after_outs
+                    // Layout: 11 + 2*depth + 4*n_out = base_after_outs
                     // Then: m_viewers, then per viewer: fvk_commit(public), fvk(private), (ct_hash, mac)*n_out
-                    let base_after_outs = 12 + depth_usize + 4 * n_out;
+                    let base_after_outs = 11 + 2 * depth_usize + 4 * n_out;
                     // m_viewers is at base_after_outs, fvk_commit at +1, fvk at +2
                     let fvk_arg_index = base_after_outs + 2; // fvk itself is private
                     private_indices.push(fvk_arg_index);
@@ -1381,32 +1387,37 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                     .with_private_indices(private_indices);
 
-                // Base args (same as before)
+                // Base args (typed binary ABI for zkVM performance)
                 host.add_hex_arg(hex::encode(domain));
-                host.add_str_arg(value.to_string());
+                host.add_u64_arg(value as u64);
                 host.add_hex_arg(hex::encode(rho));
-                host.add_hex_arg(hex::encode(recipient));
-                host.add_hex_arg(hex::encode(nf_key));
-                host.add_str_arg((position as u64).to_string());
-                host.add_str_arg((depth_usize as u8).to_string());
+                host.add_hex_arg(hex::encode(in_recipient));
+                host.add_hex_arg(hex::encode(spend_sk));
+                host.add_u64_arg(depth_usize as u64);
+                for lvl in 0..depth_usize {
+                    let bit = ((position >> lvl) & 1) as u8;
+                    let mut bit_bytes = [0u8; 32];
+                    bit_bytes[31] = bit;
+                    host.add_hex_arg(hex::encode(bit_bytes));
+                }
                 for s in &siblings {
                     host.add_hex_arg(hex::encode(s));
                 }
-                host.add_hex_arg(hex::encode(anchor));
-                host.add_hex_arg(hex::encode(nf));
-                host.add_str_arg("0".to_string()); // withdraw_amount
-                host.add_str_arg("1".to_string()); // ONE output
+                host.add_str_arg(format!("0x{}", hex::encode(anchor)));
+                host.add_str_arg(format!("0x{}", hex::encode(nf)));
+                host.add_u64_arg(0); // withdraw_amount
+                host.add_u64_arg(1); // ONE output
 
                 // Output 0
-                host.add_str_arg(out_value.to_string());
+                host.add_u64_arg(out_value as u64);
                 host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_recipient));
+                host.add_hex_arg(hex::encode(out_pk));
                 host.add_hex_arg(hex::encode(cm_out));
 
                 // Viewer section (Level-B) - add viewer args if authority FVK is set
                 if let Some((fvk, att)) = viewer_data {
                     // m_viewers
-                    host.add_str_arg("1".to_string());
+                    host.add_u64_arg(1);
                     // public fvk_commitment
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
                     // private fvk
@@ -1498,10 +1509,14 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
         use sov_rollup_interface::zk::ZkVerifier;
         let method_commitment = LigeroCodeCommitment(method_id);
-        for (i, (account_idx, proof_bytes)) in proofs.iter().enumerate() {
-            let input = &dep_inputs[i];
+        for (idx, (account_idx, proof_bytes)) in proofs.iter().enumerate() {
+            let input = dep_inputs
+                .iter()
+                .find(|d| d.account_idx == *account_idx)
+                .with_context(|| format!("Missing DepInput for account {}", account_idx))?;
             match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
+                    let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
                     let nf_exp = nullifier(&domain, &nf_key, &input.rho);
                     if public.anchor_root != shared_anchor
                         || public.nullifier != nf_exp
@@ -1509,7 +1524,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     {
                         eprintln!(
                             "  [warn] local verify mismatch idx={} account={} anc_ok={} nf_ok={} wd_ok={}",
-                            i,
+                            idx,
                             account_idx,
                             public.anchor_root == shared_anchor,
                             public.nullifier == nf_exp,
@@ -1531,7 +1546,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 Err(e) => {
                     eprintln!(
                         "  [error] local Ligero verify failed idx={} account={} pos={} err={} (bytes={})",
-                        i,
+                        idx,
                         account_idx,
                         input.position,
                         e,
@@ -1563,7 +1578,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let _ = std::io::stderr().flush();
     let mut transfer_txs_b64: Vec<String> = Vec::with_capacity(proofs.len());
     for (i, (account_idx, proof_bytes)) in proofs.into_iter().enumerate() {
-        let input = &dep_inputs[i];
+        let input = dep_inputs
+            .iter()
+            .find(|d| d.account_idx == account_idx)
+            .with_context(|| format!("Missing DepInput for account {}", account_idx))?;
         let account = &accounts[account_idx];
 
         // Each account uses the next nonce after its deposit
@@ -1576,27 +1594,33 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         };
 
         // Same nullifier as before
+        let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
         let nf = nullifier(&domain, &nf_key, &input.rho);
 
         // Reconstruct the *same* output note layout used in the proof
         let out_value = input.value;
         let mut out_rho = [0u8; 32];
-        out_rho[0] = (i as u8).wrapping_add(100);
-        let mut out_recipient = [0u8; 32];
-        out_recipient[0] = (i as u8).wrapping_add(101);
+        out_rho[0] = (account_idx as u8).wrapping_add(100);
+        let mut out_spend_sk = [0u8; 32];
+        out_spend_sk[0] = (account_idx as u8).wrapping_add(101);
+        let out_pk = pk_from_sk(&out_spend_sk);
+        let out_recipient = recipient_from_pk(&domain, &out_pk);
         let cm_out = note_commitment(&domain, out_value, &out_rho, &out_recipient);
 
+        let sender_id = recipient_from_sk(&domain, &input.spend_sk);
+
         // Build EncryptedNote for the authority, if configured
-        // sender_id = input.recipient (the spender's address)
+        // sender_id = spender's address
         let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
             let (_att, enc) = make_viewer_bundle(
-                &fvk, &domain, out_value, &out_rho, &out_recipient, &input.recipient, &cm_out,
+                &fvk, &domain, out_value, &out_rho, &out_recipient, &sender_id, &cm_out,
             );
             vec![enc]
         });
 
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
-            proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
+            proof: proof_bytes
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
             nullifier: nf,

@@ -69,3 +69,5 @@ examples/rollup-ligero/examples/rollup-ligero/output.log
 wallet_index.sqlite
 crates/utils/sov-indexer/vfk_config.json
 crates/mcp-external/logs/mcp-external.log
+debug_spend_proof.txt
+bug_private.txt

@@ -19,7 +19,7 @@ The MidnightPrivacy module provides a Zcash-style shielded pool that enables pri
 
 Moves transparent tokens into the shielded pool:
 
-```rust
+```rust,ignore
 CallMessage::Deposit {
     amount: 1000,        // Amount to deposit
     rho: [random],       // Random nonce
@@ -42,9 +42,9 @@ The core privacy-preserving operation that atomically:
 3. Creates output note commitments (from proof)
 4. Optionally withdraws transparent value
 
-```rust
+```rust,ignore
 CallMessage::Transfer {
-    proof: proof_bytes,           // Ligero proof (2-4MB)
+    proof: proof_bytes,           // Ligero proof (~8MB)
     anchor_root: [root],          // Historical Merkle root
     nullifier: [nf],              // Derived nullifier
     withdraw_amount: 200,         // 0 for pure shielded transfer
@@ -65,7 +65,7 @@ CallMessage::Transfer {
 #### Transfer Examples
 
 **Pure Shielded Transfer (2 outputs):**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 600 + 400 units
 Transfer {
     proof: proof_with_2_outputs,
@@ -76,7 +76,7 @@ Transfer {
 ```
 
 **Partial Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 400 units + Withdraw: 600 units
 Transfer {
     proof: proof_with_1_output,
@@ -87,7 +87,7 @@ Transfer {
 ```
 
 **Full Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Withdraw: 1000 units (no outputs)
 Transfer {
     proof: proof_with_no_outputs,
@@ -123,7 +123,7 @@ The proof demonstrates (in zero-knowledge):
 #### 1. Nullifier-Based Double-Spend Prevention
 
 Each note can only be spent once. The nullifier is derived as:
-```
+```text
 nullifier = PRF(domain, nf_key, rho)
 ```
 
@@ -149,7 +149,7 @@ The guest program verifies these match its computed values, ensuring cryptograph
 #### 4. Value Conservation
 
 The circuit enforces:
-```
+```text
 input_value = sum(output_values) + withdraw_amount
 ```
 
@@ -199,7 +199,7 @@ This prevents "trust me bro" scenarios where senders could lie about note values
 
 ## Usage Example
 
-```rust
+```rust,ignore
 // 1. Deposit 1000 tokens into shielded pool
 let deposit_msg = CallMessage::Deposit {
     amount: 1000,

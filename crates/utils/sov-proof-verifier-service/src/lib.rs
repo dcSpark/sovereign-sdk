@@ -409,9 +409,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/midnight-privacy/flush", post(flush_pending_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
-        // Remove default 2MB body limit and set 10MB for large Ligero proofs (~3.2MB each)
+        // Remove default 2MB body limit and allow larger payloads (Midnight Ligero proofs are ~8MB,
+        // and transactions are submitted base64-encoded, which adds ~33% overhead).
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
@@ -712,7 +713,19 @@ async fn verify_and_record_midnight_handler(
     let parse_start = std::time::Instant::now();
     let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
-            ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e))
+            let err = e.to_string();
+            let hint = if err.contains("Unexpected length of input") {
+                " (often indicates the verifier was compiled with a smaller SafeVec/proof limit than the submitted tx)"
+            } else {
+                ""
+            };
+            ServiceError::ParseError(format!(
+                "Failed to deserialize transaction (body_b64_len={}, tx_bytes_len={}): {}{}",
+                req.body.len(),
+                tx_bytes.len(),
+                err,
+                hint
+            ))
         })?;
     
     let parsed_call = parse_midnight_call(&tx)?;

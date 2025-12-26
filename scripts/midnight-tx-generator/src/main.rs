@@ -159,14 +159,14 @@ fn main() -> Result<()> {
         .with_packing(ligero_config.packing)
         .with_private_indices(private_indices);
 
-    // Add arguments in exact test order
+    // Add arguments using typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(u64::try_from(value).context("NOTE_VALUE too large")?);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(position.to_string());
-    host.add_str_arg(tree_depth.to_string());
+    host.add_u64_arg(position);
+    host.add_u64_arg(tree_depth as u64);
 
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
@@ -174,9 +174,9 @@ fn main() -> Result<()> {
 
     host.add_hex_arg(hex::encode(anchor));
     host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg(n_out.to_string());
-    host.add_str_arg(out_value.to_string());
+    host.add_u64_arg(u64::try_from(withdraw_amount).context("WITHDRAW_AMOUNT too large")?);
+    host.add_u64_arg(n_out as u64);
+    host.add_u64_arg(u64::try_from(out_value).context("Output value too large")?);
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_rcp));
     host.add_hex_arg(hex::encode(cm_out));
@@ -292,17 +292,22 @@ fn setup_ligero_env() -> Result<LigeroConfig> {
 
     let ligero_dir = repo_root.join("crates/adapters/ligero");
 
-    // Detect OS
+    // Detect OS/arch for prebuilt Ligero binaries
     let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
+        "macos-arm64"
     } else if cfg!(target_os = "linux") {
-        "linux-amd64"
+        if cfg!(target_arch = "aarch64") {
+            "linux-arm64"
+        } else {
+            "linux-amd64"
+        }
     } else {
         anyhow::bail!("Unsupported platform. Supported: macOS, Linux");
     };
 
     let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
+    // Shaders are shared across platforms
+    let shader_dir = ligero_dir.join("bins").join("shader");
 
     let config = LigeroConfig {
         program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),

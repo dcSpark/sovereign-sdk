@@ -6,27 +6,33 @@ edition = "2021"
 # Exclude from parent workspace
 [workspace]
 
-[lib]
-crate-type = ["cdylib"]
+# Binary-only crate for WASM
+[[bin]]
+name = "note_spend_guest"
+path = "src/main.rs"
 
 [dependencies]
-# Use qp-poseidon-core directly (matches midnight-privacy exactly)
-# Note: Uses std for qp-poseidon-core compatibility
-qp-poseidon-core = { version = "0.9.5" }
+# Ligetron SDK for Poseidon2 via bn254fr host functions
+ligetron = { path = "sdk/rust", default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
-qp-poseidon-core = { version = "0.9.5" }
+# Ligetron SDK with native field arithmetic for tests
+ligetron = { path = "sdk/rust", features = ["native"] }
 
 [features]
 native = []
+# Enable detailed error codes for debugging. Adds ~10% overhead from extra branches.
+# Disable in production for minimal constraint count.
+diagnostics = []
 
 [profile.release]
-opt-level = "s"     # Optimize for size while maintaining performance
+opt-level = "z"     # Optimize aggressively for size
 lto = true          # Enable Link Time Optimization
 codegen-units = 1   # Better optimization
 panic = "abort"     # Smaller binary
 strip = true        # Strip symbols
+# Note: wasm-opt -Oz provides additional ~15% size reduction
 

@@ -36,8 +36,7 @@ fn sample_midnight_withdraw_transaction(
     let to = MultiAddressEvm::Vm(
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
     );
-    let proof: SafeVec<u8, 5_000_000> =
-        SafeVec::try_from(vec![9u8; 16]).expect("within SafeVec capacity");
+    let proof = SafeVec::try_from(vec![9u8; 16]).expect("within SafeVec capacity");
 
     let call = MidnightCallMessage::<RollupSpec>::Withdraw {
         proof,
@@ -181,7 +180,6 @@ async fn test_store_verified_midnight_transaction_upsert() {
         output_commitments: vec![],
         view_attestations: None,
     };
-
     let saver = IncomingWorkerTxSaver::disabled();
     store_verified_midnight_transaction(
         &conn,
@@ -256,7 +254,7 @@ async fn test_store_deposit_transaction_without_proof() {
         &transaction_data,
         &full_blob,
         None,       // No pre-auth data in test
-        None,
+        None,       // No encrypted notes for deposits (they use view_fvks instead)
     )
     .await
     .unwrap();
@@ -337,9 +335,8 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         EthereumAddress::from_str("0x71334bf1710D12c9f689cC819476fA589F08C64C").unwrap(),
     );
     
-    // Use a small dummy proof (real proof would be ~3.2MB from Ligero)
-    let dummy_proof: SafeVec<u8, 5_000_000> =
-        SafeVec::try_from(vec![0u8; 32]).expect("within SafeVec capacity");
+    // Use a small dummy proof (real proof is ~8MB from Ligero)
+    let dummy_proof = SafeVec::try_from(vec![0u8; 32]).expect("within SafeVec capacity");
 
     let signing_key = <<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey::generate();
     
@@ -433,7 +430,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64, // full transaction blob
         None,          // No pre-auth data in test
-        None,
+        None,          // No encrypted notes in test
     )
     .await
     .expect("Should store to database");
@@ -489,7 +486,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         &transaction_data,
         &tx_base64,
         None,  // No pre-auth data in test
-        None,
+        None,  // No encrypted notes in test
     )
     .await
     .expect("Should update existing record");

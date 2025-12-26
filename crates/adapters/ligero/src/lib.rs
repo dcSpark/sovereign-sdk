@@ -371,6 +371,41 @@ impl ZkVerifier for LigeroVerifier {
     }
 }
 
+impl LigeroVerifier {
+    /// Verify a proof and return the verifier's stdout/stderr for debugging
+    #[cfg(feature = "native")]
+    pub fn verify_with_output<T: DeserializeOwned>(
+        serialized_proof: &[u8],
+        code_commitment: &LigeroCodeCommitment,
+    ) -> Result<(T, String, String), anyhow::Error> {
+        let package: LigeroProofPackage = bincode::deserialize(serialized_proof)?;
+        let public: T = bincode::deserialize(&package.public_output)?;
+
+        let paths = native::VerifierPaths::discover_with_commitment(Some(code_commitment))
+            .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
+        
+        native::ensure_code_commitment(&paths, code_commitment)?;
+        
+        let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
+        let (success, stdout, stderr) = native::verify_proof_with_output(
+            &paths,
+            &package.proof,
+            args,
+            package.private_indices.clone(),
+        )?;
+
+        if !success {
+            anyhow::bail!(
+                "Ligero verifier did not confirm proof validity\nstdout: {}\nstderr: {}",
+                stdout,
+                stderr
+            );
+        }
+
+        Ok((public, stdout, stderr))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,12 +665,36 @@ mod native {
         Ok(())
     }
 
+    /// Verify a proof and return the verifier output for debugging
+    pub fn verify_proof_with_output(
+        paths: &VerifierPaths,
+        proof_bytes: &[u8],
+        args: Vec<crate::LigeroArg>,
+        private_indices: Vec<usize>,
+    ) -> Result<(bool, String, String)> {
+        let (success, stdout, stderr) = verify_proof_internal(paths, proof_bytes, args, private_indices)?;
+        Ok((success, stdout, stderr))
+    }
+
     pub fn verify_proof(
+        paths: &VerifierPaths,
+        proof_bytes: &[u8],
+        args: Vec<crate::LigeroArg>,
+        private_indices: Vec<usize>,
+    ) -> Result<()> {
+        let (success, stdout, stderr) = verify_proof_internal(paths, proof_bytes, args, private_indices)?;
+        if !success {
+            anyhow::bail!("Ligero verifier did not confirm proof validity\nstdout: {}\nstderr: {}", stdout, stderr);
+        }
+        Ok(())
+    }
+
+    fn verify_proof_internal(
         paths: &VerifierPaths,
         proof_bytes: &[u8],
         mut args: Vec<crate::LigeroArg>,
         private_indices: Vec<usize>,
-    ) -> Result<()> {
+    ) -> Result<(bool, String, String)> {
         let temp_dir =
             tempdir().context("Failed to create temporary directory for Ligero verification")?;
 
@@ -673,26 +732,20 @@ mod native {
         // Redact private arguments (replace with dummy values)
         // IMPORTANT: Keep the same argument type and length as the original
         // (Ligero verifier requires type consistency)
+        // NOTE: Using 1-based indexing (matching Ligero's native format)
         for &idx in &private_indices {
+            // 1-based indexing: idx 1 = args[0]
             if idx > 0 && idx <= args.len() {
-                // 1-based indexing
                 let arg_idx = idx - 1;
                 args[arg_idx] = match &args[arg_idx] {
                     crate::LigeroArg::String { str: s } => {
-                        // Replace with 'x' repeated to match original length
-                        crate::LigeroArg::String {
-                            str: "x".repeat(s.len()),
-                        }
+                        // Replace string with same-length placeholder
+                        crate::LigeroArg::String { str: "_".repeat(s.len()) }
                     }
-                    crate::LigeroArg::I64 { .. } => {
-                        // Replace with 0
-                        crate::LigeroArg::I64 { i64: 0 }
-                    }
+                    crate::LigeroArg::I64 { .. } => crate::LigeroArg::I64 { i64: 0 },
                     crate::LigeroArg::Hex { hex: h } => {
-                        // Replace with '0' repeated to match original length
-                        crate::LigeroArg::Hex {
-                            hex: "0".repeat(h.len()),
-                        }
+                        // Replace with zeros of same length
+                        crate::LigeroArg::Hex { hex: "0".repeat(h.len()) }
                     }
                 };
             }
@@ -720,25 +773,27 @@ mod native {
                 )
             })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         if !output.status.success() {
             tracing::error!("Ligero verifier failed: stdout={stdout}, stderr={stderr}");
             anyhow::bail!(
-                "Ligero verifier returned non-zero exit status ({:?})",
-                output.status.code()
+                "Ligero verifier returned non-zero exit status ({:?})\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                stdout,
+                stderr
             );
         }
 
-        if !stdout.contains("Final Verify Result:                 true") {
+        let success = stdout.contains("Final Verify Result:                 true");
+        if !success {
             tracing::error!(
                 "Ligero verifier did not report success: stdout={stdout}, stderr={stderr}"
             );
-            anyhow::bail!("Ligero verifier did not confirm proof validity");
         }
 
-        Ok(())
+        Ok((success, stdout, stderr))
     }
 
     fn canonicalize(path: &str) -> Result<PathBuf> {

@@ -17,14 +17,13 @@ The guest program implements the core cryptographic verification logic for spend
 
 ### Poseidon2 Hash Function
 
-The program uses **Poseidon2**, a zero-knowledge-friendly hash function optimized for arithmetic circuits:
+The program uses **Ligetron's Poseidon2**, a zero-knowledge-friendly hash function optimized for Ligero arithmetic circuits:
 
-- **Field**: Goldilocks (64-bit prime field)
-- **Width**: 12
-- **Rate**: 4
-- **Seed**: `0x0189189189189189` (matches `qp_poseidon_core`)
+- **Field**: BN254 scalar field
+- **Width**: 2 (t=2)
+- **Implementation**: Ligetron SDK (bn254fr host functions)
 
-The implementation exactly matches the padding and domain-separation scheme used by the on-chain `midnight-privacy` module, ensuring hash compatibility.
+The implementation uses Ligetron's native Poseidon2, which is consistent with the Ligero circuit. The on-chain `midnight-privacy` module also uses Ligetron's Poseidon2 to ensure hash compatibility.
 
 ### Domain Separation
 
@@ -224,9 +223,9 @@ The original `rust-guest` (value validator) is kept as a proof-of-concept. Key d
 
 ## Dependencies
 
-- `qp-poseidon-core`: High-level Poseidon2 hash implementation (matches midnight-privacy module exactly)
+- `ligetron`: Ligetron SDK providing Poseidon2 via bn254fr host functions (same implementation as the circuit)
 
-This ensures perfect compatibility with the on-chain hashing, as both use the same underlying library.
+This ensures perfect compatibility with the on-chain hashing, as both the circuit and the `midnight-privacy` module use Ligetron's Poseidon2.
 
 ## License
 
@@ -236,7 +235,6 @@ Licensed under the Apache License, Version 2.0
 ## References
 
 - [Poseidon2 Paper](https://eprint.iacr.org/2023/323)
-- [Plonky3 (p3) Library](https://github.com/Plonky3/Plonky3)
-- [qp-poseidon-core](https://crates.io/crates/qp-poseidon-core)
+- [Ligetron SDK](./sdk/rust)
 - [Zcash Sapling Protocol](https://github.com/zcash/zips/blob/main/protocol/protocol.pdf)
 

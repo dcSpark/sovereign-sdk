@@ -40,6 +40,8 @@ sov-mock-zkvm = { workspace = true }
 sov-ligero-adapter = { path = ".", features = ["native", "arbitrary"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+# Ligetron SDK with native field arithmetic for tests
+ligetron = { path = "guest/note-spend-guest/sdk/rust", features = ["native"] }
 
 [build-dependencies]
 anyhow = { workspace = true }
