@@ -7051,8 +7051,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ligero-webgpu-runner"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=1b9ba6fd83af9ef2a2d477c50f6faded0fb03876#1b9ba6fd83af9ef2a2d477c50f6faded0fb03876"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ligetron"
-version = "1.0.0"
+version = "1.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=1b9ba6fd83af9ef2a2d477c50f6faded0fb03876#1b9ba6fd83af9ef2a2d477c50f6faded0fb03876"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -7316,6 +7331,7 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
+ "ligero-webgpu-runner",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.26",
@@ -7355,6 +7371,7 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
+ "ligero-webgpu-runner",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.26",
@@ -7491,6 +7508,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "ligero-webgpu-runner",
  "ligetron",
  "once_cell",
  "schemars 0.8.22",
@@ -12813,6 +12831,7 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
+ "ligero-webgpu-runner",
  "ligetron",
  "proptest",
  "rand 0.8.5",

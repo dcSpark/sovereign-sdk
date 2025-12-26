@@ -8,18 +8,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Detect platform and set appropriate binary paths
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos-arm64/bin/webgpu_verifier"
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"
-else
-    # Fallback to guest bins for other platforms
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
-fi
-
 # Set Ligero verification environment variables
 NOTE_SPEND_WASM="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 VALUE_VALIDATOR_WASM="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/value_validator.wasm"
@@ -28,15 +16,7 @@ VALUE_VALIDATOR_WASM="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs
 # auto-select the correct program based on the expected code commitment, but it still requires
 # LIGERO_PROGRAM_PATH to be set. Default it to the Midnight program to match the common case.
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$NOTE_SPEND_WASM}"
-export LIGERO_SHADER_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/shader"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
-
-# Verify files exist
-if [ ! -f "$LIGERO_VERIFIER_BIN" ]; then
-    echo "❌ Error: webgpu_verifier not found at: $LIGERO_VERIFIER_BIN"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
 
 if [ ! -f "$LIGERO_PROGRAM_PATH" ]; then
     echo "❌ Error: Ligero program not found at: $LIGERO_PROGRAM_PATH"
@@ -45,16 +25,8 @@ if [ ! -f "$LIGERO_PROGRAM_PATH" ]; then
     exit 1
 fi
 
-if [ ! -d "$LIGERO_SHADER_PATH" ]; then
-    echo "❌ Error: shader directory not found at: $LIGERO_SHADER_PATH"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
-
 echo "✓ Ligero verification configuration:"
-echo "  LIGERO_VERIFIER_BIN=$LIGERO_VERIFIER_BIN"
 echo "  LIGERO_PROGRAM_PATH=$LIGERO_PROGRAM_PATH"
-echo "  LIGERO_SHADER_PATH=$LIGERO_SHADER_PATH"
 echo "  LIGERO_PACKING=$LIGERO_PACKING"
 echo ""
 

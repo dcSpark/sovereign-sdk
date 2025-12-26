@@ -30,6 +30,9 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sov-rollup-interface = { workspace = true }
+# Local (developer) dependency on Ligero's runner crate (owned by ligero-prover).
+# In CI/published contexts this should be replaced with a git dependency or a published crate.
+ligero-webgpu-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "1b9ba6fd83af9ef2a2d477c50f6faded0fb03876", optional = true }
 # Note: sov-metrics doesn't have a ligero-specific feature yet
 # sov-metrics = { workspace = true, optional = true }
 
@@ -41,7 +44,7 @@ sov-ligero-adapter = { path = ".", features = ["native", "arbitrary"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 # Ligetron SDK with native field arithmetic for tests
-ligetron = { path = "guest/note-spend-guest/sdk/rust", features = ["native"] }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "1b9ba6fd83af9ef2a2d477c50f6faded0fb03876", features = ["native"] }
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -64,6 +67,7 @@ native = [
     "tempfile",
     "sov-rollup-interface/native",
     "sov-mock-zkvm/native",
+    "dep:ligero-webgpu-runner",
 ]
 # bench = [
 #     "sov-metrics",

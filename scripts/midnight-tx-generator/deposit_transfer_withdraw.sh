@@ -23,6 +23,7 @@ BASE_NONCE=$(date +%s)
 
 # Try to fetch latest from node for this key
 NODE_API_URL="${NODE_API_URL:-http://localhost:12346}"
+export NODE_API_URL
 cd "$GENERATOR_DIR"
 SKIP_GUEST_BUILD=1 cargo build --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
@@ -194,7 +195,7 @@ export NONCE=$TRANSFER_NONCE
 export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH="$REPO_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
-export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
+unset LIGERO_SHADER_PATH
 
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/transfer-generator" 2>&1 | tee /tmp/transfer.log
@@ -291,7 +292,7 @@ export WITHDRAW_AMOUNT RECIPIENT
 export NONCE=$WITHDRAW_NONCE
 export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH LIGERO_PACKING
-export LIGERO_SHADER_PATH="$REPO_ROOT/crates/adapters/ligero/bins/shader"
+unset LIGERO_SHADER_PATH
 
 cd "$GENERATOR_DIR"
 "$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log

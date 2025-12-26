@@ -108,16 +108,18 @@ int main(int argc, char *argv[]) {
 
 #### Building Guest Programs
 
-1. Place your `.cpp` file in `guest/`
-2. Update `guest/CMakeLists.txt` to include your program
-3. Run the build script:
+Sovereign intentionally **does not** keep the guest program sources in this repository anymore.
+
+- **Sources** live in the Ligero-owned repo: `ligero-prover/utils/circuits/*`
+- **Artifacts** are stored here: `crates/adapters/ligero/guest/bins/programs/*.wasm`
+
+To rebuild:
 
 ```bash
-cd guest
-./build.sh
+cd <ligero-prover>/utils/circuits/note-spend-guest
+cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/note_spend_guest.wasm <sovereign-ligero>/crates/adapters/ligero/guest/bins/programs/
 ```
-
-The compiled `.wasm` files will be placed in `bins/programs/`.
 
 ### Using Ligero in a Rollup
 

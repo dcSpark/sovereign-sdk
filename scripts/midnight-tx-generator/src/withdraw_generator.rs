@@ -30,6 +30,7 @@ const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
 #[derive(Deserialize)]
 struct NotesResponse {
     notes: Vec<NoteEntry>,
+    #[serde(default)]
     current_root: Option<Vec<u8>>,
 }
 
@@ -56,10 +57,36 @@ fn load_notes_from_source() -> Option<NotesResponse> {
     }
 
     if let Ok(node_url) = std::env::var("NODE_API_URL") {
-        let url = format!("{}/modules/midnight-privacy/notes?limit=200&reverse=true", node_url);
-        if let Ok(resp) = reqwest::blocking::get(url) {
-            return resp.json::<NotesResponse>().ok();
+        // IMPORTANT: fetch ALL notes (pagination) so the Merkle root/path matches on-chain state.
+        let mut all_notes: Vec<NoteEntry> = Vec::new();
+        let mut offset: usize = 0;
+        let limit: usize = 1000;
+        let mut last_root: Option<Vec<u8>> = None;
+
+        loop {
+            let url = format!(
+                "{}/modules/midnight-privacy/notes?limit={}&offset={}",
+                node_url, limit, offset
+            );
+            let resp = reqwest::blocking::get(&url).ok()?;
+            let page = resp.json::<NotesResponse>().ok()?;
+
+            if let Some(root) = page.current_root.clone() {
+                last_root = Some(root);
+            }
+
+            let n = page.notes.len();
+            all_notes.extend(page.notes);
+            if n < limit {
+                break;
+            }
+            offset += n;
         }
+
+        return Some(NotesResponse {
+            notes: all_notes,
+            current_root: last_root,
+        });
     }
     None
 }
@@ -100,6 +127,18 @@ fn main() -> Result<()> {
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
     if let Some(notes_resp) = load_notes_from_source() {
+        // Prefer the fresh root reported by the node (avoid stale TRANSFER_ROOT from earlier script steps).
+        if let Some(root) = notes_resp.current_root.clone() {
+            if let Ok(root32) = <[u8; 32]>::try_from(root) {
+                let fresh: Hash32 = root32;
+                if fresh != anchor {
+                    println!(
+                        "ℹ️  Provided TRANSFER_ROOT differs from node current_root; using node root"
+                    );
+                }
+                anchor = fresh;
+            }
+        }
         for note in notes_resp.notes {
             if note.position >= (1u64 << tree_depth) {
                 continue;
@@ -115,12 +154,13 @@ fn main() -> Result<()> {
             .root()
             .try_into()
             .map_err(|_| anyhow::anyhow!("Computed root has invalid length"))?;
-        if computed_root != anchor {
-            println!(
-                "ℹ️  Recomputed anchor from notes differs from provided anchor; using computed root"
-            );
-            anchor = computed_root;
-        }
+        anyhow::ensure!(
+            computed_root == anchor,
+            "Anchor root mismatch: env/node anchor = 0x{}, but Merkle root computed from on-chain notes = 0x{}. \
+             This usually means your note isn't fully indexed yet, or the note list is incomplete.",
+            hex::encode(anchor),
+            hex::encode(computed_root),
+        );
     } else {
         tree.set_leaf(position as usize, cm);
     }

@@ -36,7 +36,7 @@ fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), None, Some(shader), Some(program)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }
 
 #[tracing_test::traced_test]

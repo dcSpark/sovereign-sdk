@@ -35,10 +35,7 @@ use sov_rollup_interface::{
     crypto::PublicKey,
     zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 use futures::future::join_all;
 use tracing::{debug, error, info, warn};
 
@@ -1137,9 +1134,6 @@ async fn verify_ligero_proof(
     // Spawn blocking task for CPU-intensive proof verification
     let proof = proof.to_vec();
     let result = tokio::task::spawn_blocking(move || {
-        // Set environment variables for value_validator.wasm verification
-        configure_ligero_env_for_value_setter()?;
-        
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -1436,9 +1430,6 @@ pub async fn verify_midnight_withdraw_proof(
     let proof_vec = proof.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        // Set environment variables for note_spend_guest.wasm verification
-        configure_ligero_env_for_midnight()?;
-        
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -2106,49 +2097,9 @@ async fn submit_worker_tx_to_sequencer(
     Ok(outcome)
 }
 
-/// Configure Ligero environment variables for value-setter verification
-fn configure_ligero_env_for_value_setter() -> Result<(), ServiceError> {
-    // `sov-proof-verifier-service` must not override Ligero env vars.
-    // The caller (scripts/deploy) is responsible for exporting the correct values.
-    ensure_ligero_env_is_set()?;
-    
-    Ok(())
-}
-
-/// Configure Ligero environment variables for midnight verification
-fn configure_ligero_env_for_midnight() -> Result<(), ServiceError> {
-    // `sov-proof-verifier-service` must not override Ligero env vars.
-    // The caller (scripts/deploy) is responsible for exporting the correct values.
-    ensure_ligero_env_is_set()?;
-    
-    Ok(())
-}
-
-fn ensure_ligero_env_is_set() -> Result<(), ServiceError> {
-    fn required_path_var(name: &str) -> Result<PathBuf, ServiceError> {
-        let v = std::env::var(name).map_err(|_| {
-            ServiceError::Internal(format!(
-                "{name} must be set (required for Ligero verification)"
-            ))
-        })?;
-        let p = PathBuf::from(&v);
-        if p.exists() {
-            Ok(p)
-        } else {
-            Err(ServiceError::Internal(format!(
-                "{name} is set but does not exist: {}",
-                p.display()
-            )))
-        }
-    }
-
-    let _verifier_bin = required_path_var("LIGERO_VERIFIER_BIN")?;
-    let _program = required_path_var("LIGERO_PROGRAM_PATH")?;
-    let _shader_path = required_path_var("LIGERO_SHADER_PATH")?;
-
-    // LIGERO_PACKING is optional; the adapter defaults to 8192 if unset.
-    Ok(())
-}
+// NOTE: Ligero binary/shader discovery is handled by `ligero-webgpu-runner` inside the
+// Sovereign Ligero adapter. This service must not require env vars like `LIGERO_VERIFIER_BIN`
+// or `LIGERO_SHADER_PATH` (those binaries are owned by the Ligero repo, not Sovereign).
 
 /// Compute the method ID for the value_validator.wasm program
 fn compute_value_setter_method_id() -> Result<[u8; 32]> {

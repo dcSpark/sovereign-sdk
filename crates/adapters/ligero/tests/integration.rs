@@ -269,7 +269,7 @@ mod note_spend_tests {
         if !program_path.exists() {
             anyhow::bail!(
                 "note_spend_guest.wasm not found at: {}\n\
-                 Build it with: cd crates/adapters/ligero/guest/note-spend-guest && ./build.sh",
+                 Build it in ligero-prover with: cd <ligero-prover>/utils/circuits/note-spend-guest && ./build.sh",
                 program_path.display()
             );
         }

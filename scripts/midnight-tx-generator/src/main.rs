@@ -277,8 +277,6 @@ fn main() -> Result<()> {
 #[derive(Debug)]
 struct LigeroConfig {
     program_path: PathBuf,
-    prover_bin: PathBuf,
-    shader_path: PathBuf,
     packing: u32,
 }
 
@@ -292,27 +290,8 @@ fn setup_ligero_env() -> Result<LigeroConfig> {
 
     let ligero_dir = repo_root.join("crates/adapters/ligero");
 
-    // Detect OS/arch for prebuilt Ligero binaries
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos-arm64"
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "linux-arm64"
-        } else {
-            "linux-amd64"
-        }
-    } else {
-        anyhow::bail!("Unsupported platform. Supported: macOS, Linux");
-    };
-
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    // Shaders are shared across platforms
-    let shader_dir = ligero_dir.join("bins").join("shader");
-
     let config = LigeroConfig {
         program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
-        prover_bin: bin_dir.join("webgpu_prover"),
-        shader_path: shader_dir,
         packing: std::env::var("LIGERO_PACKING")
             .unwrap_or_else(|_| "8192".to_string())
             .parse()
@@ -322,27 +301,13 @@ fn setup_ligero_env() -> Result<LigeroConfig> {
     // Validate files exist
     if !config.program_path.exists() {
         anyhow::bail!(
-            "note_spend_guest.wasm not found at {}\nBuild it with: cd {} && cargo build --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/note_spend_guest.wasm ../bins/programs/",
+            "note_spend_guest.wasm not found at {}\nBuild it in ligero-prover with:\n  cd <ligero-prover>/utils/circuits/note-spend-guest && cargo build --release --target wasm32-unknown-unknown\nThen copy it into Sovereign with:\n  cp target/wasm32-unknown-unknown/release/note_spend_guest.wasm <sovereign-ligero>/crates/adapters/ligero/guest/bins/programs/",
             config.program_path.display(),
-            ligero_dir.join("guest/note-spend-guest").display()
-        );
-    }
-
-    if !config.prover_bin.exists() {
-        anyhow::bail!("webgpu_prover not found at {}", config.prover_bin.display());
-    }
-
-    if !config.shader_path.exists() {
-        anyhow::bail!(
-            "Shader directory not found at {}",
-            config.shader_path.display()
         );
     }
 
     // Set environment variables for Ligero
     std::env::set_var("LIGERO_PROGRAM_PATH", &config.program_path);
-    std::env::set_var("LIGERO_PROVER_BIN", &config.prover_bin);
-    std::env::set_var("LIGERO_SHADER_PATH", &config.shader_path);
     std::env::set_var("LIGERO_PACKING", config.packing.to_string());
 
     Ok(config)

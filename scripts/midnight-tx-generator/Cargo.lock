@@ -5458,6 +5458,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ligero-webgpu-runner"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=5c6fa63c06987340dbb87fdb3615cc45e5ffdf6f#5c6fa63c06987340dbb87fdb3615cc45e5ffdf6f"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ligetron"
 version = "1.0.0"
 dependencies = [
@@ -9419,6 +9433,7 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
+ "ligero-webgpu-runner",
  "rand 0.8.5",
  "schemars 0.8.22",
  "serde",

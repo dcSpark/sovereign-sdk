@@ -78,7 +78,6 @@ fn create_test_ligero() -> Ligero {
 
     Ligero::new(
         Some(prover_binary_path),
-        None,
         Some(shader_path),
         Some(program_path),
     )

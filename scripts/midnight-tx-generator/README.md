@@ -445,5 +445,6 @@ cd ../../scripts/midnight-tx-generator
 - **Module Implementation:** `crates/module-system/module-implementations/midnight-privacy/`
 - **Integration Tests:** `crates/module-system/module-implementations/midnight-privacy/tests/integration/`
 - **Ligero Adapter:** `crates/adapters/ligero/`
-- **Guest Circuit:** `crates/adapters/ligero/guest/note-spend-guest/`
+- **Guest Circuit (sources):** `ligero-prover/utils/circuits/note-spend-guest/` (in the `ligero-prover` repo)
+- **Guest WASM (artifact):** `crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm` (in this repo)
 - **Genesis Config:** `examples/test-data/genesis/demo/mock/midnight_privacy.json`

@@ -6,9 +6,6 @@ use sov_rollup_interface::zk::{CodeCommitment, ZkvmHost};
 pub struct LigeroEnv {
     pub program_path: String,
     pub method_id: [u8; 32],
-    pub prover_bin: String,
-    pub verifier_bin: String,
-    pub shader_dir: String,
 }
 
 /// Locate Ligero binaries and program artifacts, compute the method id, and
@@ -20,24 +17,7 @@ pub fn setup_ligero_env() -> Result<LigeroEnv> {
         .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
         .ok_or_else(|| anyhow!("Could not find repository root"))?;
     let ligero_dir = repo_root.join("crates/adapters/ligero");
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos-arm64"
-    } else if cfg!(target_os = "linux") {
-        // Prefer amd64 by default, but allow running on arm64 linux hosts too.
-        // (Users can still override via env vars if needed.)
-        if cfg!(target_arch = "aarch64") {
-            "linux-arm64"
-        } else {
-            "linux-amd64"
-        }
-    } else {
-        anyhow::bail!("Unsupported platform");
-    };
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join("shader");
     let program_path = ligero_dir.join("guest/bins/programs/note_spend_guest.wasm");
-    let prover_bin = bin_dir.join("webgpu_prover");
-    let verifier_bin = bin_dir.join("webgpu_verifier");
 
     anyhow::ensure!(
         program_path.exists(),
@@ -54,18 +34,16 @@ pub fn setup_ligero_env() -> Result<LigeroEnv> {
         .try_into()
         .map_err(|_| anyhow!("Code commitment should be 32 bytes"))?;
 
-    // Export the env vars so callers don't need to set them themselves.
+    // Export the env vars that are still required by downstream tools.
+    //
+    // NOTE: Prover/verifier binary discovery now lives in `ligero-webgpu-runner` and uses
+    // the portable binaries shipped with the Ligero repo. Sovereign callers should not need
+    // to set `LIGERO_PROVER_BIN`, `LIGERO_VERIFIER_BIN`, or `LIGERO_SHADER_PATH`.
     std::env::set_var("LIGERO_PROGRAM_PATH", &program_path);
-    std::env::set_var("LIGERO_PROVER_BIN", &prover_bin);
-    std::env::set_var("LIGERO_VERIFIER_BIN", &verifier_bin);
-    std::env::set_var("LIGERO_SHADER_PATH", &shader_dir);
     std::env::set_var("LIGERO_PACKING", "8192");
 
     Ok(LigeroEnv {
         program_path: program_path.to_string_lossy().to_string(),
         method_id,
-        prover_bin: prover_bin.to_string_lossy().to_string(),
-        verifier_bin: verifier_bin.to_string_lossy().to_string(),
-        shader_dir: shader_dir.to_string_lossy().to_string(),
     })
 }

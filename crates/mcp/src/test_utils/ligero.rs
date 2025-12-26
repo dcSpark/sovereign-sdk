@@ -33,15 +33,6 @@ pub fn create_test_ligero() -> Ligero {
         ),
         Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!(
-                    "../adapters/ligero/bins/{}/bin/webgpu_verifier",
-                    platform_dir
-                ))
-                .canonicalize()
-                .expect("Failed to find verifier binary"),
-        ),
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../adapters/ligero/bins/shader")
                 .canonicalize()
                 .expect("Failed to find shader directory"),

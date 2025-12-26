@@ -277,9 +277,6 @@ async fn start_managed_stack(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         )
         .env("LIGERO_PROGRAM_PATH", &ligero_env.program_path)
-        .env("LIGERO_VERIFIER_BIN", &ligero_env.verifier_bin)
-        .env("LIGERO_PROVER_BIN", &ligero_env.prover_bin)
-        .env("LIGERO_SHADER_PATH", &ligero_env.shader_dir)
         .env("LIGERO_PACKING", "8192")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

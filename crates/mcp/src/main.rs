@@ -67,7 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ligero = Arc::new(Ligero::new(
         Some(cfg.ligero_prover_binary_path.clone()),
-        None,
         Some(cfg.ligero_shader_path.clone()),
         Some(cfg.ligero_program_path.clone()),
     ));
