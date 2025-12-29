@@ -5460,9 +5460,10 @@ dependencies = [
 [[package]]
 name = "ligero-webgpu-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=5c6fa63c06987340dbb87fdb3615cc45e5ffdf6f#5c6fa63c06987340dbb87fdb3615cc45e5ffdf6f"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=69302a512f8c988e7760d85d090728e35c10d1a0#69302a512f8c988e7760d85d090728e35c10d1a0"
 dependencies = [
  "anyhow",
+ "bincode",
  "hex",
  "serde",
  "serde_json",
@@ -5473,7 +5474,8 @@ dependencies = [
 
 [[package]]
 name = "ligetron"
-version = "1.0.0"
+version = "1.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=69302a512f8c988e7760d85d090728e35c10d1a0#69302a512f8c988e7760d85d090728e35c10d1a0"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
