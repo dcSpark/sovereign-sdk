@@ -10,13 +10,7 @@ use ligero_webgpu_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
 use serde::{Deserialize, Serialize};
 
 /// Program argument encoding expected by the Ligero prover/verifier JSON interface.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum LigeroProgramArguments {
-    STR { str: String },
-    I64 { i64: i64 },
-    HEX { hex: String },
-}
+pub use ligero_webgpu_runner::LigeroArg as LigeroProgramArguments;
 
 /// Minimal wrapper used by MCP to generate Ligero proofs.
 ///
@@ -90,8 +84,10 @@ impl Ligero {
         public_output: &T,
     ) -> Result<Vec<u8>> {
         // Convert string args to LigeroProgramArguments
-        let ligero_args: Vec<LigeroProgramArguments> =
-            args.into_iter().map(|s| LigeroProgramArguments::STR { str: s }).collect();
+        let ligero_args: Vec<LigeroProgramArguments> = args
+            .into_iter()
+            .map(|s| LigeroProgramArguments::String { str: s })
+            .collect();
 
         // For midnight-privacy, we need to serialize the public output and include it
         // The public output is handled by the guest program, so we just generate the proof normally
@@ -107,50 +103,64 @@ impl Ligero {
         private_indices: Vec<u32>,
         args: Vec<LigeroProgramArguments>,
     ) -> Result<Vec<u8>> {
-        let prover_bin = self
-            .ligero_prover_binary_path
-            .clone()
-            .context("ligero prover binary path is required")?
-            .canonicalize()
-            .context("Failed to canonicalize Ligero prover binary path")?;
-        let shader_dir = self
-            .ligero_shader_path
-            .clone()
-            .context("ligero shader path is required")?
-            .canonicalize()
-            .context("Failed to canonicalize Ligero shader path")?;
         let program = self
             .ligero_program_path
             .clone()
-            .context("ligero program path is required")?
+            .or_else(|| std::env::var("LIGERO_PROGRAM_PATH").ok().map(PathBuf::from))
+            .context("ligero program path is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)")?
             .canonicalize()
             .context("Failed to canonicalize Ligero program path")?;
 
-        let bins_dir = prover_bin
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let mut runner = if self.ligero_prover_binary_path.is_some() || self.ligero_shader_path.is_some() {
+            // Explicit overrides (backwards compatible with existing MCP config).
+            let prover_bin = self
+                .ligero_prover_binary_path
+                .clone()
+                .or_else(|| {
+                    std::env::var("LIGERO_PROVER_BIN")
+                        .ok()
+                        .or_else(|| std::env::var("LIGERO_PROVER_BINARY_PATH").ok())
+                        .map(PathBuf::from)
+                })
+                .context("ligero prover binary path is required (config.ligero_prover_binary_path or LIGERO_PROVER_BIN/LIGERO_PROVER_BINARY_PATH)")?
+                .canonicalize()
+                .context("Failed to canonicalize Ligero prover binary path")?;
 
-        let paths = LigeroPaths {
-            prover_bin: prover_bin.clone(),
-            verifier_bin: bins_dir.join("webgpu_verifier"),
-            shader_dir,
-            bins_dir,
+            let shader_dir = self
+                .ligero_shader_path
+                .clone()
+                .or_else(|| std::env::var("LIGERO_SHADER_PATH").ok().map(PathBuf::from))
+                .context("ligero shader path is required (config.ligero_shader_path or LIGERO_SHADER_PATH)")?
+                .canonicalize()
+                .context("Failed to canonicalize Ligero shader path")?;
+
+            let bins_dir = prover_bin
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            let verifier_bin = std::env::var("LIGERO_VERIFIER_BIN")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| bins_dir.join("webgpu_verifier"));
+
+            let paths = LigeroPaths {
+                prover_bin: prover_bin.clone(),
+                verifier_bin,
+                shader_dir,
+                bins_dir,
+            };
+
+            LigeroRunner::new_with_paths(&program.to_string_lossy(), paths)
+        } else {
+            // Prefer runner auto-discovery (uses env overrides + git checkout discovery).
+            LigeroRunner::new(&program.to_string_lossy())
         };
-
-        let mut runner = LigeroRunner::new_with_paths(&program.to_string_lossy(), paths);
         runner.config_mut().packing = packing;
         runner.config_mut().gpu_threads = gpu_threads;
         runner.config_mut().private_indices =
             private_indices.into_iter().map(|v| v as usize).collect();
-        runner.config_mut().args = args
-            .into_iter()
-            .map(|a| match a {
-                LigeroProgramArguments::STR { str } => ligero_webgpu_runner::LigeroArg::String { str },
-                LigeroProgramArguments::I64 { i64 } => ligero_webgpu_runner::LigeroArg::I64 { i64 },
-                LigeroProgramArguments::HEX { hex } => ligero_webgpu_runner::LigeroArg::Hex { hex },
-            })
-            .collect();
+        runner.config_mut().args = args;
         if let Some(id) = &self.proof_dir_id {
             runner.set_proof_dir_id(id.clone());
         }

@@ -27,7 +27,7 @@ bincode.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
-ligero-webgpu-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "1b9ba6fd83af9ef2a2d477c50f6faded0fb03876" }
+ligero-webgpu-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "69302a512f8c988e7760d85d090728e35c10d1a0" }
 uuid = { workspace = true, features = ["v5", "v4", "std"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "macros", "sqlite"] }
 tracing-appender = { workspace = true }

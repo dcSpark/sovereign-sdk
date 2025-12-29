@@ -33,13 +33,21 @@ pub struct Config {
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_program_path: PathBuf,
 
-    /// Path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH, required)
+    /// Optional path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH).
+    ///
+    /// If unset, `ligero-webgpu-runner` will auto-discover binaries (from `LIGERO_ROOT`
+    /// or from the pinned `ligero-prover` git checkout).
+    #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_prover_binary_path: PathBuf,
+    pub ligero_prover_binary_path: Option<PathBuf>,
 
-    /// Path to Ligero shader directory (env: LIGERO_SHADER_PATH, required)
+    /// Optional path to Ligero shader directory (env: LIGERO_SHADER_PATH).
+    ///
+    /// If unset, `ligero-webgpu-runner` will auto-discover shaders (from `LIGERO_ROOT`
+    /// or from the pinned `ligero-prover` git checkout).
+    #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_shader_path: PathBuf,
+    pub ligero_shader_path: Option<PathBuf>,
 
     /// Authority Viewing Full Key (VFK) for decrypting privacy pool notes (env: AUTHORITY_VFK, optional)
     /// 32-byte hex string with or without 0x prefix

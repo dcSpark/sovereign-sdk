@@ -271,8 +271,13 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 async fn test_wallet_address_format() -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    let wallet_private_key =
-        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
+    let wallet_private_key = match std::env::var("WALLET_PRIVATE_KEY") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("⚠️  Skipping integration test: WALLET_PRIVATE_KEY not set");
+            return Ok(());
+        }
+    };
 
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let address = wallet.get_address();

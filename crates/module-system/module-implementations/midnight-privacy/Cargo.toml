@@ -28,7 +28,7 @@ serde_json = { workspace = true }
 sov-bank = { workspace = true, features = ["native", "test-utils"] }
 sov-kernels = { workspace = true }
 sov-mock-da = { workspace = true }
-ligero-webgpu-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "1b9ba6fd83af9ef2a2d477c50f6faded0fb03876" }
+ligero-webgpu-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "69302a512f8c988e7760d85d090728e35c10d1a0" }
 
 [dependencies]
 anyhow = { workspace = true }
@@ -44,7 +44,7 @@ bincode = { workspace = true }
 hex = { workspace = true }
 bech32 = { workspace = true }
 # Ligetron SDK with native field arithmetic (same Poseidon2 as circuit!)
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "1b9ba6fd83af9ef2a2d477c50f6faded0fb03876", features = ["native"] }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "69302a512f8c988e7760d85d090728e35c10d1a0", features = ["native"] }
 sov-bank = { workspace = true }
 once_cell = { workspace = true }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
