@@ -2819,7 +2819,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=69302a512f8c988e7760d85d090728e35c10d1a0#69302a512f8c988e7760d85d090728e35c10d1a0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#f2c1398bc184e59283c7b647f54be2acb5bb73d2"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
