@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
-use sov_ligero_adapter::{Ligero, LigeroCodeCommitment, LigeroVerifier};
+use sov_ligero_adapter::{Ligero, LigeroCodeCommitment};
 use sov_modules_api::{
     capabilities::UniquenessData,
     configurable_spec::ConfigurableSpec,
@@ -33,11 +33,12 @@ use sov_node_client::NodeClient;
 use sov_rollup_interface::{
     crypto::PrivateKey,
     crypto::PublicKey,
-    zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
+    zk::{CodeCommitment, CryptoSpec, Zkvm, ZkvmHost},
 };
 use std::{path::Path, sync::Arc};
 use futures::future::join_all;
 use tracing::{debug, error, info, warn};
+use std::sync::OnceLock;
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
@@ -242,6 +243,108 @@ impl AppState {
             incoming_worker_tx_saver,
         })
     }
+}
+
+fn ligero_skip_verify_enabled() -> bool {
+    std::env::var("LIGERO_SKIP_VERIFICATION")
+        .ok()
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Verify using a long-lived verifier pool hosted in a separate process.
+///
+/// - Uses `webgpu_verifier --daemon` worker processes managed in-process by `ligero_runner::daemon::DaemonPool`.
+/// - Worker count is derived from `max_concurrent_verifications` (no daemon-specific env vars).
+fn verify_with_ligero_verifier_daemon(
+    commitment: &[u8; 32],
+    package: &sov_ligero_adapter::LigeroProofPackage,
+    workers: usize,
+) -> Result<(), ServiceError> {
+    use std::collections::HashMap;
+
+    let verifier_paths = ligero_runner::verifier::VerifierPaths::discover_with_commitment(Some(commitment))
+        .map_err(|e| ServiceError::ProofError(format!("Ligero verifier config discovery failed: {e}")))?;
+
+    let args: Vec<ligero_runner::LigeroArg> = serde_json::from_slice(&package.args_json)
+        .map_err(|e| ServiceError::ProofError(format!("Failed to parse package args_json: {e}")))?;
+
+    let cfg = verifier_paths.to_config(args, package.private_indices.clone());
+    let cfg_json = serde_json::to_value(&cfg)
+        .map_err(|e| ServiceError::ProofError(format!("Failed to serialize Ligero config JSON: {e}")))?;
+
+    // Daemon verifier expects a proof path, not raw bytes: write to temp dir.
+    let dir = tempfile::tempdir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
+    let proof_path = dir.path().join("proof_data.gz");
+    std::fs::write(&proof_path, &package.proof)
+        .map_err(|e| ServiceError::Internal(format!("Failed to write proof_data.gz: {e}")))?;
+
+    // Lazily initialize (and cache) daemon pools per (verifier_bin, shader_dir).
+    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+
+    let bins_dir = verifier_paths
+        .verifier_bin
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let key = format!(
+        "{}|{}",
+        verifier_paths.verifier_bin.display(),
+        verifier_paths.shader_path.display()
+    );
+
+    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let pool = {
+        let mut guard = pools_lock.lock().unwrap();
+        if let Some(p) = guard.get(&key) {
+            p.clone()
+        } else {
+            info!(
+                "Starting Ligero verifier daemon pool (workers={}) using verifier_bin={} shader_dir={} bins_dir={}",
+                workers.max(1),
+                verifier_paths.verifier_bin.display(),
+                verifier_paths.shader_path.display(),
+                bins_dir.display(),
+            );
+            let ligero_paths = ligero_runner::LigeroPaths {
+                prover_bin: bins_dir.join("webgpu_prover"),
+                verifier_bin: verifier_paths.verifier_bin.clone(),
+                shader_dir: verifier_paths.shader_path.clone(),
+                bins_dir,
+            };
+            let created = ligero_runner::daemon::DaemonPool::new_verifier(&ligero_paths, workers.max(1))
+                .map_err(|e| ServiceError::ProofError(format!("Failed to start Ligero verifier daemon pool: {e}")))?;
+            guard.insert(key, created.clone());
+            created
+        }
+    };
+
+    let resp = pool
+        .verify(cfg_json, proof_path.to_string_lossy().as_ref())
+        .map_err(|e| ServiceError::ProofError(format!("Ligero verifier daemon request failed: {e}")))?;
+
+    if !resp.ok {
+        return Err(ServiceError::ProofError(format!(
+            "Ligero verifier daemon returned ok=false (exit_code={:?}): {}",
+            resp.exit_code,
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+
+    if resp.verify_ok != Some(true) {
+        return Err(ServiceError::ProofError(format!(
+            "Ligero verifier daemon did not confirm proof validity (verify_ok={:?})",
+            resp.verify_ok
+        )));
+    }
+
+    Ok(())
 }
 
 /// Request body for proof verification
@@ -835,6 +938,7 @@ async fn verify_and_record_midnight_handler(
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 &proof,
+                state.config.max_concurrent_verifications,
                 anchor_root,
                 nullifier,
                 0u128,
@@ -932,6 +1036,7 @@ async fn verify_and_record_midnight_handler(
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 &proof,
+                state.config.max_concurrent_verifications,
                 anchor_root,
                 nullifier,
                 withdraw_amount,
@@ -1130,6 +1235,7 @@ async fn verify_ligero_proof(
         )
     })?;
     let method_id = LigeroCodeCommitment(method_id_bytes);
+    let workers = state.config.max_concurrent_verifications;
 
     // Spawn blocking task for CPU-intensive proof verification
     let proof = proof.to_vec();
@@ -1149,9 +1255,14 @@ async fn verify_ligero_proof(
             package.public_output.len()
         );
 
-        // Use LigeroVerifier to verify the proof (same as module-level verification)
-        let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
-            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
+        let public: ValueProofPublic = if ligero_skip_verify_enabled() {
+            bincode::deserialize(&package.public_output)
+                .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?
+        } else {
+            verify_with_ligero_verifier_daemon(&method_id.0, &package, workers)?;
+            bincode::deserialize(&package.public_output)
+                .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?
+        };
 
         // Check that the public output matches the claimed value
         if public.value != value {
@@ -1414,6 +1525,7 @@ pub fn verify_midnight_transaction_signature(
 pub async fn verify_midnight_withdraw_proof(
     method_id_opt: Option<&[u8; 32]>,
     proof: &[u8],
+    workers: usize,
     expected_anchor_root: MidnightHash32,
     expected_nullifier: MidnightHash32,
     expected_withdraw_amount: u128,
@@ -1445,8 +1557,14 @@ pub async fn verify_midnight_withdraw_proof(
             package.public_output.len()
         );
 
-        let public: SpendPublic = LigeroVerifier::verify(&proof_vec, &method_id)
-            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
+        let public: SpendPublic = if ligero_skip_verify_enabled() {
+            bincode::deserialize(&package.public_output)
+                .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?
+        } else {
+            verify_with_ligero_verifier_daemon(&method_id.0, &package, workers)?;
+            bincode::deserialize(&package.public_output)
+                .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?
+        };
 
         if public.anchor_root != expected_anchor_root {
             return Err(ServiceError::ProofError(format!(

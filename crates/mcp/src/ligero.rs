@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use ligero_webgpu_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
+use ligero_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
 use serde::{Deserialize, Serialize};
 
 /// Program argument encoding expected by the Ligero prover/verifier JSON interface.
@@ -20,7 +20,7 @@ pub enum LigeroProgramArguments {
 
 /// Minimal wrapper used by MCP to generate Ligero proofs.
 ///
-/// All actual `webgpu_prover` process execution is delegated to `ligero-webgpu-runner`.
+/// All actual `webgpu_prover` process execution is delegated to `ligero-runner`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ligero {
     ligero_prover_binary_path: Option<PathBuf>,
@@ -145,9 +145,9 @@ impl Ligero {
         runner.config_mut().args = args
             .into_iter()
             .map(|a| match a {
-                LigeroProgramArguments::STR { str } => ligero_webgpu_runner::LigeroArg::String { str },
-                LigeroProgramArguments::I64 { i64 } => ligero_webgpu_runner::LigeroArg::I64 { i64 },
-                LigeroProgramArguments::HEX { hex } => ligero_webgpu_runner::LigeroArg::Hex { hex },
+                LigeroProgramArguments::STR { str } => ligero_runner::LigeroArg::String { str },
+                LigeroProgramArguments::I64 { i64 } => ligero_runner::LigeroArg::I64 { i64 },
+                LigeroProgramArguments::HEX { hex } => ligero_runner::LigeroArg::Hex { hex },
             })
             .collect();
         if let Some(id) = &self.proof_dir_id {

@@ -13,7 +13,7 @@ export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-50}"
 
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm}"
 # Sovereign no longer vendors Ligero binaries/shaders.
-# Prefer `ligero-webgpu-runner` auto-discovery. If you want to override discovery,
+# Prefer `ligero-runner` auto-discovery. If you want to override discovery,
 # set these env vars explicitly before running this script:
 # - LIGERO_PROVER_BIN or LIGERO_PROVER_BINARY_PATH
 # - LIGERO_VERIFIER_BIN

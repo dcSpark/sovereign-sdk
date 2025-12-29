@@ -219,7 +219,7 @@ impl LigeroTestConfig {
 
         set_path_if_missing_or_invalid("LIGERO_PROGRAM_PATH", &self.program_path);
         // NOTE: Do NOT set LIGERO_PROVER_BIN/LIGERO_VERIFIER_BIN/LIGERO_SHADER_PATH here.
-        // Sovereign no longer vendors Ligero binaries/shaders; `ligero-webgpu-runner` is responsible
+        // Sovereign no longer vendors Ligero binaries/shaders; `ligero-runner` is responsible
         // for discovering them from `LIGERO_ROOT` or the `ligero-prover` git checkout.
 
         let should_set_packing = match std::env::var("LIGERO_PACKING") {
@@ -879,7 +879,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
         program_path().context("Set LIGERO_PROGRAM_PATH to note_spend.wasm guest program")?;
 
     // Use the centralized Ligero runner crate (owned by ligero-prover) for discovery + execution.
-    let mut runner = ligero_webgpu_runner::LigeroRunner::new(&program.to_string_lossy());
+    let mut runner = ligero_runner::LigeroRunner::new(&program.to_string_lossy());
     runner.config_mut().packing = packing;
 
     println!("✓ Prover:      {}", runner.paths().prover_bin.display());
@@ -1020,12 +1020,12 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     runner.config_mut().private_indices = private_indices.clone();
     runner.config_mut().args = args.clone().into_iter().map(|v| {
         // The test builds JSON values; decode to LigeroArg via serde_json.
-        serde_json::from_value::<ligero_webgpu_runner::LigeroArg>(v).expect("valid LigeroArg")
+        serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
     }).collect();
 
     // Generate proof (compressed proof_data.gz bytes)
     let proof_bytes = runner
-        .run_prover_with_options(ligero_webgpu_runner::ProverRunOptions {
+        .run_prover_with_options(ligero_runner::ProverRunOptions {
             keep_proof_dir: false,
             proof_outputs_base: None,
             write_replay_script: true,
@@ -1037,7 +1037,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    let vpaths = ligero_webgpu_runner::verifier::VerifierPaths::from_explicit(
+    let vpaths = ligero_runner::verifier::VerifierPaths::from_explicit(
         program.to_path_buf(),
         std::path::PathBuf::from(&runner.config().shader_path),
         runner.paths().verifier_bin.clone(),
@@ -1045,13 +1045,13 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     );
 
     // Convert args JSON -> LigeroArg and let the verifier helper redact private ones.
-    let args_for_verify: Vec<ligero_webgpu_runner::LigeroArg> = args
+    let args_for_verify: Vec<ligero_runner::LigeroArg> = args
         .clone()
         .into_iter()
         .map(|v| serde_json::from_value(v).expect("valid LigeroArg"))
         .collect();
 
-    ligero_webgpu_runner::verifier::verify_proof(
+    ligero_runner::verifier::verify_proof(
         &vpaths,
         &proof_bytes,
         args_for_verify,

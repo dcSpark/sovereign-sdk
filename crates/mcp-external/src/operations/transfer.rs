@@ -748,14 +748,15 @@ pub async fn transfer(
         view_attestations,
     };
 
-    let proof_package = LigeroProofPackage {
-        proof: proof_bytes_raw,
-        public_output: bincode::serialize(&public_output)
-            .context("Failed to serialize spend public output")?,
-        args_json: serde_json::to_vec(&proof_args_for_package)
-            .context("Failed to serialize Ligero args for package")?,
-        private_indices: private_indices_for_package,
-    };
+    let args_json = serde_json::to_vec(&proof_args_for_package)
+        .context("Failed to serialize Ligero args for package")?;
+    let proof_package = LigeroProofPackage::new(
+        proof_bytes_raw,
+        bincode::serialize(&public_output).context("Failed to serialize spend public output")?,
+        args_json,
+        private_indices_for_package,
+    )
+    .context("Failed to build LigeroProofPackage")?;
 
     let proof_bytes =
         bincode::serialize(&proof_package).context("Failed to serialize Ligero proof package")?;

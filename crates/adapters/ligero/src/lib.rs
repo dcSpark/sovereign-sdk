@@ -121,6 +121,8 @@ use thiserror::Error;
 mod guest;
 pub use guest::LigeroGuest;
 
+pub use ligero_runner::LigeroProofPackage;
+
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
@@ -279,21 +281,6 @@ impl<'de> Visitor<'de> for LigeroCodeCommitmentVisitor {
         data.copy_from_slice(v);
         Ok(LigeroCodeCommitment(data))
     }
-}
-
-/// A Ligero proof package containing both the proof and serialized public output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LigeroProofPackage {
-    /// The compressed Ligero proof bytes (from proof_data.gz - boost serialized + gzipped).
-    pub proof: Vec<u8>,
-    /// Serialized public output committed by the guest program.
-    pub public_output: Vec<u8>,
-    /// Arguments passed to the guest program (JSON-serialized for bincode compatibility).
-    #[cfg(feature = "native")]
-    pub args_json: Vec<u8>,
-    /// Indices of private arguments (1-based).
-    #[cfg(feature = "native")]
-    pub private_indices: Vec<usize>,
 }
 
 /// Verifier for Ligero proofs
@@ -467,7 +454,7 @@ mod tests {
 }
 #[cfg(feature = "native")]
 mod native {
-    pub use ligero_webgpu_runner::verifier::{
+    pub use ligero_runner::verifier::{
         ensure_code_commitment, verify_proof, verify_proof_with_output, VerifierPaths,
     };
 }

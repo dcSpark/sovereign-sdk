@@ -7051,9 +7051,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "ligero-webgpu-runner"
+name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#f2c1398bc184e59283c7b647f54be2acb5bb73d2"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7068,7 +7068,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#f2c1398bc184e59283c7b647f54be2acb5bb73d2"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -7332,7 +7332,7 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
- "ligero-webgpu-runner",
+ "ligero-runner",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.26",
@@ -7372,7 +7372,7 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
- "ligero-webgpu-runner",
+ "ligero-runner",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.26",
@@ -7472,11 +7472,13 @@ dependencies = [
  "anyhow",
  "axum 0.7.9",
  "base64 0.22.1",
+ "bincode",
  "borsh",
  "chrono",
  "clap",
  "demo-stf",
  "hex",
+ "ligero-runner",
  "midnight-privacy",
  "num_cpus",
  "rand 0.8.5",
@@ -7509,7 +7511,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
- "ligero-webgpu-runner",
+ "ligero-runner",
  "ligetron",
  "once_cell",
  "schemars 0.8.22",
@@ -12832,7 +12834,7 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
- "ligero-webgpu-runner",
+ "ligero-runner",
  "ligetron",
  "proptest",
  "rand 0.8.5",
@@ -13214,6 +13216,7 @@ dependencies = [
  "demo-stf",
  "futures",
  "hex",
+ "ligero-runner",
  "midnight-privacy",
  "reqwest 0.12.26",
  "sea-orm",

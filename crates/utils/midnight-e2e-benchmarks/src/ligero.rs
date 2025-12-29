@@ -36,7 +36,7 @@ pub fn setup_ligero_env() -> Result<LigeroEnv> {
 
     // Export the env vars that are still required by downstream tools.
     //
-    // NOTE: Prover/verifier binary discovery now lives in `ligero-webgpu-runner` and uses
+    // NOTE: Prover/verifier binary discovery now lives in `ligero-runner` and uses
     // the portable binaries shipped with the Ligero repo. Sovereign callers should not need
     // to set `LIGERO_PROVER_BIN`, `LIGERO_VERIFIER_BIN`, or `LIGERO_SHADER_PATH`.
     std::env::set_var("LIGERO_PROGRAM_PATH", &program_path);

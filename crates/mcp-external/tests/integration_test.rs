@@ -22,7 +22,7 @@ use sov_modules_api::execution_mode::Native;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
-use ligero_webgpu_runner::LigeroRunner;
+use ligero_runner::LigeroRunner;
 
 fn env_opt(var: &str) -> Option<std::path::PathBuf> {
     std::env::var(var).ok().map(std::path::PathBuf::from)

@@ -4,7 +4,7 @@ use std::env;
 use std::path::PathBuf;
 
 use crate::ligero::Ligero;
-use ligero_webgpu_runner::LigeroRunner;
+use ligero_runner::LigeroRunner;
 
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
@@ -34,7 +34,7 @@ pub fn create_test_ligero() -> Option<Ligero> {
         return None;
     }
 
-    // Prefer env overrides, otherwise use ligero-webgpu-runner's built-in discovery (git checkout / LIGERO_ROOT).
+    // Prefer env overrides, otherwise use ligero-runner's built-in discovery (git checkout / LIGERO_ROOT).
     let runner = LigeroRunner::new(&program.to_string_lossy());
     let prover = env_opt("LIGERO_PROVER_BIN")
         .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))

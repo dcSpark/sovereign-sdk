@@ -35,7 +35,7 @@ pub struct Config {
 
     /// Optional path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH).
     ///
-    /// If unset, `ligero-webgpu-runner` will auto-discover binaries (from `LIGERO_ROOT`
+    /// If unset, `ligero-runner` will auto-discover binaries (from `LIGERO_ROOT`
     /// or from the pinned `ligero-prover` git checkout).
     #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]
@@ -43,7 +43,7 @@ pub struct Config {
 
     /// Optional path to Ligero shader directory (env: LIGERO_SHADER_PATH).
     ///
-    /// If unset, `ligero-webgpu-runner` will auto-discover shaders (from `LIGERO_ROOT`
+    /// If unset, `ligero-runner` will auto-discover shaders (from `LIGERO_ROOT`
     /// or from the pinned `ligero-prover` git checkout).
     #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]

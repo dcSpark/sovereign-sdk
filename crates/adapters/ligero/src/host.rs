@@ -1,12 +1,12 @@
 //! Host implementation for Ligero zkVM.
 //!
-//! Most of the implementation lives in `ligero-webgpu-runner` (Ligero-owned repo).
+//! Most of the implementation lives in `ligero-runner` (Ligero-owned repo).
 //! This adapter keeps a small wrapper so we can implement Sovereign traits without
 //! running into Rust's orphan rules.
 
-use anyhow::Result;
-pub use ligero_webgpu_runner::{LigeroArg, LigeroConfig};
-use ligero_webgpu_runner::sovereign_host::LigeroHostCore;
+use anyhow::{Context, Result};
+pub use ligero_runner::{LigeroArg, LigeroConfig};
+use ligero_runner::sovereign_host::LigeroHostCore;
 use serde::Serialize;
 use sov_rollup_interface::zk::ZkvmHost;
 use std::ops::{Deref, DerefMut};
@@ -62,12 +62,15 @@ impl LigeroHost {
         let public_output = self.0.require_public_output()?;
         let (proof, stdout) = self.0.run_prover_with_output()?;
 
-        let package = LigeroProofPackage {
+        let args_json = serde_json::to_vec(&self.0.runner().config().args)
+            .context("Failed to serialize Ligero args as JSON")?;
+        let package = LigeroProofPackage::new(
             proof,
             public_output,
-            args_json: serde_json::to_vec(&self.0.runner().config().args)?,
-            private_indices: self.0.runner().config().private_indices.clone(),
-        };
+            args_json,
+            self.0.runner().config().private_indices.clone(),
+        )
+        .context("Failed to build LigeroProofPackage")?;
 
         Ok((bincode::serialize(&package)?, stdout))
     }
@@ -97,12 +100,15 @@ impl ZkvmHost for LigeroHost {
             let public_output = self.0.require_public_output()?;
             let proof = self.0.run_prover()?;
 
-            let package = LigeroProofPackage {
+            let args_json = serde_json::to_vec(&self.0.runner().config().args)
+                .context("Failed to serialize Ligero args as JSON")?;
+            let package = LigeroProofPackage::new(
                 proof,
                 public_output,
-                args_json: serde_json::to_vec(&self.0.runner().config().args)?,
-                private_indices: self.0.runner().config().private_indices.clone(),
-            };
+                args_json,
+                self.0.runner().config().private_indices.clone(),
+            )
+            .context("Failed to build LigeroProofPackage")?;
 
             Ok(bincode::serialize(&package)?)
         } else {
@@ -118,12 +124,15 @@ impl ZkvmHost for LigeroHost {
                 .map(|b| b.to_vec())
                 .unwrap_or_default();
 
-            let package = LigeroProofPackage {
-                proof: vec![],
+            let args_json = serde_json::to_vec(&self.0.runner().config().args)
+                .context("Failed to serialize Ligero args as JSON")?;
+            let package = LigeroProofPackage::new(
+                vec![],
                 public_output,
-                args_json: serde_json::to_vec(&self.0.runner().config().args)?,
-                private_indices: self.0.runner().config().private_indices.clone(),
-            };
+                args_json,
+                self.0.runner().config().private_indices.clone(),
+            )
+            .context("Failed to build LigeroProofPackage")?;
 
             Ok(bincode::serialize(&package)?)
         }

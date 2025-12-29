@@ -1023,7 +1023,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -3333,9 +3333,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ligero-runner"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#f2c1398bc184e59283c7b647f54be2acb5bb73d2"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -3776,7 +3791,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af1844ef2428cc3e1cb900be36181049ef3d3193c63e43026cfe202983b27a56"
 dependencies = [
- "proc-macro-crate 3.2.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -6151,6 +6166,7 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
+ "ligero-runner",
  "schemars 0.8.21",
  "serde",
  "serde_json",

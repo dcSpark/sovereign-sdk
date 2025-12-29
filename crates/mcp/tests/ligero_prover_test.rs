@@ -2,7 +2,7 @@
 
 use std::{env, path::PathBuf};
 
-use ligero_webgpu_runner::LigeroRunner;
+use ligero_runner::LigeroRunner;
 use mcp::ligero::{Ligero, LigeroProgramArguments};
 
 const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";

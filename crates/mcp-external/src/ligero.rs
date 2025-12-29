@@ -6,15 +6,15 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use ligero_webgpu_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
+use ligero_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
 use serde::{Deserialize, Serialize};
 
 /// Program argument encoding expected by the Ligero prover/verifier JSON interface.
-pub use ligero_webgpu_runner::LigeroArg as LigeroProgramArguments;
+pub use ligero_runner::LigeroArg as LigeroProgramArguments;
 
 /// Minimal wrapper used by MCP to generate Ligero proofs.
 ///
-/// All actual `webgpu_prover` process execution is delegated to `ligero-webgpu-runner`.
+/// All actual `webgpu_prover` process execution is delegated to `ligero-runner`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ligero {
     ligero_prover_binary_path: Option<PathBuf>,

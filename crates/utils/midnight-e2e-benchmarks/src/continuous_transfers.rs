@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::io::{self, Write};
 use std::fs;
 
@@ -50,6 +51,29 @@ const MISSING_NOTE_RETRY_MAX: usize = 10;
 const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
+
+fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
+    static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+    let lock = POOL.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = lock.lock().unwrap();
+    if let Some(p) = guard.as_ref() {
+        return Ok(p.clone());
+    }
+
+    let paths = ligero_runner::LigeroPaths::discover()
+        .or_else(|_| Ok::<_, anyhow::Error>(ligero_runner::LigeroPaths::fallback()))?;
+    let workers = workers.max(1);
+    eprintln!(
+        "[prover-daemon] starting webgpu_prover --daemon pool: workers={} prover_bin={} shader_dir={}",
+        workers,
+        paths.prover_bin.display(),
+        paths.shader_dir.display()
+    );
+    let pool = ligero_runner::daemon::DaemonPool::new_prover(&paths, workers)?;
+    *guard = Some(pool.clone());
+    Ok(pool)
+}
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
@@ -1415,6 +1439,7 @@ async fn perform_transfer_cycle(
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
         let authority_fvk = authority_fvk; // Copy for closure
+        let daemon_workers = config.max_concurrent_proofs;
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
@@ -1523,8 +1548,49 @@ async fn perform_transfer_cycle(
                 host.set_public_output(&public)
                     .context("set public output (round 2)")?;
 
-                let proof_data =
-                    host.run(true).context("generate second-round transfer proof")?;
+                // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
+                let proof_data = (|| -> anyhow::Result<Vec<u8>> {
+                    let public_output = host.require_public_output()?;
+                    let cfg = host.runner().config().clone();
+                    let mut cfg_json = serde_json::to_value(&cfg)?;
+
+                    // Provide an explicit, unique proof output path to the daemon.
+                    // Relying on the daemon's internal temp-path generator can collide across
+                    // multiple daemon processes started at the same time (same timestamp + per-process counter).
+                    let tmp = tempfile::tempdir()?;
+                    let proof_path = tmp.path().join("proof_data.gz");
+                    if let serde_json::Value::Object(ref mut map) = cfg_json {
+                        map.insert(
+                            "proof-path".to_string(),
+                            serde_json::Value::String(proof_path.to_string_lossy().to_string()),
+                        );
+                    }
+
+                    let pool = prover_daemon_pool(daemon_workers)
+                        .context("initialize ligero prover daemon pool")?;
+                    let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
+                    if !resp.ok {
+                        anyhow::bail!(
+                            "prover daemon returned ok=false (exit_code={:?}): {}",
+                            resp.exit_code,
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                    }
+                    // Daemon will echo `proof_path`, but we read from our explicitly-provided path.
+                    let proof_bytes = std::fs::read(&proof_path)
+                        .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
+                    drop(tmp); // cleanup temp directory
+
+                    let args_json = serde_json::to_vec(&cfg.args)?;
+                    let pkg = ligero_runner::LigeroProofPackage::new(
+                        proof_bytes,
+                        public_output,
+                        args_json,
+                        cfg.private_indices.clone(),
+                    )?;
+                    Ok(bincode::serialize(&pkg)?)
+                })()
+                .context("generate second-round transfer proof via daemon")?;
                 Ok((account_idx, proof_data, out_rho, out_spend_sk))
             })
             .await
