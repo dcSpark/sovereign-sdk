@@ -4,6 +4,7 @@ use std::env;
 use std::path::PathBuf;
 
 use crate::ligero::Ligero;
+use ligero_webgpu_runner::LigeroRunner;
 
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
@@ -13,35 +14,35 @@ fn env_path(var: &str, default_rel: &str) -> PathBuf {
     }
 }
 
-/// Helper function to get the platform-specific binary directory
-#[allow(dead_code)]
-pub fn get_platform_bin_dir() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos-arm64"
-    } else if cfg!(target_os = "linux") {
-        "linux-amd64"
-    } else {
-        panic!("Unsupported platform for Ligero tests");
-    }
+fn env_opt(var: &str) -> Option<PathBuf> {
+    env::var(var).ok().map(PathBuf::from)
 }
 
 /// Helper function to create a Ligero instance for testing
 #[allow(dead_code)]
 pub fn create_test_ligero() -> Option<Ligero> {
-    let platform_dir = get_platform_bin_dir();
-
-    // Defaults are best-effort; callers can override with env vars pointing to local Ligero assets.
-    let prover = env_path(
-        "LIGERO_PROVER_BINARY_PATH",
-        &format!("../adapters/ligero/bins/{}/bin/webgpu_prover", platform_dir),
-    );
-    let shader = env_path("LIGERO_SHADER_PATH", "../adapters/ligero/bins/shader");
     let program = env_path(
         "LIGERO_PROGRAM_PATH",
         "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm",
     );
 
-    for (label, path) in [("prover", &prover), ("shader", &shader), ("program", &program)] {
+    if !program.exists() {
+        eprintln!(
+            "⚠️  Skipping Ligero tests: program path not found at {}",
+            program.display()
+        );
+        return None;
+    }
+
+    // Prefer env overrides, otherwise use ligero-webgpu-runner's built-in discovery (git checkout / LIGERO_ROOT).
+    let runner = LigeroRunner::new(&program.to_string_lossy());
+    let prover = env_opt("LIGERO_PROVER_BIN")
+        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
+        .unwrap_or_else(|| runner.paths().prover_bin.clone());
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| PathBuf::from(runner.config().shader_path.clone()));
+
+    for (label, path) in [("prover", &prover), ("shader", &shader)] {
         if !path.exists() {
             eprintln!(
                 "⚠️  Skipping Ligero tests: {} path not found at {}",
