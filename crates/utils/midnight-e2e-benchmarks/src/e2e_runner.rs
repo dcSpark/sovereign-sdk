@@ -72,7 +72,7 @@ impl Default for RunnerConfig {
             use_proof_cache: false,
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
-            max_concurrent_proofs: num_cpus::get(),
+            max_concurrent_proofs: 5,
             defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
             authority_fvk: None,

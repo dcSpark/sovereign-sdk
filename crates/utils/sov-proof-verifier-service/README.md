@@ -111,7 +111,7 @@ export BIND_ADDRESS="127.0.0.1:8080"
 export NODE_RPC_URL="http://127.0.0.1:12346"
 export SIGNING_KEY_PATH="../test-data/keys/token_deployer_private_key.json"
 export METHOD_ID="0x..."
-export MAX_CONCURRENT_VERIFICATIONS="10"
+export MAX_CONCURRENT_VERIFICATIONS="5"
 export LOG_LEVEL="info"
 
 ./target/release/proof-verifier

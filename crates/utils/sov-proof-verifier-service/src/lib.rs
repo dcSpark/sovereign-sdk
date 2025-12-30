@@ -272,16 +272,22 @@ fn verify_with_ligero_verifier_daemon(
     let args: Vec<ligero_runner::LigeroArg> = serde_json::from_slice(&package.args_json)
         .map_err(|e| ServiceError::ProofError(format!("Failed to parse package args_json: {e}")))?;
 
-    let cfg = verifier_paths.to_config(args, package.private_indices.clone());
+    let mut cfg = verifier_paths.to_config(args, package.private_indices.clone());
+
+    // Uncompressed proofs: `webgpu_verifier` can now read either gzip or raw proofs, and we
+    // default Sovereign integration to raw to avoid gzip CPU overhead.
+    cfg.gzip_proof = false;
+    cfg.proof_path = Some("proof_data.bin".to_string());
+
     let cfg_json = serde_json::to_value(&cfg)
         .map_err(|e| ServiceError::ProofError(format!("Failed to serialize Ligero config JSON: {e}")))?;
 
     // Daemon verifier expects a proof path, not raw bytes: write to temp dir.
     let dir = tempfile::tempdir()
         .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
-    let proof_path = dir.path().join("proof_data.gz");
+    let proof_path = dir.path().join("proof_data.bin");
     std::fs::write(&proof_path, &package.proof)
-        .map_err(|e| ServiceError::Internal(format!("Failed to write proof_data.gz: {e}")))?;
+        .map_err(|e| ServiceError::Internal(format!("Failed to write proof_data.bin: {e}")))?;
 
     // Lazily initialize (and cache) daemon pools per (verifier_bin, shader_dir).
     static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =

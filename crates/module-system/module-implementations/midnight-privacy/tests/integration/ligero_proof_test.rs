@@ -1023,7 +1023,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
         serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
     }).collect();
 
-    // Generate proof (compressed proof_data.gz bytes)
+    // Generate proof bytes (default: compressed `proof_data.gz`; when gzip is disabled: `proof_data.bin`).
     let proof_bytes = runner
         .run_prover_with_options(ligero_runner::ProverRunOptions {
             keep_proof_dir: false,

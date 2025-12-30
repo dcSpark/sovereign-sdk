@@ -281,7 +281,7 @@ Shielded → Shielded (Transfer)
 
 - `midnight_withdraw_tx.bin` - Borsh-serialized transaction
 - `midnight_withdraw_tx.json` - JSON payload for API
-- `proof_data.gz` - Compressed Ligero proof (temporary)
+- `proof_data.gz` / `proof_data.bin` - Ligero proof (temporary). The exact filename depends on whether proof gzipping is enabled.
 
 ## Security Considerations
 

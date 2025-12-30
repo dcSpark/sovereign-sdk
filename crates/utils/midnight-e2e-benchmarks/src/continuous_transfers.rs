@@ -127,7 +127,7 @@ impl ContinuousConfig {
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(num_cpus::get);
+            .unwrap_or(5);
 
         let detailed_wallet_logs = std::env::var("DETAILED_WALLET_LOGS")
             .ok()
@@ -351,7 +351,7 @@ async fn start_managed_stack(
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
 
-    let verifier_parallelism = std::cmp::max(4, config.max_concurrent_proofs);
+    let verifier_parallelism = std::cmp::max(1, config.max_concurrent_proofs);
     let verifier_url = start_local_verifier(
         &api_url,
         ligero_env.method_id,
@@ -1558,12 +1558,15 @@ async fn perform_transfer_cycle(
                     // Relying on the daemon's internal temp-path generator can collide across
                     // multiple daemon processes started at the same time (same timestamp + per-process counter).
                     let tmp = tempfile::tempdir()?;
-                    let proof_path = tmp.path().join("proof_data.gz");
+                    let proof_path = tmp.path().join("proof_data.bin");
                     if let serde_json::Value::Object(ref mut map) = cfg_json {
                         map.insert(
                             "proof-path".to_string(),
                             serde_json::Value::String(proof_path.to_string_lossy().to_string()),
                         );
+                        // Request uncompressed proofs: this significantly reduces CPU overhead
+                        // (gzip compress/decompress) while keeping proving/verifying correctness.
+                        map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
                     }
 
                     let pool = prover_daemon_pool(daemon_workers)

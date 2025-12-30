@@ -129,7 +129,7 @@ ENV \
     NODE_RPC_URL=http://localhost:12346 \
     SIGNING_KEY_PATH=/app/keys/token_deployer_private_key.json \
     METHOD_ID=0x698c44527e4fa3f934471015da3caa61da1f4e167107dbba9df71a6545396fb3 \
-    MAX_CONCURRENT_VERIFICATIONS=10 \
+    MAX_CONCURRENT_VERIFICATIONS=5 \
     LOG_LEVEL=debug \
     LIGERO_PROGRAM_PATH=/app/ligero/programs/value_validator.wasm \
     LIGERO_SHADER_PATH=/app/ligero/shader \
