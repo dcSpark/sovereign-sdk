@@ -174,8 +174,8 @@ fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Ha
 /// Configuration for Ligero test environment
 #[derive(Debug)]
 struct LigeroTestConfig {
-    /// Path to the WASM program
-    program_path: PathBuf,
+    /// Ligero program specifier: circuit name (preferred) or full `.wasm` path
+    program: String,
     /// FFT packing parameter
     packing: u32,
 }
@@ -183,44 +183,22 @@ struct LigeroTestConfig {
 impl LigeroTestConfig {
     /// Discover paths for note spend guest (complex hex arguments)
     fn discover() -> Result<Self> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .context("Could not find repository root")?;
-
-        let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-        let config = Self {
-            program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
-            packing: 8192,
-        };
+        let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+        let config = Self { program, packing: 8192 };
 
         Ok(config)
     }
 
     /// Apply this configuration to the environment
     fn apply(&self) -> Result<()> {
-        // Only set environment variables if they're not already set, or if they
-        // point to paths that don't exist (common when the on-disk layout changes).
-        // This preserves manual overrides while keeping CI/dev setups resilient.
-        fn set_path_if_missing_or_invalid(var: &str, desired: &PathBuf) {
-            let should_set = match std::env::var(var) {
-                Ok(existing) => !PathBuf::from(existing).exists(),
-                Err(_) => true,
-            };
-            if should_set {
-                std::env::set_var(var, desired);
-                println!("Set {}={}", var, desired.display());
-            }
+        // Only set the program if the user didn't provide one.
+        if std::env::var("LIGERO_PROGRAM_PATH").is_err() {
+            std::env::set_var("LIGERO_PROGRAM_PATH", &self.program);
+            println!("Set LIGERO_PROGRAM_PATH={}", self.program);
         }
-
-        set_path_if_missing_or_invalid("LIGERO_PROGRAM_PATH", &self.program_path);
         // NOTE: Do NOT set LIGERO_PROVER_BIN/LIGERO_VERIFIER_BIN/LIGERO_SHADER_PATH here.
         // Sovereign no longer vendors Ligero binaries/shaders; `ligero-runner` is responsible
-        // for discovering them from `LIGERO_ROOT` or the `ligero-prover` git checkout.
+        // for discovering them from the pinned `ligero-prover` git checkout.
 
         let should_set_packing = match std::env::var("LIGERO_PACKING") {
             Ok(existing) => existing.parse::<u32>().is_err(),
@@ -244,12 +222,13 @@ impl LigeroTestConfig {
 
     /// Check if all required files exist
     fn validate(&self) -> Result<()> {
-        if !self.program_path.exists() {
-            anyhow::bail!(
-                "WASM program not found at: {}\nRun (in ligero-prover): cd utils/circuits/note-spend-guest && cargo build --release --target wasm32-unknown-unknown",
-                self.program_path.display()
-            );
-        }
+        // Ensure the program can be resolved before running expensive GPU work.
+        ligero_runner::resolve_program(&self.program).with_context(|| {
+            format!(
+                "Failed to resolve Ligero program '{}'. Set LIGERO_PROGRAM_PATH to a circuit name (e.g. note_spend_guest) or a full path to a .wasm",
+                self.program
+            )
+        })?;
 
         // Note: verifier_bin and shader_path might not exist in all environments
         // We'll let those fail at runtime if actually needed
@@ -279,8 +258,8 @@ fn setup_ligero_env() -> Result<String> {
         .apply()
         .context("Failed to apply Ligero configuration")?;
 
-    // Return the program path for convenience
-    Ok(config.program_path.to_string_lossy().to_string())
+    // Return the program specifier for convenience
+    Ok(config.program)
 }
 
 /// Simple test demonstrating note spending with the note_spend_guest program
@@ -825,23 +804,8 @@ fn hex32(h: &Hash32) -> String {
 
 
 /// Helper to discover guest program path and platform-specific binaries
-fn program_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LIGERO_PROGRAM_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Try to discover it based on project structure
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    // For note spending, we'd need a different guest program
-    // For now, return the note_spend_guest as the implementation
-    Ok(repo_root.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"))
+fn program_spec() -> String {
+    std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string())
 }
 
 const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
@@ -875,18 +839,17 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8192);
-    let program =
-        program_path().context("Set LIGERO_PROGRAM_PATH to note_spend.wasm guest program")?;
+    let program = program_spec();
 
     // Use the centralized Ligero runner crate (owned by ligero-prover) for discovery + execution.
-    let mut runner = ligero_runner::LigeroRunner::new(&program.to_string_lossy());
+    let mut runner = ligero_runner::LigeroRunner::new(&program);
     runner.config_mut().packing = packing;
 
     println!("✓ Prover:      {}", runner.paths().prover_bin.display());
     println!("✓ Verifier:    {}", runner.paths().verifier_bin.display());
     println!("✓ Shaders:     {}", runner.config().shader_path);
     println!("✓ Packing:     {}", packing);
-    println!("✓ Program:     {}", program.display());
+    println!("✓ Program:     {}", program);
 
     // ---- 1) Create a note + tree ----
     println!("\nStep 1: Creating note and building Merkle tree...");
@@ -1006,7 +969,7 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     println!("✓ Private indices: {:?}", private_indices);
 
     let _prove_cfg = json!({
-        "program": program.to_string_lossy(),
+        "program": program.clone(),
         "shader-path": runner.config().shader_path.clone(),
         "packing": packing,
         "private-indices": private_indices,
@@ -1037,9 +1000,13 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
+    // Resolve the program name to an actual path
+    let program_path = ligero_runner::resolve_program(&program)
+        .context("Failed to resolve program path for verifier")?;
+
     let vpaths = ligero_runner::verifier::VerifierPaths::from_explicit(
-        program.to_path_buf(),
-        std::path::PathBuf::from(&runner.config().shader_path),
+        program_path,
+        PathBuf::from(&runner.config().shader_path),
         runner.paths().verifier_bin.clone(),
         packing,
     );
@@ -1243,7 +1210,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     let out2_recipient = recipient_from_pk(&domain, &out2_pk);
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
 
-    let program_path = config.program_path.to_string_lossy().to_string();
+    let program_path = config.program.clone();
     let depth = siblings.len();
     
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
@@ -1382,7 +1349,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let change_recipient = recipient_from_pk(&domain, &change_pk);
     let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
 
-    let program_path = config.program_path.to_string_lossy().to_string();
+    let program_path = config.program.clone();
     let depth = siblings.len();
     
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
@@ -2012,7 +1979,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
                 println!("  ✓  Circuit contains balance assertion: value (600) == withdraw (1000) + outputs (0)");
                 println!("  ✓  Assertion WOULD fail in production: 600 ≠ 1000");
                 println!(
-                    "  ℹ️  See ligero-prover/utils/circuits/note-spend-guest/src/main.rs for the guest-side balance check implementation"
+                    "  ℹ️  See `<ligero-prover>/utils/circuits/bins/note_spend_guest.wat` for a readable version of the guest program."
                 );
             }
         }
@@ -2031,7 +1998,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("\nCircuit Protection:");
     println!("  ✅ Balance assertion implemented: value_in == sum(value_out) + withdraw_amount");
     println!("  ✅ Circuit code verifies: 600 == 1000 + 0 (fails!)");
-    println!("  ✅ See ligero-prover/utils/circuits/note-spend-guest/src/main.rs for implementation");
+    println!("  ✅ See `<ligero-prover>/utils/circuits/bins/note_spend_guest.wat` for a readable version of the guest program.");
     println!("\nSecurity Properties Demonstrated:");
     println!("  • Circuit contains balance check preventing supply inflation");
     println!("  • Cannot withdraw more than note value without outputs to balance");

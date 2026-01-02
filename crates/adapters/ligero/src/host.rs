@@ -34,7 +34,12 @@ impl DerefMut for LigeroHost {
 impl LigeroHost {
     /// Create a new LigeroHost with the given WASM program path.
     pub fn new(program_path: &str) -> Self {
-        Self(LigeroHostCore::new(program_path))
+        let mut host = Self(LigeroHostCore::new(program_path));
+        // Default to raw (uncompressed) proofs:
+        // - avoids gzip CPU overhead
+        // - matches the proof-verifier-service default verification config (`gzip-proof=false`)
+        host.0.runner_mut().config_mut().gzip_proof = false;
+        host
     }
 
     /// Set the packing size.

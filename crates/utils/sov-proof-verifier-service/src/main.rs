@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!("No value-setter method ID provided, will auto-compute from value_validator.wasm");
+        info!("No value-setter method ID provided, will auto-compute from value_validator_rust.wasm");
         None
     };
 
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
     let config = ServiceConfig {
         node_rpc_url: args.node_rpc_url,
         signing_key_path: args.signing_key_path,
-        value_setter_method_id, // Will be auto-computed from value_validator.wasm if None
+        value_setter_method_id, // Will be auto-computed from value_validator_rust.wasm if None
         midnight_method_id,     // Will be auto-computed from note_spend_guest.wasm if None
         chain_id: args.chain_id,
         max_concurrent_verifications: args.max_concurrent,

@@ -50,11 +50,6 @@ ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", branch = "fea
 anyhow = { workspace = true }
 sov-zkvm-utils = { workspace = true }
 
-[[example]]
-name = "generate_value_proof"
-path = "examples/generate_value_proof.rs"
-required-features = ["native"]
-
 [[test]]
 name = "integration"
 path = "tests/integration.rs"

@@ -69,7 +69,7 @@ Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be repo
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
-- `LIGERO_PROGRAM_PATH` (default: `../adapters/ligero/guest/bins/programs/note_spend_guest.wasm`)
+- `LIGERO_PROGRAM_PATH`: optional override (either a circuit name like `note_spend_guest` or a full path to a `.wasm` program)
 - `LIGERO_PROVER_BINARY_PATH` (default: `../adapters/ligero/bins/macos-arm64/bin/webgpu_prover`)
 - `LIGERO_SHADER_PATH` (default: `../adapters/ligero/bins/shader`)
 

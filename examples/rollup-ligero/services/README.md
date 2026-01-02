@@ -7,7 +7,7 @@ and the continuous transfers load generator as background services on Linux.
 ## Prerequisites
 - A Linux host with `systemd`
 - Rust toolchain and build dependencies for the project
-- Built Ligero assets (`crates/adapters/ligero/guest && ./build.sh`)
+- Built Ligero guest programs (from the Ligero repo): `<ligero-prover>/utils/circuits/bins/*.wasm`
 - Configured indexer environment at
   `crates/utils/sov-indexer/.env` (`DA_CONNECTION_STRING`, `INDEX_DB`,
   `INDEXER_BIND`, optional `MODE`/VFK settings)

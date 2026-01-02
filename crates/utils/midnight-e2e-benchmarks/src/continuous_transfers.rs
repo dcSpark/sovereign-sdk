@@ -1554,6 +1554,21 @@ async fn perform_transfer_cycle(
                     let cfg = host.runner().config().clone();
                     let mut cfg_json = serde_json::to_value(&cfg)?;
 
+                    // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
+                    // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
+                    if let serde_json::Value::Object(ref mut map) = cfg_json {
+                        if let Some(serde_json::Value::String(program)) =
+                            map.get("program").cloned()
+                        {
+                            let resolved = ligero_runner::resolve_program(&program)
+                                .with_context(|| format!("Failed to resolve program '{program}'"))?;
+                            map.insert(
+                                "program".to_string(),
+                                serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                            );
+                        }
+                    }
+
                     // Provide an explicit, unique proof output path to the daemon.
                     // Relying on the daemon's internal temp-path generator can collide across
                     // multiple daemon processes started at the same time (same timestamp + per-process counter).

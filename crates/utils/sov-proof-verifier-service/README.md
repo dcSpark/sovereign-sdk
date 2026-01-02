@@ -192,8 +192,8 @@ cd ../../../examples/rollup-ligero
 
 ```bash
 # 1. Generate a proof
-cd crates/adapters/ligero
-cargo run --example generate_value_proof --features native -- 42
+This repo no longer ships a `generate_value_proof` example. Generate a proof using your own host
+wrapper (or the module tooling) and submit the resulting `LigeroProofPackage` bytes.
 
 # 2. Sign the transaction
 cd ../../..

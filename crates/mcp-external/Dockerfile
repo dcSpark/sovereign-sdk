@@ -5,6 +5,9 @@ FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /app
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+# Use the git CLI for git dependencies (supports standard git credential helpers better than libgit2).
+# See: https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -18,11 +21,20 @@ RUN apt-get update \
        curl \
        ca-certificates \
        git \
+       openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
-RUN cargo build --locked --release -p mcp-external
+# If you build with private git dependencies, use SSH forwarding:
+#   DOCKER_BUILDKIT=1 docker build --ssh default -f crates/mcp-external/Dockerfile .
+#
+# Cargo dependencies use https URLs, so we rewrite them to SSH inside the build.
+RUN --mount=type=ssh \
+    mkdir -p -m 0700 /root/.ssh \
+    && ssh-keyscan github.com >> /root/.ssh/known_hosts \
+    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
+    && cargo build --locked --release -p mcp-external
 
 # ---------------------------------------------------------------------
 # Fetch Ligero runtime assets (binaries + shader) from ligero-prover
@@ -30,27 +42,32 @@ RUN cargo build --locked --release -p mcp-external
 # Sovereign no longer vendors Ligero binaries/shaders, but downstream
 # images still need the binaries/shaders at runtime.
 # ---------------------------------------------------------------------
-ARG LIGERO_PROVER_REV=1b9ba6fd83af9ef2a2d477c50f6faded0fb03876
+# Use the Ligero repo branch that includes `ligero-runner` and the prebuilt circuits in
+# `utils/circuits/bins/`.
+ARG LIGERO_PROVER_REF=feature/ligero-runner
 ARG TARGETARCH
-RUN set -eux; \
+RUN --mount=type=ssh set -eux; \
     case "${TARGETARCH:-amd64}" in \
       amd64) LIGERO_PLATFORM="linux-amd64" ;; \
       arm64) LIGERO_PLATFORM="linux-arm64" ;; \
       *) echo "Unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
     esac; \
-    mkdir -p /opt/ligero/bin /opt/ligero/lib /opt/ligero/shader; \
+    mkdir -p /opt/ligero/bin /opt/ligero/lib /opt/ligero/shader /opt/ligero/programs; \
     tmpdir="$(mktemp -d)"; \
-    curl -fsSL "https://codeload.github.com/dcSpark/ligero-prover/tar.gz/${LIGERO_PROVER_REV}" -o "${tmpdir}/ligero-prover.tar.gz"; \
-    tar -xzf "${tmpdir}/ligero-prover.tar.gz" -C "${tmpdir}"; \
-    root="$(find "${tmpdir}" -maxdepth 1 -type d -name 'ligero-prover-*' | head -n 1)"; \
-    test -n "${root}"; \
+    git clone --depth 1 --branch "${LIGERO_PROVER_REF}" git@github.com:dcSpark/ligero-prover.git "${tmpdir}/ligero-prover"; \
+    root="${tmpdir}/ligero-prover"; \
     cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/bin/." /opt/ligero/bin/; \
     cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/lib/." /opt/ligero/lib/; \
-    cp -a "${root}/shader/." /opt/ligero/shader/; \
+    if [ -d "${root}/utils/portable-binaries/shader" ]; then \
+      cp -a "${root}/utils/portable-binaries/shader/." /opt/ligero/shader/; \
+    else \
+      cp -a "${root}/shader/." /opt/ligero/shader/; \
+    fi; \
+    cp -a "${root}/utils/circuits/bins/." /opt/ligero/programs/; \
     rm -rf "${tmpdir}"
 
 
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -65,11 +82,11 @@ RUN groupadd --system mcp && useradd --system --no-create-home --gid mcp --home 
 
 COPY --from=builder /app/target/release/mcp-external /usr/local/bin/mcp-external
 
-# Ligero assets
-COPY crates/adapters/ligero/guest/bins/programs /opt/ligero/programs
+# Ligero assets (binaries/shaders/programs are copied from the Ligero branch during build).
 COPY --from=builder /opt/ligero/bin /opt/ligero/bin
 COPY --from=builder /opt/ligero/lib /opt/ligero/lib
 COPY --from=builder /opt/ligero/shader /opt/ligero/shader
+COPY --from=builder /opt/ligero/programs /opt/ligero/programs
 
 RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && mkdir -p /app/logs /app/proof_outputs \

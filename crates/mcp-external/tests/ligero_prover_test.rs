@@ -5,8 +5,6 @@ use std::{env, path::PathBuf};
 use ligero_runner::LigeroRunner;
 use mcp_external::ligero::{Ligero, LigeroProgramArguments};
 
-const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";
-
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
         PathBuf::from(val)
@@ -20,16 +18,16 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 }
 
 fn create_test_ligero() -> Option<Ligero> {
-    let program = env_path("LIGERO_PROGRAM_PATH", DEFAULT_PROGRAM_REL);
-    if !program.exists() {
-        eprintln!(
-            "⚠️  Skipping Ligero prover test: program path not found at {}",
-            program.display()
-        );
-        return None;
-    }
+    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program_path = match ligero_runner::resolve_program(&program) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("⚠️  Skipping Ligero prover test: failed to resolve program '{program}': {e}");
+            return None;
+        }
+    };
 
-    let runner = LigeroRunner::new(&program.to_string_lossy());
+    let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
         .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
         .unwrap_or_else(|| runner.paths().prover_bin.clone());
@@ -47,7 +45,7 @@ fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
 }
 
 #[tracing_test::traced_test]

@@ -19,7 +19,8 @@ pub use ligero_runner::LigeroArg as LigeroProgramArguments;
 pub struct Ligero {
     ligero_prover_binary_path: Option<PathBuf>,
     ligero_shader_path: Option<PathBuf>,
-    ligero_program_path: Option<PathBuf>,
+    /// Program specifier: circuit name (preferred) or a full `.wasm` path.
+    ligero_program: Option<String>,
     proof_dir_id: Option<String>,
 }
 
@@ -27,12 +28,12 @@ impl Ligero {
     pub fn new(
         ligero_prover_binary_path: Option<PathBuf>,
         ligero_shader_path: Option<PathBuf>,
-        ligero_program_path: Option<PathBuf>,
+        ligero_program: Option<String>,
     ) -> Self {
         Self {
             ligero_prover_binary_path,
             ligero_shader_path,
-            ligero_program_path,
+            ligero_program,
             proof_dir_id: None,
         }
     }
@@ -104,12 +105,12 @@ impl Ligero {
         args: Vec<LigeroProgramArguments>,
     ) -> Result<Vec<u8>> {
         let program = self
-            .ligero_program_path
+            .ligero_program
             .clone()
-            .or_else(|| std::env::var("LIGERO_PROGRAM_PATH").ok().map(PathBuf::from))
-            .context("ligero program path is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)")?
-            .canonicalize()
-            .context("Failed to canonicalize Ligero program path")?;
+            .or_else(|| std::env::var("LIGERO_PROGRAM_PATH").ok())
+            .context(
+                "ligero program is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)",
+            )?;
 
         let mut runner = if self.ligero_prover_binary_path.is_some() || self.ligero_shader_path.is_some() {
             // Explicit overrides (backwards compatible with existing MCP config).
@@ -151,10 +152,10 @@ impl Ligero {
                 bins_dir,
             };
 
-            LigeroRunner::new_with_paths(&program.to_string_lossy(), paths)
+            LigeroRunner::new_with_paths(&program, paths)
         } else {
             // Prefer runner auto-discovery (uses env overrides + git checkout discovery).
-            LigeroRunner::new(&program.to_string_lossy())
+            LigeroRunner::new(&program)
         };
         runner.config_mut().packing = packing;
         runner.config_mut().gpu_threads = gpu_threads;

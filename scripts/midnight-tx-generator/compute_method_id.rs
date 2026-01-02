@@ -12,32 +12,13 @@
 use anyhow::{Context, Result};
 use sov_ligero_adapter::Ligero;
 use sov_rollup_interface::zk::{Zkvm, ZkvmHost, CodeCommitment};
-use std::path::PathBuf;
-
 fn main() -> Result<()> {
-    // Find the note_spend_guest.wasm program
-    let repo_root = std::env::current_dir()?
-        .ancestors()
-        .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
-        .ok_or_else(|| anyhow::anyhow!("Could not find repository root"))?
-        .to_path_buf();
+    // Pass a circuit name (not a filesystem path). `ligero-runner` resolves the correct wasm.
+    let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
-    let program_path = repo_root
-        .join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm");
+    println!("Computing method ID for: {}", program);
 
-    if !program_path.exists() {
-        anyhow::bail!(
-            "note_spend_guest.wasm not found at {}\n\
-            Build it with: cd {} && ./build-guest-wasm.sh",
-            program_path.display(),
-            repo_root.join("crates/adapters/ligero/guest").display()
-        );
-    }
-
-    println!("Computing method ID for: {}", program_path.display());
-
-    let program_str = program_path.to_string_lossy().to_string();
-    let host = <Ligero as Zkvm>::Host::from_args(&program_str);
+    let host = <Ligero as Zkvm>::Host::from_args(&program);
     let method_id = host.code_commitment();
     
     let method_id_bytes = method_id.encode();

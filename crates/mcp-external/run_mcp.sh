@@ -11,7 +11,9 @@ export VERIFIER_URL="${VERIFIER_URL:-http://localhost:8080}"
 export INDEXER_URL="${INDEXER_URL:-http://localhost:13100}"
 export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-50}"
 
-export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm}"
+# Provide the ZK guest program via:
+# - LIGERO_PROGRAM_PATH (circuit name like `note_spend_guest` OR full path to a `.wasm` file)
+export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 # Sovereign no longer vendors Ligero binaries/shaders.
 # Prefer `ligero-runner` auto-discovery. If you want to override discovery,
 # set these env vars explicitly before running this script:
@@ -19,9 +21,12 @@ export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$WORKSPACE_ROOT/crates/adapte
 # - LIGERO_VERIFIER_BIN
 # - LIGERO_SHADER_PATH
 
-if [[ ! -f "$LIGERO_PROGRAM_PATH" ]]; then
-  echo "LIGERO_PROGRAM_PATH not found: $LIGERO_PROGRAM_PATH"
-  exit 1
+# If the user passed a path, fail fast if it doesn't exist.
+if [[ "$LIGERO_PROGRAM_PATH" == *"/"* || "$LIGERO_PROGRAM_PATH" == *".wasm" ]]; then
+  if [[ ! -f "$LIGERO_PROGRAM_PATH" ]]; then
+    echo "LIGERO_PROGRAM_PATH not found: $LIGERO_PROGRAM_PATH"
+    exit 1
+  fi
 fi
 
 if [[ -n "${LIGERO_PROVER_BINARY_PATH:-}" && ! -f "$LIGERO_PROVER_BINARY_PATH" ]]; then

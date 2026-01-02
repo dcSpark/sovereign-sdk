@@ -43,15 +43,15 @@
 //! ### Verification Configuration (required for proof verification)
 //!
 //! - **`LIGERO_VERIFIER_BIN`**: Path to `webgpu_verifier` binary (required)
-//!   - Example: `crates/adapters/ligero/guest/bins/webgpu_verifier`
+//!   - Provided by the Ligero repo (not stored in this repo)
 //!
 //! - **`LIGERO_PROGRAM_PATH`**: Path to WASM program to verify (required)
-//!   - Example: `crates/adapters/ligero/guest/bins/value_validator.wasm`
+//!   - Example: `<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm`
 //!   - **Security Note**: This WASM program's hash (with packing) forms the code commitment.
 //!     The verifier will reject proofs that don't match this exact program.
 //!
 //! - **`LIGERO_SHADER_PATH`**: Path to verifier shader (required)
-//!   - Example: `crates/adapters/ligero/guest/bins/shader`
+//!   - Provided by the Ligero repo (not stored in this repo)
 //!
 //! - **`LIGERO_PACKING`**: FFT packing parameter (optional, default: 8192)
 //!   - **Security Note**: This value is included in the code commitment computation.

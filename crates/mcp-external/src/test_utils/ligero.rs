@@ -21,21 +21,18 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 /// Helper function to create a Ligero instance for testing
 #[allow(dead_code)]
 pub fn create_test_ligero() -> Option<Ligero> {
-    let program = env_path(
-        "LIGERO_PROGRAM_PATH",
-        "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm",
-    );
+    // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
+    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program_path = match ligero_runner::resolve_program(&program) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("⚠️  Skipping Ligero tests: failed to resolve program '{program}': {e}");
+            return None;
+        }
+    };
 
-    if !program.exists() {
-        eprintln!(
-            "⚠️  Skipping Ligero tests: program path not found at {}",
-            program.display()
-        );
-        return None;
-    }
-
-    // Prefer env overrides, otherwise use ligero-runner's built-in discovery (git checkout / LIGERO_ROOT).
-    let runner = LigeroRunner::new(&program.to_string_lossy());
+    // Create the runner using the program *specifier* (name or path). `ligero-runner` resolves internally.
+    let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
         .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
         .unwrap_or_else(|| runner.paths().prover_bin.clone());
@@ -53,5 +50,5 @@ pub fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
 }

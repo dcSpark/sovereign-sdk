@@ -21,24 +21,15 @@ CARGO_PROFILE="profiling"
 # NOTE: LIGERO_PROGRAM_PATH is now optional - the verifier will auto-discover the correct program
 # based on the code commitment (method_id) in the proof. This allows supporting both:
 #   - midnight-privacy (note_spend_guest.wasm)
-#   - value-setter-zk (value_validator.wasm)
+#   - value-setter-zk (value_validator_rust.wasm)
 # 
-# If you want to force a specific program, uncomment one of these:
-# export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
-# export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/value_validator.wasm"
+# If you want to force a specific program, set LIGERO_PROGRAM_PATH to a circuit name
+# (e.g. `note_spend_guest`) or a full path to a `.wasm` file.
 
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
-# Check that at least one guest program exists
-PROGRAMS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs"
-if [ ! -f "$PROGRAMS_DIR/note_spend_guest.wasm" ] && [ ! -f "$PROGRAMS_DIR/value_validator.wasm" ]; then
-    echo "❌ Error: No guest programs found in $PROGRAMS_DIR"
-    echo "   Build them with:"
-    echo "   cd <ligero-prover>/utils/circuits/note-spend-guest"
-    echo "   cargo build --release --target wasm32-unknown-unknown"
-    echo "   cp target/wasm32-unknown-unknown/release/note_spend_guest.wasm ../bins/programs/"
-    exit 1
-fi
+# `ligero-runner` resolves the actual `.wasm` internally. If auto-discovery doesn't work in your
+# environment, set `LIGERO_PROGRAM_PATH` to a full path to the `.wasm` file.
 
 # Check if samply is installed
 if ! command -v samply &> /dev/null; then

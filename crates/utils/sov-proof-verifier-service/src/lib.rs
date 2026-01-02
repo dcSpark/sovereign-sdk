@@ -74,7 +74,7 @@ pub struct ServiceConfig {
     /// Private key path for signing non-ZK transactions
     pub signing_key_path: String,
     /// Ligero method ID for value-setter proof verification
-    /// If None, it will be computed from the value_validator.wasm program
+    /// If None, it will be computed from the value_validator_rust.wasm program
     pub value_setter_method_id: Option<[u8; 32]>,
     /// Ligero method ID for midnight note_spend_guest proof verification
     /// If None, it will be computed from the note_spend_guest.wasm program
@@ -151,7 +151,7 @@ impl AppState {
 
         // Compute value-setter method ID if not provided
         if config.value_setter_method_id.is_none() {
-            info!("Computing value-setter method ID from value_validator.wasm...");
+            info!("Computing value-setter method ID from value_validator_rust.wasm...");
             match compute_value_setter_method_id() {
                 Ok(method_id) => {
                     info!("✓ Value-setter method ID: 0x{}", hex::encode(method_id));
@@ -274,10 +274,12 @@ fn verify_with_ligero_verifier_daemon(
 
     let mut cfg = verifier_paths.to_config(args, package.private_indices.clone());
 
-    // Uncompressed proofs: `webgpu_verifier` can now read either gzip or raw proofs, and we
-    // default Sovereign integration to raw to avoid gzip CPU overhead.
-    cfg.gzip_proof = false;
-    cfg.proof_path = Some("proof_data.bin".to_string());
+    // Proof bytes in the package may be gzip-compressed (proof_data.gz) or raw (proof_data.bin).
+    // Select the correct verifier mode based on the bytes we received.
+    let is_gzip = package.is_valid_gzip();
+    let proof_filename = if is_gzip { "proof_data.gz" } else { "proof_data.bin" };
+    cfg.gzip_proof = is_gzip;
+    cfg.proof_path = Some(proof_filename.to_string());
 
     let cfg_json = serde_json::to_value(&cfg)
         .map_err(|e| ServiceError::ProofError(format!("Failed to serialize Ligero config JSON: {e}")))?;
@@ -285,9 +287,9 @@ fn verify_with_ligero_verifier_daemon(
     // Daemon verifier expects a proof path, not raw bytes: write to temp dir.
     let dir = tempfile::tempdir()
         .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
-    let proof_path = dir.path().join("proof_data.bin");
+    let proof_path = dir.path().join(proof_filename);
     std::fs::write(&proof_path, &package.proof)
-        .map_err(|e| ServiceError::Internal(format!("Failed to write proof_data.bin: {e}")))?;
+        .map_err(|e| ServiceError::Internal(format!("Failed to write {proof_filename}: {e}")))?;
 
     // Lazily initialize (and cache) daemon pools per (verifier_bin, shader_dir).
     static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
@@ -1236,7 +1238,7 @@ async fn verify_ligero_proof(
     let method_id_bytes = state.config.value_setter_method_id.ok_or_else(|| {
         ServiceError::Internal(
             "Value-setter method ID not configured. \
-            The service needs the value_validator.wasm program to compute the method ID."
+            The service needs the value_validator_rust.wasm program to compute the method ID."
                 .to_string(),
         )
     })?;
@@ -2225,43 +2227,20 @@ async fn submit_worker_tx_to_sequencer(
 // Sovereign Ligero adapter. This service must not require env vars like `LIGERO_VERIFIER_BIN`
 // or `LIGERO_SHADER_PATH` (those binaries are owned by the Ligero repo, not Sovereign).
 
-/// Compute the method ID for the value_validator.wasm program
+/// Compute the method ID for the value_validator_rust.wasm program
 fn compute_value_setter_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("value_validator.wasm")
+    compute_method_id_for_program("value_validator_rust")
 }
 
 /// Compute the method ID for the note_spend_guest.wasm program
 fn compute_midnight_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("note_spend_guest.wasm")
+    compute_method_id_for_program("note_spend_guest")
 }
 
 /// Generic function to compute method ID for any guest program
 fn compute_method_id_for_program(program_name: &str) -> Result<[u8; 32]> {
-    let current_dir = std::env::current_dir()?;
-    
-    // Try multiple possible locations
-    let possible_paths = vec![
-        current_dir.join(format!("crates/adapters/ligero/guest/bins/programs/{}", program_name)),
-        current_dir.join(format!("../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
-        current_dir.join(format!("../../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
-    ];
-    
-    let program_path = possible_paths
-        .iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not find {}. Searched:\n{}",
-                program_name,
-                possible_paths
-                    .iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })?;
-    
-    let program_str = program_path.to_string_lossy().to_string();
+    // We only pass a circuit name here; `ligero-runner` is responsible for resolving the actual wasm.
+    let program_str = program_name.to_string();
     let host = <Ligero as Zkvm>::Host::from_args(&program_str);
     let method_id = host.code_commitment();
     

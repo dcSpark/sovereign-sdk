@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::info!("[mcp] Shader path: <auto-discovery>");
     }
-    tracing::info!("[mcp] Program path: {}", cfg.ligero_program_path.display());
+    tracing::info!("[mcp] Program: {}", cfg.ligero_program_path);
 
     let ligero = Arc::new(Ligero::new(
         cfg.ligero_prover_binary_path.clone(),
