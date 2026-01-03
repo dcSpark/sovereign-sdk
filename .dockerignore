@@ -1,0 +1,43 @@
+# Keep Docker build contexts small (especially on developer machines).
+#
+# The Sovereign repo can accumulate large local artifacts (Rust targets, proof outputs, logs, etc.)
+# that are not needed for container builds and can make `docker build` unusable.
+
+# Rust build artifacts
+target/
+**/target/
+
+# Proof artifacts / caches
+proof_outputs/
+**/proof_outputs/
+proof_cache/
+**/proof_cache/
+
+# Logs
+logs/
+**/*.log
+
+# Local demo/runtime data
+demo_data/
+**/demo_data/
+
+# OS/editor junk
+.DS_Store
+**/.DS_Store
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+
+# Git metadata (not needed for builds)
+.git/
+
+# Node artifacts (if present)
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Large local checkouts (if present)
+ligero-vm/
+

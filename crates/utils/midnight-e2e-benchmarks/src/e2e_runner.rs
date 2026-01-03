@@ -72,7 +72,7 @@ impl Default for RunnerConfig {
             use_proof_cache: false,
             proof_cache_dir: PathBuf::from("proof_cache"),
             skip_verify: true,
-            max_concurrent_proofs: num_cpus::get(),
+            max_concurrent_proofs: 5,
             defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
             authority_fvk: None,
@@ -215,9 +215,6 @@ fn prepare_environment(
     crate_dir: &Path,
     bin_path: &str,
     program_path: &str,
-    verifier_bin: &str,
-    prover_bin: &str,
-    shader_dir: &str,
     external: Option<ExternalConfig>,
 ) -> Result<TestEnvironment> {
     if let Some(cfg) = external {
@@ -250,9 +247,6 @@ fn prepare_environment(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         )
         .env("LIGERO_PROGRAM_PATH", program_path)
-        .env("LIGERO_VERIFIER_BIN", verifier_bin)
-        .env("LIGERO_PROVER_BIN", prover_bin)
-        .env("LIGERO_SHADER_PATH", shader_dir)
         .env("LIGERO_PACKING", "8192")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -298,17 +292,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let ligero_env = setup_ligero_env()?;
     let program_path_for_node = ligero_env.program_path.clone();
     let method_id_for_node = ligero_env.method_id;
-    let verifier_bin_for_node = ligero_env.verifier_bin.clone();
-    let prover_bin_for_node = ligero_env.prover_bin.clone();
-    let shader_dir_for_node = ligero_env.shader_dir.clone();
     let external_services = ExternalConfig::from_config(&config)?;
     let mut env = prepare_environment(
         &crate_dir,
         &bin_path,
         &program_path_for_node,
-        &verifier_bin_for_node,
-        &prover_bin_for_node,
-        &shader_dir_for_node,
         external_services.clone(),
     )?;
 

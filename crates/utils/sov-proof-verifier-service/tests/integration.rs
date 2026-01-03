@@ -298,9 +298,6 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
             // Also acceptable in test environment: WASM file not found
             // This means we can't even attempt proof verification
         }
-        Err(ServiceError::Internal(msg)) if msg.contains("LIGERO_VERIFIER_BIN") => {
-            // Also acceptable in test environment: verifier binary not configured
-        }
         other => panic!("expected proof error or missing WASM file, got {other:?}"),
     }
 }

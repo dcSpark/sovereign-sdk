@@ -614,64 +614,64 @@ pub async fn transfer(
     // Prepare proof arguments with correct HEX/STR format
     // Hash values use HEX format, numeric values use STR format
     let mut proof_args: Vec<LigeroProgramArguments> = vec![
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(DOMAIN),
         }, // domain
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: note_value.to_string(),
         }, // value (input note value)
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(input_rho),
         }, // in_rho
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(input_recipient),
         }, // in_recipient
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(NF_KEY),
         }, // nf_key
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: position.to_string(),
         }, // position
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: depth.to_string(),
         }, // depth
     ];
 
     // Add siblings as HEX
     for s in &siblings {
-        proof_args.push(LigeroProgramArguments::HEX {
+        proof_args.push(LigeroProgramArguments::Hex {
             hex: hex::encode(s),
         });
     }
 
     // Add remaining public inputs
     proof_args.extend_from_slice(&[
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(anchor_root),
         }, // anchor
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(nf),
         }, // nullifier
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: "0".to_string(),
         }, // withdraw_amount
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: num_outputs.to_string(),
         }, // num_outputs
     ]);
 
     // Output 0: destination (send_amount → output_recipient)
     proof_args.extend_from_slice(&[
-        LigeroProgramArguments::STR {
+        LigeroProgramArguments::String {
             str: send_amount.to_string(),
         }, // output 0 value
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(out_rho_0),
         }, // output 0 rho
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(out_recipient_0),
         }, // output 0 recipient
-        LigeroProgramArguments::HEX {
+        LigeroProgramArguments::Hex {
             hex: hex::encode(cm_out_0),
         }, // output 0 commitment
     ]);
@@ -679,16 +679,16 @@ pub async fn transfer(
     // Output 1: change (if partial transfer)
     if has_change {
         proof_args.extend_from_slice(&[
-            LigeroProgramArguments::STR {
+            LigeroProgramArguments::String {
                 str: change_amount.to_string(),
             }, // output 1 value
-            LigeroProgramArguments::HEX {
+            LigeroProgramArguments::Hex {
                 hex: hex::encode(out_rho_1.unwrap()),
             }, // output 1 rho
-            LigeroProgramArguments::HEX {
+            LigeroProgramArguments::Hex {
                 hex: hex::encode(out_recipient_1.unwrap()),
             }, // output 1 recipient
-            LigeroProgramArguments::HEX {
+            LigeroProgramArguments::Hex {
                 hex: hex::encode(cm_out_1.unwrap()),
             }, // output 1 commitment
         ]);
@@ -698,19 +698,19 @@ pub async fn transfer(
     if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
         if let Some(att) = atts.first() {
             proof_args.extend_from_slice(&[
-                LigeroProgramArguments::STR {
+                LigeroProgramArguments::String {
                     str: "1".to_string(),
                 }, // m_viewers
-                LigeroProgramArguments::HEX {
+                LigeroProgramArguments::Hex {
                     hex: hex::encode(att.fvk_commitment),
                 }, // vfk_commitment
-                LigeroProgramArguments::HEX {
+                LigeroProgramArguments::Hex {
                     hex: hex::encode(vfk),
                 }, // vfk (private)
-                LigeroProgramArguments::HEX {
+                LigeroProgramArguments::Hex {
                     hex: hex::encode(att.ct_hash),
                 }, // ct_hash
-                LigeroProgramArguments::HEX {
+                LigeroProgramArguments::Hex {
                     hex: hex::encode(att.mac),
                 }, // mac
             ]);
@@ -748,14 +748,15 @@ pub async fn transfer(
         view_attestations,
     };
 
-    let proof_package = LigeroProofPackage {
-        proof: proof_bytes_raw,
-        public_output: bincode::serialize(&public_output)
-            .context("Failed to serialize spend public output")?,
-        args_json: serde_json::to_vec(&proof_args_for_package)
-            .context("Failed to serialize Ligero args for package")?,
-        private_indices: private_indices_for_package,
-    };
+    let args_json = serde_json::to_vec(&proof_args_for_package)
+        .context("Failed to serialize Ligero args for package")?;
+    let proof_package = LigeroProofPackage::new(
+        proof_bytes_raw,
+        bincode::serialize(&public_output).context("Failed to serialize spend public output")?,
+        args_json,
+        private_indices_for_package,
+    )
+    .context("Failed to build LigeroProofPackage")?;
 
     let proof_bytes =
         bincode::serialize(&proof_package).context("Failed to serialize Ligero proof package")?;

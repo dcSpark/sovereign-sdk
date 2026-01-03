@@ -8,53 +8,30 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Detect platform and set appropriate binary paths
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos-arm64/bin/webgpu_verifier"
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"
-else
-    # Fallback to guest bins for other platforms
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
-fi
+# -----------------------------------------------------------------------------
+# Ligero guest program selection
+#
+# IMPORTANT: Sovereign should pass a **circuit name** to `ligero-runner`, not a filesystem path.
+# `ligero-runner` will resolve the correct `.wasm` internally.
+#
+# Common values:
+# - note_spend_guest
+# - value_validator_rust
+#
+# You can still override program selection with:
+# - LIGERO_PROGRAM_PATH (either a circuit name OR a full path to a `.wasm`)
+# -----------------------------------------------------------------------------
 
-# Set Ligero verification environment variables
-NOTE_SPEND_WASM="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
-VALUE_VALIDATOR_WASM="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/value_validator.wasm"
-
-# The proof-verifier handles BOTH value-setter-zk and midnight-privacy. The Ligero adapter can
-# auto-select the correct program based on the expected code commitment, but it still requires
-# LIGERO_PROGRAM_PATH to be set. Default it to the Midnight program to match the common case.
-export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$NOTE_SPEND_WASM}"
-export LIGERO_SHADER_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/shader"
+# Default to the Midnight circuit name (not a path).
+export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
-# Verify files exist
-if [ ! -f "$LIGERO_VERIFIER_BIN" ]; then
-    echo "❌ Error: webgpu_verifier not found at: $LIGERO_VERIFIER_BIN"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
-
-if [ ! -f "$LIGERO_PROGRAM_PATH" ]; then
-    echo "❌ Error: Ligero program not found at: $LIGERO_PROGRAM_PATH"
-    echo "   Expected a WASM program (e.g. note_spend_guest.wasm)."
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it."
-    exit 1
-fi
-
-if [ ! -d "$LIGERO_SHADER_PATH" ]; then
-    echo "❌ Error: shader directory not found at: $LIGERO_SHADER_PATH"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
+#
+# NOTE: We intentionally do NOT check `-f $LIGERO_PROGRAM_PATH` here, because it may be a
+# circuit name (e.g. "note_spend_guest"), not a file path.
 
 echo "✓ Ligero verification configuration:"
-echo "  LIGERO_VERIFIER_BIN=$LIGERO_VERIFIER_BIN"
 echo "  LIGERO_PROGRAM_PATH=$LIGERO_PROGRAM_PATH"
-echo "  LIGERO_SHADER_PATH=$LIGERO_SHADER_PATH"
 echo "  LIGERO_PACKING=$LIGERO_PACKING"
 echo ""
 
@@ -112,13 +89,6 @@ if [ -n "$METHOD_ID" ]; then
 fi
 if [ -n "$MIDNIGHT_METHOD_ID" ]; then
     METHOD_ID_ARGS+=(--midnight-method-id "$MIDNIGHT_METHOD_ID")
-fi
-
-# Best-effort: warn if optional value-setter WASM isn't present (midnight still works).
-if [ ! -f "$VALUE_VALIDATOR_WASM" ]; then
-    echo "⚠️  Warning: value_validator.wasm not found at: $VALUE_VALIDATOR_WASM"
-    echo "   The /value-setter-zk endpoint may be unavailable."
-    echo ""
 fi
 
 exec "$WORKSPACE_ROOT/target/release/proof-verifier" \

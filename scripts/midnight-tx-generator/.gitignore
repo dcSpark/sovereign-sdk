@@ -2,5 +2,6 @@ target/
 *.bin
 *.json
 proof_data.gz
+proof_data.bin
 !Cargo.json
 .last_nonce

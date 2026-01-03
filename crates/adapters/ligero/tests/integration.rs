@@ -2,27 +2,24 @@
 mod tests {
     use sov_ligero_adapter::{Ligero, LigeroHost};
     use sov_rollup_interface::zk::{CodeCommitment, Zkvm, ZkvmHost};
-    use std::path::PathBuf;
-
-    fn get_test_program_path() -> String {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let program_path = manifest_dir.join("guest/bins/programs/value_validator.wasm");
-        program_path.to_string_lossy().to_string()
+    fn get_test_program() -> String {
+        // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
+        std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "value_validator_rust".to_string())
     }
 
     #[test]
     fn test_ligero_host_creation() {
-        let program_path = get_test_program_path();
-        let _host = LigeroHost::new(&program_path);
+        let program = get_test_program();
+        let _host = LigeroHost::new(&program);
 
         // Just verify the host can be created
-        assert!(!program_path.is_empty());
+        assert!(!program.is_empty());
     }
 
     #[test]
     fn test_code_commitment() {
-        let program_path = get_test_program_path();
-        let host = <Ligero as Zkvm>::Host::from_args(&program_path);
+        let program = get_test_program();
+        let host = <Ligero as Zkvm>::Host::from_args(&program);
 
         let commitment = host.code_commitment();
         let encoded = commitment.encode();
@@ -31,15 +28,15 @@ mod tests {
         assert_eq!(encoded.len(), 32);
 
         // Code commitment should be deterministic
-        let host2 = <Ligero as Zkvm>::Host::from_args(&program_path);
+        let host2 = <Ligero as Zkvm>::Host::from_args(&program);
         let commitment2 = host2.code_commitment();
         assert_eq!(commitment.encode(), commitment2.encode());
     }
 
     #[test]
     fn test_code_commitment_decode() {
-        let program_path = get_test_program_path();
-        let host = <Ligero as Zkvm>::Host::from_args(&program_path);
+        let program = get_test_program();
+        let host = <Ligero as Zkvm>::Host::from_args(&program);
 
         let commitment = host.code_commitment();
         let encoded = commitment.encode();
@@ -51,8 +48,8 @@ mod tests {
 
     #[test]
     fn test_host_with_args() {
-        let program_path = get_test_program_path();
-        let mut host = LigeroHost::new(&program_path);
+        let program = get_test_program();
+        let mut host = LigeroHost::new(&program);
 
         // Add some test arguments
         host.add_i64_arg(42);
@@ -64,16 +61,16 @@ mod tests {
 
     #[test]
     fn test_host_with_packing() {
-        let program_path = get_test_program_path();
-        let _host = LigeroHost::new(&program_path).with_packing(4096);
+        let program = get_test_program();
+        let _host = LigeroHost::new(&program).with_packing(4096);
 
         // Should not panic
     }
 
     #[test]
     fn test_host_with_private_indices() {
-        let program_path = get_test_program_path();
-        let _host = LigeroHost::new(&program_path).with_private_indices(vec![1, 2]);
+        let program = get_test_program();
+        let _host = LigeroHost::new(&program).with_private_indices(vec![1, 2]);
 
         // Should not panic
     }
@@ -81,26 +78,35 @@ mod tests {
     #[test]
     #[ignore] // Only run if webgpu_prover is available
     fn test_proof_generation_if_available() {
-        let program_path = get_test_program_path();
+        let program = get_test_program();
+        let program_path = match ligero_runner::resolve_program(&program) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping test: failed to resolve program '{}': {}", program, e);
+                return;
+            }
+        };
 
         // Check if the program file exists
-        if !PathBuf::from(&program_path).exists() {
-            eprintln!("Skipping test: program not found at {}", program_path);
+        if !program_path.exists() {
+            eprintln!("Skipping test: program not found at {}", program_path.display());
             return;
         }
 
-        // Check if webgpu_prover binary exists
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        #[cfg(target_os = "macos")]
-        let prover_bin = manifest_dir.join("bins/macos-arm64/bin/webgpu_prover");
-        #[cfg(target_os = "linux")]
-        let prover_bin = manifest_dir.join("bins/linux-amd64/bin/webgpu_prover");
-        if !prover_bin.exists() {
-            eprintln!("Skipping test: webgpu_prover not found");
+        // Check if we can discover a prover binary.
+        let paths = match ligero_runner::LigeroPaths::discover() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping test: failed to discover Ligero prover: {}", e);
+                return;
+            }
+        };
+        if !paths.prover_bin.exists() {
+            eprintln!("Skipping test: webgpu_prover not found at {}", paths.prover_bin.display());
             return;
         }
 
-        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path);
+        let mut host = <Ligero as Zkvm>::Host::from_args(&program);
         host.set_public_output(&())
             .expect("bincode serialization must succeed");
 
@@ -125,8 +131,8 @@ mod tests {
 
     #[test]
     fn test_simulation_mode() {
-        let program_path = get_test_program_path();
-        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path);
+        let program = get_test_program();
+        let mut host = <Ligero as Zkvm>::Host::from_args(&program);
 
         // Simulation mode should always work (even without binaries)
         host.set_public_output(&())
@@ -155,7 +161,7 @@ mod note_spend_tests {
     use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
     use serde::{Deserialize, Serialize};
     use sov_ligero_adapter::{Ligero, LigeroVerifier};
-    use sov_rollup_interface::zk::{ZkVerifier, Zkvm, ZkvmHost};
+    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -264,16 +270,8 @@ mod note_spend_tests {
     }
 
     fn get_note_spend_program_path() -> Result<String> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let program_path = manifest_dir.join("guest/bins/programs/note_spend_guest.wasm");
-        if !program_path.exists() {
-            anyhow::bail!(
-                "note_spend_guest.wasm not found at: {}\n\
-                 Build it with: cd crates/adapters/ligero/guest/note-spend-guest && ./build.sh",
-                program_path.display()
-            );
-        }
-        Ok(program_path.to_string_lossy().to_string())
+        // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
+        Ok(std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string()))
     }
 
     fn prover_available() -> bool {

@@ -54,8 +54,8 @@ cargo build --release
 
 ```bash
 # Set Ligero environment variables for proof verification
-export LIGERO_PROGRAM_PATH=$(pwd)/../../crates/adapters/ligero/guest/bins/programs/value_validator.wasm
-export LIGERO_SHADER_PATH=$(pwd)/../../../ligero-vm/ligero-prover/gpu-prover/src/shaders
+export LIGERO_PROGRAM_PATH=value_validator_rust
+export LIGERO_SHADER_PATH=<ligero-prover>/shader
 ```
 
 Or simply source the provided script:
@@ -109,7 +109,7 @@ The rollup configuration is in `rollup_config.toml`. Key settings:
 - `SKIP_GUEST_BUILD`: Skip building guest programs
   - `1`, `true`, or `ligero`: Skip Ligero guest builds
 
-- `LIGERO_SDK_PATH`: Path to Ligero SDK (default: `../../../../../ligero-vm/ligero-prover/sdk`)
+- `LIGERO_SDK_PATH`: Path to Ligero SDK (default: `<ligero-prover>/sdk`)
 
 ## Differences from demo-rollup
 

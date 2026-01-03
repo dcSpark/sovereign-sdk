@@ -256,10 +256,10 @@ cargo test --features native
 
 ### Building the Guest Program
 
-The Ligero guest program (`note_spend_guest.wasm`) must be built:
+The Ligero guest program (`note_spend_guest.wasm`) must be available:
 
 ```bash
-cd crates/adapters/ligero/guest
+ls -lh <ligero-prover>/utils/circuits/bins/note_spend_guest.wasm
 cargo build --release --target wasm32-unknown-unknown
 ```
 

@@ -17,54 +17,19 @@ PROFILE_FILE="$PROFILE_DIR/rollup-profile-$(date +%Y%m%d-%H%M%S).json"
 # Use the 'profiling' cargo profile which has debug=true and strip=false
 CARGO_PROFILE="profiling"
 
-# Detect platform and set appropriate binary paths
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos-arm64/bin/webgpu_verifier"
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/bins/linux-amd64/bin/webgpu_verifier"
-else
-    # Fallback to guest bins for other platforms
-    export LIGERO_VERIFIER_BIN="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/webgpu_verifier"
-fi
-
 # Set Ligero verification environment variables
 # NOTE: LIGERO_PROGRAM_PATH is now optional - the verifier will auto-discover the correct program
 # based on the code commitment (method_id) in the proof. This allows supporting both:
 #   - midnight-privacy (note_spend_guest.wasm)
-#   - value-setter-zk (value_validator.wasm)
+#   - value-setter-zk (value_validator_rust.wasm)
 # 
-# If you want to force a specific program, uncomment one of these:
-# export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"
-# export LIGERO_PROGRAM_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/value_validator.wasm"
+# If you want to force a specific program, set LIGERO_PROGRAM_PATH to a circuit name
+# (e.g. `note_spend_guest`) or a full path to a `.wasm` file.
 
-export LIGERO_SHADER_PATH="$WORKSPACE_ROOT/crates/adapters/ligero/bins/shader"
 export LIGERO_PACKING=8192  # Must match the packing used during proof generation
 
-# Verify files exist
-if [ ! -f "$LIGERO_VERIFIER_BIN" ]; then
-    echo "❌ Error: webgpu_verifier not found at: $LIGERO_VERIFIER_BIN"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
-
-# Check that at least one guest program exists
-PROGRAMS_DIR="$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs"
-if [ ! -f "$PROGRAMS_DIR/note_spend_guest.wasm" ] && [ ! -f "$PROGRAMS_DIR/value_validator.wasm" ]; then
-    echo "❌ Error: No guest programs found in $PROGRAMS_DIR"
-    echo "   Build them with:"
-    echo "   cd crates/adapters/ligero/guest/note-spend-guest"
-    echo "   cargo build --release --target wasm32-unknown-unknown"
-    echo "   cp target/wasm32-unknown-unknown/release/note_spend_guest.wasm ../bins/programs/"
-    exit 1
-fi
-
-if [ ! -d "$LIGERO_SHADER_PATH" ]; then
-    echo "❌ Error: shader directory not found at: $LIGERO_SHADER_PATH"
-    echo "   Run 'cd crates/adapters/ligero/guest && ./build.sh' to build it"
-    exit 1
-fi
+# `ligero-runner` resolves the actual `.wasm` internally. If auto-discovery doesn't work in your
+# environment, set `LIGERO_PROGRAM_PATH` to a full path to the `.wasm` file.
 
 # Check if samply is installed
 if ! command -v samply &> /dev/null; then
@@ -74,14 +39,12 @@ if ! command -v samply &> /dev/null; then
 fi
 
 echo "✓ Ligero verification configuration:"
-echo "  LIGERO_VERIFIER_BIN=$LIGERO_VERIFIER_BIN"
 if [ -n "$LIGERO_PROGRAM_PATH" ]; then
     echo "  LIGERO_PROGRAM_PATH=$LIGERO_PROGRAM_PATH"
 else
     echo "  LIGERO_PROGRAM_PATH=<auto-discovery enabled>"
     echo "  Available programs: $(ls -1 $PROGRAMS_DIR/*.wasm 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
 fi
-echo "  LIGERO_SHADER_PATH=$LIGERO_SHADER_PATH"
 echo "  LIGERO_PACKING=$LIGERO_PACKING"
 echo ""
 

@@ -5,6 +5,11 @@ use serde::Deserialize;
 use url::Url;
 use validator::Validate;
 
+fn default_ligero_program() -> String {
+    // MCP-External is primarily used for midnight-privacy flows.
+    "note_spend_guest".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct Config {
     /// Server bind address (env: MCP_SERVER_BIND_ADDRESS, default: "127.0.0.1:3000")
@@ -29,17 +34,30 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub indexer_url: Url,
 
-    /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_program_path: PathBuf,
+    /// Ligero guest program to use (env: LIGERO_PROGRAM_PATH, optional).
+    ///
+    /// Accepts either:
+    /// - a circuit name (e.g. `note_spend_guest`)
+    /// - a full path to a `.wasm` file
+    ///
+    /// Defaults to `note_spend_guest`.
+    #[serde(default = "default_ligero_program", alias = "ZK_PROGRAM_PATH")]
+    #[validate(custom(function = "validate_ligero_program"))]
+    pub ligero_program_path: String,
 
-    /// Path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH, required)
+    /// Optional path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH).
+    ///
+    /// If unset, `ligero-runner` will auto-discover binaries from the pinned `ligero-prover` git checkout.
+    #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_prover_binary_path: PathBuf,
+    pub ligero_prover_binary_path: Option<PathBuf>,
 
-    /// Path to Ligero shader directory (env: LIGERO_SHADER_PATH, required)
+    /// Optional path to Ligero shader directory (env: LIGERO_SHADER_PATH).
+    ///
+    /// If unset, `ligero-runner` will auto-discover shaders from the pinned `ligero-prover` git checkout.
+    #[serde(default)]
     #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_shader_path: PathBuf,
+    pub ligero_shader_path: Option<PathBuf>,
 
     /// Authority Viewing Full Key (VFK) for decrypting privacy pool notes (env: AUTHORITY_VFK, optional)
     /// 32-byte hex string with or without 0x prefix
@@ -67,6 +85,27 @@ fn validate_file_exists(path: &PathBuf) -> Result<(), validator::ValidationError
             .with_message(format!("File does not exist: {}", path.display()).into()));
     }
     Ok(())
+}
+
+fn validate_ligero_program(program: &String) -> Result<(), validator::ValidationError> {
+    let program = program.trim();
+    if program.is_empty() {
+        return Err(validator::ValidationError::new("empty_program")
+            .with_message("LIGERO_PROGRAM_PATH must be set (circuit name or .wasm path)".into()));
+    }
+
+    // If the caller provided an existing path, accept it.
+    if std::path::Path::new(program).exists() {
+        return Ok(());
+    }
+
+    // Otherwise, treat it as a circuit name and ensure `ligero-runner` can resolve it.
+    if ligero_runner::resolve_program(program).is_ok() {
+        return Ok(());
+    }
+
+    Err(validator::ValidationError::new("invalid_program")
+        .with_message(format!("Could not resolve Ligero program '{program}'. Provide a circuit name (e.g. note_spend_guest) or a full path to a .wasm file.").into()))
 }
 
 fn validate_http_url(url: &Url) -> Result<(), validator::ValidationError> {

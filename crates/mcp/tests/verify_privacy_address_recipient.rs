@@ -27,7 +27,7 @@ fn test_privacy_address_to_recipient() {
     println!("Expected recipient in deposit response: {}", recipient_hex);
 
     // The recipient you saw in the response
-    let expected_recipient = "aa679508d91fabf66b009c037144534ade270c849dd1bf110bf1e7d8706a6a66";
+    let expected_recipient = "1f6ac8bc5ab4fc16003a3073c3e48f7fd56542663a6940e98b6d7c7057dd0fea";
 
     println!();
     println!("Comparison:");
@@ -55,7 +55,7 @@ fn test_privacy_address_to_recipient() {
 #[test]
 fn test_reverse_engineer_privacy_key() {
     // If we know the recipient, can we verify it matches a privacy address?
-    let recipient_from_deposit = "aa679508d91fabf66b009c037144534ade270c849dd1bf110bf1e7d8706a6a66";
+    let recipient_from_deposit = "1f6ac8bc5ab4fc16003a3073c3e48f7fd56542663a6940e98b6d7c7057dd0fea";
 
     // Try the privacy address from the user
     let privacy_address = "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";

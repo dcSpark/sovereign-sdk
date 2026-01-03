@@ -32,18 +32,15 @@ Created `/examples/test-data/genesis/integration-tests/value_setter_zk.json`:
 
 First, compile the guest program (if not already done):
 ```bash
-cd crates/adapters/ligero/guest
+ls -lh <ligero-prover>/utils/circuits/bins/value_validator_rust.wasm
 mkdir build && cd build
 emcmake cmake ..
 emmake make
-cp value_validator.wasm ../../bins/programs/
+export LIGERO_PROGRAM_PATH=<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm
 ```
 
-Generate a proof for a value (e.g., 42):
-```bash
-cd crates/adapters/ligero
-cargo run --example generate_value_proof --features native -- 42
-```
+This repo no longer ships a `generate_value_proof` example. Proof generation for value-setter-zk is
+handled by the verifier service flow (or by your own host wrapper using the Ligero adapter APIs).
 
 This creates:
 - `value_proof.bin`: Serialized proof package
@@ -55,9 +52,8 @@ After building the guest program, calculate and update the method ID:
 
 ```bash
 # Get the SHA-256 hash of (WASM + packing)
-# The proof generator outputs the commitment
-cargo run --example generate_value_proof --features native -- 42
-# Look for: "Code commitment: <hex>"
+# The method ID is the Ligero code commitment (SHA-256(wasm_bytes || packing_u32_le)).
+# Use the module/service utilities to compute it (or a small helper that calls `Host::code_commitment()`).
 ```
 
 Update `examples/test-data/genesis/integration-tests/value_setter_zk.json`:
@@ -201,7 +197,7 @@ cargo test value_setter_zk --features test-utils
 - Verify the genesis file is valid JSON
 
 ### "Proof verification failed"
-- Ensure you compiled the guest program (`value_validator.wasm`)
+- Ensure you compiled the guest program (`value_validator_rust.wasm`)
 - Verify the method ID in genesis matches your compiled program
 - Check that the proof was generated with the same packing parameter (8192)
 
@@ -218,7 +214,7 @@ cargo test value_setter_zk --features test-utils
 ```
 ┌─────────────────────────────────────┐
 │        Off-Chain (User)             │
-│  1. Compile value_validator.wasm    │
+│  1. Compile value_validator_rust.wasm    │
 │  2. Generate proof with Ligero      │
 │  3. Create transaction              │
 └──────────────┬──────────────────────┘
@@ -246,5 +242,5 @@ cargo test value_setter_zk --features test-utils
 - [Value Setter ZK README](../../crates/module-system/module-implementations/sov-value-setter-zk/README.md)
 - [Ligero Integration Guide](../../LIGERO_INTEGRATION.md)
 - [Ligero Adapter](../../crates/adapters/ligero/README.md)
-- [Guest Program](../../crates/adapters/ligero/guest/README.md)
+- Guest program: `<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm`
 

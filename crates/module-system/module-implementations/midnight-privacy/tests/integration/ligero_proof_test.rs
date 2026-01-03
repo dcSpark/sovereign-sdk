@@ -41,7 +41,7 @@
 //!
 //! These tests generate and verify **REAL** proofs - no simulation or skipping!
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 // Import SpendPublic and MerkleTree from midnight_privacy, but use our own hash functions
 // that are based on Ligetron's Poseidon2 (consistent with the circuit)
 use midnight_privacy::SpendPublic;
@@ -49,10 +49,8 @@ use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroVerifier};
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, Zkvm, ZkvmHost};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 use std::collections::HashMap;
-use tempfile::tempdir;
 
 // Use Ligetron's native Poseidon2 for hash computations (same as the circuit!)
 use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
@@ -176,14 +174,8 @@ fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Ha
 /// Configuration for Ligero test environment
 #[derive(Debug)]
 struct LigeroTestConfig {
-    /// Path to the WASM program
-    program_path: PathBuf,
-    /// Path to the prover binary
-    prover_bin: PathBuf,
-    /// Path to the verifier binary
-    verifier_bin: PathBuf,
-    /// Path to the shader directory
-    shader_path: PathBuf,
+    /// Ligero program specifier: circuit name (preferred) or full `.wasm` path
+    program: String,
     /// FFT packing parameter
     packing: u32,
 }
@@ -191,66 +183,22 @@ struct LigeroTestConfig {
 impl LigeroTestConfig {
     /// Discover paths for note spend guest (complex hex arguments)
     fn discover() -> Result<Self> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .context("Could not find repository root")?;
-
-        let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-        // Detect OS and choose correct binary path
-        let platform_dir = if cfg!(target_os = "macos") {
-            // Binaries are staged under `bins/macos-arm64` (Apple Silicon).
-            // Keep the string-based layout to match the on-disk structure.
-            "macos-arm64"
-        } else if cfg!(target_os = "linux") {
-            if cfg!(target_arch = "aarch64") {
-                "linux-arm64"
-            } else {
-                "linux-amd64"
-            }
-        } else {
-            bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
-        };
-
-        let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-        // Shaders are shared across platforms: `crates/adapters/ligero/bins/shader`.
-        let shader_dir = ligero_dir.join("bins").join("shader");
-
-        let config = Self {
-            program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
-            prover_bin: bin_dir.join("webgpu_prover"),
-            verifier_bin: bin_dir.join("webgpu_verifier"),
-            shader_path: shader_dir,
-            packing: 8192,
-        };
+        let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+        let config = Self { program, packing: 8192 };
 
         Ok(config)
     }
 
     /// Apply this configuration to the environment
     fn apply(&self) -> Result<()> {
-        // Only set environment variables if they're not already set, or if they
-        // point to paths that don't exist (common when the on-disk layout changes).
-        // This preserves manual overrides while keeping CI/dev setups resilient.
-        fn set_path_if_missing_or_invalid(var: &str, desired: &PathBuf) {
-            let should_set = match std::env::var(var) {
-                Ok(existing) => !PathBuf::from(existing).exists(),
-                Err(_) => true,
-            };
-            if should_set {
-                std::env::set_var(var, desired);
-                println!("Set {}={}", var, desired.display());
-            }
+        // Only set the program if the user didn't provide one.
+        if std::env::var("LIGERO_PROGRAM_PATH").is_err() {
+            std::env::set_var("LIGERO_PROGRAM_PATH", &self.program);
+            println!("Set LIGERO_PROGRAM_PATH={}", self.program);
         }
-
-        set_path_if_missing_or_invalid("LIGERO_PROGRAM_PATH", &self.program_path);
-        set_path_if_missing_or_invalid("LIGERO_PROVER_BIN", &self.prover_bin);
-        set_path_if_missing_or_invalid("LIGERO_VERIFIER_BIN", &self.verifier_bin);
-        set_path_if_missing_or_invalid("LIGERO_SHADER_PATH", &self.shader_path);
+        // NOTE: Do NOT set LIGERO_PROVER_BIN/LIGERO_VERIFIER_BIN/LIGERO_SHADER_PATH here.
+        // Sovereign no longer vendors Ligero binaries/shaders; `ligero-runner` is responsible
+        // for discovering them from the pinned `ligero-prover` git checkout.
 
         let should_set_packing = match std::env::var("LIGERO_PACKING") {
             Ok(existing) => existing.parse::<u32>().is_err(),
@@ -274,12 +222,13 @@ impl LigeroTestConfig {
 
     /// Check if all required files exist
     fn validate(&self) -> Result<()> {
-        if !self.program_path.exists() {
-            anyhow::bail!(
-                "WASM program not found at: {}\nRun: cd crates/adapters/ligero/guest/note-spend-guest && cargo build --release --target wasm32-unknown-unknown",
-                self.program_path.display()
-            );
-        }
+        // Ensure the program can be resolved before running expensive GPU work.
+        ligero_runner::resolve_program(&self.program).with_context(|| {
+            format!(
+                "Failed to resolve Ligero program '{}'. Set LIGERO_PROGRAM_PATH to a circuit name (e.g. note_spend_guest) or a full path to a .wasm",
+                self.program
+            )
+        })?;
 
         // Note: verifier_bin and shader_path might not exist in all environments
         // We'll let those fail at runtime if actually needed
@@ -309,8 +258,8 @@ fn setup_ligero_env() -> Result<String> {
         .apply()
         .context("Failed to apply Ligero configuration")?;
 
-    // Return the program path for convenience
-    Ok(config.program_path.to_string_lossy().to_string())
+    // Return the program specifier for convenience
+    Ok(config.program)
 }
 
 /// Simple test demonstrating note spending with the note_spend_guest program
@@ -855,58 +804,8 @@ fn hex32(h: &Hash32) -> String {
 
 
 /// Helper to discover guest program path and platform-specific binaries
-fn program_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LIGERO_PROGRAM_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Try to discover it based on project structure
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    // For note spending, we'd need a different guest program
-    // For now, return the note_spend_guest as the implementation
-    Ok(repo_root.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"))
-}
-
-/// Helper to get platform-specific binary paths
-fn get_platform_bin_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-    // Detect OS and choose correct binary path
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos-arm64"
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "linux-arm64"
-        } else {
-            "linux-amd64"
-        }
-    } else {
-        bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
-    };
-
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join("shader");
-
-    Ok((
-        bin_dir.join("webgpu_prover"),
-        bin_dir.join("webgpu_verifier"),
-        shader_dir,
-    ))
+fn program_spec() -> String {
+    std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string())
 }
 
 const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
@@ -936,39 +835,21 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     setup_ligero_env().context("Failed to setup Ligero environment")?;
 
-    // Use platform-specific paths or environment overrides
-    let (default_prover, default_verifier, default_shader_path) = get_platform_bin_paths()?;
-    
-    let prover = if let Ok(path) = std::env::var("LIGERO_PROVER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_prover
-    };
-    
-    let verifier = if let Ok(path) = std::env::var("LIGERO_VERIFIER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_verifier
-    };
-    
-    let shader_path = if let Ok(path) = std::env::var("LIGERO_SHADER_PATH") {
-        path
-    } else {
-        default_shader_path.to_string_lossy().to_string()
-    };
-    
     let packing: u32 = std::env::var("LIGERO_PACKING")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8192);
-    let program =
-        program_path().context("Set LIGERO_PROGRAM_PATH to note_spend.wasm guest program")?;
+    let program = program_spec();
 
-    println!("✓ Prover:      {}", prover.display());
-    println!("✓ Verifier:    {}", verifier.display());
-    println!("✓ Shaders:     {}", shader_path);
+    // Use the centralized Ligero runner crate (owned by ligero-prover) for discovery + execution.
+    let mut runner = ligero_runner::LigeroRunner::new(&program);
+    runner.config_mut().packing = packing;
+
+    println!("✓ Prover:      {}", runner.paths().prover_bin.display());
+    println!("✓ Verifier:    {}", runner.paths().verifier_bin.display());
+    println!("✓ Shaders:     {}", runner.config().shader_path);
     println!("✓ Packing:     {}", packing);
-    println!("✓ Program:     {}", program.display());
+    println!("✓ Program:     {}", program);
 
     // ---- 1) Create a note + tree ----
     println!("\nStep 1: Creating note and building Merkle tree...");
@@ -1087,9 +968,9 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     println!("✓ Arguments prepared: {} total", args.len());
     println!("✓ Private indices: {:?}", private_indices);
 
-    let prove_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
+    let _prove_cfg = json!({
+        "program": program.clone(),
+        "shader-path": runner.config().shader_path.clone(),
         "packing": packing,
         "private-indices": private_indices,
         "args": args,
@@ -1097,83 +978,55 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     // ---- 4) Run REAL prover (writes proof.data) ----
     println!("\nStep 4: Generating REAL proof with WebGPU prover...");
-    println!("⏳ This may take a while (proof generation is compute-intensive)...");
 
-    let tmp = tempdir()?;
-    let out = Command::new(&prover)
-        .arg(serde_json::to_string(&prove_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_prover - is WebGPU available?")?;
+    // Fill config
+    runner.config_mut().private_indices = private_indices.clone();
+    runner.config_mut().args = args.clone().into_iter().map(|v| {
+        // The test builds JSON values; decode to LigeroArg via serde_json.
+        serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
+    }).collect();
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !stdout.contains("Final prove result:") || !stdout.contains("true")
-    {
-        eprintln!("❌ Prover output:\n{}", stdout);
-        eprintln!(
-            "❌ Prover stderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        bail!("Ligero prover failed to produce a valid proof");
-    }
+    // Generate proof bytes (default: compressed `proof_data.gz`; when gzip is disabled: `proof_data.bin`).
+    let proof_bytes = runner
+        .run_prover_with_options(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        })
+        .context("Failed to run webgpu_prover")?;
 
-    println!("✓ REAL proof generated successfully!");
-    println!("  Prover output: {}", stdout.lines().last().unwrap_or(""));
+    println!("✓ REAL proof generated successfully! ({} bytes)", proof_bytes.len());
 
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    // Redact ALL private arguments (rho, recipient, spend_sk, position bits, siblings, out_rho, out_pk).
-    // The verifier must not see witness values; the circuit must verify with obscured private args.
-    let mut redacted_args = args.clone();
-    let zero32 = "00".repeat(32);
-    redacted_args[2] = json!({"hex": zero32}); // rho
-    redacted_args[3] = json!({"hex": "00".repeat(32)}); // recipient
-    redacted_args[4] = json!({"hex": "00".repeat(32)}); // spend_sk
-    for i in 0..depth {
-        redacted_args[6 + i] = json!({"hex": "00".repeat(32)}); // pos_bits (index 7..)
-    }
-    for i in 0..depth {
-        redacted_args[6 + depth + i] = json!({"hex": "00".repeat(32)}); // siblings
-    }
-    // Output redaction: out_rho and out_pk live at the tail.
-    let out_rho_idx = out_base; // 0-based: out_base+1 (1-based) => out_base (0-based)
-    let out_pk_idx = out_base + 1; // 0-based
-    redacted_args[out_rho_idx] = json!({"hex": "00".repeat(32)});
-    redacted_args[out_pk_idx] = json!({"hex": "00".repeat(32)});
+    // Resolve the program name to an actual path
+    let program_path = ligero_runner::resolve_program(&program)
+        .context("Failed to resolve program path for verifier")?;
 
-    let verify_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
-        "packing": packing,
-        "private-indices": private_indices,
-        "args": redacted_args,
-    });
+    let vpaths = ligero_runner::verifier::VerifierPaths::from_explicit(
+        program_path,
+        PathBuf::from(&runner.config().shader_path),
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
 
-    let out_v = Command::new(&verifier)
-        .arg(serde_json::to_string(&verify_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_verifier")?;
+    // Convert args JSON -> LigeroArg and let the verifier helper redact private ones.
+    let args_for_verify: Vec<ligero_runner::LigeroArg> = args
+        .clone()
+        .into_iter()
+        .map(|v| serde_json::from_value(v).expect("valid LigeroArg"))
+        .collect();
 
-    let vstdout = String::from_utf8_lossy(&out_v.stdout);
-    if !out_v.status.success()
-        || !vstdout.contains("Final Verify Result:")
-        || !vstdout.contains("true")
-    {
-        eprintln!("❌ Verifier output:\n{}", vstdout);
-        eprintln!(
-            "❌ Verifier stderr:\n{}",
-            String::from_utf8_lossy(&out_v.stderr)
-        );
-        bail!("Ligero verifier rejected the proof");
-    }
+    ligero_runner::verifier::verify_proof(
+        &vpaths,
+        &proof_bytes,
+        args_for_verify,
+        private_indices.clone(),
+    )
+    .context("Failed to run webgpu_verifier")?;
 
     println!("✓ REAL proof verified successfully!");
-    println!(
-        "  Verifier output: {}",
-        vstdout.lines().last().unwrap_or("")
-    );
 
     // ---- 6) Local sanity checks ----
     println!("\nStep 6: Validating proof correctness...");
@@ -1357,7 +1210,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     let out2_recipient = recipient_from_pk(&domain, &out2_pk);
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
 
-    let program_path = config.program_path.to_string_lossy().to_string();
+    let program_path = config.program.clone();
     let depth = siblings.len();
     
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
@@ -1496,7 +1349,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let change_recipient = recipient_from_pk(&domain, &change_pk);
     let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
 
-    let program_path = config.program_path.to_string_lossy().to_string();
+    let program_path = config.program.clone();
     let depth = siblings.len();
     
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
@@ -2125,7 +1978,9 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
                 println!("  ⚠️  Note: Ligero may produce output despite assertion failures");
                 println!("  ✓  Circuit contains balance assertion: value (600) == withdraw (1000) + outputs (0)");
                 println!("  ✓  Assertion WOULD fail in production: 600 ≠ 1000");
-                println!("  ℹ️  See guest/note-spend-guest/src/lib.rs:286 for balance check implementation");
+                println!(
+                    "  ℹ️  See `<ligero-prover>/utils/circuits/bins/note_spend_guest.wat` for a readable version of the guest program."
+                );
             }
         }
     }
@@ -2143,7 +1998,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     println!("\nCircuit Protection:");
     println!("  ✅ Balance assertion implemented: value_in == sum(value_out) + withdraw_amount");
     println!("  ✅ Circuit code verifies: 600 == 1000 + 0 (fails!)");
-    println!("  ✅ See guest/note-spend-guest/src/lib.rs:284-286 for implementation");
+    println!("  ✅ See `<ligero-prover>/utils/circuits/bins/note_spend_guest.wat` for a readable version of the guest program.");
     println!("\nSecurity Properties Demonstrated:");
     println!("  • Circuit contains balance check preventing supply inflation");
     println!("  • Cannot withdraw more than note value without outputs to balance");

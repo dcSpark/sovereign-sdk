@@ -11,21 +11,30 @@ export VERIFIER_URL="${VERIFIER_URL:-http://localhost:8080}"
 export INDEXER_URL="${INDEXER_URL:-http://localhost:13100}"
 export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-50}"
 
-export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-$WORKSPACE_ROOT/crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm}"
-export LIGERO_PROVER_BINARY_PATH="${LIGERO_PROVER_BINARY_PATH:-$WORKSPACE_ROOT/crates/adapters/ligero/bins/macos-arm64/bin/webgpu_prover}"
-export LIGERO_SHADER_PATH="${LIGERO_SHADER_PATH:-$WORKSPACE_ROOT/crates/adapters/ligero/bins/shader}"
+# Provide the ZK guest program via:
+# - LIGERO_PROGRAM_PATH (circuit name like `note_spend_guest` OR full path to a `.wasm` file)
+export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
+# Sovereign no longer vendors Ligero binaries/shaders.
+# Prefer `ligero-runner` auto-discovery. If you want to override discovery,
+# set these env vars explicitly before running this script:
+# - LIGERO_PROVER_BIN or LIGERO_PROVER_BINARY_PATH
+# - LIGERO_VERIFIER_BIN
+# - LIGERO_SHADER_PATH
 
-if [[ ! -f "$LIGERO_PROGRAM_PATH" ]]; then
-  echo "LIGERO_PROGRAM_PATH not found: $LIGERO_PROGRAM_PATH"
-  exit 1
+# If the user passed a path, fail fast if it doesn't exist.
+if [[ "$LIGERO_PROGRAM_PATH" == *"/"* || "$LIGERO_PROGRAM_PATH" == *".wasm" ]]; then
+  if [[ ! -f "$LIGERO_PROGRAM_PATH" ]]; then
+    echo "LIGERO_PROGRAM_PATH not found: $LIGERO_PROGRAM_PATH"
+    exit 1
+  fi
 fi
 
-if [[ ! -f "$LIGERO_PROVER_BINARY_PATH" ]]; then
+if [[ -n "${LIGERO_PROVER_BINARY_PATH:-}" && ! -f "$LIGERO_PROVER_BINARY_PATH" ]]; then
   echo "LIGERO_PROVER_BINARY_PATH not found: $LIGERO_PROVER_BINARY_PATH"
   exit 1
 fi
 
-if [[ ! -d "$LIGERO_SHADER_PATH" ]]; then
+if [[ -n "${LIGERO_SHADER_PATH:-}" && ! -d "$LIGERO_SHADER_PATH" ]]; then
   echo "LIGERO_SHADER_PATH not found: $LIGERO_SHADER_PATH"
   exit 1
 fi

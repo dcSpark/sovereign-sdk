@@ -281,7 +281,7 @@ Shielded → Shielded (Transfer)
 
 - `midnight_withdraw_tx.bin` - Borsh-serialized transaction
 - `midnight_withdraw_tx.json` - JSON payload for API
-- `proof_data.gz` - Compressed Ligero proof (temporary)
+- `proof_data.gz` / `proof_data.bin` - Ligero proof (temporary). The exact filename depends on whether proof gzipping is enabled.
 
 ## Security Considerations
 
@@ -349,7 +349,7 @@ curl http://localhost:12346/state/midnight_privacy/current_root
 **Cause:** The proof was generated with a different WASM program than expected.
 
 **Solution:** The verifier now auto-discovers the correct program based on the code commitment in the proof. Ensure:
-1. `note_spend_guest.wasm` exists in `crates/adapters/ligero/guest/bins/programs/`
+1. The `note_spend_guest` circuit is available to `ligero-runner` (auto-discovery), or you set `LIGERO_PROGRAM_PATH` to a full path to the `.wasm`
 2. Rollup genesis has the correct `method_id`: `02af46d4...`
 
 ### "Argument list too long" (curl error)
@@ -445,5 +445,6 @@ cd ../../scripts/midnight-tx-generator
 - **Module Implementation:** `crates/module-system/module-implementations/midnight-privacy/`
 - **Integration Tests:** `crates/module-system/module-implementations/midnight-privacy/tests/integration/`
 - **Ligero Adapter:** `crates/adapters/ligero/`
-- **Guest Circuit:** `crates/adapters/ligero/guest/note-spend-guest/`
+- **Guest WASM (artifact):** `<ligero-prover>/utils/circuits/bins/note_spend_guest.wasm`
+- **Guest WAT (readable):** `<ligero-prover>/utils/circuits/bins/note_spend_guest.wat`
 - **Genesis Config:** `examples/test-data/genesis/demo/mock/midnight_privacy.json`

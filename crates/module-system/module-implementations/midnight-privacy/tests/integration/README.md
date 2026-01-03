@@ -46,8 +46,8 @@ To run the Ligero proof tests, you need:
 - Shader files - For GPU computation
 
 ### 3. Guest Program
-- `value_validator.wasm` - The WASM program that enforces constraints
-  - Located at: `crates/adapters/ligero/guest/bins/programs/value_validator.wasm`
+- `value_validator_rust.wasm` - The WASM program that enforces constraints
+  - Located at: `<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm`
 
 ### 4. Automatic Configuration ✨
 
@@ -65,7 +65,7 @@ If you need to override the default paths, you can set these environment variabl
 ```bash
 # Optional manual overrides
 export LIGERO_VERIFIER_BIN="path/to/webgpu_verifier"
-export LIGERO_PROGRAM_PATH="path/to/value_validator.wasm"
+export LIGERO_PROGRAM_PATH="path/to/value_validator_rust.wasm"
 export LIGERO_SHADER_PATH="path/to/shader"
 export LIGERO_PACKING=8192  # optional, defaults to 8192
 ```
@@ -104,7 +104,7 @@ Unlike many zkVM tests that use simulation or skip verification, these tests:
 
 **No shortcuts. No simulation. Real zero-knowledge proofs.**
 
-## Guest Program: value_validator.wasm
+## Guest Program: value_validator_rust.wasm
 
 The tests use a C++ guest program (`value_validator.cpp`) that enforces:
 
@@ -121,8 +121,8 @@ This demonstrates how Ligero can enforce arbitrary constraints in zero-knowledge
 
 ## Troubleshooting
 
-### Test skips with "value_validator.wasm not found"
-- Build the guest program: `cd crates/adapters/ligero/guest && ./build.sh`
+### Test skips with "value_validator_rust.wasm not found"
+- Build the guest program in the Ligero repo (or set `LIGERO_PROGRAM_PATH` to an explicit wasm path).
 
 ### "Failed to execute webgpu_prover"
 - Ensure the prover binary is in your PATH or use absolute paths

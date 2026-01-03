@@ -22,6 +22,30 @@ use sov_modules_api::execution_mode::Native;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
+use ligero_runner::LigeroRunner;
+
+fn env_opt(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var(var).ok().map(std::path::PathBuf::from)
+}
+
+/// Helper to create test ligero prover (skips if assets are missing).
+fn create_test_ligero() -> Option<Ligero> {
+    let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program_path = ligero_runner::resolve_program(&program).ok()?;
+
+    let runner = LigeroRunner::new(&program);
+    let prover = env_opt("LIGERO_PROVER_BIN")
+        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
+        .unwrap_or_else(|| runner.paths().prover_bin.clone());
+    let shader =
+        env_opt("LIGERO_SHADER_PATH").unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
+
+    if !prover.exists() || !shader.exists() {
+        return None;
+    }
+
+    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
+}
 
 /// Helper to check if services are available
 async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> bool {
@@ -46,42 +70,6 @@ async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url
     }
 
     true
-}
-
-/// Helper to create test ligero prover
-fn create_test_ligero() -> Ligero {
-    let base_path = std::env::current_dir()
-        .expect("Failed to get current directory")
-        .join("..")
-        .join("..");
-
-    let os_name = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        panic!("Unsupported OS for Ligero prover");
-    };
-
-    let prover_binary_path = base_path
-        .join("crates/adapters/ligero/bins")
-        .join(os_name)
-        .join("bin/webgpu_prover");
-
-    let shader_path = base_path
-        .join("crates/adapters/ligero/bins")
-        .join(os_name)
-        .join("shader");
-
-    let program_path =
-        base_path.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm");
-
-    Ligero::new(
-        Some(prover_binary_path),
-        None,
-        Some(shader_path),
-        Some(program_path),
-    )
 }
 
 #[tokio::test]
@@ -189,7 +177,10 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 
     // Step 6: Initialize Ligero prover for transfer
     tracing::info!("Step 6: Initializing Ligero prover");
-    let ligero = create_test_ligero();
+    let Some(ligero) = create_test_ligero() else {
+        eprintln!("⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)");
+        return Ok(());
+    };
     tracing::info!("✓ Ligero prover initialized");
 
     // Step 7: Perform transfer using deposit outputs
@@ -272,8 +263,13 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
 async fn test_wallet_address_format() -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    let wallet_private_key =
-        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
+    let wallet_private_key = match std::env::var("WALLET_PRIVATE_KEY") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("⚠️  Skipping integration test: WALLET_PRIVATE_KEY not set");
+            return Ok(());
+        }
+    };
 
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let address = wallet.get_address();
@@ -435,7 +431,10 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let send_amount = 50u128;
 
     // Initialize Ligero prover
-    let ligero = create_test_ligero();
+    let Some(ligero) = create_test_ligero() else {
+        eprintln!("⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)");
+        return Ok(());
+    };
 
     // Get the deposited note details for transfer
     let note = initial_balance_result.unspent_notes.first()

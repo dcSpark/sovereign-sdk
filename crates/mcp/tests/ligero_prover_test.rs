@@ -1,12 +1,9 @@
-//! Integration-style test for the Ligero prover. Requires the local prover binary and GPU/WebGPU.
+//! Integration-style test for the Ligero prover. Requires GPU/WebGPU and Ligero prover assets.
 
 use std::{env, path::PathBuf};
 
+use ligero_runner::LigeroRunner;
 use mcp::ligero::{Ligero, LigeroProgramArguments};
-
-const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";
-const DEFAULT_PROVER_REL: &str = "../adapters/ligero/bins/macos-arm64/bin/webgpu_prover";
-const DEFAULT_SHADER_REL: &str = "../adapters/ligero/bins/shader";
 
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
@@ -16,16 +13,28 @@ fn env_path(var: &str, default_rel: &str) -> PathBuf {
     }
 }
 
-fn create_test_ligero() -> Option<Ligero> {
-    let prover = env_path("LIGERO_PROVER_BINARY_PATH", DEFAULT_PROVER_REL);
-    let shader = env_path("LIGERO_SHADER_PATH", DEFAULT_SHADER_REL);
-    let program = env_path("LIGERO_PROGRAM_PATH", DEFAULT_PROGRAM_REL);
+fn env_opt(var: &str) -> Option<PathBuf> {
+    env::var(var).ok().map(PathBuf::from)
+}
 
-    for (label, path) in [
-        ("prover", &prover),
-        ("shader", &shader),
-        ("program", &program),
-    ] {
+fn create_test_ligero() -> Option<Ligero> {
+    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program_path = match ligero_runner::resolve_program(&program) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("⚠️  Skipping Ligero prover test: failed to resolve program '{program}': {e}");
+            return None;
+        }
+    };
+
+    let runner = LigeroRunner::new(&program);
+    let prover = env_opt("LIGERO_PROVER_BIN")
+        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
+        .unwrap_or_else(|| runner.paths().prover_bin.clone());
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| PathBuf::from(runner.config().shader_path.clone()));
+
+    for (label, path) in [("prover", &prover), ("shader", &shader)] {
         if !path.exists() {
             eprintln!(
                 "⚠️  Skipping Ligero prover test: {} path not found at {}",
@@ -36,12 +45,7 @@ fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(
-        Some(prover),
-        None,
-        Some(shader),
-        Some(program),
-    ))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
 }
 
 #[tracing_test::traced_test]

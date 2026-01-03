@@ -106,18 +106,16 @@ int main(int argc, char *argv[]) {
 }
 ```
 
-#### Building Guest Programs
+#### Guest Programs
 
-1. Place your `.cpp` file in `guest/`
-2. Update `guest/CMakeLists.txt` to include your program
-3. Run the build script:
+Sovereign expects guest program artifacts to come from the Ligero-owned repo checkout.
 
-```bash
-cd guest
-./build.sh
-```
+- **Programs dir**: `<ligero-prover>/utils/circuits/bins/`
+- **Programs**:
+  - `note_spend_guest.wasm`
+  - `value_validator_rust.wasm`
 
-The compiled `.wasm` files will be placed in `bins/programs/`.
+You can point directly at a program with `LIGERO_PROGRAM_PATH` (either a circuit name like `note_spend_guest` or a full path to a `.wasm`).
 
 ### Using Ligero in a Rollup
 
@@ -183,10 +181,8 @@ ls -lh $LIGERO_SDK_PATH/build/libligetron.a
 ```
 
 3. **Manual build:**
-```bash
-cd crates/adapters/ligero/guest
-LIGERO_SDK_PATH=/path/to/sdk ./build.sh
-```
+
+Build the guest programs in the Ligero repo (or set `LIGERO_PROGRAM_PATH` to point at the program you want to use).
 
 ### Proof Generation Errors
 
@@ -219,12 +215,9 @@ For optimal proving performance:
 
 ### Module-Level Proof (value-setter-zk)
 
-See `examples/generate_value_proof.rs` for an example of using Ligero for module-level proofs:
-
-```bash
-cd crates/adapters/ligero
-cargo run --example generate_value_proof --features native -- 42
-```
+This repo no longer ships a `generate_value_proof` example. Use the `value-setter-zk` module tooling
+or your own host wrapper that calls `<Ligero as Zkvm>::Host::from_args(...)` and submits the resulting
+`LigeroProofPackage` to the verifier service.
 
 ### Rollup-Level Proof
 
