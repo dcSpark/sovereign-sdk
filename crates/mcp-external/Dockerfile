@@ -44,7 +44,7 @@ RUN --mount=type=ssh \
 # ---------------------------------------------------------------------
 # Use the Ligero repo branch that includes `ligero-runner` and the prebuilt circuits in
 # `utils/circuits/bins/`.
-ARG LIGERO_PROVER_REF=feature/ligero-runner
+ARG LIGERO_PROVER_REF=feature/midnight-l2
 ARG TARGETARCH
 RUN --mount=type=ssh set -eux; \
     case "${TARGETARCH:-amd64}" in \

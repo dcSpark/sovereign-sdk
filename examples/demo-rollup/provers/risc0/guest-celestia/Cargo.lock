@@ -2819,11 +2819,13 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#e840774a219e22e6174e2e1fd0374a4cd85251fd"
 dependencies = [
  "anyhow",
  "bincode",
  "hex",
+ "ligetron",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2834,7 +2836,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#2b6b251d03b581dd13715d5526b1903bfa0bd354"
+source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#e840774a219e22e6174e2e1fd0374a4cd85251fd"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
