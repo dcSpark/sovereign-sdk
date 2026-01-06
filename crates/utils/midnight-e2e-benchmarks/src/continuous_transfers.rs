@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     SpendPublic,
 };
@@ -1473,8 +1473,7 @@ async fn perform_transfer_cycle(
                 }
 
                 // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
-                // For benchmarks we use pk_ivk_owner == pk_spend_owner.
-                let pk_ivk_owner = pk_from_sk(&in_spend_sk);
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &in_spend_sk);
                 let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
                 let sender_id_out = in_recipient;
 
@@ -1482,7 +1481,7 @@ async fn perform_transfer_cycle(
                 let out_rho: Hash32 = rand::thread_rng().gen();
                 let out_spend_sk: Hash32 = rand::thread_rng().gen();
                 let out_pk_spend = pk_from_sk(&out_spend_sk);
-                let out_pk_ivk = out_pk_spend;
+                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
                 let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
                 let cm_out = note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id_out);
 
@@ -1734,10 +1733,10 @@ async fn perform_transfer_cycle(
                 .try_into()
                 .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
             let out_pk_spend = pk_from_sk(&out_spend_sk);
-            let out_pk_ivk = out_pk_spend;
+            let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
             let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
-            let pk_spend_owner = pk_from_sk(&wallet.spend_sk);
-            let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend_owner);
+            let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+            let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
             // Build encrypted note for authority if configured
             let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {

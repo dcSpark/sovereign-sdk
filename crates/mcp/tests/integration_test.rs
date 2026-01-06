@@ -24,6 +24,8 @@ type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddres
 type McpRuntime = Runtime<McpSpec>;
 use ligero_runner::LigeroRunner;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 fn env_opt(var: &str) -> Option<std::path::PathBuf> {
     std::env::var(var).ok().map(std::path::PathBuf::from)
 }
@@ -125,7 +127,10 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         PrivacyKey::from_hex(&privpool_spend_key)
     }
     .expect("Failed to parse PRIVPOOL_SPEND_KEY");
-    tracing::info!("Using privacy address: {}", privacy_key.privacy_address());
+    tracing::info!(
+        "Using privacy address: {}",
+        privacy_key.privacy_address(&DOMAIN)
+    );
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");

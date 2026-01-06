@@ -5,6 +5,8 @@
 
 use mcp_external::privacy_key::PrivacyKey;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 #[test]
 fn test_privacy_address_included_in_response() {
     // This test verifies the structure that walletAddress should return
@@ -13,7 +15,7 @@ fn test_privacy_address_included_in_response() {
     let test_spend_sk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let privacy_key = PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
 
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     // Simulate the expected response structure
     #[derive(serde::Serialize)]
@@ -61,7 +63,7 @@ fn test_wallet_address_json_format() {
 
     let response = WalletAddressResponse {
         address: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb2".to_string(),
-        privacy_address: privacy_key.privacy_address().to_string(),
+        privacy_address: privacy_key.privacy_address(&DOMAIN).to_string(),
     };
 
     // Serialize to JSON
@@ -103,9 +105,9 @@ fn test_multiple_calls_consistent_privacy_address() {
     let privacy_key = PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
 
     // Simulate multiple calls
-    let addr1 = privacy_key.privacy_address().to_string();
-    let addr2 = privacy_key.privacy_address().to_string();
-    let addr3 = privacy_key.privacy_address().to_string();
+    let addr1 = privacy_key.privacy_address(&DOMAIN).to_string();
+    let addr2 = privacy_key.privacy_address(&DOMAIN).to_string();
+    let addr3 = privacy_key.privacy_address(&DOMAIN).to_string();
 
     assert_eq!(addr1, addr2, "Privacy address should be consistent");
     assert_eq!(addr2, addr3, "Privacy address should be consistent");

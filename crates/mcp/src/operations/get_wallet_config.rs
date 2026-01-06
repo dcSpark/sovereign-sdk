@@ -8,6 +8,8 @@ use crate::provider::Provider;
 use crate::wallet::WalletContext;
 use anyhow::Result;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 /// Wallet configuration information
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WalletConfig {
@@ -79,7 +81,7 @@ where
     let rpc_url = provider.rpc_url().to_string();
 
     // Get privacy address from privacy key
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     let config = WalletConfig {
         rpc_url,

@@ -365,6 +365,7 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
 const PK_TAG: &[u8; 5] = b"PK_V1";
 const ADDR_TAG: &[u8; 7] = b"ADDR_V2";
 const NFKEY_TAG: &[u8; 8] = b"NFKEY_V1";
+const IVK_SEED_TAG: &[u8; 11] = b"IVK_SEED_V1";
 
 /// Derive public key from spending secret key.
 /// pk = H("PK_V1" || spend_sk)
@@ -374,6 +375,41 @@ pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     buf[..5].copy_from_slice(PK_TAG);
     buf[5..].copy_from_slice(spend_sk);
     ligetron_hash_bytes(&buf).to_bytes_be()
+}
+
+/// Clamp a 32-byte seed into an X25519 scalar (RFC 7748).
+#[inline]
+fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    scalar
+}
+
+/// Derive incoming viewing key secret from domain and spending secret key.
+/// ivk_sk = H("IVK_SEED_V1" || domain || spend_sk)
+///
+/// The receiver uses this to decrypt notes sent to them.
+#[inline]
+pub fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 11 + 32 + 32];
+    buf[..11].copy_from_slice(IVK_SEED_TAG);
+    buf[11..43].copy_from_slice(domain);
+    buf[43..].copy_from_slice(spend_sk);
+    ligetron_hash_bytes(&buf).to_bytes_be()
+}
+
+/// Derive the incoming viewing public key (pk_ivk) from spend_sk and domain.
+/// pk_ivk = X25519_BASE(clamp(ivk_sk_from_sk(domain, spend_sk)))
+#[inline]
+pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
+    let clamped = clamp_x25519_scalar(ivk_sk);
+    let secret = StaticSecret::from(clamped);
+    let public = PublicKey::from(&secret);
+    *public.as_bytes()
 }
 
 /// Derive privacy recipient address from domain and public key material.

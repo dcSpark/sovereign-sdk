@@ -30,7 +30,7 @@ fn test_privacy_key_recipient_derivation() {
     assert_ne!(recipient1, [0u8; 32], "Recipient should not be all zeros");
 
     // Privacy address should be in correct format
-    let privacy_address = privacy_key.privacy_address();
+    let privacy_address = privacy_key.privacy_address(&domain);
     let addr_str = privacy_address.to_string();
     assert!(
         addr_str.starts_with("privpool1"),
@@ -50,14 +50,12 @@ fn test_privacy_key_from_address() {
     let full_key = PrivacyKey::from_hex(spend_sk_hex).expect("Failed to create full key");
 
     // Get the address string
-    let addr_str = full_key.privacy_address().to_string();
+    let domain = [1u8; 32];
+    let addr_str = full_key.privacy_address(&domain).to_string();
 
     // Create a new key from just the address
     let address_only_key =
         PrivacyKey::from_address(&addr_str).expect("Failed to create key from address");
-
-    // Domain for testing
-    let domain = [1u8; 32];
 
     // Both should derive the same recipient
     assert_eq!(

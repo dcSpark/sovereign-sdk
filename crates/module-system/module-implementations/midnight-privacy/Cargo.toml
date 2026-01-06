@@ -45,6 +45,7 @@ hex = { workspace = true }
 bech32 = { workspace = true }
 # Ligetron SDK with native field arithmetic (same Poseidon2 as circuit!)
 ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", branch = "feature/midnight-l2", features = ["native"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 sov-bank = { workspace = true }
 once_cell = { workspace = true }
 chacha20poly1305 = { version = "0.10", features = ["std"] }

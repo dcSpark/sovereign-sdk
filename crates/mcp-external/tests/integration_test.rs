@@ -24,6 +24,8 @@ type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddres
 type McpRuntime = Runtime<McpSpec>;
 use ligero_runner::LigeroRunner;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 fn env_opt(var: &str) -> Option<std::path::PathBuf> {
     std::env::var(var).ok().map(std::path::PathBuf::from)
 }
@@ -107,7 +109,10 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         PrivacyKey::from_hex(&privpool_spend_key)
     }
     .expect("Failed to parse PRIVPOOL_SPEND_KEY");
-    tracing::info!("Using privacy address: {}", privacy_key.privacy_address());
+    tracing::info!(
+        "Using privacy address: {}",
+        privacy_key.privacy_address(&DOMAIN)
+    );
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");
@@ -386,7 +391,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let mut spend_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut spend_key_bytes);
     let new_privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
-    let new_privacy_address = new_privacy_key.privacy_address().to_string();
+    let new_privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
     tracing::info!("✓ New privacy address: {}", new_privacy_address);
 
     // Step 4: Generate new authority VFK
