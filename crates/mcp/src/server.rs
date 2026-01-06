@@ -767,7 +767,7 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<TransferRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        use midnight_privacy::{PrivacyAddress, recipient_from_pk};
+        use midnight_privacy::PrivacyAddress;
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
@@ -870,9 +870,40 @@ impl CryptoServer {
         let mut input_rho = [0u8; 32];
         input_rho.copy_from_slice(&input_rho_bytes);
 
-        // Input recipient is the current wallet's privacy address
+        // Input recipient is the current wallet's privacy address (derived from spend_sk).
         const DOMAIN: [u8; 32] = [1u8; 32];
         let input_recipient = privacy_key_guard.recipient(&DOMAIN);
+
+        // Input sender_id must match the NOTE_V2 commitment for this note.
+        // - Deposits: by convention sender_id = recipient (no sender_id in plaintext)
+        // - Transfers/withdraw outputs: sender_id is included in decrypted plaintext
+        let input_sender_id: [u8; 32] = if let Some(ref sender_id_hex) = note.sender_id {
+            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|_| {
+                ErrorData::internal_error(
+                    "Invalid sender_id in note (expected hex-encoded 32 bytes)".to_string(),
+                    None,
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(ErrorData::internal_error(
+                    "Invalid sender_id length in note (expected 32 bytes)".to_string(),
+                    None,
+                ));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        } else {
+            // Deposit-style note: sender_id is derived deterministically as recipient.
+            input_recipient
+        };
+
+        let spend_sk = privacy_key_guard
+            .spend_sk()
+            .ok_or_else(|| ErrorData::invalid_params("Privacy key must include spend_sk to transfer.", None))?;
+        let spend_sk = *spend_sk;
+        // v2 requires pk_ivk_owner as a private witness; MCP defaults `pk_ivk_owner = pk_spend_owner`.
+        let pk_ivk_owner = *privacy_key_guard.pk();
 
         // Parse output recipient (destination bech32 privacy address)
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse()
@@ -881,9 +912,9 @@ impl CryptoServer {
                 None,
             ))?;
 
-        // Derive output recipient hash from the privacy address
-        let output_pk = output_privacy_addr.to_pk();
-        let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
+        // Destination public key (pk_spend); MCP defaults pk_ivk = pk_spend.
+        let destination_pk_spend = output_privacy_addr.to_pk();
+        let destination_pk_ivk = destination_pk_spend;
 
         tracing::info!(
             "[transfer] Spending note: tx_hash={}, note_value={}, send_amount={}, rho={}",
@@ -898,23 +929,18 @@ impl CryptoServer {
             has_change
         );
 
-        // If partial transfer, change goes back to our own privacy address
-        let change_recipient = if has_change {
-            Some(input_recipient)
-        } else {
-            None
-        };
-
         let transfer_result = crate::operations::transfer(
             ligero,
             provider,
             &*ctx,
+            spend_sk,
+            pk_ivk_owner,
             note_value,
             send_amount,
             input_rho,
-            input_recipient,
-            output_recipient,
-            change_recipient,
+            input_sender_id,
+            destination_pk_spend,
+            destination_pk_ivk,
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;

@@ -188,15 +188,17 @@ Build the guest programs in the Ligero repo (or set `LIGERO_PROGRAM_PATH` to poi
 
 If proof generation fails:
 
-1. **Check binaries exist:**
-```bash
-ls -lh crates/adapters/ligero/bins/*/bin/webgpu_{prover,verifier}
-```
+1. **Binaries are auto-discovered:**
+   The `ligero-runner` crate (from the `ligero-prover` repository) automatically discovers and provides
+   the `webgpu_prover`, `webgpu_verifier`, and shader files. No manual binary setup is needed.
 
-2. **Verify shader directory:**
-```bash
-ls crates/adapters/ligero/bins/shader/
-```
+2. **Optional environment overrides:**
+   You can override the auto-discovered paths if needed:
+   ```bash
+   export LIGERO_PROVER_BIN=/path/to/webgpu_prover
+   export LIGERO_VERIFIER_BIN=/path/to/webgpu_verifier
+   export LIGERO_SHADER_PATH=/path/to/shader/
+   ```
 
 3. **Enable debug logging:**
 ```bash

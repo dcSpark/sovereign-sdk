@@ -49,6 +49,7 @@ sov-modules-stf-blueprint.workspace = true
 midnight-privacy = { workspace = true }
 rand = { workspace = true }
 sov-api-spec = { workspace = true }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", branch = "feature/midnight-l2" }
 
 [dev-dependencies]
 dirs = "6.0.0"

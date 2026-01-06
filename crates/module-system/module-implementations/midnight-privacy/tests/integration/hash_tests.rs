@@ -38,18 +38,18 @@ mod tests {
     #[test]
     fn test_note_commitment() {
         let domain = [1u8; 32];
-        let value = 100u128;
+        let value = 100u64;
         let rho = [2u8; 32];
         let recipient = [3u8; 32];
 
-        let cm1 = note_commitment(&domain, value, &rho, &recipient);
-        let cm2 = note_commitment(&domain, value, &rho, &recipient);
+        let cm1 = note_commitment(&domain, value, &rho, &recipient, &recipient);
+        let cm2 = note_commitment(&domain, value, &rho, &recipient, &recipient);
 
         // Same inputs should produce same commitment
         assert_eq!(cm1, cm2);
 
         // Different value should produce different commitment
-        let cm3 = note_commitment(&domain, value + 1, &rho, &recipient);
+        let cm3 = note_commitment(&domain, value + 1, &rho, &recipient, &recipient);
         assert_ne!(cm1, cm3);
     }
 

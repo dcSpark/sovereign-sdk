@@ -15,8 +15,11 @@ pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 /// A privacy pool address (bech32m-encoded public key).
 /// 
 /// This is the user-facing format for privacy recipients. The inner value is
-/// a 32-byte public key (`pk_out`) which is used to derive the actual recipient:
-/// `recipient = H("ADDR_V1" || domain || pk_out)`
+/// a 32-byte public key (`pk_spend`) which is used (together with an incoming-view key)
+/// to derive the actual recipient:
+/// `recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)`
+///
+/// By default, callers may use the convention `pk_ivk == pk_spend`.
 /// 
 /// Format: `privpool1<bech32m-encoded-32-bytes>`
 /// 

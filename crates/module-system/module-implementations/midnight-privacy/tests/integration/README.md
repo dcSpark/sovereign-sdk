@@ -40,19 +40,23 @@ To run the Ligero proof tests, you need:
 - WebGPU-capable hardware (GPU)
 - Modern browser or runtime with WebGPU support
 
-### 2. Ligero Binaries
+### 2. Ligero Binaries (Auto-Discovered)
+
+Ligero binaries are **automatically discovered** from the `ligero-runner` crate:
 - `webgpu_prover` - For proof generation
 - `webgpu_verifier` - For proof verification
 - Shader files - For GPU computation
 
+**No manual binary setup required!**
+
 ### 3. Guest Program
 - `value_validator_rust.wasm` - The WASM program that enforces constraints
-  - Located at: `<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm`
+  - Auto-discovered from `ligero-runner` by circuit name (e.g., `value_validator_rust`)
 
 ### 4. Automatic Configuration ✨
 
-**NEW:** Tests now use `setup_ligero_env()` which automatically:
-- Discovers paths to Ligero binaries based on project structure
+Tests use `setup_ligero_env()` which:
+- Uses `ligero-runner` to auto-discover paths to Ligero binaries
 - Sets environment variables for verification
 - Validates that required files exist
 
@@ -60,12 +64,13 @@ To run the Ligero proof tests, you need:
 
 ### Optional: Manual Environment Override
 
-If you need to override the default paths, you can set these environment variables:
+If you need to override the auto-discovered paths:
 
 ```bash
 # Optional manual overrides
+export LIGERO_PROVER_BIN="path/to/webgpu_prover"
 export LIGERO_VERIFIER_BIN="path/to/webgpu_verifier"
-export LIGERO_PROGRAM_PATH="path/to/value_validator_rust.wasm"
+export LIGERO_PROGRAM_PATH="value_validator_rust"  # circuit name or full path
 export LIGERO_SHADER_PATH="path/to/shader"
 export LIGERO_PACKING=8192  # optional, defaults to 8192
 ```
@@ -125,8 +130,9 @@ This demonstrates how Ligero can enforce arbitrary constraints in zero-knowledge
 - Build the guest program in the Ligero repo (or set `LIGERO_PROGRAM_PATH` to an explicit wasm path).
 
 ### "Failed to execute webgpu_prover"
-- Ensure the prover binary is in your PATH or use absolute paths
+- Binaries are auto-discovered from `ligero-runner`; ensure cargo dependencies are updated
 - Check that you have WebGPU-capable hardware
+- Optional: override with `LIGERO_PROVER_BIN` env var
 
 ### "Ligero verifier configuration error"
 - Set all required environment variables (see above)

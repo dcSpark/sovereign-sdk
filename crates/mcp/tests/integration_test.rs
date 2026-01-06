@@ -204,16 +204,30 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount;
     let send_amount = deposit_amount; // Transfer the full amount (no change)
+    let spend_sk = match privacy_key.spend_sk() {
+        Some(sk) => *sk,
+        None => {
+            eprintln!("⚠️  Skipping integration test: PRIVPOOL_SPEND_KEY must be a spend_sk (not just a privpool1... address) to run transfers");
+            return Ok(());
+        }
+    };
+    let pk_ivk_owner = *privacy_key.pk();
+    let destination_pk_spend = *privacy_key.pk();
+    let destination_pk_ivk = destination_pk_spend; // MCP default
+    let input_sender_id = deposit_result.recipient; // deposit convention: sender_id = recipient
+
     let transfer_result = transfer(
         &ligero,
         &provider,
         &wallet,
+        spend_sk,
+        pk_ivk_owner,
         note_value,
         send_amount,
         deposit_result.rho,
-        deposit_result.recipient,
-        deposit_result.recipient, // Send to same recipient
-        None, // No change since sending full amount
+        input_sender_id,
+        destination_pk_spend,
+        destination_pk_ivk,
     )
     .await?;
 

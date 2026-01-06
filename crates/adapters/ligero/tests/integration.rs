@@ -158,11 +158,12 @@ mod tests {
 #[cfg(feature = "native")]
 mod note_spend_tests {
     use anyhow::{Context, Result};
+    use ligetron::bn254fr_native::submod_checked;
+    use ligetron::Bn254Fr;
     use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
     use serde::{Deserialize, Serialize};
     use sov_ligero_adapter::{Ligero, LigeroVerifier};
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
-    use std::path::PathBuf;
     use std::time::Instant;
 
     type Hash32 = [u8; 32];
@@ -193,8 +194,16 @@ mod note_spend_tests {
         poseidon2_hash_domain(b"MT_NODE_V1", &[&[level], left, right])
     }
 
-    fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
-        poseidon2_hash_domain(b"NOTE_V1", &[domain, &value.to_le_bytes(), rho, recipient])
+    fn note_commitment_v2(
+        domain: &Hash32,
+        value: u64,
+        rho: &Hash32,
+        recipient: &Hash32,
+        sender_id: &Hash32,
+    ) -> Hash32 {
+        let mut v16 = [0u8; 16];
+        v16[..8].copy_from_slice(&value.to_le_bytes());
+        poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
     }
 
     fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
@@ -205,12 +214,12 @@ mod note_spend_tests {
         poseidon2_hash_domain(b"PK_V1", &[spend_sk])
     }
 
-    fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-        poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+    fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+        poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
     }
 
-    fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-        recipient_from_pk(domain, &pk_from_sk(spend_sk))
+    fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+        recipient_from_pk(domain, &pk_from_sk(spend_sk), pk_ivk)
     }
 
     fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
@@ -275,18 +284,21 @@ mod note_spend_tests {
     }
 
     fn prover_available() -> bool {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        #[cfg(target_os = "macos")]
-        let prover = manifest_dir.join("bins/macos/bin/webgpu_prover");
-        #[cfg(target_os = "linux")]
-        let prover = manifest_dir.join("bins/linux-amd64/bin/webgpu_prover");
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let prover = manifest_dir.join("bins/webgpu_prover");
-        prover.exists()
+        // Use ligero-runner's discovery mechanism to find the prover binary
+        match ligero_runner::LigeroPaths::discover() {
+            Ok(paths) => paths.prover_bin.exists(),
+            Err(_) => false,
+        }
     }
 
     fn hex32(h: &Hash32) -> String {
         format!("0x{}", hex::encode(h))
+    }
+
+    fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+        let mut out = Bn254Fr::new();
+        out.set_bytes_big(h);
+        out
     }
 
     /// Test spending with withdrawal (mixed shielded + transparent)
@@ -315,10 +327,12 @@ mod note_spend_tests {
         let value: u64 = 500;
         let rho: Hash32 = [2u8; 32];
         let spend_sk: Hash32 = [4u8; 32];
+        let pk_ivk_owner: Hash32 = [6u8; 32];
 
-        let recipient = recipient_from_sk(&domain, &spend_sk);
+        let recipient_owner = recipient_from_sk(&domain, &spend_sk, &pk_ivk_owner);
         let nf_key = nf_key_from_sk(&domain, &spend_sk);
-        let cm = note_commitment(&domain, value.into(), &rho, &recipient);
+        let sender_id_in: Hash32 = [3u8; 32];
+        let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
 
         println!("Input note: {} units", value);
 
@@ -333,17 +347,19 @@ mod note_spend_tests {
 
         // Withdraw some, keep rest as shielded change
         let withdraw_amount: u64 = 200;
+        let withdraw_to: Hash32 = [9u8; 32];
         let change_value: u64 = 300;
         let change_rho: Hash32 = [10u8; 32];
-        let change_pk: Hash32 = [11u8; 32];
-        let change_rcp = recipient_from_pk(&domain, &change_pk);
-        let cm_change = note_commitment(&domain, change_value.into(), &change_rho, &change_rcp);
+        let change_pk_spend: Hash32 = [11u8; 32];
+        let change_pk_ivk: Hash32 = [12u8; 32];
+        let change_rcp = recipient_from_pk(&domain, &change_pk_spend, &change_pk_ivk);
+        let sender_id_out = recipient_owner;
+        let cm_change =
+            note_commitment_v2(&domain, change_value, &change_rho, &change_rcp, &sender_id_out);
 
         println!("Withdraw: {} units (transparent)", withdraw_amount);
         println!("Change: {} units (shielded)", change_value);
         assert_eq!(value, withdraw_amount + change_value, "Balance check");
-
-        let n_out: u32 = 1;
 
         let public_output = SpendPublic {
             anchor_root: anchor,
@@ -352,97 +368,129 @@ mod note_spend_tests {
             output_commitments: vec![cm_change],
         };
 
-        // === NEW ARGUMENT LAYOUT FOR FIELD-LEVEL MERKLE PATH ===
-        // Position is now passed as individual bits (one per level) instead of a single integer.
-        // This enables making position bits private without breaking constraints.
+        // === ARGUMENT LAYOUT (matches note_spend_guest v2) ===
         //
-        // Layout:
-        //   1: domain (hex)
-        //   2: value (i64)
-        //   3: rho (hex) [PRIVATE]
-        //   4: recipient (hex) [PRIVATE]
-        //   5: spend_sk (hex) [PRIVATE]
-        //   6: depth (i64)
-        //   7 to 6+depth: position bits [PRIVATE] (hex, 0x00...00 or 0x00...01)
-        //   7+depth to 6+2*depth: siblings [PRIVATE] (hex)
-        //   7+2*depth: anchor (str)
-        //   8+2*depth: nullifier (str)
-        //   9+2*depth: withdraw_amount (i64)
-        //   10+2*depth: n_out (i64)
-        //   Then 4 args per output: value, rho, pk, cm
+        // Header:
+        //   1: domain [PUBLIC]
+        //   2: spend_sk [PRIVATE]
+        //   3: pk_ivk_owner [PRIVATE]
+        //   4: depth [PUBLIC]
+        //   5: anchor [PUBLIC]
+        //   6: n_in [PUBLIC]
+        //
+        // Per-input (n_in=1 here):
+        //   value_in, rho_in, sender_id_in, pos_bits[depth], siblings[depth], nullifier
+        //
+        // Then:
+        //   withdraw_amount [PUBLIC]
+        //   withdraw_to [PUBLIC]
+        //   n_out [PUBLIC]
+        //
+        // Per-output:
+        //   value_out, rho_out, pk_spend_out, pk_ivk_out, cm_out
+        //
+        // Finally:
+        //   inv_enforce [PRIVATE] (field inverse witness)
 
-        // Configure private indices (1-based indexing)
-        // All private inputs: rho (3), recipient (4), spend_sk (5),
-        // position bits (7 to 7+depth-1), siblings (7+depth to 7+2*depth-1)
-        // Also change output: change_rho and change_pk
         let depth = tree_depth as usize;
-        let mut private_indices: Vec<usize> = vec![3, 4, 5];
-        // Add position bit indices (7 through 7+depth-1)
-        for i in 0..depth {
-            private_indices.push(7 + i);
+        let n_in: usize = 1;
+        let n_out: usize = 1;
+
+        // Compute inv_enforce witness to satisfy the circuit's single-inverse enforcement:
+        // enforce_prod = (v_in * v_out) * (rho_out - rho_in)
+        // inv_enforce = enforce_prod^{-1}
+        let v_in_fr = Bn254Fr::from_u64(value);
+        let v_out_fr = Bn254Fr::from_u64(change_value);
+        let rho_in_fr = bn254fr_from_hash32_be(&rho);
+        let rho_out_fr = bn254fr_from_hash32_be(&change_rho);
+
+        let mut enforce_prod = Bn254Fr::from_u32(1);
+        enforce_prod.mulmod_checked(&v_in_fr);
+        enforce_prod.mulmod_checked(&v_out_fr);
+        let mut delta = Bn254Fr::new();
+        submod_checked(&mut delta, &rho_out_fr, &rho_in_fr);
+        enforce_prod.mulmod_checked(&delta);
+
+        let mut inv_enforce_fr = enforce_prod.clone();
+        inv_enforce_fr.inverse();
+        let inv_enforce = inv_enforce_fr.to_bytes_be();
+
+        // Configure private indices (1-based indexing).
+        let mut private_indices: Vec<usize> = Vec::new();
+        // Header privates.
+        private_indices.extend_from_slice(&[2, 3]);
+        // Input privates.
+        let mut idx: usize = 7;
+        for _ in 0..n_in {
+            private_indices.extend_from_slice(&[idx, idx + 1, idx + 2]); // value, rho, sender_id
+            idx += 3;
+            for _ in 0..depth {
+                private_indices.push(idx); // pos_bit
+                idx += 1;
+            }
+            for _ in 0..depth {
+                private_indices.push(idx); // sibling
+                idx += 1;
+            }
+            idx += 1; // nullifier (public)
         }
-        // Add sibling indices (7+depth through 7+2*depth-1)
-        for i in 0..depth {
-            private_indices.push(7 + depth + i);
+        idx += 3; // withdraw_amount, withdraw_to, n_out (public)
+        // Output privates.
+        for _ in 0..n_out {
+            private_indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx + 3]); // v, rho, pk_spend, pk_ivk
+            idx += 5; // skip cm_out (public)
         }
-        // Add change output private fields
-        // Output args start at 11+2*depth: value, rho, pk, cm
-        // change_rho is at 11+2*depth+1, change_pk is at 11+2*depth+2
-        let change_rho_idx = 11 + 2 * depth + 1;
-        let change_pk_idx = 11 + 2 * depth + 2;
-        private_indices.push(change_rho_idx);
-        private_indices.push(change_pk_idx);
+        // inv_enforce (private).
+        private_indices.push(idx);
+
+        println!("✓ Private indices: {:?}", private_indices);
 
         let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
             .with_private_indices(private_indices);
 
-        // Add arguments with NEW layout
-        // 1: domain
+        // Header.
         host.add_hex_arg(hex32(&domain));
-        // 2: value
-        host.add_u64_arg(value);
-        // 3: rho [PRIVATE]
-        host.add_hex_arg(hex32(&rho));
-        // 4: recipient [PRIVATE]
-        host.add_hex_arg(hex32(&recipient));
-        // 5: spend_sk [PRIVATE]
         host.add_hex_arg(hex32(&spend_sk));
-        // 6: depth
+        host.add_hex_arg(hex32(&pk_ivk_owner));
         host.add_u64_arg(tree_depth as u64);
+        host.add_hex_arg(hex32(&anchor));
+        host.add_u64_arg(n_in as u64);
 
-        // 7 to 6+depth: position bits [PRIVATE]
-        // Each bit is passed as a 32-byte field element (0x00...00 for 0, 0x00...01 for 1)
+        // Input 0.
+        host.add_u64_arg(value);
+        host.add_hex_arg(hex32(&rho));
+        host.add_hex_arg(hex32(&sender_id_in));
+
+        // Position bits (LSB-first), each passed as 32-byte BE 0 or 1.
         for level in 0..depth {
             let bit = ((position >> level) & 1) as u8;
             let mut bit_bytes = [0u8; 32];
-            bit_bytes[31] = bit;  // Little-endian: bit value in last byte
+            bit_bytes[31] = bit;
             host.add_hex_arg(hex32(&bit_bytes));
         }
 
-        // 7+depth to 6+2*depth: siblings [PRIVATE]
+        // Siblings (bottom-up).
         for sibling in &siblings {
             host.add_hex_arg(hex32(sibling));
         }
 
-        // 7+2*depth: anchor (str - field element format for from_c_str)
-        host.add_str_arg(hex32(&anchor));
-        // 8+2*depth: nullifier (str)
-        host.add_str_arg(hex32(&nf));
-        // 9+2*depth: withdraw_amount
+        // Public nullifier.
+        host.add_hex_arg(hex32(&nf));
+
+        // Withdraw binding.
         host.add_u64_arg(withdraw_amount);
-        // 10+2*depth: n_out
+        host.add_hex_arg(hex32(&withdraw_to));
         host.add_u64_arg(n_out as u64);
 
-        // Output args (starting at 11+2*depth):
-        // For each output: value, rho, pk, cm
-        // 11+2*depth: change_value
+        // Output 0.
         host.add_u64_arg(change_value);
-        // 11+2*depth+1: change_rho [PRIVATE]
         host.add_hex_arg(hex32(&change_rho));
-        // 11+2*depth+2: change_pk [PRIVATE]
-        host.add_hex_arg(hex32(&change_pk));
-        // 11+2*depth+3: cm_change
+        host.add_hex_arg(hex32(&change_pk_spend));
+        host.add_hex_arg(hex32(&change_pk_ivk));
         host.add_hex_arg(hex32(&cm_change));
+
+        // inv_enforce (private).
+        host.add_hex_arg(hex32(&inv_enforce));
 
         host.set_public_output(&public_output)?;
 

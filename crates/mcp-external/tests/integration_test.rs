@@ -31,7 +31,6 @@ fn env_opt(var: &str) -> Option<std::path::PathBuf> {
 /// Helper to create test ligero prover (skips if assets are missing).
 fn create_test_ligero() -> Option<Ligero> {
     let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
-    let program_path = ligero_runner::resolve_program(&program).ok()?;
 
     let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
@@ -44,7 +43,7 @@ fn create_test_ligero() -> Option<Ligero> {
         return None;
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }
 
 /// Helper to check if services are available
@@ -207,12 +206,16 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         &ligero,
         &provider,
         &wallet,
+        *privacy_key
+            .spend_sk()
+            .expect("transfer requires spend_sk (privacy key must not be address-only)"),
+        *privacy_key.pk(),
         note_value,
         send_amount,
         deposit_result.rho,
-        deposit_result.recipient,
-        deposit_result.recipient,
-        None, // No change since sending full amount
+        deposit_result.recipient, // deposit convention: sender_id == recipient
+        *privacy_key.pk(),
+        *privacy_key.pk(),
         authority_vfk,
     )
     .await?;
@@ -447,8 +450,6 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     const DOMAIN: [u8; 32] = [1u8; 32];
     let input_recipient = new_privacy_key.recipient(&DOMAIN);
-    let output_recipient = input_recipient; // Send to ourselves
-    let change_recipient = Some(input_recipient); // Change back to ourselves
 
     // Use the viewing key bytes as authority VFK for the transfer
     let authority_vfk_for_transfer = Some(viewing_key.0);
@@ -457,12 +458,16 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
         &ligero,
         &provider,
         &funding_wallet,
+        *new_privacy_key
+            .spend_sk()
+            .expect("transfer requires spend_sk (privacy key must not be address-only)"),
+        *new_privacy_key.pk(),
         note.value,
         send_amount,
         input_rho,
-        input_recipient,
-        output_recipient,
-        change_recipient,
+        input_recipient, // deposit convention: sender_id == recipient
+        *new_privacy_key.pk(),
+        *new_privacy_key.pk(),
         authority_vfk_for_transfer,
     )
     .await?;

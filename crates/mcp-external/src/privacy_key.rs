@@ -6,7 +6,7 @@
 //!
 //! The spending secret key (spend_sk) enables:
 //! - Deriving public key: pk = H("PK_V1" || spend_sk)
-//! - Deriving recipient: recipient = H("ADDR_V1" || domain || pk)
+//! - Deriving recipient: recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
 //! - Deriving nullifier key: nf_key = H("NFKEY_V1" || domain || spend_sk)
 
 use anyhow::{Context, Result};
@@ -110,7 +110,9 @@ impl PrivacyKey {
 
     /// Derive the recipient address for a given domain
     ///
-    /// recipient = H("ADDR_V1" || domain || pk)
+    /// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+    ///
+    /// This helper uses the default convention `pk_ivk == pk_spend`.
     pub fn recipient(&self, domain: &Hash32) -> Hash32 {
         recipient_from_pk(domain, &self.pk)
     }

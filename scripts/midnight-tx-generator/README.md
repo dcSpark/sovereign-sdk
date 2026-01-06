@@ -364,8 +364,9 @@ curl http://localhost:12346/state/midnight_privacy/current_root
 
 **Solutions:**
 1. Run outside any sandbox that restricts GPU access
-2. Check that shader files exist: `crates/adapters/ligero/bins/shader/`
-3. Verify prover binary: `crates/adapters/ligero/bins/*/bin/webgpu_prover`
+2. Ligero binaries are auto-discovered from the `ligero-runner` crate
+3. Check that auto-discovery is working: `cargo test -p sov-ligero-adapter --test integration -- --nocapture`
+4. Optional: override paths with `LIGERO_PROVER_BIN` and `LIGERO_SHADER_PATH` env vars
 
 ## Environment Requirements
 

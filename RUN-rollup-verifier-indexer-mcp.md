@@ -94,11 +94,11 @@ RUST_LOG=debug
 # VERIFIER_URL=http://127.0.0.1:8080
 # INDEXER_URL=http://127.0.0.1:13100
 
-# LIGERO_PROGRAM_PATH=<full path to a .wasm program>   # optional override
-# If auto-discovery doesn't work in your environment, set:
+# Ligero binaries are auto-discovered from the ligero-runner crate.
+# Optional overrides (only if auto-discovery fails):
 # LIGERO_PROGRAM_PATH=<circuit name like note_spend_guest OR full path to a .wasm file>
-# LIGERO_PROVER_BINARY_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/macos-arm64/bin/webgpu_prover
-# LIGERO_SHADER_PATH=${CARGO_MANIFEST_DIR}/../adapters/ligero/bins/shader
+# LIGERO_PROVER_BIN=<path to webgpu_prover binary>
+# LIGERO_SHADER_PATH=<path to shader directory>
 
 # This key belongs to a wallet that already exists in the L2 and has enough funds
 # WALLET_PRIVATE_KEY=75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd

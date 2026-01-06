@@ -525,7 +525,7 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<SendFundsRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        use midnight_privacy::{recipient_from_pk, PrivacyAddress};
+        use midnight_privacy::{recipient_from_pk_v2, PrivacyAddress};
         const DOMAIN: [u8; 32] = [1u8; 32];
 
         let provider = self.provider.as_ref().ok_or_else(|| {
@@ -735,7 +735,7 @@ impl CryptoServer {
             let mut input_rho = [0u8; 32];
             input_rho.copy_from_slice(&rho_bytes);
             let input_recipient = privacy_guard.recipient(&DOMAIN);
-            let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
+            let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk);
 
             tracing::info!(
                 "[send] Input note - value: {}, rho: {}, recipient: {}",
@@ -748,31 +748,42 @@ impl CryptoServer {
                 hex::encode(&output_recipient)
             );
 
-            // Set change_recipient to sender's address to receive change
-            let change_recipient = if send_amount < note.value {
+            if send_amount < note.value {
                 let change_amt = note.value - send_amount;
-                tracing::info!(
-                    "[send] Creating change note - amount: {}, recipient: {}",
-                    change_amt,
-                    hex::encode(&input_recipient)
-                );
-                Some(input_recipient)
+                tracing::info!("[send] Transfer includes change output - amount: {}", change_amt);
             } else {
                 tracing::info!("[send] No change needed - sending full note value");
-                None
+            }
+
+            let spend_sk = match privacy_guard.spend_sk().copied() {
+                Some(sk) => sk,
+                None => {
+                    let _ = tx_store
+                        .mark_failed(
+                            &id,
+                            "privacy key missing spend_sk; cannot spend note",
+                            current_timestamp_ms(),
+                        )
+                        .await;
+                    return;
+                }
             };
+            let pk_ivk_owner = *privacy_guard.pk();
+            let input_sender_id = input_recipient; // Deposit convention / fallback.
 
             let send_res = if let Some(ligero_ref) = ligero.as_ref() {
                 crate::operations::transfer(
                     ligero_ref,
                     &provider,
                     &*ctx_guard,
+                    spend_sk,
+                    pk_ivk_owner,
                     note.value,
                     send_amount,
                     input_rho,
-                    input_recipient,
-                    output_recipient,
-                    change_recipient,
+                    input_sender_id,
+                    output_pk,
+                    output_pk,
                     authority_vfk_for_transfer,
                 )
                 .await

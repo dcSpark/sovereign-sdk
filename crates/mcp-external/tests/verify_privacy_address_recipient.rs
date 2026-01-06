@@ -27,7 +27,7 @@ fn test_privacy_address_to_recipient() {
     println!("Expected recipient in deposit response: {}", recipient_hex);
 
     // The recipient you saw in the response
-    let expected_recipient = "1f6ac8bc5ab4fc16003a3073c3e48f7fd56542663a6940e98b6d7c7057dd0fea";
+    let expected_recipient = "0fe6d328717f5263e348c06031ff526ad21464c19a83a931fc163b22787ed066";
 
     println!();
     println!("Comparison:");
@@ -55,7 +55,7 @@ fn test_privacy_address_to_recipient() {
 #[test]
 fn test_reverse_engineer_privacy_key() {
     // If we know the recipient, can we verify it matches a privacy address?
-    let recipient_from_deposit = "1f6ac8bc5ab4fc16003a3073c3e48f7fd56542663a6940e98b6d7c7057dd0fea";
+    let recipient_from_deposit = "0fe6d328717f5263e348c06031ff526ad21464c19a83a931fc163b22787ed066";
 
     // Try the privacy address from the user
     let privacy_address = "privpool1eqrexjkvvw5wjljp4mpup250hl4sdpk6hl36dmdcdsfldvjw2j8staydzl";
@@ -100,6 +100,6 @@ fn test_show_privacy_address_components() {
     println!();
     println!("How it works:");
     println!("   1. Privacy address (bech32m) → Public Key (pk)");
-    println!("   2. pk + domain → Recipient (via H('ADDR_V1' || domain || pk))");
+    println!("   2. pk + domain → Recipient (via H('ADDR_V2' || domain || pk_spend || pk_ivk))");
     println!("   3. Recipient is what's stored in the note commitment on-chain");
 }

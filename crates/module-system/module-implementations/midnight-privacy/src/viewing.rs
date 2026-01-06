@@ -31,7 +31,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::hash::{note_commitment, poseidon2_hash, Hash32};
+use crate::hash::{note_commitment, note_commitment_v1, poseidon2_hash, Hash32};
 use crate::types::{EncryptedNote, FullViewingKey, Note};
 
 /// Compute FVK commitment: H("FVK_COMMIT_V1" || fvk)
@@ -86,25 +86,37 @@ pub fn view_mac(k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Hash32 {
 
 /// Deterministic serialization of a Note plaintext (deposit format):
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) ] => 112 bytes
-fn encode_note_bytes(note: &Note) -> Vec<u8> {
+fn encode_note_bytes(note: &Note) -> Result<Vec<u8>> {
+    let value_u64: u64 = note
+        .value
+        .try_into()
+        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 encoding)"))?;
     let mut pt = Vec::with_capacity(112);
     pt.extend_from_slice(&note.domain);
-    pt.extend_from_slice(&note.value.to_le_bytes());
+    // Encode as 16-byte LE, zero-extended from u64.
+    pt.extend_from_slice(&value_u64.to_le_bytes());
+    pt.extend_from_slice(&[0u8; 8]);
     pt.extend_from_slice(&note.rho);
     pt.extend_from_slice(&note.recipient);
-    pt
+    Ok(pt)
 }
 
 /// Deterministic serialization of a Note plaintext with sender_id (transfer format):
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
-fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Vec<u8> {
+fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Result<Vec<u8>> {
+    let value_u64: u64 = note
+        .value
+        .try_into()
+        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 encoding)"))?;
     let mut pt = Vec::with_capacity(144);
     pt.extend_from_slice(&note.domain);
-    pt.extend_from_slice(&note.value.to_le_bytes());
+    // Encode as 16-byte LE, zero-extended from u64.
+    pt.extend_from_slice(&value_u64.to_le_bytes());
+    pt.extend_from_slice(&[0u8; 8]);
     pt.extend_from_slice(&note.rho);
     pt.extend_from_slice(&note.recipient);
     pt.extend_from_slice(sender_id);
-    pt
+    Ok(pt)
 }
 
 /// Deserialize Note from plaintext.
@@ -193,7 +205,7 @@ pub fn encrypt_note_for_fvk_level_b(
     let k = view_kdf(fvk, cm);
 
     // Serialize Note deterministically (112 bytes)
-    let pt = encode_note_bytes(note);
+    let pt = encode_note_bytes(note)?;
 
     // Encrypt with Poseidon2-stream XOR
     let ct_vec = stream_xor_encrypt(&k, &pt);
@@ -235,7 +247,7 @@ pub fn encrypt_note_for_fvk_with_sender(
     let k = view_kdf(fvk, cm);
 
     // Serialize Note with sender_id (144 bytes)
-    let pt = encode_note_bytes_with_sender(note, sender_id);
+    let pt = encode_note_bytes_with_sender(note, sender_id)?;
 
     // Encrypt with Poseidon2-stream XOR
     let ct_vec = stream_xor_encrypt(&k, &pt);
@@ -317,11 +329,19 @@ pub fn decrypt_and_verify_note_level_b(fvk: &FullViewingKey, enc: &EncryptedNote
     // 5. Decrypt
     let pt_vec = stream_xor_decrypt(&k, &enc.ct);
 
-    // 6. Deserialize Note
-    let note = decode_note_bytes(&pt_vec)?;
+    // 6. Deserialize Note (and optional sender_id if present)
+    let (note, sender_id_opt) = decode_note_with_sender(&pt_vec)?;
 
-    // 7. Recompute commitment
-    let cm_recomputed = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    // 7. Recompute commitment (NOTE_V2).
+    let value_u64: u64 = note
+        .value
+        .try_into()
+        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)"))?;
+    // For 112-byte plaintexts (deposit format), treat `sender_id = recipient` to match the
+    // NOTE_V2 deposit commitment convention used by this module.
+    let sender_id = sender_id_opt.unwrap_or(note.recipient);
+    let cm_recomputed =
+        note_commitment(&note.domain, value_u64, &note.rho, &note.recipient, &sender_id);
 
     // 8. Verify commitment matches
     if cm_recomputed != enc.cm {
@@ -401,7 +421,7 @@ pub fn decrypt_and_verify_note_legacy(fvk: &FullViewingKey, enc: &EncryptedNote)
 
     let note: Note = bincode::deserialize(&pt).map_err(|e| anyhow!("note deserialize: {e}"))?;
 
-    let cm_recomputed = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm_recomputed = note_commitment_v1(&note.domain, note.value, &note.rho, &note.recipient);
     if cm_recomputed != enc.cm {
         return Err(anyhow!("commitment mismatch: not truthful"));
     }
@@ -453,8 +473,19 @@ pub fn decrypt_and_verify_note_with_sender(fvk: &FullViewingKey, enc: &Encrypted
     // 6. Deserialize Note with optional sender_id
     let (note, sender_id) = decode_note_with_sender(&pt_vec)?;
 
-    // 7. Recompute commitment
-    let cm_recomputed = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    // 7. Recompute commitment (NOTE_V2).
+    let value_u64: u64 = note
+        .value
+        .try_into()
+        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)"))?;
+    let sender_id_for_cm = sender_id.unwrap_or(note.recipient);
+    let cm_recomputed = note_commitment(
+        &note.domain,
+        value_u64,
+        &note.rho,
+        &note.recipient,
+        &sender_id_for_cm,
+    );
 
     // 8. Verify commitment matches
     if cm_recomputed != enc.cm {
@@ -477,7 +508,13 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
 
         let enc = encrypt_note_for_fvk_level_b(&fvk, &note, &cm).unwrap();
         let out = decrypt_and_verify_note_level_b(&fvk, &enc).unwrap();
@@ -495,7 +532,13 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
 
         let enc = encrypt_note_for_fvk_level_b(&fvk1, &note, &cm).unwrap();
         let result = decrypt_and_verify_note_level_b(&fvk2, &enc);
@@ -512,7 +555,13 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
 
         let mut enc = encrypt_note_for_fvk_level_b(&fvk, &note, &cm).unwrap();
 
@@ -532,7 +581,13 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
 
         let mut enc = encrypt_note_for_fvk_level_b(&fvk, &note, &cm).unwrap();
 
@@ -559,8 +614,20 @@ mod tests {
             recipient: [3u8; 32],
         };
 
-        let cm1 = note_commitment(&note1.domain, note1.value, &note1.rho, &note1.recipient);
-        let cm2 = note_commitment(&note2.domain, note2.value, &note2.rho, &note2.recipient);
+        let cm1 = note_commitment(
+            &note1.domain,
+            note1.value as u64,
+            &note1.rho,
+            &note1.recipient,
+            &note1.recipient,
+        );
+        let cm2 = note_commitment(
+            &note2.domain,
+            note2.value as u64,
+            &note2.rho,
+            &note2.recipient,
+            &note2.recipient,
+        );
 
         let enc1 = encrypt_note_for_fvk_level_b(&fvk, &note1, &cm1).unwrap();
         let enc2 = encrypt_note_for_fvk_level_b(&fvk, &note2, &cm2).unwrap();
@@ -580,7 +647,13 @@ mod tests {
             rho: [2u8; 32],
             recipient: [3u8; 32],
         };
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
 
         // Encrypt the same note twice
         let enc1 = encrypt_note_for_fvk_level_b(&fvk, &note, &cm).unwrap();
