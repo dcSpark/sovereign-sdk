@@ -6712,49 +6712,18 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#861079ff20371391bbeea7e936020b1fbd9620e9"
-dependencies = [
- "anyhow",
- "bincode",
- "hex",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "ligero-runner"
-version = "0.1.0"
 source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
 dependencies = [
  "anyhow",
  "bincode",
  "hex",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844)",
+ "ligetron",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
-]
-
-[[package]]
-name = "ligetron"
-version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2#861079ff20371391bbeea7e936020b1fbd9620e9"
-dependencies = [
- "ark-bn254",
- "ark-ff 0.5.0",
- "base64 0.22.1",
- "hex",
- "lazy_static",
- "num-bigint 0.4.6",
- "paste",
 ]
 
 [[package]]
@@ -7034,8 +7003,8 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
+ "ligero-runner",
+ "ligetron",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7075,8 +7044,8 @@ dependencies = [
  "dotenvy",
  "envy",
  "hex",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
+ "ligero-runner",
+ "ligetron",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7182,8 +7151,8 @@ dependencies = [
  "clap",
  "demo-stf",
  "hex",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
+ "ligero-runner",
+ "ligetron",
  "midnight-privacy",
  "num_cpus",
  "rand 0.8.5",
@@ -7216,8 +7185,8 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
+ "ligero-runner",
+ "ligetron",
  "once_cell",
  "schemars 0.8.22",
  "sea-orm",
@@ -12569,8 +12538,8 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844)",
- "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844)",
+ "ligero-runner",
+ "ligetron",
  "proptest",
  "rand 0.8.5",
  "schemars 0.8.22",
@@ -12951,7 +12920,7 @@ dependencies = [
  "demo-stf",
  "futures",
  "hex",
- "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fmidnight-l2)",
+ "ligero-runner",
  "midnight-privacy",
  "reqwest 0.12.28",
  "sea-orm",
