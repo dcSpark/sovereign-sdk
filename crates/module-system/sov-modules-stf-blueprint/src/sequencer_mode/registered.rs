@@ -4,16 +4,16 @@ use sov_modules_api::capabilities::{
     TransactionAuthorizer,
 };
 use sov_modules_api::transaction::TransactionConsumption;
+#[cfg(feature = "native")]
+use sov_modules_api::{
+    count_writes, verify_against_cache, BatchVerificationStats, PrecomputedResult, GLOBAL_TX_CACHE,
+};
 use sov_modules_api::{
     Amount, BasicGasMeter, BatchSequencerOutcome, BatchSequencerReceipt, DaSpec, ExecutionContext,
     FullyBakedTx, Gas, GasArray, GasMeter, GasSpec, GetGasPrice, IgnoredTransactionReceipt,
     IncrementalBatch, InjectedControlFlow, PreExecWorkingSet, ProvisionalSequencerOutcome, Rewards,
     SequencerBondForTx, SlotGasMeter, Spec, StateCheckpoint, StateProvider, TransactionReceipt,
     TxControlFlow, TxScratchpad, WorkingSet, *,
-};
-#[cfg(feature = "native")]
-use sov_modules_api::{
-    count_writes, verify_against_cache, BatchVerificationStats, PrecomputedResult, GLOBAL_TX_CACHE,
 };
 use sov_rollup_interface::TxHash;
 use tracing::{trace, warn};
@@ -460,10 +460,10 @@ where
 
                 // Commit scratchpad to get checkpoint, then apply cached writes
                 let mut new_checkpoint = clean_scratchpad.commit();
-                
+
                 // Apply cached tx_changes writes to the checkpoint (by reference, no clone)
                 new_checkpoint.apply_tx_changes(&cached.tx_changes);
-                
+
                 new_checkpoint.commit_revertable_storage_cache();
 
                 // Charge gas
@@ -596,18 +596,14 @@ where
                 {
                     // For Sequencer context: Insert into global cache for later node verification
                     if execution_context == ExecutionContext::Sequencer {
-                        GLOBAL_TX_CACHE.insert::<S>(
-                            receipt.tx_hash,
-                            precomputed_for_verification.clone(),
-                        );
+                        GLOBAL_TX_CACHE
+                            .insert::<S>(receipt.tx_hash, precomputed_for_verification.clone());
                     }
 
                     // For Node context: Verify against cached sequencer result
                     if execution_context == ExecutionContext::Node {
-                        let verification_result = verify_against_cache(
-                            &receipt.tx_hash,
-                            &precomputed_for_verification,
-                        );
+                        let verification_result =
+                            verify_against_cache(&receipt.tx_hash, &precomputed_for_verification);
                         let write_count = count_writes(&precomputed_for_verification);
                         batch_verification_stats.record(&verification_result, write_count);
 
@@ -634,7 +630,7 @@ where
                 accumulated_penalty = accumulated_penalty
                     .checked_add(provisional_penalty)
                     .expect("Total supply of gas token exceeded");
-                
+
                 #[cfg(feature = "native")]
                 if execution_context == ExecutionContext::Node {
                     let exec_elapsed = exec_start.elapsed();

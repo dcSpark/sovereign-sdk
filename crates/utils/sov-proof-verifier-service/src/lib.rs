@@ -14,6 +14,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
+use futures::future::join_all;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
     ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
@@ -39,12 +40,14 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use futures::future::join_all;
 use tracing::{debug, error, info, warn};
 
 // Import the actual demo-stf Runtime types
 use demo_stf::runtime::Runtime as DemoRuntime;
-use midnight_privacy::{CallMessage as MidnightCallMessage, EncryptedNote, FullViewingKey, Hash32 as MidnightHash32, SpendPublic};
+use midnight_privacy::{
+    CallMessage as MidnightCallMessage, EncryptedNote, FullViewingKey, Hash32 as MidnightHash32,
+    SpendPublic,
+};
 use sov_address::MultiAddressEvm;
 use sov_midnight_da::storable::{
     setup_db as setup_midnight_da_db, worker_verified_transactions, IncomingWorkerTxSaver,
@@ -186,12 +189,17 @@ impl AppState {
         let da_conn = if config.da_connection_string.starts_with("sqlite:") {
             use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
             use std::str::FromStr;
-            
+
             // Parse connection string and set busy_timeout
             let sqlite_opts = SqliteConnectOptions::from_str(&config.da_connection_string)
-                .with_context(|| format!("Failed to parse SQLite connection string: {}", config.da_connection_string))?
+                .with_context(|| {
+                    format!(
+                        "Failed to parse SQLite connection string: {}",
+                        config.da_connection_string
+                    )
+                })?
                 .busy_timeout(std::time::Duration::from_millis(30000)); // 30 seconds
-            
+
             // Create pool with optimized settings for SQLite
             let pool = SqlitePoolOptions::new()
                 .max_connections(10) // Conservative for SQLite (single-writer)
@@ -201,15 +209,20 @@ impl AppState {
                 .max_lifetime(Some(std::time::Duration::from_secs(1800)))
                 .connect_with(sqlite_opts)
                 .await
-                .with_context(|| format!("Failed to connect to SQLite database at {}", config.da_connection_string))?;
-            
+                .with_context(|| {
+                    format!(
+                        "Failed to connect to SQLite database at {}",
+                        config.da_connection_string
+                    )
+                })?;
+
             info!("Verifier service connected to SQLite database (max_connections=10, busy_timeout=30s)");
-            
+
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
             // PostgreSQL or other databases
             let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
-            
+
             connect_opts
                 .max_connections(20)
                 .min_connections(1)
@@ -218,9 +231,9 @@ impl AppState {
                 .idle_timeout(std::time::Duration::from_secs(300))
                 .max_lifetime(std::time::Duration::from_secs(1800))
                 .sqlx_logging(false);
-            
+
             info!("Verifier service connecting to PostgreSQL database (max_connections=20)");
-            
+
             Database::connect(connect_opts).await.with_context(|| {
                 format!(
                     "Failed to connect to PostgreSQL database at {}",
@@ -231,7 +244,7 @@ impl AppState {
         setup_midnight_da_db(&da_conn)
             .await
             .context("Failed to initialize MockDA database schema")?;
-        
+
         info!("✓ Connected to MockDA database (busy_timeout applied per-connection)");
 
         Ok(Self {
@@ -405,7 +418,10 @@ impl IntoResponse for ServiceError {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/value-setter-zk", post(verify_and_submit_handler))
-        .route("/midnight-privacy", post(verify_and_record_midnight_handler))
+        .route(
+            "/midnight-privacy",
+            post(verify_and_record_midnight_handler),
+        )
         .route("/midnight-privacy/flush", post(flush_pending_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
@@ -433,15 +449,17 @@ async fn health_check() -> impl IntoResponse {
 }
 
 /// Flush all pending worker-verified transactions to the sequencer in parallel.
-/// 
+///
 /// This returns as soon as all sequencer submissions have completed and the
 /// aggregate results are computed; the per-tx DB updates are applied in a
 /// background task so they don't block the HTTP response.
 async fn flush_pending_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ServiceError> {
-    use worker_verified_transactions::{Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState};
     use sea_orm::QuerySelect;
+    use worker_verified_transactions::{
+        Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState,
+    };
 
     // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
     let pending_tx_hashes: Vec<String> = VerifiedEntity::find()
@@ -451,7 +469,9 @@ async fn flush_pending_handler(
         .into_tuple::<(String,)>()
         .all(state.da_conn.as_ref())
         .await
-        .map_err(|err| ServiceError::Internal(format!("Failed to list pending worker transactions: {err}")))?
+        .map_err(|err| {
+            ServiceError::Internal(format!("Failed to list pending worker transactions: {err}"))
+        })?
         .into_iter()
         .map(|(txh,)| txh)
         .collect();
@@ -493,7 +513,10 @@ async fn flush_pending_handler(
     let sequencer_start = std::time::Instant::now();
     let all_results = join_all(handles).await;
     let sequencer_elapsed_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
-    info!("Sequencer processed worker transactions in {:.2} ms", sequencer_elapsed_ms);
+    info!(
+        "Sequencer processed worker transactions in {:.2} ms",
+        sequencer_elapsed_ms
+    );
 
     let mut accepted = 0usize;
     let mut rejected = 0usize;
@@ -597,15 +620,14 @@ async fn flush_pending_handler(
             }
 
             if let Err(err) = txn.commit().await {
-                error!(
-                    "Failed to commit worker tx updates in background: {}",
-                    err
-                );
+                error!("Failed to commit worker tx updates in background: {}", err);
             }
         });
     }
 
-    info!("Total worker transactions processed: {total}, accepted: {accepted}, rejected: {rejected}");
+    info!(
+        "Total worker transactions processed: {total}, accepted: {accepted}, rejected: {rejected}"
+    );
 
     Ok(Json(serde_json::json!({
         "flushed": total,
@@ -714,7 +736,7 @@ async fn verify_and_record_midnight_handler(
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
             ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e))
         })?;
-    
+
     let parsed_call = parse_midnight_call(&tx)?;
     metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -726,7 +748,12 @@ async fn verify_and_record_midnight_handler(
     let transaction_data = create_transaction_without_proof(&tx)?;
 
     match parsed_call {
-        ParsedMidnightCall::Deposit { amount, rho, recipient, view_fvks } => {
+        ParsedMidnightCall::Deposit {
+            amount,
+            rho,
+            recipient,
+            view_fvks,
+        } => {
             // Deposits don't have proofs, so we just verify signature and store
             debug!(
                 "Parsed midnight deposit: amount={}, rho=0x{}, recipient=0x{}, view_fvks={:?}",
@@ -851,7 +878,7 @@ async fn verify_and_record_midnight_handler(
                 &state.incoming_worker_tx_saver,
                 &tx_hash,
                 Some(&proof_public), // Proof outputs from verification
-                true,                 // signature_valid
+                true,                // signature_valid
                 Some(true),          // proof_verified: true
                 &transaction_data,
                 &req.body,
@@ -947,7 +974,7 @@ async fn verify_and_record_midnight_handler(
                 &state.incoming_worker_tx_saver,
                 &tx_hash,
                 Some(&proof_public), // Proof outputs from verification
-                true,                 // signature_valid
+                true,                // signature_valid
                 Some(true),          // proof_verified: true (has proof and verified correctly)
                 &transaction_data,
                 &req.body,
@@ -1126,7 +1153,7 @@ async fn verify_ligero_proof(
     let result = tokio::task::spawn_blocking(move || {
         // Set environment variables for value_validator.wasm verification
         configure_ligero_env_for_value_setter()?;
-        
+
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -1386,7 +1413,14 @@ pub fn parse_midnight_withdraw_call(
             withdraw_amount,
             to,
             view_ciphertexts,
-        } => Ok((proof, anchor_root, nullifier, withdraw_amount, to, view_ciphertexts)),
+        } => Ok((
+            proof,
+            anchor_root,
+            nullifier,
+            withdraw_amount,
+            to,
+            view_ciphertexts,
+        )),
         ParsedMidnightCall::Deposit { .. } => Err(ServiceError::UnsupportedCall(
             "Expected Withdraw call, got Deposit".to_string(),
         )),
@@ -1425,7 +1459,7 @@ pub async fn verify_midnight_withdraw_proof(
     tokio::task::spawn_blocking(move || {
         // Set environment variables for note_spend_guest.wasm verification
         configure_ligero_env_for_midnight()?;
-        
+
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -1473,14 +1507,18 @@ pub async fn verify_midnight_withdraw_proof(
 
 /// Create a transaction JSON representation without the proof data
 /// Extracts the runtime call message and replaces proof with "REMOVED"
-pub fn create_transaction_without_proof(
-    tx: &DemoTransaction,
-) -> Result<String, ServiceError> {
+pub fn create_transaction_without_proof(tx: &DemoTransaction) -> Result<String, ServiceError> {
     // Extract the runtime call and create JSON representation with proof removed
     match tx.runtime_call() {
         RuntimeCall::MidnightPrivacy(call) => {
             let call_json = match call.clone() {
-                MidnightCallMessage::Deposit { amount, rho, recipient, view_fvks, gas } => {
+                MidnightCallMessage::Deposit {
+                    amount,
+                    rho,
+                    recipient,
+                    view_fvks,
+                    gas,
+                } => {
                     serde_json::json!({
                         "deposit": {
                             "amount": amount.to_string(),
@@ -1537,7 +1575,7 @@ pub fn create_transaction_without_proof(
                     })
                 }
             };
-            
+
             serde_json::to_string(&call_json)
                 .map_err(|e| ServiceError::Internal(format!("Failed to serialize JSON: {}", e)))
         }
@@ -1557,14 +1595,19 @@ pub fn create_transaction_without_proof(
                         "set_many_values": values
                     })
                 }
-                ValueSetterCallMessage::AssertVisibleSlotNumber { expected_visible_slot_number } => {
+                ValueSetterCallMessage::AssertVisibleSlotNumber {
+                    expected_visible_slot_number,
+                } => {
                     serde_json::json!({
                         "assert_visible_slot_number": {
                             "expected_visible_slot_number": expected_visible_slot_number
                         }
                     })
                 }
-                ValueSetterCallMessage::SetValueAndSleep { value, sleep_millis } => {
+                ValueSetterCallMessage::SetValueAndSleep {
+                    value,
+                    sleep_millis,
+                } => {
                     serde_json::json!({
                         "set_value_and_sleep": {
                             "value": value,
@@ -1578,7 +1621,7 @@ pub fn create_transaction_without_proof(
                     })
                 }
             };
-            
+
             serde_json::to_string(&call_json)
                 .map_err(|e| ServiceError::Internal(format!("Failed to serialize JSON: {}", e)))
         }
@@ -1599,34 +1642,30 @@ pub fn create_transaction_without_proof(
 fn extract_pre_authenticated_data(
     tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
 ) -> Result<(String, String, String, String, String), ServiceError> {
-    use sov_modules_api::transaction::{VersionedTx, Version0};
-    
+    use sov_modules_api::transaction::{Version0, VersionedTx};
+
     match &tx.versioned_tx {
         VersionedTx::V0(v0) => {
             // Serialize all components as borsh bytes then hex encode
             // This ensures we can reliably reconstruct them without type issues
-            let pub_key_hex = hex::encode(
-                &borsh::to_vec(&v0.pub_key)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize public key: {}", e)))?
-            );
-            
-            let signature_hex = hex::encode(
-                &borsh::to_vec(&v0.signature)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize signature: {}", e)))?
-            );
-            
-            let uniqueness_hex = hex::encode(
-                &borsh::to_vec(&v0.uniqueness)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize uniqueness: {}", e)))?
-            );
-            
-            let details_hex = hex::encode(
-                &borsh::to_vec(&v0.details)
-                    .map_err(|e| ServiceError::Internal(format!("Failed to serialize details: {}", e)))?
-            );
-            
+            let pub_key_hex = hex::encode(&borsh::to_vec(&v0.pub_key).map_err(|e| {
+                ServiceError::Internal(format!("Failed to serialize public key: {}", e))
+            })?);
+
+            let signature_hex = hex::encode(&borsh::to_vec(&v0.signature).map_err(|e| {
+                ServiceError::Internal(format!("Failed to serialize signature: {}", e))
+            })?);
+
+            let uniqueness_hex = hex::encode(&borsh::to_vec(&v0.uniqueness).map_err(|e| {
+                ServiceError::Internal(format!("Failed to serialize uniqueness: {}", e))
+            })?);
+
+            let details_hex = hex::encode(&borsh::to_vec(&v0.details).map_err(|e| {
+                ServiceError::Internal(format!("Failed to serialize details: {}", e))
+            })?);
+
             // OPTIMIZATION: Create a lightweight transaction WITHOUT the proof for pre-authenticated path
-            // 
+            //
             // SECURITY MODEL:
             // 1. Worker verifies signature on FULL transaction (with 3MB proof) ✓
             // 2. Worker verifies the Ligero proof itself ✓
@@ -1636,20 +1675,28 @@ fn extract_pre_authenticated_data(
             // 6. Sequencer receives: lightweight_tx + original_hash
             // 7. Sequencer uses PreAuthenticated wrapper with original_hash
             // 8. STF uses the provided hash (NO recalculation) and skips signature verification
-            // 
+            //
             // The signature is cryptographically bound to the FULL transaction content,
             // but we don't need to verify it again since the worker already did.
             // The STF just needs to know the correct hash for tracking purposes.
-            
+
             let lightweight_runtime_call = {
                 use demo_stf::runtime::RuntimeCall;
                 use midnight_privacy::CallMessage;
                 use sov_modules_api::SafeVec;
-                
+
                 match &v0.runtime_call {
                     RuntimeCall::MidnightPrivacy(midnight_call) => {
                         match midnight_call {
-                            CallMessage::Withdraw { proof: _, anchor_root, nullifier, withdraw_amount, to, view_ciphertexts, gas } => {
+                            CallMessage::Withdraw {
+                                proof: _,
+                                anchor_root,
+                                nullifier,
+                                withdraw_amount,
+                                to,
+                                view_ciphertexts,
+                                gas,
+                            } => {
                                 // Create withdraw call with EMPTY proof (already verified by worker)
                                 RuntimeCall::MidnightPrivacy(CallMessage::Withdraw {
                                     proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
@@ -1661,7 +1708,13 @@ fn extract_pre_authenticated_data(
                                     gas: gas.clone(),
                                 })
                             }
-                            CallMessage::Transfer { proof: _, anchor_root, nullifier, view_ciphertexts, gas } => {
+                            CallMessage::Transfer {
+                                proof: _,
+                                anchor_root,
+                                nullifier,
+                                view_ciphertexts,
+                                gas,
+                            } => {
                                 // Create transfer call with EMPTY proof (already verified by worker)
                                 RuntimeCall::MidnightPrivacy(CallMessage::Transfer {
                                     proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
@@ -1677,10 +1730,10 @@ fn extract_pre_authenticated_data(
                             }
                         }
                     }
-                    _ => v0.runtime_call.clone()
+                    _ => v0.runtime_call.clone(),
                 }
             };
-            
+
             // Create lightweight transaction (proof stripped, saves ~3MB)
             let lightweight_tx = Transaction::<DemoRuntime<RollupSpec>, RollupSpec> {
                 versioned_tx: VersionedTx::V0(Version0 {
@@ -1691,24 +1744,30 @@ fn extract_pre_authenticated_data(
                     details: v0.details.clone(),
                 }),
             };
-            
+
             // Serialize the LIGHTWEIGHT transaction (proof stripped, saves ~3MB)
-            let lightweight_tx_bytes = borsh::to_vec(&lightweight_tx)
-                .map_err(|e| ServiceError::Internal(format!("Failed to serialize lightweight transaction: {}", e)))?;
-            let serialized_tx_base64 = base64::engine::general_purpose::STANDARD.encode(&lightweight_tx_bytes);
-            
+            let lightweight_tx_bytes = borsh::to_vec(&lightweight_tx).map_err(|e| {
+                ServiceError::Internal(format!(
+                    "Failed to serialize lightweight transaction: {}",
+                    e
+                ))
+            })?;
+            let serialized_tx_base64 =
+                base64::engine::general_purpose::STANDARD.encode(&lightweight_tx_bytes);
+
             // Compute size savings
-            let full_tx_bytes = borsh::to_vec(tx)
-                .map_err(|e| ServiceError::Internal(format!("Failed to serialize full transaction: {}", e)))?;
+            let full_tx_bytes = borsh::to_vec(tx).map_err(|e| {
+                ServiceError::Internal(format!("Failed to serialize full transaction: {}", e))
+            })?;
             let bytes_saved = full_tx_bytes.len() - lightweight_tx_bytes.len();
-            
+
             debug!(
                 "✓ Created lightweight pre-authenticated transaction: {} bytes (original: {} bytes, saved: {} bytes)",
                 lightweight_tx_bytes.len(),
                 full_tx_bytes.len(),
                 bytes_saved
             );
-            
+
             Ok((
                 pub_key_hex,
                 signature_hex,
@@ -1737,18 +1796,20 @@ pub async fn store_verified_midnight_transaction(
         TransactionState,
     };
 
-    let full_transaction_location =
-        match incoming_worker_tx_saver.save(tx_hash, full_transaction_blob).await {
-            Ok(location) => location,
-            Err(err) => {
-                warn!(
-                    tx_hash,
-                    ?err,
-                    "Failed to persist full incoming worker transaction blob"
-                );
-                None
-            }
-        };
+    let full_transaction_location = match incoming_worker_tx_saver
+        .save(tx_hash, full_transaction_blob)
+        .await
+    {
+        Ok(location) => location,
+        Err(err) => {
+            warn!(
+                tx_hash,
+                ?err,
+                "Failed to persist full incoming worker transaction blob"
+            );
+            None
+        }
+    };
 
     // Serialize proof outputs to JSON (empty object if no proof)
     let proof_outputs_json = if let Some(proof) = proof_output {
@@ -1768,14 +1829,15 @@ pub async fn store_verified_midnight_transaction(
             })
         })
         .transpose()?;
-    let view_fvks_json = (|| -> Option<Result<String, ServiceError>> {
-        let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;
-        let fvks = v.get("deposit")?.get("view_fvks")?.clone();
-        Some(serde_json::to_string(&fvks).map_err(|err| {
-            ServiceError::Internal(format!("Failed to serialize view_fvks: {err}"))
-        }))
-    })()
-    .transpose()?;
+    let view_fvks_json =
+        (|| -> Option<Result<String, ServiceError>> {
+            let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;
+            let fvks = v.get("deposit")?.get("view_fvks")?.clone();
+            Some(serde_json::to_string(&fvks).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize view_fvks: {err}"))
+            }))
+        })()
+        .transpose()?;
     // Serialize encrypted notes to JSON for Level-B viewing access
     let encrypted_notes_json = encrypted_notes
         .map(|notes| {
@@ -1811,9 +1873,9 @@ pub async fn store_verified_midnight_transaction(
             }
         };
         let recipient = match tx.runtime_call() {
-            demo_stf::runtime::RuntimeCall::MidnightPrivacy(midnight_privacy::CallMessage::Withdraw { to, .. }) => {
-                Some(to.to_string())
-            }
+            demo_stf::runtime::RuntimeCall::MidnightPrivacy(
+                midnight_privacy::CallMessage::Withdraw { to, .. },
+            ) => Some(to.to_string()),
             _ => None,
         };
         Ok((sender_addr.to_string(), recipient))
@@ -1895,7 +1957,10 @@ async fn send_worker_tx_to_sequencer(
     state: &AppState,
     tx_hash: &str,
 ) -> Result<SequencerSubmissionOutcome, ServiceError> {
-    let url = format!("{}/sequencer/worker_txs/{}", state.node_client.base_url, tx_hash);
+    let url = format!(
+        "{}/sequencer/worker_txs/{}",
+        state.node_client.base_url, tx_hash
+    );
     let http_start = std::time::Instant::now();
     let http_result = state.http_client.post(&url).send().await;
     let latency_ms = http_start.elapsed().as_secs_f64() * 1000.0;
@@ -1940,8 +2005,9 @@ async fn send_worker_tx_to_sequencer(
                     internal_breakdown,
                 }
             } else {
-                let body_value =
-                    parsed_json.clone().unwrap_or_else(|| serde_json::Value::String(body.clone()));
+                let body_value = parsed_json
+                    .clone()
+                    .unwrap_or_else(|| serde_json::Value::String(body.clone()));
                 let response_value = serde_json::json!({
                     "status": status.as_u16(),
                     "body": body_value,
@@ -2026,14 +2092,11 @@ where
         TransactionState::Rejected
     });
     active_model.sequencer_status = Set(outcome.raw_response.clone());
-    active_model
-        .update(conn)
-        .await
-        .map_err(|err| {
-            ServiceError::Internal(format!(
-                "Failed to update worker transaction {tx_hash} after sequencer submission: {err}"
-            ))
-        })?;
+    active_model.update(conn).await.map_err(|err| {
+        ServiceError::Internal(format!(
+            "Failed to update worker transaction {tx_hash} after sequencer submission: {err}"
+        ))
+    })?;
 
     if outcome.accepted {
         debug!("✓ Sequencer accepted worker transaction {}", tx_hash);
@@ -2098,7 +2161,7 @@ fn configure_ligero_env_for_value_setter() -> Result<(), ServiceError> {
     // `sov-proof-verifier-service` must not override Ligero env vars.
     // The caller (scripts/deploy) is responsible for exporting the correct values.
     ensure_ligero_env_is_set()?;
-    
+
     Ok(())
 }
 
@@ -2107,7 +2170,7 @@ fn configure_ligero_env_for_midnight() -> Result<(), ServiceError> {
     // `sov-proof-verifier-service` must not override Ligero env vars.
     // The caller (scripts/deploy) is responsible for exporting the correct values.
     ensure_ligero_env_is_set()?;
-    
+
     Ok(())
 }
 
@@ -2150,33 +2213,39 @@ fn compute_midnight_method_id() -> Result<[u8; 32]> {
 /// Generic function to compute method ID for any guest program
 fn compute_method_id_for_program(program_name: &str) -> Result<[u8; 32]> {
     let current_dir = std::env::current_dir()?;
-    
+
     // Try multiple possible locations
     let possible_paths = vec![
-        current_dir.join(format!("crates/adapters/ligero/guest/bins/programs/{}", program_name)),
-        current_dir.join(format!("../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
-        current_dir.join(format!("../../crates/adapters/ligero/guest/bins/programs/{}", program_name)),
+        current_dir.join(format!(
+            "crates/adapters/ligero/guest/bins/programs/{}",
+            program_name
+        )),
+        current_dir.join(format!(
+            "../crates/adapters/ligero/guest/bins/programs/{}",
+            program_name
+        )),
+        current_dir.join(format!(
+            "../../crates/adapters/ligero/guest/bins/programs/{}",
+            program_name
+        )),
     ];
-    
-    let program_path = possible_paths
-        .iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not find {}. Searched:\n{}",
-                program_name,
-                possible_paths
-                    .iter()
-                    .map(|p| format!("  - {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })?;
-    
+
+    let program_path = possible_paths.iter().find(|p| p.exists()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not find {}. Searched:\n{}",
+            program_name,
+            possible_paths
+                .iter()
+                .map(|p| format!("  - {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
+
     let program_str = program_path.to_string_lossy().to_string();
     let host = <Ligero as Zkvm>::Host::from_args(&program_str);
     let method_id = host.code_commitment();
-    
+
     let encoded = method_id.encode();
     let mut result = [0u8; 32];
     result.copy_from_slice(&encoded[..32]);

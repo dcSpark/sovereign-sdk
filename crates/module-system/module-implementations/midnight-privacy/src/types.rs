@@ -13,18 +13,18 @@ use crate::hash::Hash32;
 pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 
 /// A privacy pool address (bech32m-encoded public key).
-/// 
+///
 /// This is the user-facing format for privacy recipients. The inner value is
 /// a 32-byte public key (`pk_out`) which is used to derive the actual recipient:
 /// `recipient = H("ADDR_V1" || domain || pk_out)`
-/// 
+///
 /// Format: `privpool1<bech32m-encoded-32-bytes>`
-/// 
+///
 /// # Example
 /// ```ignore
 /// let addr = PrivacyAddress::from_pk(&pk);
 /// println!("Send to: {}", addr); // privpool1qypqxpq9qcrsszg2pvxq6rs...
-/// 
+///
 /// // Parse from string
 /// let addr: PrivacyAddress = "privpool1qypqxpq9qcrsszg2pvxq6rs...".parse()?;
 /// let pk = addr.to_pk();
@@ -63,10 +63,10 @@ impl FromStr for PrivacyAddress {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         use bech32::{Bech32m, Hrp};
-        
-        let (hrp, data) = bech32::decode(s)
-            .map_err(|e| PrivacyAddressError::InvalidBech32(e.to_string()))?;
-        
+
+        let (hrp, data) =
+            bech32::decode(s).map_err(|e| PrivacyAddressError::InvalidBech32(e.to_string()))?;
+
         let expected_hrp = Hrp::parse(PRIVACY_ADDRESS_HRP).expect("valid HRP");
         if hrp != expected_hrp {
             return Err(PrivacyAddressError::WrongPrefix {
@@ -74,19 +74,19 @@ impl FromStr for PrivacyAddress {
                 got: hrp.to_string(),
             });
         }
-        
+
         // Verify it's bech32m (not bech32)
         // Re-encode to check variant
-        let _: String = bech32::encode::<Bech32m>(hrp, &data)
-            .map_err(|_| PrivacyAddressError::NotBech32m)?;
-        
+        let _: String =
+            bech32::encode::<Bech32m>(hrp, &data).map_err(|_| PrivacyAddressError::NotBech32m)?;
+
         if data.len() != 32 {
             return Err(PrivacyAddressError::WrongLength {
                 expected: 32,
                 got: data.len(),
             });
         }
-        
+
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&data);
         Ok(PrivacyAddress(pk))

@@ -1,5 +1,8 @@
 use std::marker::PhantomData;
 
+use alloy_primitives::U256;
+
+use crate::da::DaSpec;
 use crate::da::{BlockHeaderTrait, DaVerifier};
 use crate::stf::{ExecutionContext, StateTransitionFunction};
 use crate::zk::{StateTransitionPublicData, StateTransitionWitnessWithAddress, Zkvm, ZkvmGuest};
@@ -65,6 +68,12 @@ where
             final_state_root: result.state_root,
             slot_hash: data.da_block_header.hash(),
             prover_address,
+            // Placeholders for now.
+            // Those may require to get the data from the hyperlane
+            withdraw_root: [0u8; 32],
+            // Lazy unwrap for testing purposes
+            message_queue_hash: <Da::Spec as DaSpec>::SlotHash::try_from([0u8; 32]).unwrap(),
+            last_processed_queue_index: U256::ZERO,
         };
 
         zkvm.commit(&out);

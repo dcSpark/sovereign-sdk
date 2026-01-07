@@ -103,12 +103,10 @@ where
                     .proof_processor()
                     .process_aggregated_proof(proof, sequencer_rollup_address, &mut working_set)
                     .map(|(pub_data, proof)| ProofReceiptContents::AggregateProof(pub_data, proof)),
-
                 ProofType::OptimisticProofAttestation(proof) => runtime
                     .proof_processor()
                     .process_attestation(proof, sequencer_rollup_address, &mut working_set)
                     .map(ProofReceiptContents::Attestation),
-
                 ProofType::OptimisticProofChallenge(proof, rollup_height) => runtime
                     .proof_processor()
                     .process_challenge(
@@ -118,6 +116,7 @@ where
                         &mut working_set,
                     )
                     .map(ProofReceiptContents::BlockProof),
+                ProofType::TEEProofAttestation(proof) => todo!(),
             };
 
             let (outcome, mut scratchpad, transaction_consumption) = match receipt_contents {

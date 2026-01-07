@@ -1,12 +1,21 @@
-use std::{env, path::PathBuf, process::{Command, Stdio}};
-use rkyv::rancor::Error as RancorError;
-use base64::{Engine as _, engine::{self, general_purpose, general_purpose::URL_SAFE_NO_PAD}, alphabet};
+use crate::common::BatchPublicDataV1;
 use anyhow::{Context, Result};
+use base64::{
+    alphabet,
+    engine::{self, general_purpose, general_purpose::URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use borsh::{from_slice, to_vec};
 use serde_json::Value;
-use crate::common::AttestationData;
+use std::{
+    env,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 // base64 engine to handle the encoding and decoding of the payload.
-const BASE64_ENGINE: engine::GeneralPurpose = engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD);
+const BASE64_ENGINE: engine::GeneralPurpose =
+    engine::GeneralPurpose::new(&alphabet::STANDARD, general_purpose::PAD);
 
 /// Function to decode the JWT payload into a JSON value.
 /// The verification of the JWT signature is not done here, as it is done by the AttestationClient.
@@ -30,8 +39,7 @@ pub fn attestation_client_path() -> Result<PathBuf> {
     }
 
     // If the value ATTESTATION_CLIENT_PATH is not set, we assume the AttestationClient is in the same directory as the current executable.
-    let exe = env::current_exe()
-        .context("cannot get current executable path")?;
+    let exe = env::current_exe().context("cannot get current executable path")?;
 
     let client = exe
         .parent()
@@ -48,10 +56,10 @@ pub fn attestation_client_path() -> Result<PathBuf> {
 /// Function to attest the provided payload using the MAA service.
 /// # Arguments
 /// * `payload` - A struct containing the data to be attested.
-/// 
+///
 /// # Returns
 /// * `Result<String, Error>` - The result of the attestation process.
-pub fn attest(payload: AttestationData) -> Result<String> { 
+pub fn attest(payload: &BatchPublicDataV1) -> Result<String> {
     // As MAA requires a C++ library, we call an external C++ program to handle the attestation process.
     // Easier and less time consuming than writing bindings...
 
@@ -59,7 +67,7 @@ pub fn attest(payload: AttestationData) -> Result<String> {
     let client = attestation_client_path()?;
 
     // Serialize the payload to a byte array using rkyv, then encode it to base64.
-    let payload = rkyv::to_bytes::<RancorError>(&payload)?;
+    let payload = to_vec(&payload)?;
     let payload = BASE64_ENGINE.encode(payload);
 
     println!("Sending payload to AttestationClient: {}", payload);
@@ -82,7 +90,7 @@ pub fn attest(payload: AttestationData) -> Result<String> {
         anyhow::bail!(
             "AttestationClient exited with status {}. stdout:\n{} stderr:\n{}",
             result.status,
-            stdout, 
+            stdout,
             stderr
         );
     }
@@ -93,7 +101,7 @@ pub fn attest(payload: AttestationData) -> Result<String> {
 /// # Arguments
 /// * `payload` - The JWT token to be verified.
 /// * `policy` - The policy JSON to be used for verification.
-pub fn verify(payload: &String, policy: String) -> Result<()> { 
+pub fn verify(payload: &String, policy: String) -> Result<()> {
     let client = attestation_client_path()?;
     let result = Command::new(client)
         .arg("-p")
@@ -112,7 +120,7 @@ pub fn verify(payload: &String, policy: String) -> Result<()> {
         anyhow::bail!(
             "AttestationClient exited with status {}. stdout:\n{} stderr:\n{}",
             result.status,
-            stdout, 
+            stdout,
             stderr
         );
     }
@@ -123,22 +131,30 @@ pub fn verify(payload: &String, policy: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::U256;
+
     use super::*;
     const TEST_POLICY_JSON: &str = include_str!("../../policy_sample.json");
 
     #[test]
     fn test_attest() {
         // Create a test payload.
-        let payload = AttestationData {
-            prev_state_root: vec![0; 256],
-            post_state_root: vec![0; 256],
-            batch_hash: "0x1234567890abcdef".to_string(),
-            message_queue_hash: "0x1234567890abcdef".to_string(),
+        let payload = BatchPublicDataV1 {
+            version: 1,
+            layer2_chain_id: 1,
             batch_index: 1,
-            layer2_chain_id: "0x1234567890abcdef".to_string(),
+            da_start_height: 100,
+            da_end_height: 200,
+            prev_state_root: [0u8; 64],
+            post_state_root: [0u8; 64],
+            prev_batch_hash: [0u8; 32],
+            batch_hash: [0u8; 32],
+            last_processed_queue_index: U256::from(12844u64),
+            message_queue_hash: [0u8; 32],
+            withdraw_root: [8u8; 32],
         };
         // Generate the attestation.
-        let result = attest(payload.clone());
+        let result = attest(&payload);
         assert!(result.is_ok(), "Attestation failed");
 
         // If it was successful, we should have a JWT token.
@@ -153,17 +169,25 @@ mod tests {
         // Decode the JWT payload to verify it contains the expected data.
         let jwt = jwt_payload_json(&attestation).unwrap();
         println!("JWT payload: {:?}", jwt);
-        let client_payload = jwt.pointer("/x-ms-runtime/client-payload/midnight_payload").and_then(|s| s.as_str()).expect("Payload is empty");
+        let client_payload = jwt
+            .pointer("/x-ms-runtime/client-payload/midnight_payload")
+            .and_then(|s| s.as_str())
+            .expect("Payload is empty");
         assert!(!client_payload.is_empty(), "Expected payload is empty");
 
         // Decode the client payload.
         // Needed, as the payload is encoded twice, once by us, once by MAA...
+        println!("Client payload: {:?}", client_payload);
         let client_payload = BASE64_ENGINE.decode(client_payload).unwrap();
         let client_payload = BASE64_ENGINE.decode(client_payload).unwrap();
         // Get back the original payload.
-        let client_payload: AttestationData = rkyv::from_bytes::<AttestationData, RancorError>(&client_payload).unwrap();
-        println!("Client payload: {:?}", client_payload);
+        let client_payload: BatchPublicDataV1 =
+            from_slice::<BatchPublicDataV1>(&client_payload).unwrap();
+        println!("Client payload (decoded): {:?}", client_payload);
         // Check if the client payload is the same as the original payload.
-        assert_eq!(payload, client_payload, "Extracted payload does not match the original payload");
+        assert_eq!(
+            payload, client_payload,
+            "Extracted payload does not match the original payload"
+        );
     }
 }

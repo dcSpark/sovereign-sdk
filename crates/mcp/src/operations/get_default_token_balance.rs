@@ -38,7 +38,9 @@ where
         .with_context(|e| {
             tracing::error!(
                 "Failed to get balance for token {} at address {}: {}",
-                token_id, address, e
+                token_id,
+                address,
+                e
             );
             e.to_string()
         })?;

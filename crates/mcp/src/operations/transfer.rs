@@ -422,11 +422,11 @@ async fn create_transfer_unsigned_tx(
 }
 
 /// Transfer funds within the Midnight Privacy shielded pool
-/// 
+///
 /// If `send_amount` < `note_value`, creates 2 outputs:
 ///   - Output 0: `send_amount` → `output_recipient` (destination)
 ///   - Output 1: `note_value - send_amount` → `change_recipient` (change back to sender)
-/// 
+///
 /// If `send_amount` == `note_value`, creates 1 output (full transfer, no change).
 pub async fn transfer(
     ligero: &Ligero,
@@ -452,7 +452,11 @@ pub async fn transfer(
     }
 
     let has_change = send_amount < note_value;
-    let change_amount = if has_change { note_value - send_amount } else { 0 };
+    let change_amount = if has_change {
+        note_value - send_amount
+    } else {
+        0
+    };
 
     if has_change && change_recipient.is_none() {
         anyhow::bail!("change_recipient is required when send_amount < note_value");
@@ -540,7 +544,7 @@ pub async fn transfer(
             "Authority VFK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
-        
+
         // sender_id for transfers is the input_recipient (spender's address)
         let (att_0, enc_0) = viewer::make_viewer_bundle(
             &vfk,
@@ -810,7 +814,11 @@ pub async fn transfer(
         amount_sent: send_amount,
         output_rho: out_rho_0,
         output_recipient: out_recipient_0,
-        change_amount: if has_change { Some(change_amount) } else { None },
+        change_amount: if has_change {
+            Some(change_amount)
+        } else {
+            None
+        },
         change_rho: out_rho_1,
         change_recipient: out_recipient_1,
     })

@@ -2,6 +2,7 @@
 mod op_manager;
 mod prover_service;
 mod stf_info_manager;
+mod tee_manager;
 mod zk_manager;
 use std::num::NonZero;
 
@@ -11,9 +12,38 @@ use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::optimistic::BondingProofService;
 use sov_rollup_interface::stf::ProofSender;
 pub use stf_info_manager::*;
+pub use tee_manager::*;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 pub use zk_manager::*;
+
+/// Starts a process that generates aggregated proofs in the background.
+pub async fn start_tee_workflow_in_background<Ps>(
+    prover_service: Ps,
+    aggregated_proof_block_jump: NonZero<usize>,
+    proof_sender: Box<dyn ProofSender>,
+    genesis_state_root: Ps::StateRoot,
+    stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
+    shutdown_receiver: tokio::sync::watch::Receiver<()>,
+) -> anyhow::Result<JoinHandle<()>>
+where
+    Ps: ProverService,
+    Ps::DaService: DaService<Error = anyhow::Error>,
+{
+    Ok(TeeProofManager::new(
+        prover_service,
+        aggregated_proof_block_jump,
+        proof_sender,
+        genesis_state_root.clone(),
+        0,
+        [0u8; 32],
+        1,
+        stf_info_receiver,
+        shutdown_receiver,
+    )
+    .post_aggregated_proof_to_da_in_background()
+    .await)
+}
 
 /// Starts a process that generates aggregated proofs in the background.
 pub async fn start_zk_workflow_in_background<Ps>(

@@ -3,7 +3,8 @@ use sov_db::storage_manager::NativeChangeSet;
 use sov_mock_da::MockAddress;
 use sov_mock_zkvm::{MockCodeCommitment, MockZkVerifier};
 use sov_modules_api::{
-    AggregatedProofPublicData, ProofOutcome, ProofReceipt, ProofReceiptContents, Storage,
+    AggregatedProofPublicData, ProofOutcome, ProofReceipt, ProofReceiptContents,
+    SerializedTEEAttestation, Storage, TEEAttestation,
 };
 use sov_rollup_interface::common::RollupHeight;
 use sov_rollup_interface::da::{BlobReaderTrait, BlockHeaderTrait, DaSpec, RelevantBlobIters};
@@ -148,9 +149,19 @@ impl<InnerVm: Zkvm, OuterVm: Zkvm, Da: DaSpec> StateTransitionFunction<InnerVm, 
             if raw_proof.is_empty() {
                 continue;
             }
+            println!(
+                "Processing TEE attestation blob of size {}",
+                raw_proof.len()
+            );
+            let raw_proof = SerializedTEEAttestation {
+                tee_raw_attestation: raw_proof.to_vec(),
+            };
+            let raw_proof: TEEAttestation =
+                borsh::from_slice(&raw_proof.tee_raw_attestation).unwrap();
+            let raw_aggregated_proof = raw_proof.raw_aggregated_proof;
             let public_data: AggregatedProofPublicData<Self::Address, Da, Self::StateRoot> =
                 match <MockZkVerifier as ZkVerifier>::verify(
-                    raw_proof,
+                    &raw_aggregated_proof,
                     &MockCodeCommitment::default(),
                 ) {
                     Ok(public_data) => public_data,
@@ -158,16 +169,22 @@ impl<InnerVm: Zkvm, OuterVm: Zkvm, Da: DaSpec> StateTransitionFunction<InnerVm, 
                         panic!("Error when processing proof: {err:?}");
                     }
                 };
-
+            println!("Pushing proof receipt");
             proof_receipts.push(ProofReceipt {
                 blob_hash: [0u8; 32],
                 outcome: ProofOutcome::<Self::Address, Da, Self::StateRoot, _>::Valid(
                     ProofReceiptContents::AggregateProof(
                         public_data,
                         SerializedAggregatedProof {
-                            raw_aggregated_proof: raw_proof.to_vec(),
+                            raw_aggregated_proof,
                         },
                     ),
+                    /*ProofReceiptContents::TEEAttestation(
+                        public_data,
+                        raw_proof.attestation,
+                        raw_proof.attestation_type,
+                        raw_proof.batch_data,
+                    ),*/
                 ),
                 gas_used: Default::default(),
                 gas_price: Default::default(),

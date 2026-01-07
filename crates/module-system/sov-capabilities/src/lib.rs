@@ -45,6 +45,7 @@ impl<'a, S: Spec, T> StandardProvenRollupCapabilities<'a, S, T> {
         state: &mut impl InfallibleStateAccessor,
     ) -> TokenHolder<S> {
         let rewarded_token_holder = match oprating_mode {
+            OperatingMode::TEE => self.prover_incentives.id().to_payable().into(),
             OperatingMode::Zk => self.prover_incentives.id().to_payable().into(),
             OperatingMode::Optimistic => self.attester_incentives.id().to_payable().into(),
             OperatingMode::Operator => {

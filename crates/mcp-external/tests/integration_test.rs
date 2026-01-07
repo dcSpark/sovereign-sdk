@@ -196,7 +196,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
-    // Load authority VFK from environment for test
+                                      // Load authority VFK from environment for test
     let authority_vfk = std::env::var("AUTHORITY_VFK")
         .ok()
         .and_then(|s| {
@@ -372,7 +372,8 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 1: Create funding wallet from private key
     tracing::info!("Step 1: Creating funding wallet");
-    let funding_wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
+    let funding_wallet =
+        WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let funding_address = funding_wallet.get_address();
     tracing::info!("Funding wallet address: {}", funding_address);
 
@@ -398,8 +399,17 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("✓ Authority VFK generated");
 
     // Step 5: Perform deposit to the new privacy address
-    tracing::info!("Step 5: Depositing {} tokens to new privacy address", startup_deposit_amount);
-    let deposit_result = deposit(&provider, &funding_wallet, startup_deposit_amount, &new_privacy_key).await?;
+    tracing::info!(
+        "Step 5: Depositing {} tokens to new privacy address",
+        startup_deposit_amount
+    );
+    let deposit_result = deposit(
+        &provider,
+        &funding_wallet,
+        startup_deposit_amount,
+        &new_privacy_key,
+    )
+    .await?;
     tracing::info!("✓ Deposit successful");
     tracing::info!("  Transaction hash: {}", deposit_result.tx_hash);
     tracing::info!("  Rho: {}", hex::encode(&deposit_result.rho));
@@ -438,7 +448,9 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let ligero = create_test_ligero();
 
     // Get the deposited note details for transfer
-    let note = initial_balance_result.unspent_notes.first()
+    let note = initial_balance_result
+        .unspent_notes
+        .first()
         .expect("Should have at least one unspent note from deposit");
 
     // Parse rho from the note
@@ -511,7 +523,10 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("  - Initial balance: {}", initial_balance);
     tracing::info!("  - Amount sent: {}", send_amount);
     tracing::info!("  - Final balance: {}", final_balance);
-    tracing::info!("  - Unspent notes: {}", final_balance_result.unspent_notes.len());
+    tracing::info!(
+        "  - Unspent notes: {}",
+        final_balance_result.unspent_notes.len()
+    );
     tracing::info!("==========================================");
 
     Ok(())

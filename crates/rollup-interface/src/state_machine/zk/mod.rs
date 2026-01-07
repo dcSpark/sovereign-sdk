@@ -9,6 +9,7 @@
 pub mod aggregated_proof;
 use core::fmt::Debug;
 
+use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use digest::typenum::U32;
 use digest::Digest;
@@ -190,6 +191,19 @@ pub struct StateTransitionPublicData<Address, Da: DaSpec, Root> {
 
     /// Prover address.
     pub prover_address: Address,
+
+    /// Undocumented, atm. We need this from the hyperlane, so the TEE can get it eventually...
+    pub withdraw_root: [u8; 32],
+
+    /// Need this from the hyperlane too
+    #[borsh(bound(
+        serialize = "<Da as DaSpec>::SlotHash: borsh::ser::BorshSerialize",
+        deserialize = "<Da as DaSpec>::SlotHash: borsh::de::BorshDeserialize"
+    ))]
+    pub message_queue_hash: Da::SlotHash,
+
+    /// Undocumented
+    pub last_processed_queue_index: U256,
 }
 
 #[derive(Serialize, Deserialize, UniversalWallet)]

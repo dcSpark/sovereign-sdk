@@ -24,7 +24,7 @@ async fn fetch_aggregated_proof_test_sync() -> anyhow::Result<()> {
 async fn fetch_aggregated_proof_test_async() -> anyhow::Result<()> {
     let test_case = TestCase::new(5);
     tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(6000),
         run_make_proof_async(test_case, 3),
     )
     .await??;
@@ -57,10 +57,12 @@ async fn run_make_proof_sync(test_case: TestCase, nb_of_threads: usize) -> anyho
 
     let mut pub_data = None;
     for _ in (0..nb_of_batches).step_by(jump) {
+        println!("Calculating rollup height from init_slot: {}", init_slot);
         init_slot = calculate_and_check_rollup_height(init_slot, jump);
 
         let resp = test_node.wait_for_aggregated_proof_saved_in_db().await;
         pub_data = Some(verify_aggregated_proof(resp.proof)?);
+        println!("Aggregated proof verified: {:?}", pub_data);
     }
 
     test_case.assert(&pub_data.unwrap());

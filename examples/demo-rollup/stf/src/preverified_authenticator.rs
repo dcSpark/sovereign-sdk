@@ -1,12 +1,14 @@
 use std::marker::PhantomData;
 
-use sov_evm::{EvmAuthenticator, EvmAuthenticatorInput};
 use sov_address::{EthereumAddress, FromVmAddress};
+use sov_evm::{EvmAuthenticator, EvmAuthenticatorInput};
 use sov_modules_api::capabilities::{
-    AuthenticationError, AuthenticationOutput, BatchFromUnregisteredSequencer, FatalError, TransactionAuthenticator,
-    UnregisteredAuthenticationError,
+    AuthenticationError, AuthenticationOutput, BatchFromUnregisteredSequencer, FatalError,
+    TransactionAuthenticator, UnregisteredAuthenticationError,
 };
-use sov_modules_api::{DispatchCall, FullyBakedTx, GetGasPrice, ProvableStateReader, RawTx, Runtime, Spec};
+use sov_modules_api::{
+    DispatchCall, FullyBakedTx, GetGasPrice, ProvableStateReader, RawTx, Runtime, Spec,
+};
 use sov_rollup_interface::TxHash;
 use sov_state::User;
 
@@ -63,6 +65,9 @@ where
     }
 
     fn encode_with_pre_authenticated(tx: RawTx, original_hash: TxHash) -> FullyBakedTx {
-        <EvmAuthenticator<S, Rt> as TransactionAuthenticator<S>>::encode_with_pre_authenticated(tx, original_hash)
+        <EvmAuthenticator<S, Rt> as TransactionAuthenticator<S>>::encode_with_pre_authenticated(
+            tx,
+            original_hash,
+        )
     }
 }

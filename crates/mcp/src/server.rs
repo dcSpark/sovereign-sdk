@@ -409,10 +409,7 @@ impl CryptoServer {
         })?;
 
         let token_id: sov_bank::TokenId = DEFAULT_TOKEN_ID.parse().map_err(|e| {
-            ErrorData::invalid_params(
-                format!("Invalid token_id format: {}", e),
-                None,
-            )
+            ErrorData::invalid_params(format!("Invalid token_id format: {}", e), None)
         })?;
 
         let amount_obj = sov_modules_api::Amount::from(amount);
@@ -618,9 +615,10 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let transactions =
+            crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let transaction_infos: Vec<TransactionInfo> = transactions
             .into_iter()
@@ -728,9 +726,10 @@ impl CryptoServer {
 
         let privacy_key_guard = self.privacy_key.read().await;
 
-        let deposit_result = crate::operations::deposit(provider, &*ctx, amount, &*privacy_key_guard)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let deposit_result =
+            crate::operations::deposit(provider, &*ctx, amount, &*privacy_key_guard)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let recipient = privacy_key_guard.privacy_address().to_string();
 
@@ -767,7 +766,7 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<TransferRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        use midnight_privacy::{PrivacyAddress, recipient_from_pk};
+        use midnight_privacy::{recipient_from_pk, PrivacyAddress};
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
@@ -812,15 +811,18 @@ impl CryptoServer {
             &viewing_key,
         )
         .await
-        .map_err(|e| ErrorData::internal_error(format!("Failed to get unspent notes: {}", e), None))?;
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to get unspent notes: {}", e), None)
+        })?;
 
         // Normalize the input tx_hash (add 0x prefix if missing, lowercase)
         let note_tx_hash = params.note_tx_hash.trim();
-        let note_tx_hash_normalized = if note_tx_hash.starts_with("0x") || note_tx_hash.starts_with("0X") {
-            note_tx_hash.to_lowercase()
-        } else {
-            format!("0x{}", note_tx_hash.to_lowercase())
-        };
+        let note_tx_hash_normalized =
+            if note_tx_hash.starts_with("0x") || note_tx_hash.starts_with("0X") {
+                note_tx_hash.to_lowercase()
+            } else {
+                format!("0x{}", note_tx_hash.to_lowercase())
+            };
 
         // Find the note with matching tx_hash
         let note = unified_result
@@ -842,7 +844,10 @@ impl CryptoServer {
         // Determine send amount: if user specified, use it; otherwise send full note
         let send_amount: u128 = if let Some(ref amount_str) = params.amount {
             amount_str.parse().map_err(|_| {
-                ErrorData::invalid_params("Invalid amount format. Must be a valid u128 number.", None)
+                ErrorData::invalid_params(
+                    "Invalid amount format. Must be a valid u128 number.",
+                    None,
+                )
             })?
         } else {
             note_value
@@ -850,7 +855,10 @@ impl CryptoServer {
 
         // Validate amount
         if send_amount == 0 {
-            return Err(ErrorData::invalid_params("Amount must be greater than 0.", None));
+            return Err(ErrorData::invalid_params(
+                "Amount must be greater than 0.",
+                None,
+            ));
         }
         if send_amount > note_value {
             return Err(ErrorData::invalid_params(
@@ -1035,22 +1043,30 @@ impl CryptoServer {
             rng.fill_bytes(&mut privacy_spend_key_bytes);
             let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
 
-            (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex)
+            (
+                wallet_private_key_hex,
+                authority_vfk_hex,
+                privacy_spend_key_hex,
+            )
         }; // RNG is dropped here
 
         // Create new wallet context from the private key
         let new_wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None))?;
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None)
+            })?;
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
         // Create new authority VFK
-        let new_authority_vfk = AuthorityVfk::from_hex(&authority_vfk_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None))?;
+        let new_authority_vfk = AuthorityVfk::from_hex(&authority_vfk_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None)
+        })?;
 
         // Create new privacy key
-        let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
+        let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None)
+        })?;
 
         let privacy_address = new_privacy_key.privacy_address().to_string();
 
@@ -1121,17 +1137,21 @@ impl CryptoServer {
 
         // Create wallet context from the private key
         let new_wallet_ctx = McpWalletContext::from_private_key_hex(wallet_private_key_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None))?;
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None)
+            })?;
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
         // Create authority VFK
-        let new_authority_vfk = AuthorityVfk::from_hex(authority_vfk_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None))?;
+        let new_authority_vfk = AuthorityVfk::from_hex(authority_vfk_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None)
+        })?;
 
         // Create privacy key
-        let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
+        let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None)
+        })?;
 
         let privacy_address = new_privacy_key.privacy_address().to_string();
 
@@ -1160,7 +1180,6 @@ impl CryptoServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
-
 }
 
 #[tool_handler]

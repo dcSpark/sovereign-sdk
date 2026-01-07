@@ -200,7 +200,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         deposit_result.rho,
         deposit_result.recipient,
         deposit_result.recipient, // Send to same recipient
-        None, // No change since sending full amount
+        None,                     // No change since sending full amount
     )
     .await?;
 

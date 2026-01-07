@@ -168,7 +168,10 @@ fn simulates_add_commitment_at_capacity() {
         commitment[31] = 0xFF; // marker to identify real commitments
 
         // This is what add_commitment does:
-        assert!(next_position < tree.len() as u64, "Tree should have capacity");
+        assert!(
+            next_position < tree.len() as u64,
+            "Tree should have capacity"
+        );
         tree.set_leaf(next_position as usize, commitment);
         next_position += 1;
     }
@@ -176,7 +179,11 @@ fn simulates_add_commitment_at_capacity() {
     // Now tree is FULL: next_position (4) == tree.len() (4)
     assert_eq!(next_position, 4);
     assert_eq!(tree.len(), 4);
-    assert_eq!(next_position as usize, tree.len(), "Tree should be at capacity");
+    assert_eq!(
+        next_position as usize,
+        tree.len(),
+        "Tree should be at capacity"
+    );
 
     // Record state before growth
     let pre_growth_depth = tree.depth();
@@ -214,7 +221,12 @@ fn simulates_add_commitment_at_capacity() {
     // Verify all commitments are intact (positions 0..final_position)
     for i in 0..final_position {
         let leaf = tree.leaf(i as usize);
-        assert_eq!(leaf[0], (i + 1) as u8, "Commitment {} should be preserved", i);
+        assert_eq!(
+            leaf[0],
+            (i + 1) as u8,
+            "Commitment {} should be preserved",
+            i
+        );
         assert_eq!(
             leaf[31], 0xFF,
             "Commitment {} marker should be preserved",
@@ -291,7 +303,11 @@ fn simulates_heavy_usage_multiple_growths() {
         tree.len() >= target_deposits as usize,
         "Tree should have enough capacity"
     );
-    assert_eq!(tree.depth(), 5, "Should need depth 5 for 20 leaves (2^5 = 32)");
+    assert_eq!(
+        tree.depth(),
+        5,
+        "Should need depth 5 for 20 leaves (2^5 = 32)"
+    );
 
     // Verify all 20 commitments are intact
     for i in 0..target_deposits {
@@ -365,4 +381,3 @@ fn new_tree_rejects_excessive_depth() {
     // MAX_TREE_DEPTH is 63, so 64 should panic
     let _ = MerkleTree::new(64);
 }
-

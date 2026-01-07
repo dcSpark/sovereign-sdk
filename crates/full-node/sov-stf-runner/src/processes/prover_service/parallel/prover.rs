@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
+use alloy_primitives::U256;
 use borsh::BorshSerialize;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -19,8 +20,8 @@ use super::state::{ProverState, ProverStatus};
 use super::{ProverServiceError, Verifier};
 use crate::processes::prover_service::block_proof::BlockProof;
 use crate::processes::{
-    ProofAggregationStatus, ProofProcessingStatus, RollupProverConfigDiscriminants,
-    StateTransitionInfo,
+    hash_to_bytes32, state_root_to_bytes32, ProofAggregationStatus, ProofProcessingStatus,
+    PublicDataTee, RollupProverConfigDiscriminants, StateTransitionInfo,
 };
 
 // A prover that generates proofs in parallel using a thread pool. If the pool is saturated,
@@ -146,6 +147,11 @@ where
                             final_state_root,
                             slot_hash: block_header_hash.clone(),
                             prover_address,
+                            // Placeholders for now. 
+                            // Those may require to get the data from the hyperlane
+                            withdraw_root: [0u8; 32],
+                            message_queue_hash: <Da::Spec as DaSpec>::SlotHash::try_from([0u8; 32]).unwrap(),
+                            last_processed_queue_index: U256::ZERO,
                         },
                         slot_number: state_transition_info.slot_number,
                     });
@@ -207,6 +213,18 @@ where
             initial_slot_hash: initial_block_proof.st.slot_hash.clone(),
             final_slot_hash: final_block_proof.st.slot_hash.clone(),
             code_commitment: self.code_commitment.clone(),
+            withdraw_root: final_block_proof.st.withdraw_root,
+            message_queue_hash: final_block_proof.st.message_queue_hash.clone(),
+            last_processed_queue_index: final_block_proof.st.last_processed_queue_index,
+        };
+
+        let public_tee: PublicDataTee = PublicDataTee {
+            initial_state_root: state_root_to_bytes32(&public_data.initial_state_root)?,
+            final_state_root: state_root_to_bytes32(&public_data.final_state_root)?,
+            final_slot_hash: hash_to_bytes32(&public_data.final_slot_hash)?,
+            withdraw_root: public_data.withdraw_root,
+            message_queue_hash: hash_to_bytes32(&public_data.message_queue_hash)?,
+            last_processed_queue_index: public_data.last_processed_queue_index,
         };
 
         trace!(%public_data, "generating aggregate proof");
@@ -220,7 +238,10 @@ where
         for slot_hash in block_header_hashes {
             prover_state.remove(slot_hash);
         }
-        Ok(ProofAggregationStatus::Success(serialized_aggregated_proof))
+        Ok(ProofAggregationStatus::Success(
+            serialized_aggregated_proof,
+            public_tee,
+        ))
     }
 }
 

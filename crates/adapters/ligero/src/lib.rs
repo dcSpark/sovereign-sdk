@@ -345,10 +345,10 @@ impl ZkVerifier for LigeroVerifier {
             // Automatically discover the correct program based on the code commitment
             let paths = native::VerifierPaths::discover_with_commitment(Some(code_commitment))
                 .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
-            
+
             // Verify the program matches the expected commitment
             native::ensure_code_commitment(&paths, code_commitment)?;
-            
+
             // Deserialize args from JSON
             let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
             native::verify_proof(
@@ -455,7 +455,9 @@ mod native {
             Self::discover_with_commitment(None)
         }
 
-        pub fn discover_with_commitment(expected_commitment: Option<&LigeroCodeCommitment>) -> Result<Self> {
+        pub fn discover_with_commitment(
+            expected_commitment: Option<&LigeroCodeCommitment>,
+        ) -> Result<Self> {
             let config = if let Ok(config_path) = std::env::var("LIGERO_CONFIG_PATH") {
                 let config_contents = fs::read_to_string(&config_path)
                     .with_context(|| format!("Failed to read Ligero config at {config_path}"))?;
@@ -521,10 +523,7 @@ mod native {
                 .unwrap_or(8192);
 
             // List of known programs to try
-            let program_candidates = vec![
-                "note_spend_guest.wasm",
-                "value_validator.wasm",
-            ];
+            let program_candidates = vec!["note_spend_guest.wasm", "value_validator.wasm"];
 
             let base_paths = vec![
                 current_dir.join("crates/adapters/ligero/guest/bins/programs"),
@@ -564,7 +563,9 @@ mod native {
                                 .context("Failed to locate webgpu_verifier binary")?;
 
                             return Ok(Some(Self {
-                                program: canonicalize(program_path.to_str().context("Invalid path")?)?,
+                                program: canonicalize(
+                                    program_path.to_str().context("Invalid path")?,
+                                )?,
                                 shader_path,
                                 verifier_bin,
                                 packing,
@@ -585,7 +586,8 @@ mod native {
                 current_dir.join("../crates/adapters/ligero/bins/linux-amd64/shader"),
             ];
 
-            candidates.into_iter()
+            candidates
+                .into_iter()
                 .find(|p| p.exists())
                 .and_then(|p| p.to_str().and_then(|s| canonicalize(s).ok()))
         }

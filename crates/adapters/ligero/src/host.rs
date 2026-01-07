@@ -205,12 +205,12 @@ impl LigeroHost {
         } else {
             format!("ligero_proof_{:?}", std::thread::current().id())
         };
-        
+
         // Use project-relative path instead of /tmp/
         let proof_outputs_base = std::env::current_dir()
             .context("Failed to get current directory")?
             .join("proof_outputs");
-        
+
         let unique_proof_dir = proof_outputs_base.join(dir_name);
         std::fs::create_dir_all(&unique_proof_dir)
             .context("Failed to create unique proof directory")?;
@@ -296,12 +296,12 @@ impl LigeroHost {
         );
 
         tracing::debug!("Proof generated successfully, size: {} bytes", proof.len());
-        
+
         // Clean up the temporary directory after reading the proof
         if let Err(e) = std::fs::remove_dir_all(&unique_proof_dir) {
             tracing::warn!("Failed to clean up temporary proof directory: {}", e);
         }
-        
+
         Ok(proof)
     }
 

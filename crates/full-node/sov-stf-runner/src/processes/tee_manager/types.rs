@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use sov_modules_api::AggregatedProofPublicData;
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 
 use crate::processes::{
-    ProofAggregationStatus, ProofProcessingStatus, ProverService, StateTransitionInfo,
+    ProofAggregationStatus, ProofProcessingStatus, ProverService, PublicDataTee,
+    StateTransitionInfo,
 };
 
 /// A [`VecDeque`] which is guaranteed to contain at least one item at all
@@ -66,7 +68,7 @@ pub(crate) enum BlockProofStatus<W> {
 /// Metadata for an aggregated proof that has not yet been created.
 pub(crate) struct AggregateProofMetadata<Ps: ProverService> {
     /// The proof info for each individual block covered by this proof
-    block_proof_info: Vec<BlockProofInfo<Ps>>,
+    pub(crate) block_proof_info: Vec<BlockProofInfo<Ps>>,
     /// Set to true if and only if all subproofs have been submitted to the prover service.
     is_ready: bool,
     /// The estimated size of the aggregated proof, including any public data needed to verify it.
@@ -126,7 +128,7 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
         mut self,
         prover_service: &Ps,
         genesis_state_root: &Ps::StateRoot,
-    ) -> Result<SerializedAggregatedProof, (Self, anyhow::Error)> {
+    ) -> Result<(SerializedAggregatedProof, PublicDataTee), (Self, anyhow::Error)> {
         self.prove_any_unproven_blocks(prover_service).await;
         let agg_proof_hashes: Vec<_> = self
             .block_proof_info
@@ -141,7 +143,7 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
 
             match status {
                 Ok(ProofAggregationStatus::Success(agg_proof, public_data)) => {
-                    return Ok(agg_proof);
+                    return Ok((agg_proof, public_data));
                 }
                 // TODO(https://github.com/Sovereign-Labs/sovereign-sdk/issues/1185): Add timeout handling.
                 Ok(ProofAggregationStatus::ProofGenerationInProgress) => {

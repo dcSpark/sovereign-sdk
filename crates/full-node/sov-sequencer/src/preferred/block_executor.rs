@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::preferred::cache_warm_up_executor::FullyBakedTxWithMaybeChangeSet;
 use anyhow::Context;
+use axum::http::StatusCode;
 #[cfg(feature = "native")]
 use midnight_privacy::prime_pre_verified_spend;
-use axum::http::StatusCode;
 use sov_modules_api::capabilities::{
     BlobSelector, BlobSelectorOutput, ChainState, FatalError, RollupHeight,
     TransactionAuthenticator,
@@ -18,7 +18,7 @@ use sov_modules_api::{
     FullyBakedTx, Gas, GasSpec, HexString, KernelStateAccessor, NoOpControlFlow, RejectReason,
     Runtime, RuntimeEventProcessor, RuntimeEventResponse, SelectedBlob, Spec, StateCheckpoint,
     StateUpdateInfo, TransactionReceipt, TxChangeSet, TxHash, TxReceiptContents, VersionReader,
-    VisibleSlotNumber
+    VisibleSlotNumber,
 };
 use sov_modules_stf_blueprint::{BatchReceipt, StfBlueprint};
 use sov_rest_utils::{json_obj, ErrorObject};
@@ -272,7 +272,15 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         );
 
         match result {
-            Ok((receipt, remaining_slot_gas, execution_time_micros, tx_changes, _gas_used, _reward, _penalty)) => {
+            Ok((
+                receipt,
+                remaining_slot_gas,
+                execution_time_micros,
+                tx_changes,
+                _gas_used,
+                _reward,
+                _penalty,
+            )) => {
                 let accepted_tx = self.process_tx_receipt(&receipt, Some(execution_time_micros));
                 if let Some(writer) = self.startup_transaction_cache_writer.as_mut() {
                     writer.insert(accepted_tx.clone()).await;
@@ -310,8 +318,15 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         ),
         RollupBlockExecutorError<S>,
     > {
-        let (receipt, remaining_slot_gas, execution_time_micros, tx_changes, gas_used, reward, penalty) =
-            self.apply_tx_to_in_progress_batch_inner(baked_tx).await?;
+        let (
+            receipt,
+            remaining_slot_gas,
+            execution_time_micros,
+            tx_changes,
+            gas_used,
+            reward,
+            penalty,
+        ) = self.apply_tx_to_in_progress_batch_inner(baked_tx).await?;
         Ok((
             receipt,
             tx_changes,

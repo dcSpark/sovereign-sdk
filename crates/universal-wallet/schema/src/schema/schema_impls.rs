@@ -41,6 +41,10 @@ mod primitive_type_impls {
         type Output = u32;
     }
 
+    impl OverrideSchema for alloy_primitives::U256 {
+        type Output = [u8; 32];
+    }
+
     impl UniversalWallet for bool {
         fn scaffold() -> Item<IndexLinking> {
             Item::Atom(Primitive::Boolean)

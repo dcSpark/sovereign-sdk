@@ -32,7 +32,8 @@ use sov_sequencer::{react_to_state_updates, SequencerConfig, SequencerKindConfig
 use sov_state::{DefaultStorageSpec, NativeStorage, ProverStorage};
 use sov_stf_runner::make_da_sync_state;
 use sov_stf_runner::processes::{
-    start_zk_workflow_in_background, ParallelProverService, RollupProverConfigDiscriminants,
+    start_tee_workflow_in_background, start_zk_workflow_in_background, ParallelProverService,
+    RollupProverConfigDiscriminants,
 };
 use sov_stf_runner::{
     initialize_state, query_state_update_info, HttpServerConfig, ProofManagerConfig, RollupConfig,
@@ -127,6 +128,17 @@ impl ProofSender for MockProofSender {
         serialized_proof: SerializedAggregatedProof,
     ) -> anyhow::Result<()> {
         let serialized_blob = serialized_proof.raw_aggregated_proof;
+
+        self.da.send_proof(&serialized_blob).await.await??;
+
+        Ok(())
+    }
+
+    async fn publish_tee_attestation_blob_with_metadata(
+        &self,
+        serialized_attestation: sov_modules_api::SerializedTEEAttestation,
+    ) -> anyhow::Result<()> {
+        let serialized_blob = serialized_attestation.tee_raw_attestation;
 
         self.da.send_proof(&serialized_blob).await.await??;
 
@@ -260,7 +272,7 @@ pub async fn initialize_runner(
                 Default::default(),
                 MockAddress::new([0u8; 32]),
             );
-        let handle = start_zk_workflow_in_background::<_>(
+        let handle = start_tee_workflow_in_background::<_>(
             prover_service,
             rollup_config.proof_manager.aggregated_proof_block_jump,
             Box::new(MockProofSender {

@@ -33,8 +33,8 @@ use sov_state::Storage;
 use sov_stf_runner::make_da_sync_state;
 use sov_stf_runner::processes::{
     start_op_workflow_in_background, start_operator_workflow_in_background,
-    start_zk_workflow_in_background, ProverService, RollupProverConfig,
-    RollupProverConfigDiscriminants,
+    start_tee_workflow_in_background, start_zk_workflow_in_background, ProverService,
+    RollupProverConfig, RollupProverConfigDiscriminants,
 };
 use sov_stf_runner::{
     initialize_state, query_state_update_info, CorsConfiguration, RollupConfig,
@@ -487,6 +487,17 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                 }
                 OperatingMode::Zk => {
                     start_zk_workflow_in_background(
+                        prover_service,
+                        rollup_config.proof_manager.aggregated_proof_block_jump,
+                        proof_sender,
+                        genesis_state_root,
+                        stf_info_receiver,
+                        secondary_shutdown_receiver,
+                    )
+                    .await?
+                }
+                OperatingMode::TEE => {
+                    start_tee_workflow_in_background(
                         prover_service,
                         rollup_config.proof_manager.aggregated_proof_block_jump,
                         proof_sender,

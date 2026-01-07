@@ -14,6 +14,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+alloy-primitives = { workspace = true, features = ["borsh", "serde"] }
 axum = { workspace = true, features = ["tokio", "http1", "http2", "ws", ] }
 rockbound = { workspace = true }
 bincode = { workspace = true }
@@ -34,10 +35,13 @@ tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 rayon = { workspace = true }
+sov-state = { workspace = true, features = ["native"] }
+sov-modules-api = { workspace = true, features = ["native"] }
 sov-db = { workspace = true }
 sov-rollup-interface = { workspace = true }
 sov-metrics = { workspace = true }
 tower-http = { workspace = true, features = ["normalize-path", "cors"] }
+tee = { workspace = true, features = ["maa"] }
 tower-layer = "0.3.3"
 futures-util = "0.3.31"
 

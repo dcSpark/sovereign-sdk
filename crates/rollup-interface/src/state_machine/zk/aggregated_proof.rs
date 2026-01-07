@@ -1,6 +1,7 @@
 //! Defines types that are related to the `AggregatedProof`.
 use core::marker::PhantomData;
 
+use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,12 @@ pub struct AggregatedProofPublicData<Address, Da: DaSpec, Root> {
     pub code_commitment: CodeCommitment,
     /// These are the addresses of the provers who proved individual blocks.
     pub rewarded_addresses: Vec<Address>,
+    /// Undocumented, atm.
+    pub withdraw_root: [u8; 32],
+    /// Undocumented, atm.
+    pub message_queue_hash: Da::SlotHash,
+    /// Undocumented, atm.
+    pub last_processed_queue_index: U256,
 }
 
 impl<Address, Da: DaSpec, Root: AsRef<[u8]>> core::fmt::Display

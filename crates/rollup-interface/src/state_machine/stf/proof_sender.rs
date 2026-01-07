@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::common::SlotNumber;
 use crate::optimistic::{SerializedAttestation, SerializedChallenge};
+use crate::tee::SerializedTEEAttestation;
 use crate::zk::aggregated_proof::SerializedAggregatedProof;
 
 /// Publishes proof blobs and adds metadata needed for verification.
@@ -11,6 +12,12 @@ pub trait ProofSender: Send + Sync {
     async fn publish_proof_blob_with_metadata(
         &self,
         serialized_proof: SerializedAggregatedProof,
+    ) -> anyhow::Result<()>;
+
+    /// Creates an attestation blob with metadata needed for verification.
+    async fn publish_tee_attestation_blob_with_metadata(
+        &self,
+        serialized_attestation: SerializedTEEAttestation,
     ) -> anyhow::Result<()>;
 
     /// Creates an attestation blob with metadata needed for verification.

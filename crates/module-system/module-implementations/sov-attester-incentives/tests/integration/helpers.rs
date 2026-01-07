@@ -6,6 +6,7 @@ use sov_chain_state::ChainState;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvmHost;
 use sov_modules_api::capabilities::RollupHeight;
+use sov_modules_api::digest::consts::U256;
 use sov_modules_api::{
     Amount, ApiStateAccessor, DaSpec, ProofOutcome, SerializedAttestation, SerializedChallenge,
     Spec, StateTransitionPublicData,
@@ -262,6 +263,9 @@ pub(crate) fn build_challenge(
         final_state_root: *current_transition.post_state_root(),
         slot_hash: *current_transition.slot().slot_hash(),
         prover_address,
+        withdraw_root: [0u8; 32],
+        message_queue_hash: <MockDaSpec as DaSpec>::SlotHash::try_from([0u8; 32]).unwrap(),
+        last_processed_queue_index: U256::ZERO,
     };
 
     Ok(challenge)

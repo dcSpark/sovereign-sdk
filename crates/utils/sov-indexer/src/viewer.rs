@@ -196,8 +196,8 @@ impl Default for VfkRegistry {
 pub fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
     let s = vfk_hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s)
-        .map_err(|e| anyhow::anyhow!("Invalid VFK hex '{}': {}", vfk_hex, e))?;
+    let bytes =
+        hex::decode(s).map_err(|e| anyhow::anyhow!("Invalid VFK hex '{}': {}", vfk_hex, e))?;
     if bytes.len() != 32 {
         anyhow::bail!(
             "VFK must be 32 bytes (64 hex chars), got {} bytes",
@@ -354,10 +354,7 @@ pub fn try_decrypt_notes_with_registry(
                     decrypted.push(decrypted_note);
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to decrypt note {} despite matching VFK: {}",
-                        idx, e
-                    );
+                    warn!("Failed to decrypt note {} despite matching VFK: {}", idx, e);
                 }
             }
         } else {
@@ -392,10 +389,7 @@ pub fn try_decrypt_notes_json(
     for (idx, note) in notes.iter().enumerate() {
         match decrypt_note(vfk, note) {
             Ok(decrypted_note) => {
-                debug!(
-                    "Decrypted note {}: value={}",
-                    idx, decrypted_note.value
-                );
+                debug!("Decrypted note {}: value={}", idx, decrypted_note.value);
                 decrypted.push(decrypted_note);
             }
             Err(e) => {

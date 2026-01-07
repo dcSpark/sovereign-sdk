@@ -126,4 +126,3 @@ pub fn make_viewer_bundle(
 
     (att, enc)
 }
-

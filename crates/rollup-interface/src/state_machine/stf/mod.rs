@@ -13,6 +13,7 @@ mod verifier;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
+use tee::common::BatchPublicDataV1;
 
 use std::fmt::{Debug, Display};
 
@@ -27,6 +28,7 @@ pub use verifier::StateTransitionVerifier;
 use super::optimistic::Attestation;
 use crate::common::{HexHash, RollupHeight};
 use crate::da::{DaSpec, RelevantBlobIters};
+use crate::tee::TEEAttestationType;
 use crate::zk::aggregated_proof::{AggregatedProofPublicData, SerializedAggregatedProof};
 use crate::zk::{StateTransitionPublicData, Zkvm};
 
@@ -98,6 +100,13 @@ pub enum ProofReceiptContents<Address, Da: DaSpec, Root, StorageProof> {
     BlockProof(StateTransitionPublicData<Address, Da, Root>),
     /// A receipt for an attestation contains the public data that the attestation made a claim about.
     Attestation(Attestation<Da::SlotHash, Root, StorageProof>),
+    /// A receipt for a TEE attestation contains the public data that the attestation made a claim about.
+    TEEAttestation(
+        AggregatedProofPublicData<Address, Da, Root>,
+        Vec<u8>,
+        TEEAttestationType,
+        BatchPublicDataV1,
+    ),
 }
 
 /// The context in which the execution is happening.

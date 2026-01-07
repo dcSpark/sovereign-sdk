@@ -3,15 +3,15 @@ use std::fmt::Debug;
 use anyhow::Result;
 use schemars::JsonSchema;
 use sov_modules_api::macros::{serialize, UniversalWallet};
-use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
 use sov_modules_api::VersionReader;
+use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
+use std::collections::HashSet;
 use thiserror::Error;
 use tracing::{debug, info};
-use std::collections::HashSet;
 
 use super::ValueMidnightPrivacy;
 use crate::event::Event;
-use crate::hash::{note_commitment, Hash32, RootKey, PendingRootKey};
+use crate::hash::{note_commitment, Hash32, PendingRootKey, RootKey};
 use crate::types::{EncryptedNote, FullViewingKey};
 
 #[cfg(feature = "native")]
@@ -182,22 +182,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// dramatically reducing cache memory usage.
 
     /// Queue a commitment for end-of-block processing.
-    /// 
+    ///
     /// This function does NOT update the tree or assign positions. It only enqueues
     /// the commitment. All tree updates and position assignments happen in `end_block_flush`,
     /// which runs single-threaded after all transactions complete.
-    /// 
+    ///
     /// PARALLEL-SAFE: Each commitment writes to a unique key `(height, commitment)`,
     /// so there are no write conflicts between concurrent transactions.
     /// Enumeration at flush time uses StateMap::iter_prefix to find all commitments
     /// for the current height.
-    fn add_commitment(
-        &mut self,
-        commitment: Hash32,
-        state: &mut impl TxState<S>,
-    ) -> Result<()> {
+    fn add_commitment(&mut self, commitment: Hash32, state: &mut impl TxState<S>) -> Result<()> {
         let current_height = state.rollup_height_to_access();
-        
+
         // Store commitment with unique key (height, commitment) - no conflicts in parallel execution
         // Value is just a presence marker - position is assigned at flush time.
         let cm_key = crate::hash::PendingCommitmentKey {
@@ -213,22 +209,18 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     }
 
     /// Queue a nullifier for end-of-block processing.
-    /// 
+    ///
     /// This function does NOT update the nullifier tree. It only enqueues the nullifier.
     /// Tree updates happen in `end_block_flush`.
-    /// 
+    ///
     /// PARALLEL-SAFE: Each nullifier writes to a unique key `(height, nullifier)`,
     /// so there are no write conflicts between concurrent transactions.
-    /// 
+    ///
     /// Note: Double-spend protection is done via `nullifier_set` (O(1) lookup, per tx).
     /// The nullifier tree is for canonical root tracking and future circuit integration.
-    fn append_nullifier(
-        &mut self,
-        nullifier: Hash32,
-        state: &mut impl TxState<S>,
-    ) -> Result<()> {
+    fn append_nullifier(&mut self, nullifier: Hash32, state: &mut impl TxState<S>) -> Result<()> {
         let current_height = state.rollup_height_to_access();
-        
+
         // Store nullifier with unique key (height, nullifier) - no conflicts
         let nf_key = crate::hash::PendingNullifierKey {
             height: current_height.get(),
@@ -295,7 +287,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Update deposit statistics
         let total_deposited = self.total_deposited.get(st)?.unwrap_or(0);
         self.total_deposited.set(&(total_deposited + amount), st)?;
-        
+
         let deposit_count = self.deposit_count.get(st)?.unwrap_or(0);
         self.deposit_count.set(&(deposit_count + 1), st)?;
 
@@ -328,8 +320,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
+            Vec<EncryptedNote>,
+        >,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -440,7 +433,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Level B: Viewer attestation verification
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
-                
+
                 const MAX_VIEW_CT: usize = 16; // reasonable upper bound for viewer ciphertexts
                 let outputs_set: HashSet<Hash32> = outputs.iter().copied().collect();
 
@@ -548,8 +541,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] to: S::Address,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        view_ciphertexts: Option<Vec<EncryptedNote>>,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
+            Vec<EncryptedNote>,
+        >,
         gas: Option<S::Gas>,
         _ctx: &Context<S>,
         st: &mut impl TxState<S>,
@@ -590,8 +584,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
                     .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
 
-                LigeroVerifier::verify(&proof, &method_id)
-                    .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()))?
+                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
+                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
+                })?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -677,15 +672,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
             // Update withdrawal statistics
             let total_withdrawn = self.total_withdrawn.get(st)?.unwrap_or(0);
-            self.total_withdrawn.set(&(total_withdrawn + public.withdraw_amount), st)?;
-            
+            self.total_withdrawn
+                .set(&(total_withdrawn + public.withdraw_amount), st)?;
+
             let withdraw_count = self.withdraw_count.get(st)?.unwrap_or(0);
             self.withdraw_count.set(&(withdraw_count + 1), st)?;
 
             // Level B: Viewer attestation verification for change outputs
             if let Some(vcs) = view_ciphertexts {
                 use crate::viewing::ct_hash as compute_ct_hash;
-                
+
                 const MAX_VIEW_CT: usize = 16; // reasonable upper bound for viewer ciphertexts
                 let outputs_set: HashSet<Hash32> = change_outputs.iter().copied().collect();
 
@@ -808,7 +804,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// 3. Save both trees once
     ///
     /// SCOPE: Flushes only current block's pending items. Other heights ignored.
-    /// 
+    ///
     /// PARALLEL-SAFE: Uses StateMap::iter_prefix to enumerate all commitments/nullifiers
     /// for the current height. Each tx writes to a unique key (height, hash), so there
     /// are no conflicts during parallel execution. Final ordering is deterministic (sorted by hash).
@@ -821,24 +817,26 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // ═══════════════════════════════════════════════════════════════════════════════
         // PHASE 1: Replay pending commitments into the commitment tree
         // ═══════════════════════════════════════════════════════════════════════════════
-        
+
         // Collect all commitments using prefix iteration (parallel-safe: no data loss)
         let cm_prefix = crate::hash::PendingCommitmentPrefix {
             height: current_height.get(),
         };
-        let cm_entries = self.pending_commitments_by_hash.iter_prefix(&cm_prefix, st)?;
-        
+        let cm_entries = self
+            .pending_commitments_by_hash
+            .iter_prefix(&cm_prefix, st)?;
+
         // Extract commitments and sort for deterministic ordering
         let mut commitments: Vec<Hash32> = cm_entries
             .into_iter()
             .map(|(key, _)| key.commitment)
             .collect();
         commitments.sort();
-        
+
         if !commitments.is_empty() {
             let mut tree = self.commitment_tree.get_or_err(st)??;
             let mut pos = self.next_position.get_or_err(st)??;
-            
+
             for cm in &commitments {
                 if pos >= tree.len() as u64 {
                     tree.grow_to_fit((pos + 1) as usize);
@@ -849,13 +847,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 self.record_root_forever_direct(root, st)?;
                 pos += 1;
             }
-            
+
             self.next_position.set(&pos, st)?;
             self.commitment_tree.set(&tree, st)?;
-            
+
             // Clean up processed entries
-            self.pending_commitments_by_hash.delete_prefix(&cm_prefix, st)?;
-            
+            self.pending_commitments_by_hash
+                .delete_prefix(&cm_prefix, st)?;
+
             tracing::debug!(
                 height = current_height.get(),
                 commitments_flushed = commitments.len(),
@@ -867,24 +866,26 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // ═══════════════════════════════════════════════════════════════════════════════
         // PHASE 2: Replay pending nullifiers into the nullifier tree
         // ═══════════════════════════════════════════════════════════════════════════════
-        
+
         // Collect all nullifiers using prefix iteration
         let nf_prefix = crate::hash::PendingNullifierPrefix {
             height: current_height.get(),
         };
-        let nf_entries = self.pending_nullifiers_by_hash.iter_prefix(&nf_prefix, st)?;
-        
+        let nf_entries = self
+            .pending_nullifiers_by_hash
+            .iter_prefix(&nf_prefix, st)?;
+
         // Extract nullifiers and sort for deterministic ordering
         let mut nullifiers: Vec<Hash32> = nf_entries
             .into_iter()
             .map(|(key, _)| key.nullifier)
             .collect();
         nullifiers.sort();
-        
+
         if !nullifiers.is_empty() {
             let mut tree = self.nullifier_tree.get_or_err(st)??;
             let mut pos = self.next_nullifier_position.get_or_err(st)??;
-            
+
             for nf in &nullifiers {
                 if pos >= tree.len() as u64 {
                     tree.grow_to_fit((pos + 1) as usize);
@@ -892,13 +893,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 tree.set_leaf(pos as usize, *nf);
                 pos += 1;
             }
-            
+
             self.next_nullifier_position.set(&pos, st)?;
             self.nullifier_tree.set(&tree, st)?;
-            
+
             // Clean up processed entries
-            self.pending_nullifiers_by_hash.delete_prefix(&nf_prefix, st)?;
-            
+            self.pending_nullifiers_by_hash
+                .delete_prefix(&nf_prefix, st)?;
+
             tracing::debug!(
                 height = current_height.get(),
                 nullifiers_flushed = nullifiers.len(),
@@ -932,14 +934,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.record_root_forever_direct(root, st)?;
         }
 
-        self.pending_roots_count
-            .set(&current_height, &0u32, st)?;
+        self.pending_roots_count.set(&current_height, &0u32, st)?;
 
         Ok(())
     }
 
     /// Helper: Add a root to the recent roots window (for StateCheckpoint).
-    fn add_recent_root_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+    fn add_recent_root_direct(
+        &mut self,
+        root: Hash32,
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<()> {
         let mut recent_roots = self.recent_roots.get_or_err(state)??;
         let root_window_size = self.root_window_size.get_or_err(state)??;
 
@@ -954,7 +959,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
     /// Helper: Record a root in the full-history index (for StateCheckpoint).
     /// Note: This version doesn't emit events since StateCheckpoint doesn't implement EventContainer.
-    fn record_root_forever_direct(&mut self, root: Hash32, state: &mut sov_modules_api::StateCheckpoint<S>) -> Result<()> {
+    fn record_root_forever_direct(
+        &mut self,
+        root: Hash32,
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<()> {
         // Fast path: already recorded?
         if self.all_roots.get(&RootKey(root), state)?.is_some() {
             return Ok(());

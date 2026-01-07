@@ -33,4 +33,3 @@ pub fn set_shared_db_connection_string(connection_string: impl Into<String>) {
 pub fn shared_db_connection_string() -> Option<&'static str> {
     SHARED_DB_CONNECTION_STRING.get().map(|s| s.as_str())
 }
-

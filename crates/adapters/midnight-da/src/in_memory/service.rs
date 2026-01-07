@@ -17,8 +17,8 @@ use crate::config::{GENESIS_BLOCK, GENESIS_HEADER, WAIT_ATTEMPT_PAUSE};
 use crate::in_memory::fork::PlannedFork;
 use crate::utils::hash_to_array;
 use crate::{
-    MidnightAddress, MidnightBlob, MidnightBlock, MidnightBlockHeader, MidnightDaConfig, MidnightDaSpec, MidnightDaVerifier,
-    MidnightHash,
+    MidnightAddress, MidnightBlob, MidnightBlock, MidnightBlockHeader, MidnightDaConfig,
+    MidnightDaSpec, MidnightDaVerifier, MidnightHash,
 };
 
 const DEFAULT_WAIT_ATTEMPTS: u64 = 100;
@@ -495,7 +495,8 @@ mod tests {
     }
 
     async fn test_push_and_read(finalization: u64, num_blocks: usize) -> anyhow::Result<()> {
-        let mut da = MidnightDaService::new(MidnightAddress::new([1; 32])).with_finality(finalization as _);
+        let mut da =
+            MidnightDaService::new(MidnightAddress::new([1; 32])).with_finality(finalization as _);
         da.wait_attempts = 2;
         let number_of_finalized_blocks = num_blocks - finalization as usize;
         let collector_handle =
@@ -535,7 +536,8 @@ mod tests {
     }
 
     async fn test_push_many_then_read(finalization: u64, num_blocks: usize) -> anyhow::Result<()> {
-        let mut da = MidnightDaService::new(MidnightAddress::new([1; 32])).with_finality(finalization as _);
+        let mut da =
+            MidnightDaService::new(MidnightAddress::new([1; 32])).with_finality(finalization as _);
         da.wait_attempts = 2;
         let number_of_finalized_blocks = num_blocks - finalization as usize;
         let collector_handle =

@@ -5,15 +5,18 @@ mod block_proof;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use alloy_primitives::U256;
 use async_trait::async_trait;
 use borsh::BorshSerialize;
 pub use parallel::ParallelProverService;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_modules_api::{Address, AggregatedProofPublicData};
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 use sov_rollup_interface::zk::{ZkVerifier, Zkvm, ZkvmHost};
+use sov_state::StateRoot;
 use strum::{Display, EnumString};
 use thiserror::Error;
 
@@ -105,11 +108,29 @@ pub enum WitnessSubmissionStatus {
     WitnessExist,
 }
 
+/// Extracted public data from the aggregated proof for submission to the DA, for the TEE attestation.
+/// Preserialized for convenience, as this is what will be sent to the DA. This data is expected to be deserialized for determistic verification in the TEE.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PublicDataTee {
+    /// The initial state root before the batch execution.
+    pub initial_state_root: [u8; 64],
+    /// The final state root after the batch execution.
+    pub final_state_root: [u8; 64],
+    /// The final slot hash after the batch execution.
+    pub final_slot_hash: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub withdraw_root: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub message_queue_hash: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub last_processed_queue_index: U256,
+}
+
 /// Represents the status of a DA proof submission.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ProofAggregationStatus {
     /// Indicates successful proof generation.
-    Success(SerializedAggregatedProof),
+    Success(SerializedAggregatedProof, PublicDataTee),
     /// Indicates that proof generation is currently in progress.
     ProofGenerationInProgress,
 }

@@ -2,7 +2,6 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     // Re-run if anything in the attestation_verifier directory changes.
-    // Brutal but simple.
     println!("cargo:rerun-if-changed=attestation_verifier");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -39,6 +38,5 @@ fn main() {
         fs::set_permissions(&dest, perms).unwrap();
     }
 
-    // ALWAYS emit, so env!/option_env! works.
     println!("cargo:rustc-env=ATTESTATION_CLIENT_PATH={}", dest.display());
 }

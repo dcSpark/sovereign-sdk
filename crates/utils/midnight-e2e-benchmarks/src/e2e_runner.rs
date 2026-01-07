@@ -9,8 +9,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, Hash32, MerkleTree, SpendPublic,
-    EncryptedNote,
+    note_commitment, nullifier, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
+    MerkleTree, SpendPublic,
 };
 use num_cpus;
 use serde_json::Value as JsonValue;
@@ -26,8 +26,8 @@ use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
 use crate::{
-    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
-    load_authority_fvk, make_viewer_bundle,
+    find_rollup_binary, load_authority_fvk, make_viewer_bundle, setup_ligero_env,
+    start_local_verifier, wait_for_ready, ChildGuard,
 };
 use sov_rollup_ligero::MockDemoRollup;
 
@@ -101,12 +101,10 @@ impl RunnerConfig {
             }
         }
         // Allow enabling batch/queued submission mode via env
-        if let Ok(value) = std::env::var("DEFER_SEQUENCER_SUBMISSION")
-        {
+        if let Ok(value) = std::env::var("DEFER_SEQUENCER_SUBMISSION") {
             cfg.defer_sequencer_submission = value == "1" || value.to_lowercase() == "true";
         }
-        if let Ok(value) = std::env::var("TRANSFER_SUBMIT_DELAY_MS")
-        {
+        if let Ok(value) = std::env::var("TRANSFER_SUBMIT_DELAY_MS") {
             if let Ok(parsed) = value.parse() {
                 cfg.transfer_submit_delay_ms = parsed;
             }
@@ -586,7 +584,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
 
-    async fn flush_verifier_queue(http: &reqwest::Client, verifier_url: &str) -> anyhow::Result<()> {
+    async fn flush_verifier_queue(
+        http: &reqwest::Client,
+        verifier_url: &str,
+    ) -> anyhow::Result<()> {
         eprintln!("[flush] Flushing queued worker transactions to sequencer...");
         let resp = http
             .post(format!("{}/midnight-privacy/flush", verifier_url))
@@ -827,7 +828,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // If we deferred sequencer submission in the verifier, flush deposits now
     if config.defer_sequencer_submission {
         eprintln!("[flush] Waiting 5 seconds before flushing queued transfers...");
-        sleep(Duration::from_secs(5)).await;        
+        sleep(Duration::from_secs(5)).await;
         flush_verifier_queue(&http, &verifier_url).await?;
     }
 
@@ -1059,24 +1060,27 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let mut all_notes = Vec::new();
         let batch_size = 1000;
         let mut offset = 0;
-        
+
         loop {
             let batch_resp: NotesResp = client
-                .query_rest_endpoint(&format!("/modules/midnight-privacy/notes?limit={}&offset={}", batch_size, offset))
+                .query_rest_endpoint(&format!(
+                    "/modules/midnight-privacy/notes?limit={}&offset={}",
+                    batch_size, offset
+                ))
                 .await
                 .context("Failed to query notes batch")?;
-            
+
             let batch_len = batch_resp.notes.len();
             all_notes.extend(batch_resp.notes);
-            
+
             // If we got fewer notes than requested, we've reached the end
             if batch_len < batch_size {
                 break;
             }
-            
+
             offset += batch_size;
         }
-        
+
         notes_resp = NotesResp { notes: all_notes };
 
         eprintln!(
@@ -1590,7 +1594,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         // sender_id = input.recipient (the spender's address)
         let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
             let (_att, enc) = make_viewer_bundle(
-                &fvk, &domain, out_value, &out_rho, &out_recipient, &input.recipient, &cm_out,
+                &fvk,
+                &domain,
+                out_value,
+                &out_rho,
+                &out_recipient,
+                &input.recipient,
+                &cm_out,
             );
             vec![enc]
         });
@@ -1944,7 +1954,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     eprintln!("[transfer-stats] Total batches: {}", total_batches);
     eprintln!("[transfer-stats] Total transactions: {}", total_txs);
-    eprintln!("[transfer-stats] Average txs/batch: {:.2}", avg_txs_per_batch);
+    eprintln!(
+        "[transfer-stats] Average txs/batch: {:.2}",
+        avg_txs_per_batch
+    );
     eprintln!("[transfer-stats]");
     eprintln!("[transfer-stats] Distribution:");
 
@@ -2062,7 +2075,7 @@ async fn collect_batch_sizes(
         {
             Ok(batch) => {
                 let mut total: usize = 8 + 1 + 4; // overhead
-                // Generated type exposes `txs` as a Vec; it may be empty when children are not included
+                                                  // Generated type exposes `txs` as a Vec; it may be empty when children are not included
                 for tx in &batch.txs {
                     // borsh vec element overhead (4 bytes) + body bytes
                     total += 4 + tx.body.len();

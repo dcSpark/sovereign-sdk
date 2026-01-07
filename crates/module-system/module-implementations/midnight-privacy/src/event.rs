@@ -17,15 +17,15 @@ pub struct ViewerBinding {
 }
 
 /// Events emitted by the MidnightPrivacy module.
-/// 
+///
 /// **IMPORTANT: Position and root values in per-tx events are PROVISIONAL.**
-/// 
+///
 /// Due to parallel execution, the actual tree positions and roots are only finalized
 /// at the end of the block in `end_block_flush`. Events emitted during transaction
 /// execution contain placeholder values:
 /// - `position`: Will be `None` (unknown until flush)
 /// - `new_root`: Will be `[0u8; 32]` placeholder
-/// 
+///
 /// For authoritative position/root data, indexers should:
 /// 1. Query `/modules/midnight-privacy/notes` endpoint after block finalization
 /// 2. Use `AnchorRootRecorded` events which are emitted during flush with real roots
@@ -34,7 +34,7 @@ pub struct ViewerBinding {
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     /// A note commitment was queued for addition to the tree.
-    /// 
+    ///
     /// **Note:** Position is provisional and will be assigned at end-of-block flush.
     /// The `new_root` is a placeholder `[0u8; 32]` - real roots come from `AnchorRootRecorded`.
     NoteCreated {
@@ -54,7 +54,7 @@ pub enum Event {
         new_method_id: [u8; 32],
     },
     /// Tokens were deposited into the pool and a note was queued for creation.
-    /// 
+    ///
     /// **Note:** Position is provisional. Final position assigned at end-of-block flush.
     PoolDeposit {
         /// Amount deposited
@@ -63,7 +63,7 @@ pub enum Event {
         commitment: Hash32,
     },
     /// Shielded → Shielded transfer (pure privacy).
-    /// 
+    ///
     /// **Note:** Output positions are provisional. Final positions assigned at flush.
     PoolTransfer {
         /// The nullifier that was spent
@@ -78,7 +78,7 @@ pub enum Event {
         viewer_bindings: Option<Vec<ViewerBinding>>,
     },
     /// Tokens were withdrawn from the pool after consuming a nullifier.
-    /// 
+    ///
     /// **Note:** Change output positions are provisional.
     PoolWithdraw {
         /// Amount withdrawn
@@ -95,7 +95,7 @@ pub enum Event {
         viewer_bindings: Option<Vec<ViewerBinding>>,
     },
     /// A Merkle root was recorded in the permanent historical index (NOMT-backed).
-    /// 
+    ///
     /// This event is emitted during `end_block_flush` and contains the **authoritative**
     /// root value. Use this for anchor tracking, not per-tx events.
     AnchorRootRecorded {

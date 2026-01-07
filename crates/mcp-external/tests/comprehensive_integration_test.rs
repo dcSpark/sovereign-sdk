@@ -72,7 +72,10 @@ async fn test_get_wallet_config() -> Result<()> {
 
     // Test chain data
     let chain_data = provider.get_chain_data().await?;
-    assert!(!chain_data.chain_name.is_empty(), "Chain name should not be empty");
+    assert!(
+        !chain_data.chain_name.is_empty(),
+        "Chain name should not be empty"
+    );
 
     tracing::info!("✅ getWalletConfig test passed");
     tracing::info!("  RPC URL: {}", rpc_url);
@@ -235,7 +238,10 @@ async fn test_verify_transaction() -> Result<()> {
     let fake_tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
     let verify_result_fake = verify_transaction(&provider, fake_tx_hash, Some(&vfk_hex)).await?;
 
-    assert!(!verify_result_fake.exists, "Fake transaction should not exist");
+    assert!(
+        !verify_result_fake.exists,
+        "Fake transaction should not exist"
+    );
     assert_eq!(
         verify_result_fake.transaction_amount, "0",
         "Non-existent transaction should have 0 amount"
@@ -281,7 +287,8 @@ async fn test_get_unified_balance() -> Result<()> {
 
     // Get initial balance (should be 0)
     let token_id = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
-    let initial_balance = get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
+    let initial_balance =
+        get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
 
     let initial_privacy_balance: u128 = initial_balance.privacy_balance.parse()?;
     tracing::info!("Initial privacy balance: {}", initial_privacy_balance);
@@ -296,7 +303,8 @@ async fn test_get_unified_balance() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // Get balance after deposit
-    let final_balance = get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
+    let final_balance =
+        get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
 
     let final_privacy_balance: u128 = final_balance.privacy_balance.parse()?;
     tracing::info!("Final privacy balance: {}", final_privacy_balance);
@@ -348,7 +356,8 @@ async fn test_restore_wallet_keys() -> Result<()> {
     let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
 
     // Test restoring wallet context
-    let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key_hex)?;
+    let wallet =
+        WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key_hex)?;
     let wallet_address = wallet.get_address().to_string();
 
     // Test restoring privacy key

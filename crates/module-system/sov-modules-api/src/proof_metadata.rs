@@ -3,6 +3,7 @@ use std::io;
 use borsh::BorshDeserialize;
 use sov_rollup_interface::common::SlotNumber;
 use sov_rollup_interface::optimistic::{SerializedAttestation, SerializedChallenge};
+use sov_rollup_interface::tee::SerializedTEEAttestation;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 
 use crate::transaction::TxDetails;
@@ -26,6 +27,8 @@ pub enum ProofType {
     ZkAggregatedProof(SerializedAggregatedProof),
     /// Optimistic workflow: attestation.
     OptimisticProofAttestation(SerializedAttestation),
+    /// TEE workflow: attestation.
+    TEEProofAttestation(SerializedTEEAttestation),
     /// Optimistic workflow: challenge.
     OptimisticProofChallenge(SerializedChallenge, SlotNumber),
 }

@@ -175,8 +175,8 @@ impl FromStr for PendingCommitmentKey {
         let height = parts[0]
             .parse::<u64>()
             .map_err(|e| format!("Failed to parse height: {}", e))?;
-        let commitment_bytes = hex::decode(parts[1])
-            .map_err(|e| format!("Failed to parse commitment: {}", e))?;
+        let commitment_bytes =
+            hex::decode(parts[1]).map_err(|e| format!("Failed to parse commitment: {}", e))?;
         if commitment_bytes.len() != 32 {
             return Err("Commitment must be 32 bytes".to_string());
         }
@@ -227,8 +227,8 @@ impl FromStr for PendingNullifierKey {
         let height = parts[0]
             .parse::<u64>()
             .map_err(|e| format!("Failed to parse height: {}", e))?;
-        let nullifier_bytes = hex::decode(parts[1])
-            .map_err(|e| format!("Failed to parse nullifier: {}", e))?;
+        let nullifier_bytes =
+            hex::decode(parts[1]).map_err(|e| format!("Failed to parse nullifier: {}", e))?;
         if nullifier_bytes.len() != 32 {
             return Err("Nullifier must be 32 bytes".to_string());
         }
@@ -356,7 +356,7 @@ pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
 
 /// Derive privacy recipient address from domain and public key.
 /// recipient = H("ADDR_V1" || domain || pk)
-/// 
+///
 /// This is the internal 32-byte "recipient" value used in note commitments.
 /// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
 #[inline]

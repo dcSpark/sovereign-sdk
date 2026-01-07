@@ -177,9 +177,7 @@ fn main() {
             eprintln!("  cargo run --bin e2e_runner_cli -- --authority-fvk \"<key>\"");
             eprintln!();
             eprintln!("Security notes:");
-            eprintln!(
-                "  • Store this key securely - it allows decryption of transaction data"
-            );
+            eprintln!("  • Store this key securely - it allows decryption of transaction data");
             eprintln!("  • Share only with authorized compliance/audit entities");
             eprintln!("  • The FVK commitment (hash) is public; the FVK itself is secret");
             eprintln!("─────────────────────────────────────────────────────────────");

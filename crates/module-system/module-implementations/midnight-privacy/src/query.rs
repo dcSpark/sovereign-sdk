@@ -140,7 +140,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ) -> ApiResult<NullifierResponse> {
         let nullifier_bytes = hex::decode(&nullifier_hex)
             .map_err(|e| errors::bad_request_400("Invalid hex string", e))?;
-        
+
         let nullifier: Hash32 = nullifier_bytes
             .try_into()
             .map_err(|_| errors::bad_request_400("Nullifier must be 32 bytes", "Invalid length"))?;
@@ -154,7 +154,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(NullifierResponse {
             nullifier,
             is_spent,
-        }.into())
+        }
+        .into())
     }
 
     /// Get the current Merkle tree state
@@ -178,7 +179,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             root: tree.root(),
             next_position,
             depth: tree.depth(),
-        }.into())
+        }
+        .into())
     }
 
     /// Get all notes in the tree (all commitments)
@@ -204,7 +206,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         let reverse = params.reverse.unwrap_or(false);
 
         let mut notes = Vec::new();
-        
+
         if reverse {
             // Most recent first: iterate backwards from (next_position - 1 - offset)
             if next_position > 0 {
@@ -214,7 +216,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                     0
                 };
                 let end = start.saturating_sub(limit);
-                
+
                 for pos in (end..start).rev() {
                     let commitment = tree.leaf(pos);
                     notes.push(NoteInfoResponse {
@@ -239,7 +241,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             notes,
             count: next_position,
             current_root: tree.root(),
-        }.into())
+        }
+        .into())
     }
 
     /// Get recent roots (anchor window)
@@ -262,7 +265,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(RootsResponse {
             recent_roots: recent_roots.into_iter().collect(),
             window_size,
-        }.into())
+        }
+        .into())
     }
 
     /// Get module statistics
@@ -315,7 +319,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .get(&mut accessor)
             .unwrap_infallible()
             .unwrap_or(0);
-        
+
         Ok(StatsResponse {
             total_notes: next_position,
             total_roots_recorded: root_seq,
@@ -325,7 +329,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             withdraw_count,
             pool_balance,
             nullifiers_spent,
-        }.into())
+        }
+        .into())
     }
 }
 
@@ -352,8 +357,7 @@ impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
 
     fn custom_openapi_spec(&self) -> Option<OpenApi> {
         let mut open_api: OpenApi =
-            serde_yaml::from_str(include_str!("../openapi-v3.yaml"))
-                .expect("Invalid OpenAPI spec");
+            serde_yaml::from_str(include_str!("../openapi-v3.yaml")).expect("Invalid OpenAPI spec");
         // Because https://github.com/juhaku/utoipa/issues/972
         for path_item in open_api.paths.paths.values_mut() {
             path_item.extensions = None;
