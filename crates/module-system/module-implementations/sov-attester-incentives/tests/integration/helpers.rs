@@ -265,7 +265,7 @@ pub(crate) fn build_challenge(
         prover_address,
         withdraw_root: [0u8; 32],
         message_queue_hash: <MockDaSpec as DaSpec>::SlotHash::try_from([0u8; 32]).unwrap(),
-        last_processed_queue_index: U256::ZERO,
+        last_processed_queue_index: 0.into(),
     };
 
     Ok(challenge)

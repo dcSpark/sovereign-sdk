@@ -10,6 +10,7 @@ pub struct BatchPublicDataV1 {
 
     pub da_start_height: u64,
     pub da_end_height: u64,
+    pub da_commitment: [u8; 32],
 
     pub prev_state_root: [u8; 64],
     pub post_state_root: [u8; 64],
@@ -32,6 +33,7 @@ impl Default for BatchPublicDataV1 {
             batch_index: 0,
             da_start_height: 0,
             da_end_height: 0,
+            da_commitment: [0u8; 32],
             prev_state_root: [0u8; 64],
             post_state_root: [0u8; 64],
             prev_batch_hash: [0u8; 32],

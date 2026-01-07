@@ -11,12 +11,10 @@ use borsh::BorshSerialize;
 pub use parallel::ParallelProverService;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use sov_modules_api::{Address, AggregatedProofPublicData};
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 use sov_rollup_interface::zk::{ZkVerifier, Zkvm, ZkvmHost};
-use sov_state::StateRoot;
 use strum::{Display, EnumString};
 use thiserror::Error;
 

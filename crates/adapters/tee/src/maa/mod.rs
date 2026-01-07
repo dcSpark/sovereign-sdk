@@ -145,6 +145,7 @@ mod tests {
             batch_index: 1,
             da_start_height: 100,
             da_end_height: 200,
+            da_commitment: [1u8; 32],
             prev_state_root: [0u8; 64],
             post_state_root: [0u8; 64],
             prev_batch_hash: [0u8; 32],

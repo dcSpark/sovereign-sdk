@@ -1,9 +1,7 @@
-use core::panic;
 use std::collections::HashMap;
 use std::num::NonZero;
 
 use backon::{BackoffBuilder, ExponentialBuilder};
-use sov_modules_api::prelude::serde_yaml::with;
 use sov_rollup_interface::da::BlockHeaderTrait;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
@@ -17,6 +15,7 @@ use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
+use crate::processes::tee_manager::types::merkle_root_from_leaves;
 use crate::processes::{ProverService, PublicDataTee, Receiver};
 
 mod types;
@@ -210,13 +209,12 @@ where
             let slot_number = stf_info.slot_number.get();
             let da_height = stf_info.da_block_header().height();
 
-            // Store DA height in cache before moving stf_info
-            self.da_height_cache.insert(slot_number, da_height);
-
             println!(
                 "Adding block at slot number {} to proofs_to_create",
                 slot_number
             );
+
+            println!("{}", block_hash);
 
             // Save the transition for later proving. This is temporarily redundant
             // since we always just try to prove blocks right away (because we don't have fee
@@ -227,6 +225,7 @@ where
                 // TODO(@preston-evans98): estimate public data size. This requires a new API on the `prover_service`.
                 // <https://github.com/Sovereign-Labs/sovereign-sdk-wip/issues/440>
                 public_data_size: 0,
+                da_height,
             });
         }
 
@@ -247,11 +246,21 @@ where
             let infos = &metadata.block_proof_info;
 
             // Get DA heights from cache (min/max keys give us start/end heights)
-            let da_start_height = self.da_height_cache.values().min().copied().unwrap_or(0);
-            let da_end_height = self.da_height_cache.values().max().copied().unwrap_or(0);
+            let da_start_height = infos.iter().map(|b| b.da_height).min().unwrap();
+            let da_end_height = infos.iter().map(|b| b.da_height).max().unwrap();
 
-            // Clear the cache for the next batch
-            self.da_height_cache.clear();
+            let da_leaves: Vec<[u8; 32]> = infos
+                .iter()
+                .map(|b| {
+                    borsh::to_vec(&b.hash)
+                        .expect("Serialization should succeed")
+                        .try_into()
+                        .expect("Serialization should produce 32 bytes")
+                })
+                .collect();
+
+            let da_commitment_root = merkle_root_from_leaves(da_leaves);
+            println!("DA commitment root: {:?}", da_commitment_root);
 
             println!(
                 "Creating aggregated proof for blocks covering DA heights {} to {}",
@@ -286,6 +295,7 @@ where
                 batch_index: self.batch_index,
                 da_start_height,
                 da_end_height,
+                da_commitment: da_commitment_root,
                 prev_state_root,
                 post_state_root,
                 prev_batch_hash: self.prev_batch_hash,

@@ -14196,6 +14196,7 @@ dependencies = [
  "hex",
  "insta",
  "jsonrpsee",
+ "nmt-rs",
  "num_cpus",
  "proptest",
  "rand 0.8.5",

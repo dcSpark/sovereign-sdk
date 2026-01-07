@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use sov_modules_api::AggregatedProofPublicData;
+use nmt_rs::{TmSha2Hasher, simple_merkle::{db::MemDb, tree::MerkleTree}};
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -10,6 +10,17 @@ use crate::processes::{
     ProofAggregationStatus, ProofProcessingStatus, ProverService, PublicDataTee,
     StateTransitionInfo,
 };
+
+/// Computes the Merkle root from a list of leaves.
+pub fn merkle_root_from_leaves(leaves: Vec<[u8; 32]>) -> [u8; 32] {
+    let mut tree: MerkleTree<MemDb<[u8; 32]>, TmSha2Hasher> = MerkleTree::new();
+
+    for leaf in leaves {
+        tree.push_raw_leaf(&leaf);
+    }
+
+    tree.root()
+}
 
 /// A [`VecDeque`] which is guaranteed to contain at least one item at all
 /// times.
@@ -164,6 +175,9 @@ pub(crate) struct BlockProofInfo<Ps: ProverService> {
 
     /// The size of any public data needed to verify a proof of this block, in bytes
     pub public_data_size: u64,
+
+    /// DA Height of this block
+    pub da_height: u64,
 }
 
 // The type alias bound is required here because we access associated types... but rustc still complains 🤷‍♂️
