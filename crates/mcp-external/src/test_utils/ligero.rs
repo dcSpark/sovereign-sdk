@@ -6,14 +6,6 @@ use std::path::PathBuf;
 use crate::ligero::Ligero;
 use ligero_runner::LigeroRunner;
 
-fn env_path(var: &str, default_rel: &str) -> PathBuf {
-    if let Ok(val) = env::var(var) {
-        PathBuf::from(val)
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default_rel)
-    }
-}
-
 fn env_opt(var: &str) -> Option<PathBuf> {
     env::var(var).ok().map(PathBuf::from)
 }
@@ -23,13 +15,6 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 pub fn create_test_ligero() -> Option<Ligero> {
     // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
     let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
-    let program_path = match ligero_runner::resolve_program(&program) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("⚠️  Skipping Ligero tests: failed to resolve program '{program}': {e}");
-            return None;
-        }
-    };
 
     // Create the runner using the program *specifier* (name or path). `ligero-runner` resolves internally.
     let runner = LigeroRunner::new(&program);
@@ -50,5 +35,5 @@ pub fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }

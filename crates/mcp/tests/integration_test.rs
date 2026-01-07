@@ -24,6 +24,8 @@ type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddres
 type McpRuntime = Runtime<McpSpec>;
 use ligero_runner::LigeroRunner;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 fn env_opt(var: &str) -> Option<std::path::PathBuf> {
     std::env::var(var).ok().map(std::path::PathBuf::from)
 }
@@ -125,7 +127,10 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         PrivacyKey::from_hex(&privpool_spend_key)
     }
     .expect("Failed to parse PRIVPOOL_SPEND_KEY");
-    tracing::info!("Using privacy address: {}", privacy_key.privacy_address());
+    tracing::info!(
+        "Using privacy address: {}",
+        privacy_key.privacy_address(&DOMAIN)
+    );
 
     // Step 1: Create wallet from private key
     tracing::info!("Step 1: Creating wallet from private key");
@@ -204,16 +209,30 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount;
     let send_amount = deposit_amount; // Transfer the full amount (no change)
+    let spend_sk = match privacy_key.spend_sk() {
+        Some(sk) => *sk,
+        None => {
+            eprintln!("⚠️  Skipping integration test: PRIVPOOL_SPEND_KEY must be a spend_sk (not just a privpool1... address) to run transfers");
+            return Ok(());
+        }
+    };
+    let pk_ivk_owner = *privacy_key.pk();
+    let destination_pk_spend = *privacy_key.pk();
+    let destination_pk_ivk = destination_pk_spend; // MCP default
+    let input_sender_id = deposit_result.recipient; // deposit convention: sender_id = recipient
+
     let transfer_result = transfer(
         &ligero,
         &provider,
         &wallet,
+        spend_sk,
+        pk_ivk_owner,
         note_value,
         send_amount,
         deposit_result.rho,
-        deposit_result.recipient,
-        deposit_result.recipient, // Send to same recipient
-        None, // No change since sending full amount
+        input_sender_id,
+        destination_pk_spend,
+        destination_pk_ivk,
     )
     .await?;
 

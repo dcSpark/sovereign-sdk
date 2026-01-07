@@ -16,12 +16,14 @@ pub mod verify_transaction;
 pub mod wallet_status;
 
 pub use deposit::deposit;
+#[allow(unused_imports)]
 pub use decrypt_transaction::decrypt_transaction;
 pub use get_default_address::get_default_address;
 pub use get_default_token_balance::get_default_token_balance;
 pub use get_transaction_status::get_transaction_status;
 pub use get_transactions::get_transactions;
 pub use get_unified_balance::get_unified_balance;
+#[allow(unused_imports)]
 pub use get_wallet_config::get_wallet_config;
 pub use transfer::transfer;
 pub use verify_transaction::verify_transaction;

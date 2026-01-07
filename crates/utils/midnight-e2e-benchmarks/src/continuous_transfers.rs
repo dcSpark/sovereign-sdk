@@ -15,9 +15,12 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
-    CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
+    SpendPublic,
 };
+use ligetron::bn254fr_native::submod_checked;
+use ligetron::Bn254Fr;
 use rand::Rng;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
@@ -174,6 +177,7 @@ struct WalletState {
     value: u128,
     rho: Hash32,
     spend_sk: Hash32,
+    sender_id: Hash32,
 }
 
 fn rollup_crate_dir() -> Result<PathBuf> {
@@ -681,6 +685,7 @@ pub async fn run() -> Result<()> {
             value: 0,
             rho: [0u8; 32],
             spend_sk: [0u8; 32],
+            sender_id: [0u8; 32],
         });
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
@@ -1005,7 +1010,8 @@ async fn perform_initial_deposits(
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
         let spend_sk: Hash32 = rand::random();
-        let recipient: Hash32 = recipient_from_sk(&DOMAIN, &spend_sk);
+        let pk_spend = pk_from_sk(&spend_sk);
+        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_spend);
 
         let call =
             RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
@@ -1057,6 +1063,9 @@ async fn perform_initial_deposits(
         wallet.value = amount;
         wallet.rho = rho;
         wallet.spend_sk = spend_sk;
+        // Deposit convention: sender_id == recipient.
+        let pk_spend = pk_from_sk(&wallet.spend_sk);
+        wallet.sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
 
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
@@ -1085,8 +1094,13 @@ async fn perform_initial_deposits(
 
     let mut expected_commitments: Vec<[u8; 32]> = Vec::with_capacity(wallets.len());
     for wallet in wallets.iter() {
-        let recipient = recipient_from_sk(&DOMAIN, &wallet.spend_sk);
-        let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &recipient);
+        let value_u64: u64 = wallet
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_spend = pk_from_sk(&wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
+        let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
         expected_commitments.push(cm);
     }
 
@@ -1350,6 +1364,7 @@ async fn perform_transfer_cycle(
         value: u128,
         rho: Hash32,
         spend_sk: Hash32,
+        sender_id: Hash32,
         position: u64,
     }
 
@@ -1358,8 +1373,13 @@ async fn perform_transfer_cycle(
         if wallet.value == 0 {
             continue;
         }
-        let recipient = recipient_from_sk(&DOMAIN, &wallet.spend_sk);
-        let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &recipient);
+        let value_u64: u64 = wallet
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_spend = pk_from_sk(&wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
+        let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
         let mut position = pos_by_cm.get(&cm).copied();
 
         if position.is_none() {
@@ -1380,6 +1400,7 @@ async fn perform_transfer_cycle(
                 value: wallet.value,
                 rho: wallet.rho,
                 spend_sk: wallet.spend_sk,
+                sender_id: wallet.sender_id,
                 position,
             });
         } else {
@@ -1433,6 +1454,7 @@ async fn perform_transfer_cycle(
         let value = input.value;
         let in_rho = input.rho;
         let in_spend_sk = input.spend_sk;
+        let in_sender_id = input.sender_id;
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = anchor_root;
@@ -1443,26 +1465,37 @@ async fn perform_transfer_cycle(
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
-                // Input note recipient is derived from spend_sk by the circuit.
-                let in_recipient = recipient_from_sk(&DOMAIN, &in_spend_sk);
+                let value_u64: u64 = value
+                    .try_into()
+                    .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
+                if value_u64 > i64::MAX as u64 {
+                    bail!("note value does not fit into i64 (required by note_spend_guest v2 ABI)");
+                }
+
+                // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
+                // For these benchmarks we use the backward-compatible convention `pk_ivk == pk_spend`.
+                let pk_spend_owner = pk_from_sk(&in_spend_sk);
+                let pk_ivk_owner = pk_spend_owner;
+                let in_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
+                let sender_id_out = in_recipient;
 
                 // New output note (same value, fresh rho + fresh address (pk/spend_sk))
                 let out_rho: Hash32 = rand::thread_rng().gen();
                 let out_spend_sk: Hash32 = rand::thread_rng().gen();
-                let out_pk = pk_from_sk(&out_spend_sk);
-                let out_recipient = recipient_from_pk(&DOMAIN, &out_pk);
-                let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
+                let out_pk_spend = pk_from_sk(&out_spend_sk);
+                let out_pk_ivk = out_pk_spend;
+                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+                let cm_out = note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id_out);
 
                 // Nullifier is derived from spend_sk (nf_key is derived inside the circuit).
                 let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
                 let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
 
                 // Build viewer attestation if authority FVK is set
-                // sender_id = in_recipient (the spender's address)
                 let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &in_recipient, &cm_out,
-                    );
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id_out, &cm_out,
+                    )?;
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
                     (None, None)
@@ -1477,25 +1510,33 @@ async fn perform_transfer_cycle(
                 };
 
                 let n_out: usize = 1;
-                // NOTE: Keep i64 args (like `value`) public for verifier compatibility.
-                let mut private_indices = vec![3, 4, 5];
-                // position bits [7..7+depth)
+                // LigeroConfig private indices are 1-based (by argument position).
+                // v2 ABI (no viewers): 1+6 + 1*(4 + 2*depth) + 3 + 5*n_out + 1(inv_enforce)
+                let mut private_indices: Vec<usize> = Vec::new();
+                private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
+                private_indices.extend_from_slice(&[7, 8, 9]); // value_in, rho_in, sender_id_in
+                // pos_bits [10..10+depth)
                 for j in 0..depth_usize {
-                    private_indices.push(7 + j);
+                    private_indices.push(10 + j);
                 }
-                // siblings [7+depth..7+2*depth)
+                // siblings [10+depth..10+2*depth)
                 for j in 0..depth_usize {
-                    private_indices.push(7 + depth_usize + j);
+                    private_indices.push(10 + depth_usize + j);
                 }
-                // output args start at [11 + 2*depth]
-                let out_base = 11 + 2 * depth_usize;
-                private_indices.extend_from_slice(&[out_base + 1, out_base + 2]);
-
+                // output 0 private args:
+                // value_out, rho_out, pk_spend_out, pk_ivk_out
+                let out_base = 14 + 2 * depth_usize;
+                private_indices.extend_from_slice(&[
+                    out_base,         // value_out
+                    out_base + 1,     // rho_out
+                    out_base + 2,     // pk_spend_out
+                    out_base + 3,     // pk_ivk_out
+                ]);
+                // inv_enforce (private)
+                private_indices.push(19 + 2 * depth_usize);
                 // Viewer section: fvk is private
                 if viewer_data.is_some() {
-                    let base_after_outs = 11 + 2 * depth_usize + 4 * n_out;
-                    let fvk_arg_index = base_after_outs + 2;
-                    private_indices.push(fvk_arg_index);
+                    private_indices.push(22 + 2 * depth_usize);
                 }
 
                 let mut host =
@@ -1503,14 +1544,18 @@ async fn perform_transfer_cycle(
                         .with_private_indices(private_indices);
 
                 // Typed binary ABI for zkVM performance (matches note_spend_guest argument layout)
-                host.add_hex_arg(hex::encode(DOMAIN)); // 1: domain
-                host.add_u64_arg(value as u64); // 2: value
-                host.add_hex_arg(hex::encode(in_rho)); // 3: rho
-                host.add_hex_arg(hex::encode(in_recipient)); // 4: recipient (private, layout only)
-                host.add_hex_arg(hex::encode(in_spend_sk)); // 5: spend_sk
-                host.add_u64_arg(TREE_DEPTH as u64); // 6: depth
+                host.add_hex_arg(hex::encode(DOMAIN)); // 1: domain (PUBLIC)
+                host.add_hex_arg(hex::encode(in_spend_sk)); // 2: spend_sk (PRIVATE)
+                host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3: pk_ivk_owner (PRIVATE)
+                host.add_u64_arg(TREE_DEPTH as u64); // 4: depth (PUBLIC)
+                host.add_hex_arg(hex::encode(anchor)); // 5: anchor (PUBLIC)
+                host.add_u64_arg(1); // 6: n_in (PUBLIC)
 
-                // 7..7+depth: position bits (field elements 0/1 as 32-byte BE)
+                host.add_u64_arg(value_u64); // 7: value_in (PRIVATE)
+                host.add_hex_arg(hex::encode(in_rho)); // 8: rho_in (PRIVATE)
+                host.add_hex_arg(hex::encode(in_sender_id)); // 9: sender_id_in (PRIVATE)
+
+                // 10..10+depth: position bits (field elements 0/1 as 32-byte BE)
                 for lvl in 0..depth_usize {
                     let bit = ((position >> lvl) & 1) as u8;
                     let mut bit_bytes = [0u8; 32];
@@ -1518,23 +1563,39 @@ async fn perform_transfer_cycle(
                     host.add_hex_arg(hex::encode(bit_bytes));
                 }
 
-                // 7+depth..7+2*depth: siblings
+                // 10+depth..10+2*depth: siblings
                 for s in &siblings {
                     host.add_hex_arg(hex::encode(s));
                 }
 
-                // anchor + nullifier are passed as public field elements (string args)
-                host.add_str_arg(format!("0x{}", hex::encode(anchor)));
-                host.add_str_arg(format!("0x{}", hex::encode(nf)));
-
-                host.add_u64_arg(0); // withdraw_amount
-                host.add_u64_arg(n_out as u64); // n_out
+                host.add_hex_arg(hex::encode(nf)); // nullifier (PUBLIC)
+                host.add_u64_arg(0); // withdraw_amount (PUBLIC)
+                host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
+                host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
 
                 // output 0 (private except commitment)
-                host.add_u64_arg(value as u64);
+                host.add_u64_arg(value_u64);
                 host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_pk));
+                host.add_hex_arg(hex::encode(out_pk_spend));
+                host.add_hex_arg(hex::encode(out_pk_ivk));
                 host.add_hex_arg(hex::encode(cm_out));
+                // inv_enforce (PRIVATE)
+                let inv_enforce = {
+                    let mut enforce_prod = Bn254Fr::from_u32(1);
+                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
+                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
+                    let mut delta = Bn254Fr::new();
+                    let mut out_fr = Bn254Fr::new();
+                    out_fr.set_bytes_big(&out_rho);
+                    let mut in_fr = Bn254Fr::new();
+                    in_fr.set_bytes_big(&in_rho);
+                    submod_checked(&mut delta, &out_fr, &in_fr);
+                    enforce_prod.mulmod_checked(&delta);
+                    let mut inv = enforce_prod.clone();
+                    inv.inverse();
+                    inv.to_bytes_be()
+                };
+                host.add_hex_arg(hex::encode(inv_enforce));
 
                 // Viewer section (Level-B)
                 if let Some((fvk, att)) = viewer_data {
@@ -1655,6 +1716,7 @@ async fn perform_transfer_cycle(
         new_nonce: u64,
         new_rho: Hash32,
         new_spend_sk: Hash32,
+        new_sender_id: Hash32,
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
@@ -1669,18 +1731,28 @@ async fn perform_transfer_cycle(
             let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
             let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
 
-            let out_pk = pk_from_sk(&out_spend_sk);
-            let out_recipient = recipient_from_pk(&DOMAIN, &out_pk);
-            let sender_id = recipient_from_sk(&DOMAIN, &wallet.spend_sk);
+            let value_u64: u64 = value
+                .try_into()
+                .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
+            let out_pk_spend = pk_from_sk(&out_spend_sk);
+            let out_pk_ivk = out_pk_spend;
+            let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+            let pk_spend_owner = pk_from_sk(&wallet.spend_sk);
+            let pk_ivk_owner = pk_spend_owner;
+            let sender_id = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
 
             // Build encrypted note for authority if configured
-            let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
-                let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
-                let (_att, enc) = make_viewer_bundle(
-                    &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id, &cm_out,
-                );
-                vec![enc]
-            });
+            let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+                Some(fvk) => {
+                    let cm_out =
+                        note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id);
+                    let (_att, enc) = make_viewer_bundle(
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id, &cm_out,
+                    )?;
+                    Some(vec![enc])
+                }
+                None => None,
+            };
 
             let call =
                 RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
@@ -1728,6 +1800,7 @@ async fn perform_transfer_cycle(
                 new_nonce: wallet.nonce + 1,
                 new_rho: out_rho,
                 new_spend_sk: out_spend_sk,
+                new_sender_id: sender_id,
             })
         }));
     }
@@ -1745,6 +1818,7 @@ async fn perform_transfer_cycle(
         w.nonce = b.new_nonce;
         w.rho = b.new_rho;
         w.spend_sk = b.new_spend_sk;
+        w.sender_id = b.new_sender_id;
     }
     let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -2178,8 +2252,13 @@ async fn perform_transfer_cycle(
     for input in &inputs {
         // The wallet state has already been updated with the new note secrets.
         let w = &wallets[input.wallet_idx];
-        let recipient = recipient_from_sk(&DOMAIN, &w.spend_sk);
-        let expected_cm = note_commitment(&DOMAIN, w.value, &w.rho, &recipient);
+        let value_u64: u64 = w
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_spend = pk_from_sk(&w.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_spend);
+        let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
         expected_commitments.push((expected_cm, input.wallet_idx));
     }
     

@@ -5,6 +5,8 @@
 
 use mcp_external::privacy_key::PrivacyKey;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 #[test]
 fn test_privacy_address_format() {
     // Create a test privacy key
@@ -12,7 +14,7 @@ fn test_privacy_address_format() {
     let privacy_key = PrivacyKey::from_hex(test_spend_sk).expect("Failed to create privacy key");
 
     // Get the privacy address
-    let privacy_address = privacy_key.privacy_address();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN);
     let addr_str = privacy_address.to_string();
 
     // Verify format
@@ -41,8 +43,8 @@ fn test_privacy_address_consistency() {
     let key1 = PrivacyKey::from_hex(test_spend_sk).unwrap();
     let key2 = PrivacyKey::from_hex(test_spend_sk).unwrap();
 
-    let addr1 = key1.privacy_address().to_string();
-    let addr2 = key2.privacy_address().to_string();
+    let addr1 = key1.privacy_address(&DOMAIN).to_string();
+    let addr2 = key2.privacy_address(&DOMAIN).to_string();
 
     assert_eq!(
         addr1, addr2,
@@ -64,8 +66,8 @@ fn test_different_keys_different_addresses() {
         PrivacyKey::from_hex("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .unwrap();
 
-    let addr1 = key1.privacy_address().to_string();
-    let addr2 = key2.privacy_address().to_string();
+    let addr1 = key1.privacy_address(&DOMAIN).to_string();
+    let addr2 = key2.privacy_address(&DOMAIN).to_string();
 
     assert_ne!(
         addr1, addr2,

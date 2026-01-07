@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::ligero::Ligero;
 use ligero_runner::LigeroRunner;
 
+#[allow(dead_code)]
 fn env_path(var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = env::var(var) {
         PathBuf::from(val)

@@ -33,6 +33,8 @@ pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEv
 pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct SendFundsRequest {
     pub destination_address: String,
@@ -536,7 +538,7 @@ impl CryptoServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let privacy_key_guard = self.privacy_key.read().await;
-        let privacy_address = privacy_key_guard.privacy_address().to_string();
+        let privacy_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
 
         let result = GetWalletAddressResult {
             address,
@@ -732,7 +734,7 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let recipient = privacy_key_guard.privacy_address().to_string();
+        let recipient = privacy_key_guard.privacy_address(&DOMAIN).to_string();
 
         // Compute vfk_commitment from the authority VFK
         let authority_vfk_guard = self.authority_vfk.read().await;
@@ -767,7 +769,7 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<TransferRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        use midnight_privacy::{PrivacyAddress, recipient_from_pk};
+        use midnight_privacy::PrivacyAddress;
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
@@ -870,9 +872,39 @@ impl CryptoServer {
         let mut input_rho = [0u8; 32];
         input_rho.copy_from_slice(&input_rho_bytes);
 
-        // Input recipient is the current wallet's privacy address
-        const DOMAIN: [u8; 32] = [1u8; 32];
+        // Input recipient is the current wallet's privacy address (derived from spend_sk).
         let input_recipient = privacy_key_guard.recipient(&DOMAIN);
+
+        // Input sender_id must match the NOTE_V2 commitment for this note.
+        // - Deposits: by convention sender_id = recipient (no sender_id in plaintext)
+        // - Transfers/withdraw outputs: sender_id is included in decrypted plaintext
+        let input_sender_id: [u8; 32] = if let Some(ref sender_id_hex) = note.sender_id {
+            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|_| {
+                ErrorData::internal_error(
+                    "Invalid sender_id in note (expected hex-encoded 32 bytes)".to_string(),
+                    None,
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(ErrorData::internal_error(
+                    "Invalid sender_id length in note (expected 32 bytes)".to_string(),
+                    None,
+                ));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        } else {
+            // Deposit-style note: sender_id is derived deterministically as recipient.
+            input_recipient
+        };
+
+        let spend_sk = privacy_key_guard
+            .spend_sk()
+            .ok_or_else(|| ErrorData::invalid_params("Privacy key must include spend_sk to transfer.", None))?;
+        let spend_sk = *spend_sk;
+        // v2 requires pk_ivk_owner as a private witness (derived from spend_sk + domain).
+        let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
 
         // Parse output recipient (destination bech32 privacy address)
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse()
@@ -881,9 +913,8 @@ impl CryptoServer {
                 None,
             ))?;
 
-        // Derive output recipient hash from the privacy address
-        let output_pk = output_privacy_addr.to_pk();
-        let output_recipient = recipient_from_pk(&DOMAIN, &output_pk);
+        let destination_pk_spend = output_privacy_addr.to_pk();
+        let destination_pk_ivk = output_privacy_addr.pk_ivk();
 
         tracing::info!(
             "[transfer] Spending note: tx_hash={}, note_value={}, send_amount={}, rho={}",
@@ -898,29 +929,24 @@ impl CryptoServer {
             has_change
         );
 
-        // If partial transfer, change goes back to our own privacy address
-        let change_recipient = if has_change {
-            Some(input_recipient)
-        } else {
-            None
-        };
-
         let transfer_result = crate::operations::transfer(
             ligero,
             provider,
             &*ctx,
+            spend_sk,
+            pk_ivk_owner,
             note_value,
             send_amount,
             input_rho,
-            input_recipient,
-            output_recipient,
-            change_recipient,
+            input_sender_id,
+            destination_pk_spend,
+            destination_pk_ivk,
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         // Get our own privacy address for change recipient display (reuse the guard from earlier)
-        let my_privacy_address = privacy_key_guard.privacy_address().to_string();
+        let my_privacy_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
 
         // Return the result with output and change details
         let result = TransferResult {
@@ -1052,7 +1078,7 @@ impl CryptoServer {
         let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
             .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
 
-        let privacy_address = new_privacy_key.privacy_address().to_string();
+        let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
         // Replace the existing keys with the new ones
         if let Some(ref wallet_ctx) = self.wallet_context {
@@ -1133,7 +1159,7 @@ impl CryptoServer {
         let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex)
             .map_err(|e| ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None))?;
 
-        let privacy_address = new_privacy_key.privacy_address().to_string();
+        let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
         // Replace the existing keys with the restored ones
         if let Some(ref wallet_ctx) = self.wallet_context {

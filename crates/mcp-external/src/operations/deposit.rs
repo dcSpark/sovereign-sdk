@@ -110,7 +110,7 @@ pub async fn deposit(
 
     let rho: [u8; 32] = rand::random();
     let recipient = privacy_key.recipient(&DOMAIN);
-    let privacy_address = privacy_key.privacy_address();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN);
 
     tracing::info!(
         "Depositing to privacy address: {} (recipient: {})",

@@ -23,11 +23,17 @@ Configure the following environment variables:
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
-- `LIGERO_PROGRAM_PATH` - Path to Ligero program WASM
-- `LIGERO_PROVER_BINARY_PATH` - Path to Ligero prover binary
-- `LIGERO_SHADER_PATH` - Path to shader directory
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
 - `AUTHORITY_VFK` - Optional authority viewing key for note decryption
+
+#### Ligero Configuration (Optional)
+
+Ligero binaries and programs are **automatically discovered** from the `ligero-runner` crate. 
+You can optionally override them:
+
+- `LIGERO_PROGRAM_PATH` - Circuit name (e.g. `note_spend_guest`) or full path to `.wasm` file
+- `LIGERO_PROVER_BIN` - Override path to `webgpu_prover` binary
+- `LIGERO_SHADER_PATH` - Override path to shader directory
 
 ### Start the Server
 
@@ -65,12 +71,15 @@ Integration tests (rollup/indexer/verifier + Ligero) are ignored by default. Run
 cargo test --all-targets -- --ignored
 ```
 
-Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be reported as "filtered out". To run everything, execute both commands above. The integration suite expects these env vars/files to exist (the defaults are relative to this repo):
+Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be reported as "filtered out". To run everything, execute both commands above. The integration suite expects these env vars/files to exist:
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
-- `LIGERO_PROGRAM_PATH`: optional override (either a circuit name like `note_spend_guest` or a full path to a `.wasm` program)
-- `LIGERO_PROVER_BINARY_PATH` (default: `../adapters/ligero/bins/macos-arm64/bin/webgpu_prover`)
-- `LIGERO_SHADER_PATH` (default: `../adapters/ligero/bins/shader`)
+
+Ligero binaries are auto-discovered from `ligero-runner`. Optional overrides:
+
+- `LIGERO_PROGRAM_PATH` - Circuit name (e.g. `note_spend_guest`) or path to `.wasm`
+- `LIGERO_PROVER_BIN` - Override `webgpu_prover` binary path
+- `LIGERO_SHADER_PATH` - Override shader directory path
 
 Set `RUST_LOG=debug` for verbose logging during development.

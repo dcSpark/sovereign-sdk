@@ -25,7 +25,13 @@ fn test_basic_fvk_workflow() {
     };
 
     // 3. Compute the commitment (this goes on-chain)
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
 
     // 4. Encrypt the note for the FVK holder
     let encrypted = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
@@ -73,7 +79,13 @@ fn test_multiple_notes_same_fvk() {
 
     // Encrypt all notes
     for note in &notes {
-        let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+        let cm = note_commitment(
+            &note.domain,
+            note.value as u64,
+            &note.rho,
+            &note.recipient,
+            &note.recipient,
+        );
         let enc = encrypt_note_for_fvk(&fvk, note, &cm).unwrap();
         encrypted_notes.push(enc);
     }
@@ -97,7 +109,13 @@ fn test_wrong_fvk_cannot_decrypt() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
     let encrypted = encrypt_note_for_fvk(&fvk1, &note, &cm).unwrap();
 
     // Correct FVK can decrypt
@@ -118,7 +136,13 @@ fn test_tampered_ciphertext_rejected() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
     let mut encrypted = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
 
     // Tamper with the ciphertext
@@ -142,7 +166,13 @@ fn test_mismatched_commitment_rejected() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
     let mut encrypted = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
 
     // Change the commitment (simulating a "trust me bro" attack)
@@ -164,7 +194,13 @@ fn test_serialization_roundtrip() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
     let encrypted = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
 
     // Serialize to JSON
@@ -191,7 +227,13 @@ fn test_borsh_serialization_roundtrip() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
     let encrypted = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
 
     // Serialize to Borsh
@@ -232,7 +274,13 @@ fn test_deterministic_nonce_derivation() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
 
     // Encrypt the same note multiple times
     let enc1 = encrypt_note_for_fvk(&fvk, &note, &cm).unwrap();
@@ -257,7 +305,13 @@ fn test_different_fvks_different_ciphertexts() {
         recipient: [3u8; 32],
     };
 
-    let cm = note_commitment(&note.domain, note.value, &note.rho, &note.recipient);
+    let cm = note_commitment(
+        &note.domain,
+        note.value as u64,
+        &note.rho,
+        &note.recipient,
+        &note.recipient,
+    );
 
     let enc1 = encrypt_note_for_fvk(&fvk1, &note, &cm).unwrap();
     let enc2 = encrypt_note_for_fvk(&fvk2, &note, &cm).unwrap();
@@ -299,8 +353,9 @@ fn test_non_truthful_ciphertext_rejected() {
     // The on-chain commitment is for the REAL note
     let real_cm = note_commitment(
         &real_note.domain,
-        real_note.value,
+        real_note.value as u64,
         &real_note.rho,
+        &real_note.recipient,
         &real_note.recipient,
     );
 

@@ -5,27 +5,12 @@ use std::{env, path::PathBuf};
 use ligero_runner::LigeroRunner;
 use mcp_external::ligero::{Ligero, LigeroProgramArguments};
 
-fn env_path(var: &str, default_rel: &str) -> PathBuf {
-    if let Ok(val) = env::var(var) {
-        PathBuf::from(val)
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default_rel)
-    }
-}
-
 fn env_opt(var: &str) -> Option<PathBuf> {
     env::var(var).ok().map(PathBuf::from)
 }
 
 fn create_test_ligero() -> Option<Ligero> {
     let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
-    let program_path = match ligero_runner::resolve_program(&program) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("⚠️  Skipping Ligero prover test: failed to resolve program '{program}': {e}");
-            return None;
-        }
-    };
 
     let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
@@ -45,7 +30,7 @@ fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program_path)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }
 
 #[tracing_test::traced_test]

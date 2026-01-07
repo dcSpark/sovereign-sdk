@@ -276,7 +276,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Compute commitment and queue for end-of-block processing
         let domain = self.domain.get_or_err(st)??;
-        let cm = note_commitment(&domain, amount, &rho, &recipient);
+        // For deposit-created notes, we set `sender_id = recipient` so the commitment is fully
+        // determined by the deposit parameters (no extra transparent sender binding).
+        let cm = note_commitment(&domain, amount_u64, &rho, &recipient, &recipient);
         self.add_commitment(cm, st)?;
 
         // Optional: emit viewer ciphertexts for the deposit note

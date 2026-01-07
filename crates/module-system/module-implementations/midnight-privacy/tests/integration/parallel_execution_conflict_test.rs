@@ -30,7 +30,7 @@ use sov_test_utils::{
 fn make_cm(domain: &Hash32, val: u128, rho_byte: u8, recipient_byte: u8) -> Hash32 {
     let rho = [rho_byte; 32];
     let rcpt = [recipient_byte; 32];
-    note_commitment(domain, val, &rho, &rcpt)
+    note_commitment(domain, val.try_into().unwrap(), &rho, &rcpt, &rcpt)
 }
 
 fn make_nf(domain: &Hash32, nfkey_byte: u8, rho_byte: u8) -> Hash32 {

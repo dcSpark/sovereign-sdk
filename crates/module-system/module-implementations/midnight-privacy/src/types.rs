@@ -15,37 +15,65 @@ pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 /// A privacy pool address (bech32m-encoded public key).
 /// 
 /// This is the user-facing format for privacy recipients. The inner value is
-/// a 32-byte public key (`pk_out`) which is used to derive the actual recipient:
-/// `recipient = H("ADDR_V1" || domain || pk_out)`
+/// a 32-byte public key (`pk_spend`) plus an incoming-view public key (`pk_ivk`) which are used
+/// to derive the actual recipient:
+/// `recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)`
+///
+/// Backward compatibility: legacy addresses may only encode `pk_spend` (32 bytes); in that case
+/// callers may use the convention `pk_ivk == pk_spend`.
 /// 
-/// Format: `privpool1<bech32m-encoded-32-bytes>`
+/// Format:
+/// - Legacy: `privpool1<bech32m-encoded-32-bytes>` (pk_spend only)
+/// - V2:     `privpool1<bech32m-encoded-64-bytes>` (pk_spend || pk_ivk)
 /// 
 /// # Example
 /// ```ignore
-/// let addr = PrivacyAddress::from_pk(&pk);
+/// let addr = PrivacyAddress::from_pk(&pk_spend); // legacy (pk_ivk == pk_spend)
 /// println!("Send to: {}", addr); // privpool1qypqxpq9qcrsszg2pvxq6rs...
 /// 
 /// // Parse from string
 /// let addr: PrivacyAddress = "privpool1qypqxpq9qcrsszg2pvxq6rs...".parse()?;
-/// let pk = addr.to_pk();
+/// let pk_spend = addr.to_pk();
+/// let pk_ivk = addr.pk_ivk();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct PrivacyAddress(pub [u8; 32]);
+pub struct PrivacyAddress {
+    pk_spend: [u8; 32],
+    pk_ivk: [u8; 32],
+}
 
 impl PrivacyAddress {
-    /// Create a PrivacyAddress from a 32-byte public key
+    /// Create a legacy PrivacyAddress from a 32-byte spending public key.
+    ///
+    /// This sets `pk_ivk == pk_spend` for backward compatibility.
     pub fn from_pk(pk: &Hash32) -> Self {
-        Self(*pk)
+        Self {
+            pk_spend: *pk,
+            pk_ivk: *pk,
+        }
     }
 
-    /// Get the underlying 32-byte public key
+    /// Create a v2 PrivacyAddress from both public keys.
+    pub fn from_keys(pk_spend: &Hash32, pk_ivk: &Hash32) -> Self {
+        Self {
+            pk_spend: *pk_spend,
+            pk_ivk: *pk_ivk,
+        }
+    }
+
+    /// Get the underlying 32-byte spending public key (pk_spend).
     pub fn to_pk(&self) -> Hash32 {
-        self.0
+        self.pk_spend
     }
 
-    /// Get reference to the underlying bytes
+    /// Get the incoming-view public key (pk_ivk).
+    pub fn pk_ivk(&self) -> Hash32 {
+        self.pk_ivk
+    }
+
+    /// Get reference to the underlying spending public key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.pk_spend
     }
 }
 
@@ -53,7 +81,16 @@ impl fmt::Display for PrivacyAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use bech32::{Bech32m, Hrp};
         let hrp = Hrp::parse(PRIVACY_ADDRESS_HRP).expect("valid HRP");
-        let encoded = bech32::encode::<Bech32m>(hrp, &self.0).expect("encoding succeeds");
+
+        // Emit legacy 32-byte encoding when pk_ivk == pk_spend to preserve backward compatibility.
+        let encoded = if self.pk_spend == self.pk_ivk {
+            bech32::encode::<Bech32m>(hrp, &self.pk_spend).expect("encoding succeeds")
+        } else {
+            let mut payload = [0u8; 64];
+            payload[..32].copy_from_slice(&self.pk_spend);
+            payload[32..].copy_from_slice(&self.pk_ivk);
+            bech32::encode::<Bech32m>(hrp, &payload).expect("encoding succeeds")
+        };
         write!(f, "{}", encoded)
     }
 }
@@ -80,16 +117,26 @@ impl FromStr for PrivacyAddress {
         let _: String = bech32::encode::<Bech32m>(hrp, &data)
             .map_err(|_| PrivacyAddressError::NotBech32m)?;
         
-        if data.len() != 32 {
+        if data.len() != 32 && data.len() != 64 {
             return Err(PrivacyAddressError::WrongLength {
-                expected: 32,
+                expected: "32 or 64",
                 got: data.len(),
             });
         }
-        
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(&data);
-        Ok(PrivacyAddress(pk))
+
+        let mut pk_spend = [0u8; 32];
+        pk_spend.copy_from_slice(&data[..32]);
+
+        let pk_ivk = if data.len() == 64 {
+            let mut pk_ivk = [0u8; 32];
+            pk_ivk.copy_from_slice(&data[32..64]);
+            pk_ivk
+        } else {
+            // Legacy encoding: only pk_spend is present.
+            pk_spend
+        };
+
+        Ok(PrivacyAddress { pk_spend, pk_ivk })
     }
 }
 
@@ -146,7 +193,7 @@ pub enum PrivacyAddressError {
     /// Wrong data length
     WrongLength {
         /// Expected byte length
-        expected: usize,
+        expected: &'static str,
         /// Actual byte length
         got: usize,
     },

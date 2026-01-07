@@ -9,6 +9,8 @@ use crate::wallet::WalletContext;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 /// Sync progress information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncProgress {
@@ -119,7 +121,7 @@ where
     tracing::info!("Getting wallet synchronization status");
 
     // Get privacy address from privacy key (as per CLAUDE.md instructions)
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     // Since we can't get real sync data, we mock these values
     // The wallet is considered always ready and synced in this implementation

@@ -256,7 +256,7 @@ pub struct PendingNullifierPrefix {
 }
 
 /// Domain-separated 32-byte Poseidon2 hash using Ligetron's implementation.
-/// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V1", "NF_V1").
+/// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V2", "PRF_NF_V1").
 /// This provides collision resistance between different hash use cases.
 /// 
 /// Uses Ligetron's native Poseidon2 to ensure consistency with the ZK circuit.
@@ -274,7 +274,8 @@ pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
 
 /// Domain tags as fixed-size arrays (avoids const evaluation issues)
 const MT_TAG: &[u8; 10] = b"MT_NODE_V1";
-const NOTE_TAG: &[u8; 7] = b"NOTE_V1";
+const NOTE_TAG: &[u8; 7] = b"NOTE_V2";
+const NOTE_V1_TAG: &[u8; 7] = b"NOTE_V1";
 const NF_TAG: &[u8; 9] = b"PRF_NF_V1";
 
 /// Combine two children into a parent node in the Merkle tree.
@@ -293,20 +294,46 @@ pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
 }
 
 /// Compute a note commitment.
-/// Commits to: domain tag, value, randomness, and recipient binding.
-/// Uses domain tag "NOTE_V1" for domain separation.
+/// Commits to: domain tag, value, rho, recipient binding, and `sender_id`.
+/// Uses domain tag "NOTE_V2" for domain separation.
 /// Optimized to avoid heap allocations by using a fixed-size buffer.
 #[inline]
-pub fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
-    let v = value.to_le_bytes();
-    // Fixed-size buffer: tag (7 bytes) + domain (32 bytes) + value (16 bytes) + rho (32 bytes) + recipient (32 bytes) = 119 bytes
-    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32];
+pub fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
+    // Fixed-size buffer:
+    // tag (7) + domain (32) + value_le_16 (16) + rho (32) + recipient (32) + sender_id (32) = 151 bytes
+    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32 + 32];
     buf[..7].copy_from_slice(NOTE_TAG);
+    buf[7..39].copy_from_slice(domain);
+    // Encode value as 16-byte LE, zero-extended from u64.
+    buf[39..47].copy_from_slice(&value.to_le_bytes());
+    // buf[47..55] are already zero-initialized.
+    buf[55..87].copy_from_slice(rho);
+    buf[87..119].copy_from_slice(recipient);
+    buf[119..151].copy_from_slice(sender_id);
+
+    ligetron_hash_bytes(&buf).to_bytes_be()
+}
+
+/// Compute a legacy note commitment (v1).
+///
+/// NOTE: This legacy format is kept for backward-compatible tooling and tests only.
+/// The current `note_spend_guest` circuit uses `NOTE_V2`.
+#[inline]
+pub fn note_commitment_v1(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+    let v = value.to_le_bytes();
+    // tag (7) + domain (32) + value_le_16 (16) + rho (32) + recipient (32) = 119 bytes
+    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32];
+    buf[..7].copy_from_slice(NOTE_V1_TAG);
     buf[7..39].copy_from_slice(domain);
     buf[39..55].copy_from_slice(&v);
     buf[55..87].copy_from_slice(rho);
     buf[87..].copy_from_slice(recipient);
-
     ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
@@ -336,8 +363,9 @@ pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
 // The circuit uses these to bind spending authorization to note ownership.
 
 const PK_TAG: &[u8; 5] = b"PK_V1";
-const ADDR_TAG: &[u8; 7] = b"ADDR_V1";
+const ADDR_TAG: &[u8; 7] = b"ADDR_V2";
 const NFKEY_TAG: &[u8; 8] = b"NFKEY_V1";
+const IVK_SEED_TAG: &[u8; 11] = b"IVK_SEED_V1";
 
 /// Derive public key from spending secret key.
 /// pk = H("PK_V1" || spend_sk)
@@ -349,26 +377,77 @@ pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
     ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
-/// Derive privacy recipient address from domain and public key.
-/// recipient = H("ADDR_V1" || domain || pk)
+/// Clamp a 32-byte seed into an X25519 scalar (RFC 7748).
+#[inline]
+fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    scalar
+}
+
+/// Derive incoming viewing key secret from domain and spending secret key.
+/// ivk_sk = H("IVK_SEED_V1" || domain || spend_sk)
+///
+/// The receiver uses this to decrypt notes sent to them.
+#[inline]
+pub fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 11 + 32 + 32];
+    buf[..11].copy_from_slice(IVK_SEED_TAG);
+    buf[11..43].copy_from_slice(domain);
+    buf[43..].copy_from_slice(spend_sk);
+    ligetron_hash_bytes(&buf).to_bytes_be()
+}
+
+/// Derive the incoming viewing public key (pk_ivk) from spend_sk and domain.
+/// pk_ivk = X25519_BASE(clamp(ivk_sk_from_sk(domain, spend_sk)))
+#[inline]
+pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
+    let clamped = clamp_x25519_scalar(ivk_sk);
+    let secret = StaticSecret::from(clamped);
+    let public = PublicKey::from(&secret);
+    *public.as_bytes()
+}
+
+/// Derive privacy recipient address from domain and public key material.
+/// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
 /// 
 /// This is the internal 32-byte "recipient" value used in note commitments.
 /// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
 #[inline]
-pub fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 7 + 32 + 32];
+pub fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32) -> Hash32 {
+    // Backward-compatible default: if callers only have one key, treat `pk_ivk == pk_spend`.
+    recipient_from_pk_v2(domain, pk_spend, pk_spend)
+}
+
+/// Derive recipient using both the spend pubkey and the incoming-view pubkey.
+#[inline]
+pub fn recipient_from_pk_v2(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 7 + 32 + 32 + 32];
     buf[..7].copy_from_slice(ADDR_TAG);
     buf[7..39].copy_from_slice(domain);
-    buf[39..].copy_from_slice(pk);
+    buf[39..71].copy_from_slice(pk_spend);
+    buf[71..103].copy_from_slice(pk_ivk);
     ligetron_hash_bytes(&buf).to_bytes_be()
 }
 
 /// Derive privacy recipient address from domain and spending secret key.
-/// This is a convenience function: recipient = H("ADDR_V1" || domain || pk_from_sk(spend_sk))
+/// This is a convenience function: recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk),
+/// with the backward-compatible default `pk_ivk == pk_spend`.
 #[inline]
 pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
     let pk = pk_from_sk(spend_sk);
     recipient_from_pk(domain, &pk)
+}
+
+/// Derive privacy recipient address from domain, spending secret key, and an explicit incoming-view pubkey.
+#[inline]
+pub fn recipient_from_sk_v2(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    let pk_spend = pk_from_sk(spend_sk);
+    recipient_from_pk_v2(domain, &pk_spend, pk_ivk)
 }
 
 /// Derive nullifier key from domain and spending secret key.
