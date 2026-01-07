@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     SpendPublic,
 };
@@ -705,8 +705,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let amount: u128 = 100;
         let rho: Hash32 = rand::random();
         let spend_sk: Hash32 = rand::random();
-        let pk_spend = pk_from_sk(&spend_sk);
-        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
+        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk);
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
             amount,
             rho,
@@ -1327,10 +1327,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 }
 
                 // note_spend_guest v2 derives the input recipient from (spend_sk, pk_ivk_owner).
-                // For these benchmarks we use the backward-compatible convention `pk_ivk == pk_spend`.
-                let pk_spend_owner = pk_from_sk(&spend_sk);
-                let pk_ivk_owner = pk_spend_owner;
-                let in_recipient = recipient_from_pk_v2(&domain, &pk_spend_owner, &pk_ivk_owner);
+                let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+                let in_recipient = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
                 let in_sender_id = in_recipient; // deposit convention: sender_id == recipient
                 let sender_id_out = in_recipient;
 
@@ -1340,7 +1338,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let mut out_spend_sk = [0u8; 32];
                 out_spend_sk[0] = (account_idx as u8).wrapping_add(101);
                 let out_pk_spend = pk_from_sk(&out_spend_sk);
-                let out_pk_ivk = out_pk_spend;
+                let out_pk_ivk = pk_ivk_from_sk(&domain, &out_spend_sk);
                 let out_recipient = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
                 let cm_out = note_commitment(
                     &domain,
@@ -1654,12 +1652,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let mut out_spend_sk = [0u8; 32];
         out_spend_sk[0] = (account_idx as u8).wrapping_add(101);
         let out_pk_spend = pk_from_sk(&out_spend_sk);
-        let out_pk_ivk = out_pk_spend;
+        let out_pk_ivk = pk_ivk_from_sk(&domain, &out_spend_sk);
         let out_recipient = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
 
-        let pk_spend_owner = pk_from_sk(&input.spend_sk);
-        let pk_ivk_owner = pk_spend_owner;
-        let sender_id = recipient_from_pk_v2(&domain, &pk_spend_owner, &pk_ivk_owner);
+        let pk_ivk_owner = pk_ivk_from_sk(&domain, &input.spend_sk);
+        let sender_id = recipient_from_sk_v2(&domain, &input.spend_sk, &pk_ivk_owner);
         let cm_out = note_commitment(&domain, out_value_u64, &out_rho, &out_recipient, &sender_id);
 
         // Build EncryptedNote for the authority, if configured
