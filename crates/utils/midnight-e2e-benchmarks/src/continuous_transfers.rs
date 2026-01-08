@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     SpendPublic,
 };
@@ -1010,8 +1010,8 @@ async fn perform_initial_deposits(
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
         let spend_sk: Hash32 = rand::random();
-        let pk_spend = pk_from_sk(&spend_sk);
-        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
+        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk);
 
         let call =
             RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
@@ -1064,8 +1064,8 @@ async fn perform_initial_deposits(
         wallet.rho = rho;
         wallet.spend_sk = spend_sk;
         // Deposit convention: sender_id == recipient.
-        let pk_spend = pk_from_sk(&wallet.spend_sk);
-        wallet.sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        wallet.sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
 
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
@@ -1098,8 +1098,8 @@ async fn perform_initial_deposits(
             .value
             .try_into()
             .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
-        let pk_spend = pk_from_sk(&wallet.spend_sk);
-        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
         let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
         expected_commitments.push(cm);
     }
@@ -1377,8 +1377,8 @@ async fn perform_transfer_cycle(
             .value
             .try_into()
             .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
-        let pk_spend = pk_from_sk(&wallet.spend_sk);
-        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
         let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
         let mut position = pos_by_cm.get(&cm).copied();
 
@@ -1473,17 +1473,15 @@ async fn perform_transfer_cycle(
                 }
 
                 // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
-                // For these benchmarks we use the backward-compatible convention `pk_ivk == pk_spend`.
-                let pk_spend_owner = pk_from_sk(&in_spend_sk);
-                let pk_ivk_owner = pk_spend_owner;
-                let in_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &in_spend_sk);
+                let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
                 let sender_id_out = in_recipient;
 
                 // New output note (same value, fresh rho + fresh address (pk/spend_sk))
                 let out_rho: Hash32 = rand::thread_rng().gen();
                 let out_spend_sk: Hash32 = rand::thread_rng().gen();
                 let out_pk_spend = pk_from_sk(&out_spend_sk);
-                let out_pk_ivk = out_pk_spend;
+                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
                 let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
                 let cm_out = note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id_out);
 
@@ -1735,11 +1733,10 @@ async fn perform_transfer_cycle(
                 .try_into()
                 .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
             let out_pk_spend = pk_from_sk(&out_spend_sk);
-            let out_pk_ivk = out_pk_spend;
+            let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
             let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
-            let pk_spend_owner = pk_from_sk(&wallet.spend_sk);
-            let pk_ivk_owner = pk_spend_owner;
-            let sender_id = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
+            let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+            let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
             // Build encrypted note for authority if configured
             let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
@@ -2256,8 +2253,8 @@ async fn perform_transfer_cycle(
             .value
             .try_into()
             .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
-        let pk_spend = pk_from_sk(&w.spend_sk);
-        let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_spend);
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &w.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_ivk);
         let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
         expected_commitments.push((expected_cm, input.wallet_idx));
     }

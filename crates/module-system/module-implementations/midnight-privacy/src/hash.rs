@@ -477,3 +477,5 @@ pub fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -
     }
     cur
 }
+
+// (tests live in `tests/ivk_crypto_tests.rs`)

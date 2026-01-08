@@ -455,6 +455,254 @@ fn setup_ligero_env() -> Result<String> {
     Ok(config.program)
 }
 
+#[test]
+fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        Key, XChaCha20Poly1305, XNonce,
+    };
+    use hkdf::Hkdf;
+    use midnight_privacy::{ivk_sk_from_sk, pk_ivk_from_sk, IvkEncryptedNote, PrivacyAddress};
+    use sha2::Sha256;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
+        scalar[0] &= 248;
+        scalar[31] &= 127;
+        scalar[31] |= 64;
+        scalar
+    }
+
+    fn ivk_aead_key_nonce(domain: &Hash32, dh: &[u8; 32], cm: &Hash32) -> (Key, XNonce) {
+        const INFO_TAG: &[u8] = b"MP_IVK_AEAD_V1";
+        let hk = Hkdf::<Sha256>::new(Some(domain), dh);
+        let mut okm = [0u8; 56]; // 32 bytes key + 24 bytes nonce
+
+        let mut info = [0u8; 14 + 32];
+        info[..14].copy_from_slice(INFO_TAG);
+        info[14..].copy_from_slice(cm);
+        hk.expand(&info, &mut okm).expect("HKDF expand");
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&okm[..32]);
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&okm[32..]);
+        (Key::from(key), XNonce::from(nonce))
+    }
+
+    fn encode_note_plain(
+        domain: &Hash32,
+        value: u64,
+        rho: &Hash32,
+        recipient: &Hash32,
+        sender_id: &Hash32,
+    ) -> [u8; 144] {
+        let mut out = [0u8; 144];
+        out[0..32].copy_from_slice(domain);
+        out[32..40].copy_from_slice(&value.to_le_bytes());
+        out[40..48].copy_from_slice(&[0u8; 8]);
+        out[48..80].copy_from_slice(rho);
+        out[80..112].copy_from_slice(recipient);
+        out[112..144].copy_from_slice(sender_id);
+        out
+    }
+
+    fn parse_note_plain(pt: &[u8]) -> Result<(Hash32, u64, Hash32, Hash32, Hash32)> {
+        anyhow::ensure!(pt.len() == 144, "unexpected plaintext length: {}", pt.len());
+
+        let mut domain = [0u8; 32];
+        domain.copy_from_slice(&pt[0..32]);
+
+        let mut v_le = [0u8; 8];
+        v_le.copy_from_slice(&pt[32..40]);
+        let value = u64::from_le_bytes(v_le);
+
+        anyhow::ensure!(&pt[40..48] == &[0u8; 8], "value high bytes must be zero");
+
+        let mut rho = [0u8; 32];
+        rho.copy_from_slice(&pt[48..80]);
+
+        let mut recipient = [0u8; 32];
+        recipient.copy_from_slice(&pt[80..112]);
+
+        let mut sender_id = [0u8; 32];
+        sender_id.copy_from_slice(&pt[112..144]);
+
+        Ok((domain, value, rho, recipient, sender_id))
+    }
+
+    println!("\n=== IVK Roundtrip (Real Ligero Proof) ===\n");
+
+    let program_path = setup_ligero_env()?;
+    let domain: Hash32 = [1u8; 32];
+    let tree_depth: u8 = 16;
+
+    // Sender (spender) setup.
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_out = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // Input note owned by the sender.
+    let value_in: u64 = 100;
+    let rho_in: Hash32 = [2u8; 32];
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm_in = note_commitment_v2(&domain, value_in, &rho_in, &recipient_owner, &sender_id_in);
+
+    let mut tree = MerkleTree::new(tree_depth);
+    let pos: u64 = 0;
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    let siblings = tree.open(pos as usize);
+    let nf = nullifier(&domain, &nf_key, &rho_in);
+
+    // Receiver publishes a privacy address that contains (pk_spend, pk_ivk).
+    let receiver_spend_sk: Hash32 = [42u8; 32];
+    let receiver_pk_spend = pk_from_sk(&receiver_spend_sk);
+    let receiver_pk_ivk = pk_ivk_from_sk(&domain, &receiver_spend_sk);
+    anyhow::ensure!(receiver_pk_spend != receiver_pk_ivk, "pk_spend unexpectedly equals pk_ivk");
+
+    let receiver_addr = PrivacyAddress::from_keys(&receiver_pk_spend, &receiver_pk_ivk).to_string();
+    let parsed: PrivacyAddress = receiver_addr.parse().context("parse privacy address")?;
+    assert_eq!(parsed.to_pk(), receiver_pk_spend);
+    assert_eq!(parsed.pk_ivk(), receiver_pk_ivk);
+
+    // Output note sent to the receiver (TRANSFER shape: withdraw_amount=0, n_out=1).
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
+    let out_value = value_in;
+    let out_rho: Hash32 = [9u8; 32];
+    let out_recipient = recipient_from_pk_v2(&domain, &receiver_pk_spend, &receiver_pk_ivk);
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_recipient, &sender_id_out);
+
+    let public_output = SpendPublic {
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount: withdraw_amount as u128,
+        output_commitments: vec![cm_out],
+        view_attestations: None,
+    };
+
+    let input = SpendInputV2 {
+        value: value_in,
+        rho: rho_in,
+        sender_id: sender_id_in,
+        pos,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: receiver_pk_spend,
+        pk_ivk: receiver_pk_ivk,
+        cm: cm_out,
+    };
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
+
+    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
+    add_args_to_host(&mut host, &args)?;
+    host.set_public_output(&public_output)?;
+
+    let code_commitment = host.code_commitment();
+    let proof_data = host.run(true).context("Failed to generate Ligero proof")?;
+    let verified: SpendPublic =
+        LigeroVerifier::verify(&proof_data, &code_commitment).context("Proof verification failed")?;
+
+    let cm_out_from_proof = verified
+        .output_commitments
+        .first()
+        .copied()
+        .context("missing output commitment")?;
+    assert_eq!(cm_out_from_proof, cm_out);
+
+    // --- Build the IVK-encrypted output (sender side) ---
+    let receiver_pk_ivk_point = PublicKey::from(parsed.pk_ivk());
+
+    let esk_seed: Hash32 = [7u8; 32];
+    let esk = StaticSecret::from(clamp_x25519_scalar(esk_seed));
+    let epk = PublicKey::from(&esk);
+
+    let dh_sender = esk.diffie_hellman(&receiver_pk_ivk_point);
+    let (key, nonce) = ivk_aead_key_nonce(&domain, dh_sender.as_bytes(), &cm_out_from_proof);
+    let cipher = XChaCha20Poly1305::new(&key);
+
+    let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id_out);
+    let mut aad = [0u8; 64];
+    aad[..32].copy_from_slice(epk.as_bytes());
+    aad[32..].copy_from_slice(&cm_out_from_proof);
+
+    let ct = cipher
+        .encrypt(&nonce, Payload { msg: &pt, aad: &aad })
+        .expect("encrypt");
+
+    let tx_out = IvkEncryptedNote {
+        cm: cm_out_from_proof,
+        epk: *epk.as_bytes(),
+        ct: ct.try_into().expect("ciphertext fits SafeVec"),
+    };
+
+    // --- Wallet scanning (receiver side): decrypt and verify cm matches proof output ---
+    let ivk_secret =
+        StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(&domain, &receiver_spend_sk)));
+    let epk_from_tx = PublicKey::from(tx_out.epk);
+    let dh_receiver = ivk_secret.diffie_hellman(&epk_from_tx);
+    let (key2, nonce2) = ivk_aead_key_nonce(&domain, dh_receiver.as_bytes(), &tx_out.cm);
+    let cipher2 = XChaCha20Poly1305::new(&key2);
+
+    let mut aad2 = [0u8; 64];
+    aad2[..32].copy_from_slice(&tx_out.epk);
+    aad2[32..].copy_from_slice(&tx_out.cm);
+
+    let pt2 = cipher2
+        .decrypt(&nonce2, Payload { msg: tx_out.ct.as_ref(), aad: &aad2 })
+        .context("decrypt")?;
+
+    let (d_domain, d_value, d_rho, d_recipient, d_sender_id) = parse_note_plain(&pt2)?;
+    assert_eq!(d_domain, domain);
+    assert_eq!(d_value, out_value);
+    assert_eq!(d_rho, out_rho);
+    assert_eq!(d_recipient, out_recipient);
+    assert_eq!(d_sender_id, sender_id_out);
+
+    let cm_recomputed = note_commitment_v2(&d_domain, d_value, &d_rho, &d_recipient, &d_sender_id);
+    assert_eq!(cm_recomputed, tx_out.cm);
+
+    // Negative: if the sender encrypts to pk_spend instead of pk_ivk, the receiver cannot decrypt.
+    let pk_spend_as_pk_ivk = PublicKey::from(receiver_pk_spend);
+    let dh_wrong = esk.diffie_hellman(&pk_spend_as_pk_ivk);
+    let (wrong_key, wrong_nonce) = ivk_aead_key_nonce(&domain, dh_wrong.as_bytes(), &cm_out_from_proof);
+    let wrong_cipher = XChaCha20Poly1305::new(&wrong_key);
+    let wrong_ct = wrong_cipher
+        .encrypt(&wrong_nonce, Payload { msg: &pt, aad: &aad })
+        .expect("encrypt (wrong pk)");
+    let wrong_tx_out = IvkEncryptedNote {
+        cm: cm_out_from_proof,
+        epk: *epk.as_bytes(),
+        ct: wrong_ct.try_into().expect("ciphertext fits SafeVec"),
+    };
+
+    assert!(
+        cipher2
+            .decrypt(&nonce2, Payload { msg: wrong_tx_out.ct.as_ref(), aad: &aad2 })
+            .is_err(),
+        "decrypt unexpectedly succeeded with pk_spend-as-pk_ivk"
+    );
+
+    Ok(())
+}
+
 /// Simple test demonstrating note spending with the note_spend_guest program
 ///
 /// This test shows the basic flow:

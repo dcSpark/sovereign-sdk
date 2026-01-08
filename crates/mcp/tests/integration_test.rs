@@ -216,9 +216,9 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
             return Ok(());
         }
     };
-    let pk_ivk_owner = *privacy_key.pk();
+    let pk_ivk_owner = privacy_key.pk_ivk(&DOMAIN);
     let destination_pk_spend = *privacy_key.pk();
-    let destination_pk_ivk = destination_pk_spend; // MCP default
+    let destination_pk_ivk = privacy_key.pk_ivk(&DOMAIN);
     let input_sender_id = deposit_result.recipient; // deposit convention: sender_id = recipient
 
     let transfer_result = transfer(

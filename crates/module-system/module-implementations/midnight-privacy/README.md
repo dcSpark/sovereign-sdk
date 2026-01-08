@@ -118,6 +118,28 @@ The proof demonstrates (in zero-knowledge):
 - `pos`: Leaf position in tree
 - `siblings`: Merkle authentication path
 
+### Privacy Addresses, `pk_spend`, and `pk_ivk`
+
+Privacy recipients are derived from **two** 32-byte public keys:
+
+- `pk_spend`: spend public key used for ownership/spend authorization (Poseidon2-derived)
+- `pk_ivk`: incoming-view public key used for note viewing/encryption flows (X25519 public key)
+
+Key derivations (see `src/hash.rs` and `src/types.rs`):
+
+```text
+pk_spend  = H("PK_V1" || spend_sk)
+ivk_sk    = H("IVK_SEED_V1" || domain || spend_sk)
+pk_ivk    = X25519_BASE(clamp(ivk_sk))     // RFC 7748 clamping
+recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+```
+
+Important behavior/assumptions:
+
+- The Ligero guest program (`note_spend_guest` v2) treats `pk_ivk_owner` / `pk_ivk_out` as **opaque 32-byte inputs** and only uses them to recompute `recipient` and note commitments. It does **not** prove that `pk_ivk` is a “real” X25519 key or that it’s derived from `spend_sk`.
+- Supplying the wrong `pk_ivk` effectively creates an address the intended recipient cannot view/spend, so funds may become unrecoverable. This is expected “sent to wrong address” behavior and is the sender’s responsibility.
+- Backward compatibility: legacy privacy addresses may only encode `pk_spend` (32 bytes); in that case we use the convention `pk_ivk == pk_spend`. New integrations should prefer full v2 addresses that include both keys.
+
 ### Security Features
 
 #### 1. Nullifier-Based Double-Spend Prevention

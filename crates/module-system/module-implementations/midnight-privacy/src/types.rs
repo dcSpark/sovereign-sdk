@@ -533,6 +533,90 @@ impl JsonSchema for EncryptedNote {
     }
 }
 
+/// IVK-encrypted note for recipient-side scanning (Zcash Sapling style).
+///
+/// Unlike `EncryptedNote` (FVK-based authority viewing), this is for the actual recipient
+/// who derives their incoming viewing key from their spend secret key.
+///
+/// The recipient scans transactions by:
+/// 1. Extract `epk` from each output
+/// 2. Compute `dh = ivk_secret.diffie_hellman(epk)`
+/// 3. Derive symmetric key and decrypt `ct`
+/// 4. Verify `cm` matches the decrypted note contents
+///
+/// This enables wallet scanning without revealing the spend secret key.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    UniversalWallet,
+)]
+pub struct IvkEncryptedNote {
+    /// The on-chain commitment this ciphertext is bound to.
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub cm: Hash32,
+    /// Ephemeral public key (sender's per-output key for DH).
+    /// Receiver uses this with their `ivk_secret` to compute the shared secret.
+    #[serde(with = "serde_bytes_as_hex_array")]
+    pub epk: Hash32,
+    /// Ciphertext bytes (XChaCha20-Poly1305 encrypted note payload).
+    /// Encrypted with key derived from DH(esk, pk_ivk) = DH(ivk, epk).
+    pub ct: sov_modules_api::SafeVec<u8, 8_192>,
+}
+
+impl JsonSchema for IvkEncryptedNote {
+    fn schema_name() -> String {
+        "IvkEncryptedNote".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+
+        let mut obj = SchemaObject::default();
+        obj.instance_type = Some(InstanceType::Object.into());
+
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(
+            "cm".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "epk".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                format: Some("hex".to_string()),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "ct".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::Array.into()),
+                ..Default::default()
+            }),
+        );
+
+        obj.object = Some(Box::new(ObjectValidation {
+            properties,
+            required: vec!["cm".to_string(), "epk".to_string(), "ct".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }));
+
+        Schema::Object(obj)
+    }
+}
+
 // Custom serde module for 24-byte nonce
 mod serde_bytes_as_hex_array_24 {
     use serde::{Deserialize, Deserializer, Serializer};
