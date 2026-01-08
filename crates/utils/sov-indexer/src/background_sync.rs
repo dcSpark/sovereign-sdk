@@ -1,6 +1,8 @@
 use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
-use crate::viewer::{self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, VfkRegistry};
+use crate::viewer::{
+    self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, VfkRegistry,
+};
 use anyhow::Result;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sov_midnight_da::storable::worker_verified_transactions;
@@ -287,7 +289,7 @@ pub fn parse_deposit_fields(
 /// - Already bech32m: "privpool1..." -> passed through
 pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<String> {
     let value = value?;
-    
+
     // If it's a string
     if let Some(s) = value.as_str() {
         // If it's already a bech32m address, return as-is
@@ -297,13 +299,10 @@ pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<S
         // Otherwise treat as hex and convert to bech32m
         return hex_to_bech32m_address(s);
     }
-    
+
     // If it's a byte array (JSON array of numbers)
     if let Some(arr) = value.as_array() {
-        let bytes: Option<Vec<u8>> = arr
-            .iter()
-            .map(|v| v.as_u64().map(|n| n as u8))
-            .collect();
+        let bytes: Option<Vec<u8>> = arr.iter().map(|v| v.as_u64().map(|n| n as u8)).collect();
         if let Some(bytes) = bytes {
             if bytes.len() == 32 {
                 let hex_str = hex::encode(&bytes);
@@ -311,7 +310,7 @@ pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<S
             }
         }
     }
-    
+
     None
 }
 

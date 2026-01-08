@@ -112,7 +112,9 @@ impl Ligero {
                 "ligero program is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)",
             )?;
 
-        let mut runner = if self.ligero_prover_binary_path.is_some() || self.ligero_shader_path.is_some() {
+        let mut runner = if self.ligero_prover_binary_path.is_some()
+            || self.ligero_shader_path.is_some()
+        {
             // Explicit overrides (backwards compatible with existing MCP config).
             let prover_bin = self
                 .ligero_prover_binary_path

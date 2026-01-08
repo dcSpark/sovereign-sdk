@@ -276,7 +276,11 @@ impl MidnightDaConfig {
     }
 
     /// Instance of [`MidnightDaConfig`] that resembles Celestia DA. Batch production is periodic.
-    pub fn celestia_like(connection_string: String, sender: MidnightAddress, seed: HexHash) -> Self {
+    pub fn celestia_like(
+        connection_string: String,
+        sender: MidnightAddress,
+        seed: HexHash,
+    ) -> Self {
         MidnightDaConfig {
             connection_string,
             sender_address: sender,

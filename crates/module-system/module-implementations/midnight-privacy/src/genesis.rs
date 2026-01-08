@@ -125,7 +125,8 @@ mod tests {
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();
-        let parsed_config: MidnightPrivacyConfig<TestSpec> = serde_json::from_str(&json_str).unwrap();
+        let parsed_config: MidnightPrivacyConfig<TestSpec> =
+            serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed_config, config);
     }
 }

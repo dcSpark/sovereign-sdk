@@ -120,15 +120,18 @@ fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Result<Vec<
 }
 
 /// Deserialize Note from plaintext.
-/// 
+///
 /// Supports two formats:
 /// - 112 bytes: Deposit notes [domain(32) | value(16) | rho(32) | recipient(32)]
 /// - 144 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
-/// 
+///
 /// For 144-byte format, sender_id is ignored when returning Note (use decode_note_with_sender for full data).
 fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
     if pt.len() != 112 && pt.len() != 144 {
-        return Err(anyhow!("invalid note plaintext length: {} (expected 112 or 144)", pt.len()));
+        return Err(anyhow!(
+            "invalid note plaintext length: {} (expected 112 or 144)",
+            pt.len()
+        ));
     }
     let mut domain = [0u8; 32];
     domain.copy_from_slice(&pt[0..32]);
@@ -148,14 +151,17 @@ fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
 }
 
 /// Deserialize Note from plaintext, including optional sender_id.
-/// 
+///
 /// Returns (Note, Option<sender_id>) where sender_id is present for 144-byte spend outputs.
 pub fn decode_note_with_sender(pt: &[u8]) -> Result<(Note, Option<Hash32>)> {
     if pt.len() != 112 && pt.len() != 144 {
-        return Err(anyhow!("invalid note plaintext length: {} (expected 112 or 144)", pt.len()));
+        return Err(anyhow!(
+            "invalid note plaintext length: {} (expected 112 or 144)",
+            pt.len()
+        ));
     }
     let note = decode_note_bytes(pt)?;
-    
+
     let sender_id = if pt.len() == 144 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
@@ -163,7 +169,7 @@ pub fn decode_note_with_sender(pt: &[u8]) -> Result<(Note, Option<Hash32>)> {
     } else {
         None
     };
-    
+
     Ok((note, sender_id))
 }
 
@@ -323,7 +329,9 @@ pub fn decrypt_and_verify_note_level_b(fvk: &FullViewingKey, enc: &EncryptedNote
     // 4. Verify MAC
     let mac_expected = view_mac(&k, &enc.cm, &ct_h);
     if mac_expected != enc.mac {
-        return Err(anyhow!("mac mismatch: ciphertext may be corrupted or tampered"));
+        return Err(anyhow!(
+            "mac mismatch: ciphertext may be corrupted or tampered"
+        ));
     }
 
     // 5. Decrypt
@@ -333,15 +341,19 @@ pub fn decrypt_and_verify_note_level_b(fvk: &FullViewingKey, enc: &EncryptedNote
     let (note, sender_id_opt) = decode_note_with_sender(&pt_vec)?;
 
     // 7. Recompute commitment (NOTE_V2).
-    let value_u64: u64 = note
-        .value
-        .try_into()
-        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)"))?;
+    let value_u64: u64 = note.value.try_into().map_err(|_| {
+        anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)")
+    })?;
     // For 112-byte plaintexts (deposit format), treat `sender_id = recipient` to match the
     // NOTE_V2 deposit commitment convention used by this module.
     let sender_id = sender_id_opt.unwrap_or(note.recipient);
-    let cm_recomputed =
-        note_commitment(&note.domain, value_u64, &note.rho, &note.recipient, &sender_id);
+    let cm_recomputed = note_commitment(
+        &note.domain,
+        value_u64,
+        &note.rho,
+        &note.recipient,
+        &sender_id,
+    );
 
     // 8. Verify commitment matches
     if cm_recomputed != enc.cm {
@@ -445,10 +457,13 @@ pub fn decrypt_and_verify_note(fvk: &FullViewingKey, enc: &EncryptedNote) -> Res
 }
 
 /// Decrypt and verify a note, returning optional sender_id (for spend outputs).
-/// 
+///
 /// Returns (Note, Option<sender_id>) where sender_id is present for 144-byte spend outputs
 /// and absent for 112-byte deposit notes.
-pub fn decrypt_and_verify_note_with_sender(fvk: &FullViewingKey, enc: &EncryptedNote) -> Result<(Note, Option<Hash32>)> {
+pub fn decrypt_and_verify_note_with_sender(
+    fvk: &FullViewingKey,
+    enc: &EncryptedNote,
+) -> Result<(Note, Option<Hash32>)> {
     // 1. Verify FVK matches commitment
     let fvk_c = fvk_commitment(fvk);
     if fvk_c != enc.fvk_commitment {
@@ -464,7 +479,9 @@ pub fn decrypt_and_verify_note_with_sender(fvk: &FullViewingKey, enc: &Encrypted
     // 4. Verify MAC
     let mac_expected = view_mac(&k, &enc.cm, &ct_h);
     if mac_expected != enc.mac {
-        return Err(anyhow!("mac mismatch: ciphertext may be corrupted or tampered"));
+        return Err(anyhow!(
+            "mac mismatch: ciphertext may be corrupted or tampered"
+        ));
     }
 
     // 5. Decrypt
@@ -474,10 +491,9 @@ pub fn decrypt_and_verify_note_with_sender(fvk: &FullViewingKey, enc: &Encrypted
     let (note, sender_id) = decode_note_with_sender(&pt_vec)?;
 
     // 7. Recompute commitment (NOTE_V2).
-    let value_u64: u64 = note
-        .value
-        .try_into()
-        .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)"))?;
+    let value_u64: u64 = note.value.try_into().map_err(|_| {
+        anyhow!("note value does not fit into u64 (required by NOTE_V2 commitment)")
+    })?;
     let sender_id_for_cm = sender_id.unwrap_or(note.recipient);
     let cm_recomputed = note_commitment(
         &note.domain,

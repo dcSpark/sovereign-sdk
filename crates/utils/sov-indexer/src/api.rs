@@ -239,10 +239,7 @@ async fn add_vfk(
         tracing::warn!("Failed to persist VFK to database: {}", e);
     }
 
-    tracing::info!(
-        "Added VFK with commitment {}",
-        &commitment_hex[..16]
-    );
+    tracing::info!("Added VFK with commitment {}", &commitment_hex[..16]);
 
     (
         StatusCode::CREATED,
@@ -281,7 +278,10 @@ async fn delete_vfk(
         tracing::warn!("Failed to delete VFK from database: {}", e);
     }
 
-    tracing::info!("Deleted VFK with commitment {}", &fvk_commitment[..16.min(fvk_commitment.len())]);
+    tracing::info!(
+        "Deleted VFK with commitment {}",
+        &fvk_commitment[..16.min(fvk_commitment.len())]
+    );
 
     (
         StatusCode::OK,

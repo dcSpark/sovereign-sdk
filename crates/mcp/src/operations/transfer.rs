@@ -2,13 +2,13 @@
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
+use ligetron::bn254fr_native::submod_checked;
+use ligetron::Bn254Fr;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     SpendPublic,
 };
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
@@ -424,11 +424,11 @@ async fn create_transfer_unsigned_tx(
 }
 
 /// Transfer funds within the Midnight Privacy shielded pool
-/// 
+///
 /// If `send_amount` < `note_value`, creates 2 outputs:
 ///   - Output 0: `send_amount` → `output_recipient` (destination)
 ///   - Output 1: `note_value - send_amount` → `change_recipient` (change back to sender)
-/// 
+///
 /// If `send_amount` == `note_value`, creates 1 output (full transfer, no change).
 pub async fn transfer(
     ligero: &Ligero,
@@ -456,7 +456,11 @@ pub async fn transfer(
     }
 
     let has_change = send_amount < note_value;
-    let change_amount = if has_change { note_value - send_amount } else { 0 };
+    let change_amount = if has_change {
+        note_value - send_amount
+    } else {
+        0
+    };
     let note_value_u64: u64 = note_value
         .try_into()
         .context("note_value does not fit into u64 (required by note_spend_guest v2)")?;
@@ -570,7 +574,7 @@ pub async fn transfer(
             "Authority VFK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
-        
+
         // sender_id for spend outputs is the spender's address (derived from spend_sk).
         let (att_0, enc_0) = viewer::make_viewer_bundle(
             &vfk,
@@ -618,7 +622,12 @@ pub async fn transfer(
         out
     }
 
-    fn inv_enforce_v2(in_values: &[u64], in_rhos: &[Hash32], out_values: &[u64], out_rhos: &[Hash32]) -> Hash32 {
+    fn inv_enforce_v2(
+        in_values: &[u64],
+        in_rhos: &[Hash32],
+        out_values: &[u64],
+        out_rhos: &[Hash32],
+    ) -> Hash32 {
         let mut enforce_prod = Bn254Fr::from_u32(1);
 
         for v in in_values {
@@ -665,13 +674,18 @@ pub async fn transfer(
     let inv_enforce = inv_enforce_v2(&in_values, &in_rhos, &out_values, &out_rhos);
 
     fn u64_to_i64(v: u64, label: &'static str) -> Result<i64> {
-        i64::try_from(v).with_context(|| format!("{label} does not fit into i64 (required by note_spend_guest v2 ABI)"))
+        i64::try_from(v).with_context(|| {
+            format!("{label} does not fit into i64 (required by note_spend_guest v2 ABI)")
+        })
     }
 
     // Build args + private indices in the exact order required by note_spend_guest v2.
     let mut private_indices: Vec<u32> = Vec::new();
     let mut proof_args: Vec<LigeroProgramArguments> = Vec::new();
-    let push = |arg: LigeroProgramArguments, private: bool, private_indices: &mut Vec<u32>, proof_args: &mut Vec<LigeroProgramArguments>| {
+    let push = |arg: LigeroProgramArguments,
+                private: bool,
+                private_indices: &mut Vec<u32>,
+                proof_args: &mut Vec<LigeroProgramArguments>| {
         proof_args.push(arg);
         if private {
             private_indices.push(proof_args.len() as u32); // 1-based
@@ -679,76 +693,288 @@ pub async fn transfer(
     };
 
     // Header:
-    push(LigeroProgramArguments::HEX { hex: hex::encode(DOMAIN) }, false, &mut private_indices, &mut proof_args); // 1 domain
-    push(LigeroProgramArguments::HEX { hex: hex::encode(spend_sk) }, true, &mut private_indices, &mut proof_args); // 2 spend_sk
-    push(LigeroProgramArguments::HEX { hex: hex::encode(pk_ivk_owner) }, true, &mut private_indices, &mut proof_args); // 3 pk_ivk_owner
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(depth as u64, "depth")? }, false, &mut private_indices, &mut proof_args); // 4 depth
-    push(LigeroProgramArguments::HEX { hex: hex::encode(anchor_root) }, false, &mut private_indices, &mut proof_args); // 5 anchor
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(n_in as u64, "n_in")? }, false, &mut private_indices, &mut proof_args); // 6 n_in
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(DOMAIN),
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 1 domain
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(spend_sk),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 2 spend_sk
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(pk_ivk_owner),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 3 pk_ivk_owner
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(depth as u64, "depth")?,
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 4 depth
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(anchor_root),
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 5 anchor
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(n_in as u64, "n_in")?,
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 6 n_in
 
     // Input 0:
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(note_value_u64, "value_in")? }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(input_rho) }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(input_sender_id) }, true, &mut private_indices, &mut proof_args);
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(note_value_u64, "value_in")?,
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(input_rho),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(input_sender_id),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Position bits (LSB-first), each passed as a 32-byte BE 0/1.
     for level in 0..depth {
         let bit = ((position >> level) & 1) as u8;
         let mut bit_bytes = [0u8; 32];
         bit_bytes[31] = bit;
-        push(LigeroProgramArguments::HEX { hex: hex::encode(bit_bytes) }, true, &mut private_indices, &mut proof_args);
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(bit_bytes),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
     }
 
     // Siblings (bottom-up).
     for s in &siblings {
-        push(LigeroProgramArguments::HEX { hex: hex::encode(s) }, true, &mut private_indices, &mut proof_args);
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(s),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
     }
 
     // Nullifier (public).
-    push(LigeroProgramArguments::HEX { hex: hex::encode(nf) }, false, &mut private_indices, &mut proof_args);
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(nf),
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Withdraw binding.
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(withdraw_amount, "withdraw_amount")? }, false, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(withdraw_to) }, false, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(n_out as u64, "n_out")? }, false, &mut private_indices, &mut proof_args);
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(withdraw_amount, "withdraw_amount")?,
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(withdraw_to),
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(n_out as u64, "n_out")?,
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Output 0.
-    push(LigeroProgramArguments::I64 { i64: u64_to_i64(send_amount_u64, "value_out_0")? }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(out_rho_0) }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(destination_pk_spend) }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(destination_pk_ivk) }, true, &mut private_indices, &mut proof_args);
-    push(LigeroProgramArguments::HEX { hex: hex::encode(cm_out_0) }, false, &mut private_indices, &mut proof_args);
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(send_amount_u64, "value_out_0")?,
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(out_rho_0),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(destination_pk_spend),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(destination_pk_ivk),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(cm_out_0),
+        },
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Output 1 (change).
     if has_change {
         let rho1 = out_rho_1.expect("change rho set when has_change");
         let cm1 = cm_out_1.expect("change cm set when has_change");
-        push(LigeroProgramArguments::I64 { i64: u64_to_i64(change_amount_u64, "value_out_1")? }, true, &mut private_indices, &mut proof_args);
-        push(LigeroProgramArguments::HEX { hex: hex::encode(rho1) }, true, &mut private_indices, &mut proof_args);
-        push(LigeroProgramArguments::HEX { hex: hex::encode(pk_spend_owner) }, true, &mut private_indices, &mut proof_args);
-        push(LigeroProgramArguments::HEX { hex: hex::encode(pk_ivk_owner) }, true, &mut private_indices, &mut proof_args);
-        push(LigeroProgramArguments::HEX { hex: hex::encode(cm1) }, false, &mut private_indices, &mut proof_args);
+        push(
+            LigeroProgramArguments::I64 {
+                i64: u64_to_i64(change_amount_u64, "value_out_1")?,
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(rho1),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(pk_spend_owner),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(pk_ivk_owner),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(cm1),
+            },
+            false,
+            &mut private_indices,
+            &mut proof_args,
+        );
     }
 
     // inv_enforce (private).
-    push(LigeroProgramArguments::HEX { hex: hex::encode(inv_enforce) }, true, &mut private_indices, &mut proof_args);
+    push(
+        LigeroProgramArguments::HEX {
+            hex: hex::encode(inv_enforce),
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Viewer section arguments (Level B) if authority VFK is configured.
     if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
         // n_viewers
-        push(LigeroProgramArguments::I64 { i64: 1 }, false, &mut private_indices, &mut proof_args);
+        push(
+            LigeroProgramArguments::I64 { i64: 1 },
+            false,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // fvk_commitment (public)
-        let fvk_commitment = atts
-            .first()
-            .map(|a| a.fvk_commitment)
-            .unwrap_or([0u8; 32]);
-        push(LigeroProgramArguments::HEX { hex: hex::encode(fvk_commitment) }, false, &mut private_indices, &mut proof_args);
+        let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(fvk_commitment),
+            },
+            false,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // fvk (private)
-        push(LigeroProgramArguments::HEX { hex: hex::encode(vfk) }, true, &mut private_indices, &mut proof_args);
+        push(
+            LigeroProgramArguments::HEX {
+                hex: hex::encode(vfk),
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
-            push(LigeroProgramArguments::HEX { hex: hex::encode(att.ct_hash) }, false, &mut private_indices, &mut proof_args);
-            push(LigeroProgramArguments::HEX { hex: hex::encode(att.mac) }, false, &mut private_indices, &mut proof_args);
+            push(
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(att.ct_hash),
+                },
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
+            push(
+                LigeroProgramArguments::HEX {
+                    hex: hex::encode(att.mac),
+                },
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
         }
     }
 
@@ -854,7 +1080,11 @@ pub async fn transfer(
         amount_sent: send_amount,
         output_rho: out_rho_0,
         output_recipient: out_recipient_0,
-        change_amount: if has_change { Some(change_amount) } else { None },
+        change_amount: if has_change {
+            Some(change_amount)
+        } else {
+            None
+        },
         change_rho: out_rho_1,
         change_recipient: out_recipient_1,
     })

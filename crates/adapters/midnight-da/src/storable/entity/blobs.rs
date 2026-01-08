@@ -52,18 +52,26 @@ fn build_blob(
     )
 }
 
-pub fn build_batch_blob(height: i32, data: &[u8], sender: &MidnightAddress) -> (ActiveModel, MidnightHash) {
+pub fn build_batch_blob(
+    height: i32,
+    data: &[u8],
+    sender: &MidnightAddress,
+) -> (ActiveModel, MidnightHash) {
     build_blob(height, data, sender, BATCH_NAMESPACE.to_string())
 }
 
-pub fn build_proof_blob(height: i32, data: &[u8], sender: &MidnightAddress) -> (ActiveModel, MidnightHash) {
+pub fn build_proof_blob(
+    height: i32,
+    data: &[u8],
+    sender: &MidnightAddress,
+) -> (ActiveModel, MidnightHash) {
     build_blob(height, data, sender, PROOF_NAMESPACE.to_string())
 }
 
 impl From<Model> for MidnightBlob {
     fn from(value: Model) -> Self {
-        let address =
-            MidnightAddress::try_from(&value.sender[..]).expect("Malformed sender stored in database");
+        let address = MidnightAddress::try_from(&value.sender[..])
+            .expect("Malformed sender stored in database");
         let hash: [u8; 32] = value
             .hash
             .try_into()

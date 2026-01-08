@@ -82,14 +82,20 @@ mod tests {
         let program_path = match ligero_runner::resolve_program(&program) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Skipping test: failed to resolve program '{}': {}", program, e);
+                eprintln!(
+                    "Skipping test: failed to resolve program '{}': {}",
+                    program, e
+                );
                 return;
             }
         };
 
         // Check if the program file exists
         if !program_path.exists() {
-            eprintln!("Skipping test: program not found at {}", program_path.display());
+            eprintln!(
+                "Skipping test: program not found at {}",
+                program_path.display()
+            );
             return;
         }
 
@@ -102,7 +108,10 @@ mod tests {
             }
         };
         if !paths.prover_bin.exists() {
-            eprintln!("Skipping test: webgpu_prover not found at {}", paths.prover_bin.display());
+            eprintln!(
+                "Skipping test: webgpu_prover not found at {}",
+                paths.prover_bin.display()
+            );
             return;
         }
 
@@ -159,8 +168,8 @@ mod tests {
 mod note_spend_tests {
     use anyhow::{Context, Result};
     use ligetron::bn254fr_native::submod_checked;
-    use ligetron::Bn254Fr;
     use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
+    use ligetron::Bn254Fr;
     use serde::{Deserialize, Serialize};
     use sov_ligero_adapter::{Ligero, LigeroVerifier};
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
@@ -239,7 +248,11 @@ mod note_spend_tests {
                 let prev = default_nodes[level - 1];
                 default_nodes[level] = mt_combine((level - 1) as u8, &prev, &prev);
             }
-            Self { depth, leaves: std::collections::HashMap::new(), default_nodes }
+            Self {
+                depth,
+                leaves: std::collections::HashMap::new(),
+                default_nodes,
+            }
         }
 
         fn set_leaf(&mut self, pos: usize, leaf: Hash32) {
@@ -354,8 +367,13 @@ mod note_spend_tests {
         let change_pk_ivk: Hash32 = [12u8; 32];
         let change_rcp = recipient_from_pk(&domain, &change_pk_spend, &change_pk_ivk);
         let sender_id_out = recipient_owner;
-        let cm_change =
-            note_commitment_v2(&domain, change_value, &change_rho, &change_rcp, &sender_id_out);
+        let cm_change = note_commitment_v2(
+            &domain,
+            change_value,
+            &change_rho,
+            &change_rcp,
+            &sender_id_out,
+        );
 
         println!("Withdraw: {} units (transparent)", withdraw_amount);
         println!("Change: {} units (shielded)", change_value);
@@ -435,7 +453,7 @@ mod note_spend_tests {
             idx += 1; // nullifier (public)
         }
         idx += 3; // withdraw_amount, withdraw_to, n_out (public)
-        // Output privates.
+                  // Output privates.
         for _ in 0..n_out {
             private_indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx + 3]); // v, rho, pk_spend, pk_ivk
             idx += 5; // skip cm_out (public)
@@ -445,8 +463,8 @@ mod note_spend_tests {
 
         println!("✓ Private indices: {:?}", private_indices);
 
-        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-            .with_private_indices(private_indices);
+        let mut host =
+            <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
 
         // Header.
         host.add_hex_arg(hex32(&domain));
@@ -497,40 +515,51 @@ mod note_spend_tests {
         let code_commitment = host.code_commitment();
 
         println!("\n==================== PROVER ====================\n");
-        
+
         let proof_start = Instant::now();
-        let (proof_data, prover_stdout) = host.run_with_logging()
+        let (proof_data, prover_stdout) = host
+            .run_with_logging()
             .context("Failed to generate proof")?;
         let proof_time = proof_start.elapsed();
 
         // Print full prover output
         println!("{}", prover_stdout);
-        
+
         // Extract stats from prover output
-        let linear = prover_stdout.lines()
+        let linear = prover_stdout
+            .lines()
             .find(|l| l.contains("Num Linear constraints:"))
             .and_then(|l| l.split_whitespace().last())
             .unwrap_or("?");
-        let quadratic = prover_stdout.lines()
+        let quadratic = prover_stdout
+            .lines()
             .find(|l| l.contains("Num quadratic constraints:"))
             .and_then(|l| l.split_whitespace().last())
             .unwrap_or("?");
 
-        println!("\n✓ Proof generated: {} bytes ({:.3}s)", proof_data.len(), proof_time.as_secs_f64());
+        println!(
+            "\n✓ Proof generated: {} bytes ({:.3}s)",
+            proof_data.len(),
+            proof_time.as_secs_f64()
+        );
 
         println!("\n==================== VERIFIER ====================\n");
-        
+
         // Set environment variables for verifier
         // SAFETY: This is a single-threaded test, no concurrent access to env vars
         unsafe {
             std::env::set_var("LIGERO_PROGRAM_PATH", host.program_path());
             std::env::set_var("LIGERO_SHADER_PATH", host.shader_path());
             std::env::set_var("LIGERO_PACKING", host.packing().to_string());
-            std::env::set_var("LIGERO_VERIFIER_BIN", host.verifier_bin().to_string_lossy().to_string());
+            std::env::set_var(
+                "LIGERO_VERIFIER_BIN",
+                host.verifier_bin().to_string_lossy().to_string(),
+            );
         }
 
         let verify_start = Instant::now();
-        let verify_result: Result<(SpendPublic, String, String)> = LigeroVerifier::verify_with_output(&proof_data, &code_commitment);
+        let verify_result: Result<(SpendPublic, String, String)> =
+            LigeroVerifier::verify_with_output(&proof_data, &code_commitment);
         let verify_time = verify_start.elapsed();
 
         let verified = match verify_result {
@@ -545,7 +574,10 @@ mod note_spend_tests {
             }
             Err(e) => {
                 // Still try to get the verifier output from the error message
-                eprintln!("\n✗ Verification FAILED ({:.3}s)", verify_time.as_secs_f64());
+                eprintln!(
+                    "\n✗ Verification FAILED ({:.3}s)",
+                    verify_time.as_secs_f64()
+                );
                 eprintln!("Error: {:#}", e);
                 return Err(e);
             }
@@ -563,7 +595,10 @@ mod note_spend_tests {
         println!("  Prover Time:   {:.0}ms", proof_time.as_millis());
         println!("  Verifier Time: {:.0}ms", verify_time.as_millis());
         println!("  ─────────────────────────────");
-        println!("  Total Time:    {:.0}ms", (proof_time + verify_time).as_millis());
+        println!(
+            "  Total Time:    {:.0}ms",
+            (proof_time + verify_time).as_millis()
+        );
         println!("==============================================");
 
         assert_eq!(verified.withdraw_amount, withdraw_amount as u128);
@@ -571,7 +606,10 @@ mod note_spend_tests {
         assert_eq!(verified.output_commitments[0], cm_change);
 
         println!("\n=== Test Complete ===");
-        println!("✓ Withdrawal: {} transparent + {} shielded change", withdraw_amount, change_value);
+        println!(
+            "✓ Withdrawal: {} transparent + {} shielded change",
+            withdraw_amount, change_value
+        );
 
         Ok(())
     }

@@ -16,7 +16,9 @@ pub struct IncomingWorkerTxSaver {
 
 enum IncomingWorkerTxSaverInner {
     Disabled,
-    Disk { dir: PathBuf },
+    Disk {
+        dir: PathBuf,
+    },
     Gcs {
         bucket_resource: String,
         bucket_name: String,
@@ -46,9 +48,9 @@ impl IncomingWorkerTxSaver {
                     "Midnight DA config requires `worker_tx_path` when `save_incoming_worker_txs = \"disk\"`",
                 )?;
                 let dir = resolve_path(config_dir, raw_path);
-                tokio::fs::create_dir_all(&dir)
-                    .await
-                    .with_context(|| format!("Failed to create worker tx directory {}", dir.display()))?;
+                tokio::fs::create_dir_all(&dir).await.with_context(|| {
+                    format!("Failed to create worker tx directory {}", dir.display())
+                })?;
                 Ok(Self {
                     inner: Arc::new(IncomingWorkerTxSaverInner::Disk { dir }),
                 })
@@ -90,9 +92,9 @@ impl IncomingWorkerTxSaver {
             IncomingWorkerTxSaverInner::Disabled => Ok(None),
             IncomingWorkerTxSaverInner::Disk { dir } => {
                 let path = dir.join(&object_name);
-                tokio::fs::write(&path, payload)
-                    .await
-                    .with_context(|| format!("Failed to write worker tx file {}", path.display()))?;
+                tokio::fs::write(&path, payload).await.with_context(|| {
+                    format!("Failed to write worker tx file {}", path.display())
+                })?;
                 Ok(Some(path.to_string_lossy().to_string()))
             }
             IncomingWorkerTxSaverInner::Gcs {
@@ -101,11 +103,7 @@ impl IncomingWorkerTxSaver {
                 storage,
             } => {
                 storage
-                    .write_object(
-                        bucket_resource,
-                        &object_name,
-                        bytes::Bytes::from(payload),
-                    )
+                    .write_object(bucket_resource, &object_name, bytes::Bytes::from(payload))
                     .set_content_type("application/json")
                     .send_buffered()
                     .await

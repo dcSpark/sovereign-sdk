@@ -12,19 +12,20 @@
 
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
-    Hash32, SpendPublic, ValueMidnightPrivacy, MidnightPrivacyConfig, PendingCommitmentKey,
+    Hash32, MidnightPrivacyConfig, PendingCommitmentKey, SpendPublic, ValueMidnightPrivacy,
 };
-use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::capabilities::mocks::MockKernel;
-use sov_modules_api::{Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet, ExecutionContext};
+use sov_modules_api::hooks::BlockHooks;
+use sov_modules_api::transaction::AuthenticatedTransactionData;
 use sov_modules_api::Context;
 use sov_modules_api::StateProvider;
 use sov_modules_api::VersionReader;
-use sov_modules_api::transaction::AuthenticatedTransactionData;
+use sov_modules_api::{ExecutionContext, Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet};
 use sov_test_utils::storage::ForklessStorageManager;
 use sov_test_utils::storage::SimpleStorageManager;
 use sov_test_utils::{
-    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec, TestStorageSpec,
+    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec,
+    TestStorageSpec,
 };
 
 fn make_cm(domain: &Hash32, val: u128, rho_byte: u8, recipient_byte: u8) -> Hash32 {
@@ -40,7 +41,7 @@ fn make_nf(domain: &Hash32, nfkey_byte: u8, rho_byte: u8) -> Hash32 {
 }
 
 /// This test verifies that the parallel-safe storage pattern works correctly.
-/// 
+///
 /// It simulates parallel execution by creating multiple WorkingSets from the same
 /// checkpoint. Each WorkingSet executes a transfer independently, and we verify
 /// that ALL commitments are preserved using the new hash-based storage.
@@ -70,7 +71,8 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     // Run module genesis
     {
         let storage = sm.create_storage();
-        let mut cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let mut cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         let mut gs = cp.to_genesis_state_accessor::<ValueMidnightPrivacy<TestSpec>>(&cfg);
         Genesis::genesis(&mut mp, &Default::default(), &cfg, &mut gs).unwrap();
         let (cache_log, accessory_delta, witness) = cp.freeze();
@@ -84,7 +86,8 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
 
     // Get initial state
     let (initial_next_position, initial_root) = {
-        let cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         let scratchpad = cp.to_tx_scratchpad();
         let tx = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
         let gas_meter = new_test_gas_meter::<TestSpec>();
@@ -122,19 +125,16 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     // Create WorkingSets from the SAME checkpoint (same state snapshot)
     let sender = <TestSpec as Spec>::Address::from([0xA1; 28]);
     let sequencer = <TestSpec as Spec>::Address::from([0xA2; 28]);
-    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address = Default::default();
-    let ctx = Context::<TestSpec>::new(
-        sender,
-        Default::default(),
-        sequencer,
-        sequencer_da_addr,
-    );
+    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address =
+        Default::default();
+    let ctx = Context::<TestSpec>::new(sender, Default::default(), sequencer, sequencer_da_addr);
 
     let mut all_tx_changes = Vec::new();
 
     for i in 0..num_parallel_txs {
         // Each parallel worker creates a fresh WorkingSet from the SAME storage snapshot
-        let cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         let scratchpad = cp.to_tx_scratchpad();
         let tx = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
         let gas_meter = new_test_gas_meter::<TestSpec>();
@@ -162,12 +162,18 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
             height: current_height.get(),
             commitment: outputs[i],
         };
-        let stored_pos = mp.pending_commitments_by_hash.get(&cm_key, &mut ws).unwrap();
+        let stored_pos = mp
+            .pending_commitments_by_hash
+            .get(&cm_key, &mut ws)
+            .unwrap();
         println!(
             "Worker {}: commitment stored at hash-based key with position {:?}",
             i, stored_pos
         );
-        assert!(stored_pos.is_some(), "Commitment should be stored with unique hash key");
+        assert!(
+            stored_pos.is_some(),
+            "Commitment should be stored with unique hash key"
+        );
 
         // Get the tx changes
         let (scratchpad_after, _, _) = ws.finalize();
@@ -176,9 +182,10 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     }
 
     println!("\n=== APPLYING CHANGES FROM ALL WORKERS ===");
-    
+
     // Apply all changes to a fresh checkpoint (simulating sequential merge of parallel results)
-    let mut final_cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+    let mut final_cp =
+        StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
 
     for (i, changes) in all_tx_changes.iter().enumerate() {
         println!("Applying changes from worker {}...", i);
@@ -194,21 +201,29 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
             height: current_height.get(),
             commitment: *cm,
         };
-        if mp.pending_commitments_by_hash.get(&cm_key, &mut final_cp).unwrap().is_some() {
+        if mp
+            .pending_commitments_by_hash
+            .get(&cm_key, &mut final_cp)
+            .unwrap()
+            .is_some()
+        {
             println!("Output {} found in hash storage", i);
             found_in_hash_storage += 1;
         } else {
             println!("Output {} NOT found in hash storage", i);
         }
     }
-    
+
     // With the new storage pattern, ALL commitments should be in hash storage
     assert_eq!(
         found_in_hash_storage, num_parallel_txs,
         "All {} commitments should be preserved in hash-based storage, but only {} found",
         num_parallel_txs, found_in_hash_storage
     );
-    println!("SUCCESS: All {} commitments preserved in hash-based storage!", num_parallel_txs);
+    println!(
+        "SUCCESS: All {} commitments preserved in hash-based storage!",
+        num_parallel_txs
+    );
 
     // Run end_block_flush to process pending commitments
     println!("\n=== RUNNING END_BLOCK_FLUSH ===");
@@ -221,7 +236,10 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     println!("\n=== FINAL STATE ===");
     println!("Initial next_position: {}", initial_next_position);
     println!("Final next_position: {}", final_next_position);
-    println!("Commitments added: {}", final_next_position - initial_next_position);
+    println!(
+        "Commitments added: {}",
+        final_next_position - initial_next_position
+    );
 
     // Count how many commitments are actually in the tree
     let mut found_in_tree = 0;
@@ -248,7 +266,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
         The parallel-safe storage fix should prevent data loss.",
         num_parallel_txs, found_in_tree
     );
-    
+
     // Verify the final position matches expected
     assert_eq!(
         final_next_position,
@@ -257,7 +275,10 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     );
 
     println!("\n=== TEST PASSED ===");
-    println!("Parallel execution fix verified: all {} commitments preserved!", num_parallel_txs);
+    println!(
+        "Parallel execution fix verified: all {} commitments preserved!",
+        num_parallel_txs
+    );
 
     // Clean up cache
     for pub_input in &pub_inputs {
@@ -292,7 +313,8 @@ fn sequential_execution_works_with_slot_based_storage() {
     // Run module genesis
     {
         let storage = sm.create_storage();
-        let mut cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let mut cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         let mut gs = cp.to_genesis_state_accessor::<ValueMidnightPrivacy<TestSpec>>(&cfg);
         Genesis::genesis(&mut mp, &Default::default(), &cfg, &mut gs).unwrap();
         let (cache_log, accessory_delta, witness) = cp.freeze();
@@ -304,7 +326,8 @@ fn sequential_execution_works_with_slot_based_storage() {
 
     let storage = sm.create_storage();
     let initial_root = {
-        let cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         let scratchpad = cp.to_tx_scratchpad();
         let tx = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
         let gas_meter = new_test_gas_meter::<TestSpec>();
@@ -335,13 +358,9 @@ fn sequential_execution_works_with_slot_based_storage() {
 
     let sender = <TestSpec as Spec>::Address::from([0xA1; 28]);
     let sequencer = <TestSpec as Spec>::Address::from([0xA2; 28]);
-    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address = Default::default();
-    let ctx = Context::<TestSpec>::new(
-        sender,
-        Default::default(),
-        sequencer,
-        sequencer_da_addr,
-    );
+    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address =
+        Default::default();
+    let ctx = Context::<TestSpec>::new(sender, Default::default(), sequencer, sequencer_da_addr);
 
     // Execute SEQUENTIALLY on the same WorkingSet (simulating non-parallel execution)
     let cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
@@ -365,7 +384,7 @@ fn sequential_execution_works_with_slot_based_storage() {
             &mut ws,
         )
         .unwrap();
-        
+
         let current_pos = mp.next_position.get(&mut ws).unwrap().unwrap();
         println!("After tx {}: next_position = {}", i, current_pos);
     }
@@ -396,8 +415,15 @@ fn sequential_execution_works_with_slot_based_storage() {
         }
     }
 
-    assert_eq!(found, num_txs, "All {} commitments should be in tree", num_txs);
-    println!("Sequential execution test passed: {} commitments added", num_txs);
+    assert_eq!(
+        found, num_txs,
+        "All {} commitments should be in tree",
+        num_txs
+    );
+    println!(
+        "Sequential execution test passed: {} commitments added",
+        num_txs
+    );
 
     // Clean up
     for pub_input in &pub_inputs {

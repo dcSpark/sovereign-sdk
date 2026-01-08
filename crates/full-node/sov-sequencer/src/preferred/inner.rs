@@ -18,10 +18,10 @@ use sov_modules_api::{
     StateUpdateInfo, VersionReader, VisibleSlotNumber, GLOBAL_TX_CACHE,
 };
 use sov_state::{NativeStorage, Storage};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use std::collections::HashMap;
 
 use super::batch_size_tracker::BatchSizeTracker;
 use crate::metrics::{
@@ -45,9 +45,9 @@ use crate::preferred::{
 use crate::{SequencerConfig, SequencerNotReadyDetails, SlotNumber, TxHash};
 
 use borsh::BorshDeserialize;
-use sov_modules_api::transaction::Transaction;
-use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
 use sov_modules_api::capabilities::TransactionAuthenticator;
+use sov_modules_api::runtime::capabilities::authentication::AuthenticatorInput;
+use sov_modules_api::transaction::Transaction;
 
 /// These two constants are used to calculate the comfortable batch size limit.
 /// Currently, this is 99% of the hard limit. After the comfortable limit is reached,
@@ -1361,7 +1361,10 @@ where
                 reason,
             } => {
                 let start = std::time::Instant::now();
-                debug!("[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}", tx_hash, start);
+                debug!(
+                    "[ACCEPT TX] Starting AcceptTx message processing for tx_hash={} at {:?}",
+                    tx_hash, start
+                );
                 let ret = self
                     .process_accept_tx(baked_tx, tx_hash, original_tx_queue_id, reason)
                     .await;
@@ -1452,7 +1455,7 @@ where
             Message::SimpleStateUpdate { info } => {
                 self.process_new_storage(info).await;
             }
-            // stage 3 - post process results of parallelized workers that 
+            // stage 3 - post process results of parallelized workers that
             Message::ParallelTxCompleted {
                 parallel_response,
                 sequence_number,
@@ -1672,10 +1675,9 @@ where
                 // Only flush the tx cache when not actively producing a batch or holding
                 // pending parallel completions, to avoid reordering panics in the
                 // transaction_subscriptions cache during mid-batch sync transitions.
-                let should_flush_tx_cache =
-                    (is_startup || is_resync || is_recover)
-                        && !inner.executor.has_in_progress_batch()
-                        && inner.pending_parallel_count == 0;
+                let should_flush_tx_cache = (is_startup || is_resync || is_recover)
+                    && !inner.executor.has_in_progress_batch()
+                    && inner.pending_parallel_count == 0;
 
                 // We only need to replay the transactions in the edge cases where the event/tx cache needs repopulating.
                 // In all other cases, we can just accept the new storage and move on.
@@ -1890,8 +1892,9 @@ where
         // 1. It's a midnight privacy tx
         // 2. We have parallel workers configured
         // 3. Parallel routing is not paused (batch not waiting to close)
-        let can_route_parallel =
-            is_parallelizable_midnight_privacy_tx && has_parallel_capacity && !parallel_routing_paused;
+        let can_route_parallel = is_parallelizable_midnight_privacy_tx
+            && has_parallel_capacity
+            && !parallel_routing_paused;
 
         if parallel_routing_paused && is_parallelizable_midnight_privacy_tx {
             tracing::debug!(
@@ -2047,7 +2050,9 @@ where
                     %reason,
                     "Dropping parallel completion after max retries"
                 );
-                if let Some(waiter) = inner.pending_http_waiters.remove(&parallel_response.tx_hash)
+                if let Some(waiter) = inner
+                    .pending_http_waiters
+                    .remove(&parallel_response.tx_hash)
                 {
                     drop(waiter);
                 }
@@ -2076,10 +2081,7 @@ where
 
             channel_size.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(
-                    PARALLEL_COMPLETION_RETRY_DELAY_MS,
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(PARALLEL_COMPLETION_RETRY_DELAY_MS)).await;
                 if let Err(err) = sender.send(retry_msg).await {
                     channel_size.fetch_sub(1, Ordering::Relaxed);
                     tracing::debug!(
@@ -2170,12 +2172,10 @@ where
             .num_parallel_tx_workers
             .unwrap_or(0)
             .max(1) as u64;
-        inner
-            .batch_size_tracker
-            .add_tx(
-                tx_len,
-                accepted_with_budget_main.execution_time_micros / num_parallel_tx_workers,
-            );
+        inner.batch_size_tracker.add_tx(
+            tx_len,
+            accepted_with_budget_main.execution_time_micros / num_parallel_tx_workers,
+        );
         let batch_metrics_time = batch_metrics_start.elapsed();
 
         // Decide whether to fast-ack HTTP callers immediately after the in-memory

@@ -32,14 +32,15 @@ fn env_opt(var: &str) -> Option<std::path::PathBuf> {
 
 /// Helper to create test ligero prover (skips if assets are missing).
 fn create_test_ligero() -> Option<Ligero> {
-    let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
     let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
         .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
         .unwrap_or_else(|| runner.paths().prover_bin.clone());
-    let shader =
-        env_opt("LIGERO_SHADER_PATH").unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
 
     if !prover.exists() || !shader.exists() {
         return None;
@@ -182,7 +183,9 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Step 6: Initialize Ligero prover for transfer
     tracing::info!("Step 6: Initializing Ligero prover");
     let Some(ligero) = create_test_ligero() else {
-        eprintln!("⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)");
+        eprintln!(
+            "⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)"
+        );
         return Ok(());
     };
     tracing::info!("✓ Ligero prover initialized");
@@ -191,7 +194,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
-    // Load authority VFK from environment for test
+                                      // Load authority VFK from environment for test
     let authority_vfk = std::env::var("AUTHORITY_VFK")
         .ok()
         .and_then(|s| {
@@ -376,7 +379,8 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 1: Create funding wallet from private key
     tracing::info!("Step 1: Creating funding wallet");
-    let funding_wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
+    let funding_wallet =
+        WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let funding_address = funding_wallet.get_address();
     tracing::info!("Funding wallet address: {}", funding_address);
 
@@ -402,8 +406,17 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("✓ Authority VFK generated");
 
     // Step 5: Perform deposit to the new privacy address
-    tracing::info!("Step 5: Depositing {} tokens to new privacy address", startup_deposit_amount);
-    let deposit_result = deposit(&provider, &funding_wallet, startup_deposit_amount, &new_privacy_key).await?;
+    tracing::info!(
+        "Step 5: Depositing {} tokens to new privacy address",
+        startup_deposit_amount
+    );
+    let deposit_result = deposit(
+        &provider,
+        &funding_wallet,
+        startup_deposit_amount,
+        &new_privacy_key,
+    )
+    .await?;
     tracing::info!("✓ Deposit successful");
     tracing::info!("  Transaction hash: {}", deposit_result.tx_hash);
     tracing::info!("  Rho: {}", hex::encode(&deposit_result.rho));
@@ -440,12 +453,16 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Initialize Ligero prover
     let Some(ligero) = create_test_ligero() else {
-        eprintln!("⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)");
+        eprintln!(
+            "⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)"
+        );
         return Ok(());
     };
 
     // Get the deposited note details for transfer
-    let note = initial_balance_result.unspent_notes.first()
+    let note = initial_balance_result
+        .unspent_notes
+        .first()
         .expect("Should have at least one unspent note from deposit");
 
     // Parse rho from the note
@@ -520,7 +537,10 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("  - Initial balance: {}", initial_balance);
     tracing::info!("  - Amount sent: {}", send_amount);
     tracing::info!("  - Final balance: {}", final_balance);
-    tracing::info!("  - Unspent notes: {}", final_balance_result.unspent_notes.len());
+    tracing::info!(
+        "  - Unspent notes: {}",
+        final_balance_result.unspent_notes.len()
+    );
     tracing::info!("==========================================");
 
     Ok(())

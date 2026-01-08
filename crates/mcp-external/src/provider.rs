@@ -161,11 +161,7 @@ impl Provider {
         address: &S::Address,
         token_id: &TokenId,
     ) -> Result<Amount> {
-        match self
-            .client
-            .get_balance::<S>(address, token_id, None)
-            .await
-        {
+        match self.client.get_balance::<S>(address, token_id, None).await {
             Ok(amount) => Ok(amount),
             Err(e) => {
                 // If the error is a reqwest 404, return 0
@@ -184,11 +180,15 @@ impl Provider {
                 }
                 tracing::error!(
                     "Failed to get balance for token {} at address {:?}: {}",
-                    token_id, address, e
+                    token_id,
+                    address,
+                    e
                 );
                 Err(anyhow::anyhow!(
                     "Failed to get balance for token {} at address {:?}: {}",
-                    token_id, address, e
+                    token_id,
+                    address,
+                    e
                 ))
             }
         }

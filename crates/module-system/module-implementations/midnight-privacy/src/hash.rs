@@ -174,8 +174,8 @@ impl FromStr for PendingCommitmentKey {
         let height = parts[0]
             .parse::<u64>()
             .map_err(|e| format!("Failed to parse height: {}", e))?;
-        let commitment_bytes = hex::decode(parts[1])
-            .map_err(|e| format!("Failed to parse commitment: {}", e))?;
+        let commitment_bytes =
+            hex::decode(parts[1]).map_err(|e| format!("Failed to parse commitment: {}", e))?;
         if commitment_bytes.len() != 32 {
             return Err("Commitment must be 32 bytes".to_string());
         }
@@ -226,8 +226,8 @@ impl FromStr for PendingNullifierKey {
         let height = parts[0]
             .parse::<u64>()
             .map_err(|e| format!("Failed to parse height: {}", e))?;
-        let nullifier_bytes = hex::decode(parts[1])
-            .map_err(|e| format!("Failed to parse nullifier: {}", e))?;
+        let nullifier_bytes =
+            hex::decode(parts[1]).map_err(|e| format!("Failed to parse nullifier: {}", e))?;
         if nullifier_bytes.len() != 32 {
             return Err("Nullifier must be 32 bytes".to_string());
         }
@@ -258,7 +258,7 @@ pub struct PendingNullifierPrefix {
 /// Domain-separated 32-byte Poseidon2 hash using Ligetron's implementation.
 /// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V2", "PRF_NF_V1").
 /// This provides collision resistance between different hash use cases.
-/// 
+///
 /// Uses Ligetron's native Poseidon2 to ensure consistency with the ZK circuit.
 pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
     // Concatenate tag and all parts
@@ -325,7 +325,12 @@ pub fn note_commitment(
 /// NOTE: This legacy format is kept for backward-compatible tooling and tests only.
 /// The current `note_spend_guest` circuit uses `NOTE_V2`.
 #[inline]
-pub fn note_commitment_v1(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+pub fn note_commitment_v1(
+    domain: &Hash32,
+    value: u128,
+    rho: &Hash32,
+    recipient: &Hash32,
+) -> Hash32 {
     let v = value.to_le_bytes();
     // tag (7) + domain (32) + value_le_16 (16) + rho (32) + recipient (32) = 119 bytes
     let mut buf = [0u8; 7 + 32 + 16 + 32 + 32];
@@ -414,7 +419,7 @@ pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
 
 /// Derive privacy recipient address from domain and public key material.
 /// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
-/// 
+///
 /// This is the internal 32-byte "recipient" value used in note commitments.
 /// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
 #[inline]

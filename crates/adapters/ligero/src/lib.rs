@@ -332,11 +332,11 @@ impl ZkVerifier for LigeroVerifier {
             // Automatically discover the correct program based on the code commitment
             let paths =
                 native::VerifierPaths::discover_with_commitment(Some(&code_commitment.0))
-                .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
-            
+                    .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
+
             // Verify the program matches the expected commitment
             native::ensure_code_commitment(&paths, &code_commitment.0)?;
-            
+
             // Deserialize args from JSON
             let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
             native::verify_proof(
@@ -371,9 +371,9 @@ impl LigeroVerifier {
 
         let paths = native::VerifierPaths::discover_with_commitment(Some(&code_commitment.0))
             .map_err(|err| anyhow::anyhow!("Ligero verifier configuration error: {err}"))?;
-        
+
         native::ensure_code_commitment(&paths, &code_commitment.0)?;
-        
+
         let args: Vec<LigeroArg> = serde_json::from_slice(&package.args_json)?;
         let (success, stdout, stderr) = native::verify_proof_with_output(
             &paths,
@@ -458,4 +458,3 @@ mod native {
         ensure_code_commitment, verify_proof, verify_proof_with_output, VerifierPaths,
     };
 }
-

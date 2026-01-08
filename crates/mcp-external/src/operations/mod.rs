@@ -15,9 +15,9 @@ mod transfer;
 pub mod verify_transaction;
 pub mod wallet_status;
 
-pub use deposit::deposit;
 #[allow(unused_imports)]
 pub use decrypt_transaction::decrypt_transaction;
+pub use deposit::deposit;
 pub use get_default_address::get_default_address;
 pub use get_default_token_balance::get_default_token_balance;
 pub use get_transaction_status::get_transaction_status;

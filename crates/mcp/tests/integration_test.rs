@@ -32,15 +32,16 @@ fn env_opt(var: &str) -> Option<std::path::PathBuf> {
 
 /// Helper to create test ligero prover (skips if assets are missing).
 fn create_test_ligero() -> Option<Ligero> {
-    let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
     let program_path = ligero_runner::resolve_program(&program).ok()?;
 
     let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")
         .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
         .unwrap_or_else(|| runner.paths().prover_bin.clone());
-    let shader =
-        env_opt("LIGERO_SHADER_PATH").unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
 
     if !prover.exists() || !shader.exists() {
         return None;
@@ -200,7 +201,9 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Step 6: Initialize Ligero prover for transfer
     tracing::info!("Step 6: Initializing Ligero prover");
     let Some(ligero) = create_test_ligero() else {
-        eprintln!("⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)");
+        eprintln!(
+            "⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)"
+        );
         return Ok(());
     };
     tracing::info!("✓ Ligero prover initialized");

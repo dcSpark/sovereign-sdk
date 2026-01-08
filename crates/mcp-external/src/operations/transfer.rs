@@ -459,7 +459,11 @@ pub async fn transfer(
     }
 
     let has_change = send_amount < note_value;
-    let change_amount = if has_change { note_value - send_amount } else { 0 };
+    let change_amount = if has_change {
+        note_value - send_amount
+    } else {
+        0
+    };
     let note_value_u64: u64 = note_value
         .try_into()
         .context("note_value does not fit into u64 (required by note_spend_guest v2)")?;
@@ -683,9 +687,9 @@ pub async fn transfer(
     let mut private_indices: Vec<u32> = Vec::new();
     let mut proof_args: Vec<LigeroProgramArguments> = Vec::new();
     let push = |arg: LigeroProgramArguments,
-                    private: bool,
-                    private_indices: &mut Vec<u32>,
-                    proof_args: &mut Vec<LigeroProgramArguments>| {
+                private: bool,
+                private_indices: &mut Vec<u32>,
+                proof_args: &mut Vec<LigeroProgramArguments>| {
         proof_args.push(arg);
         if private {
             private_indices.push(proof_args.len() as u32); // 1-based
@@ -910,7 +914,9 @@ pub async fn transfer(
             &mut proof_args,
         );
         push(
-            LigeroProgramArguments::Hex { hex: hex::encode(cm1) },
+            LigeroProgramArguments::Hex {
+                hex: hex::encode(cm1),
+            },
             false,
             &mut private_indices,
             &mut proof_args,
@@ -937,10 +943,7 @@ pub async fn transfer(
             &mut proof_args,
         );
         // fvk_commitment (public)
-        let fvk_commitment = atts
-            .first()
-            .map(|a| a.fvk_commitment)
-            .unwrap_or([0u8; 32]);
+        let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
         push(
             LigeroProgramArguments::Hex {
                 hex: hex::encode(fvk_commitment),
@@ -981,7 +984,8 @@ pub async fn transfer(
 
     // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
     let proof_args_for_package = proof_args.clone();
-    let private_indices_for_package: Vec<usize> = private_indices.iter().map(|i| *i as usize).collect();
+    let private_indices_for_package: Vec<usize> =
+        private_indices.iter().map(|i| *i as usize).collect();
 
     let (packing, gpu_threads) = ligero.resolve_prover_params(8192, None);
     let proof_start = StdInstant::now();

@@ -7,10 +7,10 @@ use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, FromQueryResult,
     QueryFilter, QuerySelect,
 };
-use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::shared_db_connection_string;
+use sov_midnight_da::storable::worker_verified_transactions;
 use sov_rollup_interface::TxHash;
-use tokio::{runtime::Handle, task, sync::OnceCell};
+use tokio::{runtime::Handle, sync::OnceCell, task};
 
 use crate::{Hash32, SpendPublic};
 
@@ -140,7 +140,8 @@ fn get_worker_db() -> anyhow::Result<&'static DatabaseConnection> {
             .get_or_try_init(|| async move {
                 if connection_string.starts_with("sqlite:") {
                     use sea_orm::sqlx::sqlite::{
-                        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+                        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
+                        SqliteSynchronous,
                     };
                     use std::str::FromStr;
 
