@@ -873,15 +873,15 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             .http_get(&format!("/ledger/txs/{}?children=1", hash_hex))
                             .await
                             .unwrap_or_else(|e| format!("<failed to fetch ledger json: {e}>"));
-                        if let Some((_, _, amt, rho, recp)) =
-                            deposit_secrets.iter().find(|(_, h, ..)| h == hash_hex)
-                        {
-                            let pk_spend = pk_from_sk(recp);
-                            let recipient = recipient_from_sk_v2(&DOMAIN, recp, &pk_spend);
-                            eprintln!(
-                                "[debug] expected deposit: amount={} rho={} recipient={}",
-                                amt,
-                                hex::encode(&rho[..8]),
+	                        if let Some((_, _, amt, rho, recp)) =
+	                            deposit_secrets.iter().find(|(_, h, ..)| h == hash_hex)
+	                        {
+	                            let pk_ivk = pk_ivk_from_sk(&DOMAIN, recp);
+	                            let recipient = recipient_from_sk_v2(&DOMAIN, recp, &pk_ivk);
+	                            eprintln!(
+	                                "[debug] expected deposit: amount={} rho={} recipient={}",
+	                                amt,
+	                                hex::encode(&rho[..8]),
                                 hex::encode(&recipient[..8])
                             );
                         }
@@ -1118,17 +1118,17 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     // Compare expected commitments (from our deposits) with API commitments
     let domain: Hash32 = DOMAIN; // Must match genesis config!
-    eprintln!("\n[tree] Comparing expected vs API commitments:");
-    for (account_idx, txh, amount, rho, spend_sk) in &deposit_secrets {
-        let amount_u64: u64 = (*amount)
-            .try_into()
-            .context("deposit amount does not fit into u64 (required by note_spend_guest v2)")?;
-        let pk_spend = pk_from_sk(spend_sk);
-        let recipient = recipient_from_sk_v2(&domain, spend_sk, &pk_spend);
-        // Deposit convention: sender_id == recipient.
-        let expected_cm = note_commitment(&domain, amount_u64, rho, &recipient, &recipient);
-        if let Some(api_cm) = deposit_cm_by_hash.get(txh) {
-            let match_str = if &expected_cm == api_cm {
+	    eprintln!("\n[tree] Comparing expected vs API commitments:");
+	    for (account_idx, txh, amount, rho, spend_sk) in &deposit_secrets {
+	        let amount_u64: u64 = (*amount)
+	            .try_into()
+	            .context("deposit amount does not fit into u64 (required by note_spend_guest v2)")?;
+	        let pk_ivk = pk_ivk_from_sk(&domain, spend_sk);
+	        let recipient = recipient_from_sk_v2(&domain, spend_sk, &pk_ivk);
+	        // Deposit convention: sender_id == recipient.
+	        let expected_cm = note_commitment(&domain, amount_u64, rho, &recipient, &recipient);
+	        if let Some(api_cm) = deposit_cm_by_hash.get(txh) {
+	            let match_str = if &expected_cm == api_cm {
                 "✓ MATCH"
             } else {
                 "✗ MISMATCH"
