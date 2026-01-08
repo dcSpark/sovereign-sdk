@@ -5,7 +5,14 @@
 use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use midnight_privacy::{nf_key_from_sk, note_commitment, recipient_from_sk, CallMessage, Hash32};
+use midnight_privacy::{
+    nf_key_from_sk,
+    note_commitment,
+    pk_ivk_from_sk,
+    recipient_from_sk_v2,
+    CallMessage,
+    Hash32,
+};
 use rand;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -59,7 +66,9 @@ fn main() -> Result<()> {
     let domain: Hash32 = [1u8; 32]; // Keep domain consistent
     let rho: Hash32 = rand::random(); // Random rho = unique nullifier
     let spend_sk: Hash32 = rand::random(); // Secret spend key (note owner)
-    let recipient: Hash32 = recipient_from_sk(&domain, &spend_sk);
+    let pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &spend_sk); // Incoming-view public key
+    let recipient: Hash32 = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk);
+    let sender_id: Hash32 = recipient; // Deposit convention: sender_id == recipient
     let nf_key: Hash32 = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Note parameters (for later withdrawal):");
@@ -69,7 +78,10 @@ fn main() -> Result<()> {
     println!("  Recipient: 0x{}", hex::encode(&recipient[..8]));
 
     // Compute note commitment
-    let cm = note_commitment(&domain, amount, &rho, &recipient);
+    let amount_u64: u64 = amount
+        .try_into()
+        .context("Deposit amount must fit into u64 (note circuit limit)")?;
+    let cm = note_commitment(&domain, amount_u64, &rho, &recipient, &sender_id);
     println!("  Commitment: 0x{}\n", hex::encode(cm));
 
     // Save note details for later spending (transfer/withdraw).
