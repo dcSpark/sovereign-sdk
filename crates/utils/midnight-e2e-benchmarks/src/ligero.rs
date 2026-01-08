@@ -12,9 +12,11 @@ pub struct LigeroEnv {
 /// export the environment variables that downstream tools expect.
 pub fn setup_ligero_env() -> Result<LigeroEnv> {
     // Pass a circuit name (not a filesystem path). `ligero-runner` resolves the correct wasm.
-    let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
-    let host = <sov_ligero_adapter::Ligero as sov_rollup_interface::zk::Zkvm>::Host::from_args(&program);
+    let host =
+        <sov_ligero_adapter::Ligero as sov_rollup_interface::zk::Zkvm>::Host::from_args(&program);
     let code_commitment = host.code_commitment();
     let method_id: [u8; 32] = code_commitment
         .encode()

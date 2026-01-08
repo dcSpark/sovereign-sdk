@@ -19,11 +19,14 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 }
 
 fn create_test_ligero() -> Option<Ligero> {
-    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
     let program_path = match ligero_runner::resolve_program(&program) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("⚠️  Skipping Ligero prover test: failed to resolve program '{program}': {e}");
+            eprintln!(
+                "⚠️  Skipping Ligero prover test: failed to resolve program '{program}': {e}"
+            );
             return None;
         }
     };

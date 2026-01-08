@@ -129,7 +129,6 @@ impl GlobalTxExecutionCache {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
 }
 
 // Safety: DashMap and Mutex are thread-safe

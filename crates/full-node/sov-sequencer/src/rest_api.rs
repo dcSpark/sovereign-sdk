@@ -448,8 +448,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
             midnight_privacy::cache_pre_verified_spend(proof_outputs.clone());
             WorkerTxIntent::Withdraw { proof_outputs }
-        } else if let Some(transfer) =
-            transaction_data.get("transfer").and_then(|v| v.as_object())
+        } else if let Some(transfer) = transaction_data.get("transfer").and_then(|v| v.as_object())
         {
             let anchor_root_hex = transfer
                 .get("anchor_root")
@@ -532,7 +531,10 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
         let result = match worker_tx_intent {
             WorkerTxIntent::Withdraw { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
+                crate::common::cache_pre_verified_midnight_transaction(
+                    tx_hash_value,
+                    proof_outputs_clone,
+                );
                 let sequencer = state.sequencer.clone();
                 crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
                     sequencer
@@ -546,7 +548,10 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             }
             WorkerTxIntent::Transfer { proof_outputs } => {
                 let proof_outputs_clone = proof_outputs.clone();
-                crate::common::cache_pre_verified_midnight_transaction(tx_hash_value, proof_outputs_clone);
+                crate::common::cache_pre_verified_midnight_transaction(
+                    tx_hash_value,
+                    proof_outputs_clone,
+                );
                 let sequencer = state.sequencer.clone();
                 crate::common::with_pre_verified_midnight_transaction(proof_outputs, async move {
                     sequencer

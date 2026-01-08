@@ -146,7 +146,11 @@ pub mod vfk_registry {
     #[sea_orm(table_name = "vfk_registry")]
     pub struct Model {
         /// FVK commitment: H("FVK_COMMIT_V1" || vfk) - primary key for lookups
-        #[sea_orm(primary_key, auto_increment = false, column_type = "String(StringLen::N(64))")]
+        #[sea_orm(
+            primary_key,
+            auto_increment = false,
+            column_type = "String(StringLen::N(64))"
+        )]
         pub fvk_commitment: String,
         /// The actual VFK (32 bytes hex-encoded)
         #[sea_orm(column_type = "String(StringLen::N(64))")]

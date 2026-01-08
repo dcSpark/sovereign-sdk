@@ -69,21 +69,22 @@ pub async fn get_privacy_balance(
     let mut withdraw_count = 0;
     let mut total_transactions = 0;
 
-    let mut record_note = |rho: Hash32, value: u128, sender_id: Option<Hash32>, tx: &InvolvementItem| -> bool {
-        if seen_rhos.insert(rho) {
-            all_notes.push((
-                rho,
-                value,
-                sender_id,
-                tx.tx_hash.clone(),
-                tx.timestamp_ms,
-                tx.kind.clone(),
-            ));
-            true
-        } else {
-            false
-        }
-    };
+    let mut record_note =
+        |rho: Hash32, value: u128, sender_id: Option<Hash32>, tx: &InvolvementItem| -> bool {
+            if seen_rhos.insert(rho) {
+                all_notes.push((
+                    rho,
+                    value,
+                    sender_id,
+                    tx.tx_hash.clone(),
+                    tx.timestamp_ms,
+                    tx.kind.clone(),
+                ));
+                true
+            } else {
+                false
+            }
+        };
 
     let mut offset = 0;
     loop {

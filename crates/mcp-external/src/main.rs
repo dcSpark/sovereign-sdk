@@ -132,7 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     tracing::info!("[mcp] Privacy key initialized successfully");
-    tracing::info!("[mcp] Privacy address: {}", privacy_key.privacy_address(&DOMAIN));
+    tracing::info!(
+        "[mcp] Privacy address: {}",
+        privacy_key.privacy_address(&DOMAIN)
+    );
     tracing::info!(
         "[mcp] All deposits will be made to this privacy address: {}",
         privacy_key.privacy_address(&DOMAIN)

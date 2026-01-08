@@ -43,7 +43,10 @@
 
 use clap::Parser;
 use midnight_privacy::{
-    viewing::{fvk_commitment as mp_fvk_commitment, view_kdf as mp_view_kdf, ct_hash as mp_ct_hash, view_mac as mp_view_mac},
+    viewing::{
+        ct_hash as mp_ct_hash, fvk_commitment as mp_fvk_commitment, view_kdf as mp_view_kdf,
+        view_mac as mp_view_mac,
+    },
     FullViewingKey, Hash32, PrivacyAddress,
 };
 use serde::{Deserialize, Serialize};
@@ -96,7 +99,7 @@ impl<'de> Deserialize<'de> for CtBytes {
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
-        
+
         // Try to deserialize as array first, then as hex string
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -104,7 +107,7 @@ impl<'de> Deserialize<'de> for CtBytes {
             Array(Vec<u8>),
             Hex(String),
         }
-        
+
         match CtBytesHelper::deserialize(deserializer)? {
             CtBytesHelper::Array(arr) => Ok(CtBytes(arr)),
             CtBytesHelper::Hex(s) => {
@@ -192,7 +195,7 @@ fn stream_xor_decrypt(k: &Hash32, ct: &[u8]) -> Vec<u8> {
     let mut pt = vec![0u8; ct.len()];
     let mut ctr = 0u32;
     let mut off = 0usize;
-    
+
     while off < ct.len() {
         let ks = stream_block(k, ctr);
         ctr = ctr.wrapping_add(1);
@@ -206,28 +209,33 @@ fn stream_xor_decrypt(k: &Hash32, ct: &[u8]) -> Vec<u8> {
 }
 
 /// Parse decrypted plaintext into note components.
-/// 
+///
 /// Supports two formats:
 /// - 112 bytes: Deposit notes [domain(32) | value(16) | rho(32) | recipient(32)]
 /// - 144 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
-fn parse_note_plaintext(pt: &[u8]) -> Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>), String> {
+fn parse_note_plaintext(
+    pt: &[u8],
+) -> Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>), String> {
     if pt.len() != 112 && pt.len() != 144 {
-        return Err(format!("Expected 112 or 144 bytes plaintext, got {}", pt.len()));
+        return Err(format!(
+            "Expected 112 or 144 bytes plaintext, got {}",
+            pt.len()
+        ));
     }
-    
+
     let mut domain = [0u8; 32];
     domain.copy_from_slice(&pt[0..32]);
-    
+
     let mut value_bytes = [0u8; 16];
     value_bytes.copy_from_slice(&pt[32..48]);
     let value = u128::from_le_bytes(value_bytes);
-    
+
     let mut rho = [0u8; 32];
     rho.copy_from_slice(&pt[48..80]);
-    
+
     let mut recipient = [0u8; 32];
     recipient.copy_from_slice(&pt[80..112]);
-    
+
     // Parse sender_id if present (144-byte format from spend outputs)
     let sender_id = if pt.len() == 144 {
         let mut sender = [0u8; 32];
@@ -236,20 +244,24 @@ fn parse_note_plaintext(pt: &[u8]) -> Result<(Hash32, u128, Hash32, Hash32, Opti
     } else {
         None
     };
-    
+
     Ok((domain, value, rho, recipient, sender_id))
 }
 
-fn decrypt_note(fvk: &Hash32, note: &EncryptedNoteInput, verify: bool) -> Result<DecryptedNote, String> {
+fn decrypt_note(
+    fvk: &Hash32,
+    note: &EncryptedNoteInput,
+    verify: bool,
+) -> Result<DecryptedNote, String> {
     let cm = parse_hash32(&note.cm)?;
     let expected_fvk_c = parse_hash32(&note.fvk_commitment)?;
     let expected_mac = parse_hash32(&note.mac)?;
     let ct = &note.ct.0;
-    
+
     // Check FVK commitment matches
     let computed_fvk_c = fvk_commitment(fvk);
     let fvk_match = computed_fvk_c == expected_fvk_c;
-    
+
     if !fvk_match {
         return Err(format!(
             "FVK commitment mismatch: expected {}, got {}. Wrong FVK?",
@@ -257,10 +269,10 @@ fn decrypt_note(fvk: &Hash32, note: &EncryptedNoteInput, verify: bool) -> Result
             hex::encode(computed_fvk_c)
         ));
     }
-    
+
     // Derive decryption key
     let k = view_kdf(fvk, &cm);
-    
+
     // Optionally verify MAC
     let mac_valid = if verify {
         let ct_h = ct_hash(ct);
@@ -277,19 +289,19 @@ fn decrypt_note(fvk: &Hash32, note: &EncryptedNoteInput, verify: bool) -> Result
     } else {
         None
     };
-    
+
     // Decrypt
     let pt = stream_xor_decrypt(&k, ct);
-    
+
     // Parse plaintext (supports both 112-byte deposits and 144-byte spend outputs)
     let (domain, value, rho, recipient, sender_id) = parse_note_plaintext(&pt)?;
-    
+
     // Convert to bech32 for display
     // Note: recipient is H(domain || pk), not the pk itself, so we display it as-is
     // The sender_id IS the spender's recipient (their address), so we can convert it to bech32
     let recipient_bech32 = hash_to_bech32(&recipient);
     let sender_bech32 = sender_id.map(|s| hash_to_bech32(&s));
-    
+
     Ok(DecryptedNote {
         cm: note.cm.clone(),
         fvk_match,
@@ -306,15 +318,16 @@ fn decrypt_note(fvk: &Hash32, note: &EncryptedNoteInput, verify: bool) -> Result
 
 fn main() {
     let args = Args::parse();
-    
+
     // Get FVK from CLI arg or environment variable
-    let fvk_str = args.fvk
+    let fvk_str = args
+        .fvk
         .or_else(|| std::env::var("AUTHORITY_FVK").ok())
         .unwrap_or_else(|| {
             eprintln!("Error: FVK not provided. Set AUTHORITY_FVK env var or use --fvk");
             std::process::exit(1);
         });
-    
+
     let fvk = match parse_hash32(&fvk_str) {
         Ok(f) => f,
         Err(e) => {
@@ -322,13 +335,15 @@ fn main() {
             std::process::exit(1);
         }
     };
-    
+
     // Get input
     let input_json = match &args.input {
         Some(input) if input == "-" => {
             // Read from stdin
             let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).expect("Failed to read stdin");
+            io::stdin()
+                .read_to_string(&mut buf)
+                .expect("Failed to read stdin");
             buf
         }
         Some(input) if input.starts_with('[') || input.starts_with('{') => {
@@ -346,11 +361,13 @@ fn main() {
         None => {
             // Read from stdin
             let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).expect("Failed to read stdin");
+            io::stdin()
+                .read_to_string(&mut buf)
+                .expect("Failed to read stdin");
             buf
         }
     };
-    
+
     // Parse input (handle both single object and array)
     let notes: Vec<EncryptedNoteInput> = if input_json.trim().starts_with('[') {
         serde_json::from_str(&input_json).unwrap_or_else(|e| {
@@ -364,35 +381,37 @@ fn main() {
         });
         vec![single]
     };
-    
+
     if notes.is_empty() {
         eprintln!("No encrypted notes found in input");
         std::process::exit(1);
     }
-    
+
     // Compute FVK commitment for display
     let fvk_c = fvk_commitment(&fvk);
     eprintln!("Using FVK commitment: 0x{}", hex::encode(fvk_c));
     eprintln!("Decrypting {} note(s)...\n", notes.len());
-    
+
     // Decrypt each note
     let mut results: Vec<DecryptedNote> = Vec::new();
     let mut errors: Vec<(usize, String)> = Vec::new();
-    
+
     for (i, note) in notes.iter().enumerate() {
         match decrypt_note(&fvk, note, args.verify_mac) {
             Ok(decrypted) => results.push(decrypted),
             Err(e) => errors.push((i, e)),
         }
     }
-    
+
     // Output results
     match args.format.as_str() {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&results).unwrap());
         }
         "csv" => {
-            println!("cm,value,domain,rho,recipient,recipient_hex,sender,sender_hex,fvk_match,mac_valid");
+            println!(
+                "cm,value,domain,rho,recipient,recipient_hex,sender,sender_hex,fvk_match,mac_valid"
+            );
             for r in &results {
                 println!(
                     "{},{},{},{},{},{},{},{},{},{}",
@@ -405,7 +424,9 @@ fn main() {
                     r.sender_bech32.as_deref().unwrap_or(""),
                     r.sender_id.as_deref().unwrap_or(""),
                     r.fvk_match,
-                    r.mac_valid.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string())
+                    r.mac_valid
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "N/A".to_string())
                 );
             }
         }
@@ -416,7 +437,10 @@ fn main() {
                 println!("Note #{}", i + 1);
                 println!("═══════════════════════════════════════════════════════════════");
                 println!("  Commitment (cm): 0x{}", r.cm);
-                println!("  FVK Match:       {}", if r.fvk_match { "✓ Yes" } else { "✗ No" });
+                println!(
+                    "  FVK Match:       {}",
+                    if r.fvk_match { "✓ Yes" } else { "✗ No" }
+                );
                 if let Some(mac) = r.mac_valid {
                     println!("  MAC Valid:       {}", if mac { "✓ Yes" } else { "✗ No" });
                 }
@@ -436,7 +460,7 @@ fn main() {
             }
         }
     }
-    
+
     // Report errors
     if !errors.is_empty() {
         eprintln!("\n⚠️  {} note(s) failed to decrypt:", errors.len());
@@ -445,7 +469,7 @@ fn main() {
         }
         std::process::exit(1);
     }
-    
+
     eprintln!("✓ Successfully decrypted {} note(s)", results.len());
 }
 
@@ -478,24 +502,25 @@ mod tests {
         // Verify the decrypted values
         assert!(decrypted.fvk_match, "FVK commitment should match");
         assert_eq!(decrypted.mac_valid, Some(true), "MAC should be valid");
-        
+
         // Deposit notes (112 bytes) don't have sender_id
-        assert!(decrypted.sender_id.is_none(), "Deposit notes should not have sender_id");
-        
+        assert!(
+            decrypted.sender_id.is_none(),
+            "Deposit notes should not have sender_id"
+        );
+
         // The note contains 100 tokens
         assert_eq!(decrypted.value, 100, "Value should be 100");
-        
+
         // Domain should be the test domain (32 bytes of 0x01)
         assert_eq!(
-            decrypted.domain,
-            "0101010101010101010101010101010101010101010101010101010101010101",
+            decrypted.domain, "0101010101010101010101010101010101010101010101010101010101010101",
             "Domain should be test domain"
         );
-        
+
         // Verify rho and recipient are correct
         assert_eq!(
-            decrypted.rho,
-            "70462bbcd194b508d996277523f974eeb0482be026ffdfb6250f2bf299a99ac1",
+            decrypted.rho, "70462bbcd194b508d996277523f974eeb0482be026ffdfb6250f2bf299a99ac1",
             "Rho should match"
         );
         // recipient_hex contains the raw hash
@@ -536,28 +561,32 @@ mod tests {
         // Verify the decrypted values
         assert!(decrypted.fvk_match, "FVK commitment should match");
         assert_eq!(decrypted.mac_valid, Some(true), "MAC should be valid");
-        
+
         // Transfer notes (144 bytes) HAVE sender_id
-        assert!(decrypted.sender_id.is_some(), "Transfer notes should have sender_id");
-        assert!(decrypted.sender_bech32.is_some(), "Transfer notes should have sender_bech32");
-        
+        assert!(
+            decrypted.sender_id.is_some(),
+            "Transfer notes should have sender_id"
+        );
+        assert!(
+            decrypted.sender_bech32.is_some(),
+            "Transfer notes should have sender_bech32"
+        );
+
         // The note contains 100 tokens
         assert_eq!(decrypted.value, 100, "Value should be 100");
-        
+
         // Domain should be the test domain (32 bytes of 0x01)
         assert_eq!(
-            decrypted.domain,
-            "0101010101010101010101010101010101010101010101010101010101010101",
+            decrypted.domain, "0101010101010101010101010101010101010101010101010101010101010101",
             "Domain should be test domain"
         );
-        
+
         // Verify rho
         assert_eq!(
-            decrypted.rho,
-            "4e0dcba2eb2f6967909e42a7acca05aefc32bed516213f0d7b271f527611d5f9",
+            decrypted.rho, "4e0dcba2eb2f6967909e42a7acca05aefc32bed516213f0d7b271f527611d5f9",
             "Rho should match"
         );
-        
+
         // Verify recipient (bech32)
         assert_eq!(
             decrypted.recipient,
@@ -569,7 +598,7 @@ mod tests {
             "4f0de7b7156375a517b665e15a43c87c99d386de7e67f28cd39260ad6d9ff69b",
             "Recipient hex should match"
         );
-        
+
         // Verify sender (bech32)
         assert_eq!(
             decrypted.sender_bech32.as_deref(),
@@ -615,7 +644,8 @@ mod tests {
         let fvk_hex = "fd3f0fc84254bcbe06977154d4db171a952201685f6ff8d5afe4a3c6e083f2b1";
         let fvk = parse_hash32(fvk_hex).expect("valid FVK hex");
 
-        let expected_commitment = "10defb66061a9babdf3d75ae27129953ab6c05437e3370aaa40a3891ceb8c917";
+        let expected_commitment =
+            "10defb66061a9babdf3d75ae27129953ab6c05437e3370aaa40a3891ceb8c917";
         let computed_commitment = fvk_commitment(&fvk);
 
         assert_eq!(
@@ -641,4 +671,3 @@ mod tests {
         assert_eq!(note.ct.0, vec![1u8, 2, 3]);
     }
 }
-

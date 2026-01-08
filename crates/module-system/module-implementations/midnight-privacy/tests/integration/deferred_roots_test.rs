@@ -12,20 +12,21 @@
 
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
-    Hash32, SpendPublic, ValueMidnightPrivacy, MidnightPrivacyConfig, PendingRootKey,
-    PendingCommitmentKey,
+    Hash32, MidnightPrivacyConfig, PendingCommitmentKey, PendingRootKey, SpendPublic,
+    ValueMidnightPrivacy,
 };
-use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::capabilities::mocks::MockKernel;
-use sov_modules_api::{Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet};
-use sov_modules_api::VersionReader;
-use sov_modules_api::Context;
+use sov_modules_api::hooks::BlockHooks;
 use sov_modules_api::transaction::AuthenticatedTransactionData;
+use sov_modules_api::Context;
 use sov_modules_api::StateProvider;
+use sov_modules_api::VersionReader;
+use sov_modules_api::{Gas, Genesis, Module, Spec, StateCheckpoint, WorkingSet};
 use sov_test_utils::storage::ForklessStorageManager;
 use sov_test_utils::storage::SimpleStorageManager;
 use sov_test_utils::{
-    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec, TestStorageSpec,
+    default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec,
+    TestStorageSpec,
 };
 
 fn make_cm(domain: &Hash32, val: u128, rho_byte: u8, recipient_byte: u8) -> Hash32 {
@@ -68,7 +69,8 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // Run module genesis against a checkpoint, then materialize to storage
     {
         let storage = sm.create_storage();
-        let mut cp = StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
+        let mut cp =
+            StateCheckpoint::<TestSpec>::new(storage.clone(), &MockKernel::<TestSpec>::default());
         // Create a genesis accessor from the checkpoint and initialize module state
         let mut gs = cp.to_genesis_state_accessor::<ValueMidnightPrivacy<TestSpec>>(&cfg);
         Genesis::genesis(&mut mp, &Default::default(), &cfg, &mut gs).unwrap();
@@ -92,7 +94,8 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // Construct a Context
     let sender = <TestSpec as Spec>::Address::from([0xA1; 28]);
     let sequencer = <TestSpec as Spec>::Address::from([0xA2; 28]);
-    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address = Default::default();
+    let sequencer_da_addr: <<TestSpec as Spec>::Da as sov_modules_api::DaSpec>::Address =
+        Default::default();
     let ctx = Context::<TestSpec>::new(
         sender,
         Default::default(), // Credentials
@@ -101,12 +104,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     );
 
     // Initial root is present in recent_roots
-    let initial_root = mp
-        .commitment_tree
-        .get(&mut ws)
-        .unwrap()
-        .unwrap()
-        .root();
+    let initial_root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
     let recent0 = mp.recent_roots.get(&mut ws).unwrap().unwrap();
     assert_eq!(recent0.len(), 1);
     assert_eq!(recent0.front().copied().unwrap(), initial_root);
@@ -142,7 +140,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // After transfer: COMMITMENTS are queued in pending_commitments_by_hash (deferred design).
     // Roots are NOT queued during tx execution - they're computed at flush time.
     let current_height = ws.rollup_height_to_access();
-    
+
     // Verify commitments were queued
     let cm_key1 = PendingCommitmentKey {
         height: current_height.get(),
@@ -153,14 +151,20 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         commitment: out2,
     };
     assert!(
-        mp.pending_commitments_by_hash.get(&cm_key1, &mut ws).unwrap().is_some(),
+        mp.pending_commitments_by_hash
+            .get(&cm_key1, &mut ws)
+            .unwrap()
+            .is_some(),
         "output1 should be queued in pending_commitments_by_hash"
     );
     assert!(
-        mp.pending_commitments_by_hash.get(&cm_key2, &mut ws).unwrap().is_some(),
+        mp.pending_commitments_by_hash
+            .get(&cm_key2, &mut ws)
+            .unwrap()
+            .is_some(),
         "output2 should be queued in pending_commitments_by_hash"
     );
-    
+
     // recent_roots should be unchanged (roots computed at flush)
     let recent_after_t1 = mp.recent_roots.get(&mut ws).unwrap().unwrap();
     assert_eq!(recent_after_t1.len(), 1);
@@ -171,7 +175,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // so we can't even compute the "same_block_root" yet.
     // Instead, test that using a fabricated root fails.
     let fake_same_block_root = [0xFFu8; 32]; // A non-existent root
-    
+
     // Prepare another pre-verified transfer anchored to fake root - must fail.
     let nf2: Hash32 = make_nf(&domain, 0x9A, 0x22);
     let pub2 = SpendPublic {
@@ -240,11 +244,12 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     // recent_roots should now have initial + 2 new roots (one per commitment).
     let recent_after_flush = mp.recent_roots.get(&mut end_cp).unwrap().unwrap();
     assert_eq!(
-        recent_after_flush.len(), 3,
+        recent_after_flush.len(),
+        3,
         "recent_roots should have 3 entries: initial + 2 from flush"
     );
     assert_eq!(recent_after_flush.front().copied().unwrap(), initial_root);
-    
+
     // Get the final root after flush (this is the "same_block_root" that's now valid)
     let final_root = recent_after_flush.back().copied().unwrap();
 
@@ -267,13 +272,12 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
 
     // Block 2: transfer anchored to final_root now succeeds.
     let storage2 = sm.create_storage();
-    let cp2 =
-        StateCheckpoint::<TestSpec>::new(storage2, &MockKernel::<TestSpec>::default());
+    let cp2 = StateCheckpoint::<TestSpec>::new(storage2, &MockKernel::<TestSpec>::default());
     let scratchpad2 = cp2.to_tx_scratchpad();
     let tx2 = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
     let gas_meter2 = new_test_gas_meter::<TestSpec>();
     let mut ws2 = WorkingSet::<TestSpec>::create_working_set(scratchpad2, &tx2, gas_meter2);
-    
+
     // Prepare a new transfer anchored to final_root
     let nf2_new: Hash32 = make_nf(&domain, 0x9C, 0x25);
     let pub2_new = SpendPublic {
@@ -284,7 +288,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         view_attestations: None,
     };
     cache_pre_verified_spend(pub2_new.clone());
-    
+
     mp.call(
         CallMessage::Transfer {
             proof: Default::default(),
@@ -305,7 +309,10 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         commitment: pub2_new.output_commitments[0],
     };
     assert!(
-        mp.pending_commitments_by_hash.get(&cm_key_block2, &mut ws2).unwrap().is_some(),
+        mp.pending_commitments_by_hash
+            .get(&cm_key_block2, &mut ws2)
+            .unwrap()
+            .is_some(),
         "Block 2 commitment should be queued"
     );
 

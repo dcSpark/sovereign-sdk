@@ -5,8 +5,8 @@
 //! running into Rust's orphan rules.
 
 use anyhow::{Context, Result};
-pub use ligero_runner::{LigeroArg, LigeroConfig};
 use ligero_runner::sovereign_host::LigeroHostCore;
+pub use ligero_runner::{LigeroArg, LigeroConfig};
 use serde::Serialize;
 use sov_rollup_interface::zk::ZkvmHost;
 use std::ops::{Deref, DerefMut};

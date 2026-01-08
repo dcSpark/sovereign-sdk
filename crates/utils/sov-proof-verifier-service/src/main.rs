@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use axum::ServiceExt;
 use clap::Parser;
 use sov_address::MultiAddressEvm;
-use sov_midnight_da::storable::IncomingWorkerTxSaver;
 use sov_midnight_da::storable::service::StorableMidnightDaService;
+use sov_midnight_da::storable::IncomingWorkerTxSaver;
 use sov_proof_verifier_service::{create_router, AppState, ServiceConfig};
 use sov_stf_runner::{from_toml_path, RollupConfig};
 use std::net::SocketAddr;
@@ -145,7 +145,9 @@ async fn main() -> Result<()> {
     let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!("No value-setter method ID provided, will auto-compute from value_validator_rust.wasm");
+        info!(
+            "No value-setter method ID provided, will auto-compute from value_validator_rust.wasm"
+        );
         None
     };
 
@@ -172,8 +174,8 @@ async fn main() -> Result<()> {
     };
 
     // Create application state (loads signing key at startup)
-    let state = AppState::new_with_incoming_worker_tx_saver(config, incoming_worker_tx_saver)
-        .await?;
+    let state =
+        AppState::new_with_incoming_worker_tx_saver(config, incoming_worker_tx_saver).await?;
 
     // Create router
     let app = create_router(state);

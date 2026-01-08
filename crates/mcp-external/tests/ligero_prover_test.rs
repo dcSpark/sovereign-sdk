@@ -10,7 +10,8 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 }
 
 fn create_test_ligero() -> Option<Ligero> {
-    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
     let runner = LigeroRunner::new(&program);
     let prover = env_opt("LIGERO_PROVER_BIN")

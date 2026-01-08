@@ -93,7 +93,7 @@ pub trait TransactionAuthenticator<S: Spec> {
     fn encode_with_standard_auth(tx: RawTx) -> FullyBakedTx {
         Self::encode_authenticator_input(&Self::add_standard_auth(tx))
     }
-    
+
     /// Encode a pre-authenticated transaction (skips signature verification during execution).
     ///
     /// # Parameters
@@ -119,7 +119,7 @@ pub enum AuthenticatorInput {
     /// a `struct` to allow for future transaction types in a
     /// backwards-compatible way.
     Standard(RawTx),
-    
+
     /// A pre-authenticated transaction from a worker service.
     ///
     /// These transactions have already been verified off-chain (signature + proof)
@@ -158,7 +158,10 @@ where
         if !buf.is_empty() {
             // Log and ignore any leftover bytes after the authenticator input.
             // This can happen if upstream attached non-critical padding/metadata.
-            tracing::debug!(remaining = buf.len(), "decode_serialized_tx: trailing bytes after AuthenticatorInput; ignoring");
+            tracing::debug!(
+                remaining = buf.len(),
+                "decode_serialized_tx: trailing bytes after AuthenticatorInput; ignoring"
+            );
         }
 
         let raw_tx = match input {
@@ -176,25 +179,38 @@ where
         capabilities::AuthenticationOutput<S, Self::Decodable>,
         capabilities::AuthenticationError,
     > {
-        tracing::error!("🔴 RollupAuthenticator::authenticate called! tx.data len={}", tx.data.len());
-        
+        tracing::error!(
+            "🔴 RollupAuthenticator::authenticate called! tx.data len={}",
+            tx.data.len()
+        );
+
         // Streamed deserialize avoids strict EOF check which can trigger
         // "Not all bytes read" on benign trailing bytes. We ignore leftovers.
         let mut buf: &[u8] = &tx.data;
-        let input: AuthenticatorInput = borsh::BorshDeserialize::deserialize(&mut buf)
-            .map_err(|e| {
+        let input: AuthenticatorInput =
+            borsh::BorshDeserialize::deserialize(&mut buf).map_err(|e| {
                 tracing::error!("🔴 Failed to deserialize AuthenticatorInput: {}", e);
                 capabilities::fatal_deserialization_error::<_, S, _>(&tx.data, e, pre_exec_ws)
             })?;
         if !buf.is_empty() {
-            tracing::debug!(remaining = buf.len(), "authenticate: trailing bytes after AuthenticatorInput; ignoring");
+            tracing::debug!(
+                remaining = buf.len(),
+                "authenticate: trailing bytes after AuthenticatorInput; ignoring"
+            );
         }
 
         match input {
             AuthenticatorInput::Standard(raw_tx) => {
-                tracing::error!("🔵 Using STANDARD path (full signature verification) raw_tx len={}", raw_tx.data.len());
+                tracing::error!(
+                    "🔵 Using STANDARD path (full signature verification) raw_tx len={}",
+                    raw_tx.data.len()
+                );
                 // Standard path: full authentication with signature verification
-                crate::capabilities::authenticate::<_, S, Rt>(&raw_tx.data, &Rt::CHAIN_HASH, pre_exec_ws)
+                crate::capabilities::authenticate::<_, S, Rt>(
+                    &raw_tx.data,
+                    &Rt::CHAIN_HASH,
+                    pre_exec_ws,
+                )
             }
             AuthenticatorInput::PreAuthenticated(raw_tx, original_hash) => {
                 tracing::error!("🟢 Using PRE-AUTHENTICATED path (skip signature verification) original_hash={} raw_tx len={}", original_hash, raw_tx.data.len());
@@ -205,7 +221,7 @@ where
                     &raw_tx.data,
                     original_hash,
                     &Rt::CHAIN_HASH,
-                    pre_exec_ws
+                    pre_exec_ws,
                 )
             }
         }
@@ -216,9 +232,7 @@ where
         let mut buf: &[u8] = &tx.data;
         let input: AuthenticatorInput = borsh::BorshDeserialize::deserialize(&mut buf)?;
         match input {
-            AuthenticatorInput::Standard(raw_tx) => {
-                Ok(calculate_hash::<S>(&raw_tx.data))
-            }
+            AuthenticatorInput::Standard(raw_tx) => Ok(calculate_hash::<S>(&raw_tx.data)),
             AuthenticatorInput::PreAuthenticated(_raw_tx, original_hash) => {
                 // For pre-authenticated transactions, return the original hash
                 // (computed over the full transaction with proof)
@@ -517,7 +531,7 @@ pub fn authenticate_pre_verified<
                     raw_tx.len()
                 );
                 ok
-            },
+            }
 
             Err(MeteredBorshDeserializeError::GasError(e)) => {
                 return Err(AuthenticationError::OutOfGas(format!(

@@ -90,8 +90,10 @@ impl Ligero {
         public_output: &T,
     ) -> Result<Vec<u8>> {
         // Convert string args to LigeroProgramArguments
-        let ligero_args: Vec<LigeroProgramArguments> =
-            args.into_iter().map(|s| LigeroProgramArguments::STR { str: s }).collect();
+        let ligero_args: Vec<LigeroProgramArguments> = args
+            .into_iter()
+            .map(|s| LigeroProgramArguments::STR { str: s })
+            .collect();
 
         // For midnight-privacy, we need to serialize the public output and include it
         // The public output is handled by the guest program, so we just generate the proof normally
@@ -141,7 +143,8 @@ impl Ligero {
         let mut runner = LigeroRunner::new_with_paths(&program.to_string_lossy(), paths);
         runner.config_mut().packing = packing;
         runner.config_mut().gpu_threads = gpu_threads;
-        runner.config_mut().private_indices = private_indices.into_iter().map(|v| v as usize).collect();
+        runner.config_mut().private_indices =
+            private_indices.into_iter().map(|v| v as usize).collect();
         runner.config_mut().args = args
             .into_iter()
             .map(|a| match a {

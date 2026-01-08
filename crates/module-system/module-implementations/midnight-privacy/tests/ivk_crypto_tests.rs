@@ -81,7 +81,10 @@ fn ivk_encrypt_decrypt_roundtrip_from_privacy_address() {
     let spend_sk: Hash32 = [42u8; 32];
     let pk_spend = pk_from_sk(&spend_sk);
     let pk_ivk = pk_ivk_from_sk(&domain, &spend_sk);
-    assert_ne!(pk_spend, pk_ivk, "test expects a v2 (pk_spend, pk_ivk) address");
+    assert_ne!(
+        pk_spend, pk_ivk,
+        "test expects a v2 (pk_spend, pk_ivk) address"
+    );
 
     let addr = PrivacyAddress::from_keys(&pk_spend, &pk_ivk).to_string();
 
@@ -112,8 +115,7 @@ fn ivk_encrypt_decrypt_roundtrip_from_privacy_address() {
         .expect("encrypt");
 
     // Receiver-side: derive ivk_sk from spend_sk, compute the same DH using epk from tx, then decrypt.
-    let ivk_secret =
-        StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(&domain, &spend_sk)));
+    let ivk_secret = StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(&domain, &spend_sk)));
     let dh_receiver = ivk_secret.diffie_hellman(&epk);
     let (key2, nonce2) = ivk_aead_key_nonce(&domain, dh_receiver.as_bytes());
     let cipher2 = XChaCha20Poly1305::new(&key2);
@@ -129,4 +131,3 @@ fn ivk_encrypt_decrypt_roundtrip_from_privacy_address() {
 
     assert_eq!(pt, plaintext);
 }
-

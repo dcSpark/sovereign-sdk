@@ -102,9 +102,9 @@ pub fn make_viewer_bundle(
     sender_id: &Hash32,
     cm: &Hash32,
 ) -> anyhow::Result<(ViewAttestation, EncryptedNote)> {
-    let value_u64: u64 = value
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("note value does not fit into u64 (required by note_spend_guest v2)"))?;
+    let value_u64: u64 = value.try_into().map_err(|_| {
+        anyhow::anyhow!("note value does not fit into u64 (required by note_spend_guest v2)")
+    })?;
     let fvk_obj = FullViewingKey(*fvk);
     let fvk_c = fvk_commitment(&fvk_obj);
     let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id);

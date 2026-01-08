@@ -619,11 +619,7 @@ impl CryptoServer {
 
             if send_amount == 0 {
                 let _ = tx_store
-                    .mark_failed(
-                        &id,
-                        "Amount must be greater than 0",
-                        current_timestamp_ms(),
-                    )
+                    .mark_failed(&id, "Amount must be greater than 0", current_timestamp_ms())
                     .await;
                 return;
             }
@@ -686,7 +682,8 @@ impl CryptoServer {
                 match exact_match.or(smallest_sufficient) {
                     Some(n) => n,
                     None => {
-                        let total_balance: u128 = unified.unspent_notes.iter().map(|n| n.value).sum();
+                        let total_balance: u128 =
+                            unified.unspent_notes.iter().map(|n| n.value).sum();
                         let _ = tx_store
                             .mark_failed(
                                 &id,
@@ -708,7 +705,11 @@ impl CryptoServer {
                 "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
                 note.value,
                 note.tx_hash,
-                if note.value == send_amount { "exact match" } else { "smallest sufficient" }
+                if note.value == send_amount {
+                    "exact match"
+                } else {
+                    "smallest sufficient"
+                }
             );
 
             let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
@@ -753,7 +754,10 @@ impl CryptoServer {
 
             if send_amount < note.value {
                 let change_amt = note.value - send_amount;
-                tracing::info!("[send] Transfer includes change output - amount: {}", change_amt);
+                tracing::info!(
+                    "[send] Transfer includes change output - amount: {}",
+                    change_amt
+                );
             } else {
                 tracing::info!("[send] No change needed - sending full note value");
             }
@@ -1321,10 +1325,9 @@ impl CryptoServer {
                             "[auto-fund/createWallet] Deposit submitted: {}",
                             res.tx_hash
                         ),
-                        Err(e) => tracing::warn!(
-                            "[auto-fund/createWallet] Deposit attempt failed: {}",
-                            e
-                        ),
+                        Err(e) => {
+                            tracing::warn!("[auto-fund/createWallet] Deposit attempt failed: {}", e)
+                        }
                     }
                 });
             } else {

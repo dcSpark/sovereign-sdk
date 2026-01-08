@@ -14,7 +14,8 @@ fn env_opt(var: &str) -> Option<PathBuf> {
 #[allow(dead_code)]
 pub fn create_test_ligero() -> Option<Ligero> {
     // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
-    let program = env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let program =
+        env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
     // Create the runner using the program *specifier* (name or path). `ligero-runner` resolves internally.
     let runner = LigeroRunner::new(&program);

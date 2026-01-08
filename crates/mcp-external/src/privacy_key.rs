@@ -11,7 +11,9 @@
 //! - Deriving nullifier key: nf_key = H("NFKEY_V1" || domain || spend_sk)
 
 use anyhow::{Context, Result};
-use midnight_privacy::{nf_key_from_sk, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2, Hash32, PrivacyAddress};
+use midnight_privacy::{
+    nf_key_from_sk, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2, Hash32, PrivacyAddress,
+};
 
 /// Privacy key context that manages the spending secret key for privacy operations
 ///

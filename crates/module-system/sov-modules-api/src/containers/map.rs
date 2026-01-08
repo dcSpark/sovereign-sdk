@@ -14,12 +14,12 @@ use unwrap_infallible::UnwrapInfallible;
 
 use super::{Borrowed, BorrowedMut};
 use crate::state::StateReader;
+#[cfg(feature = "arbitrary")]
+use crate::InfallibleStateReaderAndWriter;
 #[cfg(feature = "native")]
 use crate::ProvenStateAccessor;
 #[cfg(feature = "native")]
 use crate::StateCheckpoint;
-#[cfg(feature = "arbitrary")]
-use crate::InfallibleStateReaderAndWriter;
 use crate::{StateReaderAndWriter, StateWriter};
 
 /// A container that maps keys to values.

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::io::{self, Write};
-use std::fs;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 
@@ -14,35 +14,35 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
+use ligetron::bn254fr_native::submod_checked;
+use ligetron::Bn254Fr;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     SpendPublic,
 };
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use rand::Rng;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::json;
+use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
-use sov_api_spec::types as api_types;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
+use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tempfile::TempDir;
 use toml::Value as TomlValue;
 
 use crate::{
-    find_rollup_binary, setup_ligero_env, start_local_verifier, wait_for_ready, ChildGuard,
-    LigeroEnv, load_authority_fvk, make_viewer_bundle,
+    find_rollup_binary, load_authority_fvk, make_viewer_bundle, setup_ligero_env,
+    start_local_verifier, wait_for_ready, ChildGuard, LigeroEnv,
 };
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
@@ -219,7 +219,9 @@ fn confirm_and_wipe_demo_data(crate_dir: &Path) -> Result<()> {
             bail!("Aborted by user; demo_data preserved");
         }
     } else {
-        eprintln!("[managed-mode] MANAGED_MODE_SKIP_CONFIRM=1 set, proceeding without confirmation");
+        eprintln!(
+            "[managed-mode] MANAGED_MODE_SKIP_CONFIRM=1 set, proceeding without confirmation"
+        );
     }
 
     fs::remove_dir_all(&demo_data)
@@ -490,7 +492,7 @@ fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()>
     use std::io::Write;
 
     eprintln!("{}", prompt);
-    
+
     if config.continuous {
         // In continuous mode, just sleep for cycle_delay_ms instead of waiting for user input
         std::thread::sleep(Duration::from_millis(config.cycle_delay_ms));
@@ -583,14 +585,12 @@ pub async fn run() -> Result<()> {
         managed_stack = Some(managed);
         (node, verifier)
     } else {
-        let node = config
-            .external_node_url
-            .clone()
-            .ok_or_else(|| anyhow!("E2E_ROLLUP_EXTERNAL_NODE_URL must be set unless MANAGED_MODE=1"))?;
-        let verifier = config
-            .external_verifier_url
-            .clone()
-            .ok_or_else(|| anyhow!("E2E_ROLLUP_EXTERNAL_VERIFIER_URL must be set unless MANAGED_MODE=1"))?;
+        let node = config.external_node_url.clone().ok_or_else(|| {
+            anyhow!("E2E_ROLLUP_EXTERNAL_NODE_URL must be set unless MANAGED_MODE=1")
+        })?;
+        let verifier = config.external_verifier_url.clone().ok_or_else(|| {
+            anyhow!("E2E_ROLLUP_EXTERNAL_VERIFIER_URL must be set unless MANAGED_MODE=1")
+        })?;
         (node, verifier)
     };
     eprintln!(
@@ -735,9 +735,7 @@ pub async fn run() -> Result<()> {
             max
         );
     } else {
-        eprintln!(
-            "\n[loop] Starting continuous transfer cycles (Ctrl+C to stop)..."
-        );
+        eprintln!("\n[loop] Starting continuous transfer cycles (Ctrl+C to stop)...");
     }
     let mut cycle_idx: u64 = 0;
     let mut total_transfers: usize = 0;
@@ -803,7 +801,8 @@ pub async fn run() -> Result<()> {
             ) => res?,
         };
 
-        total_transfers += summary.num_transfers; total_included += summary.num_included;
+        total_transfers += summary.num_transfers;
+        total_included += summary.num_included;
         for (block_number, count) in summary.batches {
             *total_batches.entry(block_number).or_insert(0) += count;
         }
@@ -1013,14 +1012,13 @@ async fn perform_initial_deposits(
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
         let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk);
 
-        let call =
-            RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
-                amount,
-                rho,
-                recipient,
-                gas: None,
-                view_fvks: None,
-            });
+        let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
+            amount,
+            rho,
+            recipient,
+            gas: None,
+            view_fvks: None,
+        });
 
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
             default_test_signed_transaction(
@@ -1055,7 +1053,8 @@ async fn perform_initial_deposits(
             bail!(
                 "Deposit for wallet {} failed via verifier with status {}: {}",
                 i,
-                status, body
+                status,
+                body
             );
         }
 
@@ -1073,16 +1072,19 @@ async fn perform_initial_deposits(
     }
 
     // Flush any queued deposits to the sequencer to ensure inclusion before proceeding.
-    let flush_endpoint = format!("{}/midnight-privacy/flush", verifier_url.trim_end_matches('/'));
-    let flush_resp = http.post(&flush_endpoint).send().await.context("Deposit flush request failed")?;
+    let flush_endpoint = format!(
+        "{}/midnight-privacy/flush",
+        verifier_url.trim_end_matches('/')
+    );
+    let flush_resp = http
+        .post(&flush_endpoint)
+        .send()
+        .await
+        .context("Deposit flush request failed")?;
     let status = flush_resp.status();
     let body = flush_resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!(
-            "Deposit flush failed with status {}: {}",
-            status,
-            body
-        );
+        bail!("Deposit flush failed with status {}: {}", status, body);
     } else if detailed_wallet_logs {
         eprintln!("[deposit] flushed queued deposits via {}", flush_endpoint);
     }
@@ -1100,7 +1102,13 @@ async fn perform_initial_deposits(
             .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
         let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
-        let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
+        let cm = note_commitment(
+            &DOMAIN,
+            value_u64,
+            &wallet.rho,
+            &recipient,
+            &wallet.sender_id,
+        );
         expected_commitments.push(cm);
     }
 
@@ -1176,14 +1184,24 @@ async fn fetch_initial_nonce(
     Ok(body.generation.unwrap_or(0))
 }
 
-async fn wait_for_sequencer_ready(http: &HttpClient, node_url: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_sequencer_ready(
+    http: &HttpClient,
+    node_url: &str,
+    timeout: Duration,
+) -> Result<()> {
     let start = Instant::now();
     let url = format!("{}/sequencer/ready", node_url.trim_end_matches('/'));
     loop {
         if start.elapsed() > timeout {
             bail!("Timeout waiting for sequencer readiness at {}", url);
         }
-        if http.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+        if http
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         sleep(Duration::from_millis(500)).await;
@@ -1206,28 +1224,32 @@ async fn perform_transfer_cycle(
     // Fetch tree state incrementally; reuse cached tree when possible to avoid O(n) rebuilds.
     let tree_rebuild_phase_start = Instant::now();
     let mut attempts_made = 0;
-    let mut mt = cached_tree.take().unwrap_or_else(|| MerkleTree::new(TREE_DEPTH));
+    let mut mt = cached_tree
+        .take()
+        .unwrap_or_else(|| MerkleTree::new(TREE_DEPTH));
     let mut pos_by_cm = std::mem::take(cached_pos_by_cm);
     let mut cached_root_val = *cached_root;
     let mut cached_next_pos = *cached_next_position;
     let (state, _state_root) = {
         let mut attempt_result = None;
         let mut used_fallback = false;
-        
+
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
             attempts_made = attempt + 1;
-            
+
             // On the last attempt, use bomb-proof full rebuild
             let force_full_rebuild = attempt == TREE_REBUILD_MAX_RETRIES - 1;
             if force_full_rebuild && !used_fallback {
-                eprintln!("[cycle] Incremental rebuild failed, falling back to full rebuild from scratch");
+                eprintln!(
+                    "[cycle] Incremental rebuild failed, falling back to full rebuild from scratch"
+                );
                 mt = MerkleTree::new(TREE_DEPTH);
                 pos_by_cm.clear();
                 cached_next_pos = 0;
                 cached_root_val = None;
                 used_fallback = true;
             }
-            
+
             let state_attempt: TreeState = client
                 .query_rest_endpoint("/modules/midnight-privacy/tree/state")
                 .await
@@ -1265,7 +1287,7 @@ async fn perform_transfer_cycle(
                 let batch_size = 1000;
                 let mut offset = cached_next_pos as usize;
                 let mut last_current_root: Option<Vec<u8>> = None;
-                
+
                 while offset < target_leaves {
                     let endpoint = format!(
                         "/modules/midnight-privacy/notes?limit={}&offset={}",
@@ -1281,7 +1303,7 @@ async fn perform_transfer_cycle(
                     if batch_resp.notes.is_empty() {
                         break;
                     }
-                    
+
                     // Capture current_root from the response for atomic consistency
                     if let Some(ref root) = batch_resp.current_root {
                         last_current_root = Some(root.clone());
@@ -1302,7 +1324,7 @@ async fn perform_transfer_cycle(
                     let len = batch_resp.notes.len();
                     offset += len;
                 }
-                
+
                 // Prefer using current_root from notes response (atomic with notes data)
                 // Fall back to state_attempt.root if not available
                 if let Some(ref api_root) = last_current_root {
@@ -1379,7 +1401,13 @@ async fn perform_transfer_cycle(
             .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
         let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
-        let cm = note_commitment(&DOMAIN, value_u64, &wallet.rho, &recipient, &wallet.sender_id);
+        let cm = note_commitment(
+            &DOMAIN,
+            value_u64,
+            &wallet.rho,
+            &recipient,
+            &wallet.sender_id,
+        );
         let mut position = pos_by_cm.get(&cm).copied();
 
         if position.is_none() {
@@ -1443,9 +1471,7 @@ async fn perform_transfer_cycle(
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 
     let depth_usize = TREE_DEPTH as usize;
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        config.max_concurrent_proofs,
-    ));
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_proofs));
     let mut proof_tasks = Vec::with_capacity(inputs.len());
 
     let authority_fvk = config.authority_fvk;
@@ -1725,81 +1751,95 @@ async fn perform_transfer_cycle(
         let detailed_logs = config.detailed_wallet_logs;
         let authority_fvk = authority_fvk; // Copy for closure
         let value = wallet.value; // The output value (same as input for pure transfer)
-        build_tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<BuiltTransfer> {
-            let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
-            let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
+        build_tasks.push(tokio::task::spawn_blocking(
+            move || -> anyhow::Result<BuiltTransfer> {
+                let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
+                let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
 
-            let value_u64: u64 = value
-                .try_into()
-                .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
-            let out_pk_spend = pk_from_sk(&out_spend_sk);
-            let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
-            let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
-            let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
-            let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
+                let value_u64: u64 = value.try_into().context(
+                    "note value does not fit into u64 (required by note_spend_guest v2)",
+                )?;
+                let out_pk_spend = pk_from_sk(&out_spend_sk);
+                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
+                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+                let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
-            // Build encrypted note for authority if configured
-            let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
-                Some(fvk) => {
-                    let cm_out =
-                        note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id);
-                    let (_att, enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id, &cm_out,
-                    )?;
-                    Some(vec![enc])
+                // Build encrypted note for authority if configured
+                let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+                    Some(fvk) => {
+                        let cm_out = note_commitment(
+                            &DOMAIN,
+                            value_u64,
+                            &out_rho,
+                            &out_recipient,
+                            &sender_id,
+                        );
+                        let (_att, enc) = make_viewer_bundle(
+                            &fvk,
+                            &DOMAIN,
+                            value,
+                            &out_rho,
+                            &out_recipient,
+                            &sender_id,
+                            &cm_out,
+                        )?;
+                        Some(vec![enc])
+                    }
+                    None => None,
+                };
+
+                let call =
+                    RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
+                        proof: proof_bytes
+                            .try_into()
+                            .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
+                        anchor_root,
+                        nullifier: nf,
+                        view_ciphertexts,
+                        gas: None,
+                    });
+
+                let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
+                    default_test_signed_transaction(
+                        &wallet.account.private_key,
+                        &call,
+                        wallet.nonce,
+                        &chain_hash,
+                    );
+
+                let mut meter =
+                    sov_modules_api::gas::UnlimitedGasMeter::<DemoRollupSpec>::default();
+                tx.verify(&chain_hash, &mut meter)
+                    .context("Transfer tx signature verify failed")?;
+
+                let tx_bytes = borsh::to_vec(&tx)?;
+                let tx_hash = tx.hash().to_string();
+                let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
+
+                if detailed_logs {
+                    eprintln!(
+                        "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
+                        wallet_idx,
+                        i + 1,
+                        wallet.nonce,
+                        tx_hash,
+                        hex::encode(&nf[..8])
+                    );
                 }
-                None => None,
-            };
 
-            let call =
-                RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
-                    proof: proof_bytes
-                        .try_into()
-                        .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
-                    anchor_root,
-                    nullifier: nf,
-                    view_ciphertexts,
-                    gas: None,
-                });
-
-            let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
-                default_test_signed_transaction(
-                    &wallet.account.private_key,
-                    &call,
-                    wallet.nonce,
-                    &chain_hash,
-                );
-
-            let mut meter = sov_modules_api::gas::UnlimitedGasMeter::<DemoRollupSpec>::default();
-            tx.verify(&chain_hash, &mut meter)
-                .context("Transfer tx signature verify failed")?;
-
-            let tx_bytes = borsh::to_vec(&tx)?;
-            let tx_hash = tx.hash().to_string();
-            let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
-
-            if detailed_logs {
-                eprintln!(
-                    "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
+                Ok(BuiltTransfer {
+                    idx: i,
                     wallet_idx,
-                    i + 1,
-                    wallet.nonce,
                     tx_hash,
-                    hex::encode(&nf[..8])
-                );
-            }
-
-            Ok(BuiltTransfer {
-                idx: i,
-                wallet_idx,
-                tx_hash,
-                tx_b64,
-                new_nonce: wallet.nonce + 1,
-                new_rho: out_rho,
-                new_spend_sk: out_spend_sk,
-                new_sender_id: sender_id,
-            })
-        }));
+                    tx_b64,
+                    new_nonce: wallet.nonce + 1,
+                    new_rho: out_rho,
+                    new_spend_sk: out_spend_sk,
+                    new_sender_id: sender_id,
+                })
+            },
+        ));
     }
 
     let mut built = Vec::with_capacity(build_tasks.len());
@@ -1972,10 +2012,7 @@ async fn perform_transfer_cycle(
     wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
     let flush_start = Instant::now();
     let resp = http
-        .post(format!(
-            "{}/midnight-privacy/flush",
-            verifier_url
-        ))
+        .post(format!("{}/midnight-privacy/flush", verifier_url))
         .send()
         .await
         .context("Submit to sequencer request failed")?;
@@ -1984,7 +2021,8 @@ async fn perform_transfer_cycle(
     if !status.is_success() {
         bail!(
             "Submit to sequencer endpoint returned status {}: {}",
-            status, body
+            status,
+            body
         );
     }
     let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
@@ -2028,15 +2066,20 @@ async fn perform_transfer_cycle(
         results: Vec<FlushResultEntry>,
     }
 
-    let flush: FlushSummary = serde_json::from_str(&body)
-        .context("Failed to parse submit to sequencer JSON response")?;
+    let flush: FlushSummary =
+        serde_json::from_str(&body).context("Failed to parse submit to sequencer JSON response")?;
     if config.detailed_wallet_logs {
         eprintln!(
             "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
             flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
         );
     } else {
-        eprintln!("[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)", flush_elapsed_ms, flush_elapsed_ms / flush.flushed as f64, flush.flushed as f64 / (flush_elapsed_ms / 1000.0));
+        eprintln!(
+            "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
+            flush_elapsed_ms,
+            flush_elapsed_ms / flush.flushed as f64,
+            flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
+        );
     }
 
     // Track per-tx sequencer times and breakdown for this cycle
@@ -2070,10 +2113,7 @@ async fn perform_transfer_cycle(
                 sequencer_metrics_by_hash.insert(hash, b);
             } else if let Some(ms) = entry.sequencer_ms {
                 if config.detailed_wallet_logs {
-                    eprintln!(
-                        "    [timing][sequencer] tx={} total_ms={:.2}",
-                        hash, ms
-                    );
+                    eprintln!("    [timing][sequencer] tx={} total_ms={:.2}", hash, ms);
                 }
                 sequencer_times_ms.insert(hash, ms);
             }
@@ -2166,20 +2206,15 @@ async fn perform_transfer_cycle(
         first_batch_number,
         last_batch_number,
     ) {
-        let span_ms = last_instant
-            .duration_since(first_instant)
-            .as_secs_f64()
-            * 1000.0;
+        let span_ms = last_instant.duration_since(first_instant).as_secs_f64() * 1000.0;
 
         fn format_time_hhmmss_millis(ts: SystemTime) -> String {
             match ts.duration_since(SystemTime::UNIX_EPOCH) {
-                Ok(dur) => {
-                    DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
-                        .map(|dt| dt.with_timezone(&Local))
-                        .unwrap_or_else(Local::now)
-                        .format("%Y-%m-%d %H:%M:%S%.3f")
-                        .to_string()
-                }
+                Ok(dur) => DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
+                    .map(|dt| dt.with_timezone(&Local))
+                    .unwrap_or_else(Local::now)
+                    .format("%Y-%m-%d %H:%M:%S%.3f")
+                    .to_string(),
                 Err(_) => "invalid-system-time".to_string(),
             }
         }
@@ -2196,9 +2231,11 @@ async fn perform_transfer_cycle(
         );
         eprintln!(
             "[cycle] Total span: {:.2} ms, {} blocks, {} total txs",
-            span_ms, batches.len(), num_included
+            span_ms,
+            batches.len(),
+            num_included
         );
-        
+
         // Per-block statistics
         for (block_num, tx_count) in &batches {
             eprintln!(
@@ -2243,7 +2280,7 @@ async fn perform_transfer_cycle(
     // This ensures the next cycle can find the note commitments for all wallets.
     const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
     const NOTE_SYNC_POLL_MS: u64 = 100;
-    
+
     // Collect expected output commitments for wallets that participated in this cycle
     let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
     for input in &inputs {
@@ -2258,21 +2295,22 @@ async fn perform_transfer_cycle(
         let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
         expected_commitments.push((expected_cm, input.wallet_idx));
     }
-    
+
     if !expected_commitments.is_empty() {
         let sync_start = Instant::now();
         let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
-        let mut pending: HashSet<[u8; 32]> = expected_commitments.iter().map(|(cm, _)| *cm).collect();
-        
+        let mut pending: HashSet<[u8; 32]> =
+            expected_commitments.iter().map(|(cm, _)| *cm).collect();
+
         while !pending.is_empty() && Instant::now() < sync_deadline {
             let fresh_positions = fetch_note_positions(client, false).await?;
             pending.retain(|cm| !fresh_positions.contains_key(cm));
-            
+
             if !pending.is_empty() {
                 sleep(Duration::from_millis(NOTE_SYNC_POLL_MS)).await;
             }
         }
-        
+
         let sync_elapsed = sync_start.elapsed();
         if pending.is_empty() {
             if config.detailed_wallet_logs {

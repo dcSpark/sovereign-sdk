@@ -48,9 +48,9 @@ use midnight_privacy::SpendPublic;
 use serde_json::json;
 use sov_ligero_adapter::{Ligero, LigeroHost, LigeroVerifier};
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, Zkvm, ZkvmHost};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
-use std::collections::HashMap;
 
 // Use Ligetron's native Poseidon2 for hash computations (same as the circuit!)
 use ligetron::bn254fr_native::submod_checked;
@@ -266,7 +266,12 @@ fn build_note_spend_args_v2(
         args.push(json!({"hex": hex32(&out.pk_spend)}));
         args.push(json!({"hex": hex32(&out.pk_ivk)}));
         args.push(json!({"hex": hex32(&out.cm)})); // public cm_out
-        private_indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx + 3]);
+        private_indices.extend_from_slice(&[
+            start_idx,
+            start_idx + 1,
+            start_idx + 2,
+            start_idx + 3,
+        ]);
     }
 
     // inv_enforce (private).
@@ -309,7 +314,11 @@ impl MerkleTree {
             let prev = default_nodes[level - 1];
             default_nodes[level] = mt_combine((level - 1) as u8, &prev, &prev);
         }
-        Self { depth, leaves: HashMap::new(), default_nodes }
+        Self {
+            depth,
+            leaves: HashMap::new(),
+            default_nodes,
+        }
     }
 
     fn set_leaf(&mut self, pos: usize, leaf: Hash32) {
@@ -376,8 +385,12 @@ struct LigeroTestConfig {
 impl LigeroTestConfig {
     /// Discover paths for note spend guest (complex hex arguments)
     fn discover() -> Result<Self> {
-        let program = std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
-        let config = Self { program, packing: 8192 };
+        let program =
+            std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+        let config = Self {
+            program,
+            packing: 8192,
+        };
 
         Ok(config)
     }
@@ -561,7 +574,10 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     let receiver_spend_sk: Hash32 = [42u8; 32];
     let receiver_pk_spend = pk_from_sk(&receiver_spend_sk);
     let receiver_pk_ivk = pk_ivk_from_sk(&domain, &receiver_spend_sk);
-    anyhow::ensure!(receiver_pk_spend != receiver_pk_ivk, "pk_spend unexpectedly equals pk_ivk");
+    anyhow::ensure!(
+        receiver_pk_spend != receiver_pk_ivk,
+        "pk_spend unexpectedly equals pk_ivk"
+    );
 
     let receiver_addr = PrivacyAddress::from_keys(&receiver_pk_spend, &receiver_pk_ivk).to_string();
     let parsed: PrivacyAddress = receiver_addr.parse().context("parse privacy address")?;
@@ -611,14 +627,15 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
         &[output],
     );
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
+    let mut host =
+        <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
     add_args_to_host(&mut host, &args)?;
     host.set_public_output(&public_output)?;
 
     let code_commitment = host.code_commitment();
     let proof_data = host.run(true).context("Failed to generate Ligero proof")?;
-    let verified: SpendPublic =
-        LigeroVerifier::verify(&proof_data, &code_commitment).context("Proof verification failed")?;
+    let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)
+        .context("Proof verification failed")?;
 
     let cm_out_from_proof = verified
         .output_commitments
@@ -644,7 +661,13 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     aad[32..].copy_from_slice(&cm_out_from_proof);
 
     let ct = cipher
-        .encrypt(&nonce, Payload { msg: &pt, aad: &aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &pt,
+                aad: &aad,
+            },
+        )
         .expect("encrypt");
 
     let tx_out = IvkEncryptedNote {
@@ -654,8 +677,10 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     };
 
     // --- Wallet scanning (receiver side): decrypt and verify cm matches proof output ---
-    let ivk_secret =
-        StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(&domain, &receiver_spend_sk)));
+    let ivk_secret = StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(
+        &domain,
+        &receiver_spend_sk,
+    )));
     let epk_from_tx = PublicKey::from(tx_out.epk);
     let dh_receiver = ivk_secret.diffie_hellman(&epk_from_tx);
     let (key2, nonce2) = ivk_aead_key_nonce(&domain, dh_receiver.as_bytes(), &tx_out.cm);
@@ -666,7 +691,13 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     aad2[32..].copy_from_slice(&tx_out.cm);
 
     let pt2 = cipher2
-        .decrypt(&nonce2, Payload { msg: tx_out.ct.as_ref(), aad: &aad2 })
+        .decrypt(
+            &nonce2,
+            Payload {
+                msg: tx_out.ct.as_ref(),
+                aad: &aad2,
+            },
+        )
         .context("decrypt")?;
 
     let (d_domain, d_value, d_rho, d_recipient, d_sender_id) = parse_note_plain(&pt2)?;
@@ -682,10 +713,17 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     // Negative: if the sender encrypts to pk_spend instead of pk_ivk, the receiver cannot decrypt.
     let pk_spend_as_pk_ivk = PublicKey::from(receiver_pk_spend);
     let dh_wrong = esk.diffie_hellman(&pk_spend_as_pk_ivk);
-    let (wrong_key, wrong_nonce) = ivk_aead_key_nonce(&domain, dh_wrong.as_bytes(), &cm_out_from_proof);
+    let (wrong_key, wrong_nonce) =
+        ivk_aead_key_nonce(&domain, dh_wrong.as_bytes(), &cm_out_from_proof);
     let wrong_cipher = XChaCha20Poly1305::new(&wrong_key);
     let wrong_ct = wrong_cipher
-        .encrypt(&wrong_nonce, Payload { msg: &pt, aad: &aad })
+        .encrypt(
+            &wrong_nonce,
+            Payload {
+                msg: &pt,
+                aad: &aad,
+            },
+        )
         .expect("encrypt (wrong pk)");
     let wrong_tx_out = IvkEncryptedNote {
         cm: cm_out_from_proof,
@@ -695,7 +733,13 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
 
     assert!(
         cipher2
-            .decrypt(&nonce2, Payload { msg: wrong_tx_out.ct.as_ref(), aad: &aad2 })
+            .decrypt(
+                &nonce2,
+                Payload {
+                    msg: wrong_tx_out.ct.as_ref(),
+                    aad: &aad2
+                }
+            )
             .is_err(),
         "decrypt unexpectedly succeeded with pk_spend-as-pk_ivk"
     );
@@ -721,14 +765,14 @@ fn test_simple_note_spend() -> Result<()> {
     let domain: Hash32 = [1u8; 32];
     let value: u64 = 100;
     let rho: Hash32 = [2u8; 32];
-    
+
     // Spending secret key (the master secret for this note)
     let spend_sk: Hash32 = [4u8; 32];
     let pk_ivk_owner: Hash32 = [6u8; 32];
-    
+
     // Derive recipient(owner) from (spend_sk, pk_ivk_owner) (matches the v2 guest program).
     let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
-    
+
     // Derive nullifier key from spend_sk (circuit does this internally too)
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
@@ -903,7 +947,10 @@ fn test_simple_note_spend() -> Result<()> {
         hex::encode(&verified_output.nullifier[..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
-    println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
+    println!(
+        "  - Outputs:   {} commitment(s)",
+        verified_output.output_commitments.len()
+    );
 
     println!("\n=== Performance Summary ===");
     println!(
@@ -956,14 +1003,14 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // Spending secret key (the master secret for this note)
     let spend_sk: Hash32 = [4u8; 32];
     let pk_ivk_owner: Hash32 = [6u8; 32];
-    
+
     // Derive recipient(owner) from (spend_sk, pk_ivk_owner) (matches the v2 guest program).
     let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
     println!(
         "✓ Derived recipient(owner) from spend_sk: {}",
         hex::encode(recipient_owner)
     );
-    
+
     // Derive nullifier key from spend_sk (circuit does this internally too)
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
     println!("✓ Derived nf_key from spend_sk: {}", hex::encode(nf_key));
@@ -1044,7 +1091,10 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
         hex::encode(public_output.nullifier)
     );
     println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
-    println!("  - Output commitments: {}", public_output.output_commitments.len());
+    println!(
+        "  - Output commitments: {}",
+        public_output.output_commitments.len()
+    );
 
     // ---- 6) Generate REAL ZK proof with Ligero ----
     println!("\nStep 6: Generating REAL ZK proof with Ligero...");
@@ -1152,7 +1202,10 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
         hex::encode(&verified_output.nullifier[..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
-    println!("  - Outputs:   {} commitment(s)", verified_output.output_commitments.len());
+    println!(
+        "  - Outputs:   {} commitment(s)",
+        verified_output.output_commitments.len()
+    );
 
     // ---- 8) Check nullifier consumption ----
     println!("\nStep 8: Validating spend conditions...");
@@ -1189,7 +1242,6 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 fn hex32(h: &Hash32) -> String {
     hex::encode(h)
 }
-
 
 /// Helper to discover guest program path and platform-specific binaries
 fn program_spec() -> String {
@@ -1369,10 +1421,14 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     // Fill config
     runner.config_mut().private_indices = private_indices.clone();
-    runner.config_mut().args = args.clone().into_iter().map(|v| {
-        // The test builds JSON values; decode to LigeroArg via serde_json.
-        serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
-    }).collect();
+    runner.config_mut().args = args
+        .clone()
+        .into_iter()
+        .map(|v| {
+            // The test builds JSON values; decode to LigeroArg via serde_json.
+            serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
+        })
+        .collect();
 
     // Generate proof bytes (default: compressed `proof_data.gz`; when gzip is disabled: `proof_data.bin`).
     let proof_bytes = runner
@@ -1383,7 +1439,10 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
         })
         .context("Failed to run webgpu_prover")?;
 
-    println!("✓ REAL proof generated successfully! ({} bytes)", proof_bytes.len());
+    println!(
+        "✓ REAL proof generated successfully! ({} bytes)",
+        proof_bytes.len()
+    );
 
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
@@ -1587,7 +1646,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     let withdraw_amount: u64 = 0;
     let withdraw_to: Hash32 = [0u8; 32];
-    
+
     // Create two output notes that sum to input value
     let out1_value: u64 = 600;
     let out1_rho = [10u8; 32];
@@ -1595,16 +1654,26 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     let out1_pk_ivk = out1_pk_spend;
     let out1_recipient = recipient_from_pk_v2(&domain, &out1_pk_spend, &out1_pk_ivk);
     let sender_id_out = recipient_owner;
-    let out1_cm =
-        note_commitment_v2(&domain, out1_value, &out1_rho, &out1_recipient, &sender_id_out);
+    let out1_cm = note_commitment_v2(
+        &domain,
+        out1_value,
+        &out1_rho,
+        &out1_recipient,
+        &sender_id_out,
+    );
 
     let out2_value: u64 = 400;
     let out2_rho = [20u8; 32];
     let out2_pk_spend = [21u8; 32];
     let out2_pk_ivk = out2_pk_spend;
     let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
-    let out2_cm =
-        note_commitment_v2(&domain, out2_value, &out2_rho, &out2_recipient, &sender_id_out);
+    let out2_cm = note_commitment_v2(
+        &domain,
+        out2_value,
+        &out2_rho,
+        &out2_recipient,
+        &sender_id_out,
+    );
 
     let program_path = config.program.clone();
     let input = SpendInputV2 {
@@ -1659,11 +1728,14 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     // Generate and verify the valid proof
     let proof_data = host.run(true)?;
     println!("✅ Proof generated successfully for VALID balanced spend");
-    
+
     let code_commitment = host.code_commitment();
     let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)?;
     println!("✅ Proof verified successfully");
-    println!("   Balance satisfied: {} == {} + {} + {}", value, withdraw_amount, out1_value, out2_value);
+    println!(
+        "   Balance satisfied: {} == {} + {} + {}",
+        value, withdraw_amount, out1_value, out2_value
+    );
     assert_eq!(verified.anchor_root, anchor);
     assert_eq!(verified.nullifier, nf);
     assert_eq!(verified.output_commitments.len(), 2);
@@ -1672,9 +1744,15 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("  Circuit constraint at line 286 in note_spend_guest.wasm:");
     println!("  assert_one((value == withdraw_amount + sum(outputs)) as i32)");
     println!();
-    println!("  Valid spend: {} == {} + {} + {} ✓", value, withdraw_amount, out1_value, out2_value);
-    println!("  Invalid spend (no outputs): {} != {} + 0 would violate constraint", value, withdraw_amount);
-    
+    println!(
+        "  Valid spend: {} == {} + {} + {} ✓",
+        value, withdraw_amount, out1_value, out2_value
+    );
+    println!(
+        "  Invalid spend (no outputs): {} != {} + 0 would violate constraint",
+        value, withdraw_amount
+    );
+
     Ok(())
 }
 
@@ -1724,7 +1802,13 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let change_recipient = recipient_from_pk_v2(&domain, &change_pk_spend, &change_pk_ivk);
     // Output sender_id is the spender's (owner) privacy address.
     let sender_id_out = recipient_owner;
-    let change_cm = note_commitment_v2(&domain, change_value, &change_rho, &change_recipient, &sender_id_out);
+    let change_cm = note_commitment_v2(
+        &domain,
+        change_value,
+        &change_rho,
+        &change_recipient,
+        &sender_id_out,
+    );
 
     let program_path = config.program.clone();
     let input = SpendInputV2 {
@@ -1795,7 +1879,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 }
 
 /// Test full transaction lifecycle: Deposit → Spend (2 outputs) → Withdraw
-/// 
+///
 /// This test demonstrates a complete privacy-preserving value flow:
 /// 1. **Deposit**: Create initial note with 1000 units
 /// 2. **Spend with 2 outputs**: Split into 600 + 400 (demonstrates value splitting)
@@ -1808,7 +1892,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     // Setup
     setup_ligero_env()?;
     let program_path = setup_ligero_env()?;
-    
+
     const TREE_DEPTH: u8 = 16;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain: Hash32 = [1u8; 32];
@@ -1818,21 +1902,21 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     // PHASE 1: DEPOSIT - Create initial note
     // ========================================================================
     println!("━━━ PHASE 1: DEPOSIT ━━━");
-    
+
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
     let deposit_spend_sk: Hash32 = [12u8; 32]; // SECRET spending key
-    // Derive recipient and nf_key from spend_sk (same as circuit does)
+                                               // Derive recipient and nf_key from spend_sk (same as circuit does)
     let deposit_recipient = recipient_from_sk(&domain, &deposit_spend_sk);
     let deposit_nf_key = nf_key_from_sk(&domain, &deposit_spend_sk);
-    
+
     let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
     let deposit_pos = next_position;
     next_position += 1;
-    
+
     tree.set_leaf(deposit_pos as usize, deposit_cm);
     let anchor_after_deposit = tree.root();
-    
+
     println!("✓ Deposited note:");
     println!("  Value:       {}", initial_value);
     println!("  Commitment:  {}", hex::encode(&deposit_cm[..8]));
@@ -1842,12 +1926,15 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     // ========================================================================
     // PHASE 2: SPEND WITH 2 OUTPUTS - Split value into two notes
     // ========================================================================
-    println!("\n━━━ PHASE 2: SPEND (2 outputs) - Split {} into 600 + 400 ━━━", initial_value);
-    
+    println!(
+        "\n━━━ PHASE 2: SPEND (2 outputs) - Split {} into 600 + 400 ━━━",
+        initial_value
+    );
+
     // Prepare to spend the deposit note
     let deposit_siblings = tree.open(deposit_pos as usize);
     let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
-    
+
     // Create 2 output notes (using proper key hierarchy: spend_sk -> pk -> recipient)
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
@@ -1855,39 +1942,58 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     let out1_pk = pk_from_sk(&out1_spend_sk); // Derive pk from spend_sk
     let out1_recipient = recipient_from_pk(&domain, &out1_pk);
     let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
-    
+
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
     let out2_spend_sk: Hash32 = [31u8; 32]; // Secret key for output 2 recipient
     let out2_pk = pk_from_sk(&out2_spend_sk);
     let out2_recipient = recipient_from_pk(&domain, &out2_pk);
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
-    
+
     let n_out_phase2: u32 = 2;
     let withdraw_amount_phase2: u128 = 0;
-    
-    println!("  Input:  {} units (nullifier: {})", initial_value, hex::encode(&deposit_nf[..8]));
-    println!("  Output 1: {} units (cm: {})", out1_value, hex::encode(&out1_cm[..8]));
-    println!("  Output 2: {} units (cm: {})", out2_value, hex::encode(&out2_cm[..8]));
+
+    println!(
+        "  Input:  {} units (nullifier: {})",
+        initial_value,
+        hex::encode(&deposit_nf[..8])
+    );
+    println!(
+        "  Output 1: {} units (cm: {})",
+        out1_value,
+        hex::encode(&out1_cm[..8])
+    );
+    println!(
+        "  Output 2: {} units (cm: {})",
+        out2_value,
+        hex::encode(&out2_cm[..8])
+    );
     println!("  Withdraw: {} units", withdraw_amount_phase2);
-    println!("  ✓ Balance: {} = {} + {} + {}", initial_value, out1_value, out2_value, withdraw_amount_phase2);
-    
+    println!(
+        "  ✓ Balance: {} = {} + {} + {}",
+        initial_value, out1_value, out2_value, withdraw_amount_phase2
+    );
+
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
     let depth = TREE_DEPTH as usize;
     let mut private_indices_phase2: Vec<usize> = vec![3, 4, 5]; // rho, recipient, spend_sk
-    for i in 0..depth { private_indices_phase2.push(7 + i); } // position bits
-    for i in 0..depth { private_indices_phase2.push(7 + depth + i); } // siblings
+    for i in 0..depth {
+        private_indices_phase2.push(7 + i);
+    } // position bits
+    for i in 0..depth {
+        private_indices_phase2.push(7 + depth + i);
+    } // siblings
     let out_base2 = 11 + 2 * depth;
     // Output 0: rho, pk
     private_indices_phase2.push(out_base2 + 1); // out1_rho
     private_indices_phase2.push(out_base2 + 2); // out1_pk
-    // Output 1: rho, pk
+                                                // Output 1: rho, pk
     private_indices_phase2.push(out_base2 + 5); // out2_rho
     private_indices_phase2.push(out_base2 + 6); // out2_pk
-    
+
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
-    
+
     // === NEW ARGUMENT ORDER ===
     host2.add_hex_arg(hex::encode(domain)); // 1: domain
     host2.add_u64_arg(initial_value as u64); // 2: value
@@ -1924,7 +2030,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     host2.add_hex_arg(hex::encode(out2_rho));
     host2.add_hex_arg(hex::encode(out2_pk));
     host2.add_hex_arg(hex::encode(out2_cm));
-    
+
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
         nullifier: deposit_nf,
@@ -1932,78 +2038,103 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
     };
-    
+
     host2.set_public_output(&public2)?;
-    
+
     println!("\n  Generating proof for 2-output spend...");
     let proof_start2 = Instant::now();
     let proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
     let proof_time2 = proof_start2.elapsed().as_secs_f64();
-    println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data2.len(), proof_time2);
-    
+    println!(
+        "  ✓ Proof generated ({} bytes, {:.3}s)",
+        proof_data2.len(),
+        proof_time2
+    );
+
     println!("  Verifying proof...");
     let code_commitment2 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
     let verify_start2 = Instant::now();
     let verified2: SpendPublic = LigeroVerifier::verify(&proof_data2, &code_commitment2)
         .context("Phase 2 proof verification failed")?;
     let verify_time2 = verify_start2.elapsed().as_secs_f64();
-    
+
     assert_eq!(verified2.nullifier, deposit_nf);
     assert_eq!(verified2.output_commitments.len(), 2);
     assert_eq!(verified2.output_commitments[0], out1_cm);
     assert_eq!(verified2.output_commitments[1], out2_cm);
     println!("  ✓ Proof verified ({:.3}s)", verify_time2);
-    
+
     // Add the 2 output notes to tree
     let out1_pos = next_position;
     next_position += 1;
     tree.set_leaf(out1_pos as usize, out1_cm);
-    
+
     let out2_pos = next_position;
     next_position += 1;
     tree.set_leaf(out2_pos as usize, out2_cm);
-    
+
     let anchor_after_split = tree.root();
-    println!("  ✓ Added outputs to tree at positions {} and {}", out1_pos, out2_pos);
+    println!(
+        "  ✓ Added outputs to tree at positions {} and {}",
+        out1_pos, out2_pos
+    );
     println!("  ✓ New anchor: {}", hex::encode(&anchor_after_split[..8]));
 
     // ========================================================================
     // PHASE 3: WITHDRAW - Spend first output note, withdraw some, get change
     // ========================================================================
-    println!("\n━━━ PHASE 3: WITHDRAW - Spend {} note, withdraw 200, get 400 change ━━━", out1_value);
-    
+    println!(
+        "\n━━━ PHASE 3: WITHDRAW - Spend {} note, withdraw 200, get 400 change ━━━",
+        out1_value
+    );
+
     // We'll spend the first output (600 units) and withdraw 200
     // Use the same spend_sk that was used to derive out1's recipient
     // (out1_spend_sk was defined in Phase 2 as [21u8; 32])
     let out1_nf_key = nf_key_from_sk(&domain, &out1_spend_sk);
     let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
-    
+
     let withdraw_amount_phase3: u128 = 200;
     let change_value: u128 = out1_value - withdraw_amount_phase3; // 400
     let change_rho: Hash32 = [50u8; 32];
     let change_pk: Hash32 = [51u8; 32];
     let change_recipient = recipient_from_pk(&domain, &change_pk);
     let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
-    
+
     let n_out_phase3: u32 = 1;
-    
-    println!("  Input:  {} units (nullifier: {})", out1_value, hex::encode(&out1_nf[..8]));
-    println!("  Output: {} units (change, cm: {})", change_value, hex::encode(&change_cm[..8]));
+
+    println!(
+        "  Input:  {} units (nullifier: {})",
+        out1_value,
+        hex::encode(&out1_nf[..8])
+    );
+    println!(
+        "  Output: {} units (change, cm: {})",
+        change_value,
+        hex::encode(&change_cm[..8])
+    );
     println!("  Withdraw: {} units (transparent)", withdraw_amount_phase3);
-    println!("  ✓ Balance: {} = {} + {}", out1_value, change_value, withdraw_amount_phase3);
-    
+    println!(
+        "  ✓ Balance: {} = {} + {}",
+        out1_value, change_value, withdraw_amount_phase3
+    );
+
     // === NEW CIRCUIT ARGUMENT LAYOUT ===
     let mut private_indices_phase3: Vec<usize> = vec![3, 4, 5]; // rho, recipient, spend_sk
-    for i in 0..depth { private_indices_phase3.push(7 + i); } // position bits
-    for i in 0..depth { private_indices_phase3.push(7 + depth + i); } // siblings
+    for i in 0..depth {
+        private_indices_phase3.push(7 + i);
+    } // position bits
+    for i in 0..depth {
+        private_indices_phase3.push(7 + depth + i);
+    } // siblings
     let out_base3 = 11 + 2 * depth;
     private_indices_phase3.push(out_base3 + 1); // change_rho
     private_indices_phase3.push(out_base3 + 2); // change_pk
-    
+
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
-    
+
     // === NEW ARGUMENT ORDER ===
     host3.add_hex_arg(hex::encode(domain)); // 1: domain
     host3.add_u64_arg(out1_value as u64); // 2: value
@@ -2035,7 +2166,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     host3.add_hex_arg(hex::encode(change_rho));
     host3.add_hex_arg(hex::encode(change_pk));
     host3.add_hex_arg(hex::encode(change_cm));
-    
+
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
         nullifier: out1_nf,
@@ -2043,28 +2174,32 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
         output_commitments: vec![change_cm],
         view_attestations: None,
     };
-    
+
     host3.set_public_output(&public3)?;
-    
+
     println!("\n  Generating proof for withdraw...");
     let proof_start3 = Instant::now();
     let proof_data3 = host3.run(true).context("Phase 3 proof generation failed")?;
     let proof_time3 = proof_start3.elapsed().as_secs_f64();
-    println!("  ✓ Proof generated ({} bytes, {:.3}s)", proof_data3.len(), proof_time3);
-    
+    println!(
+        "  ✓ Proof generated ({} bytes, {:.3}s)",
+        proof_data3.len(),
+        proof_time3
+    );
+
     println!("  Verifying proof...");
     let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
     let verify_start3 = Instant::now();
     let verified3: SpendPublic = LigeroVerifier::verify(&proof_data3, &code_commitment3)
         .context("Phase 3 proof verification failed")?;
     let verify_time3 = verify_start3.elapsed().as_secs_f64();
-    
+
     assert_eq!(verified3.nullifier, out1_nf);
     assert_eq!(verified3.withdraw_amount, withdraw_amount_phase3);
     assert_eq!(verified3.output_commitments.len(), 1);
     assert_eq!(verified3.output_commitments[0], change_cm);
     println!("  ✓ Proof verified ({:.3}s)", verify_time3);
-    
+
     // Add change to tree
     let change_pos = next_position;
     tree.set_leaf(change_pos as usize, change_cm);
@@ -2080,10 +2215,14 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("\nTransaction Flow:");
     println!("  1. Deposit:       1000 units → Note@pos{}", deposit_pos);
-    println!("  2. Split spend:   Note@pos{} → Note@pos{}(600) + Note@pos{}(400)", 
-             deposit_pos, out1_pos, out2_pos);
-    println!("  3. Withdraw:      Note@pos{}(600) → Transparent(200) + Note@pos{}(400)", 
-             out1_pos, change_pos);
+    println!(
+        "  2. Split spend:   Note@pos{} → Note@pos{}(600) + Note@pos{}(400)",
+        deposit_pos, out1_pos, out2_pos
+    );
+    println!(
+        "  3. Withdraw:      Note@pos{}(600) → Transparent(200) + Note@pos{}(400)",
+        out1_pos, change_pos
+    );
     println!("\nNullifiers consumed:");
     println!("  • {}", hex::encode(&deposit_nf[..16]));
     println!("  • {}", hex::encode(&out1_nf[..16]));
@@ -2092,16 +2231,25 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     println!("  • After split: 2 notes (600 + 400 units)");
     println!("  • After withdraw: 2 notes (400 + 400 units, 200 withdrawn)");
     println!("\nPerformance:");
-    println!("  • Phase 2 proof: {:.3}s generation, {:.3}s verification", proof_time2, verify_time2);
-    println!("  • Phase 3 proof: {:.3}s generation, {:.3}s verification", proof_time3, verify_time3);
-    println!("  • Total:         {:.3}s", proof_time2 + verify_time2 + proof_time3 + verify_time3);
-    
+    println!(
+        "  • Phase 2 proof: {:.3}s generation, {:.3}s verification",
+        proof_time2, verify_time2
+    );
+    println!(
+        "  • Phase 3 proof: {:.3}s generation, {:.3}s verification",
+        proof_time3, verify_time3
+    );
+    println!(
+        "  • Total:         {:.3}s",
+        proof_time2 + verify_time2 + proof_time3 + verify_time3
+    );
+
     println!("\n🎉 Successfully demonstrated full privacy-preserving value flow!");
     println!("   ✓ Deposit → Shielded pool");
     println!("   ✓ Split into multiple notes (privacy set expansion)");
     println!("   ✓ Partial withdrawal with change");
     println!("   ✓ All proofs verified with correct balance enforcement");
-    
+
     Ok(())
 }
 
@@ -2161,10 +2309,20 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
 
     let sender_id_out_phase2 = deposit_recipient; // v2 guest sets sender_id = owner_addr
-    let out1_cm =
-        note_commitment_v2(&domain, out1_value, &out1_rho, &out1_recipient, &sender_id_out_phase2);
-    let out2_cm =
-        note_commitment_v2(&domain, out2_value, &out2_rho, &out2_recipient, &sender_id_out_phase2);
+    let out1_cm = note_commitment_v2(
+        &domain,
+        out1_value,
+        &out1_rho,
+        &out1_recipient,
+        &sender_id_out_phase2,
+    );
+    let out2_cm = note_commitment_v2(
+        &domain,
+        out2_value,
+        &out2_rho,
+        &out2_recipient,
+        &sender_id_out_phase2,
+    );
 
     let input2 = SpendInputV2 {
         value: deposit_value,
@@ -2216,8 +2374,8 @@ fn test_full_transaction_lifecycle() -> Result<()> {
 
     let code_commitment2 = host2.code_commitment();
     let proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
-    let verified2: SpendPublic =
-        LigeroVerifier::verify(&proof_data2, &code_commitment2).context("Phase 2 proof verification failed")?;
+    let verified2: SpendPublic = LigeroVerifier::verify(&proof_data2, &code_commitment2)
+        .context("Phase 2 proof verification failed")?;
     assert_eq!(verified2.output_commitments, vec![out1_cm, out2_cm]);
 
     let out1_pos = next_position;
@@ -2248,7 +2406,13 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     };
 
     // Change goes back to the same recipient as out1; sender_id_out becomes out1's owner address.
-    let change_cm = note_commitment_v2(&domain, change_value, &change_rho, &out1_recipient, &out1_recipient);
+    let change_cm = note_commitment_v2(
+        &domain,
+        change_value,
+        &change_rho,
+        &out1_recipient,
+        &out1_recipient,
+    );
     let change_out = SpendOutputV2 {
         value: change_value,
         rho: change_rho,
@@ -2284,23 +2448,20 @@ fn test_full_transaction_lifecycle() -> Result<()> {
 
     let code_commitment3 = host3.code_commitment();
     let proof_data3 = host3.run(true).context("Phase 3 proof generation failed")?;
-    let verified3: SpendPublic =
-        LigeroVerifier::verify(&proof_data3, &code_commitment3).context("Phase 3 proof verification failed")?;
+    let verified3: SpendPublic = LigeroVerifier::verify(&proof_data3, &code_commitment3)
+        .context("Phase 3 proof verification failed")?;
     assert_eq!(verified3.output_commitments, vec![change_cm]);
 
     println!(
         "✓ lifecycle complete: deposit_pos={}, out1_pos={}, out2_pos={}, change_pos={}",
-        deposit_pos,
-        out1_pos,
-        out2_pos,
-        next_position
+        deposit_pos, out1_pos, out2_pos, next_position
     );
 
     Ok(())
 }
 
 /// Test that circuit rejects over-withdrawal attempts (trying to withdraw more than note value)
-/// 
+///
 /// This test demonstrates circuit-level balance enforcement preventing theft/inflation:
 /// 1. **Deposit**: Create note with 1000 units
 /// 2. **Split**: Create 600 + 400 notes
@@ -2338,8 +2499,14 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     let withdraw_to: Hash32 = [55u8; 32];
 
     println!("  Note value:      {} units", value);
-    println!("  Withdraw attempt: {} units (OVER-WITHDRAWAL)", withdraw_amount);
-    println!("  Expected: must be rejected because {} != {} + 0", value, withdraw_amount);
+    println!(
+        "  Withdraw attempt: {} units (OVER-WITHDRAWAL)",
+        withdraw_amount
+    );
+    println!(
+        "  Expected: must be rejected because {} != {} + 0",
+        value, withdraw_amount
+    );
 
     let input = SpendInputV2 {
         value,
@@ -2361,8 +2528,8 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
         &[],
     );
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_private_indices(private_indices);
+    let mut host =
+        <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
     add_args_to_host(&mut host, &args)?;
 
     let public = SpendPublic {
@@ -2380,8 +2547,10 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
             println!("✅ Proof generation failed as expected: {e}");
         }
         Ok(proof_data) => {
-            let code_commitment = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
-            let verify_res: Result<SpendPublic> = LigeroVerifier::verify(&proof_data, &code_commitment);
+            let code_commitment =
+                <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
+            let verify_res: Result<SpendPublic> =
+                LigeroVerifier::verify(&proof_data, &code_commitment);
             assert!(
                 verify_res.is_err(),
                 "over-withdrawal proof unexpectedly verified (should be rejected)"

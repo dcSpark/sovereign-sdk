@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use borsh::{BorshDeserialize, BorshSerialize};
+#[cfg(feature = "native")]
+use midnight_privacy::prime_pre_verified_spend;
+use midnight_privacy::SpendPublic;
 use sov_blob_sender::{BlobExecutionStatus, BlobInternalId, BlobSenderHooks};
 use sov_db::ledger_db::LedgerDb;
 use sov_modules_api::capabilities::{AuthenticationOutput, TransactionAuthenticator};
@@ -18,21 +21,19 @@ use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::*;
 use sov_modules_stf_blueprint::{PreExecError, Runtime};
 use sov_rest_utils::{json_obj, to_json_object};
-#[cfg(feature = "native")]
-use midnight_privacy::prime_pre_verified_spend;
-use midnight_privacy::SpendPublic;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::ledger_api::{ItemOrHash, LedgerStateProvider, QueryMode};
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
-use tokio::time::timeout;
 use tokio::task_local;
+use tokio::time::timeout;
 use tracing::{info, trace};
 
 // Global cache of pre-authenticated transaction hashes
 // Transactions in this set have been verified by the worker and can skip signature verification
-static PRE_AUTHENTICATED_TXS: OnceLock<StdMutex<std::collections::HashSet<TxHash>>> = OnceLock::new();
+static PRE_AUTHENTICATED_TXS: OnceLock<StdMutex<std::collections::HashSet<TxHash>>> =
+    OnceLock::new();
 
 fn get_pre_auth_cache() -> &'static StdMutex<std::collections::HashSet<TxHash>> {
     PRE_AUTHENTICATED_TXS.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
@@ -130,15 +131,17 @@ pub struct SequencerMetrics {
 }
 
 // Global cache of per-transaction sequencer metrics keyed by tx hash.
-static SEQUENCER_METRICS: OnceLock<StdMutex<HashMap<TxHash, SequencerMetrics>>> =
-    OnceLock::new();
+static SEQUENCER_METRICS: OnceLock<StdMutex<HashMap<TxHash, SequencerMetrics>>> = OnceLock::new();
 
 fn sequencer_metrics_map() -> &'static StdMutex<HashMap<TxHash, SequencerMetrics>> {
     SEQUENCER_METRICS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 pub(crate) fn cache_sequencer_metrics(tx_hash: TxHash, metrics: SequencerMetrics) {
-    let _ = sequencer_metrics_map().lock().unwrap().insert(tx_hash, metrics);
+    let _ = sequencer_metrics_map()
+        .lock()
+        .unwrap()
+        .insert(tx_hash, metrics);
 }
 
 pub(crate) fn take_sequencer_metrics(tx_hash: &TxHash) -> Option<SequencerMetrics> {

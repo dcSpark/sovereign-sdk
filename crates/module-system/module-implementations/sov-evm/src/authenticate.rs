@@ -265,9 +265,12 @@ where
     > {
         // Streamed deserialize to be tolerant to trailing bytes
         let mut buf: &[u8] = &tx.data;
-        let input: EvmAuthenticatorInput = BorshDeserialize::deserialize(&mut buf).map_err(|e| {
-            sov_modules_api::capabilities::fatal_deserialization_error::<_, S, _>(&tx.data, e, state)
-        })?;
+        let input: EvmAuthenticatorInput =
+            BorshDeserialize::deserialize(&mut buf).map_err(|e| {
+                sov_modules_api::capabilities::fatal_deserialization_error::<_, S, _>(
+                    &tx.data, e, state,
+                )
+            })?;
 
         match input {
             EvmAuthenticatorInput::Evm(tx) => {
@@ -326,7 +329,9 @@ where
                 Ok(TxHash::new(**tx.hash()))
             }
             EvmAuthenticatorInput::Standard(tx) => Ok(capabilities::calculate_hash::<S>(&tx.data)),
-            EvmAuthenticatorInput::StandardPreAuthenticated(_tx, original_hash) => Ok(original_hash),
+            EvmAuthenticatorInput::StandardPreAuthenticated(_tx, original_hash) => {
+                Ok(original_hash)
+            }
         }
     }
 

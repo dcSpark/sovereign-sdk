@@ -28,7 +28,9 @@ mod tests {
 
     use crate::storable::layer::StorableMidnightDaLayer;
     use crate::storable::service::StorableMidnightDaService;
-    use crate::{BlockProducingConfig, IncomingWorkerTxSaveMode, MidnightAddress, MidnightDaConfig};
+    use crate::{
+        BlockProducingConfig, IncomingWorkerTxSaveMode, MidnightAddress, MidnightDaConfig,
+    };
 
     #[tokio::test(flavor = "multi_thread")]
     async fn manually_triggered_blocks_are_fetched_after_await() -> anyhow::Result<()> {
@@ -179,8 +181,11 @@ mod tests {
             for sender in [TestDaSender::One, TestDaSender::Two, TestDaSender::Three] {
                 da_services.insert(
                     sender,
-                    StorableMidnightDaService::new_manual_producing(sender.address(), da_layer.clone())
-                        .await,
+                    StorableMidnightDaService::new_manual_producing(
+                        sender.address(),
+                        da_layer.clone(),
+                    )
+                    .await,
                 );
             }
 

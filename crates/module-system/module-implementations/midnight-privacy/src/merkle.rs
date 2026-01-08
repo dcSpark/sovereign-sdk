@@ -71,7 +71,11 @@ impl MerkleTree {
             levels.push(vec![defaults[lvl]; len]);
         }
 
-        Self { depth, levels, defaults }
+        Self {
+            depth,
+            levels,
+            defaults,
+        }
     }
 
     /// Return the tree depth (number of levels from leaves to root).
@@ -127,9 +131,7 @@ impl MerkleTree {
     /// Panics if the new depth would exceed `MAX_TREE_DEPTH`.
     fn grow_one(&mut self) {
         let old_depth = self.depth;
-        let new_depth = old_depth
-            .checked_add(1)
-            .expect("MerkleTree depth overflow");
+        let new_depth = old_depth.checked_add(1).expect("MerkleTree depth overflow");
 
         assert!(
             new_depth <= MAX_TREE_DEPTH,
