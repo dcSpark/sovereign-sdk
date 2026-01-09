@@ -21,20 +21,12 @@ RUN apt-get update \
        curl \
        ca-certificates \
        git \
-       openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
-# If you build with private git dependencies, use SSH forwarding:
-#   DOCKER_BUILDKIT=1 docker build --ssh default -f crates/mcp-external/Dockerfile .
-#
-# Cargo dependencies use https URLs, so we rewrite them to SSH inside the build.
-RUN --mount=type=ssh \
-    mkdir -p -m 0700 /root/.ssh \
-    && ssh-keyscan github.com >> /root/.ssh/known_hosts \
-    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
-    && cargo build --locked --release -p mcp-external
+# Build using HTTPS for git dependencies to avoid requiring SSH keys.
+RUN cargo build --locked --release -p mcp-external
 
 # ---------------------------------------------------------------------
 # Fetch Ligero runtime assets (binaries + shader) from ligero-prover
@@ -44,17 +36,17 @@ RUN --mount=type=ssh \
 # ---------------------------------------------------------------------
 # Use the Ligero repo branch that includes `ligero-runner` and the prebuilt circuits in
 # `utils/circuits/bins/`.
-ARG LIGERO_PROVER_REF=feature/midnight-l2
+ARG LIGERO_PROVER_REF=main
 ARG TARGETARCH
-RUN --mount=type=ssh set -eux; \
+RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
       amd64) LIGERO_PLATFORM="linux-amd64" ;; \
       arm64) LIGERO_PLATFORM="linux-arm64" ;; \
-      *) echo "Unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+      *) LIGERO_PLATFORM="linux-arm64" ;; \
     esac; \
     mkdir -p /opt/ligero/bin /opt/ligero/lib /opt/ligero/shader /opt/ligero/programs; \
     tmpdir="$(mktemp -d)"; \
-    git clone --depth 1 --branch "${LIGERO_PROVER_REF}" git@github.com:dcSpark/ligero-prover.git "${tmpdir}/ligero-prover"; \
+    git clone --depth 1 --branch "${LIGERO_PROVER_REF}" https://github.com/dcSpark/ligero-prover.git "${tmpdir}/ligero-prover"; \
     root="${tmpdir}/ligero-prover"; \
     cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/bin/." /opt/ligero/bin/; \
     cp -a "${root}/utils/portable-binaries/${LIGERO_PLATFORM}/lib/." /opt/ligero/lib/; \
