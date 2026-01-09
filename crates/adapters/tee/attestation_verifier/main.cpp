@@ -281,6 +281,7 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
         {"attestation-type",            "/x-ms-isolation-tee/x-ms-attestation-type"},
         {"compliance-status",           "/x-ms-isolation-tee/x-ms-compliance-status"},
         {"secureboot",                  "/secureboot"},
+        {"vm_id",                       "/x-ms-azurevm-vmid"},
         {"kerneldebug-enabled",         "/x-ms-azurevm-kerneldebug-enabled"},
         {"imageId",                     "/x-ms-isolation-tee/x-ms-sevsnpvm-imageId"},
         {"microcode-svn",               "/x-ms-isolation-tee/x-ms-sevsnpvm-microcode-svn"},
@@ -313,7 +314,7 @@ void check_policy(jwt::traits::nlohmann_json::object_type& raw, nlohmann::json& 
 }
 
 void usage(char* programName) {
-    fprintf(stderr, "Usage: %s -o <output_file> -i <payload_input> | -v <input_file> -p <policy_file>\n", programName);
+    fprintf(stderr, "Usage: %s -o <output_file> -n <nonce> -i <payload_input> | -v <input_file> -p <policy_file>\n", programName);
 }
 
 int main(int argc, char* argv[]) {
