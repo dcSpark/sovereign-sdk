@@ -24,6 +24,40 @@ const BACKOFF_POLICY_MIN_DELAY: u64 = 1;
 const BACKOFF_POLICY_MAX_DELAY: u64 = 60;
 const BACKOFF_POLICY_MAX_NUM_RETRIES: usize = 5;
 
+pub(crate) fn compute_batch_hash_v1(
+    batch_version: u8,
+    batch_index: u64,
+    parent_batch_hash: &[u8; 32],
+    da_commitment: &[u8; 32],
+    da_start_height: u64,
+    da_end_height: u64,
+) -> [u8; 32] {
+    // Domain tag
+    const TAG: &[u8] = b"BATCH_V1";
+
+    // Forcing little-endian encoding for consistency
+    let batch_index_le = batch_index.to_le_bytes();
+    let da_start_le = da_start_height.to_le_bytes();
+    let da_end_le = da_end_height.to_le_bytes();
+
+    // version is u8, 1 byte fixed-width
+    let ver = [batch_version];
+
+    let h = midnight_privacy::poseidon2_hash(
+        TAG,
+        &[
+            &ver,                 // 1
+            &batch_index_le,      // 8
+            parent_batch_hash,    // 32
+            da_commitment,        // 32
+            &da_start_le,         // 8
+            &da_end_le,           // 8
+        ],
+    );
+
+    h
+}
+
 pub(crate) fn hash_to_bytes32<H: AsRef<[u8]>>(h: &H) -> anyhow::Result<[u8; 32]> {
     let b = h.as_ref();
     anyhow::ensure!(
@@ -252,10 +286,7 @@ where
             let da_leaves: Vec<[u8; 32]> = infos
                 .iter()
                 .map(|b| {
-                    borsh::to_vec(&b.hash)
-                        .expect("Serialization should succeed")
-                        .try_into()
-                        .expect("Serialization should produce 32 bytes")
+                    hash_to_bytes32(&b.hash).expect("Block hash should be 32 bytes")
                 })
                 .collect();
 
@@ -276,8 +307,14 @@ where
                 .await?;
 
             // Compute batch hash
-            // This is NOT correct, it's a placeholder until we have the correct way to compute it
-            let batch_hash = hash_to_bytes32(&public_data.final_slot_hash)?;
+            let batch_hash = compute_batch_hash_v1(
+                1,
+                self.batch_index,
+                &self.prev_batch_hash,
+                &da_commitment_root,
+                da_start_height,
+                da_end_height,
+            );
 
             tracing::debug!("Generating TEE attestation...");
 
@@ -288,7 +325,6 @@ where
             let message_queue_hash = public_data.message_queue_hash;
             let last_processed_queue_index = public_data.last_processed_queue_index;
 
-            //daCommitment is not computed yet
             let batch = BatchPublicDataV1 {
                 version: 1,
                 layer2_chain_id: self.layer2_chain_id,

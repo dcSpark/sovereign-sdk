@@ -14196,6 +14196,7 @@ dependencies = [
  "hex",
  "insta",
  "jsonrpsee",
+ "midnight-privacy",
  "nmt-rs",
  "num_cpus",
  "proptest",
