@@ -143,7 +143,7 @@ std::string http_get(const std::string& url)
 
     std::string body;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L); // No redirects
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
@@ -161,9 +161,18 @@ bool ValidateToken(const jwt::decoded_jwt<jwt::traits::nlohmann_json>& decoded, 
 {
     jwt::traits::nlohmann_json::object_type payload = decoded.get_payload_json();
 
+    // The issuer in the token doesn't end up with /
+    // so we need to trim it, in order to pass the validation, in case an issuer was specified with a /.
+    expectedIssuer = trimSlash(expectedIssuer);
+
     // URL where you can pull the signing certificates
     auto header = decoded.get_header_json();
     std::string jku = header["jku"].get<std::string>();
+    const std::string expectedJku = expectedIssuer + "/certs";
+    if (trimSlash(jku) != expectedJku) {
+        fprintf(stderr, "Rejected: jku not pinned. got=%s expected=%s\n", jku.c_str(), expectedJku.c_str());
+        return false;
+    }
     std::string kid = header["kid"].get<std::string>();
     fprintf(stderr, "Cert URL header: %s\n", jku.c_str());
     fprintf(stderr, "Key ID header: %s\n", kid.c_str());
@@ -184,10 +193,6 @@ bool ValidateToken(const jwt::decoded_jwt<jwt::traits::nlohmann_json>& decoded, 
         fprintf(stderr, "Error: PEM conversion failed for JWK with key ID %s\n", kid.c_str());
         return false;
     }
-
-    // The issuer in the token doesn't end up with /
-    // so we need to trim it, in order to pass the validation, in case an issuer was specified with a /.
-    expectedIssuer = trimSlash(expectedIssuer);
 
     // As we only verify the token, we can specify the public key and leave the rest of the parameters empty.
     // jwt-cpp does the heavy lifting here regarding the verification itself
@@ -313,7 +318,7 @@ void usage(char* programName) {
 
 int main(int argc, char* argv[]) {
     std::string attestation_url;
-    std::string nonce = "midnight-l2"; // Hardcoded nonce
+    std::string nonce;
     std::string output_file = "";
     std::string input_file;
     std::string hash_file;
@@ -322,7 +327,7 @@ int main(int argc, char* argv[]) {
     bool validate_lifetime = true;
 
     int opt;
-    while ((opt = getopt(argc, argv, ":o:v:a:p:i:")) != -1) {
+    while ((opt = getopt(argc, argv, ":o:v:a:p:i:n:")) != -1) {
         switch (opt) {
         case 'o':
             output_file.assign(optarg);
@@ -338,6 +343,9 @@ int main(int argc, char* argv[]) {
             break;
         case 'i':
             midnight_payload.assign(optarg);
+            break;
+        case 'n':
+            nonce.assign(optarg);
             break;
         case ':':
             fprintf(stderr, "Option needs a value\n");
@@ -361,6 +369,12 @@ int main(int argc, char* argv[]) {
 
         if (policy_file.empty()) {
             policy_file = "policy.json";
+        }
+
+
+        if (nonce.empty()) {
+            fprintf(stderr, "Error: You must specify a nonce to get an attestation.\n");
+            return (1);
         }
 
         if (midnight_payload.empty() && input_file.empty()) {
@@ -405,7 +419,7 @@ int main(int argc, char* argv[]) {
         
             if (attestation_success) {
                 jwt_str = reinterpret_cast<char*>(jwt);
-                fprintf(stderr, "Attestation generated. JWT token: %s\n\n", jwt_str.c_str());
+                fprintf(stderr, "Attestation generated");
                 attestation_client->Free(jwt);
                 
                 jwt::decoded_jwt<jwt::traits::nlohmann_json> decoded = jwt::decode(jwt_str);

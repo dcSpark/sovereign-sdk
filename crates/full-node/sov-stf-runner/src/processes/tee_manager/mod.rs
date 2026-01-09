@@ -305,7 +305,7 @@ where
                 withdraw_root,
             };
 
-            let attestation = attest(&batch)?;
+            let attestation = attest(&batch, "midnight-l2")?; // Hardcoded for now, should be replaced.
 
             tracing::debug!(
                 bytes = agg_proof.raw_aggregated_proof.len(),

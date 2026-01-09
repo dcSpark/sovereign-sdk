@@ -59,7 +59,7 @@ pub fn attestation_client_path() -> Result<PathBuf> {
 ///
 /// # Returns
 /// * `Result<String, Error>` - The result of the attestation process.
-pub fn attest(payload: &BatchPublicDataV1) -> Result<String> {
+pub fn attest(payload: &BatchPublicDataV1, nonce: &str) -> Result<String> {
     // As MAA requires a C++ library, we call an external C++ program to handle the attestation process.
     // Easier and less time consuming than writing bindings...
 
@@ -78,6 +78,8 @@ pub fn attest(payload: &BatchPublicDataV1) -> Result<String> {
         .arg(client)
         .arg("-i")
         .arg(payload)
+        .arg("-n")
+        .arg(nonce)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -101,13 +103,15 @@ pub fn attest(payload: &BatchPublicDataV1) -> Result<String> {
 /// # Arguments
 /// * `payload` - The JWT token to be verified.
 /// * `policy` - The policy JSON to be used for verification.
-pub fn verify(payload: &String, policy: String) -> Result<()> {
+pub fn verify(payload: &String, policy: String, nonce: &str) -> Result<()> {
     let client = attestation_client_path()?;
     let result = Command::new(client)
         .arg("-p")
         .arg(policy)
         .arg("-v")
         .arg(payload)
+        .arg("-n")
+        .arg(nonce)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -155,7 +159,7 @@ mod tests {
             withdraw_root: [8u8; 32],
         };
         // Generate the attestation.
-        let result = attest(&payload);
+        let result = attest(&payload, "midnight-l2");
         assert!(result.is_ok(), "Attestation failed");
 
         // If it was successful, we should have a JWT token.
@@ -164,7 +168,7 @@ mod tests {
 
         // Verify the attestation.
         println!("Verifying attestation using policy {}", TEST_POLICY_JSON);
-        let result = verify(&attestation, TEST_POLICY_JSON.to_string());
+        let result = verify(&attestation, TEST_POLICY_JSON.to_string(), "midnight-l2");
         assert!(result.is_ok(), "Verification failed");
 
         // Decode the JWT payload to verify it contains the expected data.
