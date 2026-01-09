@@ -1,31 +1,26 @@
-//! Integration-style test for the Ligero prover. Requires the local prover binary and GPU/WebGPU.
+//! Integration-style test for the Ligero prover. Requires GPU/WebGPU and Ligero prover assets.
 
 use std::{env, path::PathBuf};
 
+use ligero_runner::LigeroRunner;
 use mcp_external::ligero::{Ligero, LigeroProgramArguments};
 
-const DEFAULT_PROGRAM_REL: &str = "../adapters/ligero/guest/bins/programs/note_spend_guest.wasm";
-const DEFAULT_PROVER_REL: &str = "../adapters/ligero/bins/macos/bin/webgpu_prover";
-const DEFAULT_SHADER_REL: &str = "../adapters/ligero/bins/macos/shader";
-
-fn env_path(var: &str, default_rel: &str) -> PathBuf {
-    if let Ok(val) = env::var(var) {
-        PathBuf::from(val)
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default_rel)
-    }
+fn env_opt(var: &str) -> Option<PathBuf> {
+    env::var(var).ok().map(PathBuf::from)
 }
 
 fn create_test_ligero() -> Option<Ligero> {
-    let prover = env_path("LIGERO_PROVER_BINARY_PATH", DEFAULT_PROVER_REL);
-    let shader = env_path("LIGERO_SHADER_PATH", DEFAULT_SHADER_REL);
-    let program = env_path("LIGERO_PROGRAM_PATH", DEFAULT_PROGRAM_REL);
+    let program =
+        env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
-    for (label, path) in [
-        ("prover", &prover),
-        ("shader", &shader),
-        ("program", &program),
-    ] {
+    let runner = LigeroRunner::new(&program);
+    let prover = env_opt("LIGERO_PROVER_BIN")
+        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
+        .unwrap_or_else(|| runner.paths().prover_bin.clone());
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| PathBuf::from(runner.config().shader_path.clone()));
+
+    for (label, path) in [("prover", &prover), ("shader", &shader)] {
         if !path.exists() {
             eprintln!(
                 "⚠️  Skipping Ligero prover test: {} path not found at {}",
@@ -36,7 +31,7 @@ fn create_test_ligero() -> Option<Ligero> {
         }
     }
 
-    Some(Ligero::new(Some(prover), None, Some(shader), Some(program)))
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }
 
 #[tracing_test::traced_test]

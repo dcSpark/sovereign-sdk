@@ -21,7 +21,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
-use sov_ligero_adapter::{Ligero, LigeroCodeCommitment, LigeroVerifier};
+use sov_ligero_adapter::{Ligero, LigeroCodeCommitment};
 use sov_modules_api::{
     capabilities::UniquenessData,
     configurable_spec::ConfigurableSpec,
@@ -34,12 +34,10 @@ use sov_node_client::NodeClient;
 use sov_rollup_interface::{
     crypto::PrivateKey,
     crypto::PublicKey,
-    zk::{CodeCommitment, CryptoSpec, ZkVerifier, Zkvm, ZkvmHost},
+    zk::{CodeCommitment, CryptoSpec, Zkvm, ZkvmHost},
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::OnceLock;
+use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 // Import the actual demo-stf Runtime types
@@ -79,7 +77,7 @@ pub struct ServiceConfig {
     /// Private key path for signing non-ZK transactions
     pub signing_key_path: String,
     /// Ligero method ID for value-setter proof verification
-    /// If None, it will be computed from the value_validator.wasm program
+    /// If None, it will be computed from the value_validator_rust.wasm program
     pub value_setter_method_id: Option<[u8; 32]>,
     /// Ligero method ID for midnight note_spend_guest proof verification
     /// If None, it will be computed from the note_spend_guest.wasm program
@@ -156,7 +154,7 @@ impl AppState {
 
         // Compute value-setter method ID if not provided
         if config.value_setter_method_id.is_none() {
-            info!("Computing value-setter method ID from value_validator.wasm...");
+            info!("Computing value-setter method ID from value_validator_rust.wasm...");
             match compute_value_setter_method_id() {
                 Ok(method_id) => {
                     info!("✓ Value-setter method ID: 0x{}", hex::encode(method_id));
@@ -258,6 +256,131 @@ impl AppState {
             incoming_worker_tx_saver,
         })
     }
+}
+
+fn ligero_skip_verify_enabled() -> bool {
+    std::env::var("LIGERO_SKIP_VERIFICATION")
+        .ok()
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Verify using a long-lived verifier pool hosted in a separate process.
+///
+/// - Uses `webgpu_verifier --daemon` worker processes managed in-process by `ligero_runner::daemon::DaemonPool`.
+/// - Worker count is derived from `max_concurrent_verifications` (no daemon-specific env vars).
+fn verify_with_ligero_verifier_daemon(
+    commitment: &[u8; 32],
+    package: &sov_ligero_adapter::LigeroProofPackage,
+    workers: usize,
+) -> Result<(), ServiceError> {
+    use std::collections::HashMap;
+
+    let verifier_paths =
+        ligero_runner::verifier::VerifierPaths::discover_with_commitment(Some(commitment))
+            .map_err(|e| {
+                ServiceError::ProofError(format!("Ligero verifier config discovery failed: {e}"))
+            })?;
+
+    let args: Vec<ligero_runner::LigeroArg> = serde_json::from_slice(&package.args_json)
+        .map_err(|e| ServiceError::ProofError(format!("Failed to parse package args_json: {e}")))?;
+
+    let mut cfg = verifier_paths.to_config(args, package.private_indices.clone());
+
+    // Proof bytes in the package may be gzip-compressed (proof_data.gz) or raw (proof_data.bin).
+    // Select the correct verifier mode based on the bytes we received.
+    let is_gzip = package.is_valid_gzip();
+    let proof_filename = if is_gzip {
+        "proof_data.gz"
+    } else {
+        "proof_data.bin"
+    };
+    cfg.gzip_proof = is_gzip;
+    cfg.proof_path = Some(proof_filename.to_string());
+
+    let cfg_json = serde_json::to_value(&cfg).map_err(|e| {
+        ServiceError::ProofError(format!("Failed to serialize Ligero config JSON: {e}"))
+    })?;
+
+    // Daemon verifier expects a proof path, not raw bytes: write to temp dir.
+    let dir = tempfile::tempdir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
+    let proof_path = dir.path().join(proof_filename);
+    std::fs::write(&proof_path, &package.proof)
+        .map_err(|e| ServiceError::Internal(format!("Failed to write {proof_filename}: {e}")))?;
+
+    // Lazily initialize (and cache) daemon pools per (verifier_bin, shader_dir).
+    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+
+    let bins_dir = verifier_paths
+        .verifier_bin
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let key = format!(
+        "{}|{}",
+        verifier_paths.verifier_bin.display(),
+        verifier_paths.shader_path.display()
+    );
+
+    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let pool = {
+        let mut guard = pools_lock.lock().unwrap();
+        if let Some(p) = guard.get(&key) {
+            p.clone()
+        } else {
+            info!(
+                "Starting Ligero verifier daemon pool (workers={}) using verifier_bin={} shader_dir={} bins_dir={}",
+                workers.max(1),
+                verifier_paths.verifier_bin.display(),
+                verifier_paths.shader_path.display(),
+                bins_dir.display(),
+            );
+            let ligero_paths = ligero_runner::LigeroPaths {
+                prover_bin: bins_dir.join("webgpu_prover"),
+                verifier_bin: verifier_paths.verifier_bin.clone(),
+                shader_dir: verifier_paths.shader_path.clone(),
+                bins_dir,
+            };
+            let created =
+                ligero_runner::daemon::DaemonPool::new_verifier(&ligero_paths, workers.max(1))
+                    .map_err(|e| {
+                        ServiceError::ProofError(format!(
+                            "Failed to start Ligero verifier daemon pool: {e}"
+                        ))
+                    })?;
+            guard.insert(key, created.clone());
+            created
+        }
+    };
+
+    let resp = pool
+        .verify(cfg_json, proof_path.to_string_lossy().as_ref())
+        .map_err(|e| {
+            ServiceError::ProofError(format!("Ligero verifier daemon request failed: {e}"))
+        })?;
+
+    if !resp.ok {
+        return Err(ServiceError::ProofError(format!(
+            "Ligero verifier daemon returned ok=false (exit_code={:?}): {}",
+            resp.exit_code,
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+
+    if resp.verify_ok != Some(true) {
+        return Err(ServiceError::ProofError(format!(
+            "Ligero verifier daemon did not confirm proof validity (verify_ok={:?})",
+            resp.verify_ok
+        )));
+    }
+
+    Ok(())
 }
 
 /// Request body for proof verification
@@ -425,9 +548,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/midnight-privacy/flush", post(flush_pending_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
-        // Remove default 2MB body limit and set 10MB for large Ligero proofs (~3.2MB each)
+        // Remove default 2MB body limit and allow larger payloads (Midnight Ligero proofs are ~8MB,
+        // and transactions are submitted base64-encoded, which adds ~33% overhead).
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
@@ -734,7 +858,19 @@ async fn verify_and_record_midnight_handler(
     let parse_start = std::time::Instant::now();
     let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
-            ServiceError::ParseError(format!("Failed to deserialize transaction: {}", e))
+            let err = e.to_string();
+            let hint = if err.contains("Unexpected length of input") {
+                " (often indicates the verifier was compiled with a smaller SafeVec/proof limit than the submitted tx)"
+            } else {
+                ""
+            };
+            ServiceError::ParseError(format!(
+                "Failed to deserialize transaction (body_b64_len={}, tx_bytes_len={}): {}{}",
+                req.body.len(),
+                tx_bytes.len(),
+                err,
+                hint
+            ))
         })?;
 
     let parsed_call = parse_midnight_call(&tx)?;
@@ -852,6 +988,7 @@ async fn verify_and_record_midnight_handler(
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 &proof,
+                state.config.max_concurrent_verifications,
                 anchor_root,
                 nullifier,
                 0u128,
@@ -949,6 +1086,7 @@ async fn verify_and_record_midnight_handler(
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 &proof,
+                state.config.max_concurrent_verifications,
                 anchor_root,
                 nullifier,
                 withdraw_amount,
@@ -1142,18 +1280,16 @@ async fn verify_ligero_proof(
     let method_id_bytes = state.config.value_setter_method_id.ok_or_else(|| {
         ServiceError::Internal(
             "Value-setter method ID not configured. \
-            The service needs the value_validator.wasm program to compute the method ID."
+            The service needs the value_validator_rust.wasm program to compute the method ID."
                 .to_string(),
         )
     })?;
     let method_id = LigeroCodeCommitment(method_id_bytes);
+    let workers = state.config.max_concurrent_verifications;
 
     // Spawn blocking task for CPU-intensive proof verification
     let proof = proof.to_vec();
     let result = tokio::task::spawn_blocking(move || {
-        // Set environment variables for value_validator.wasm verification
-        configure_ligero_env_for_value_setter()?;
-
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -1169,9 +1305,16 @@ async fn verify_ligero_proof(
             package.public_output.len()
         );
 
-        // Use LigeroVerifier to verify the proof (same as module-level verification)
-        let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
-            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
+        let public: ValueProofPublic = if ligero_skip_verify_enabled() {
+            bincode::deserialize(&package.public_output).map_err(|e| {
+                ServiceError::ProofError(format!("Failed to decode public output: {e}"))
+            })?
+        } else {
+            verify_with_ligero_verifier_daemon(&method_id.0, &package, workers)?;
+            bincode::deserialize(&package.public_output).map_err(|e| {
+                ServiceError::ProofError(format!("Failed to decode public output: {e}"))
+            })?
+        };
 
         // Check that the public output matches the claimed value
         if public.value != value {
@@ -1441,6 +1584,7 @@ pub fn verify_midnight_transaction_signature(
 pub async fn verify_midnight_withdraw_proof(
     method_id_opt: Option<&[u8; 32]>,
     proof: &[u8],
+    workers: usize,
     expected_anchor_root: MidnightHash32,
     expected_nullifier: MidnightHash32,
     expected_withdraw_amount: u128,
@@ -1457,9 +1601,6 @@ pub async fn verify_midnight_withdraw_proof(
     let proof_vec = proof.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        // Set environment variables for note_spend_guest.wasm verification
-        configure_ligero_env_for_midnight()?;
-
         let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
             .map_err(|err| {
                 ServiceError::ProofError(format!(
@@ -1475,8 +1616,16 @@ pub async fn verify_midnight_withdraw_proof(
             package.public_output.len()
         );
 
-        let public: SpendPublic = LigeroVerifier::verify(&proof_vec, &method_id)
-            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {}", e)))?;
+        let public: SpendPublic = if ligero_skip_verify_enabled() {
+            bincode::deserialize(&package.public_output).map_err(|e| {
+                ServiceError::ProofError(format!("Failed to decode public output: {e}"))
+            })?
+        } else {
+            verify_with_ligero_verifier_daemon(&method_id.0, &package, workers)?;
+            bincode::deserialize(&package.public_output).map_err(|e| {
+                ServiceError::ProofError(format!("Failed to decode public output: {e}"))
+            })?
+        };
 
         if public.anchor_root != expected_anchor_root {
             return Err(ServiceError::ProofError(format!(
@@ -2156,93 +2305,24 @@ async fn submit_worker_tx_to_sequencer(
     Ok(outcome)
 }
 
-/// Configure Ligero environment variables for value-setter verification
-fn configure_ligero_env_for_value_setter() -> Result<(), ServiceError> {
-    // `sov-proof-verifier-service` must not override Ligero env vars.
-    // The caller (scripts/deploy) is responsible for exporting the correct values.
-    ensure_ligero_env_is_set()?;
+// NOTE: Ligero binary/shader discovery is handled by `ligero-webgpu-runner` inside the
+// Sovereign Ligero adapter. This service must not require env vars like `LIGERO_VERIFIER_BIN`
+// or `LIGERO_SHADER_PATH` (those binaries are owned by the Ligero repo, not Sovereign).
 
-    Ok(())
-}
-
-/// Configure Ligero environment variables for midnight verification
-fn configure_ligero_env_for_midnight() -> Result<(), ServiceError> {
-    // `sov-proof-verifier-service` must not override Ligero env vars.
-    // The caller (scripts/deploy) is responsible for exporting the correct values.
-    ensure_ligero_env_is_set()?;
-
-    Ok(())
-}
-
-fn ensure_ligero_env_is_set() -> Result<(), ServiceError> {
-    fn required_path_var(name: &str) -> Result<PathBuf, ServiceError> {
-        let v = std::env::var(name).map_err(|_| {
-            ServiceError::Internal(format!(
-                "{name} must be set (required for Ligero verification)"
-            ))
-        })?;
-        let p = PathBuf::from(&v);
-        if p.exists() {
-            Ok(p)
-        } else {
-            Err(ServiceError::Internal(format!(
-                "{name} is set but does not exist: {}",
-                p.display()
-            )))
-        }
-    }
-
-    let _verifier_bin = required_path_var("LIGERO_VERIFIER_BIN")?;
-    let _program = required_path_var("LIGERO_PROGRAM_PATH")?;
-    let _shader_path = required_path_var("LIGERO_SHADER_PATH")?;
-
-    // LIGERO_PACKING is optional; the adapter defaults to 8192 if unset.
-    Ok(())
-}
-
-/// Compute the method ID for the value_validator.wasm program
+/// Compute the method ID for the value_validator_rust.wasm program
 fn compute_value_setter_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("value_validator.wasm")
+    compute_method_id_for_program("value_validator_rust")
 }
 
 /// Compute the method ID for the note_spend_guest.wasm program
 fn compute_midnight_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("note_spend_guest.wasm")
+    compute_method_id_for_program("note_spend_guest")
 }
 
 /// Generic function to compute method ID for any guest program
 fn compute_method_id_for_program(program_name: &str) -> Result<[u8; 32]> {
-    let current_dir = std::env::current_dir()?;
-
-    // Try multiple possible locations
-    let possible_paths = vec![
-        current_dir.join(format!(
-            "crates/adapters/ligero/guest/bins/programs/{}",
-            program_name
-        )),
-        current_dir.join(format!(
-            "../crates/adapters/ligero/guest/bins/programs/{}",
-            program_name
-        )),
-        current_dir.join(format!(
-            "../../crates/adapters/ligero/guest/bins/programs/{}",
-            program_name
-        )),
-    ];
-
-    let program_path = possible_paths.iter().find(|p| p.exists()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not find {}. Searched:\n{}",
-            program_name,
-            possible_paths
-                .iter()
-                .map(|p| format!("  - {}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    })?;
-
-    let program_str = program_path.to_string_lossy().to_string();
+    // We only pass a circuit name here; `ligero-runner` is responsible for resolving the actual wasm.
+    let program_str = program_name.to_string();
     let host = <Ligero as Zkvm>::Host::from_args(&program_str);
     let method_id = host.code_commitment();
 

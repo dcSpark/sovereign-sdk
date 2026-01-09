@@ -21,6 +21,8 @@ use sov_modules_api::execution_mode::Native;
 type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 /// Helper to check if services are available
 async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> bool {
     // Check rollup
@@ -100,7 +102,7 @@ async fn test_wallet_address() -> Result<()> {
     let privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
 
     // Get privacy address
-    let privacy_address = privacy_key.privacy_address();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN);
     let address_str = privacy_address.to_string();
 
     // Validate address format
@@ -362,7 +364,7 @@ async fn test_restore_wallet_keys() -> Result<()> {
 
     // Test restoring privacy key
     let privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)?;
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     // Validate
     assert!(
@@ -398,18 +400,18 @@ async fn test_privacy_key_formats() -> Result<()> {
 
     // Both should produce same address
     assert_eq!(
-        privacy_key_1.privacy_address().to_string(),
-        privacy_key_2.privacy_address().to_string(),
+        privacy_key_1.privacy_address(&DOMAIN).to_string(),
+        privacy_key_2.privacy_address(&DOMAIN).to_string(),
         "Both hex formats should produce the same address"
     );
 
     // Test bech32m address format
-    let privacy_address = privacy_key_1.privacy_address().to_string();
+    let privacy_address = privacy_key_1.privacy_address(&DOMAIN).to_string();
     let privacy_key_3 = PrivacyKey::from_address(&privacy_address)?;
 
     assert_eq!(
-        privacy_key_1.privacy_address().to_string(),
-        privacy_key_3.privacy_address().to_string(),
+        privacy_key_1.privacy_address(&DOMAIN).to_string(),
+        privacy_key_3.privacy_address(&DOMAIN).to_string(),
         "Address format should roundtrip correctly"
     );
 

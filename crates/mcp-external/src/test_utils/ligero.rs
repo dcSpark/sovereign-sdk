@@ -1,56 +1,40 @@
 //! Test utilities for Ligero proof generation
 
+use std::env;
 use std::path::PathBuf;
 
 use crate::ligero::Ligero;
+use ligero_runner::LigeroRunner;
 
-/// Helper function to get the platform-specific binary directory
-#[allow(dead_code)]
-pub fn get_platform_bin_dir() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux-amd64"
-    } else {
-        panic!("Unsupported platform for Ligero tests");
-    }
+fn env_opt(var: &str) -> Option<PathBuf> {
+    env::var(var).ok().map(PathBuf::from)
 }
 
 /// Helper function to create a Ligero instance for testing
 #[allow(dead_code)]
-pub fn create_test_ligero() -> Ligero {
-    let platform_dir = get_platform_bin_dir();
+pub fn create_test_ligero() -> Option<Ligero> {
+    // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
+    let program =
+        env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
 
-    Ligero::new(
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!(
-                    "../adapters/ligero/bins/{}/bin/webgpu_prover",
-                    platform_dir
-                ))
-                .canonicalize()
-                .expect("Failed to find prover binary"),
-        ),
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!(
-                    "../adapters/ligero/bins/{}/bin/webgpu_verifier",
-                    platform_dir
-                ))
-                .canonicalize()
-                .expect("Failed to find verifier binary"),
-        ),
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("../adapters/ligero/bins/{}/shader", platform_dir))
-                .canonicalize()
-                .expect("Failed to find shader directory"),
-        ),
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../adapters/ligero/guest/bins/programs/note_spend_guest.wasm")
-                .canonicalize()
-                .expect("Failed to find note_spend_guest.wasm"),
-        ),
-    )
+    // Create the runner using the program *specifier* (name or path). `ligero-runner` resolves internally.
+    let runner = LigeroRunner::new(&program);
+    let prover = env_opt("LIGERO_PROVER_BIN")
+        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
+        .unwrap_or_else(|| runner.paths().prover_bin.clone());
+    let shader = env_opt("LIGERO_SHADER_PATH")
+        .unwrap_or_else(|| PathBuf::from(runner.config().shader_path.clone()));
+
+    for (label, path) in [("prover", &prover), ("shader", &shader)] {
+        if !path.exists() {
+            eprintln!(
+                "⚠️  Skipping Ligero tests: {} path not found at {}",
+                label,
+                path.display()
+            );
+            return None;
+        }
+    }
+
+    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
 }

@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
@@ -13,9 +14,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
+use ligetron::bn254fr_native::submod_checked;
+use ligetron::Bn254Fr;
 use midnight_privacy::{
-    note_commitment, nullifier, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
-    MerkleTree, SpendPublic,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
+    SpendPublic,
 };
 use rand::Rng;
 use reqwest::Client as HttpClient;
@@ -49,8 +53,30 @@ const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
 const MISSING_NOTE_RETRY_MAX: usize = 10;
 const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const NF_KEY: [u8; 32] = [4u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
+
+fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
+    static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+    let lock = POOL.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = lock.lock().unwrap();
+    if let Some(p) = guard.as_ref() {
+        return Ok(p.clone());
+    }
+
+    let paths = ligero_runner::LigeroPaths::discover()
+        .or_else(|_| Ok::<_, anyhow::Error>(ligero_runner::LigeroPaths::fallback()))?;
+    let workers = workers.max(1);
+    eprintln!(
+        "[prover-daemon] starting webgpu_prover --daemon pool: workers={} prover_bin={} shader_dir={}",
+        workers,
+        paths.prover_bin.display(),
+        paths.shader_dir.display()
+    );
+    let pool = ligero_runner::daemon::DaemonPool::new_prover(&paths, workers)?;
+    *guard = Some(pool.clone());
+    Ok(pool)
+}
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
@@ -104,7 +130,7 @@ impl ContinuousConfig {
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(num_cpus::get);
+            .unwrap_or(5);
 
         let detailed_wallet_logs = std::env::var("DETAILED_WALLET_LOGS")
             .ok()
@@ -150,7 +176,8 @@ struct WalletState {
     nonce: u64,
     value: u128,
     rho: Hash32,
-    recipient: Hash32,
+    spend_sk: Hash32,
+    sender_id: Hash32,
 }
 
 fn rollup_crate_dir() -> Result<PathBuf> {
@@ -280,9 +307,6 @@ async fn start_managed_stack(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         )
         .env("LIGERO_PROGRAM_PATH", &ligero_env.program_path)
-        .env("LIGERO_VERIFIER_BIN", &ligero_env.verifier_bin)
-        .env("LIGERO_PROVER_BIN", &ligero_env.prover_bin)
-        .env("LIGERO_SHADER_PATH", &ligero_env.shader_dir)
         .env("LIGERO_PACKING", "8192")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -333,7 +357,7 @@ async fn start_managed_stack(
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
 
-    let verifier_parallelism = std::cmp::max(4, config.max_concurrent_proofs);
+    let verifier_parallelism = std::cmp::max(1, config.max_concurrent_proofs);
     let verifier_url = start_local_verifier(
         &api_url,
         ligero_env.method_id,
@@ -660,7 +684,8 @@ pub async fn run() -> Result<()> {
             nonce,
             value: 0,
             rho: [0u8; 32],
-            recipient: [0u8; 32],
+            spend_sk: [0u8; 32],
+            sender_id: [0u8; 32],
         });
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
@@ -983,7 +1008,9 @@ async fn perform_initial_deposits(
     for (i, wallet) in wallets.iter_mut().enumerate() {
         let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
         let rho: Hash32 = rand::random();
-        let recipient: Hash32 = rand::random();
+        let spend_sk: Hash32 = rand::random();
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
+        let recipient: Hash32 = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk);
 
         let call = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Deposit {
             amount,
@@ -1016,7 +1043,7 @@ async fn perform_initial_deposits(
 
         let resp = http
             .post(&url)
-            .json(&json!({ "body": tx_b64, "serialized_tx_base64": tx_b64 }))
+            .json(&json!({ "body": tx_b64 }))
             .send()
             .await
             .context("Deposit HTTP request to verifier failed")?;
@@ -1034,7 +1061,10 @@ async fn perform_initial_deposits(
         wallet.nonce += 1;
         wallet.value = amount;
         wallet.rho = rho;
-        wallet.recipient = recipient;
+        wallet.spend_sk = spend_sk;
+        // Deposit convention: sender_id == recipient.
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        wallet.sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
 
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
@@ -1066,7 +1096,19 @@ async fn perform_initial_deposits(
 
     let mut expected_commitments: Vec<[u8; 32]> = Vec::with_capacity(wallets.len());
     for wallet in wallets.iter() {
-        let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &wallet.recipient);
+        let value_u64: u64 = wallet
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
+        let cm = note_commitment(
+            &DOMAIN,
+            value_u64,
+            &wallet.rho,
+            &recipient,
+            &wallet.sender_id,
+        );
         expected_commitments.push(cm);
     }
 
@@ -1343,7 +1385,8 @@ async fn perform_transfer_cycle(
         wallet_idx: usize,
         value: u128,
         rho: Hash32,
-        recipient: Hash32,
+        spend_sk: Hash32,
+        sender_id: Hash32,
         position: u64,
     }
 
@@ -1352,7 +1395,19 @@ async fn perform_transfer_cycle(
         if wallet.value == 0 {
             continue;
         }
-        let cm = note_commitment(&DOMAIN, wallet.value, &wallet.rho, &wallet.recipient);
+        let value_u64: u64 = wallet
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
+        let cm = note_commitment(
+            &DOMAIN,
+            value_u64,
+            &wallet.rho,
+            &recipient,
+            &wallet.sender_id,
+        );
         let mut position = pos_by_cm.get(&cm).copied();
 
         if position.is_none() {
@@ -1372,7 +1427,8 @@ async fn perform_transfer_cycle(
                 wallet_idx: idx,
                 value: wallet.value,
                 rho: wallet.rho,
-                recipient: wallet.recipient,
+                spend_sk: wallet.spend_sk,
+                sender_id: wallet.sender_id,
                 position,
             });
         } else {
@@ -1423,40 +1479,51 @@ async fn perform_transfer_cycle(
         let account_idx = input.wallet_idx;
         let value = input.value;
         let in_rho = input.rho;
-        let in_recipient = input.recipient;
+        let in_spend_sk = input.spend_sk;
+        let in_sender_id = input.sender_id;
         let position = input.position;
         let siblings = mt.open(position as usize);
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
         let authority_fvk = authority_fvk; // Copy for closure
+        let daemon_workers = config.max_concurrent_proofs;
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            tokio::task::spawn_blocking(
-                move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
-                    // New output note (same value, fresh rho/recipient)
-                    let out_rho: Hash32 = rand::thread_rng().gen();
-                    let out_recipient: Hash32 = rand::thread_rng().gen();
-                    let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
+                let value_u64: u64 = value
+                    .try_into()
+                    .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
+                if value_u64 > i64::MAX as u64 {
+                    bail!("note value does not fit into i64 (required by note_spend_guest v2 ABI)");
+                }
 
-                    let nf = nullifier(&DOMAIN, &NF_KEY, &in_rho);
+                // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &in_spend_sk);
+                let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
+                let sender_id_out = in_recipient;
 
-                    // Build viewer attestation if authority FVK is set
-                    // sender_id = in_recipient (the spender's address)
-                    let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
-                        let (att, _enc) = make_viewer_bundle(
-                            &fvk,
-                            &DOMAIN,
-                            value,
-                            &out_rho,
-                            &out_recipient,
-                            &in_recipient,
-                            &cm_out,
-                        );
-                        (Some(vec![att.clone()]), Some((fvk, att)))
-                    } else {
-                        (None, None)
-                    };
+                // New output note (same value, fresh rho + fresh address (pk/spend_sk))
+                let out_rho: Hash32 = rand::thread_rng().gen();
+                let out_spend_sk: Hash32 = rand::thread_rng().gen();
+                let out_pk_spend = pk_from_sk(&out_spend_sk);
+                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
+                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+                let cm_out = note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id_out);
+
+                // Nullifier is derived from spend_sk (nf_key is derived inside the circuit).
+                let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
+                let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
+
+                // Build viewer attestation if authority FVK is set
+                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
+                    let (att, _enc) = make_viewer_bundle(
+                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id_out, &cm_out,
+                    )?;
+                    (Some(vec![att.clone()]), Some((fvk, att)))
+                } else {
+                    (None, None)
+                };
 
                     let public = SpendPublic {
                         anchor_root: anchor,
@@ -1466,62 +1533,169 @@ async fn perform_transfer_cycle(
                         view_attestations,
                     };
 
-                    let n_out: usize = 1;
-                    let mut private_indices = vec![2, 3, 4, 5, 6];
-                    for j in 0..depth_usize {
-                        private_indices.push(7 + j);
-                    }
-                    let out_base = 11 + depth_usize;
-                    private_indices.extend_from_slice(&[out_base + 0, out_base + 1, out_base + 2]);
-
-                    // Viewer section: fvk is private
-                    if viewer_data.is_some() {
-                        let base_after_outs = 12 + depth_usize + 4 * n_out;
-                        let fvk_arg_index = base_after_outs + 2;
-                        private_indices.push(fvk_arg_index);
-                    }
+                let n_out: usize = 1;
+                // LigeroConfig private indices are 1-based (by argument position).
+                // v2 ABI (no viewers): 1+6 + 1*(4 + 2*depth) + 3 + 5*n_out + 1(inv_enforce)
+                let mut private_indices: Vec<usize> = Vec::new();
+                private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
+                private_indices.extend_from_slice(&[7, 8, 9]); // value_in, rho_in, sender_id_in
+                // pos_bits [10..10+depth)
+                for j in 0..depth_usize {
+                    private_indices.push(10 + j);
+                }
+                // siblings [10+depth..10+2*depth)
+                for j in 0..depth_usize {
+                    private_indices.push(10 + depth_usize + j);
+                }
+                // output 0 private args:
+                // value_out, rho_out, pk_spend_out, pk_ivk_out
+                let out_base = 14 + 2 * depth_usize;
+                private_indices.extend_from_slice(&[
+                    out_base,         // value_out
+                    out_base + 1,     // rho_out
+                    out_base + 2,     // pk_spend_out
+                    out_base + 3,     // pk_ivk_out
+                ]);
+                // inv_enforce (private)
+                private_indices.push(19 + 2 * depth_usize);
+                // Viewer section: fvk is private
+                if viewer_data.is_some() {
+                    private_indices.push(22 + 2 * depth_usize);
+                }
 
                     let mut host =
                         <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
                             .with_private_indices(private_indices);
 
-                    host.add_hex_arg(hex::encode(DOMAIN));
-                    host.add_str_arg(value.to_string());
-                    host.add_hex_arg(hex::encode(in_rho));
-                    host.add_hex_arg(hex::encode(in_recipient));
-                    host.add_hex_arg(hex::encode(NF_KEY));
-                    host.add_str_arg((position as u64).to_string());
-                    host.add_str_arg((TREE_DEPTH as u8).to_string());
-                    for s in &siblings {
-                        host.add_hex_arg(hex::encode(s));
-                    }
-                    host.add_hex_arg(hex::encode(anchor));
-                    host.add_hex_arg(hex::encode(nf));
-                    host.add_str_arg("0".to_string()); // withdraw_amount
-                    host.add_str_arg("1".to_string()); // ONE output
-                    host.add_str_arg(value.to_string());
-                    host.add_hex_arg(hex::encode(out_rho));
-                    host.add_hex_arg(hex::encode(out_recipient));
-                    host.add_hex_arg(hex::encode(cm_out));
+                // Typed binary ABI for zkVM performance (matches note_spend_guest argument layout)
+                host.add_hex_arg(hex::encode(DOMAIN)); // 1: domain (PUBLIC)
+                host.add_hex_arg(hex::encode(in_spend_sk)); // 2: spend_sk (PRIVATE)
+                host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3: pk_ivk_owner (PRIVATE)
+                host.add_u64_arg(TREE_DEPTH as u64); // 4: depth (PUBLIC)
+                host.add_hex_arg(hex::encode(anchor)); // 5: anchor (PUBLIC)
+                host.add_u64_arg(1); // 6: n_in (PUBLIC)
 
-                    // Viewer section (Level-B)
-                    if let Some((fvk, att)) = viewer_data {
-                        host.add_str_arg("1".to_string()); // m_viewers
-                        host.add_hex_arg(hex::encode(att.fvk_commitment));
-                        host.add_hex_arg(hex::encode(fvk));
-                        host.add_hex_arg(hex::encode(att.ct_hash));
-                        host.add_hex_arg(hex::encode(att.mac));
-                    }
+                host.add_u64_arg(value_u64); // 7: value_in (PRIVATE)
+                host.add_hex_arg(hex::encode(in_rho)); // 8: rho_in (PRIVATE)
+                host.add_hex_arg(hex::encode(in_sender_id)); // 9: sender_id_in (PRIVATE)
+
+                // 10..10+depth: position bits (field elements 0/1 as 32-byte BE)
+                for lvl in 0..depth_usize {
+                    let bit = ((position >> lvl) & 1) as u8;
+                    let mut bit_bytes = [0u8; 32];
+                    bit_bytes[31] = bit;
+                    host.add_hex_arg(hex::encode(bit_bytes));
+                }
+
+                // 10+depth..10+2*depth: siblings
+                for s in &siblings {
+                    host.add_hex_arg(hex::encode(s));
+                }
+
+                host.add_hex_arg(hex::encode(nf)); // nullifier (PUBLIC)
+                host.add_u64_arg(0); // withdraw_amount (PUBLIC)
+                host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
+                host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
+
+                // output 0 (private except commitment)
+                host.add_u64_arg(value_u64);
+                host.add_hex_arg(hex::encode(out_rho));
+                host.add_hex_arg(hex::encode(out_pk_spend));
+                host.add_hex_arg(hex::encode(out_pk_ivk));
+                host.add_hex_arg(hex::encode(cm_out));
+                // inv_enforce (PRIVATE)
+                let inv_enforce = {
+                    let mut enforce_prod = Bn254Fr::from_u32(1);
+                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
+                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
+                    let mut delta = Bn254Fr::new();
+                    let mut out_fr = Bn254Fr::new();
+                    out_fr.set_bytes_big(&out_rho);
+                    let mut in_fr = Bn254Fr::new();
+                    in_fr.set_bytes_big(&in_rho);
+                    submod_checked(&mut delta, &out_fr, &in_fr);
+                    enforce_prod.mulmod_checked(&delta);
+                    let mut inv = enforce_prod.clone();
+                    inv.inverse();
+                    inv.to_bytes_be()
+                };
+                host.add_hex_arg(hex::encode(inv_enforce));
+
+                // Viewer section (Level-B)
+                if let Some((fvk, att)) = viewer_data {
+                    host.add_u64_arg(1); // m_viewers
+                    host.add_hex_arg(hex::encode(att.fvk_commitment));
+                    host.add_hex_arg(hex::encode(fvk));
+                    host.add_hex_arg(hex::encode(att.ct_hash));
+                    host.add_hex_arg(hex::encode(att.mac));
+                }
 
                     host.set_public_output(&public)
                         .context("set public output (round 2)")?;
 
-                    let proof_data = host
-                        .run(true)
-                        .context("generate second-round transfer proof")?;
-                    Ok((account_idx, proof_data, out_rho, out_recipient))
-                },
-            )
+                // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
+                let proof_data = (|| -> anyhow::Result<Vec<u8>> {
+                    let public_output = host.require_public_output()?;
+                    let cfg = host.runner().config().clone();
+                    let mut cfg_json = serde_json::to_value(&cfg)?;
+
+                    // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
+                    // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
+                    if let serde_json::Value::Object(ref mut map) = cfg_json {
+                        if let Some(serde_json::Value::String(program)) =
+                            map.get("program").cloned()
+                        {
+                            let resolved = ligero_runner::resolve_program(&program)
+                                .with_context(|| format!("Failed to resolve program '{program}'"))?;
+                            map.insert(
+                                "program".to_string(),
+                                serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                            );
+                        }
+                    }
+
+                    // Provide an explicit, unique proof output path to the daemon.
+                    // Relying on the daemon's internal temp-path generator can collide across
+                    // multiple daemon processes started at the same time (same timestamp + per-process counter).
+                    let tmp = tempfile::tempdir()?;
+                    let proof_path = tmp.path().join("proof_data.bin");
+                    if let serde_json::Value::Object(ref mut map) = cfg_json {
+                        map.insert(
+                            "proof-path".to_string(),
+                            serde_json::Value::String(proof_path.to_string_lossy().to_string()),
+                        );
+                        // Request uncompressed proofs: this significantly reduces CPU overhead
+                        // (gzip compress/decompress) while keeping proving/verifying correctness.
+                        map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
+                    }
+
+                    let pool = prover_daemon_pool(daemon_workers)
+                        .context("initialize ligero prover daemon pool")?;
+                    let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
+                    if !resp.ok {
+                        anyhow::bail!(
+                            "prover daemon returned ok=false (exit_code={:?}): {}",
+                            resp.exit_code,
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                    }
+                    // Daemon will echo `proof_path`, but we read from our explicitly-provided path.
+                    let proof_bytes = std::fs::read(&proof_path)
+                        .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
+                    drop(tmp); // cleanup temp directory
+
+                    let args_json = serde_json::to_vec(&cfg.args)?;
+                    let pkg = ligero_runner::LigeroProofPackage::new(
+                        proof_bytes,
+                        public_output,
+                        args_json,
+                        cfg.private_indices.clone(),
+                    )?;
+                    Ok(bincode::serialize(&pkg)?)
+                })()
+                .context("generate second-round transfer proof via daemon")?;
+                Ok((account_idx, proof_data, out_rho, out_spend_sk))
+            })
             .await
             .expect("spawn_blocking join failed")
         }));
@@ -1565,11 +1739,12 @@ async fn perform_transfer_cycle(
         tx_b64: String,
         new_nonce: u64,
         new_rho: Hash32,
-        new_recipient: Hash32,
+        new_spend_sk: Hash32,
+        new_sender_id: Hash32,
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
-    for (i, (wallet_idx, proof_bytes, out_rho, out_recipient)) in proofs.into_iter().enumerate() {
+    for (i, (wallet_idx, proof_bytes, out_rho, out_spend_sk)) in proofs.into_iter().enumerate() {
         let wallet = wallets[wallet_idx].clone();
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
@@ -1578,27 +1753,46 @@ async fn perform_transfer_cycle(
         let value = wallet.value; // The output value (same as input for pure transfer)
         build_tasks.push(tokio::task::spawn_blocking(
             move || -> anyhow::Result<BuiltTransfer> {
-                let nf = nullifier(&DOMAIN, &NF_KEY, &wallet.rho);
+                let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
+                let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
+
+                let value_u64: u64 = value.try_into().context(
+                    "note value does not fit into u64 (required by note_spend_guest v2)",
+                )?;
+                let out_pk_spend = pk_from_sk(&out_spend_sk);
+                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
+                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+                let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
                 // Build encrypted note for authority if configured
-                // sender_id = wallet.recipient (the spender's address)
-                let view_ciphertexts: Option<Vec<EncryptedNote>> = authority_fvk.map(|fvk| {
-                    let cm_out = note_commitment(&DOMAIN, value, &out_rho, &out_recipient);
-                    let (_att, enc) = make_viewer_bundle(
-                        &fvk,
-                        &DOMAIN,
-                        value,
-                        &out_rho,
-                        &out_recipient,
-                        &wallet.recipient,
-                        &cm_out,
-                    );
-                    vec![enc]
-                });
+                let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+                    Some(fvk) => {
+                        let cm_out = note_commitment(
+                            &DOMAIN,
+                            value_u64,
+                            &out_rho,
+                            &out_recipient,
+                            &sender_id,
+                        );
+                        let (_att, enc) = make_viewer_bundle(
+                            &fvk,
+                            &DOMAIN,
+                            value,
+                            &out_rho,
+                            &out_recipient,
+                            &sender_id,
+                            &cm_out,
+                        )?;
+                        Some(vec![enc])
+                    }
+                    None => None,
+                };
 
                 let call =
                     RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(MidnightCallMessage::Transfer {
-                        proof: <sov_modules_api::SafeVec<u8, 5_000_000>>::try_from(proof_bytes)
+                        proof: proof_bytes
+                            .try_into()
                             .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                         anchor_root,
                         nullifier: nf,
@@ -1641,7 +1835,8 @@ async fn perform_transfer_cycle(
                     tx_b64,
                     new_nonce: wallet.nonce + 1,
                     new_rho: out_rho,
-                    new_recipient: out_recipient,
+                    new_spend_sk: out_spend_sk,
+                    new_sender_id: sender_id,
                 })
             },
         ));
@@ -1659,12 +1854,9 @@ async fn perform_transfer_cycle(
         let w = &mut wallets[b.wallet_idx];
         w.nonce = b.new_nonce;
         w.rho = b.new_rho;
-        w.recipient = b.new_recipient;
-    }
-    let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
+        w.spend_sk = b.new_spend_sk;
     eprintln!(
         "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
-        transfer_txs_b64.len(),
         transfer_txs_ms,
         transfer_txs_ms / transfer_txs_b64.len() as f64
     );
@@ -1711,7 +1903,7 @@ async fn perform_transfer_cycle(
             for attempt in 0..=MAX_SUBMIT_RETRIES {
                 let resp = client
                     .post(&endpoint)
-                    .json(&json!({ "body": body_b64, "serialized_tx_base64": body_b64 }))
+                    .json(&json!({ "body": body_b64 }))
                     .send()
                     .await;
 
@@ -2088,9 +2280,15 @@ async fn perform_transfer_cycle(
     // Collect expected output commitments for wallets that participated in this cycle
     let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
     for input in &inputs {
-        // The wallet state has already been updated with new_rho/new_recipient
+        // The wallet state has already been updated with the new note secrets.
         let w = &wallets[input.wallet_idx];
-        let expected_cm = note_commitment(&DOMAIN, w.value, &w.rho, &w.recipient);
+        let value_u64: u64 = w
+            .value
+            .try_into()
+            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &w.spend_sk);
+        let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_ivk);
+        let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
         expected_commitments.push((expected_cm, input.wallet_idx));
     }
 

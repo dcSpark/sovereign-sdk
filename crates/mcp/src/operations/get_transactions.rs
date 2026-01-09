@@ -10,6 +10,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 /// Transaction information from indexer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -119,7 +121,7 @@ where
     // Get the wallet address and privacy address
     let address = wallet.get_address();
     let address_str = address.to_string();
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     tracing::debug!(
         "Fetching transactions for wallet address: {} and privacy address: {}",

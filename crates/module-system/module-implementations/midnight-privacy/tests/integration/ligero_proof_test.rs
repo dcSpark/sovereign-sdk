@@ -41,29 +41,343 @@
 //!
 //! These tests generate and verify **REAL** proofs - no simulation or skipping!
 
-use anyhow::{bail, Context, Result};
-use midnight_privacy::{
-    note_commitment, nullifier, root_from_path, Hash32, MerkleTree, SpendPublic,
-};
+use anyhow::{Context, Result};
+// Import SpendPublic and MerkleTree from midnight_privacy, but use our own hash functions
+// that are based on Ligetron's Poseidon2 (consistent with the circuit)
+use midnight_privacy::SpendPublic;
 use serde_json::json;
-use sov_ligero_adapter::{Ligero, LigeroVerifier};
+use sov_ligero_adapter::{Ligero, LigeroHost, LigeroVerifier};
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, Zkvm, ZkvmHost};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
-use tempfile::tempdir;
+
+// Use Ligetron's native Poseidon2 for hash computations (same as the circuit!)
+use ligetron::bn254fr_native::submod_checked;
+use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
+use ligetron::Bn254Fr;
+
+type Hash32 = [u8; 32];
+
+// === Ligetron-compatible hash functions ===
+// These must match exactly what the circuit does!
+
+fn poseidon2_hash_bytes(data: &[u8]) -> Hash32 {
+    let result = ligetron_hash_bytes(data);
+    result.to_bytes_be()
+}
+
+fn poseidon2_hash_domain(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
+    let mut tmp = Vec::with_capacity(tag.len() + parts.iter().map(|p| p.len()).sum::<usize>());
+    tmp.extend_from_slice(tag);
+    for p in parts {
+        tmp.extend_from_slice(p);
+    }
+    poseidon2_hash_bytes(&tmp)
+}
+
+fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"MT_NODE_V1", &[&[level], left, right])
+}
+
+fn note_commitment(domain: &Hash32, value: u128, rho: &Hash32, recipient: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"NOTE_V1", &[domain, &value.to_le_bytes(), rho, recipient])
+}
+
+fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"PRF_NF_V1", &[domain, nf_key, rho])
+}
+
+fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"PK_V1", &[spend_sk])
+}
+
+fn recipient_from_pk(domain: &Hash32, pk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V1", &[domain, pk])
+}
+
+fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    recipient_from_pk(domain, &pk_from_sk(spend_sk))
+}
+
+fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"NFKEY_V1", &[domain, spend_sk])
+}
+
+// === V2 circuit helpers (TRANSFER/WITHDRAW note_spend_guest) ===
+
+fn note_commitment_v2(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
+    let mut v16 = [0u8; 16];
+    v16[..8].copy_from_slice(&value.to_le_bytes());
+    poseidon2_hash_domain(b"NOTE_V2", &[domain, &v16, rho, recipient, sender_id])
+}
+
+fn recipient_from_pk_v2(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    poseidon2_hash_domain(b"ADDR_V2", &[domain, pk_spend, pk_ivk])
+}
+
+fn recipient_from_sk_v2(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    recipient_from_pk_v2(domain, &pk_from_sk(spend_sk), pk_ivk)
+}
+
+fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+    let mut out = Bn254Fr::new();
+    out.set_bytes_big(h);
+    out
+}
+
+fn inv_enforce_v2(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Hash32 {
+    let mut enforce_prod = Bn254Fr::from_u32(1);
+
+    for v in in_values {
+        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
+    }
+    for v in out_values {
+        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
+    }
+
+    let mut delta = Bn254Fr::new();
+    for out_rho in out_rhos {
+        let out_fr = bn254fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = bn254fr_from_hash32_be(in_rho);
+            submod_checked(&mut delta, &out_fr, &in_fr);
+            enforce_prod.mulmod_checked(&delta);
+        }
+    }
+    if out_rhos.len() == 2 {
+        let a = bn254fr_from_hash32_be(&out_rhos[0]);
+        let b = bn254fr_from_hash32_be(&out_rhos[1]);
+        submod_checked(&mut delta, &a, &b);
+        enforce_prod.mulmod_checked(&delta);
+    }
+
+    let mut inv = enforce_prod.clone();
+    inv.inverse();
+    inv.to_bytes_be()
+}
+
+#[derive(Debug, Clone)]
+struct SpendInputV2 {
+    value: u64,
+    rho: Hash32,
+    sender_id: Hash32,
+    pos: u64,
+    siblings: Vec<Hash32>,
+    nullifier: Hash32,
+}
+
+#[derive(Debug, Clone)]
+struct SpendOutputV2 {
+    value: u64,
+    rho: Hash32,
+    pk_spend: Hash32,
+    pk_ivk: Hash32,
+    cm: Hash32,
+}
+
+fn build_note_spend_args_v2(
+    domain: Hash32,
+    spend_sk: Hash32,
+    pk_ivk_owner: Hash32,
+    depth: u8,
+    anchor: Hash32,
+    inputs: &[SpendInputV2],
+    withdraw_amount: u64,
+    withdraw_to: Hash32,
+    outputs: &[SpendOutputV2],
+) -> (Vec<serde_json::Value>, Vec<usize>) {
+    let depth_usize = depth as usize;
+    assert!(!inputs.is_empty());
+    assert!(inputs.len() <= 4);
+    assert!(outputs.len() <= 2);
+
+    // Compute inv_enforce from values and rhos.
+    let in_values: Vec<u64> = inputs.iter().map(|i| i.value).collect();
+    let in_rhos: Vec<Hash32> = inputs.iter().map(|i| i.rho).collect();
+    let out_values: Vec<u64> = outputs.iter().map(|o| o.value).collect();
+    let out_rhos: Vec<Hash32> = outputs.iter().map(|o| o.rho).collect();
+    let inv_enforce = inv_enforce_v2(&in_values, &in_rhos, &out_values, &out_rhos);
+
+    let mut args: Vec<serde_json::Value> = Vec::new();
+    let mut private_indices: Vec<usize> = Vec::new();
+
+    // Header (1-indexed in circuit docs).
+    args.push(json!({"hex": hex32(&domain)})); // 1 domain (public)
+    args.push(json!({"hex": hex32(&spend_sk)})); // 2 spend_sk (private)
+    args.push(json!({"hex": hex32(&pk_ivk_owner)})); // 3 pk_ivk_owner (private)
+    args.push(json!({"i64": depth as i64})); // 4 depth (public)
+    args.push(json!({"hex": hex32(&anchor)})); // 5 anchor (public)
+    args.push(json!({"i64": inputs.len() as i64})); // 6 n_in (public)
+
+    private_indices.extend_from_slice(&[2, 3]);
+
+    // Inputs.
+    for input in inputs {
+        args.push(json!({"i64": input.value as i64}));
+        args.push(json!({"hex": hex32(&input.rho)}));
+        args.push(json!({"hex": hex32(&input.sender_id)}));
+
+        // Track private indices for (value, rho, sender_id).
+        let sender_idx = args.len(); // 1-based index of the last pushed arg
+        private_indices.extend_from_slice(&[sender_idx - 2, sender_idx - 1, sender_idx]);
+
+        // Position bits (LSB-first).
+        for lvl in 0..depth_usize {
+            let bit = ((input.pos >> lvl) & 1) as u8;
+            let mut bit_bytes = [0u8; 32];
+            bit_bytes[31] = bit;
+            args.push(json!({"hex": hex32(&bit_bytes)}));
+            private_indices.push(args.len());
+        }
+
+        // Siblings.
+        assert_eq!(input.siblings.len(), depth_usize);
+        for sib in &input.siblings {
+            args.push(json!({"hex": hex32(sib)}));
+            private_indices.push(args.len());
+        }
+
+        // Public nullifier.
+        args.push(json!({"hex": hex32(&input.nullifier)}));
+    }
+
+    // Withdraw binding (public).
+    args.push(json!({"i64": withdraw_amount as i64}));
+    args.push(json!({"hex": hex32(&withdraw_to)}));
+    args.push(json!({"i64": outputs.len() as i64}));
+
+    // Outputs.
+    for out in outputs {
+        let start_idx = args.len() + 1; // 1-based index of value_out
+        args.push(json!({"i64": out.value as i64}));
+        args.push(json!({"hex": hex32(&out.rho)}));
+        args.push(json!({"hex": hex32(&out.pk_spend)}));
+        args.push(json!({"hex": hex32(&out.pk_ivk)}));
+        args.push(json!({"hex": hex32(&out.cm)})); // public cm_out
+        private_indices.extend_from_slice(&[
+            start_idx,
+            start_idx + 1,
+            start_idx + 2,
+            start_idx + 3,
+        ]);
+    }
+
+    // inv_enforce (private).
+    args.push(json!({"hex": hex32(&inv_enforce)}));
+    private_indices.push(args.len());
+
+    (args, private_indices)
+}
+
+fn add_args_to_host(host: &mut LigeroHost, args: &[serde_json::Value]) -> Result<()> {
+    for a in args {
+        if let Some(hex) = a.get("hex").and_then(|v| v.as_str()) {
+            host.add_hex_arg(hex.to_string());
+            continue;
+        }
+        if let Some(i64v) = a.get("i64").and_then(|v| v.as_i64()) {
+            host.add_i64_arg(i64v);
+            continue;
+        }
+        if let Some(s) = a.get("str").and_then(|v| v.as_str()) {
+            host.add_str_arg(s.to_string());
+            continue;
+        }
+        anyhow::bail!("Unexpected Ligero arg JSON shape: {a}");
+    }
+    Ok(())
+}
+
+/// Local Merkle tree using Ligetron's Poseidon2
+struct MerkleTree {
+    depth: u8,
+    leaves: HashMap<usize, Hash32>,
+    default_nodes: Vec<Hash32>,
+}
+
+impl MerkleTree {
+    fn new(depth: u8) -> Self {
+        let mut default_nodes = vec![[0u8; 32]; depth as usize + 1];
+        for level in 1..=depth as usize {
+            let prev = default_nodes[level - 1];
+            default_nodes[level] = mt_combine((level - 1) as u8, &prev, &prev);
+        }
+        Self {
+            depth,
+            leaves: HashMap::new(),
+            default_nodes,
+        }
+    }
+
+    fn set_leaf(&mut self, pos: usize, leaf: Hash32) {
+        self.leaves.insert(pos, leaf);
+    }
+
+    fn get_leaf(&self, pos: usize) -> Hash32 {
+        *self.leaves.get(&pos).unwrap_or(&self.default_nodes[0])
+    }
+
+    fn root(&self) -> Hash32 {
+        self.compute_node(0, self.depth)
+    }
+
+    fn compute_node(&self, pos: usize, level: u8) -> Hash32 {
+        if level == 0 {
+            return self.get_leaf(pos);
+        }
+        let left = self.compute_node(pos * 2, level - 1);
+        let right = self.compute_node(pos * 2 + 1, level - 1);
+        let default = self.default_nodes[(level - 1) as usize];
+        if left == default && right == default {
+            return self.default_nodes[level as usize];
+        }
+        mt_combine(level - 1, &left, &right)
+    }
+
+    fn open(&self, pos: usize) -> Vec<Hash32> {
+        let mut siblings = Vec::with_capacity(self.depth as usize);
+        let mut idx = pos;
+        for level in 0..self.depth {
+            siblings.push(self.compute_node(idx ^ 1, level));
+            idx /= 2;
+        }
+        siblings
+    }
+}
+
+fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Hash32 {
+    let mut cur = *leaf;
+    let mut idx = pos;
+    for level in 0..depth as u32 {
+        let sibling = siblings[level as usize];
+        let bit = (idx & 1) as u8;
+        cur = if bit == 0 {
+            mt_combine(level as u8, &cur, &sibling)
+        } else {
+            mt_combine(level as u8, &sibling, &cur)
+        };
+        idx >>= 1;
+    }
+    cur
+}
 
 /// Configuration for Ligero test environment
 #[derive(Debug)]
 struct LigeroTestConfig {
-    /// Path to the WASM program
-    program_path: PathBuf,
-    /// Path to the prover binary
-    prover_bin: PathBuf,
-    /// Path to the verifier binary
-    verifier_bin: PathBuf,
-    /// Path to the shader directory
-    shader_path: PathBuf,
+    /// Ligero program specifier: circuit name (preferred) or full `.wasm` path
+    program: String,
     /// FFT packing parameter
     packing: u32,
 }
@@ -71,33 +385,10 @@ struct LigeroTestConfig {
 impl LigeroTestConfig {
     /// Discover paths for note spend guest (complex hex arguments)
     fn discover() -> Result<Self> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .context("Could not find repository root")?;
-
-        let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-        // Detect OS and choose correct binary path
-        let platform_dir = if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux-amd64"
-        } else {
-            bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
-        };
-
-        let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-        let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
-
+        let program =
+            std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
         let config = Self {
-            program_path: ligero_dir.join("guest/bins/programs/note_spend_guest.wasm"),
-            prover_bin: bin_dir.join("webgpu_prover"),
-            verifier_bin: bin_dir.join("webgpu_verifier"),
-            shader_path: shader_dir,
+            program,
             packing: 8192,
         };
 
@@ -106,29 +397,20 @@ impl LigeroTestConfig {
 
     /// Apply this configuration to the environment
     fn apply(&self) -> Result<()> {
-        // Only set environment variables if they're not already set
-        // This allows manual overrides
+        // Only set the program if the user didn't provide one.
         if std::env::var("LIGERO_PROGRAM_PATH").is_err() {
-            std::env::set_var("LIGERO_PROGRAM_PATH", &self.program_path);
-            println!("Set LIGERO_PROGRAM_PATH={}", self.program_path.display());
+            std::env::set_var("LIGERO_PROGRAM_PATH", &self.program);
+            println!("Set LIGERO_PROGRAM_PATH={}", self.program);
         }
+        // NOTE: Do NOT set LIGERO_PROVER_BIN/LIGERO_VERIFIER_BIN/LIGERO_SHADER_PATH here.
+        // Sovereign no longer vendors Ligero binaries/shaders; `ligero-runner` is responsible
+        // for discovering them from the pinned `ligero-prover` git checkout.
 
-        if std::env::var("LIGERO_PROVER_BIN").is_err() {
-            std::env::set_var("LIGERO_PROVER_BIN", &self.prover_bin);
-            println!("Set LIGERO_PROVER_BIN={}", self.prover_bin.display());
-        }
-
-        if std::env::var("LIGERO_VERIFIER_BIN").is_err() {
-            std::env::set_var("LIGERO_VERIFIER_BIN", &self.verifier_bin);
-            println!("Set LIGERO_VERIFIER_BIN={}", self.verifier_bin.display());
-        }
-
-        if std::env::var("LIGERO_SHADER_PATH").is_err() {
-            std::env::set_var("LIGERO_SHADER_PATH", &self.shader_path);
-            println!("Set LIGERO_SHADER_PATH={}", self.shader_path.display());
-        }
-
-        if std::env::var("LIGERO_PACKING").is_err() {
+        let should_set_packing = match std::env::var("LIGERO_PACKING") {
+            Ok(existing) => existing.parse::<u32>().is_err(),
+            Err(_) => true,
+        };
+        if should_set_packing {
             std::env::set_var("LIGERO_PACKING", self.packing.to_string());
             println!("Set LIGERO_PACKING={}", self.packing);
         }
@@ -146,12 +428,13 @@ impl LigeroTestConfig {
 
     /// Check if all required files exist
     fn validate(&self) -> Result<()> {
-        if !self.program_path.exists() {
-            anyhow::bail!(
-                "WASM program not found at: {}\nRun: cd crates/adapters/ligero/guest/note-spend-guest && cargo build --release --target wasm32-unknown-unknown",
-                self.program_path.display()
-            );
-        }
+        // Ensure the program can be resolved before running expensive GPU work.
+        ligero_runner::resolve_program(&self.program).with_context(|| {
+            format!(
+                "Failed to resolve Ligero program '{}'. Set LIGERO_PROGRAM_PATH to a circuit name (e.g. note_spend_guest) or a full path to a .wasm",
+                self.program
+            )
+        })?;
 
         // Note: verifier_bin and shader_path might not exist in all environments
         // We'll let those fail at runtime if actually needed
@@ -181,8 +464,287 @@ fn setup_ligero_env() -> Result<String> {
         .apply()
         .context("Failed to apply Ligero configuration")?;
 
-    // Return the program path for convenience
-    Ok(config.program_path.to_string_lossy().to_string())
+    // Return the program specifier for convenience
+    Ok(config.program)
+}
+
+#[test]
+fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        Key, XChaCha20Poly1305, XNonce,
+    };
+    use hkdf::Hkdf;
+    use midnight_privacy::{ivk_sk_from_sk, pk_ivk_from_sk, IvkEncryptedNote, PrivacyAddress};
+    use sha2::Sha256;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
+        scalar[0] &= 248;
+        scalar[31] &= 127;
+        scalar[31] |= 64;
+        scalar
+    }
+
+    fn ivk_aead_key_nonce(domain: &Hash32, dh: &[u8; 32], cm: &Hash32) -> (Key, XNonce) {
+        const INFO_TAG: &[u8] = b"MP_IVK_AEAD_V1";
+        let hk = Hkdf::<Sha256>::new(Some(domain), dh);
+        let mut okm = [0u8; 56]; // 32 bytes key + 24 bytes nonce
+
+        let mut info = [0u8; 14 + 32];
+        info[..14].copy_from_slice(INFO_TAG);
+        info[14..].copy_from_slice(cm);
+        hk.expand(&info, &mut okm).expect("HKDF expand");
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&okm[..32]);
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&okm[32..]);
+        (Key::from(key), XNonce::from(nonce))
+    }
+
+    fn encode_note_plain(
+        domain: &Hash32,
+        value: u64,
+        rho: &Hash32,
+        recipient: &Hash32,
+        sender_id: &Hash32,
+    ) -> [u8; 144] {
+        let mut out = [0u8; 144];
+        out[0..32].copy_from_slice(domain);
+        out[32..40].copy_from_slice(&value.to_le_bytes());
+        out[40..48].copy_from_slice(&[0u8; 8]);
+        out[48..80].copy_from_slice(rho);
+        out[80..112].copy_from_slice(recipient);
+        out[112..144].copy_from_slice(sender_id);
+        out
+    }
+
+    fn parse_note_plain(pt: &[u8]) -> Result<(Hash32, u64, Hash32, Hash32, Hash32)> {
+        anyhow::ensure!(pt.len() == 144, "unexpected plaintext length: {}", pt.len());
+
+        let mut domain = [0u8; 32];
+        domain.copy_from_slice(&pt[0..32]);
+
+        let mut v_le = [0u8; 8];
+        v_le.copy_from_slice(&pt[32..40]);
+        let value = u64::from_le_bytes(v_le);
+
+        anyhow::ensure!(&pt[40..48] == &[0u8; 8], "value high bytes must be zero");
+
+        let mut rho = [0u8; 32];
+        rho.copy_from_slice(&pt[48..80]);
+
+        let mut recipient = [0u8; 32];
+        recipient.copy_from_slice(&pt[80..112]);
+
+        let mut sender_id = [0u8; 32];
+        sender_id.copy_from_slice(&pt[112..144]);
+
+        Ok((domain, value, rho, recipient, sender_id))
+    }
+
+    println!("\n=== IVK Roundtrip (Real Ligero Proof) ===\n");
+
+    let program_path = setup_ligero_env()?;
+    let domain: Hash32 = [1u8; 32];
+    let tree_depth: u8 = 16;
+
+    // Sender (spender) setup.
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id_out = recipient_owner;
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    // Input note owned by the sender.
+    let value_in: u64 = 100;
+    let rho_in: Hash32 = [2u8; 32];
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm_in = note_commitment_v2(&domain, value_in, &rho_in, &recipient_owner, &sender_id_in);
+
+    let mut tree = MerkleTree::new(tree_depth);
+    let pos: u64 = 0;
+    tree.set_leaf(pos as usize, cm_in);
+    let anchor = tree.root();
+    let siblings = tree.open(pos as usize);
+    let nf = nullifier(&domain, &nf_key, &rho_in);
+
+    // Receiver publishes a privacy address that contains (pk_spend, pk_ivk).
+    let receiver_spend_sk: Hash32 = [42u8; 32];
+    let receiver_pk_spend = pk_from_sk(&receiver_spend_sk);
+    let receiver_pk_ivk = pk_ivk_from_sk(&domain, &receiver_spend_sk);
+    anyhow::ensure!(
+        receiver_pk_spend != receiver_pk_ivk,
+        "pk_spend unexpectedly equals pk_ivk"
+    );
+
+    let receiver_addr = PrivacyAddress::from_keys(&receiver_pk_spend, &receiver_pk_ivk).to_string();
+    let parsed: PrivacyAddress = receiver_addr.parse().context("parse privacy address")?;
+    assert_eq!(parsed.to_pk(), receiver_pk_spend);
+    assert_eq!(parsed.pk_ivk(), receiver_pk_ivk);
+
+    // Output note sent to the receiver (TRANSFER shape: withdraw_amount=0, n_out=1).
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
+    let out_value = value_in;
+    let out_rho: Hash32 = [9u8; 32];
+    let out_recipient = recipient_from_pk_v2(&domain, &receiver_pk_spend, &receiver_pk_ivk);
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_recipient, &sender_id_out);
+
+    let public_output = SpendPublic {
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount: withdraw_amount as u128,
+        output_commitments: vec![cm_out],
+        view_attestations: None,
+    };
+
+    let input = SpendInputV2 {
+        value: value_in,
+        rho: rho_in,
+        sender_id: sender_id_in,
+        pos,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: receiver_pk_spend,
+        pk_ivk: receiver_pk_ivk,
+        cm: cm_out,
+    };
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
+
+    let mut host =
+        <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
+    add_args_to_host(&mut host, &args)?;
+    host.set_public_output(&public_output)?;
+
+    let code_commitment = host.code_commitment();
+    let proof_data = host.run(true).context("Failed to generate Ligero proof")?;
+    let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)
+        .context("Proof verification failed")?;
+
+    let cm_out_from_proof = verified
+        .output_commitments
+        .first()
+        .copied()
+        .context("missing output commitment")?;
+    assert_eq!(cm_out_from_proof, cm_out);
+
+    // --- Build the IVK-encrypted output (sender side) ---
+    let receiver_pk_ivk_point = PublicKey::from(parsed.pk_ivk());
+
+    let esk_seed: Hash32 = [7u8; 32];
+    let esk = StaticSecret::from(clamp_x25519_scalar(esk_seed));
+    let epk = PublicKey::from(&esk);
+
+    let dh_sender = esk.diffie_hellman(&receiver_pk_ivk_point);
+    let (key, nonce) = ivk_aead_key_nonce(&domain, dh_sender.as_bytes(), &cm_out_from_proof);
+    let cipher = XChaCha20Poly1305::new(&key);
+
+    let pt = encode_note_plain(&domain, out_value, &out_rho, &out_recipient, &sender_id_out);
+    let mut aad = [0u8; 64];
+    aad[..32].copy_from_slice(epk.as_bytes());
+    aad[32..].copy_from_slice(&cm_out_from_proof);
+
+    let ct = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &pt,
+                aad: &aad,
+            },
+        )
+        .expect("encrypt");
+
+    let tx_out = IvkEncryptedNote {
+        cm: cm_out_from_proof,
+        epk: *epk.as_bytes(),
+        ct: ct.try_into().expect("ciphertext fits SafeVec"),
+    };
+
+    // --- Wallet scanning (receiver side): decrypt and verify cm matches proof output ---
+    let ivk_secret = StaticSecret::from(clamp_x25519_scalar(ivk_sk_from_sk(
+        &domain,
+        &receiver_spend_sk,
+    )));
+    let epk_from_tx = PublicKey::from(tx_out.epk);
+    let dh_receiver = ivk_secret.diffie_hellman(&epk_from_tx);
+    let (key2, nonce2) = ivk_aead_key_nonce(&domain, dh_receiver.as_bytes(), &tx_out.cm);
+    let cipher2 = XChaCha20Poly1305::new(&key2);
+
+    let mut aad2 = [0u8; 64];
+    aad2[..32].copy_from_slice(&tx_out.epk);
+    aad2[32..].copy_from_slice(&tx_out.cm);
+
+    let pt2 = cipher2
+        .decrypt(
+            &nonce2,
+            Payload {
+                msg: tx_out.ct.as_ref(),
+                aad: &aad2,
+            },
+        )
+        .context("decrypt")?;
+
+    let (d_domain, d_value, d_rho, d_recipient, d_sender_id) = parse_note_plain(&pt2)?;
+    assert_eq!(d_domain, domain);
+    assert_eq!(d_value, out_value);
+    assert_eq!(d_rho, out_rho);
+    assert_eq!(d_recipient, out_recipient);
+    assert_eq!(d_sender_id, sender_id_out);
+
+    let cm_recomputed = note_commitment_v2(&d_domain, d_value, &d_rho, &d_recipient, &d_sender_id);
+    assert_eq!(cm_recomputed, tx_out.cm);
+
+    // Negative: if the sender encrypts to pk_spend instead of pk_ivk, the receiver cannot decrypt.
+    let pk_spend_as_pk_ivk = PublicKey::from(receiver_pk_spend);
+    let dh_wrong = esk.diffie_hellman(&pk_spend_as_pk_ivk);
+    let (wrong_key, wrong_nonce) =
+        ivk_aead_key_nonce(&domain, dh_wrong.as_bytes(), &cm_out_from_proof);
+    let wrong_cipher = XChaCha20Poly1305::new(&wrong_key);
+    let wrong_ct = wrong_cipher
+        .encrypt(
+            &wrong_nonce,
+            Payload {
+                msg: &pt,
+                aad: &aad,
+            },
+        )
+        .expect("encrypt (wrong pk)");
+    let wrong_tx_out = IvkEncryptedNote {
+        cm: cm_out_from_proof,
+        epk: *epk.as_bytes(),
+        ct: wrong_ct.try_into().expect("ciphertext fits SafeVec"),
+    };
+
+    assert!(
+        cipher2
+            .decrypt(
+                &nonce2,
+                Payload {
+                    msg: wrong_tx_out.ct.as_ref(),
+                    aad: &aad2
+                }
+            )
+            .is_err(),
+        "decrypt unexpectedly succeeded with pk_spend-as-pk_ivk"
+    );
+
+    Ok(())
 }
 
 /// Simple test demonstrating note spending with the note_spend_guest program
@@ -201,16 +763,25 @@ fn test_simple_note_spend() -> Result<()> {
 
     // Create note parameters
     let domain: Hash32 = [1u8; 32];
-    let value: u128 = 100;
+    let value: u64 = 100;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET
+
+    // Spending secret key (the master secret for this note)
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner: Hash32 = [6u8; 32];
+
+    // Derive recipient(owner) from (spend_sk, pk_ivk_owner) (matches the v2 guest program).
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+
+    // Derive nullifier key from spend_sk (circuit does this internally too)
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Creating note with value: {}", value);
 
     // Compute note commitment
     let commitment_start = Instant::now();
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
     println!(
         "✓ Note commitment: {} ({:.3}s)",
         hex::encode(&cm[..8]),
@@ -269,16 +840,21 @@ fn test_simple_note_spend() -> Result<()> {
     );
 
     // Prepare public output with one shielded output (all value as change).
-    let withdraw_amount: u128 = 0;
-    let n_out: u32 = 1;
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
     let out_value = value; // put entire input into a new note
     let out_rho: Hash32 = [9u8; 32];
-    let out_rcp: Hash32 = [5u8; 32];
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    // Output keys - the circuit derives recipient from (pk_spend, pk_ivk)
+    let out_spend_sk: Hash32 = [5u8; 32];
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = out_pk_spend;
+    let out_rcp = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
+    let sender_id_out = recipient_owner;
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_rcp, &sender_id_out);
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
-        withdraw_amount,
+        withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
     };
@@ -288,50 +864,37 @@ fn test_simple_note_spend() -> Result<()> {
     // Create Ligero host with note_spend_guest.wasm
     let program_path = setup_ligero_env()?;
 
-    // Private indices (1-based). Keep input note data and path private,
-    // and mark output plaintext fields private (value_out, rho_out, recipient_out).
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
-    }
-    // Outputs start at index base = 12 + depth
-    let base = 12 + (tree_depth as usize);
-    private_indices.push(base + 0); // value_out_0
-    private_indices.push(base + 1); // rho_out_0
-    private_indices.push(base + 2); // recipient_out_0
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: out_pk_spend,
+        pk_ivk: out_pk_ivk,
+        cm: cm_out,
+    };
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices.clone());
-
     println!("✓ Private witness indices: {:?}", private_indices);
-
-    // Add arguments in guest ABI order:
-    //   domain, value, rho, recipient, nf_key, pos, depth,
-    //   siblings[0..depth], anchor, nullifier, withdraw_amount,
-    //   n_out, [value_out, rho_out, recipient_out, cm_out]...
-    host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
-    host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
-
-    // Add all siblings (PRIVATE)
-    for sibling in &siblings {
-        // 8..8+depth: PRIVATE
-        host.add_hex_arg(hex::encode(sibling));
-    }
-
-    host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
-    host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth: PUBLIC
-    host.add_str_arg(n_out.to_string()); // 11+depth: PUBLIC
-                                         // Output #0 (private fields first, public cm last)
-    host.add_str_arg(out_value.to_string()); // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho)); // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp)); // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out)); // 12+depth + 3
+    add_args_to_host(&mut host, &args)?;
 
     // Set public output (now includes output_commitments)
     host.set_public_output(&public_output)?;
@@ -371,7 +934,7 @@ fn test_simple_note_spend() -> Result<()> {
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
     assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
-    assert_eq!(verified_output.withdraw_amount, withdraw_amount);
+    assert_eq!(verified_output.withdraw_amount, withdraw_amount as u128);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
     println!("✓ Public output verified:");
@@ -434,15 +997,27 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     // Note parameters
     let domain: Hash32 = [1u8; 32]; // Domain tag for this note type
-    let value: u128 = 100; // Value stored in the note
+    let value: u64 = 100; // Value stored in the note
     let rho: Hash32 = [2u8; 32]; // Randomness (would be generated securely)
-    let recipient: Hash32 = [3u8; 32]; // Recipient's public key binding
 
-    // Secret nullifier key (kept private, never revealed)
-    let nf_key: Hash32 = [4u8; 32];
+    // Spending secret key (the master secret for this note)
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner: Hash32 = [6u8; 32];
+
+    // Derive recipient(owner) from (spend_sk, pk_ivk_owner) (matches the v2 guest program).
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    println!(
+        "✓ Derived recipient(owner) from spend_sk: {}",
+        hex::encode(recipient_owner)
+    );
+
+    // Derive nullifier key from spend_sk (circuit does this internally too)
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+    println!("✓ Derived nf_key from spend_sk: {}", hex::encode(nf_key));
 
     // Compute the note commitment using Poseidon2
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
     println!("✓ Note commitment: {}", hex::encode(cm));
 
     // ---- 2) Add note to Merkle tree and update root ----
@@ -483,16 +1058,25 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // ---- 5) Prepare public output that proof will commit to ----
     println!("\nStep 5: Preparing spend proof...");
 
-    let withdraw_amount: u128 = 0;
-    let n_out: u32 = 1;
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
     let out_value = value; // all value to shielded change
     let out_rho: Hash32 = [7u8; 32];
-    let out_rcp: Hash32 = [8u8; 32];
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    // Output keys - the circuit derives recipient from (pk_spend, pk_ivk)
+    let out_spend_sk: Hash32 = [8u8; 32];
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = out_pk_spend;
+    let out_rcp = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
+    let sender_id_out = recipient_owner;
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_rcp, &sender_id_out);
+    println!(
+        "✓ Output recipient derived from (pk_spend, pk_ivk): {}",
+        hex::encode(out_rcp)
+    );
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
-        withdraw_amount,
+        withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
     };
@@ -521,46 +1105,56 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     let program_path = setup_ligero_env()?;
 
-    // Private indices (1-based). Keep input note data and path private,
-    // and mark output plaintext fields private (value_out, rho_out, recipient_out).
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
-    }
-    let base = 12 + (tree_depth as usize);
-    private_indices.push(base + 0);
-    private_indices.push(base + 1);
-    private_indices.push(base + 2);
+    // === NEW ARGUMENT LAYOUT FOR FIELD-LEVEL MERKLE PATH ===
+    // Position is now passed as individual bits (one per level) instead of a single integer.
+    // This enables making position bits private without breaking constraints.
+    //
+    // Layout (1-based indices):
+    //   1: domain (hex)
+    //   2: value (i64)
+    //   3: rho (hex) [PRIVATE]
+    //   4: recipient (hex) [PRIVATE]
+    //   5: spend_sk (hex) [PRIVATE]
+    //   6: depth (i64)
+    //   7 to 6+depth: position bits [PRIVATE] (hex, 0x00...00 or 0x00...01)
+    //   7+depth to 6+2*depth: siblings [PRIVATE] (hex)
+    //   7+2*depth: anchor (str with "0x" prefix)
+    //   8+2*depth: nullifier (str with "0x" prefix)
+    //   9+2*depth: withdraw_amount (i64)
+    //   10+2*depth: n_out (i64)
+    //   Then 4 args per output: value, rho, pk, cm
+
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: out_pk_spend,
+        pk_ivk: out_pk_ivk,
+        cm: cm_out,
+    };
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices.clone());
-
     println!("✓ Private witness indices: {:?}", private_indices);
-
-    // Add witness data and public inputs
-    // Arguments order: domain, value, rho, recipient, nf_key, pos, depth, siblings[0..depth], anchor, nullifier, withdraw_amount, n_out, outputs...
-    host.add_hex_arg(hex::encode(domain)); // 1: PUBLIC
-    host.add_str_arg(value.to_string()); // 2: PRIVATE - decimal u128
-    host.add_hex_arg(hex::encode(rho)); // 3: PRIVATE
-    host.add_hex_arg(hex::encode(recipient)); // 4: PRIVATE
-    host.add_hex_arg(hex::encode(nf_key)); // 5: PRIVATE (nullifier key)
-    host.add_str_arg(position.to_string()); // 6: PRIVATE (position - CRITICAL!) - decimal u64
-    host.add_str_arg(tree_depth.to_string()); // 7: PUBLIC - decimal u32
-
-    // Add all siblings (PRIVATE)
-    for sibling in &siblings {
-        // 8..8+depth: PRIVATE
-        host.add_hex_arg(hex::encode(sibling));
-    }
-
-    host.add_hex_arg(hex::encode(anchor)); // 8+depth: PUBLIC
-    host.add_hex_arg(hex::encode(nf)); // 9+depth: PUBLIC
-    host.add_str_arg(withdraw_amount.to_string()); // 10+depth
-    host.add_str_arg(n_out.to_string()); // 11+depth
-    host.add_str_arg(out_value.to_string()); // 12+depth + 0
-    host.add_hex_arg(hex::encode(out_rho)); // 12+depth + 1
-    host.add_hex_arg(hex::encode(out_rcp)); // 12+depth + 2
-    host.add_hex_arg(hex::encode(cm_out)); // 12+depth + 3
+    add_args_to_host(&mut host, &args)?;
 
     // Set the public output
     host.set_public_output(&public_output)?;
@@ -595,7 +1189,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
     assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
-    assert_eq!(verified_output.withdraw_amount, withdraw_amount);
+    assert_eq!(verified_output.withdraw_amount, withdraw_amount as u128);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
     println!("✓ Public output verified:");
@@ -650,54 +1244,8 @@ fn hex32(h: &Hash32) -> String {
 }
 
 /// Helper to discover guest program path and platform-specific binaries
-fn program_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LIGERO_PROGRAM_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Try to discover it based on project structure
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    // For note spending, we'd need a different guest program
-    // For now, return the note_spend_guest as the implementation
-    Ok(repo_root.join("crates/adapters/ligero/guest/bins/programs/note_spend_guest.wasm"))
-}
-
-/// Helper to get platform-specific binary paths
-fn get_platform_bin_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("Could not find repository root")?;
-
-    let ligero_dir = repo_root.join("crates/adapters/ligero");
-
-    // Detect OS and choose correct binary path
-    let platform_dir = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux-amd64"
-    } else {
-        bail!("Unsupported platform for Ligero binaries. Supported: macOS, Linux");
-    };
-
-    let bin_dir = ligero_dir.join("bins").join(platform_dir).join("bin");
-    let shader_dir = ligero_dir.join("bins").join(platform_dir).join("shader");
-
-    Ok((
-        bin_dir.join("webgpu_prover"),
-        bin_dir.join("webgpu_verifier"),
-        shader_dir,
-    ))
+fn program_spec() -> String {
+    std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string())
 }
 
 const TREE_DEPTH: u8 = 16; // 2^16 = 65,536 max notes
@@ -727,39 +1275,21 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     setup_ligero_env().context("Failed to setup Ligero environment")?;
 
-    // Use platform-specific paths or environment overrides
-    let (default_prover, default_verifier, default_shader_path) = get_platform_bin_paths()?;
-
-    let prover = if let Ok(path) = std::env::var("LIGERO_PROVER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_prover
-    };
-
-    let verifier = if let Ok(path) = std::env::var("LIGERO_VERIFIER_BIN") {
-        PathBuf::from(path)
-    } else {
-        default_verifier
-    };
-
-    let shader_path = if let Ok(path) = std::env::var("LIGERO_SHADER_PATH") {
-        path
-    } else {
-        default_shader_path.to_string_lossy().to_string()
-    };
-
     let packing: u32 = std::env::var("LIGERO_PACKING")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8192);
-    let program =
-        program_path().context("Set LIGERO_PROGRAM_PATH to note_spend.wasm guest program")?;
+    let program = program_spec();
 
-    println!("✓ Prover:      {}", prover.display());
-    println!("✓ Verifier:    {}", verifier.display());
-    println!("✓ Shaders:     {}", shader_path);
+    // Use the centralized Ligero runner crate (owned by ligero-prover) for discovery + execution.
+    let mut runner = ligero_runner::LigeroRunner::new(&program);
+    runner.config_mut().packing = packing;
+
+    println!("✓ Prover:      {}", runner.paths().prover_bin.display());
+    println!("✓ Verifier:    {}", runner.paths().verifier_bin.display());
+    println!("✓ Shaders:     {}", runner.config().shader_path);
     println!("✓ Packing:     {}", packing);
-    println!("✓ Program:     {}", program.display());
+    println!("✓ Program:     {}", program);
 
     // ---- 1) Create a note + tree ----
     println!("\nStep 1: Creating note and building Merkle tree...");
@@ -767,8 +1297,11 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     let domain: Hash32 = [1u8; 32];
     let value: u128 = 42;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET - never revealed
+    let spend_sk: Hash32 = [4u8; 32]; // SECRET - never revealed
+
+    // Recipient + nf_key are derived from spend_sk (matches the guest program).
+    let recipient = recipient_from_sk(&domain, &spend_sk);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
     let cm = note_commitment(&domain, value, &rho, &recipient);
     let pos: u64 = 0;
@@ -801,48 +1334,83 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     // ---- 3) Build JSON config for REAL prover ----
     println!("\nStep 3: Building prover configuration...");
 
-    // Guest program arguments (using string format for Ligero interface)
-    // Argument order must match what the guest program expects:
-    // 1. domain (public)
-    // 2. commitment (public - derived from private note data)
-    // 3. nf_key (PRIVATE - SECRET nullifier key)
-    // 4. position (PRIVATE - CRITICAL for privacy, reveals which leaf)
-    // 5. tree_depth (public)
-    // 6..6+depth-1: siblings (PRIVATE - Merkle authentication path)
-    // 6+depth: anchor (public)
-    // 7+depth: nullifier (public)
+    // Guest argument layout must match `note_spend_guest`:
+    //   1  domain (hex, 32 bytes)
+    //   2  value (i64)
+    //   3  rho (hex, 32 bytes) [PRIVATE]
+    //   4  recipient (hex, 32 bytes) [PRIVATE] (layout only; derived in-circuit)
+    //   5  spend_sk (hex, 32 bytes) [PRIVATE]
+    //   6  depth (i64)
+    //   7..7+depth-1        pos_bits (hex, 32 bytes each) [PRIVATE]
+    //   7+depth..7+2*depth-1 siblings (hex, 32 bytes each) [PRIVATE]
+    //   7+2*depth           anchor (str, field element)
+    //   8+2*depth           nullifier (str, field element)
+    //   9+2*depth           withdraw_amount (i64)
+    //   10+2*depth          n_out (i64)
+    //   outputs (4*n_out): value_out (i64), rho_out (hex), pk_out (hex), cm_out (hex)
+
+    // One-output transfer: withdraw=0, out_value=value.
+    let withdraw_amount: u64 = 0;
+    let n_out: u64 = 1;
+    let out_value: u64 = value as u64;
+    let out_rho: Hash32 = [7u8; 32];
+    let out_spend_sk: Hash32 = [8u8; 32];
+    let out_pk = pk_from_sk(&out_spend_sk);
+    let out_recipient = recipient_from_pk(&domain, &out_pk);
+    let cm_out = note_commitment(&domain, value, &out_rho, &out_recipient);
 
     let mut args: Vec<serde_json::Value> = Vec::new();
-    args.push(json!({"str": hex32(&domain)})); // 1: PUBLIC
-    args.push(json!({"str": hex32(&cm)})); // 2: PUBLIC (but derived from private data)
-    args.push(json!({"str": hex32(&nf_key)})); // 3: PRIVATE
-    args.push(json!({"str": pos.to_string()})); // 4: PRIVATE
-    args.push(json!({"str": TREE_DEPTH.to_string()})); // 5: PUBLIC
+    args.push(json!({"hex": hex32(&domain)})); // 1
+    args.push(json!({"i64": value as i64})); // 2 (public)
+    args.push(json!({"hex": hex32(&rho)})); // 3 (private)
+    args.push(json!({"hex": hex32(&recipient)})); // 4 (private, layout only)
+    args.push(json!({"hex": hex32(&spend_sk)})); // 5 (private)
+    args.push(json!({"i64": TREE_DEPTH as i64})); // 6 (public)
 
-    // Add all siblings (PRIVATE)
+    // Position bits (LSB-first, one bit per level).
+    for lvl in 0..(TREE_DEPTH as usize) {
+        let bit = ((pos >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        args.push(json!({"hex": hex::encode(bit_bytes)})); // 7..7+depth-1 (private)
+    }
+
+    // Siblings (private).
     for s in &siblings {
-        args.push(json!({"str": hex32(s)})); // 6..6+depth-1: PRIVATE
+        args.push(json!({"hex": hex32(s)}));
     }
 
-    args.push(json!({"str": hex32(&anchor)})); // 6+depth: PUBLIC
-    args.push(json!({"str": hex32(&nf)})); // 7+depth: PUBLIC
+    // Anchor + nullifier are PUBLIC field elements (string args).
+    args.push(json!({"str": format!("0x{}", hex32(&anchor))}));
+    args.push(json!({"str": format!("0x{}", hex32(&nf))}));
 
-    // Mark private indices (1-based indexing)
-    let first_sibling_idx = 6usize;
-    let mut private_indices = vec![
-        3usize, // nf_key - SECRET nullifier key
-        4usize, // pos - position in tree (CRITICAL for privacy!)
-    ];
-    for i in 0..(TREE_DEPTH as usize) {
-        private_indices.push(first_sibling_idx + i); // all siblings (Merkle path)
+    // Withdraw + outputs.
+    args.push(json!({"i64": withdraw_amount as i64}));
+    args.push(json!({"i64": n_out as i64}));
+    args.push(json!({"i64": out_value as i64}));
+    args.push(json!({"hex": hex32(&out_rho)}));
+    args.push(json!({"hex": hex32(&out_pk)}));
+    args.push(json!({"hex": hex32(&cm_out)}));
+
+    // Mark private indices (1-based indexing), matching other tests in this file.
+    let depth = TREE_DEPTH as usize;
+    let mut private_indices = vec![3usize, 4usize, 5usize]; // rho, recipient, spend_sk
+    for i in 0..depth {
+        private_indices.push(7 + i); // position bits
     }
+    for i in 0..depth {
+        private_indices.push(7 + depth + i); // siblings
+    }
+    let out_base = 11 + 2 * depth;
+    private_indices.push(out_base + 1); // out_rho
+    private_indices.push(out_base + 2); // out_pk
 
     println!("✓ Arguments prepared: {} total", args.len());
     println!("✓ Private indices: {:?}", private_indices);
 
-    let prove_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
+    let _prove_cfg = json!({
+        "program": program.clone(),
+        "shader-path": runner.config().shader_path.clone(),
         "packing": packing,
         "private-indices": private_indices,
         "args": args,
@@ -850,74 +1418,62 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
 
     // ---- 4) Run REAL prover (writes proof.data) ----
     println!("\nStep 4: Generating REAL proof with WebGPU prover...");
-    println!("⏳ This may take a while (proof generation is compute-intensive)...");
 
-    let tmp = tempdir()?;
-    let out = Command::new(&prover)
-        .arg(serde_json::to_string(&prove_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_prover - is WebGPU available?")?;
+    // Fill config
+    runner.config_mut().private_indices = private_indices.clone();
+    runner.config_mut().args = args
+        .clone()
+        .into_iter()
+        .map(|v| {
+            // The test builds JSON values; decode to LigeroArg via serde_json.
+            serde_json::from_value::<ligero_runner::LigeroArg>(v).expect("valid LigeroArg")
+        })
+        .collect();
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !stdout.contains("Final prove result:") || !stdout.contains("true")
-    {
-        eprintln!("❌ Prover output:\n{}", stdout);
-        eprintln!(
-            "❌ Prover stderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        bail!("Ligero prover failed to produce a valid proof");
-    }
+    // Generate proof bytes (default: compressed `proof_data.gz`; when gzip is disabled: `proof_data.bin`).
+    let proof_bytes = runner
+        .run_prover_with_options(ligero_runner::ProverRunOptions {
+            keep_proof_dir: false,
+            proof_outputs_base: None,
+            write_replay_script: true,
+        })
+        .context("Failed to run webgpu_prover")?;
 
-    println!("✓ REAL proof generated successfully!");
-    println!("  Prover output: {}", stdout.lines().last().unwrap_or(""));
+    println!(
+        "✓ REAL proof generated successfully! ({} bytes)",
+        proof_bytes.len()
+    );
 
     // ---- 5) Run REAL verifier (must redact private args) ----
     println!("\nStep 5: Verifying proof with REAL verifier...");
 
-    // Redact ALL private arguments (nf_key, position, and all siblings)
-    // The verifier must not see these witness values!
-    let mut redacted_args = args.clone();
-    redacted_args[2] = json!({"str": "x".repeat(64)}); // redact nf_key (index 3, zero-based 2)
-    redacted_args[3] = json!({"str": "0"}); // redact position (index 4, zero-based 3)
-    for i in 0..(TREE_DEPTH as usize) {
-        let idx = (first_sibling_idx - 1) + i; // zero-based for vector
-        redacted_args[idx] = json!({"str": "x".repeat(64)}); // redact siblings
-    }
+    // Resolve the program name to an actual path
+    let program_path = ligero_runner::resolve_program(&program)
+        .context("Failed to resolve program path for verifier")?;
 
-    let verify_cfg = json!({
-        "program": program.to_string_lossy(),
-        "shader-path": shader_path,
-        "packing": packing,
-        "private-indices": private_indices,
-        "args": redacted_args,
-    });
+    let vpaths = ligero_runner::verifier::VerifierPaths::from_explicit(
+        program_path,
+        PathBuf::from(&runner.config().shader_path),
+        runner.paths().verifier_bin.clone(),
+        packing,
+    );
 
-    let out_v = Command::new(&verifier)
-        .arg(serde_json::to_string(&verify_cfg)?)
-        .current_dir(tmp.path())
-        .output()
-        .context("Failed to run webgpu_verifier")?;
+    // Convert args JSON -> LigeroArg and let the verifier helper redact private ones.
+    let args_for_verify: Vec<ligero_runner::LigeroArg> = args
+        .clone()
+        .into_iter()
+        .map(|v| serde_json::from_value(v).expect("valid LigeroArg"))
+        .collect();
 
-    let vstdout = String::from_utf8_lossy(&out_v.stdout);
-    if !out_v.status.success()
-        || !vstdout.contains("Final Verify Result:")
-        || !vstdout.contains("true")
-    {
-        eprintln!("❌ Verifier output:\n{}", vstdout);
-        eprintln!(
-            "❌ Verifier stderr:\n{}",
-            String::from_utf8_lossy(&out_v.stderr)
-        );
-        bail!("Ligero verifier rejected the proof");
-    }
+    ligero_runner::verifier::verify_proof(
+        &vpaths,
+        &proof_bytes,
+        args_for_verify,
+        private_indices.clone(),
+    )
+    .context("Failed to run webgpu_verifier")?;
 
     println!("✓ REAL proof verified successfully!");
-    println!(
-        "  Verifier output: {}",
-        vstdout.lines().last().unwrap_or("")
-    );
 
     // ---- 6) Local sanity checks ----
     println!("\nStep 6: Validating proof correctness...");
@@ -1064,12 +1620,15 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     const TREE_DEPTH: u8 = 4;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain = [1u8; 32];
-    let value = 1000u128;
+    let value: u64 = 1000;
     let rho = [42u8; 32];
-    let recipient = [99u8; 32];
-    let nf_key = [33u8; 32];
+    let spend_sk = [33u8; 32]; // Spending secret key
+    let pk_ivk_owner: Hash32 = [66u8; 32];
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk); // Derive nf_key
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
     let pos = 0u64;
     tree.set_leaf(pos as usize, cm);
     let anchor = tree.root();
@@ -1085,77 +1644,81 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     println!("\nStep 2: Testing VALID spend with balanced outputs...");
     println!("Input: {}, Withdraw: 0, Outputs: {} + {}", value, 600, 400);
 
-    let withdraw_amount = 0u128;
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
 
     // Create two output notes that sum to input value
-    let out1_value = 600u128;
+    let out1_value: u64 = 600;
     let out1_rho = [10u8; 32];
-    let out1_recipient = [11u8; 32];
-    let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1_pk_spend = [11u8; 32];
+    let out1_pk_ivk = out1_pk_spend;
+    let out1_recipient = recipient_from_pk_v2(&domain, &out1_pk_spend, &out1_pk_ivk);
+    let sender_id_out = recipient_owner;
+    let out1_cm = note_commitment_v2(
+        &domain,
+        out1_value,
+        &out1_rho,
+        &out1_recipient,
+        &sender_id_out,
+    );
 
-    let out2_value = 400u128;
+    let out2_value: u64 = 400;
     let out2_rho = [20u8; 32];
-    let out2_recipient = [21u8; 32];
-    let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2_pk_spend = [21u8; 32];
+    let out2_pk_ivk = out2_pk_spend;
+    let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
+    let out2_cm = note_commitment_v2(
+        &domain,
+        out2_value,
+        &out2_rho,
+        &out2_recipient,
+        &sender_id_out,
+    );
 
-    let program_path = config.program_path.to_string_lossy().to_string();
-    let depth = siblings.len();
-
-    // Build private indices
-    let mut private_indices = vec![
-        2, // value
-        3, // rho
-        4, // recipient
-        5, // nf_key
-        6, // pos
-    ];
-    for i in 0..depth {
-        private_indices.push(8 + i); // siblings
-    }
-    // Mark output note details as private
-    private_indices.push(12 + depth + 0); // out1_value
-    private_indices.push(12 + depth + 1); // out1_rho
-    private_indices.push(12 + depth + 2); // out1_recipient
-    private_indices.push(12 + depth + 4); // out2_value
-    private_indices.push(12 + depth + 5); // out2_rho
-    private_indices.push(12 + depth + 6); // out2_recipient
+    let program_path = config.program.clone();
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let out1 = SpendOutputV2 {
+        value: out1_value,
+        rho: out1_rho,
+        pk_spend: out1_pk_spend,
+        pk_ivk: out1_pk_ivk,
+        cm: out1_cm,
+    };
+    let out2 = SpendOutputV2 {
+        value: out2_value,
+        rho: out2_rho,
+        pk_spend: out2_pk_spend,
+        pk_ivk: out2_pk_ivk,
+        cm: out2_cm,
+    };
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        TREE_DEPTH,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[out1, out2],
+    );
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
         .with_private_indices(private_indices);
-
-    // Input note
-    host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string());
-    host.add_str_arg((siblings.len() as u32).to_string());
-    for sib in &siblings {
-        host.add_hex_arg(hex::encode(sib));
-    }
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg("2".to_string()); // n_out = 2
-
-    // Output 1
-    host.add_str_arg(out1_value.to_string());
-    host.add_hex_arg(hex::encode(out1_rho));
-    host.add_hex_arg(hex::encode(out1_recipient));
-    host.add_hex_arg(hex::encode(out1_cm));
-
-    // Output 2
-    host.add_str_arg(out2_value.to_string());
-    host.add_hex_arg(hex::encode(out2_rho));
-    host.add_hex_arg(hex::encode(out2_recipient));
-    host.add_hex_arg(hex::encode(out2_cm));
+    add_args_to_host(&mut host, &args)?;
 
     let public = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
-        withdraw_amount,
+        withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
     };
@@ -1209,12 +1772,16 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     const TREE_DEPTH: u8 = 4;
     let mut tree = MerkleTree::new(TREE_DEPTH);
     let domain = [1u8; 32];
-    let value = 1000u128;
+    let value: u64 = 1000;
     let rho = [42u8; 32];
-    let recipient = [99u8; 32];
-    let nf_key = [33u8; 32];
+    let spend_sk = [33u8; 32]; // Spending secret key
+    let pk_ivk_owner = [66u8; 32];
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    // For "deposit-style" notes in tests, use a canonical all-zero sender_id.
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
     let pos = 0u64;
     tree.set_leaf(pos as usize, cm);
     let anchor = tree.root();
@@ -1223,57 +1790,79 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 
     println!("✓ Note created with value: {}", value);
 
-    // Step 2: Generate a proof with withdraw_amount > 0
-    println!("\nStep 2: Generating proof with withdraw_amount=500...");
+    // Step 2: Generate a proof with withdraw_amount > 0 (with change output to balance)
+    println!("\nStep 2: Generating proof with withdraw_amount=500 + 500 change...");
 
-    let withdraw_amount = 500u128;
+    let withdraw_amount: u64 = 500;
+    let withdraw_to: Hash32 = [99u8; 32];
+    let change_value: u64 = 500; // Balance: 1000 = 500 withdraw + 500 change
+    let change_rho: Hash32 = [50u8; 32];
+    let change_pk_spend: Hash32 = [51u8; 32];
+    let change_pk_ivk: Hash32 = [52u8; 32];
+    let change_recipient = recipient_from_pk_v2(&domain, &change_pk_spend, &change_pk_ivk);
+    // Output sender_id is the spender's (owner) privacy address.
+    let sender_id_out = recipient_owner;
+    let change_cm = note_commitment_v2(
+        &domain,
+        change_value,
+        &change_rho,
+        &change_recipient,
+        &sender_id_out,
+    );
 
-    let program_path = config.program_path.to_string_lossy().to_string();
-    // Private: value, rho, recipient, nf_key, pos, and all siblings
-    let depth = siblings.len();
-    let mut private_indices = vec![
-        2, // value
-        3, // rho
-        4, // recipient
-        5, // nf_key
-        6, // pos
-    ];
-    for i in 0..depth {
-        private_indices.push(8 + i); // siblings
-    }
+    let program_path = config.program.clone();
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: change_value,
+        rho: change_rho,
+        pk_spend: change_pk_spend,
+        pk_ivk: change_pk_ivk,
+        cm: change_cm,
+    };
+
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        TREE_DEPTH,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(config.packing)
         .with_private_indices(private_indices);
-
-    host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string()); // decimal u128
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(pos.to_string()); // decimal u64
-    host.add_str_arg((siblings.len() as u32).to_string()); // decimal u32 - depth
-    for sib in &siblings {
-        host.add_hex_arg(hex::encode(sib));
-    }
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string()); // decimal u128
-    host.add_str_arg("0".to_string()); // n_out = 0 (no outputs in withdrawal scenario)
+    add_args_to_host(&mut host, &args)?;
 
     let public = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
-        withdraw_amount,
-        output_commitments: vec![],
+        withdraw_amount: withdraw_amount as u128,
+        output_commitments: vec![change_cm],
         view_attestations: None,
     };
 
     host.set_public_output(&public)?;
 
     let proof_result = host.run(true);
+    if let Err(e) = &proof_result {
+        println!("Error generating proof: {:?}", e);
+    }
     assert!(proof_result.is_ok(), "Proof generation should succeed");
-    println!("✓ Proof generated with withdraw_amount={}", withdraw_amount);
+    println!(
+        "✓ Proof generated with withdraw_amount={} + change={}",
+        withdraw_amount, change_value
+    );
 
     // Step 3: Module should reject and suggest using Withdraw instead
     println!("\nStep 3: Module validation...");
@@ -1295,8 +1884,8 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 /// 1. **Deposit**: Create initial note with 1000 units
 /// 2. **Spend with 2 outputs**: Split into 600 + 400 (demonstrates value splitting)
 /// 3. **Withdraw**: Take 600 note, withdraw 200, get 400 change
-#[test]
-fn test_full_transaction_lifecycle() -> Result<()> {
+#[allow(dead_code)]
+fn test_full_transaction_lifecycle_old() -> Result<()> {
     println!("\n=== Full Transaction Lifecycle Test ===");
     println!("Demonstrating: Deposit → Spend (2 outputs) → Withdraw\n");
 
@@ -1316,8 +1905,10 @@ fn test_full_transaction_lifecycle() -> Result<()> {
 
     let initial_value: u128 = 1000;
     let deposit_rho: Hash32 = [10u8; 32];
-    let deposit_recipient: Hash32 = [11u8; 32];
-    let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
+    let deposit_spend_sk: Hash32 = [12u8; 32]; // SECRET spending key
+                                               // Derive recipient and nf_key from spend_sk (same as circuit does)
+    let deposit_recipient = recipient_from_sk(&domain, &deposit_spend_sk);
+    let deposit_nf_key = nf_key_from_sk(&domain, &deposit_spend_sk);
 
     let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
     let deposit_pos = next_position;
@@ -1344,15 +1935,19 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let deposit_siblings = tree.open(deposit_pos as usize);
     let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
 
-    // Create 2 output notes
+    // Create 2 output notes (using proper key hierarchy: spend_sk -> pk -> recipient)
     let out1_value: u128 = 600;
     let out1_rho: Hash32 = [20u8; 32];
-    let out1_recipient: Hash32 = [21u8; 32];
+    let out1_spend_sk: Hash32 = [21u8; 32]; // Secret key for output 1 recipient
+    let out1_pk = pk_from_sk(&out1_spend_sk); // Derive pk from spend_sk
+    let out1_recipient = recipient_from_pk(&domain, &out1_pk);
     let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
 
     let out2_value: u128 = 400;
     let out2_rho: Hash32 = [30u8; 32];
-    let out2_recipient: Hash32 = [31u8; 32];
+    let out2_spend_sk: Hash32 = [31u8; 32]; // Secret key for output 2 recipient
+    let out2_pk = pk_from_sk(&out2_spend_sk);
+    let out2_recipient = recipient_from_pk(&domain, &out2_pk);
     let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
 
     let n_out_phase2: u32 = 2;
@@ -1379,48 +1974,61 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         initial_value, out1_value, out2_value, withdraw_amount_phase2
     );
 
-    // Prepare private indices for 2 outputs
-    let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize {
-        private_indices_phase2.push(8 + i);
-    }
-    let base2 = 12 + (TREE_DEPTH as usize);
-    // Output 0 private fields
-    private_indices_phase2.push(base2 + 0); // value_out_0
-    private_indices_phase2.push(base2 + 1); // rho_out_0
-    private_indices_phase2.push(base2 + 2); // recipient_out_0
-                                            // Output 1 private fields
-    private_indices_phase2.push(base2 + 4); // value_out_1
-    private_indices_phase2.push(base2 + 5); // rho_out_1
-    private_indices_phase2.push(base2 + 6); // recipient_out_1
+    // === NEW CIRCUIT ARGUMENT LAYOUT ===
+    let depth = TREE_DEPTH as usize;
+    let mut private_indices_phase2: Vec<usize> = vec![3, 4, 5]; // rho, recipient, spend_sk
+    for i in 0..depth {
+        private_indices_phase2.push(7 + i);
+    } // position bits
+    for i in 0..depth {
+        private_indices_phase2.push(7 + depth + i);
+    } // siblings
+    let out_base2 = 11 + 2 * depth;
+    // Output 0: rho, pk
+    private_indices_phase2.push(out_base2 + 1); // out1_rho
+    private_indices_phase2.push(out_base2 + 2); // out1_pk
+                                                // Output 1: rho, pk
+    private_indices_phase2.push(out_base2 + 5); // out2_rho
+    private_indices_phase2.push(out_base2 + 6); // out2_pk
 
     let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase2);
 
-    // Add arguments for phase 2 spend
-    host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
-    host2.add_hex_arg(hex::encode(deposit_rho));
-    host2.add_hex_arg(hex::encode(deposit_recipient));
-    host2.add_hex_arg(hex::encode(deposit_nf_key));
-    host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
+    // === NEW ARGUMENT ORDER ===
+    host2.add_hex_arg(hex::encode(domain)); // 1: domain
+    host2.add_u64_arg(initial_value as u64); // 2: value
+    host2.add_hex_arg(hex::encode(deposit_rho)); // 3: rho [PRIVATE]
+    host2.add_hex_arg(hex::encode(deposit_recipient)); // 4: recipient [PRIVATE]
+    host2.add_hex_arg(hex::encode(deposit_spend_sk)); // 5: spend_sk [PRIVATE]
+    host2.add_u64_arg(TREE_DEPTH as u64); // 6: depth
+
+    // Position bits [PRIVATE]
+    for level in 0..depth {
+        let bit = ((deposit_pos >> level) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        host2.add_hex_arg(hex::encode(bit_bytes));
+    }
+
+    // Siblings [PRIVATE]
     for sib in &deposit_siblings {
         host2.add_hex_arg(hex::encode(sib));
     }
-    host2.add_hex_arg(hex::encode(anchor_after_deposit));
-    host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
-    // Output 0
-    host2.add_str_arg(out1_value.to_string());
+
+    // Anchor and nullifier as strings with "0x" prefix
+    host2.add_str_arg(format!("0x{}", hex::encode(anchor_after_deposit)));
+    host2.add_str_arg(format!("0x{}", hex::encode(deposit_nf)));
+    host2.add_u64_arg(withdraw_amount_phase2 as u64);
+    host2.add_u64_arg(n_out_phase2 as u64);
+    // Output 0: value, rho, pk, cm
+    host2.add_u64_arg(out1_value as u64);
     host2.add_hex_arg(hex::encode(out1_rho));
-    host2.add_hex_arg(hex::encode(out1_recipient));
+    host2.add_hex_arg(hex::encode(out1_pk));
     host2.add_hex_arg(hex::encode(out1_cm));
-    // Output 1
-    host2.add_str_arg(out2_value.to_string());
+    // Output 1: value, rho, pk, cm
+    host2.add_u64_arg(out2_value as u64);
     host2.add_hex_arg(hex::encode(out2_rho));
-    host2.add_hex_arg(hex::encode(out2_recipient));
+    host2.add_hex_arg(hex::encode(out2_pk));
     host2.add_hex_arg(hex::encode(out2_cm));
 
     let public2 = SpendPublic {
@@ -1481,14 +2089,17 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     );
 
     // We'll spend the first output (600 units) and withdraw 200
-    let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
+    // Use the same spend_sk that was used to derive out1's recipient
+    // (out1_spend_sk was defined in Phase 2 as [21u8; 32])
+    let out1_nf_key = nf_key_from_sk(&domain, &out1_spend_sk);
     let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
     let out1_siblings = tree.open(out1_pos as usize);
 
     let withdraw_amount_phase3: u128 = 200;
     let change_value: u128 = out1_value - withdraw_amount_phase3; // 400
     let change_rho: Hash32 = [50u8; 32];
-    let change_recipient: Hash32 = [51u8; 32];
+    let change_pk: Hash32 = [51u8; 32];
+    let change_recipient = recipient_from_pk(&domain, &change_pk);
     let change_cm = note_commitment(&domain, change_value, &change_rho, &change_recipient);
 
     let n_out_phase3: u32 = 1;
@@ -1509,38 +2120,51 @@ fn test_full_transaction_lifecycle() -> Result<()> {
         out1_value, change_value, withdraw_amount_phase3
     );
 
-    // Prepare private indices for 1 output
-    let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize {
-        private_indices_phase3.push(8 + i);
-    }
-    let base3 = 12 + (TREE_DEPTH as usize);
-    private_indices_phase3.push(base3 + 0); // value_out_0
-    private_indices_phase3.push(base3 + 1); // rho_out_0
-    private_indices_phase3.push(base3 + 2); // recipient_out_0
+    // === NEW CIRCUIT ARGUMENT LAYOUT ===
+    let mut private_indices_phase3: Vec<usize> = vec![3, 4, 5]; // rho, recipient, spend_sk
+    for i in 0..depth {
+        private_indices_phase3.push(7 + i);
+    } // position bits
+    for i in 0..depth {
+        private_indices_phase3.push(7 + depth + i);
+    } // siblings
+    let out_base3 = 11 + 2 * depth;
+    private_indices_phase3.push(out_base3 + 1); // change_rho
+    private_indices_phase3.push(out_base3 + 2); // change_pk
 
     let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_private_indices(private_indices_phase3);
 
-    // Add arguments for phase 3 spend
-    host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string());
-    host3.add_hex_arg(hex::encode(out1_rho));
-    host3.add_hex_arg(hex::encode(out1_recipient));
-    host3.add_hex_arg(hex::encode(out1_nf_key));
-    host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
+    // === NEW ARGUMENT ORDER ===
+    host3.add_hex_arg(hex::encode(domain)); // 1: domain
+    host3.add_u64_arg(out1_value as u64); // 2: value
+    host3.add_hex_arg(hex::encode(out1_rho)); // 3: rho [PRIVATE]
+    host3.add_hex_arg(hex::encode(out1_recipient)); // 4: recipient [PRIVATE]
+    host3.add_hex_arg(hex::encode(out1_spend_sk)); // 5: spend_sk [PRIVATE]
+    host3.add_u64_arg(TREE_DEPTH as u64); // 6: depth
+
+    // Position bits [PRIVATE]
+    for level in 0..depth {
+        let bit = ((out1_pos >> level) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        host3.add_hex_arg(hex::encode(bit_bytes));
+    }
+
+    // Siblings [PRIVATE]
     for sib in &out1_siblings {
         host3.add_hex_arg(hex::encode(sib));
     }
-    host3.add_hex_arg(hex::encode(anchor_after_split));
-    host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(withdraw_amount_phase3.to_string());
-    host3.add_str_arg(n_out_phase3.to_string());
-    // Change output
-    host3.add_str_arg(change_value.to_string());
+
+    // Anchor and nullifier as strings with "0x" prefix
+    host3.add_str_arg(format!("0x{}", hex::encode(anchor_after_split)));
+    host3.add_str_arg(format!("0x{}", hex::encode(out1_nf)));
+    host3.add_u64_arg(withdraw_amount_phase3 as u64);
+    host3.add_u64_arg(n_out_phase3 as u64);
+    // Change output: value, rho, pk, cm
+    host3.add_u64_arg(change_value as u64);
     host3.add_hex_arg(hex::encode(change_rho));
-    host3.add_hex_arg(hex::encode(change_recipient));
+    host3.add_hex_arg(hex::encode(change_pk));
     host3.add_hex_arg(hex::encode(change_cm));
 
     let public3 = SpendPublic {
@@ -1629,6 +2253,213 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     Ok(())
 }
 
+/// Test full transaction lifecycle: Deposit → Spend (2 outputs) → Withdraw (v2 circuit ABI).
+#[test]
+fn test_full_transaction_lifecycle() -> Result<()> {
+    println!("\n=== Full Transaction Lifecycle Test (v2) ===");
+    println!("Deposit → Spend (2 outputs) → Withdraw\n");
+
+    let program_path = setup_ligero_env()?;
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+
+    const TREE_DEPTH: u8 = 16;
+    let mut tree = MerkleTree::new(TREE_DEPTH);
+    let domain: Hash32 = [1u8; 32];
+    let mut next_position: u64 = 0;
+
+    // Phase 1: deposit-style note insertion (NOTE_V2, sender_id = recipient).
+    let deposit_value: u64 = 1000;
+    let deposit_rho: Hash32 = [10u8; 32];
+    let deposit_spend_sk: Hash32 = [12u8; 32];
+    let deposit_pk_ivk_owner: Hash32 = [66u8; 32];
+    let deposit_recipient = recipient_from_sk_v2(&domain, &deposit_spend_sk, &deposit_pk_ivk_owner);
+    let deposit_sender_id: Hash32 = deposit_recipient;
+    let deposit_cm = note_commitment_v2(
+        &domain,
+        deposit_value,
+        &deposit_rho,
+        &deposit_recipient,
+        &deposit_sender_id,
+    );
+
+    let deposit_pos = next_position;
+    next_position += 1;
+    tree.set_leaf(deposit_pos as usize, deposit_cm);
+    let anchor_after_deposit = tree.root();
+
+    // Phase 2: spend deposit note into two outputs (transfer shape).
+    let deposit_nf_key = nf_key_from_sk(&domain, &deposit_spend_sk);
+    let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
+
+    let out1_value: u64 = 600;
+    let out1_rho: Hash32 = [20u8; 32];
+    let out1_spend_sk: Hash32 = [21u8; 32];
+    let out1_pk_spend = pk_from_sk(&out1_spend_sk);
+    let out1_pk_ivk = out1_pk_spend;
+    let out1_recipient = recipient_from_pk_v2(&domain, &out1_pk_spend, &out1_pk_ivk);
+
+    let out2_value: u64 = 400;
+    let out2_rho: Hash32 = [30u8; 32];
+    let out2_spend_sk: Hash32 = [31u8; 32];
+    let out2_pk_spend = pk_from_sk(&out2_spend_sk);
+    let out2_pk_ivk = out2_pk_spend;
+    let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
+
+    let sender_id_out_phase2 = deposit_recipient; // v2 guest sets sender_id = owner_addr
+    let out1_cm = note_commitment_v2(
+        &domain,
+        out1_value,
+        &out1_rho,
+        &out1_recipient,
+        &sender_id_out_phase2,
+    );
+    let out2_cm = note_commitment_v2(
+        &domain,
+        out2_value,
+        &out2_rho,
+        &out2_recipient,
+        &sender_id_out_phase2,
+    );
+
+    let input2 = SpendInputV2 {
+        value: deposit_value,
+        rho: deposit_rho,
+        sender_id: deposit_sender_id,
+        pos: deposit_pos,
+        siblings: tree.open(deposit_pos as usize),
+        nullifier: deposit_nf,
+    };
+    let out_2_0 = SpendOutputV2 {
+        value: out1_value,
+        rho: out1_rho,
+        pk_spend: out1_pk_spend,
+        pk_ivk: out1_pk_ivk,
+        cm: out1_cm,
+    };
+    let out_2_1 = SpendOutputV2 {
+        value: out2_value,
+        rho: out2_rho,
+        pk_spend: out2_pk_spend,
+        pk_ivk: out2_pk_ivk,
+        cm: out2_cm,
+    };
+
+    let (args2, private_indices2) = build_note_spend_args_v2(
+        domain,
+        deposit_spend_sk,
+        deposit_pk_ivk_owner,
+        TREE_DEPTH,
+        anchor_after_deposit,
+        &[input2],
+        0,
+        [0u8; 32],
+        &[out_2_0, out_2_1],
+    );
+    let public2 = SpendPublic {
+        anchor_root: anchor_after_deposit,
+        nullifier: deposit_nf,
+        withdraw_amount: 0,
+        output_commitments: vec![out1_cm, out2_cm],
+        view_attestations: None,
+    };
+
+    let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
+        .with_packing(packing)
+        .with_private_indices(private_indices2);
+    add_args_to_host(&mut host2, &args2)?;
+    host2.set_public_output(&public2)?;
+
+    let code_commitment2 = host2.code_commitment();
+    let proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
+    let verified2: SpendPublic = LigeroVerifier::verify(&proof_data2, &code_commitment2)
+        .context("Phase 2 proof verification failed")?;
+    assert_eq!(verified2.output_commitments, vec![out1_cm, out2_cm]);
+
+    let out1_pos = next_position;
+    next_position += 1;
+    let out2_pos = next_position;
+    next_position += 1;
+    tree.set_leaf(out1_pos as usize, out1_cm);
+    tree.set_leaf(out2_pos as usize, out2_cm);
+    let anchor_after_split = tree.root();
+
+    // Phase 3: withdraw from out1 with change.
+    let withdraw_amount3: u64 = 200;
+    let withdraw_to3: Hash32 = [9u8; 32];
+    let change_value: u64 = out1_value - withdraw_amount3;
+    let change_rho: Hash32 = [50u8; 32];
+
+    let out1_nf_key = nf_key_from_sk(&domain, &out1_spend_sk);
+    let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
+
+    // Spend out1: sender_id must match leaf binding from phase 2.
+    let input3 = SpendInputV2 {
+        value: out1_value,
+        rho: out1_rho,
+        sender_id: sender_id_out_phase2,
+        pos: out1_pos,
+        siblings: tree.open(out1_pos as usize),
+        nullifier: out1_nf,
+    };
+
+    // Change goes back to the same recipient as out1; sender_id_out becomes out1's owner address.
+    let change_cm = note_commitment_v2(
+        &domain,
+        change_value,
+        &change_rho,
+        &out1_recipient,
+        &out1_recipient,
+    );
+    let change_out = SpendOutputV2 {
+        value: change_value,
+        rho: change_rho,
+        pk_spend: out1_pk_spend,
+        pk_ivk: out1_pk_ivk,
+        cm: change_cm,
+    };
+
+    let (args3, private_indices3) = build_note_spend_args_v2(
+        domain,
+        out1_spend_sk,
+        out1_pk_ivk,
+        TREE_DEPTH,
+        anchor_after_split,
+        &[input3],
+        withdraw_amount3,
+        withdraw_to3,
+        &[change_out],
+    );
+    let public3 = SpendPublic {
+        anchor_root: anchor_after_split,
+        nullifier: out1_nf,
+        withdraw_amount: withdraw_amount3 as u128,
+        output_commitments: vec![change_cm],
+        view_attestations: None,
+    };
+
+    let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
+        .with_packing(packing)
+        .with_private_indices(private_indices3);
+    add_args_to_host(&mut host3, &args3)?;
+    host3.set_public_output(&public3)?;
+
+    let code_commitment3 = host3.code_commitment();
+    let proof_data3 = host3.run(true).context("Phase 3 proof generation failed")?;
+    let verified3: SpendPublic = LigeroVerifier::verify(&proof_data3, &code_commitment3)
+        .context("Phase 3 proof verification failed")?;
+    assert_eq!(verified3.output_commitments, vec![change_cm]);
+
+    println!(
+        "✓ lifecycle complete: deposit_pos={}, out1_pos={}, out2_pos={}, change_pos={}",
+        deposit_pos, out1_pos, out2_pos, next_position
+    );
+
+    Ok(())
+}
+
 /// Test that circuit rejects over-withdrawal attempts (trying to withdraw more than note value)
 ///
 /// This test demonstrates circuit-level balance enforcement preventing theft/inflation:
@@ -1644,245 +2475,90 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     setup_ligero_env()?;
     let program_path = setup_ligero_env()?;
 
+    // Single-note scenario: try to withdraw more than the note value.
+    let domain: Hash32 = [1u8; 32];
+    let value: u64 = 600;
+    let rho: Hash32 = [20u8; 32];
+    let spend_sk: Hash32 = [21u8; 32];
+    let pk_ivk_owner: Hash32 = [22u8; 32];
+
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+    let nf = nullifier(&domain, &nf_key, &rho);
+
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
+
     const TREE_DEPTH: u8 = 16;
     let mut tree = MerkleTree::new(TREE_DEPTH);
-    let domain: Hash32 = [1u8; 32];
-    let mut next_position: u64 = 0;
+    let pos: u64 = 0;
+    tree.set_leaf(pos as usize, cm);
+    let anchor = tree.root();
 
-    // ========================================================================
-    // PHASE 1: DEPOSIT - Create initial note
-    // ========================================================================
-    println!("━━━ PHASE 1: DEPOSIT ━━━");
+    let withdraw_amount: u64 = 1000; // > 600: over-withdrawal
+    let withdraw_to: Hash32 = [55u8; 32];
 
-    let initial_value: u128 = 1000;
-    let deposit_rho: Hash32 = [10u8; 32];
-    let deposit_recipient: Hash32 = [11u8; 32];
-    let deposit_nf_key: Hash32 = [12u8; 32]; // SECRET
-
-    let deposit_cm = note_commitment(&domain, initial_value, &deposit_rho, &deposit_recipient);
-    let deposit_pos = next_position;
-    next_position += 1;
-
-    tree.set_leaf(deposit_pos as usize, deposit_cm);
-    let anchor_after_deposit = tree.root();
-
+    println!("  Note value:      {} units", value);
     println!(
-        "✓ Deposited note with {} units at position {}",
-        initial_value, deposit_pos
+        "  Withdraw attempt: {} units (OVER-WITHDRAWAL)",
+        withdraw_amount
+    );
+    println!(
+        "  Expected: must be rejected because {} != {} + 0",
+        value, withdraw_amount
     );
 
-    // ========================================================================
-    // PHASE 2: SPLIT - Create 600 + 400 notes
-    // ========================================================================
-    println!("\n━━━ PHASE 2: SPLIT - Create 600 + 400 notes ━━━");
-
-    let deposit_siblings = tree.open(deposit_pos as usize);
-    let deposit_nf = nullifier(&domain, &deposit_nf_key, &deposit_rho);
-
-    let out1_value: u128 = 600;
-    let out1_rho: Hash32 = [20u8; 32];
-    let out1_recipient: Hash32 = [21u8; 32];
-    let out1_cm = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
-
-    let out2_value: u128 = 400;
-    let out2_rho: Hash32 = [30u8; 32];
-    let out2_recipient: Hash32 = [31u8; 32];
-    let out2_cm = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
-
-    let n_out_phase2: u32 = 2;
-    let withdraw_amount_phase2: u128 = 0;
-
-    println!(
-        "  Creating 2 outputs: {} + {} = {}",
-        out1_value,
-        out2_value,
-        out1_value + out2_value
-    );
-
-    let mut private_indices_phase2 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize {
-        private_indices_phase2.push(8 + i);
-    }
-    let base2 = 12 + (TREE_DEPTH as usize);
-    private_indices_phase2.push(base2 + 0);
-    private_indices_phase2.push(base2 + 1);
-    private_indices_phase2.push(base2 + 2);
-    private_indices_phase2.push(base2 + 4);
-    private_indices_phase2.push(base2 + 5);
-    private_indices_phase2.push(base2 + 6);
-
-    let mut host2 = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_private_indices(private_indices_phase2);
-
-    host2.add_hex_arg(hex::encode(domain));
-    host2.add_str_arg(initial_value.to_string());
-    host2.add_hex_arg(hex::encode(deposit_rho));
-    host2.add_hex_arg(hex::encode(deposit_recipient));
-    host2.add_hex_arg(hex::encode(deposit_nf_key));
-    host2.add_str_arg(deposit_pos.to_string());
-    host2.add_str_arg(TREE_DEPTH.to_string());
-    for sib in &deposit_siblings {
-        host2.add_hex_arg(hex::encode(sib));
-    }
-    host2.add_hex_arg(hex::encode(anchor_after_deposit));
-    host2.add_hex_arg(hex::encode(deposit_nf));
-    host2.add_str_arg(withdraw_amount_phase2.to_string());
-    host2.add_str_arg(n_out_phase2.to_string());
-    host2.add_str_arg(out1_value.to_string());
-    host2.add_hex_arg(hex::encode(out1_rho));
-    host2.add_hex_arg(hex::encode(out1_recipient));
-    host2.add_hex_arg(hex::encode(out1_cm));
-    host2.add_str_arg(out2_value.to_string());
-    host2.add_hex_arg(hex::encode(out2_rho));
-    host2.add_hex_arg(hex::encode(out2_recipient));
-    host2.add_hex_arg(hex::encode(out2_cm));
-
-    let public2 = SpendPublic {
-        anchor_root: anchor_after_deposit,
-        nullifier: deposit_nf,
-        withdraw_amount: withdraw_amount_phase2,
-        output_commitments: vec![out1_cm, out2_cm],
-        view_attestations: None,
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos,
+        siblings: tree.open(pos as usize),
+        nullifier: nf,
     };
-
-    host2.set_public_output(&public2)?;
-
-    println!("  Generating split proof...");
-    let _proof_data2 = host2.run(true).context("Phase 2 proof generation failed")?;
-    println!("  ✓ Split proof generated and will verify");
-
-    let out1_pos = next_position;
-    next_position += 1;
-    tree.set_leaf(out1_pos as usize, out1_cm);
-
-    let out2_pos = next_position;
-    let _ = next_position + 1; // Final position would be here
-    tree.set_leaf(out2_pos as usize, out2_cm);
-
-    let anchor_after_split = tree.root();
-    println!(
-        "  ✓ Notes added to tree at positions {} and {}",
-        out1_pos, out2_pos
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        TREE_DEPTH,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[],
     );
 
-    // ========================================================================
-    // PHASE 3: ATTEMPTED OVER-WITHDRAWAL - Try to steal value!
-    // ========================================================================
-    println!("\n━━━ PHASE 3: ATTEMPTED THEFT ━━━");
-    println!("⚠️  Attacker tries to spend 600-unit note but withdraw 1000 units!");
+    let mut host =
+        <Ligero as Zkvm>::Host::from_args(&program_path).with_private_indices(private_indices);
+    add_args_to_host(&mut host, &args)?;
 
-    let out1_nf_key: Hash32 = [40u8; 32]; // SECRET for spending out1
-    let out1_nf = nullifier(&domain, &out1_nf_key, &out1_rho);
-    let out1_siblings = tree.open(out1_pos as usize);
-
-    let malicious_withdraw: u128 = 1000; // ATTACK: Try to withdraw more than note value!
-    let n_out_phase3: u32 = 0; // No change output
-
-    println!("  Note value:      {} units", out1_value);
-    println!("  Withdraw attempt: {} units", malicious_withdraw);
-    println!("  Outputs:         {} (no change)", n_out_phase3);
-    println!(
-        "  ❌ Balance: {} ≠ {} + 0 (INVALID!)",
-        out1_value, malicious_withdraw
-    );
-
-    let mut private_indices_phase3 = vec![2, 3, 4, 5, 6];
-    for i in 0..TREE_DEPTH as usize {
-        private_indices_phase3.push(8 + i);
-    }
-
-    let mut host3 = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_private_indices(private_indices_phase3);
-
-    host3.add_hex_arg(hex::encode(domain));
-    host3.add_str_arg(out1_value.to_string()); // Real note value: 600
-    host3.add_hex_arg(hex::encode(out1_rho));
-    host3.add_hex_arg(hex::encode(out1_recipient));
-    host3.add_hex_arg(hex::encode(out1_nf_key));
-    host3.add_str_arg(out1_pos.to_string());
-    host3.add_str_arg(TREE_DEPTH.to_string());
-    for sib in &out1_siblings {
-        host3.add_hex_arg(hex::encode(sib));
-    }
-    host3.add_hex_arg(hex::encode(anchor_after_split));
-    host3.add_hex_arg(hex::encode(out1_nf));
-    host3.add_str_arg(malicious_withdraw.to_string()); // Try to withdraw 1000!
-    host3.add_str_arg(n_out_phase3.to_string());
-
-    let public3 = SpendPublic {
-        anchor_root: anchor_after_split,
-        nullifier: out1_nf,
-        withdraw_amount: malicious_withdraw,
+    let public = SpendPublic {
+        anchor_root: anchor,
+        nullifier: nf,
+        withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![],
         view_attestations: None,
     };
+    host.set_public_output(&public)?;
 
-    host3.set_public_output(&public3)?;
-
-    println!("\n  Attempting to generate proof...");
-    let proof_result = host3.run(true);
-
-    // The circuit MUST reject this because: input_value (600) != withdraw_amount (1000) + 0
-    // Check if proof generation failed (ideal case)
-    if proof_result.is_err() {
-        println!("  ✅ Circuit correctly REJECTED during proof generation!");
-        println!("  ✅ Balance check enforced: 600 ≠ 1000 + 0");
-    } else {
-        // If proof generation succeeded despite assertion failure (possible with some ZKVM backends),
-        // verification should fail or the proof should be invalid
-        println!(
-            "  ⚠️  Proof generation completed (assertion may not halt execution in this ZKVM)"
-        );
-        println!("  ℹ️  Checking if verification detects the invalid balance...");
-
-        let proof_data = proof_result.unwrap();
-        let code_commitment3 = <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
-
-        // Attempt to verify the proof (if it was generated)
-        let verify_result: Result<SpendPublic, _> =
-            LigeroVerifier::verify(&proof_data, &code_commitment3);
-        match verify_result {
-            Err(_) => {
-                println!("  ✅ Verification FAILED as expected (invalid balance detected)");
-            }
-            Ok(_verified_output) => {
-                // This is a known limitation: Ligero may generate output even when assertions fail
-                // The important thing is that the circuit HAS the balance check (line 286 in guest)
-                println!("  ⚠️  Note: Ligero may produce output despite assertion failures");
-                println!("  ✓  Circuit contains balance assertion: value (600) == withdraw (1000) + outputs (0)");
-                println!("  ✓  Assertion WOULD fail in production: 600 ≠ 1000");
-                println!("  ℹ️  See guest/note-spend-guest/src/lib.rs:286 for balance check implementation");
-            }
+    // Accept either prover failure OR verifier rejection.
+    match host.run(true) {
+        Err(e) => {
+            println!("✅ Proof generation failed as expected: {e}");
+        }
+        Ok(proof_data) => {
+            let code_commitment =
+                <Ligero as Zkvm>::Host::from_args(&program_path).code_commitment();
+            let verify_res: Result<SpendPublic> =
+                LigeroVerifier::verify(&proof_data, &code_commitment);
+            assert!(
+                verify_res.is_err(),
+                "over-withdrawal proof unexpectedly verified (should be rejected)"
+            );
+            println!("✅ Proof was generated but rejected by verifier (as expected)");
         }
     }
 
-    // ========================================================================
-    // SUMMARY
-    // ========================================================================
-    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("✅ SECURITY TEST COMPLETE");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("\nAttack Scenario:");
-    println!("  • Attacker held note with 600 units");
-    println!("  • Attempted to withdraw 1000 units (400 unit theft)");
-    println!("  • Provided no output notes to balance the equation");
-    println!("\nCircuit Protection:");
-    println!("  ✅ Balance assertion implemented: value_in == sum(value_out) + withdraw_amount");
-    println!("  ✅ Circuit code verifies: 600 == 1000 + 0 (fails!)");
-    println!("  ✅ See guest/note-spend-guest/src/lib.rs:284-286 for implementation");
-    println!("\nSecurity Properties Demonstrated:");
-    println!("  • Circuit contains balance check preventing supply inflation");
-    println!("  • Cannot withdraw more than note value without outputs to balance");
-    println!("  • Arithmetic constraint: input_value == withdraw_amount + sum(outputs)");
-    println!("  • Balance enforced in zero-knowledge circuit (no trusted third party)");
-
-    println!("\n✅ Balance enforcement implemented in circuit!");
-    println!(
-        "   ✓ Attempted to withdraw {} units from {} unit note",
-        malicious_withdraw, out1_value
-    );
-    println!("   ✓ Circuit has assertion: 600 == 1000 (fails)");
-    println!("   ✓ Honest value accounting enforced at cryptographic level");
-
+    println!("\n✅ Over-withdrawal protection enforced by circuit constraints");
     Ok(())
 }

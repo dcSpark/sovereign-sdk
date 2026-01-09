@@ -66,14 +66,16 @@ fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
 /// Serialize note plaintext for encryption (144 bytes with sender_id).
 pub fn encode_note_plain(
     domain: &Hash32,
-    value: u128,
+    value: u64,
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
 ) -> [u8; NOTE_PLAIN_LEN_TRANSFER] {
     let mut out = [0u8; NOTE_PLAIN_LEN_TRANSFER];
     out[0..32].copy_from_slice(domain);
-    out[32..48].copy_from_slice(&value.to_le_bytes());
+    // Encode as 16-byte LE, zero-extended from u64.
+    out[32..40].copy_from_slice(&value.to_le_bytes());
+    out[40..48].copy_from_slice(&[0u8; 8]);
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
@@ -103,10 +105,13 @@ pub fn make_viewer_bundle(
     recipient: &Hash32,
     sender_id: &Hash32,
     cm: &Hash32,
-) -> (ViewAttestation, EncryptedNote) {
+) -> anyhow::Result<(ViewAttestation, EncryptedNote)> {
+    let value_u64: u64 = value.try_into().map_err(|_| {
+        anyhow::anyhow!("note value does not fit into u64 (required by note_spend_guest v2)")
+    })?;
     let vfk_obj = FullViewingKey(*vfk);
     let vfk_c = fvk_commitment(&vfk_obj);
-    let pt = encode_note_plain(domain, value, rho, recipient, sender_id);
+    let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id);
     let k = view_kdf(&vfk_obj, cm);
     let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
     stream_xor_encrypt(&k, &pt, &mut ct);
@@ -128,7 +133,7 @@ pub fn make_viewer_bundle(
         mac,
     };
 
-    (att, enc)
+    Ok((att, enc))
 }
 
 /// Decrypt an encrypted note using the authority VFK.

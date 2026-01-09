@@ -9,6 +9,8 @@ use crate::wallet::WalletContext;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 /// Transaction information from indexer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -116,7 +118,7 @@ where
     S: sov_modules_api::Spec,
 {
     // Get the privacy pool address (as per CLAUDE.md: this MCP operates inside the privacy pool)
-    let privacy_address = privacy_key.privacy_address().to_string();
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
     tracing::debug!(
         "Fetching transactions for privacy pool address: {}",

@@ -17,6 +17,11 @@ const DEFAULT_PAGE_SIZE: usize = 100;
 pub struct UnspentNote {
     pub value: u128,
     pub rho: String,
+    /// Sender identifier bound into NOTE_V2 commitments for spend outputs.
+    /// - `None` for legacy/deposit-style plaintexts without sender_id.
+    /// - `Some(hex32)` for transfer/withdraw outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
     pub tx_hash: String,
     pub timestamp_ms: i64,
     pub kind: String,
@@ -53,7 +58,7 @@ pub async fn get_privacy_balance(
     );
 
     // Track all notes (both unspent and spent)
-    let mut all_notes: Vec<(Hash32, u128, String, i64, String)> = Vec::new(); // (rho, value, tx_hash, timestamp, kind)
+    let mut all_notes: Vec<(Hash32, u128, Option<Hash32>, String, i64, String)> = Vec::new(); // (rho, value, sender_id, tx_hash, timestamp, kind)
     let mut seen_rhos: HashSet<Hash32> = HashSet::new();
     let mut spent_nullifiers: HashSet<String> = HashSet::new();
     let mut transfer_nullifiers: HashSet<String> = HashSet::new();
@@ -64,20 +69,22 @@ pub async fn get_privacy_balance(
     let mut withdraw_count = 0;
     let mut total_transactions = 0;
 
-    let mut record_note = |rho: Hash32, value: u128, tx: &InvolvementItem| -> bool {
-        if seen_rhos.insert(rho) {
-            all_notes.push((
-                rho,
-                value,
-                tx.tx_hash.clone(),
-                tx.timestamp_ms,
-                tx.kind.clone(),
-            ));
-            true
-        } else {
-            false
-        }
-    };
+    let mut record_note =
+        |rho: Hash32, value: u128, sender_id: Option<Hash32>, tx: &InvolvementItem| -> bool {
+            if seen_rhos.insert(rho) {
+                all_notes.push((
+                    rho,
+                    value,
+                    sender_id,
+                    tx.tx_hash.clone(),
+                    tx.timestamp_ms,
+                    tx.kind.clone(),
+                ));
+                true
+            } else {
+                false
+            }
+        };
 
     let mut offset = 0;
     loop {
@@ -126,7 +133,7 @@ pub async fn get_privacy_balance(
                                 .or_else(|| extract_amount_from_deposit_payload(payload));
 
                             if let Some(value) = value {
-                                if record_note(rho, value, tx) {
+                                if record_note(rho, value, None, tx) {
                                     deposit_count += 1;
                                 }
                             } else {
@@ -161,7 +168,7 @@ pub async fn get_privacy_balance(
                 {
                     for encrypted_note in encrypted_notes {
                         match decrypt_note(&encrypted_note, viewing_key) {
-                            Ok((value, rho, recipient)) => {
+                            Ok((value, rho, recipient, sender_id)) => {
                                 if recipient == user_recipient {
                                     tracing::debug!(
                                         "Found note belonging to user: value={}, rho={}, tx={}",
@@ -169,7 +176,7 @@ pub async fn get_privacy_balance(
                                         hex::encode(&rho),
                                         tx.tx_hash
                                     );
-                                    if record_note(rho, value, tx) {
+                                    if record_note(rho, value, sender_id, tx) {
                                         match tx.kind.as_str() {
                                             "deposit" => deposit_count += 1,
                                             "transfer" => transfer_incoming_count += 1,
@@ -207,7 +214,7 @@ pub async fn get_privacy_balance(
     let mut unspent_notes = Vec::new();
     let mut balance: u128 = 0;
 
-    for (rho, value, tx_hash, timestamp_ms, kind) in all_notes {
+    for (rho, value, sender_id, tx_hash, timestamp_ms, kind) in all_notes {
         let note_nullifier_user = nullifier(&DOMAIN, &user_nf_key, &rho);
         let nullifier_hex_user = hex::encode(&note_nullifier_user);
         let note_nullifier_legacy = nullifier(&DOMAIN, &LEGACY_NF_KEY, &rho);
@@ -229,6 +236,7 @@ pub async fn get_privacy_balance(
             unspent_notes.push(UnspentNote {
                 value,
                 rho: hex::encode(&rho),
+                sender_id: sender_id.map(hex::encode),
                 tx_hash,
                 timestamp_ms,
                 kind,
@@ -255,12 +263,11 @@ pub async fn get_privacy_balance(
 fn decrypt_note(
     encrypted_note: &EncryptedNote,
     viewing_key: &FullViewingKey,
-) -> Result<(u128, Hash32, Hash32)> {
-    let note =
-        midnight_privacy::viewing::decrypt_and_verify_note_level_b(viewing_key, encrypted_note)
+) -> Result<(u128, Hash32, Hash32, Option<Hash32>)> {
+    let (note, sender_id) =
+        midnight_privacy::decrypt_and_verify_note_with_sender(viewing_key, encrypted_note)
             .context("Failed to decrypt note")?;
-
-    Ok((note.value, note.rho, note.recipient))
+    Ok((note.value, note.rho, note.recipient, sender_id))
 }
 
 fn extract_deposit_field<'a>(

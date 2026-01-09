@@ -1,3 +1,5 @@
 value_proof.bin
 value_tx.json
 proof_data.gz
+proof_data.bin
+bins/ligero-bins.tar.gz

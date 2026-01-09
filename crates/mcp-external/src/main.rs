@@ -32,6 +32,8 @@ use crate::server::CryptoServer;
 use crate::tx_store::TransactionStore;
 use crate::wallet::WalletContext;
 
+const DOMAIN: [u8; 32] = [1u8; 32];
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env()?;
@@ -75,17 +77,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Ligero prover
     tracing::info!("[mcp] Initializing Ligero prover");
-    tracing::info!(
-        "[mcp] Prover binary: {}",
-        cfg.ligero_prover_binary_path.display()
-    );
-    tracing::info!("[mcp] Shader path: {}", cfg.ligero_shader_path.display());
-    tracing::info!("[mcp] Program path: {}", cfg.ligero_program_path.display());
+    if let Some(ref prover) = cfg.ligero_prover_binary_path {
+        tracing::info!("[mcp] Prover binary (override): {}", prover.display());
+    } else {
+        tracing::info!("[mcp] Prover binary: <auto-discovery>");
+    }
+    if let Some(ref shader) = cfg.ligero_shader_path {
+        tracing::info!("[mcp] Shader path (override): {}", shader.display());
+    } else {
+        tracing::info!("[mcp] Shader path: <auto-discovery>");
+    }
+    tracing::info!("[mcp] Program: {}", cfg.ligero_program_path);
 
     let ligero = Arc::new(Ligero::new(
-        Some(cfg.ligero_prover_binary_path.clone()),
-        None,
-        Some(cfg.ligero_shader_path.clone()),
+        cfg.ligero_prover_binary_path.clone(),
+        cfg.ligero_shader_path.clone(),
         Some(cfg.ligero_program_path.clone()),
     ));
 
@@ -126,10 +132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     tracing::info!("[mcp] Privacy key initialized successfully");
-    tracing::info!("[mcp] Privacy address: {}", privacy_key.privacy_address());
+    tracing::info!(
+        "[mcp] Privacy address: {}",
+        privacy_key.privacy_address(&DOMAIN)
+    );
     tracing::info!(
         "[mcp] All deposits will be made to this privacy address: {}",
-        privacy_key.privacy_address()
+        privacy_key.privacy_address(&DOMAIN)
     );
 
     let privacy_key = Arc::new(RwLock::new(privacy_key));

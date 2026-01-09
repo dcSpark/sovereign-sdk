@@ -1,8 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
-use midnight_privacy::{note_commitment, nullifier, CallMessage, Hash32, MerkleTree, SpendPublic};
+use midnight_privacy::{
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
+    CallMessage, Hash32, MerkleTree, SpendPublic,
+};
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -27,6 +30,7 @@ const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
 #[derive(Deserialize)]
 struct NotesResponse {
     notes: Vec<NoteEntry>,
+    #[serde(default)]
     current_root: Option<Vec<u8>>,
 }
 
@@ -36,6 +40,16 @@ struct NoteEntry {
     commitment: Vec<u8>,
 }
 
+fn decode_hash32_env(var: &str) -> Result<Hash32> {
+    let raw = std::env::var(var).with_context(|| format!("Missing env var {var}"))?;
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    hex::decode(raw)
+        .with_context(|| format!("Invalid hex in env var {var}"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid {var} length (expected 32 bytes)"))
+}
+
 fn load_notes_from_source() -> Option<NotesResponse> {
     if let Ok(path) = std::env::var("NOTES_FILE") {
         let data = fs::read_to_string(path).ok()?;
@@ -43,45 +57,85 @@ fn load_notes_from_source() -> Option<NotesResponse> {
     }
 
     if let Ok(node_url) = std::env::var("NODE_API_URL") {
-        let url = format!("{}/modules/midnight-privacy/notes?limit=200&reverse=true", node_url);
-        if let Ok(resp) = reqwest::blocking::get(url) {
-            return resp.json::<NotesResponse>().ok();
+        // IMPORTANT: fetch ALL notes (pagination) so the Merkle root/path matches on-chain state.
+        // Using a small bounded `limit` (like 200) can produce an incomplete tree and invalid proofs.
+        let mut all_notes: Vec<NoteEntry> = Vec::new();
+        let mut offset: usize = 0;
+        let limit: usize = 1000;
+        let mut last_root: Option<Vec<u8>> = None;
+
+        loop {
+            let url = format!(
+                "{}/modules/midnight-privacy/notes?limit={}&offset={}",
+                node_url, limit, offset
+            );
+            let resp = reqwest::blocking::get(&url).ok()?;
+            let page = resp.json::<NotesResponse>().ok()?;
+
+            if let Some(root) = page.current_root.clone() {
+                last_root = Some(root);
+            }
+
+            let n = page.notes.len();
+            all_notes.extend(page.notes);
+            if n < limit {
+                break;
+            }
+            offset += n;
         }
+
+        return Some(NotesResponse {
+            notes: all_notes,
+            current_root: last_root,
+        });
     }
     None
 }
 
 fn main() -> Result<()> {
-    let domain: Hash32 = hex::decode(std::env::var("NOTE_DOMAIN")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid domain"))?;
-    let value: u128 = std::env::var("NOTE_VALUE")?.parse()?;
-    let rho: Hash32 = hex::decode(std::env::var("NOTE_RHO")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid rho"))?;
-    let recipient: Hash32 = hex::decode(std::env::var("NOTE_RECIPIENT")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid recipient"))?;
-    let nf_key: Hash32 = hex::decode(std::env::var("NOTE_NF_KEY")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid nf_key"))?;
+    let domain: Hash32 = decode_hash32_env("NOTE_DOMAIN")?;
+    let value: u128 = std::env::var("NOTE_VALUE")
+        .with_context(|| "Missing env var NOTE_VALUE")?
+        .parse()
+        .context("Invalid NOTE_VALUE")?;
+    let rho: Hash32 = decode_hash32_env("NOTE_RHO")?;
+    let spend_sk: Hash32 = decode_hash32_env("NOTE_SPEND_SK")?;
     let out1_value: u128 = std::env::var("TRANSFER_OUT1")?.parse()?;
     let out2_value: u128 = std::env::var("TRANSFER_OUT2")?.parse()?;
     let position: u64 = std::env::var("NOTE_POSITION")?.parse()?;
     let nonce: u64 = std::env::var("NONCE")?.parse()?;
+    anyhow::ensure!(
+        out1_value + out2_value == value,
+        "Transfer outputs must sum to input value: in={} out1={} out2={}",
+        value,
+        out1_value,
+        out2_value
+    );
 
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("ANCHOR_ROOT")?)?;
     let mut anchor: Hash32 = anchor_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let in_recipient = recipient_from_sk(&domain, &spend_sk);
+    let cm = note_commitment(&domain, value, &rho, &in_recipient);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
     // Build tree with on-chain notes when available; otherwise fall back to single-leaf tree.
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
     if let Some(notes_resp) = load_notes_from_source() {
+        // Prefer the fresh root reported by the node (avoid stale ANCHOR_ROOT from earlier script steps).
+        if let Some(root) = notes_resp.current_root.clone() {
+            if let Ok(root32) = <[u8; 32]>::try_from(root) {
+                let fresh: Hash32 = root32;
+                if fresh != anchor {
+                    println!("ℹ️  Provided ANCHOR_ROOT differs from node current_root; using node root");
+                }
+                anchor = fresh;
+            }
+        }
         for note in notes_resp.notes {
             if note.position >= (1u64 << tree_depth) {
                 continue;
@@ -90,16 +144,19 @@ fn main() -> Result<()> {
                 tree.set_leaf(note.position as usize, commitment);
             }
         }
+        // Ensure our note is present (in case not returned due to limit/filter).
+        tree.set_leaf(position as usize, cm);
         let computed_root: Hash32 = tree
             .root()
             .try_into()
             .map_err(|_| anyhow::anyhow!("Computed root has invalid length"))?;
-        if computed_root != anchor {
-            println!(
-                "ℹ️  Recomputed anchor from notes differs from provided anchor; using computed root"
-            );
-            anchor = computed_root;
-        }
+        anyhow::ensure!(
+            computed_root == anchor,
+            "Anchor root mismatch: env/node anchor = 0x{}, but Merkle root computed from on-chain notes = 0x{}. \
+             This usually means your note isn't fully indexed yet, or the note list is incomplete.",
+            hex::encode(anchor),
+            hex::encode(computed_root),
+        );
     } else {
         tree.set_leaf(position as usize, cm);
     }
@@ -110,11 +167,15 @@ fn main() -> Result<()> {
 
     // Create 2 output notes (pure shielded transfer, withdraw_amount = 0)
     let out1_rho: Hash32 = rand::thread_rng().gen();
-    let out1_recipient: Hash32 = rand::thread_rng().gen();
+    let out1_spend_sk: Hash32 = rand::thread_rng().gen();
+    let out1_pk: Hash32 = pk_from_sk(&out1_spend_sk);
+    let out1_recipient: Hash32 = recipient_from_pk(&domain, &out1_pk);
     let cm_out1 = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
 
     let out2_rho: Hash32 = rand::thread_rng().gen();
-    let out2_recipient: Hash32 = rand::thread_rng().gen();
+    let out2_spend_sk: Hash32 = rand::thread_rng().gen();
+    let out2_pk: Hash32 = pk_from_sk(&out2_spend_sk);
+    let out2_recipient: Hash32 = recipient_from_pk(&domain, &out2_pk);
     let cm_out2 = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
 
     // Save first output details for withdrawal step
@@ -123,7 +184,9 @@ fn main() -> Result<()> {
         "amount": out1_value,
         "rho": hex::encode(out1_rho),
         "recipient": hex::encode(out1_recipient),
-        "nf_key": hex::encode(nf_key)
+        "commitment": hex::encode(cm_out1),
+        "spend_sk": hex::encode(out1_spend_sk),
+        "nf_key": hex::encode(nf_key_from_sk(&domain, &out1_spend_sk)) // derived (debug)
     });
     fs::write(
         "midnight_transfer_out1_details.json",
@@ -139,55 +202,82 @@ fn main() -> Result<()> {
     };
 
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
-    let packing: u32 = std::env::var("LIGERO_PACKING")?.parse()?;
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .unwrap_or_else(|_| "8192".to_string())
+        .parse()
+        .context("Invalid LIGERO_PACKING")?;
 
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
+    // note_spend_guest ABI:
+    // 1 domain (public)
+    // 2 value (public)
+    // 3 rho (private)
+    // 4 recipient (private, layout only)
+    // 5 spend_sk (private)
+    // 6 depth (public)
+    // 7..7+depth-1 position bits (private)
+    // 7+depth..7+2*depth-1 siblings (private)
+    // ...
+    let depth_usize = tree_depth as usize;
+    let n_out: usize = 2;
+    let mut private_indices = vec![3, 4, 5];
+    for j in 0..depth_usize {
+        private_indices.push(7 + j);
     }
-    let base = 12 + tree_depth as usize;
-    // Two outputs: mark all their fields as private
-    for i in 0..6 {
-        private_indices.push(base + i);
+    for j in 0..depth_usize {
+        private_indices.push(7 + depth_usize + j);
+    }
+    for out_idx in 0..n_out {
+        let out_base = 11 + 2 * depth_usize + 4 * out_idx;
+        private_indices.extend_from_slice(&[out_base + 1, out_base + 2]); // out_rho, out_pk
     }
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(packing)
         .with_private_indices(private_indices);
 
+    // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(u64::try_from(value).context("NOTE_VALUE too large")?);
     host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(position.to_string());
-    host.add_str_arg(tree_depth.to_string());
+    host.add_hex_arg(hex::encode(in_recipient));
+    host.add_hex_arg(hex::encode(spend_sk));
+    host.add_u64_arg(tree_depth as u64);
+
+    // position bits (field elements 0/1 as 32-byte BE)
+    for lvl in 0..depth_usize {
+        let bit = ((position >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        host.add_hex_arg(hex::encode(bit_bytes));
+    }
 
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
     }
 
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg("0".to_string()); // withdraw_amount = 0
-    host.add_str_arg("2".to_string()); // n_out = 2
+    host.add_str_arg(format!("0x{}", hex::encode(anchor)));
+    host.add_str_arg(format!("0x{}", hex::encode(nf)));
+    host.add_u64_arg(0); // withdraw_amount = 0
+    host.add_u64_arg(n_out as u64);
 
     // Output 1
-    host.add_str_arg(out1_value.to_string());
+    host.add_u64_arg(u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?);
     host.add_hex_arg(hex::encode(out1_rho));
-    host.add_hex_arg(hex::encode(out1_recipient));
+    host.add_hex_arg(hex::encode(out1_pk));
     host.add_hex_arg(hex::encode(cm_out1));
 
     // Output 2
-    host.add_str_arg(out2_value.to_string());
+    host.add_u64_arg(u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?);
     host.add_hex_arg(hex::encode(out2_rho));
-    host.add_hex_arg(hex::encode(out2_recipient));
+    host.add_hex_arg(hex::encode(out2_pk));
     host.add_hex_arg(hex::encode(cm_out2));
 
     host.set_public_output(&public_output)?;
 
     println!("Generating proof...");
-    let proof_bytes = host.run(true)?;
+    let proof_bytes = host
+        .run(true)
+        .context("Ligero prover did not produce a valid proof")?;
     println!("✓ Proof generated: {} bytes", proof_bytes.len());
 
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =

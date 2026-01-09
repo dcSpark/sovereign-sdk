@@ -19,7 +19,7 @@ The MidnightPrivacy module provides a Zcash-style shielded pool that enables pri
 
 Moves transparent tokens into the shielded pool:
 
-```rust
+```rust,ignore
 CallMessage::Deposit {
     amount: 1000,        // Amount to deposit
     rho: [random],       // Random nonce
@@ -42,9 +42,9 @@ The core privacy-preserving operation that atomically:
 3. Creates output note commitments (from proof)
 4. Optionally withdraws transparent value
 
-```rust
+```rust,ignore
 CallMessage::Transfer {
-    proof: proof_bytes,           // Ligero proof (2-4MB)
+    proof: proof_bytes,           // Ligero proof (~8MB)
     anchor_root: [root],          // Historical Merkle root
     nullifier: [nf],              // Derived nullifier
     withdraw_amount: 200,         // 0 for pure shielded transfer
@@ -65,7 +65,7 @@ CallMessage::Transfer {
 #### Transfer Examples
 
 **Pure Shielded Transfer (2 outputs):**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 600 + 400 units
 Transfer {
     proof: proof_with_2_outputs,
@@ -76,7 +76,7 @@ Transfer {
 ```
 
 **Partial Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Output: 400 units + Withdraw: 600 units
 Transfer {
     proof: proof_with_1_output,
@@ -87,7 +87,7 @@ Transfer {
 ```
 
 **Full Withdrawal:**
-```rust
+```rust,ignore
 // Input: 1000 units → Withdraw: 1000 units (no outputs)
 Transfer {
     proof: proof_with_no_outputs,
@@ -118,12 +118,34 @@ The proof demonstrates (in zero-knowledge):
 - `pos`: Leaf position in tree
 - `siblings`: Merkle authentication path
 
+### Privacy Addresses, `pk_spend`, and `pk_ivk`
+
+Privacy recipients are derived from **two** 32-byte public keys:
+
+- `pk_spend`: spend public key used for ownership/spend authorization (Poseidon2-derived)
+- `pk_ivk`: incoming-view public key used for note viewing/encryption flows (X25519 public key)
+
+Key derivations (see `src/hash.rs` and `src/types.rs`):
+
+```text
+pk_spend  = H("PK_V1" || spend_sk)
+ivk_sk    = H("IVK_SEED_V1" || domain || spend_sk)
+pk_ivk    = X25519_BASE(clamp(ivk_sk))     // RFC 7748 clamping
+recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
+```
+
+Important behavior/assumptions:
+
+- The Ligero guest program (`note_spend_guest` v2) treats `pk_ivk_owner` / `pk_ivk_out` as **opaque 32-byte inputs** and only uses them to recompute `recipient` and note commitments. It does **not** prove that `pk_ivk` is a “real” X25519 key or that it’s derived from `spend_sk`.
+- Supplying the wrong `pk_ivk` effectively creates an address the intended recipient cannot view/spend, so funds may become unrecoverable. This is expected “sent to wrong address” behavior and is the sender’s responsibility.
+- Backward compatibility: legacy privacy addresses may only encode `pk_spend` (32 bytes); in that case we use the convention `pk_ivk == pk_spend`. New integrations should prefer full v2 addresses that include both keys.
+
 ### Security Features
 
 #### 1. Nullifier-Based Double-Spend Prevention
 
 Each note can only be spent once. The nullifier is derived as:
-```
+```text
 nullifier = PRF(domain, nf_key, rho)
 ```
 
@@ -149,7 +171,7 @@ The guest program verifies these match its computed values, ensuring cryptograph
 #### 4. Value Conservation
 
 The circuit enforces:
-```
+```text
 input_value = sum(output_values) + withdraw_amount
 ```
 
@@ -199,7 +221,7 @@ This prevents "trust me bro" scenarios where senders could lie about note values
 
 ## Usage Example
 
-```rust
+```rust,ignore
 // 1. Deposit 1000 tokens into shielded pool
 let deposit_msg = CallMessage::Deposit {
     amount: 1000,
@@ -256,10 +278,10 @@ cargo test --features native
 
 ### Building the Guest Program
 
-The Ligero guest program (`note_spend_guest.wasm`) must be built:
+The Ligero guest program (`note_spend_guest.wasm`) must be available:
 
 ```bash
-cd crates/adapters/ligero/guest
+ls -lh <ligero-prover>/utils/circuits/bins/note_spend_guest.wasm
 cargo build --release --target wasm32-unknown-unknown
 ```
 

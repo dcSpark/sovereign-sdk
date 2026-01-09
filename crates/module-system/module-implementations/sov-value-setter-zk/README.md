@@ -17,7 +17,7 @@ The `value-setter-zk` module demonstrates integration of the Ligero zkVM with So
 
 ### Off-Chain (Proof Generation)
 
-1. User compiles the guest program (`value_validator.wasm`) using Emscripten
+1. User provides the guest program (`value_validator_rust.wasm`) from the Ligero repo
 2. User runs the proof generator tool with their desired value
 3. Tool invokes Ligero prover to generate a proof
 4. Tool creates a `LigeroProofPackage` containing:
@@ -89,19 +89,17 @@ UpdateMethodId {
 ### 1. Build the Guest Program
 
 ```bash
-cd crates/adapters/ligero/guest
+ls -lh <ligero-prover>/utils/circuits/bins/value_validator_rust.wasm
 mkdir build && cd build
 emcmake cmake ..
 emmake make
-cp value_validator.wasm ../bins/programs/
+export LIGERO_PROGRAM_PATH=<ligero-prover>/utils/circuits/bins/value_validator_rust.wasm
 ```
 
 ### 2. Generate a Proof
 
-```bash
-cd crates/adapters/ligero
-cargo run --example generate_value_proof --features native -- 42
-```
+This repo no longer ships a `generate_value_proof` example. Use the verifier service flow or your
+own host wrapper to generate and submit proofs.
 
 This creates:
 - `value_proof.bin`: Raw proof package bytes
@@ -199,7 +197,7 @@ Configure in genesis:
 ```toml
 [value_setter_zk]
 initial_value = 0
-method_id = "0x..."  # Hash of value_validator.wasm + packing
+method_id = "0x..."  # Hash of value_validator_rust.wasm + packing
 admin = "0x..."
 ```
 

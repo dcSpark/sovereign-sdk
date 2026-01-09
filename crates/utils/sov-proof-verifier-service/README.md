@@ -111,7 +111,7 @@ export BIND_ADDRESS="127.0.0.1:8080"
 export NODE_RPC_URL="http://127.0.0.1:12346"
 export SIGNING_KEY_PATH="../test-data/keys/token_deployer_private_key.json"
 export METHOD_ID="0x..."
-export MAX_CONCURRENT_VERIFICATIONS="10"
+export MAX_CONCURRENT_VERIFICATIONS="5"
 export LOG_LEVEL="info"
 
 ./target/release/proof-verifier
@@ -192,8 +192,8 @@ cd ../../../examples/rollup-ligero
 
 ```bash
 # 1. Generate a proof
-cd crates/adapters/ligero
-cargo run --example generate_value_proof --features native -- 42
+This repo no longer ships a `generate_value_proof` example. Generate a proof using your own host
+wrapper (or the module tooling) and submit the resulting `LigeroProofPackage` bytes.
 
 # 2. Sign the transaction
 cd ../../..

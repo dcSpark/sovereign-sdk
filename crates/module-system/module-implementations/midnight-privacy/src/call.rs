@@ -20,6 +20,11 @@ use anyhow::anyhow;
 #[cfg(feature = "native")]
 use crate::hash::NullifierKey;
 
+/// Max serialized Ligero proof size accepted by the module (in bytes).
+///
+/// Proofs for `note_spend_guest` are currently ~8MB, so keep headroom.
+const MAX_LIGERO_PROOF_BYTES: usize = 12_000_000;
+
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
 #[serialize(Borsh, Serde)]
@@ -67,8 +72,8 @@ pub enum CallMessage<S: Spec> {
     /// - Send shielded payment to another recipient
     Transfer {
         /// Serialized Ligero proof package (bincode-encoded)
-        /// Note: Ligero proofs are typically 2-4MB in size
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        /// Note: Ligero proofs are currently ~8MB in size
+        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
         /// Nullifier that the proof derives (must be fresh)
@@ -102,8 +107,8 @@ pub enum CallMessage<S: Spec> {
     /// - Partial withdrawal: Input 1000 → Withdraw 600 + Change 400 (one output)
     Withdraw {
         /// Serialized Ligero proof package (bincode-encoded)
-        /// Note: Ligero proofs are typically 2-4MB in size
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        /// Note: Ligero proofs are currently ~8MB in size
+        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
         /// Nullifier that the proof derives (must be fresh)
@@ -263,7 +268,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Compute commitment and queue for end-of-block processing
         let domain = self.domain.get_or_err(st)??;
-        let cm = note_commitment(&domain, amount, &rho, &recipient);
+        // For deposit-created notes, we set `sender_id = recipient` so the commitment is fully
+        // determined by the deposit parameters (no extra transparent sender binding).
+        let cm = note_commitment(&domain, amount_u64, &rho, &recipient, &recipient);
         self.add_commitment(cm, st)?;
 
         // Optional: emit viewer ciphertexts for the deposit note
@@ -317,7 +324,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     pub(crate) fn transfer(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
@@ -536,7 +543,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     pub(crate) fn withdraw(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        proof: sov_modules_api::SafeVec<u8, 5_000_000>,
+        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,

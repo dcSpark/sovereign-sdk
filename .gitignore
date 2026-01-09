@@ -48,7 +48,9 @@ crates/module-system/module-implementations/midnight-privacy/midnight_core.txt
 crates/module-system/module-implementations/midnight-privacy/learn.txt
 crates/module-system/module-implementations/midnight-privacy/min_current_changes.txt
 crates/module-system/module-implementations/midnight-privacy/proof_data.gz
+crates/module-system/module-implementations/midnight-privacy/proof_data.bin
 proof_data.gz
+proof_data.bin
 proof_outputs/
 .env
 
@@ -77,3 +79,6 @@ crates/adapters/tee/attestation_verifier/Makefile
 crates/adapters/tee/attestation_verifier/_deps
 crates/adapters/tee/attestation_verifier/attestation.txt
 crates/adapters/tee/attestation_verifier/AttestationClient
+
+debug_spend_proof.txt
+bug_private.txt

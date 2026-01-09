@@ -1,8 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
-use midnight_privacy::{note_commitment, nullifier, CallMessage, Hash32, MerkleTree, SpendPublic};
+use midnight_privacy::{
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
+    CallMessage, Hash32, MerkleTree, SpendPublic,
+};
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -27,6 +30,7 @@ const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
 #[derive(Deserialize)]
 struct NotesResponse {
     notes: Vec<NoteEntry>,
+    #[serde(default)]
     current_root: Option<Vec<u8>>,
 }
 
@@ -36,6 +40,16 @@ struct NoteEntry {
     commitment: Vec<u8>,
 }
 
+fn decode_hash32_env(var: &str) -> Result<Hash32> {
+    let raw = std::env::var(var).with_context(|| format!("Missing env var {var}"))?;
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    hex::decode(raw)
+        .with_context(|| format!("Invalid hex in env var {var}"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid {var} length (expected 32 bytes)"))
+}
+
 fn load_notes_from_source() -> Option<NotesResponse> {
     if let Ok(path) = std::env::var("NOTES_FILE") {
         let data = fs::read_to_string(path).ok()?;
@@ -43,45 +57,88 @@ fn load_notes_from_source() -> Option<NotesResponse> {
     }
 
     if let Ok(node_url) = std::env::var("NODE_API_URL") {
-        let url = format!("{}/modules/midnight-privacy/notes?limit=200&reverse=true", node_url);
-        if let Ok(resp) = reqwest::blocking::get(url) {
-            return resp.json::<NotesResponse>().ok();
+        // IMPORTANT: fetch ALL notes (pagination) so the Merkle root/path matches on-chain state.
+        let mut all_notes: Vec<NoteEntry> = Vec::new();
+        let mut offset: usize = 0;
+        let limit: usize = 1000;
+        let mut last_root: Option<Vec<u8>> = None;
+
+        loop {
+            let url = format!(
+                "{}/modules/midnight-privacy/notes?limit={}&offset={}",
+                node_url, limit, offset
+            );
+            let resp = reqwest::blocking::get(&url).ok()?;
+            let page = resp.json::<NotesResponse>().ok()?;
+
+            if let Some(root) = page.current_root.clone() {
+                last_root = Some(root);
+            }
+
+            let n = page.notes.len();
+            all_notes.extend(page.notes);
+            if n < limit {
+                break;
+            }
+            offset += n;
         }
+
+        return Some(NotesResponse {
+            notes: all_notes,
+            current_root: last_root,
+        });
     }
     None
 }
 
 fn main() -> Result<()> {
-    let domain: Hash32 = hex::decode(std::env::var("OUT1_DOMAIN")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid domain"))?;
-    let value: u128 = std::env::var("OUT1_VALUE")?.parse()?;
-    let rho: Hash32 = hex::decode(std::env::var("OUT1_RHO")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid rho"))?;
-    let recipient_hash: Hash32 = hex::decode(std::env::var("OUT1_RECIPIENT")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid recipient"))?;
-    let nf_key: Hash32 = hex::decode(std::env::var("OUT1_NF_KEY")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid nf_key"))?;
-    let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")?.parse()?;
+    let domain: Hash32 = decode_hash32_env("OUT1_DOMAIN")?;
+    let value: u128 = std::env::var("OUT1_VALUE")
+        .with_context(|| "Missing env var OUT1_VALUE")?
+        .parse()
+        .context("Invalid OUT1_VALUE")?;
+    let rho: Hash32 = decode_hash32_env("OUT1_RHO")?;
+    let spend_sk: Hash32 = decode_hash32_env("OUT1_SPEND_SK")?;
+    let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")
+        .with_context(|| "Missing env var WITHDRAW_AMOUNT")?
+        .parse()
+        .context("Invalid WITHDRAW_AMOUNT")?;
     let position: u64 = std::env::var("OUT1_POSITION")?.parse()?;
     let nonce: u64 = std::env::var("NONCE")?.parse()?;
     let recipient_addr: String = std::env::var("RECIPIENT")?;
+    anyhow::ensure!(
+        withdraw_amount <= value,
+        "WITHDRAW_AMOUNT exceeds note value: withdraw={} value={}",
+        withdraw_amount,
+        value
+    );
 
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("TRANSFER_ROOT")?)?;
     let mut anchor: Hash32 = anchor_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    let cm = note_commitment(&domain, value, &rho, &recipient_hash);
+    let in_recipient = recipient_from_sk(&domain, &spend_sk);
+    let cm = note_commitment(&domain, value, &rho, &in_recipient);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
     // Build tree from on-chain notes when available; otherwise fall back to single-leaf tree.
     let tree_depth: u8 = 16;
     let mut tree = MerkleTree::new(tree_depth);
     if let Some(notes_resp) = load_notes_from_source() {
+        // Prefer the fresh root reported by the node (avoid stale TRANSFER_ROOT from earlier script steps).
+        if let Some(root) = notes_resp.current_root.clone() {
+            if let Ok(root32) = <[u8; 32]>::try_from(root) {
+                let fresh: Hash32 = root32;
+                if fresh != anchor {
+                    println!(
+                        "ℹ️  Provided TRANSFER_ROOT differs from node current_root; using node root"
+                    );
+                }
+                anchor = fresh;
+            }
+        }
         for note in notes_resp.notes {
             if note.position >= (1u64 << tree_depth) {
                 continue;
@@ -97,12 +154,13 @@ fn main() -> Result<()> {
             .root()
             .try_into()
             .map_err(|_| anyhow::anyhow!("Computed root has invalid length"))?;
-        if computed_root != anchor {
-            println!(
-                "ℹ️  Recomputed anchor from notes differs from provided anchor; using computed root"
-            );
-            anchor = computed_root;
-        }
+        anyhow::ensure!(
+            computed_root == anchor,
+            "Anchor root mismatch: env/node anchor = 0x{}, but Merkle root computed from on-chain notes = 0x{}. \
+             This usually means your note isn't fully indexed yet, or the note list is incomplete.",
+            hex::encode(anchor),
+            hex::encode(computed_root),
+        );
     } else {
         tree.set_leaf(position as usize, cm);
     }
@@ -116,61 +174,94 @@ fn main() -> Result<()> {
     );
     println!("Input nullifier: 0x{}", hex::encode(&nf[..8]));
 
-    // Create change note
+    // Change output (if any)
     let change_value = value - withdraw_amount;
-    let change_rho: Hash32 = rand::thread_rng().gen();
-    let change_recipient: Hash32 = rand::thread_rng().gen();
-    let cm_change = note_commitment(&domain, change_value, &change_rho, &change_recipient);
+    let (n_out, cm_change, change_rho, change_pk) = if change_value > 0 {
+        let change_rho: Hash32 = rand::thread_rng().gen();
+        // Keep change owned by the same spend key.
+        let change_pk: Hash32 = pk_from_sk(&spend_sk);
+        let change_recipient: Hash32 = recipient_from_pk(&domain, &change_pk);
+        let cm_change = note_commitment(&domain, change_value, &change_rho, &change_recipient);
+        (1usize, Some(cm_change), Some(change_rho), Some(change_pk))
+    } else {
+        (0usize, None, None, None)
+    };
 
     let public_output = SpendPublic {
         anchor_root: anchor,
         nullifier: nf,
         withdraw_amount,
-        output_commitments: vec![cm_change],
+        output_commitments: cm_change.into_iter().collect(),
         view_attestations: None,
     };
 
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
-    let packing: u32 = std::env::var("LIGERO_PACKING")?.parse()?;
+    let packing: u32 = std::env::var("LIGERO_PACKING")
+        .unwrap_or_else(|_| "8192".to_string())
+        .parse()
+        .context("Invalid LIGERO_PACKING")?;
 
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
+    let depth_usize = tree_depth as usize;
+    let mut private_indices = vec![3, 4, 5]; // rho, recipient (layout), spend_sk
+    // position bits
+    for j in 0..depth_usize {
+        private_indices.push(7 + j);
     }
-    let base = 12 + tree_depth as usize;
-    private_indices.extend(&[base, base + 1, base + 2]);
+    // siblings
+    for j in 0..depth_usize {
+        private_indices.push(7 + depth_usize + j);
+    }
+    // output 0: out_rho, out_pk private
+    if n_out == 1 {
+        let out_base = 11 + 2 * depth_usize;
+        private_indices.extend_from_slice(&[out_base + 1, out_base + 2]);
+    }
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(packing)
         .with_private_indices(private_indices);
 
+    // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_str_arg(value.to_string());
+    host.add_u64_arg(u64::try_from(value).context("OUT1_VALUE too large")?);
     host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient_hash));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_str_arg(position.to_string());
-    host.add_str_arg(tree_depth.to_string());
+    host.add_hex_arg(hex::encode(in_recipient));
+    host.add_hex_arg(hex::encode(spend_sk));
+    host.add_u64_arg(tree_depth as u64);
+
+    // position bits (field elements 0/1 as 32-byte BE)
+    for lvl in 0..depth_usize {
+        let bit = ((position >> lvl) & 1) as u8;
+        let mut bit_bytes = [0u8; 32];
+        bit_bytes[31] = bit;
+        host.add_hex_arg(hex::encode(bit_bytes));
+    }
 
     for sibling in &siblings {
         host.add_hex_arg(hex::encode(sibling));
     }
 
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_str_arg(withdraw_amount.to_string());
-    host.add_str_arg("1".to_string()); // n_out = 1 (change)
+    host.add_str_arg(format!("0x{}", hex::encode(anchor)));
+    host.add_str_arg(format!("0x{}", hex::encode(nf)));
+    host.add_u64_arg(u64::try_from(withdraw_amount).context("WITHDRAW_AMOUNT too large")?);
+    host.add_u64_arg(n_out as u64);
 
-    // Change output
-    host.add_str_arg(change_value.to_string());
-    host.add_hex_arg(hex::encode(change_rho));
-    host.add_hex_arg(hex::encode(change_recipient));
-    host.add_hex_arg(hex::encode(cm_change));
+    if n_out == 1 {
+        let cm_change = cm_change.expect("cm_change missing for change output");
+        let change_rho = change_rho.expect("change_rho missing for change output");
+        let change_pk = change_pk.expect("change_pk missing for change output");
+        host.add_u64_arg(u64::try_from(change_value).context("Change value too large")?);
+        host.add_hex_arg(hex::encode(change_rho));
+        host.add_hex_arg(hex::encode(change_pk));
+        host.add_hex_arg(hex::encode(cm_change));
+    }
 
     host.set_public_output(&public_output)?;
 
     println!("Generating proof...");
-    let proof_bytes = host.run(true)?;
+    let proof_bytes = host
+        .run(true)
+        .context("Ligero prover did not produce a valid proof")?;
     println!("✓ Proof generated: {} bytes", proof_bytes.len());
 
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =

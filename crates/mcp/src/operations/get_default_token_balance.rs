@@ -35,14 +35,11 @@ where
     let balance = provider
         .get_balance::<S>(&address, &token_id_parsed)
         .await
-        .with_context(|e| {
-            tracing::error!(
-                "Failed to get balance for token {} at address {}: {}",
-                token_id,
-                address,
-                e
-            );
-            e.to_string()
+        .with_context(|| {
+            format!(
+                "Failed to get balance for token {} at address {}",
+                token_id, address
+            )
         })?;
 
     Ok((address.to_string(), balance))
