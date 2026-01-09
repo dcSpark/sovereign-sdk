@@ -142,6 +142,23 @@ mod tests {
 
     #[test]
     fn test_attest() {
+        // This test only exercises the attestation generation and verification logic.
+        //
+        // It does NOT provide protection against request forwarding or active
+        // man-in-the-middle attacks. In this test, possession of a valid attestation
+        // JWT is sufficient to pass verification.
+        //
+        // In production, the attestation MUST be bound to a proof-of-possession key
+        // owned by the attested VM, typically via mTLS:
+        //
+        // - The VM generates an ephemeral keypair.
+        // - The public key is included in the attested client payload.
+        // - The server verifies that the requester proves possession of the
+        //   corresponding private key (e.g. via mTLS or an explicit signature).
+        //
+        // This binds the attestation to the live connection and prevents an attacker
+        // from replaying or forwarding a valid attestation token.
+
         // Create a test payload.
         let payload = BatchPublicDataV1 {
             version: 1,
