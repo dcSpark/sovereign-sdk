@@ -66,6 +66,9 @@ RUN apt-get update \
        ca-certificates \
        libsqlite3-0 \
        libssl3 \
+       libvulkan1 \
+       vulkan-tools \
+       mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
