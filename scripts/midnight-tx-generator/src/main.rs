@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    note_commitment, nullifier, root_from_path, CallMessage, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    root_from_path, CallMessage, Hash32, MerkleTree, PrivacyAddress, SpendPublic,
 };
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_ligero_adapter::Ligero;
@@ -22,6 +23,8 @@ use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
+
+mod note_spend_guest_v2;
 
 // Type alias matching the rollup-ligero tests
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
@@ -83,6 +86,11 @@ fn main() -> Result<()> {
     println!("  Recipient: {}", recipient_addr);
     println!("  Nonce: {}\n", nonce);
 
+    // Parse the transparent destination once so we can bind it into the circuit input.
+    let to_addr: <DemoRollupSpec as Spec>::Address = recipient_addr
+        .parse()
+        .context("Invalid recipient address")?;
+
     // Setup Ligero environment (discovers paths automatically)
     println!("Setting up Ligero environment...");
     let ligero_config = setup_ligero_env()?;
@@ -94,17 +102,23 @@ fn main() -> Result<()> {
     println!("Step 1: Creating note using test parameters...");
 
     let domain: Hash32 = [1u8; 32];
-    let value: u128 = note_value; // Use the validated note value
+    let value: u64 = u64::try_from(note_value).context("NOTE_VALUE too large")?;
     let rho: Hash32 = [2u8; 32];
-    let recipient: Hash32 = [3u8; 32];
-    let nf_key: Hash32 = [4u8; 32]; // SECRET
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_spend = pk_from_sk(&spend_sk);
+    let pk_ivk = pk_ivk_from_sk(&domain, &spend_sk);
+    let privacy_address = PrivacyAddress::from_keys(&pk_spend, &pk_ivk);
+    let recipient: Hash32 = recipient_from_pk_v2(&domain, &pk_spend, &pk_ivk);
+    let sender_id_in: Hash32 = recipient; // deposit-created note convention
+    let nf_key: Hash32 = nf_key_from_sk(&domain, &spend_sk);
 
     println!("  Domain: 0x{}", hex::encode(&domain[..4]));
     println!("  Value: {}", value);
     println!("  Rho: 0x{}", hex::encode(&rho[..4]));
+    println!("  Privacy address: {}", privacy_address);
 
     // Compute note commitment
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let cm = note_commitment(&domain, value, &rho, &recipient, &sender_id_in);
     println!("✓ Note commitment: 0x{}", hex::encode(&cm[..8]));
 
     // Build Merkle tree
@@ -127,59 +141,100 @@ fn main() -> Result<()> {
     let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: 0x{}\n", hex::encode(&nf[..8]));
 
-    // Create output with ALL value (like the test does)
-    let n_out: u32 = 1;
-    let out_value = value; // Put entire input into shielded change
+    // Change output (if any). For withdraw, change = value - withdraw_amount.
+    let withdraw_amount_u64: u64 =
+        u64::try_from(withdraw_amount).context("WITHDRAW_AMOUNT too large")?;
+    let change_value: u64 = value
+        .checked_sub(withdraw_amount_u64)
+        .context("withdraw_amount exceeds note value")?;
+
     let out_rho: Hash32 = [9u8; 32];
-    let out_rcp: Hash32 = [5u8; 32];
-    let cm_out = note_commitment(&domain, out_value, &out_rho, &out_rcp);
+    let sender_id_out: Hash32 = recipient; // spender identity
+    let cm_out = if change_value > 0 {
+        note_commitment(&domain, change_value, &out_rho, &recipient, &sender_id_out)
+    } else {
+        [0u8; 32]
+    };
 
     let public_output = SpendPublic {
         anchor_root: anchor,
+        // Filled below (defaults to all-allowed).
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount,
-        output_commitments: vec![cm_out],
+        output_commitments: if change_value > 0 { vec![cm_out] } else { vec![] },
         view_attestations: None,
     };
 
     println!("Step 2: Generating proof (exactly like test)...");
 
-    // Use exact private indices from test
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
+    // note_spend_guest v2 ABI builder (includes inv_enforce + deny-map section).
+    let input = note_spend_guest_v2::SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+
+    let mut outputs: Vec<note_spend_guest_v2::SpendOutputV2> = Vec::new();
+    if change_value > 0 {
+        outputs.push(note_spend_guest_v2::SpendOutputV2 {
+            value: change_value,
+            rho: out_rho,
+            pk_spend,
+            pk_ivk,
+            cm: cm_out,
+        });
     }
-    let base = 12 + (tree_depth as usize);
-    private_indices.push(base + 0); // value_out_0
-    private_indices.push(base + 1); // rho_out_0
-    private_indices.push(base + 2); // recipient_out_0
+
+    let sender_addr = privacy_address;
+    // The spend circuit's blacklist checks are:
+    // - always: sender_id
+    // - transfer only (withdraw_amount == 0): pay recipient (output 0)
+    // Change outputs are enforced to be self in-circuit and are not checked separately.
+    let addr_list = if withdraw_amount_u64 == 0 {
+        // This generator uses a self-transfer shape when withdraw_amount == 0, so pay recipient is self.
+        vec![sender_addr, sender_addr]
+    } else {
+        vec![sender_addr]
+    };
+    let node_url = std::env::var("NODE_API_URL").ok();
+    let (blacklist_root, deny_openings) =
+        note_spend_guest_v2::deny_map_openings_or_default(node_url.as_deref(), &addr_list)?;
+
+    // Bind the transparent withdrawal destination into the statement.
+    // The circuit requires:
+    // - transfers (withdraw_amount == 0): withdraw_to == 0x00..00
+    // - withdrawals (withdraw_amount  > 0): withdraw_to != 0x00..00
+    let withdraw_to: Hash32 = if withdraw_amount_u64 == 0 {
+        [0u8; 32]
+    } else {
+        note_spend_guest_v2::withdraw_to_from_address_bytes(to_addr.as_ref())?
+    };
+
+    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount_u64,
+        withdraw_to,
+        &outputs,
+        blacklist_root,
+        &deny_openings,
+    )?;
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&ligero_config.program)
         .with_packing(ligero_config.packing)
         .with_private_indices(private_indices);
+    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
 
-    // Add arguments using typed binary ABI for zkVM performance
-    host.add_hex_arg(hex::encode(domain));
-    host.add_u64_arg(u64::try_from(value).context("NOTE_VALUE too large")?);
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_u64_arg(position);
-    host.add_u64_arg(tree_depth as u64);
-
-    for sibling in &siblings {
-        host.add_hex_arg(hex::encode(sibling));
-    }
-
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_u64_arg(u64::try_from(withdraw_amount).context("WITHDRAW_AMOUNT too large")?);
-    host.add_u64_arg(n_out as u64);
-    host.add_u64_arg(u64::try_from(out_value).context("Output value too large")?);
-    host.add_hex_arg(hex::encode(out_rho));
-    host.add_hex_arg(hex::encode(out_rcp));
-    host.add_hex_arg(hex::encode(cm_out));
-
+    let mut public_output = public_output;
+    public_output.blacklist_root = blacklist_root;
     host.set_public_output(&public_output)?;
 
     println!("  Calling webgpu_prover...");
@@ -192,11 +247,6 @@ fn main() -> Result<()> {
         proof_bytes.len(),
         proof_time.as_secs_f64()
     );
-
-    // Parse recipient address
-    let recipient: <DemoRollupSpec as Spec>::Address = recipient_addr
-        .parse()
-        .context("Invalid recipient address")?;
 
     // Load or generate private key
     let private_key = if let Ok(key_file) = std::env::var("PRIVATE_KEY_FILE") {
@@ -223,7 +273,7 @@ fn main() -> Result<()> {
         anchor_root: anchor,
         nullifier: nf,
         withdraw_amount,
-        to: recipient,
+        to: to_addr,
         view_ciphertexts: None,
         gas: None,
     });
@@ -267,7 +317,7 @@ fn main() -> Result<()> {
     println!("  Withdraw amount: {} (transparent)", withdraw_amount);
     println!(
         "  Change: {} (stays in shielded pool)",
-        value - withdraw_amount
+        change_value
     );
 
     Ok(())
@@ -280,13 +330,6 @@ struct LigeroConfig {
 }
 
 fn setup_ligero_env() -> Result<LigeroConfig> {
-    // Auto-detect paths based on repository structure
-    let repo_root = std::env::current_dir()?
-        .ancestors()
-        .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
-        .ok_or_else(|| anyhow::anyhow!("Could not find repository root"))?
-        .to_path_buf();
-
     let config = LigeroConfig {
         // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
         // `ligero-runner` resolves the correct wasm when given a circuit name.

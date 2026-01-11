@@ -1,9 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
-use midnight_privacy::{note_commitment, nullifier, CallMessage, Hash32, SpendPublic};
+use midnight_privacy::{
+    note_commitment, nullifier, nf_key_from_sk, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    CallMessage, Hash32, PrivacyAddress, SpendPublic,
+};
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -17,6 +20,8 @@ use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 
+mod note_spend_guest_v2;
+
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 mod demo_generated {
@@ -26,23 +31,31 @@ mod demo_generated {
 const CHAIN_HASH: [u8; 32] = demo_generated::CHAIN_HASH;
 
 fn main() -> Result<()> {
-    let domain: Hash32 = hex::decode(std::env::var("NOTE_DOMAIN")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid domain"))?;
+    let domain: Hash32 = {
+        let raw = std::env::var("NOTE_DOMAIN")?;
+        hex::decode(raw.trim_start_matches("0x"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid domain"))?
+    };
     let value: u128 = std::env::var("NOTE_VALUE")?.parse()?;
-    let rho: Hash32 = hex::decode(std::env::var("NOTE_RHO")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid rho"))?;
-    let recipient: Hash32 = hex::decode(std::env::var("NOTE_RECIPIENT")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid recipient"))?;
-    let nf_key: Hash32 = hex::decode(std::env::var("NOTE_NF_KEY")?)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid nf_key"))?;
+    let rho: Hash32 = {
+        let raw = std::env::var("NOTE_RHO")?;
+        hex::decode(raw.trim_start_matches("0x"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid rho"))?
+    };
+    let spend_sk: Hash32 = {
+        let raw = std::env::var("NOTE_SPEND_SK")?;
+        hex::decode(raw.trim_start_matches("0x"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid NOTE_SPEND_SK"))?
+    };
     let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")?.parse()?;
     let position: u64 = std::env::var("NOTE_POSITION")?.parse()?;
     let nonce: u64 = std::env::var("NONCE")?.parse()?;
     let recipient_addr: String = std::env::var("RECIPIENT")?;
+    let to_addr: <DemoRollupSpec as Spec>::Address =
+        recipient_addr.parse().context("Invalid RECIPIENT address")?;
 
     // Get the actual anchor root from the deposit response
     let anchor_bytes: Vec<u8> = serde_json::from_str(&std::env::var("ANCHOR_ROOT")?)?;
@@ -50,8 +63,27 @@ fn main() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    // Compute the note commitment
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    // Derive owner keys for the v2 spend circuit.
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let recipient = recipient_from_pk_v2(&domain, &pk_spend_owner, &pk_ivk_owner);
+
+    // Compute the note commitment (NOTE_V2; default sender_id = recipient for deposit-created notes).
+    let value_u64 = u64::try_from(value).map_err(|_| anyhow::anyhow!("NOTE_VALUE too large"))?;
+    let sender_id_in: Hash32 = std::env::var("NOTE_SENDER_ID")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim_start_matches("0x");
+            hex::decode(raw)
+                .map_err(|e| anyhow::anyhow!("Invalid NOTE_SENDER_ID hex: {e}"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid NOTE_SENDER_ID length (expected 32 bytes)"))
+        })
+        .transpose()?
+        .unwrap_or(recipient);
+
+    let cm = note_commitment(&domain, value_u64, &rho, &recipient, &sender_id_in);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
     // Build a Merkle tree with the note at the actual position
@@ -71,65 +103,105 @@ fn main() -> Result<()> {
     println!("Nullifier: 0x{}", hex::encode(&nf[..8]));
 
     let change_value = value - withdraw_amount;
-    let out_rho: Hash32 = rand::thread_rng().gen();
-    let out_recipient: Hash32 = rand::thread_rng().gen();
-    let cm_out = note_commitment(&domain, change_value, &out_rho, &out_recipient);
+    let (n_out, out_rho, out_pk_spend, out_pk_ivk, _out_recipient, cm_out) = if change_value > 0 {
+        let out_rho: Hash32 = rand::thread_rng().gen();
+        // Keep change owned by the same keypair.
+        let out_pk_spend = pk_spend_owner;
+        let out_pk_ivk = pk_ivk_owner;
+        let out_recipient = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
+        let sender_id_out = recipient;
+        let cm_out = note_commitment(
+            &domain,
+            u64::try_from(change_value).map_err(|_| anyhow::anyhow!("Change value too large"))?,
+            &out_rho,
+            &out_recipient,
+            &sender_id_out,
+        );
+        (1usize, Some(out_rho), Some(out_pk_spend), Some(out_pk_ivk), Some(out_recipient), Some(cm_out))
+    } else {
+        (0usize, None, None, None, None, None)
+    };
 
     let public_output = SpendPublic {
         anchor_root: anchor,
+        // Filled after fetching deny-map openings (defaults to all-allowed when NODE_API_URL is unset).
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount,
-        output_commitments: vec![cm_out],
+        output_commitments: cm_out.into_iter().collect(),
         view_attestations: None,
     };
 
     let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
     let packing: u32 = std::env::var("LIGERO_PACKING")?.parse()?;
 
-    let mut private_indices = vec![2, 3, 4, 5, 6];
-    for i in 0..tree_depth as usize {
-        private_indices.push(8 + i);
+    // note_spend_guest v2 ABI builder (includes inv_enforce + deny-map section).
+    let input = note_spend_guest_v2::SpendInputV2 {
+        value: value_u64,
+        rho,
+        sender_id: sender_id_in,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+
+    let mut outputs: Vec<note_spend_guest_v2::SpendOutputV2> = Vec::new();
+    if n_out == 1 {
+        outputs.push(note_spend_guest_v2::SpendOutputV2 {
+            value: u64::try_from(change_value).map_err(|_| anyhow::anyhow!("Change value too large"))?,
+            rho: out_rho.expect("out_rho missing for change output"),
+            pk_spend: out_pk_spend.expect("out_pk_spend missing for change output"),
+            pk_ivk: out_pk_ivk.expect("out_pk_ivk missing for change output"),
+            cm: cm_out.expect("cm_out missing for change output"),
+        });
     }
-    let base = 12 + tree_depth as usize;
-    private_indices.extend(&[base, base + 1, base + 2]);
+
+    let withdraw_amount_u64 =
+        u64::try_from(withdraw_amount).map_err(|_| anyhow::anyhow!("WITHDRAW_AMOUNT too large"))?;
+
+    let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
+    let addr_list = if withdraw_amount_u64 == 0 {
+        vec![sender_addr, sender_addr]
+    } else {
+        vec![sender_addr]
+    };
+    let node_url = std::env::var("NODE_API_URL").ok();
+    let (blacklist_root, deny_openings) =
+        note_spend_guest_v2::deny_map_openings_or_default(node_url.as_deref(), &addr_list)?;
+
+    let withdraw_to: Hash32 = if withdraw_amount_u64 == 0 {
+        [0u8; 32]
+    } else {
+        note_spend_guest_v2::withdraw_to_from_address_bytes(to_addr.as_ref())?
+    };
+
+    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount_u64,
+        withdraw_to,
+        &outputs,
+        blacklist_root,
+        &deny_openings,
+    )?;
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(packing)
         .with_private_indices(private_indices);
+    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
 
-    // Typed binary ABI for zkVM performance
-    host.add_hex_arg(hex::encode(domain));
-    host.add_u64_arg(u64::try_from(value).map_err(|_| anyhow::anyhow!("NOTE_VALUE too large"))?);
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(recipient));
-    host.add_hex_arg(hex::encode(nf_key));
-    host.add_u64_arg(position);
-    host.add_u64_arg(tree_depth as u64);
-
-    for sibling in &siblings {
-        host.add_hex_arg(hex::encode(sibling));
-    }
-
-    host.add_hex_arg(hex::encode(anchor));
-    host.add_hex_arg(hex::encode(nf));
-    host.add_u64_arg(
-        u64::try_from(withdraw_amount).map_err(|_| anyhow::anyhow!("WITHDRAW_AMOUNT too large"))?,
-    );
-    host.add_u64_arg(1);
-    host.add_u64_arg(
-        u64::try_from(change_value).map_err(|_| anyhow::anyhow!("Change value too large"))?,
-    );
-    host.add_hex_arg(hex::encode(out_rho));
-    host.add_hex_arg(hex::encode(out_recipient));
-    host.add_hex_arg(hex::encode(cm_out));
-
+    let mut public_output = public_output;
+    public_output.blacklist_root = blacklist_root;
     host.set_public_output(&public_output)?;
 
     println!("Generating proof...");
     let proof_bytes = host.run(true)?;
     println!("✓ Proof: {} bytes", proof_bytes.len());
 
-    let recipient_parsed: <DemoRollupSpec as Spec>::Address = recipient_addr.parse()?;
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =
         serde_json::from_str(&fs::read_to_string(std::env::var("PRIVATE_KEY_FILE")?)?)?;
 
@@ -142,7 +214,7 @@ fn main() -> Result<()> {
         anchor_root: anchor,
         nullifier: nf,
         withdraw_amount,
-        to: recipient_parsed,
+        to: to_addr,
         view_ciphertexts: None,
         gas: None,
     });

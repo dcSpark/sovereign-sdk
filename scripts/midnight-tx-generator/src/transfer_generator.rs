@@ -3,8 +3,8 @@ use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
-    CallMessage, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    CallMessage, Hash32, MerkleTree, PrivacyAddress, SpendPublic,
 };
 use rand::Rng;
 use serde_json;
@@ -18,6 +18,8 @@ use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 use serde::Deserialize;
+
+mod note_spend_guest_v2;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -117,8 +119,13 @@ fn main() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    let in_recipient = recipient_from_sk(&domain, &spend_sk);
-    let cm = note_commitment(&domain, value, &rho, &in_recipient);
+    let pk_spend_owner = pk_from_sk(&spend_sk);
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let in_recipient = recipient_from_pk_v2(&domain, &pk_spend_owner, &pk_ivk_owner);
+    let in_sender_id = in_recipient; // deposit-created notes use sender_id = recipient
+    let value_u64 = u64::try_from(value).context("NOTE_VALUE too large")?;
+    // Deposit-created notes use sender_id = recipient.
+    let cm = note_commitment(&domain, value_u64, &rho, &in_recipient, &in_sender_id);
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
@@ -165,24 +172,46 @@ fn main() -> Result<()> {
     println!("Transfer: {} → {} + {}", value, out1_value, out2_value);
     println!("Input nullifier: 0x{}", hex::encode(&nf[..8]));
 
-    // Create 2 output notes (pure shielded transfer, withdraw_amount = 0)
+    // Create 2 output notes (pure shielded transfer, withdraw_amount = 0).
+    // Output sender_id is the spender's privacy identity.
+    let sender_id_out = in_recipient;
+
     let out1_rho: Hash32 = rand::thread_rng().gen();
     let out1_spend_sk: Hash32 = rand::thread_rng().gen();
-    let out1_pk: Hash32 = pk_from_sk(&out1_spend_sk);
-    let out1_recipient: Hash32 = recipient_from_pk(&domain, &out1_pk);
-    let cm_out1 = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1_pk_spend: Hash32 = pk_from_sk(&out1_spend_sk);
+    let out1_pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &out1_spend_sk);
+    let out1_recipient: Hash32 = recipient_from_pk_v2(&domain, &out1_pk_spend, &out1_pk_ivk);
+    let cm_out1 = note_commitment(
+        &domain,
+        u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?,
+        &out1_rho,
+        &out1_recipient,
+        &sender_id_out,
+    );
 
     let out2_rho: Hash32 = rand::thread_rng().gen();
     let out2_spend_sk: Hash32 = rand::thread_rng().gen();
-    let out2_pk: Hash32 = pk_from_sk(&out2_spend_sk);
-    let out2_recipient: Hash32 = recipient_from_pk(&domain, &out2_pk);
-    let cm_out2 = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2_pk_spend: Hash32 = pk_from_sk(&out2_spend_sk);
+    let out2_pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &out2_spend_sk);
+    let out2_recipient: Hash32 = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
+    let cm_out2 = note_commitment(
+        &domain,
+        u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?,
+        &out2_rho,
+        &out2_recipient,
+        &sender_id_out,
+    );
 
     // Save first output details for withdrawal step
+    let out1_addr = PrivacyAddress::from_keys(&out1_pk_spend, &out1_pk_ivk);
     let out1_details = serde_json::json!({
         "domain": hex::encode(domain),
         "amount": out1_value,
         "rho": hex::encode(out1_rho),
+        "sender_id": hex::encode(sender_id_out),
+        "privacy_address": out1_addr.to_string(),
+        "pk_spend": hex::encode(out1_pk_spend),
+        "pk_ivk": hex::encode(out1_pk_ivk),
         "recipient": hex::encode(out1_recipient),
         "commitment": hex::encode(cm_out1),
         "spend_sk": hex::encode(out1_spend_sk),
@@ -195,6 +224,8 @@ fn main() -> Result<()> {
 
     let public_output = SpendPublic {
         anchor_root: anchor,
+        // Filled after fetching deny-map openings (defaults to all-allowed when NODE_API_URL is unset).
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: 0, // Pure shielded transfer
         output_commitments: vec![cm_out1, cm_out2],
@@ -207,71 +238,62 @@ fn main() -> Result<()> {
         .parse()
         .context("Invalid LIGERO_PACKING")?;
 
-    // note_spend_guest ABI:
-    // 1 domain (public)
-    // 2 value (public)
-    // 3 rho (private)
-    // 4 recipient (private, layout only)
-    // 5 spend_sk (private)
-    // 6 depth (public)
-    // 7..7+depth-1 position bits (private)
-    // 7+depth..7+2*depth-1 siblings (private)
-    // ...
-    let depth_usize = tree_depth as usize;
-    let n_out: usize = 2;
-    let mut private_indices = vec![3, 4, 5];
-    for j in 0..depth_usize {
-        private_indices.push(7 + j);
-    }
-    for j in 0..depth_usize {
-        private_indices.push(7 + depth_usize + j);
-    }
-    for out_idx in 0..n_out {
-        let out_base = 11 + 2 * depth_usize + 4 * out_idx;
-        private_indices.extend_from_slice(&[out_base + 1, out_base + 2]); // out_rho, out_pk
-    }
+    // note_spend_guest v2 ABI builder (includes inv_enforce + deny-map section).
+    let input = note_spend_guest_v2::SpendInputV2 {
+        value: value_u64,
+        rho,
+        sender_id: in_sender_id,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+
+    let out1 = note_spend_guest_v2::SpendOutputV2 {
+        value: u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?,
+        rho: out1_rho,
+        pk_spend: out1_pk_spend,
+        pk_ivk: out1_pk_ivk,
+        cm: cm_out1,
+    };
+    let out2 = note_spend_guest_v2::SpendOutputV2 {
+        value: u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?,
+        rho: out2_rho,
+        pk_spend: out2_pk_spend,
+        pk_ivk: out2_pk_ivk,
+        cm: cm_out2,
+    };
+
+    // Deny-map root + openings:
+    // - always: sender_id
+    // - transfer only (withdraw_amount == 0): pay recipient (output 0)
+    // Change outputs (output 1 when n_out==2) are enforced to be self in-circuit and are not checked separately.
+    let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
+    let addr_list = vec![sender_addr, PrivacyAddress::from_keys(&out1_pk_spend, &out1_pk_ivk)];
+    let node_url = std::env::var("NODE_API_URL").ok();
+    let (blacklist_root, deny_openings) =
+        note_spend_guest_v2::deny_map_openings_or_default(node_url.as_deref(), &addr_list)?;
+
+    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        0,            // withdraw_amount
+        [0u8; 32],    // withdraw_to (unused for transfers)
+        &[out1, out2],
+        blacklist_root,
+        &deny_openings,
+    )?;
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
         .with_packing(packing)
         .with_private_indices(private_indices);
+    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
 
-    // Typed binary ABI for zkVM performance
-    host.add_hex_arg(hex::encode(domain));
-    host.add_u64_arg(u64::try_from(value).context("NOTE_VALUE too large")?);
-    host.add_hex_arg(hex::encode(rho));
-    host.add_hex_arg(hex::encode(in_recipient));
-    host.add_hex_arg(hex::encode(spend_sk));
-    host.add_u64_arg(tree_depth as u64);
-
-    // position bits (field elements 0/1 as 32-byte BE)
-    for lvl in 0..depth_usize {
-        let bit = ((position >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        host.add_hex_arg(hex::encode(bit_bytes));
-    }
-
-    for sibling in &siblings {
-        host.add_hex_arg(hex::encode(sibling));
-    }
-
-    host.add_str_arg(format!("0x{}", hex::encode(anchor)));
-    host.add_str_arg(format!("0x{}", hex::encode(nf)));
-    host.add_u64_arg(0); // withdraw_amount = 0
-    host.add_u64_arg(n_out as u64);
-
-    // Output 1
-    host.add_u64_arg(u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?);
-    host.add_hex_arg(hex::encode(out1_rho));
-    host.add_hex_arg(hex::encode(out1_pk));
-    host.add_hex_arg(hex::encode(cm_out1));
-
-    // Output 2
-    host.add_u64_arg(u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?);
-    host.add_hex_arg(hex::encode(out2_rho));
-    host.add_hex_arg(hex::encode(out2_pk));
-    host.add_hex_arg(hex::encode(cm_out2));
-
+    let mut public_output = public_output;
+    public_output.blacklist_root = blacklist_root;
     host.set_public_output(&public_output)?;
 
     println!("Generating proof...");

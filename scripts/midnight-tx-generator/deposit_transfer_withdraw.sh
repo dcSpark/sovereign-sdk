@@ -326,6 +326,7 @@ OUT1_DOMAIN=$(cat "$OUT1_DETAILS_FILE" | jq -r '.domain')
 OUT1_VALUE=$(cat "$OUT1_DETAILS_FILE" | jq -r '.amount')
 OUT1_RHO=$(cat "$OUT1_DETAILS_FILE" | jq -r '.rho')
 OUT1_SPEND_SK=$(cat "$OUT1_DETAILS_FILE" | jq -r '.spend_sk')
+OUT1_SENDER_ID=$(cat "$OUT1_DETAILS_FILE" | jq -r '.sender_id // empty')
 
 # Create withdrawal generator
 
@@ -335,6 +336,9 @@ SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compilin
 
 # Set environment and generate withdrawal
 export OUT1_DOMAIN OUT1_VALUE OUT1_RHO OUT1_SPEND_SK
+if [ -n "$OUT1_SENDER_ID" ] && [ "$OUT1_SENDER_ID" != "null" ]; then
+  export OUT1_SENDER_ID
+fi
 export OUT1_POSITION TRANSFER_ROOT
 export WITHDRAW_AMOUNT RECIPIENT
 export NONCE=$WITHDRAW_NONCE

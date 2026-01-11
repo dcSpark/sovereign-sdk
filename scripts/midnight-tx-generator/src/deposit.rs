@@ -5,7 +5,10 @@
 use anyhow::{Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use midnight_privacy::{nf_key_from_sk, note_commitment, recipient_from_sk, CallMessage, Hash32};
+use midnight_privacy::{
+    nf_key_from_sk, note_commitment, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    CallMessage, Hash32, PrivacyAddress,
+};
 use rand;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -59,17 +62,22 @@ fn main() -> Result<()> {
     let domain: Hash32 = [1u8; 32]; // Keep domain consistent
     let rho: Hash32 = rand::random(); // Random rho = unique nullifier
     let spend_sk: Hash32 = rand::random(); // Secret spend key (note owner)
-    let recipient: Hash32 = recipient_from_sk(&domain, &spend_sk);
+    let pk_spend: Hash32 = pk_from_sk(&spend_sk);
+    let pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &spend_sk);
+    let privacy_address = PrivacyAddress::from_keys(&pk_spend, &pk_ivk);
+    let recipient: Hash32 = recipient_from_pk_v2(&domain, &pk_spend, &pk_ivk);
     let nf_key: Hash32 = nf_key_from_sk(&domain, &spend_sk);
 
     println!("Note parameters (for later withdrawal):");
     println!("  Domain: 0x{}", hex::encode(&domain[..8]));
     println!("  Rho: 0x{}", hex::encode(&rho[..8]));
     println!("  Spend SK: 0x{}", hex::encode(&spend_sk[..8]));
+    println!("  Privacy address: {}", privacy_address);
     println!("  Recipient: 0x{}", hex::encode(&recipient[..8]));
 
-    // Compute note commitment
-    let cm = note_commitment(&domain, amount, &rho, &recipient);
+    // Compute note commitment (NOTE_V2; sender_id = recipient for deposit-created notes).
+    let amount_u64 = u64::try_from(amount).context("DEPOSIT_AMOUNT too large")?;
+    let cm = note_commitment(&domain, amount_u64, &rho, &recipient, &recipient);
     println!("  Commitment: 0x{}\n", hex::encode(cm));
 
     // Save note details for later spending (transfer/withdraw).
@@ -77,6 +85,10 @@ fn main() -> Result<()> {
         "domain": hex::encode(domain),
         "amount": amount,
         "rho": hex::encode(rho),
+        "sender_id": hex::encode(recipient), // deposit-created notes use sender_id = recipient
+        "privacy_address": privacy_address.to_string(),
+        "pk_spend": hex::encode(pk_spend),
+        "pk_ivk": hex::encode(pk_ivk),
         "recipient": hex::encode(recipient),
         "commitment": hex::encode(cm),
         "spend_sk": hex::encode(spend_sk),
