@@ -35,6 +35,8 @@ tags:
     description: Note commitment queries
   - name: roots
     description: Anchor root queries
+  - name: blacklist
+    description: Deny-map (freeze/blacklist) queries
   - name: stats
     description: Module statistics
 
@@ -184,6 +186,64 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StatsResponse'
+
+  /modules/midnight-privacy/blacklist/root:
+    get:
+      tags:
+        - blacklist
+      summary: Get current deny-map root
+      description: |
+        Returns the current sparse Merkle deny-map root (`blacklist_root`) that the deposit/spend
+        circuits bind to as a public input.
+      operationId: getBlacklistRoot
+      responses:
+        '200':
+          description: Blacklist root retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlacklistRootResponse'
+
+  /modules/midnight-privacy/blacklist/opening/{privacy_address}:
+    get:
+      tags:
+        - blacklist
+      summary: Get deny-map Merkle opening for an address
+      description: |
+        Returns the current deny-map root and the Merkle sibling path (bottom-up) for the given
+        privacy address. Clients use this data to build proofs that the address is not blacklisted
+        (leaf=0) under the current root.
+      operationId: getBlacklistOpening
+      parameters:
+        - name: privacy_address
+          in: path
+          required: true
+          description: Privacy pool address (bech32m, e.g. privpool1...)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Blacklist opening retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BlacklistOpeningResponse'
+
+  /modules/midnight-privacy/blacklist/admins:
+    get:
+      tags:
+        - blacklist
+      summary: List pool admins
+      description: |
+        Returns the list of pool admin addresses allowed to update the deny-map root.
+      operationId: listPoolAdmins
+      responses:
+        '200':
+          description: Pool admins retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolAdminsResponse'
 
 components:
   schemas:
@@ -371,6 +431,102 @@ components:
         pool_balance: 7000
         nullifiers_spent: 7
 
+    BlacklistRootResponse:
+      type: object
+      required:
+        - blacklist_root
+      properties:
+        blacklist_root:
+          type: array
+          description: Current deny-map root (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+      example:
+        blacklist_root: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+	    BlacklistOpeningResponse:
+	      type: object
+	      required:
+	        - blacklist_root
+	        - privacy_address
+	        - recipient
+	        - pos
+	        - is_blacklisted
+	        - bucket_entries
+	        - siblings
+	      properties:
+	        blacklist_root:
+	          type: array
+	          description: Current deny-map root (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+        privacy_address:
+          type: string
+          description: Privacy pool address (bech32m)
+        recipient:
+          type: array
+          description: Internal recipient identifier used as deny-map key (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+	        pos:
+	          type: integer
+	          format: uint64
+	          description: Leaf position derived from the recipient (low bits)
+	        is_blacklisted:
+	          type: boolean
+	          description: Whether the recipient appears in the bucket at pos
+	        bucket_entries:
+	          type: array
+	          description: Bucket entries at pos, length == BLACKLIST_BUCKET_SIZE
+	          minItems: 12
+	          maxItems: 12
+	          items:
+	            type: array
+	            items:
+	              type: integer
+	              format: uint8
+	            minItems: 32
+	            maxItems: 32
+	        siblings:
+	          type: array
+	          description: Merkle siblings (bottom-up), length == BLACKLIST_TREE_DEPTH
+	          items:
+            type: array
+            items:
+              type: integer
+              format: uint8
+            minItems: 32
+            maxItems: 32
+
+    PoolAdminsResponse:
+      type: object
+      required:
+        - admins
+        - count
+      properties:
+        admins:
+          type: array
+          description: Pool admin addresses
+          items:
+            type: string
+        count:
+          type: integer
+          format: uint64
+          description: Total number of pool admins
+      example:
+        admins:
+          - sov1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6j5kqz
+        count: 1
+
     Error:
       type: object
       required:
@@ -392,4 +548,3 @@ components:
         message: Invalid hex string
         details:
           error: "Hex decoding failed"
-

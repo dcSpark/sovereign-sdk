@@ -1,6 +1,11 @@
 //! Defines REST queries exposed by the MidnightPrivacy module, along with the relevant types.
 
-use crate::hash::{Hash32, NullifierKey};
+use crate::hash::{
+    blacklist_pos_from_recipient, recipient_from_pk_v2, sparse_default_nodes, BlacklistNodeKey,
+    empty_blacklist_bucket_entries, Hash32, NullifierKey, BLACKLIST_BUCKET_SIZE,
+    BLACKLIST_TREE_DEPTH,
+};
+use crate::types::PrivacyAddress;
 use crate::ValueMidnightPrivacy;
 use axum::routing::get;
 use sov_modules_api::prelude::utoipa::openapi::OpenApi;
@@ -129,6 +134,41 @@ pub struct StatsResponse {
     pub pool_balance: u128,
     /// Number of spent nullifiers (notes that have been consumed)
     pub nullifiers_spent: u64,
+}
+
+/// Response for the current deny-map (blacklist) root.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct BlacklistRootResponse {
+    /// Current deny-map Merkle root used by the ZK circuits.
+    pub blacklist_root: Hash32,
+}
+
+/// Response for listing all pool admins.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct PoolAdminsResponse {
+    /// Pool admin addresses (bech32 string form).
+    pub admins: Vec<String>,
+    /// Total count.
+    pub count: u64,
+}
+
+/// Response for a deny-map (blacklist) Merkle opening for a given privacy address.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct BlacklistOpeningResponse {
+    /// Current deny-map Merkle root used by the ZK circuits.
+    pub blacklist_root: Hash32,
+    /// Privacy address this opening corresponds to.
+    pub privacy_address: PrivacyAddress,
+    /// Internal recipient identifier used as deny-map key.
+    pub recipient: Hash32,
+    /// Leaf position derived from `recipient` (low `BLACKLIST_TREE_DEPTH` bits).
+    pub pos: u64,
+    /// Whether this recipient is currently blacklisted under the bucket.
+    pub is_blacklisted: bool,
+    /// Fixed-size bucket entries at `pos` (private inputs to the spend circuit).
+    pub bucket_entries: [Hash32; BLACKLIST_BUCKET_SIZE],
+    /// Sibling nodes (bottom-up), length == `BLACKLIST_TREE_DEPTH`.
+    pub siblings: Vec<Hash32>,
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -269,6 +309,108 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         .into())
     }
 
+    /// Get current deny-map (blacklist) root.
+    async fn route_blacklist_root(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+    ) -> ApiResult<BlacklistRootResponse> {
+        let blacklist_root = state
+            .blacklist_root
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_else(crate::default_blacklist_root);
+
+        Ok(BlacklistRootResponse { blacklist_root }.into())
+    }
+
+    /// List pool admins.
+    async fn route_pool_admins(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+    ) -> ApiResult<PoolAdminsResponse> {
+        let admins = state
+            .pool_admin_list
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_default();
+        let admins: Vec<String> = admins.into_iter().map(|a| a.to_string()).collect();
+
+        Ok(PoolAdminsResponse {
+            count: admins.len() as u64,
+            admins,
+        }
+        .into())
+    }
+
+    /// Get a deny-map (blacklist) Merkle opening for a given privacy address.
+    ///
+    /// Clients can use the returned `blacklist_root` (public) and `siblings` (private) to build
+    /// spend proofs that demonstrate the address is *not* blacklisted (leaf=0) under the current
+    /// root.
+    async fn route_blacklist_opening(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+        Path(addr_str): Path<String>,
+    ) -> ApiResult<BlacklistOpeningResponse> {
+        let privacy_address: PrivacyAddress = addr_str
+            .parse::<PrivacyAddress>()
+            .map_err(|e| errors::bad_request_400("Invalid privacy address", e))?;
+
+        let domain = state
+            .domain
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .ok_or_else(|| errors::not_found_404("Domain", "domain"))?;
+
+        let recipient = recipient_from_pk_v2(
+            &domain,
+            &privacy_address.to_pk(),
+            &privacy_address.pk_ivk(),
+        );
+        let pos = blacklist_pos_from_recipient(&recipient);
+
+        let blacklist_root = state
+            .blacklist_root
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_else(crate::default_blacklist_root);
+
+        let bucket_entries = state
+            .blacklist_buckets
+            .get(&pos, &mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_else(empty_blacklist_bucket_entries);
+        let is_blacklisted = bucket_entries.iter().any(|e| e == &recipient);
+
+        let defaults = sparse_default_nodes(BLACKLIST_TREE_DEPTH);
+        let depth = BLACKLIST_TREE_DEPTH as usize;
+        let mut siblings: Vec<Hash32> = Vec::with_capacity(depth);
+        for height in 0..depth {
+            let sib_idx = (pos >> height) ^ 1;
+            let key = BlacklistNodeKey {
+                height: height as u8,
+                index: sib_idx,
+            };
+            let sib = state
+                .blacklist_nodes
+                .get(&key, &mut accessor)
+                .unwrap_infallible()
+                .unwrap_or(defaults[height]);
+            siblings.push(sib);
+        }
+
+        Ok(BlacklistOpeningResponse {
+            blacklist_root,
+            privacy_address,
+            recipient,
+            pos,
+            is_blacklisted,
+            bucket_entries,
+            siblings,
+        }
+        .into())
+    }
+
     /// Get module statistics
     async fn route_stats(
         state: ApiState<S, Self>,
@@ -350,6 +492,13 @@ impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
             .route("/notes", get(Self::route_list_notes))
             // Recent roots (anchor window)
             .route("/roots/recent", get(Self::route_recent_roots))
+            // Deny-map (blacklist) queries
+            .route("/blacklist/root", get(Self::route_blacklist_root))
+            .route("/blacklist/admins", get(Self::route_pool_admins))
+            .route(
+                "/blacklist/opening/:privacy_address",
+                get(Self::route_blacklist_opening),
+            )
             // Statistics
             .route("/stats", get(Self::route_stats))
             .with_state(state.with(self.clone()))

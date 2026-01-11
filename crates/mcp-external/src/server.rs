@@ -21,6 +21,7 @@ use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_modules_api::Spec;
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
@@ -285,6 +286,59 @@ pub struct TransferResult {
     /// Recipient of change note - your privacy address (if partial transfer)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_recipient: Option<String>,
+}
+
+// Types for Pool Admin / Freeze (deny-map)
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FreezeAddressRequest {
+    /// Privacy address to freeze (bech32m format: privpool1...)
+    #[serde(rename = "privacyAddress")]
+    pub privacy_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct FreezeAddressResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct UnfreezeAddressRequest {
+    /// Privacy address to unfreeze (bech32m format: privpool1...)
+    #[serde(rename = "privacyAddress")]
+    pub privacy_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct UnfreezeAddressResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AddPoolAdminRequest {
+    /// L2 address to grant pool-admin rights to
+    #[serde(rename = "adminAddress")]
+    pub admin_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct AddPoolAdminResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RemovePoolAdminRequest {
+    /// L2 address to revoke pool-admin rights from
+    #[serde(rename = "adminAddress")]
+    pub admin_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct RemovePoolAdminResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
 }
 
 /// Decrypted note information from a transaction
@@ -1582,6 +1636,164 @@ impl CryptoServer {
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Freeze a privacy address (pool admin only).
+    #[tool(
+        name = "freezeAddress",
+        description = "Freeze (blacklist) a privacy pool address (privpool1...). Requires the caller to be a pool admin for the midnight-privacy module."
+    )]
+    async fn freeze_address(
+        &self,
+        Parameters(params): Parameters<FreezeAddressRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::PrivacyAddress;
+
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
+        })?;
+
+        let res = crate::operations::freeze_address(provider, &*ctx, addr)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&FreezeAddressResult { tx_hash: res.tx_hash })
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Unfreeze a privacy address (pool admin only).
+    #[tool(
+        name = "unfreezeAddress",
+        description = "Unfreeze (un-blacklist) a privacy pool address (privpool1...). Requires the caller to be a pool admin for the midnight-privacy module."
+    )]
+    async fn unfreeze_address(
+        &self,
+        Parameters(params): Parameters<UnfreezeAddressRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::PrivacyAddress;
+
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
+        })?;
+
+        let res = crate::operations::unfreeze_address(provider, &*ctx, addr)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json =
+            serde_json::to_string_pretty(&UnfreezeAddressResult { tx_hash: res.tx_hash })
+                .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Add a pool admin (module admin only).
+    #[tool(
+        name = "addPoolAdmin",
+        description = "Grant pool-admin rights to an L2 address (module admin only). Pool admins can freeze/unfreeze privacy addresses."
+    )]
+    async fn add_pool_admin(
+        &self,
+        Parameters(params): Parameters<AddPoolAdminRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
+        })?;
+
+        let res = crate::operations::add_pool_admin(provider, &*ctx, admin)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&AddPoolAdminResult { tx_hash: res.tx_hash })
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Remove a pool admin (module admin only).
+    #[tool(
+        name = "removePoolAdmin",
+        description = "Revoke pool-admin rights from an L2 address (module admin only)."
+    )]
+    async fn remove_pool_admin(
+        &self,
+        Parameters(params): Parameters<RemovePoolAdminRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
+        })?;
+
+        let res = crate::operations::remove_pool_admin(provider, &*ctx, admin)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json =
+            serde_json::to_string_pretty(&RemovePoolAdminResult { tx_hash: res.tx_hash })
+                .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }

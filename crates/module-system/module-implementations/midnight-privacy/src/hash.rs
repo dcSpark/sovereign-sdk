@@ -17,6 +17,57 @@ use serde::{Deserialize, Serialize};
 /// 32-byte hash output.
 pub type Hash32 = [u8; 32];
 
+/// Key for a node in the deny-map ("blacklist") Merkle tree used by the ZK circuits.
+///
+/// The current circuit design uses a **bucketed deny-map**:
+/// - The tree has fixed depth `BLACKLIST_TREE_DEPTH`.
+/// - Each leaf is the Poseidon2 hash of a fixed-size bucket of blacklisted IDs
+///   (see `BLACKLIST_BUCKET_SIZE` and `bl_bucket_leaf`).
+///
+/// Height 0 is a leaf. Height `BLACKLIST_TREE_DEPTH` is the root.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct BlacklistNodeKey {
+    /// Node height (0 = leaf).
+    pub height: u8,
+    /// Node index at this height.
+    pub index: u64,
+}
+
+impl fmt::Display for BlacklistNodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, self.index)
+    }
+}
+
+impl FromStr for BlacklistNodeKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_index".to_string());
+        }
+        let height = parts[0]
+            .parse::<u8>()
+            .map_err(|e| format!("Failed to parse height: {e}"))?;
+        let index = parts[1]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse index: {e}"))?;
+        Ok(BlacklistNodeKey { height, index })
+    }
+}
+
 /// Wrapper around Hash32 that implements Display and FromStr for use in StateMap
 #[derive(
     Debug,
@@ -481,6 +532,144 @@ pub fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -
         idx >>= 1;
     }
     cur
+}
+
+/// Depth of the deny-map Merkle tree used by the ZK circuits.
+///
+/// The circuits derive the bucket position from the low `BLACKLIST_TREE_DEPTH` bits of the
+/// 32-byte recipient (LSB-first from the last byte).
+pub const BLACKLIST_TREE_DEPTH: u8 = 16;
+
+/// Number of entries in each deny-map bucket leaf.
+///
+/// Matches the guest program constant `BL_BUCKET_SIZE`.
+pub const BLACKLIST_BUCKET_SIZE: usize = 12;
+
+const BL_BUCKET_TAG: &[u8; 12] = b"BL_BUCKET_V1";
+
+/// Fixed-size bucket entries array stored per deny-map leaf.
+pub type BlacklistBucketEntries = [Hash32; BLACKLIST_BUCKET_SIZE];
+
+/// Return the canonical "empty bucket" entries array (all zeros).
+#[inline]
+pub fn empty_blacklist_bucket_entries() -> BlacklistBucketEntries {
+    [[0u8; 32]; BLACKLIST_BUCKET_SIZE]
+}
+
+/// Compute the bucket leaf hash: H("BL_BUCKET_V1" || entries[0] || ... || entries[11]).
+///
+/// This matches the guest's `bl_bucket_leaf_fr` construction (Poseidon2 over bytes).
+pub fn bl_bucket_leaf(entries: &BlacklistBucketEntries) -> Hash32 {
+    // 12(tag) + 32*12(entries) = 396 bytes
+    let mut buf = [0u8; 12 + 32 * BLACKLIST_BUCKET_SIZE];
+    buf[..12].copy_from_slice(BL_BUCKET_TAG);
+    for (i, e) in entries.iter().enumerate() {
+        let start = 12 + 32 * i;
+        buf[start..start + 32].copy_from_slice(e);
+    }
+    ligetron_hash_bytes(&buf).to_bytes_be()
+}
+
+/// Compute the leaf position (index) used by the deny-map tree from a 32-byte recipient.
+///
+/// Matches the guest program's derivation:
+/// - Take the low `BLACKLIST_TREE_DEPTH` bits of the recipient bytes
+/// - Bits are LSB-first starting from the last byte
+pub fn blacklist_pos_from_recipient(recipient: &Hash32) -> u64 {
+    let mut pos: u64 = 0;
+    let depth = BLACKLIST_TREE_DEPTH as usize;
+    let mut i = 0usize;
+    while i < depth {
+        let byte = recipient[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        pos |= (bit as u64) << i;
+        i += 1;
+    }
+    pos
+}
+
+/// Compute the default nodes for a sparse Merkle tree of the given depth.
+///
+/// Returns a vector of length `depth + 1` where:
+/// - `out[0]` is the default leaf (height 0)
+/// - `out[h]` is the default node at height `h`
+pub fn sparse_default_nodes(depth: u8) -> Vec<Hash32> {
+    let mut out: Vec<Hash32> = Vec::with_capacity(depth as usize + 1);
+    let leaf0 = bl_bucket_leaf(&empty_blacklist_bucket_entries());
+    out.push(leaf0);
+    for lvl in 0..depth {
+        let prev = out[lvl as usize];
+        out.push(mt_combine(lvl, &prev, &prev));
+    }
+    out
+}
+
+/// Compute the all-zero sparse Merkle root for a given depth.
+///
+/// Leaf default is `0x00..00` and internal nodes are computed with `mt_combine(level, left, right)`.
+pub fn sparse_default_root(depth: u8) -> Hash32 {
+    let mut cur = bl_bucket_leaf(&empty_blacklist_bucket_entries());
+    for lvl in 0..depth {
+        cur = mt_combine(lvl, &cur, &cur);
+    }
+    cur
+}
+
+/// Compute the default (all-allowed) deny-map root expected by the ZK circuits.
+#[inline]
+pub fn default_blacklist_root() -> Hash32 {
+    sparse_default_root(BLACKLIST_TREE_DEPTH)
+}
+
+/// Compute the `inv_enforce` witness used by the `note_spend_guest` v2 circuit.
+///
+/// This value is computed off-chain by the prover and passed as a private input. It must match
+/// the guest's computation exactly.
+pub fn inv_enforce_v2(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Hash32 {
+    use ligetron::bn254fr_native::submod_checked;
+    use ligetron::Bn254Fr;
+
+    fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
+        let mut out = Bn254Fr::new();
+        out.set_bytes_big(h);
+        out
+    }
+
+    let mut enforce_prod = Bn254Fr::from_u32(1);
+
+    for v in in_values {
+        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
+    }
+    for v in out_values {
+        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
+    }
+
+    let mut delta = Bn254Fr::new();
+    for out_rho in out_rhos {
+        let out_fr = bn254fr_from_hash32_be(out_rho);
+        for in_rho in in_rhos {
+            let in_fr = bn254fr_from_hash32_be(in_rho);
+            submod_checked(&mut delta, &out_fr, &in_fr);
+            enforce_prod.mulmod_checked(&delta);
+        }
+    }
+
+    // When there are exactly two output rhos, include their mutual difference once more.
+    if out_rhos.len() == 2 {
+        let a = bn254fr_from_hash32_be(&out_rhos[0]);
+        let b = bn254fr_from_hash32_be(&out_rhos[1]);
+        submod_checked(&mut delta, &a, &b);
+        enforce_prod.mulmod_checked(&delta);
+    }
+
+    let mut inv = enforce_prod.clone();
+    inv.inverse();
+    inv.to_bytes_be()
 }
 
 // (tests live in `tests/ivk_crypto_tests.rs`)

@@ -548,10 +548,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/midnight-privacy/flush", post(flush_pending_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
-        // Remove default 2MB body limit and allow larger payloads (Midnight Ligero proofs are ~8MB,
-        // and transactions are submitted base64-encoded, which adds ~33% overhead).
+        // Remove default 2MB body limit and allow larger payloads.
+        // Note: Midnight Ligero proof packages can be tens of MB, and transactions are submitted
+        // base64-encoded (adds ~33% overhead).
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
@@ -1720,6 +1721,34 @@ pub fn create_transaction_without_proof(tx: &DemoTransaction) -> Result<String, 
                     serde_json::json!({
                         "update_method_id": {
                             "new_method_id": hex::encode(new_method_id)
+                        }
+                    })
+                }
+                MidnightCallMessage::FreezeAddress { address } => {
+                    serde_json::json!({
+                        "freeze_address": {
+                            "address": address.to_string()
+                        }
+                    })
+                }
+                MidnightCallMessage::UnfreezeAddress { address } => {
+                    serde_json::json!({
+                        "unfreeze_address": {
+                            "address": address.to_string()
+                        }
+                    })
+                }
+                MidnightCallMessage::AddPoolAdmin { admin } => {
+                    serde_json::json!({
+                        "add_pool_admin": {
+                            "admin": admin.to_string()
+                        }
+                    })
+                }
+                MidnightCallMessage::RemovePoolAdmin { admin } => {
+                    serde_json::json!({
+                        "remove_pool_admin": {
+                            "admin": admin.to_string()
                         }
                     })
                 }

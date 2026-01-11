@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 pub enum LigeroProgramArguments {
     STR { str: String },
     I64 { i64: i64 },
+    /// Backwards/forwards compatible byte argument: carries both `hex` and `bytes_b64`.
+    ///
+    /// - New binaries will prefer `bytes_b64` and pass raw bytes to the guest.
+    /// - Older binaries will ignore `bytes_b64` and fall back to `hex`.
+    HexBytesB64 { hex: String, bytes_b64: String },
+    /// Base64-encoded raw bytes argument.
+    BytesB64 { bytes_b64: String },
     HEX { hex: String },
 }
 
@@ -142,6 +149,8 @@ impl Ligero {
 
         let mut runner = LigeroRunner::new_with_paths(&program.to_string_lossy(), paths);
         runner.config_mut().packing = packing;
+        // Default to raw proofs (no gzip) to avoid compression overhead during proving.
+        runner.config_mut().gzip_proof = false;
         runner.config_mut().gpu_threads = gpu_threads;
         runner.config_mut().private_indices =
             private_indices.into_iter().map(|v| v as usize).collect();
@@ -150,6 +159,12 @@ impl Ligero {
             .map(|a| match a {
                 LigeroProgramArguments::STR { str } => ligero_runner::LigeroArg::String { str },
                 LigeroProgramArguments::I64 { i64 } => ligero_runner::LigeroArg::I64 { i64 },
+                LigeroProgramArguments::HexBytesB64 { hex, bytes_b64 } => {
+                    ligero_runner::LigeroArg::HexBytesB64 { hex, bytes_b64 }
+                }
+                LigeroProgramArguments::BytesB64 { bytes_b64 } => {
+                    ligero_runner::LigeroArg::BytesB64 { bytes_b64 }
+                }
                 LigeroProgramArguments::HEX { hex } => ligero_runner::LigeroArg::Hex { hex },
             })
             .collect();

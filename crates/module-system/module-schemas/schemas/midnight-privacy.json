@@ -258,6 +258,110 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "description": "Freeze a privacy address (pool admin only).\n\nThis sets the corresponding deny-map leaf to `1` and updates the on-chain `blacklist_root`.",
+      "type": "object",
+      "required": [
+        "freeze_address"
+      ],
+      "properties": {
+        "freeze_address": {
+          "type": "object",
+          "required": [
+            "address"
+          ],
+          "properties": {
+            "address": {
+              "description": "Privacy pool address (bech32m) to freeze.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PrivacyAddress"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Unfreeze a privacy address (pool admin only).\n\nThis sets the corresponding deny-map leaf back to `0` and updates the on-chain `blacklist_root`.",
+      "type": "object",
+      "required": [
+        "unfreeze_address"
+      ],
+      "properties": {
+        "unfreeze_address": {
+          "type": "object",
+          "required": [
+            "address"
+          ],
+          "properties": {
+            "address": {
+              "description": "Privacy pool address (bech32m) to unfreeze.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PrivacyAddress"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Add a pool admin (module admin only).",
+      "type": "object",
+      "required": [
+        "add_pool_admin"
+      ],
+      "properties": {
+        "add_pool_admin": {
+          "type": "object",
+          "required": [
+            "admin"
+          ],
+          "properties": {
+            "admin": {
+              "description": "Address to grant pool-admin rights.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Address"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Remove a pool admin (module admin only).",
+      "type": "object",
+      "required": [
+        "remove_pool_admin"
+      ],
+      "properties": {
+        "remove_pool_admin": {
+          "type": "object",
+          "required": [
+            "admin"
+          ],
+          "properties": {
+            "admin": {
+              "description": "Address to revoke pool-admin rights.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Address"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
     }
   ],
   "definitions": {
@@ -309,6 +413,10 @@
       },
       "maxItems": 2,
       "minItems": 2
+    },
+    "PrivacyAddress": {
+      "type": "string",
+      "pattern": "^privpool1[a-z0-9]+$"
     },
     "SafeVec_12000000_of_uint8": {
       "type": "array",

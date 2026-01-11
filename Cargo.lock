@@ -6712,9 +6712,10 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=cbd3db933044006fea2706727be4b657b8a6b269#cbd3db933044006fea2706727be4b657b8a6b269"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bincode",
  "hex",
  "ligetron",
@@ -6729,7 +6730,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=cbd3db933044006fea2706727be4b657b8a6b269#cbd3db933044006fea2706727be4b657b8a6b269"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -7172,6 +7173,29 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "midnight-fvk-service"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "clap",
+ "dotenvy",
+ "hex",
+ "k256",
+ "midnight-privacy",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha3",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
