@@ -111,6 +111,7 @@ fn main() -> Result<()> {
         .context("Invalid OUT1_VALUE")?;
     let rho: Hash32 = decode_hash32_env("OUT1_RHO")?;
     let spend_sk: Hash32 = decode_hash32_env("OUT1_SPEND_SK")?;
+    let spend_pk: Hash32 = pk_from_sk(&spend_sk);
     let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")
         .with_context(|| "Missing env var WITHDRAW_AMOUNT")?
         .parse()
