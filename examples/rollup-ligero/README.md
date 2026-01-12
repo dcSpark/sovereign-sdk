@@ -92,6 +92,47 @@ export SOV_PROVER_MODE=prove
 ./target/release/sov-rollup-ligero
 ```
 
+## Service Orchestration
+
+### Run All Services Locally
+
+Start the rollup, verifier, indexer, and MCP in order:
+
+```bash
+cd examples/rollup-ligero
+./run_all.sh
+```
+
+Arguments are forwarded to `run_rollup.sh`:
+
+```bash
+./run_all.sh -- --stop-at-rollup-height 1300
+```
+
+### Service Controller API
+
+The controller runs the same `run_all.sh` flow and provides HTTP endpoints to start/stop:
+
+```bash
+cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release
+```
+
+```bash
+curl -X POST http://127.0.0.1:9090/start
+curl -X POST http://127.0.0.1:9090/stop
+curl -X POST http://127.0.0.1:9090/restart
+curl -X POST http://127.0.0.1:9090/clean
+```
+
+Notes:
+- Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
+- `/clean` removes `demo_data` and only runs when services are stopped
+
+### Linux Services
+
+Systemd unit templates live in `examples/rollup-ligero/services`, including:
+- `rollup-ligero-service-controller.service`
+
 ## Configuration
 
 The rollup configuration is in `rollup_config.toml`. Key settings:
@@ -218,4 +259,3 @@ Sovereign Permissionless Commercial License
 - [Sovereign SDK](https://github.com/Sovereign-Labs/sovereign-sdk)
 - [Ligero Prover](https://github.com/ligeroinc/ligero-prover)
 - [Emscripten](https://emscripten.org/)
-
