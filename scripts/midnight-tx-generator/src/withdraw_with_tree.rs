@@ -51,7 +51,9 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
     // Compute the note commitment
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    let value_u64 = u64::try_from(value).map_err(|_| anyhow::anyhow!("NOTE_VALUE too large"))?;
+    let sender_id = recipient;
+    let cm = note_commitment(&domain, value_u64, &rho, &recipient, &sender_id);
     let nf = nullifier(&domain, &nf_key, &rho);
 
     // Build a Merkle tree with the note at the actual position
@@ -71,9 +73,11 @@ fn main() -> Result<()> {
     println!("Nullifier: 0x{}", hex::encode(&nf[..8]));
 
     let change_value = value - withdraw_amount;
+    let change_value_u64 = u64::try_from(change_value)
+        .map_err(|_| anyhow::anyhow!("Change value too large"))?;
     let out_rho: Hash32 = rand::thread_rng().gen();
     let out_recipient: Hash32 = rand::thread_rng().gen();
-    let cm_out = note_commitment(&domain, change_value, &out_rho, &out_recipient);
+    let cm_out = note_commitment(&domain, change_value_u64, &out_rho, &out_recipient, &sender_id);
 
     let public_output = SpendPublic {
         anchor_root: anchor,
@@ -99,7 +103,7 @@ fn main() -> Result<()> {
 
     // Typed binary ABI for zkVM performance
     host.add_hex_arg(hex::encode(domain));
-    host.add_u64_arg(u64::try_from(value).map_err(|_| anyhow::anyhow!("NOTE_VALUE too large"))?);
+    host.add_u64_arg(value_u64);
     host.add_hex_arg(hex::encode(rho));
     host.add_hex_arg(hex::encode(recipient));
     host.add_hex_arg(hex::encode(nf_key));
@@ -116,9 +120,7 @@ fn main() -> Result<()> {
         u64::try_from(withdraw_amount).map_err(|_| anyhow::anyhow!("WITHDRAW_AMOUNT too large"))?,
     );
     host.add_u64_arg(1);
-    host.add_u64_arg(
-        u64::try_from(change_value).map_err(|_| anyhow::anyhow!("Change value too large"))?,
-    );
+    host.add_u64_arg(change_value_u64);
     host.add_hex_arg(hex::encode(out_rho));
     host.add_hex_arg(hex::encode(out_recipient));
     host.add_hex_arg(hex::encode(cm_out));

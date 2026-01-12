@@ -3,8 +3,17 @@ use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
-    CallMessage, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk,
+    note_commitment,
+    nullifier,
+    pk_from_sk,
+    pk_ivk_from_sk,
+    recipient_from_pk_v2,
+    recipient_from_sk_v2,
+    CallMessage,
+    Hash32,
+    MerkleTree,
+    SpendPublic,
 };
 use rand::Rng;
 use serde_json;
@@ -99,6 +108,7 @@ fn main() -> Result<()> {
         .context("Invalid OUT1_VALUE")?;
     let rho: Hash32 = decode_hash32_env("OUT1_RHO")?;
     let spend_sk: Hash32 = decode_hash32_env("OUT1_SPEND_SK")?;
+    let spend_pk: Hash32 = pk_from_sk(&spend_sk);
     let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")
         .with_context(|| "Missing env var WITHDRAW_AMOUNT")?
         .parse()
@@ -118,8 +128,13 @@ fn main() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    let in_recipient = recipient_from_sk(&domain, &spend_sk);
-    let cm = note_commitment(&domain, value, &rho, &in_recipient);
+    let value_u64: u64 = value
+        .try_into()
+        .context("OUT1_VALUE must fit into u64 (note circuit limit)")?;
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let in_recipient = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id = in_recipient;
+    let cm = note_commitment(&domain, value_u64, &rho, &in_recipient, &sender_id);
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
@@ -180,8 +195,18 @@ fn main() -> Result<()> {
         let change_rho: Hash32 = rand::thread_rng().gen();
         // Keep change owned by the same spend key.
         let change_pk: Hash32 = pk_from_sk(&spend_sk);
-        let change_recipient: Hash32 = recipient_from_pk(&domain, &change_pk);
-        let cm_change = note_commitment(&domain, change_value, &change_rho, &change_recipient);
+        let change_value_u64: u64 = change_value
+            .try_into()
+            .context("Change value must fit into u64 (note circuit limit)")?;
+        let change_pk_ivk = pk_ivk_owner;
+        let change_recipient = recipient_from_pk_v2(&domain, &change_pk, &change_pk_ivk);
+        let cm_change = note_commitment(
+            &domain,
+            change_value_u64,
+            &change_rho,
+            &change_recipient,
+            &sender_id,
+        );
         (1usize, Some(cm_change), Some(change_rho), Some(change_pk))
     } else {
         (0usize, None, None, None)

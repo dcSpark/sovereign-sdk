@@ -5460,7 +5460,7 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#d66e428f7048e13e798bb834e02e3e1d0096bfc5"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
 dependencies = [
  "anyhow",
  "bincode",
@@ -5477,7 +5477,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?branch=feature%2Fligero-runner#d66e428f7048e13e798bb834e02e3e1d0096bfc5"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -5698,6 +5698,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -12565,6 +12566,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
 ]
 
 [[package]]

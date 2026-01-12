@@ -3,8 +3,17 @@ use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk, recipient_from_sk,
-    CallMessage, Hash32, MerkleTree, SpendPublic,
+    nf_key_from_sk,
+    note_commitment,
+    nullifier,
+    pk_from_sk,
+    pk_ivk_from_sk,
+    recipient_from_pk_v2,
+    recipient_from_sk_v2,
+    CallMessage,
+    Hash32,
+    MerkleTree,
+    SpendPublic,
 };
 use rand::Rng;
 use serde_json;
@@ -117,8 +126,13 @@ fn main() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid anchor"))?;
 
-    let in_recipient = recipient_from_sk(&domain, &spend_sk);
-    let cm = note_commitment(&domain, value, &rho, &in_recipient);
+    let value_u64: u64 = value
+        .try_into()
+        .context("NOTE_VALUE must fit into u64 (note circuit limit)")?;
+    let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+    let in_recipient = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let sender_id = in_recipient;
+    let cm = note_commitment(&domain, value_u64, &rho, &in_recipient, &sender_id);
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
     let nf = nullifier(&domain, &nf_key, &rho);
 
@@ -166,17 +180,25 @@ fn main() -> Result<()> {
     println!("Input nullifier: 0x{}", hex::encode(&nf[..8]));
 
     // Create 2 output notes (pure shielded transfer, withdraw_amount = 0)
+    let out1_value_u64: u64 = out1_value
+        .try_into()
+        .context("TRANSFER_OUT1 must fit into u64 (note circuit limit)")?;
     let out1_rho: Hash32 = rand::thread_rng().gen();
     let out1_spend_sk: Hash32 = rand::thread_rng().gen();
     let out1_pk: Hash32 = pk_from_sk(&out1_spend_sk);
-    let out1_recipient: Hash32 = recipient_from_pk(&domain, &out1_pk);
-    let cm_out1 = note_commitment(&domain, out1_value, &out1_rho, &out1_recipient);
+    let out1_pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &out1_spend_sk);
+    let out1_recipient: Hash32 = recipient_from_pk_v2(&domain, &out1_pk, &out1_pk_ivk);
+    let cm_out1 = note_commitment(&domain, out1_value_u64, &out1_rho, &out1_recipient, &sender_id);
 
     let out2_rho: Hash32 = rand::thread_rng().gen();
     let out2_spend_sk: Hash32 = rand::thread_rng().gen();
     let out2_pk: Hash32 = pk_from_sk(&out2_spend_sk);
-    let out2_recipient: Hash32 = recipient_from_pk(&domain, &out2_pk);
-    let cm_out2 = note_commitment(&domain, out2_value, &out2_rho, &out2_recipient);
+    let out2_value_u64: u64 = out2_value
+        .try_into()
+        .context("TRANSFER_OUT2 must fit into u64 (note circuit limit)")?;
+    let out2_pk_ivk: Hash32 = pk_ivk_from_sk(&domain, &out2_spend_sk);
+    let out2_recipient: Hash32 = recipient_from_pk_v2(&domain, &out2_pk, &out2_pk_ivk);
+    let cm_out2 = note_commitment(&domain, out2_value_u64, &out2_rho, &out2_recipient, &sender_id);
 
     // Save first output details for withdrawal step
     let out1_details = serde_json::json!({
