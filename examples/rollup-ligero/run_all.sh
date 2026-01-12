@@ -111,7 +111,7 @@ if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
 fi
 
 echo "Starting rollup..."
-start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" "${ROLLUP_ARGS[@]}"
+start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "${PIDS[0]}"
 
 echo "Starting verifier..."
