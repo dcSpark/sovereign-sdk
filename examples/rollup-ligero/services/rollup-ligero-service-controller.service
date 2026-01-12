@@ -1,0 +1,15 @@
+[Unit]
+Description=Sovereign SDK Ligero Service Controller
+After=network.target
+
+[Service]
+Type=simple
+User=replace_for_linux_user
+WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero
+ExecStart=/usr/bin/env cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release
+Restart=on-failure
+Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+#Environment="SERVICE_CONTROLLER_BIND=127.0.0.1:9090"
+
+[Install]
+WantedBy=multi-user.target
