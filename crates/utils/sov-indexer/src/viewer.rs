@@ -102,6 +102,7 @@ impl VfkRegistry {
     }
 
     /// Check if a commitment exists in the registry
+    #[allow(unused)]
     pub fn contains(&self, commitment_hex: &str) -> bool {
         self.by_commitment.contains_key(commitment_hex)
     }
@@ -374,6 +375,7 @@ pub fn try_decrypt_notes_with_registry(
 }
 
 /// Backward-compatible function: Try to decrypt with a single VFK
+#[allow(unused)]
 pub fn try_decrypt_notes_json(
     vfk: &Hash32,
     encrypted_notes_json: Option<&serde_json::Value>,

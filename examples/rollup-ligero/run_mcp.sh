@@ -43,4 +43,4 @@ if [[ -n "${LIGERO_SHADER_PATH:-}" && ! -d "$LIGERO_SHADER_PATH" ]]; then
 fi
 
 cd "$WORKSPACE_ROOT"
-exec cargo run -p mcp-external
+exec cargo run -p mcp-external --release

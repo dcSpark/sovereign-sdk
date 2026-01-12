@@ -447,20 +447,20 @@ components:
       example:
         blacklist_root: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
-	    BlacklistOpeningResponse:
-	      type: object
-	      required:
-	        - blacklist_root
-	        - privacy_address
-	        - recipient
-	        - pos
-	        - is_blacklisted
-	        - bucket_entries
-	        - siblings
-	      properties:
-	        blacklist_root:
-	          type: array
-	          description: Current deny-map root (32 bytes)
+    BlacklistOpeningResponse:
+      type: object
+      required:
+        - blacklist_root
+        - privacy_address
+        - recipient
+        - pos
+        - is_blacklisted
+        - bucket_entries
+        - siblings
+      properties:
+        blacklist_root:
+          type: array
+          description: Current deny-map root (32 bytes)
           items:
             type: integer
             format: uint8
@@ -477,29 +477,29 @@ components:
             format: uint8
           minItems: 32
           maxItems: 32
-	        pos:
-	          type: integer
-	          format: uint64
-	          description: Leaf position derived from the recipient (low bits)
-	        is_blacklisted:
-	          type: boolean
-	          description: Whether the recipient appears in the bucket at pos
-	        bucket_entries:
-	          type: array
-	          description: Bucket entries at pos, length == BLACKLIST_BUCKET_SIZE
-	          minItems: 12
-	          maxItems: 12
-	          items:
-	            type: array
-	            items:
-	              type: integer
-	              format: uint8
-	            minItems: 32
-	            maxItems: 32
-	        siblings:
-	          type: array
-	          description: Merkle siblings (bottom-up), length == BLACKLIST_TREE_DEPTH
-	          items:
+        pos:
+          type: integer
+          format: uint64
+          description: Leaf position derived from the recipient (low bits)
+        is_blacklisted:
+          type: boolean
+          description: Whether the recipient appears in the bucket at pos
+        bucket_entries:
+          type: array
+          description: Bucket entries at pos, length == BLACKLIST_BUCKET_SIZE
+          minItems: 12
+          maxItems: 12
+          items:
+            type: array
+            items:
+              type: integer
+              format: uint8
+            minItems: 32
+            maxItems: 32
+        siblings:
+          type: array
+          description: Merkle siblings (bottom-up), length == BLACKLIST_TREE_DEPTH
+          items:
             type: array
             items:
               type: integer

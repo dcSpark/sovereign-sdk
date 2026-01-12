@@ -58,6 +58,16 @@ fi
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="$REPO_ROOT/target"
+fi
+BUILD_PROFILE="${BUILD_PROFILE:-debug}"
+BIN_DIR="$CARGO_TARGET_DIR/$BUILD_PROFILE"
+CARGO_BUILD_FLAGS=()
+if [ "$BUILD_PROFILE" = "release" ]; then
+  CARGO_BUILD_FLAGS+=(--release)
+fi
+
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-1000}"
@@ -73,9 +83,9 @@ BASE_NONCE=$(date +%s)
 NODE_API_URL="${NODE_API_URL:-http://localhost:12346}"
 export NODE_API_URL
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 
 if [ -n "$LATEST_ON_NODE" ]; then
   # next usable nonce
@@ -113,10 +123,10 @@ echo "  Worker:    $VERIFIER_ENDPOINT"
 echo ""
 
 # Build generators if needed
-if [ ! -f "$GENERATOR_DIR/target/debug/midnight-deposit-generator" ]; then
+if [ ! -f "$BIN_DIR/midnight-deposit-generator" ]; then
     echo -e "${YELLOW}Building generators...${NC}"
     cd "$GENERATOR_DIR"
-    SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator 2>&1 | grep -E "Compiling|Finished" || true
+    SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin midnight-deposit-generator 2>&1 | grep -E "Compiling|Finished" || true
     cd "$REPO_ROOT"
     echo ""
 fi
@@ -125,7 +135,7 @@ fi
 if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
   echo -e "${YELLOW}Step 0: Funding sender with $FUND_AMOUNT tokens${NC}"
   cd "$GENERATOR_DIR"
-  SKIP_GUEST_BUILD=1 cargo build --bin fund 2>&1 | grep -E "Compiling|Finished" || true
+  SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fund 2>&1 | grep -E "Compiling|Finished" || true
   cd "$REPO_ROOT"
   FUND_NONCE=""
   if [ -f "$NONCE_STATE_FILE" ]; then
@@ -141,7 +151,7 @@ if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
     FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
     NONCE_STATE_FILE="$NONCE_STATE_FILE" \
     ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
-    "$GENERATOR_DIR/target/debug/fund"
+    "$BIN_DIR/fund"
   echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"
 fi
 
@@ -151,7 +161,7 @@ fi
 echo -e "${YELLOW}━━━ Step 1: Deposit ($DEPOSIT_AMOUNT tokens) ━━━${NC}"
 export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
+"$BIN_DIR/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
 
 # Send deposit to verifier service (it forwards to sequencer)
@@ -218,7 +228,7 @@ echo ""
 echo -e "${YELLOW}━━━ Step 2: Transfer (split $DEPOSIT_AMOUNT → $TRANSFER_OUT1 + $TRANSFER_OUT2) ━━━${NC}"
 
 # Re-fetch latest nonce from node to avoid stale generation
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 if [ -n "$LATEST_ON_NODE" ]; then
   TRANSFER_NONCE=$((LATEST_ON_NODE + 1))
 else
@@ -233,7 +243,9 @@ NOTE_RHO=$(cat "$NOTE_DETAILS_FILE" | jq -r '.rho')
 NOTE_SPEND_SK=$(cat "$NOTE_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Build transfer generator
-SKIP_GUEST_BUILD=1 cargo build --bin transfer-generator 2>&1 | grep -E "Compiling|Finished" || true
+cd "$GENERATOR_DIR"
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin transfer-generator 2>&1 | grep -E "Compiling|Finished" || true
+cd "$REPO_ROOT"
 
 # Set environment and generate transfer
 export NOTE_DOMAIN NOTE_VALUE NOTE_RHO NOTE_SPEND_SK
@@ -246,7 +258,7 @@ export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
 
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/transfer-generator" 2>&1 | tee /tmp/transfer.log
+"$BIN_DIR/transfer-generator" 2>&1 | tee /tmp/transfer.log
 cd "$REPO_ROOT"
 
 # Send transfer to verifier service (it forwards to sequencer)
@@ -313,7 +325,7 @@ echo ""
 echo -e "${YELLOW}━━━ Step 3: Withdraw ($WITHDRAW_AMOUNT from Note@pos$OUT1_POSITION) ━━━${NC}"
 
 # Re-fetch latest nonce from node before withdraw
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 if [ -n "$LATEST_ON_NODE" ]; then
   WITHDRAW_NONCE=$((LATEST_ON_NODE + 1))
 else
@@ -329,10 +341,9 @@ OUT1_SPEND_SK=$(cat "$OUT1_DETAILS_FILE" | jq -r '.spend_sk')
 OUT1_SENDER_ID=$(cat "$OUT1_DETAILS_FILE" | jq -r '.sender_id // empty')
 
 # Create withdrawal generator
-
-# Replace placeholder with actual repo root path
-
-SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+cd "$GENERATOR_DIR"
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+cd "$REPO_ROOT"
 
 # Set environment and generate withdrawal
 export OUT1_DOMAIN OUT1_VALUE OUT1_RHO OUT1_SPEND_SK
@@ -348,7 +359,7 @@ export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
 
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
+"$BIN_DIR/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
 # Send withdrawal to verifier service (it forwards to sequencer)

@@ -58,6 +58,16 @@ fi
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="$REPO_ROOT/target"
+fi
+BUILD_PROFILE="${BUILD_PROFILE:-debug}"
+BIN_DIR="$CARGO_TARGET_DIR/$BUILD_PROFILE"
+CARGO_BUILD_FLAGS=()
+if [ "$BUILD_PROFILE" = "release" ]; then
+  CARGO_BUILD_FLAGS+=(--release)
+fi
+
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
 NONCE_STATE_FILE="$GENERATOR_DIR/.last_nonce"
 BASE_NONCE=$(date +%s)
@@ -65,9 +75,9 @@ BASE_NONCE=$(date +%s)
 # Try to fetch latest from node for this key
 NODE_API_URL="${NODE_API_URL:-http://localhost:12346}"
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 
 if [ -n "$LATEST_ON_NODE" ]; then
   # next usable nonce
@@ -108,7 +118,7 @@ echo ""
 # Build generators if needed
 echo -e "${YELLOW}Building generators...${NC}"
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin midnight-deposit-generator --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 echo ""
 
@@ -116,7 +126,7 @@ echo ""
 if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
   echo -e "${YELLOW}Step 0: Funding sender with $FUND_AMOUNT tokens${NC}"
   cd "$GENERATOR_DIR"
-  SKIP_GUEST_BUILD=1 cargo build --bin fund 2>&1 | grep -E "Compiling|Finished" || true
+  SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fund 2>&1 | grep -E "Compiling|Finished" || true
   cd "$REPO_ROOT"
   FUND_NONCE=""
   if [ -f "$NONCE_STATE_FILE" ]; then
@@ -131,7 +141,7 @@ if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
     FUND_AMOUNT="$FUND_AMOUNT" \
     FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
     ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
-    "$GENERATOR_DIR/target/debug/fund"
+    "$BIN_DIR/fund"
   echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"
 fi
 
@@ -139,7 +149,7 @@ fi
 echo -e "${YELLOW}Step 1: Deposit${NC}"
 export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
+"$BIN_DIR/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
 
 # Send deposit to proof verifier (which forwards to sequencer)
@@ -209,7 +219,7 @@ echo ""
 echo -e "${YELLOW}Step 2: Withdraw${NC}"
 
 # Increment nonce for withdrawal (prefer node latest + 1)
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "${NODE_API_URL:-http://localhost:12346}" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "${NODE_API_URL:-http://localhost:12346}" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 if [ -n "$LATEST_ON_NODE" ]; then
   WITHDRAW_NONCE=$((LATEST_ON_NODE + 1))
 else
@@ -225,7 +235,7 @@ NOTE_SPEND_SK=$(cat "$NOTE_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Build the withdrawal generator if needed and run it
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 
 # Set environment and generate withdrawal using withdraw_generator.rs (same as transfer flow)
@@ -246,7 +256,7 @@ export NODE_API_URL
 export WITHDRAW_AMOUNT RECIPIENT
 
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
+"$BIN_DIR/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
 # Send withdrawal to proof verifier (which forwards to sequencer)

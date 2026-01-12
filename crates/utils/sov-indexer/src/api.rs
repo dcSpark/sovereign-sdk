@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get},
     Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;

@@ -147,7 +147,7 @@ fn test_parse_midnight_withdraw_call_roundtrips() {
 #[test]
 fn test_verify_midnight_transaction_signature_accepts_valid() {
     let tx = sample_midnight_withdraw_transaction(5);
-    verify_midnight_transaction_signature(&tx).expect("signature valid");
+    verify_midnight_transaction_signature(&tx, &ROLLUP_CHAIN_HASH).expect("signature valid");
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn test_verify_midnight_transaction_signature_rejects_tampered() {
         *withdraw_amount += 1;
     }
 
-    match verify_midnight_transaction_signature(&tx) {
+    match verify_midnight_transaction_signature(&tx, &ROLLUP_CHAIN_HASH) {
         Err(ServiceError::SignatureError(_)) => {}
         other => panic!("expected signature error, got {other:?}"),
     }
@@ -394,7 +394,8 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
 
     // Step 4: SIGNATURE VERIFICATION (key test!)
     println!("\n✓ Step 4: Testing signature verification");
-    verify_midnight_transaction_signature(&tx).expect("Signature should be valid");
+    verify_midnight_transaction_signature(&tx, &ROLLUP_CHAIN_HASH)
+        .expect("Signature should be valid");
     println!("  ✓ Signature verified successfully!");
 
     // Step 5: Parse the transaction (extract proof, anchor_root, nullifier, etc.)
