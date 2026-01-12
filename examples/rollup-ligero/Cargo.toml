@@ -46,7 +46,7 @@ borsh = { workspace = true, features = ["bytes", "derive"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-axum = { workspace = true, default-features = false }
+axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }
 jsonrpsee = { workspace = true, features = [
   "http-client",
   "server",
@@ -64,6 +64,8 @@ base64 = { workspace = true }
 hex = { workspace = true, optional = true }
 tokio = { workspace = true, features = [
   "rt-multi-thread",
+  "net",
+  "process",
   "sync",
   "time",
   "macros",
@@ -167,3 +169,7 @@ path = "src/bin/generate_authority_fvk.rs"
 [[bin]]
 name = "decrypt-authority-notes"
 path = "src/bin/decrypt_authority_notes.rs"
+
+[[bin]]
+name = "rollup-ligero-service-controller"
+path = "src/bin/rollup_ligero_service_controller.rs"
