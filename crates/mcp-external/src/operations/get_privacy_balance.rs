@@ -32,13 +32,21 @@ pub struct PrivacyBalanceResult {
     pub total_transactions_scanned: usize,
 }
 
-/// Get the privacy pool balance for the user
+/// Get the privacy pool balance for the user.
+///
+/// Uses the indexer `wallets/:address` endpoint for the privacy address and
+/// decrypts notes to compute the spendable balance.
 pub async fn get_privacy_balance(
     provider: &Provider,
     privacy_key: &PrivacyKey,
     viewing_key: &FullViewingKey,
 ) -> Result<PrivacyBalanceResult> {
-    tracing::info!("Starting privacy pool balance calculation");
+    let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
+
+    tracing::info!(
+        "Starting privacy pool balance calculation for address {}",
+        privacy_address
+    );
 
     // Derive user's recipient and nf_key from privacy key
     let user_recipient = privacy_key.recipient(&DOMAIN);
@@ -79,17 +87,29 @@ pub async fn get_privacy_balance(
         }
     };
 
-    let mut offset = 0;
+    let mut cursor: Option<String> = None;
     loop {
-        tracing::debug!("Fetching transactions at offset {}", offset);
+        tracing::debug!(
+            "Fetching transactions for privacy address {} (cursor: {:?})",
+            privacy_address,
+            cursor
+        );
 
         let tx_list = provider
-            .get_all_transactions(Some(DEFAULT_PAGE_SIZE), Some(offset))
+            .get_wallet_transactions(
+                &privacy_address,
+                Some(DEFAULT_PAGE_SIZE),
+                cursor.as_deref(),
+                None,
+            )
             .await
             .context("Failed to fetch transactions from indexer")?;
 
         if tx_list.items.is_empty() {
-            tracing::info!("Reached end of transactions at offset {}", offset);
+            tracing::info!(
+                "Reached end of transactions for privacy address {}",
+                privacy_address
+            );
             break;
         }
 
@@ -191,10 +211,18 @@ pub async fn get_privacy_balance(
             }
         }
 
-        offset += tx_list.items.len();
-
-        if tx_list.items.len() < DEFAULT_PAGE_SIZE {
-            break;
+        match tx_list.next {
+            Some(next) => {
+                if Some(&next) == cursor.as_ref() {
+                    tracing::warn!(
+                        "Indexer cursor did not advance for privacy address {}; stopping pagination",
+                        privacy_address
+                    );
+                    break;
+                }
+                cursor = Some(next);
+            }
+            None => break,
         }
     }
 

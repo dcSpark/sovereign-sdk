@@ -1,17 +1,17 @@
+use anyhow::Result;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::{DateTime, Utc};
+use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{Condition, DatabaseConnection, JsonValue, QueryOrder, QuerySelect, Schema, Set};
+use serde::{Deserialize, Serialize};
+use sov_midnight_da::storable::worker_verified_transactions;
+
 use crate::background_sync::{
     parse_kind_amount_roots, parse_withdraw_attestations, parse_withdraw_recipient,
 };
 use crate::index_db as idx;
-use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine as _;
-use chrono::{DateTime, Utc};
-use sea_orm::{
-    entity::prelude::*, sea_query::OnConflict, Condition, DatabaseConnection, JsonValue,
-    QueryOrder, QuerySelect, Schema, Set,
-};
-use serde::{Deserialize, Serialize};
-use sov_midnight_da::storable::worker_verified_transactions;
 
 pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     let builder = idx_db.get_database_backend();
@@ -135,23 +135,19 @@ pub async fn get_last_processed_id(idx_db: &DatabaseConnection) -> Result<Option
 }
 
 pub async fn set_last_processed_id(idx_db: &DatabaseConnection, id: i32) -> Result<()> {
-    let _ = idx::index_meta::Entity::insert(idx::index_meta::ActiveModel {
+    idx::index_meta::Entity::insert(idx::index_meta::ActiveModel {
         key: Set("last_id".to_string()),
         value: Set(id.to_string()),
     })
     .on_conflict(
         OnConflict::column(idx::index_meta::Column::Key)
-            .do_nothing()
+            .update_column(idx::index_meta::Column::Value)
             .to_owned(),
     )
     .exec(idx_db)
-    .await?;
-    let _ = idx::index_meta::Entity::update(idx::index_meta::ActiveModel {
-        key: Set("last_id".to_string()),
-        value: Set(id.to_string()),
-    })
-    .exec(idx_db)
-    .await;
+    .await
+    .inspect_err(|e| tracing::warn!(error = %e, id = id, "failed to upsert last_processed_id"))?;
+
     Ok(())
 }
 
@@ -277,33 +273,58 @@ pub async fn list_wallet_txs_sync(
     cursor: Option<CursorInner>,
     type_filter: Option<String>,
 ) -> Result<ListResponse> {
+    use tracing::{debug, info, trace};
+
     let mut collected: Vec<InvolvementItem> = Vec::new();
+    info!(
+        "Starting list_wallet_txs_sync for address {}, limit {}, cursor {:?}, type_filter {:?}",
+        address, limit, cursor, type_filter
+    );
 
     // Deposits by sender
+    debug!("Fetching midnight_deposit records for sender={}", address);
     let deps = idx::midnight_deposit::Entity::find()
         .filter(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
         .all(db)
         .await?;
+    debug!("Got {} midnight_deposit records", deps.len());
+
     for md in deps {
+        trace!("Processing deposit event_id {}", md.event_id);
         let Some(ev) = idx::Entity::find_by_id(md.event_id).one(db).await? else {
+            trace!("Deposit event id {} not found in idx::Entity", md.event_id);
             continue;
         };
         if let Some(ref cur) = cursor {
             if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                trace!(
+                    "Deposit {} not after cursor (ts={}, tx_hash={}), skipping",
+                    ev.tx_hash,
+                    ev.created_at.timestamp_millis(),
+                    ev.tx_hash
+                );
                 continue;
             }
         }
         if let Some(ref t) = type_filter {
             if t != "deposit" {
+                trace!(
+                    "Deposit {} filtered out by type (expected deposit, got {})",
+                    ev.tx_hash, t
+                );
                 continue;
             }
         }
+        debug!(
+            "Adding deposit involvement item for tx_hash={} event_id={}",
+            ev.tx_hash, md.event_id
+        );
         collected.push(InvolvementItem {
             tx_hash: ev.tx_hash.clone(),
             timestamp_ms: ev.created_at.timestamp_millis(),
             kind: ev.kind.clone(),
             sender: md.sender.clone(),
-            recipient: None,
+            recipient: md.recipient.clone(),
             amount: md.amount.clone(),
             anchor_root: None,
             nullifier: None,
@@ -317,6 +338,10 @@ pub async fn list_wallet_txs_sync(
     }
 
     // Withdrawals by sender or recipient
+    debug!(
+        "Fetching midnight_withdraw records for sender or recipient={}",
+        address
+    );
     let wds = idx::midnight_withdraw::Entity::find()
         .filter(
             Condition::any()
@@ -325,20 +350,37 @@ pub async fn list_wallet_txs_sync(
         )
         .all(db)
         .await?;
+    debug!("Got {} midnight_withdraw records", wds.len());
     for mw in wds {
+        trace!("Processing withdraw event_id {}", mw.event_id);
         let Some(ev) = idx::Entity::find_by_id(mw.event_id).one(db).await? else {
+            trace!("Withdraw event id {} not found in idx::Entity", mw.event_id);
             continue;
         };
         if let Some(ref cur) = cursor {
             if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                trace!(
+                    "Withdraw {} not after cursor (ts={}, tx_hash={}), skipping",
+                    ev.tx_hash,
+                    ev.created_at.timestamp_millis(),
+                    ev.tx_hash
+                );
                 continue;
             }
         }
         if let Some(ref t) = type_filter {
             if t != "withdraw" {
+                trace!(
+                    "Withdraw {} filtered out by type (expected withdraw, got {})",
+                    ev.tx_hash, t
+                );
                 continue;
             }
         }
+        debug!(
+            "Adding withdraw involvement item for tx_hash={} event_id={}",
+            ev.tx_hash, mw.event_id
+        );
         collected.push(InvolvementItem {
             tx_hash: ev.tx_hash.clone(),
             timestamp_ms: ev.created_at.timestamp_millis(),
@@ -358,6 +400,10 @@ pub async fn list_wallet_txs_sync(
     }
 
     // Transfers by sender or recipient
+    debug!(
+        "Fetching midnight_transfer records for sender or recipient={}",
+        address
+    );
     let tfs = idx::midnight_transfer::Entity::find()
         .filter(
             Condition::any()
@@ -366,20 +412,37 @@ pub async fn list_wallet_txs_sync(
         )
         .all(db)
         .await?;
+    debug!("Got {} midnight_transfer records", tfs.len());
     for mt in tfs {
+        trace!("Processing transfer event_id {}", mt.event_id);
         let Some(ev) = idx::Entity::find_by_id(mt.event_id).one(db).await? else {
+            trace!("Transfer event id {} not found in idx::Entity", mt.event_id);
             continue;
         };
         if let Some(ref cur) = cursor {
             if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                trace!(
+                    "Transfer {} not after cursor (ts={}, tx_hash={}), skipping",
+                    ev.tx_hash,
+                    ev.created_at.timestamp_millis(),
+                    ev.tx_hash
+                );
                 continue;
             }
         }
         if let Some(ref t) = type_filter {
             if t != "transfer" {
+                trace!(
+                    "Transfer {} filtered out by type (expected transfer, got {})",
+                    ev.tx_hash, t
+                );
                 continue;
             }
         }
+        debug!(
+            "Adding transfer involvement item for tx_hash={} event_id={}",
+            ev.tx_hash, mt.event_id
+        );
         collected.push(InvolvementItem {
             tx_hash: ev.tx_hash.clone(),
             timestamp_ms: ev.created_at.timestamp_millis(),
@@ -398,6 +461,10 @@ pub async fn list_wallet_txs_sync(
         });
     }
 
+    debug!(
+        "Sorting and truncating {} collected records",
+        collected.len()
+    );
     collected.sort_by(|a, b| {
         b.timestamp_ms
             .cmp(&a.timestamp_ms)
@@ -414,6 +481,11 @@ pub async fn list_wallet_txs_sync(
             .unwrap(),
         )
     });
+    info!(
+        "Finished list_wallet_txs_sync: returning {} items, next cursor {:?}",
+        collected.len(),
+        next
+    );
     Ok(ListResponse {
         items: collected,
         next,
@@ -619,6 +691,7 @@ pub async fn list_txs(
                     .await?
                 {
                     sender = md.sender;
+                    recipient = md.recipient;
                     amount = md.amount;
                     view_fvks = md.view_fvks;
                     encrypted_notes = md.encrypted_notes;
@@ -766,6 +839,7 @@ pub async fn get_tx(
                 .await?
             {
                 sender = md.sender;
+                recipient = md.recipient;
                 amount = md.amount;
                 view_fvks = md.view_fvks;
                 encrypted_notes = md.encrypted_notes;

@@ -241,6 +241,18 @@ async fn add_vfk(
 
     tracing::info!("Added VFK with commitment {}", &commitment_hex[..16]);
 
+    if state.mode == Mode::Sync {
+        let db = state.db.clone();
+        let vfk_registry = state.vfk_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::background_sync::backfill_decrypted_recipients(&db, &vfk_registry).await
+            {
+                tracing::warn!("VFK backfill failed: {}", e);
+            }
+        });
+    }
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({

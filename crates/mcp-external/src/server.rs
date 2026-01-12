@@ -81,12 +81,6 @@ pub struct GetWalletAddressResult {
     pub address: String,
 }
 
-// Types for GetWalletBalance
-
-/// Default gas token ID
-pub const DEFAULT_TOKEN_ID: &str =
-    "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
-
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetWalletBalanceRequest {}
 
@@ -624,16 +618,14 @@ impl CryptoServer {
                 return;
             }
 
-            let unified = match crate::operations::get_unified_balance(
+            let privacy_result = match crate::operations::get_privacy_balance(
                 &provider,
-                &*ctx_guard,
-                DEFAULT_TOKEN_ID,
                 &*privacy_guard,
                 &viewing_key,
             )
             .await
             {
-                Ok(u) => u,
+                Ok(result) => result,
                 Err(e) => {
                     let _ = tx_store
                         .mark_failed(
@@ -646,7 +638,7 @@ impl CryptoServer {
                 }
             };
 
-            if unified.unspent_notes.is_empty() {
+            if privacy_result.unspent_notes.is_empty() {
                 let _ = tx_store
                     .mark_failed(
                         &id,
@@ -667,7 +659,7 @@ impl CryptoServer {
                 let mut smallest_sufficient = None;
                 let mut smallest_sufficient_value = u128::MAX;
 
-                for n in &unified.unspent_notes {
+                for n in &privacy_result.unspent_notes {
                     if n.value == send_amount {
                         // Perfect match found
                         exact_match = Some(n);
@@ -683,7 +675,7 @@ impl CryptoServer {
                     Some(n) => n,
                     None => {
                         let total_balance: u128 =
-                            unified.unspent_notes.iter().map(|n| n.value).sum();
+                            privacy_result.unspent_notes.iter().map(|n| n.value).sum();
                         let _ = tx_store
                             .mark_failed(
                                 &id,
@@ -691,7 +683,7 @@ impl CryptoServer {
                                     "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
                                     send_amount,
                                     total_balance,
-                                    unified.unspent_notes.len()
+                                    privacy_result.unspent_notes.len()
                                 ),
                                 current_timestamp_ms(),
                             )
@@ -879,7 +871,7 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let _wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Wallet context not configured. Please set WALLET_PATH environment variable.",
                 None,
@@ -898,13 +890,10 @@ impl CryptoServer {
 
         let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
 
-        let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        let unified_result = crate::operations::get_unified_balance(
+        let privacy_result = crate::operations::get_privacy_balance(
             provider,
-            &*ctx,
-            DEFAULT_TOKEN_ID,
             &*privacy_key_guard,
             &viewing_key,
         )
@@ -912,7 +901,7 @@ impl CryptoServer {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = GetWalletBalanceResult {
-            balance: unified_result.privacy_balance,
+            balance: privacy_result.balance.to_string(),
             pending_balance: "0".to_string(),
         };
 
@@ -1286,6 +1275,23 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        provider
+            .register_vfk(&authority_vfk_hex, Some(&privacy_address))
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Failed to register authority VFK with indexer: {}", e),
+                    None,
+                )
+            })?;
+
         // Replace the privacy keys (but not the wallet context)
         let mut authority_vfk_guard = self.authority_vfk.write().await;
         *authority_vfk_guard = Some(new_authority_vfk);
@@ -1464,17 +1470,15 @@ impl CryptoServer {
             let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
 
             // Get privacy balance
-            let unified_result = crate::operations::get_unified_balance(
+            let privacy_result = crate::operations::get_privacy_balance(
                 provider,
-                &*ctx,
-                DEFAULT_TOKEN_ID,
                 &*privacy_key_guard,
                 &viewing_key,
             )
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-            unified_result.privacy_balance.parse::<u128>().unwrap_or(0)
+            privacy_result.balance
         } else {
             // No viewing key configured, default to 0
             0

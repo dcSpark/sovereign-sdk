@@ -4,5 +4,5 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
 export RUST_LOG="${RUST_LOG:-info}"
 export DA_CONNECTION_STRING="sqlite://demo_data/da.sqlite?mode=rwc"
-
+export MODE="sync"
 cargo run -p sov-indexer --release

@@ -135,7 +135,8 @@ The API validates:
 curl -X DELETE http://localhost:13100/vfks/<fvk_commitment>
 ```
 
-Changes take effect immediately - new transactions will be decrypted using the updated registry.
+Changes take effect immediately - new transactions will be decrypted using the updated registry,
+and existing indexed deposits/transfers with missing recipients are backfilled from encrypted notes.
 The registry uses DashMap for lock-free concurrent access during indexing.
 
 Notes
@@ -143,4 +144,3 @@ Notes
 - The index DB schema is created automatically on first run.
 - VFK decryption only works in `sync` mode (local index database).
 - VFKs from config files are persisted to the database for reuse across restarts.
-

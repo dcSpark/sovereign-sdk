@@ -1,8 +1,11 @@
-use anyhow::{anyhow, Context};
-use sea_orm::Database;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use sea_orm::{ConnectOptions, Database};
+use tracing::instrument::WithSubscriber;
+use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 mod api;
 mod background_sync;
@@ -34,15 +37,23 @@ async fn main() -> anyhow::Result<()> {
         _ => api::Mode::Direct,
     };
 
-    let da_db = Database::connect(&da_conn)
+    let mut connection_options = ConnectOptions::new(da_conn.clone());
+    connection_options.sqlx_logging(false);
+    let da_db = Database::connect(connection_options)
         .await
         .with_context(|| format!("Failed to connect DB {}", da_conn))?;
-
     let (idx_db, vfk_registry) = if mode == api::Mode::Sync {
-        let idx = Database::connect(&index_db_url)
+        let mut connection_options = ConnectOptions::new(index_db_url.clone());
+        connection_options.sqlx_logging(false);
+        let idx = Database::connect(connection_options)
             .await
             .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
+
+        println!("Initializing index database");
+
         db::init_index_db(&idx).await?;
+
+        println!("index database initialized");
 
         // Load VFK registry for multi-address decryption (uses DashMap for lock-free access)
         let vfk_registry = load_vfk_registry(&idx).await?;
@@ -52,6 +63,19 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = background_sync::backfill_index(&da_db, &idx, &vfk_registry).await {
             warn!(error = %e, "Initial backfill failed; will retry in background loop");
         }
+        let idx_clone = idx.clone();
+        let vfk_registry_clone = vfk_registry.clone();
+        tokio::spawn(async move {
+            println!("Starting VFK backfill");
+            if let Err(e) =
+                background_sync::backfill_decrypted_recipients(&idx_clone, &vfk_registry_clone)
+                    .await
+            {
+                warn!(error = %e, "VFK backfill failed");
+            }
+            println!("Finished VFK backfill");
+        });
+        println!("Initializing background sync loop");
         background_sync::spawn_sync_loop(da_db.clone(), idx.clone(), vfk_registry.clone());
         (idx, vfk_registry)
     } else {

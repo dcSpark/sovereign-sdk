@@ -1,10 +1,14 @@
 use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
+use crate::index_db as idx;
 use crate::viewer::{
     self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, VfkRegistry,
 };
 use anyhow::Result;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
+};
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
 use std::sync::Arc;
@@ -220,6 +224,144 @@ pub fn spawn_sync_loop(
             }
         }
     });
+}
+
+pub async fn backfill_decrypted_recipients(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &VfkRegistry,
+) -> Result<()> {
+    if vfk_registry.is_empty() {
+        return Ok(());
+    }
+
+    let dep_updates = backfill_deposits(idx_db, vfk_registry).await?;
+    let transfer_updates = backfill_transfers(idx_db, vfk_registry).await?;
+
+    if dep_updates > 0 || transfer_updates > 0 {
+        tracing::info!(
+            deposits = dep_updates,
+            transfers = transfer_updates,
+            "Backfilled recipients from encrypted notes"
+        );
+    }
+
+    Ok(())
+}
+
+async fn backfill_deposits(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &VfkRegistry,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_deposit::Entity::find()
+            .filter(idx::midnight_deposit::Column::EncryptedNotes.is_not_null())
+            .filter(
+                Condition::any()
+                    .add(idx::midnight_deposit::Column::Recipient.is_null())
+                    .add(idx::midnight_deposit::Column::DecryptedNotes.is_null()),
+            )
+            .filter(idx::midnight_deposit::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_deposit::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let recipient = if row.recipient.is_none() {
+                extract_recipient_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
+
+            let mut update = idx::midnight_deposit::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            update.decrypted_notes = Set(Some(decrypted_notes));
+            if let Some(recipient) = recipient {
+                update.recipient = Set(Some(recipient));
+            }
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_transfers(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &VfkRegistry,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_transfer::Entity::find()
+            .filter(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+            .filter(
+                Condition::any()
+                    .add(idx::midnight_transfer::Column::Recipient.is_null())
+                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null()),
+            )
+            .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_transfer::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let recipient = if row.recipient.is_none() {
+                extract_recipient_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
+
+            let mut update = idx::midnight_transfer::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            update.decrypted_notes = Set(Some(decrypted_notes));
+            if let Some(recipient) = recipient {
+                update.recipient = Set(Some(recipient));
+            }
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 pub fn parse_kind_amount_roots(

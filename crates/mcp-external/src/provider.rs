@@ -1,7 +1,7 @@
 //! RPC Provider for interacting with the Sovereign rollup
 //!
 //! This module handles all RPC communication with the rollup node, including:
-//! - Chain state queries (nonce, balance)
+//! - Chain state queries (nonce)
 //! - Transaction submission
 //! - Fee estimation
 //! - Block queries
@@ -10,8 +10,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sov_bank::TokenId;
-use sov_modules_api::{Amount, CryptoSpec, Spec};
+use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
 
 /// Chain data from the rollup schema
@@ -155,44 +154,7 @@ impl Provider {
         Ok(chain_data)
     }
 
-    /// Get the balance for a specific address and token
-    pub async fn get_balance<S: Spec>(
-        &self,
-        address: &S::Address,
-        token_id: &TokenId,
-    ) -> Result<Amount> {
-        match self.client.get_balance::<S>(address, token_id, None).await {
-            Ok(amount) => Ok(amount),
-            Err(e) => {
-                // If the error is a reqwest 404, return 0
-                if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
-                    if let Some(status) = reqwest_err.status() {
-                        if status == reqwest::StatusCode::NOT_FOUND {
-                            tracing::warn!(
-                                "Token {} does not exist at address {:?} (HTTP 404); returning 0.",
-                                token_id,
-                                address
-                            );
-                            // Amount implements From<u64>
-                            return Ok(Amount::from(0u64));
-                        }
-                    }
-                }
-                tracing::error!(
-                    "Failed to get balance for token {} at address {:?}: {}",
-                    token_id,
-                    address,
-                    e
-                );
-                Err(anyhow::anyhow!(
-                    "Failed to get balance for token {} at address {:?}: {}",
-                    token_id,
-                    address,
-                    e
-                ))
-            }
-        }
-    }
+    
 
     /// Get the nonce for a public key
     pub async fn get_nonce<S: Spec>(
@@ -493,87 +455,49 @@ impl Provider {
         Ok(tx_list)
     }
 
-    /// Get all transactions from the indexer (global list, not filtered by address)
+    /// Register an authority VFK with the indexer, if supported.
     ///
-    /// This is used for privacy pool balance calculation, where we need to scan all
-    /// transactions to find notes that belong to the user.
-    ///
-    /// # Parameters
-    /// * `limit` - Optional limit on number of transactions per page (default: 100)
-    /// * `offset` - Optional offset for pagination (default: 0)
-    ///
-    /// # Returns
-    /// A list of all transactions from the indexer
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
-    /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
-    /// println!("Found {} transactions", transactions.items.len());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn get_all_transactions(
+    /// This is required for the indexer to decrypt notes for a new privacy address.
+    pub async fn register_vfk(
         &self,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<ListTransactionsResponse> {
-        // Trim trailing slash from indexer_url to avoid double slashes
+        vfk_hex: &str,
+        shielded_address: Option<&str>,
+    ) -> Result<()> {
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/txs", base_url);
+        let url = format!("{}/vfks", base_url);
 
-        // Build query parameters
-        let mut query_params = Vec::new();
-        if let Some(limit) = limit {
-            query_params.push(format!("limit={}", limit));
-        }
-        if let Some(offset) = offset {
-            query_params.push(format!("offset={}", offset));
-        }
-
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params.join("&"));
-        }
-
-        tracing::debug!("Fetching all transactions from indexer: {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Indexer API error at {}: HTTP {} - {}",
-                url,
-                status,
-                if body.is_empty() {
-                    "No error details provided"
-                } else {
-                    &body
-                }
+        let mut payload = serde_json::Map::new();
+        payload.insert("vfk".to_string(), serde_json::Value::String(vfk_hex.to_string()));
+        if let Some(address) = shielded_address {
+            payload.insert(
+                "shielded_address".to_string(),
+                serde_json::Value::String(address.to_string()),
             );
         }
 
-        let tx_list: ListTransactionsResponse = response.json().await.with_context(|| {
-            format!(
-                "Failed to parse transaction list JSON from indexer at {}",
-                url
-            )
-        })?;
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("Failed to register VFK at {}", url))?;
 
-        tracing::debug!(
-            "Fetched {} transactions from indexer (offset: {:?}, limit: {:?})",
-            tx_list.items.len(),
-            offset,
-            limit
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
+            return Ok(());
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Indexer VFK registration failed at {}: HTTP {} - {}",
+            url,
+            status,
+            if body.is_empty() {
+                "No error details provided"
+            } else {
+                &body
+            }
         );
-
-        Ok(tx_list)
     }
 }

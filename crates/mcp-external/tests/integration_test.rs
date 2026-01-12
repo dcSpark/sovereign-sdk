@@ -426,18 +426,13 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     tracing::info!("✓ Wait completed");
 
-    // Step 7: Get initial wallet balance using get_unified_balance
+    // Step 7: Get initial wallet balance using get_privacy_balance
     tracing::info!("Step 7: Getting initial wallet balance");
-    let initial_balance_result = mcp_external::operations::get_unified_balance(
-        &provider,
-        &funding_wallet,
-        mcp_external::server::DEFAULT_TOKEN_ID,
-        &new_privacy_key,
-        &viewing_key,
-    )
-    .await?;
+    let initial_balance_result =
+        mcp_external::operations::get_privacy_balance(&provider, &new_privacy_key, &viewing_key)
+            .await?;
 
-    let initial_balance: u128 = initial_balance_result.privacy_balance.parse()?;
+    let initial_balance: u128 = initial_balance_result.balance;
     tracing::info!("✓ Initial privacy balance: {}", initial_balance);
 
     // Validate initial balance matches deposit
@@ -505,16 +500,11 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 10: Get final wallet balance
     tracing::info!("Step 10: Getting final wallet balance");
-    let final_balance_result = mcp_external::operations::get_unified_balance(
-        &provider,
-        &funding_wallet,
-        mcp_external::server::DEFAULT_TOKEN_ID,
-        &new_privacy_key,
-        &viewing_key,
-    )
-    .await?;
+    let final_balance_result =
+        mcp_external::operations::get_privacy_balance(&provider, &new_privacy_key, &viewing_key)
+            .await?;
 
-    let final_balance: u128 = final_balance_result.privacy_balance.parse()?;
+    let final_balance: u128 = final_balance_result.balance;
     tracing::info!("✓ Final privacy balance: {}", final_balance);
 
     // Step 11: Validate final balance
