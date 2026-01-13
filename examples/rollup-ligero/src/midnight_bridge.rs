@@ -12,7 +12,7 @@ use base64::Engine;
 use borsh::BorshDeserialize;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use full_node_configs::sequencer::SeqConfigExtension;
-use serde::de::DeserializeOwned;
+use hex;
 use serde::{Deserialize, Serialize};
 use sov_bank::{config_gas_token_id, CallMessage as BankCallMessage, Coins, TokenId};
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -27,7 +27,7 @@ use sov_modules_api::runtime::capabilities::authentication::{
 use sov_modules_api::transaction::TxDetails;
 use sov_modules_api::transaction::{PriorityFeeBips, Transaction, UnsignedTransaction};
 use sov_modules_api::FullyBakedTx;
-use sov_modules_api::{Amount, RawTx, Spec};
+use sov_modules_api::{Amount, CredentialId, RawTx, Spec};
 use sov_rollup_interface::TxHash;
 use sov_sequencer::{Sequencer, SequencerNotReadyDetails};
 use tokio::fs;
@@ -173,16 +173,11 @@ where
         }
     }
 
-    async fn fetch_events(
-        &self,
-    ) -> Result<Vec<MidnightBridgeEvent<<BridgeSpec as Spec>::Address>>> {
-        read_event_file(&self.settings.events_path).await
+    async fn fetch_events(&self) -> Result<Vec<Deposit>> {
+        read_deposit_file(&self.settings.events_path).await
     }
 
-    async fn process_events(
-        &mut self,
-        events: Vec<MidnightBridgeEvent<<BridgeSpec as Spec>::Address>>,
-    ) {
+    async fn process_events(&mut self, events: Vec<Deposit>) {
         if events.is_empty() {
             if !self.idle_notice_sent {
                 info!(
@@ -203,54 +198,64 @@ where
 
         debug!(count = events.len(), "Midnight bridge fetched events");
 
-        for event in events {
-            if self.processed_event_ids.contains(&event.id) {
+        for deposit in &events {
+            let event_id = deposit.event_id();
+            if self.processed_event_ids.contains(&event_id) {
                 continue;
             }
 
-            match self.submit_credit(&event).await {
+            match self.submit_credit(&event_id, deposit).await {
                 Ok(()) => {
-                    self.processed_event_ids.insert(event.id.clone());
+                    self.processed_event_ids.insert(event_id);
                 }
                 Err(err) => {
-                    warn!(event_id = %event.id, error = ?err, "Midnight bridge failed to submit credit");
+                    warn!(
+                        event_id = %event_id,
+                        nonce = deposit.nonce,
+                        error = ?err,
+                        "Midnight bridge failed to submit credit",
+                    );
                 }
             }
         }
     }
 
-    async fn submit_credit(
-        &mut self,
-        event: &MidnightBridgeEvent<<BridgeSpec as Spec>::Address>,
-    ) -> Result<()> {
-        let tx = self.build_mint_transaction(event)?;
+    async fn submit_credit(&mut self, event_id: &str, deposit: &Deposit) -> Result<()> {
+        let tx = self.build_mint_transaction(deposit)?;
         let tx_for_debug = tx.clone();
         let tx_hash = self.sequencer.accept_bridge_tx(tx).await.map_err(|err| {
-            self.log_failed_submission(event, &tx_for_debug);
+            self.log_failed_submission(event_id, &tx_for_debug);
             anyhow!("Sequencer rejected Midnight bridge tx: {:?}", err)
         })?;
 
+        let amount = Amount::from(deposit.amount);
+        let recipient_address = deposit.recipient_address();
+        let sender_hex = hex::encode(deposit.sender);
+        let recipient_hex = hex::encode(deposit.recipient);
+        let data_hash_hex = hex::encode(deposit.data_hash);
+
         info!(
-            event_id = %event.id,
+            event_id = %event_id,
             tx_hash = ?tx_hash,
-            amount = ?event.amount,
-            recipient = ?event.recipient,
+            amount = %amount,
+            recipient = ?recipient_address,
+            sender = %sender_hex,
+            nonce = deposit.nonce,
+            gas_limit = deposit.gas_limit,
+            data_hash = %data_hash_hex,
             "Midnight bridge credited rollup funds",
         );
 
         Ok(())
     }
 
-    fn build_mint_transaction(
-        &mut self,
-        event: &MidnightBridgeEvent<<BridgeSpec as Spec>::Address>,
-    ) -> Result<FullyBakedTx> {
+    fn build_mint_transaction(&mut self, deposit: &Deposit) -> Result<FullyBakedTx> {
         let runtime_call = RuntimeCall::<BridgeSpec>::Bank(BankCallMessage::Mint {
             coins: Coins {
-                amount: event.amount,
+                amount: Amount::from(deposit.amount),
                 token_id: self.settings.token_id,
             },
-            mint_to_address: event.recipient.clone(),
+            mint_to_address: deposit.recipient_address(),
         });
 
         let tx_details = TxDetails {
@@ -284,11 +289,7 @@ where
         Ok(BridgeAuthenticator::encode_with_standard_auth(raw_tx))
     }
 
-    fn log_failed_submission(
-        &self,
-        event: &MidnightBridgeEvent<<BridgeSpec as Spec>::Address>,
-        tx: &FullyBakedTx,
-    ) {
+    fn log_failed_submission(&self, event_id: &str, tx: &FullyBakedTx) {
         let tx_bytes = tx.data.len();
         let tx_base64 = BASE64_STANDARD.encode(&tx.data);
         let diagnostics = BridgeTxPayloadDiagnostics::new(tx);
@@ -296,7 +297,7 @@ where
         match (BridgeAuthenticator::decode_serialized_tx(tx), &diagnostics) {
             (Ok(call), Ok(diag)) => {
                 info!(
-                    event_id = %event.id,
+                    event_id = %event_id,
                     tx_bytes,
                     raw_tx_bytes = diag.raw_tx_bytes,
                     raw_tx_hash = %diag.raw_tx_hash,
@@ -308,7 +309,7 @@ where
             }
             (Ok(call), Err(diag_err)) => {
                 info!(
-                    event_id = %event.id,
+                    event_id = %event_id,
                     tx_bytes,
                     tx_base64 = %tx_base64,
                     diagnostics_error = %diag_err,
@@ -318,7 +319,7 @@ where
             }
             (Err(decode_err), Ok(diag)) => {
                 warn!(
-                    event_id = %event.id,
+                    event_id = %event_id,
                     tx_bytes,
                     raw_tx_bytes = diag.raw_tx_bytes,
                     raw_tx_hash = %diag.raw_tx_hash,
@@ -330,7 +331,7 @@ where
             }
             (Err(decode_err), Err(diag_err)) => {
                 warn!(
-                    event_id = %event.id,
+                    event_id = %event_id,
                     tx_bytes,
                     tx_base64 = %tx_base64,
                     diagnostics_error = %diag_err,
@@ -377,20 +378,35 @@ impl BridgeTxPayloadDiagnostics {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(bound(deserialize = "Address: DeserializeOwned"))]
-struct MidnightBridgeEvent<Address> {
-    /// Unique identifier for the event (used for idempotency).
-    pub id: String,
-    /// Amount of tokens to mint (human-readable number in the JSON file).
-    pub amount: Amount,
-    /// Rollup recipient address.
-    pub recipient: Address,
+struct Deposit {
+    #[serde(with = "hex_bytes")]
+    sender: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    recipient: [u8; 32],
+    #[serde(with = "u128_string")]
+    amount: u128,
+    nonce: u64,
+    gas_limit: u64,
+    #[serde(with = "hex_bytes")]
+    data_hash: [u8; 32],
 }
 
-async fn read_event_file<Address>(path: &Path) -> Result<Vec<MidnightBridgeEvent<Address>>>
-where
-    Address: DeserializeOwned,
-{
+impl Deposit {
+    fn event_id(&self) -> String {
+        format!(
+            "midnight-deposit:{}:{}:{}",
+            hex::encode(self.sender),
+            self.nonce,
+            hex::encode(self.data_hash)
+        )
+    }
+
+    fn recipient_address(&self) -> <BridgeSpec as Spec>::Address {
+        <BridgeSpec as Spec>::Address::from(CredentialId::from(self.recipient))
+    }
+}
+
+async fn read_deposit_file(path: &Path) -> Result<Vec<Deposit>> {
     let contents = match fs::read_to_string(path).await {
         Ok(data) => data,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -414,6 +430,57 @@ where
             path.display()
         )
     })
+}
+
+mod hex_bytes {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("0x{}", hex::encode(value)))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+        let trimmed = input.strip_prefix("0x").unwrap_or(&input);
+        let decoded =
+            hex::decode(trimmed).map_err(|err| serde::de::Error::custom(err.to_string()))?;
+        if decoded.len() != 32 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 32-byte hex string, got {} bytes",
+                decoded.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decoded);
+        Ok(arr)
+    }
+}
+
+mod u128_string {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+        input
+            .parse::<u128>()
+            .map_err(|err| serde::de::Error::custom(err.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +519,10 @@ mod tests {
 
             Ok(TxHash::new(hash))
         }
+
+        async fn readiness_status(&self) -> std::result::Result<(), SequencerNotReadyDetails> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -459,22 +530,27 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let events_path = temp_dir.path().join("bridge_events.json");
 
-        let recipient = PrivateKeyAndAddress::<BridgeSpec>::generate().address;
-        let events = vec![
-            MidnightBridgeEvent {
-                id: "evt-1".to_string(),
-                amount: Amount::from(25u64),
-                recipient: recipient.clone(),
+        let deposits = vec![
+            Deposit {
+                sender: [0u8; 32],
+                recipient: [1u8; 32],
+                amount: 25u128,
+                nonce: 7,
+                gas_limit: 50_000,
+                data_hash: [2u8; 32],
             },
-            MidnightBridgeEvent {
-                id: "evt-2".to_string(),
-                amount: Amount::from(50u64),
-                recipient: recipient.clone(),
+            Deposit {
+                sender: [3u8; 32],
+                recipient: [4u8; 32],
+                amount: 50u128,
+                nonce: 8,
+                gas_limit: 120_000,
+                data_hash: [5u8; 32],
             },
         ];
 
         let mut file = File::create(&events_path).unwrap();
-        to_writer_pretty(&mut file, &events).unwrap();
+        to_writer_pretty(&mut file, &deposits).unwrap();
 
         let settings = RuntimeBridgeSettings {
             signing_key: PrivateKeyAndAddress::generate(),
@@ -488,15 +564,15 @@ mod tests {
         let mut bridge = MidnightBridge::new(Arc::clone(&sequencer), settings);
 
         let snapshot = bridge.fetch_events().await.unwrap();
-        assert_eq!(snapshot.len(), events.len());
+        assert_eq!(snapshot.len(), deposits.len());
 
         bridge.process_events(snapshot.clone()).await;
-        bridge.process_events(snapshot).await;
+        bridge.process_events(snapshot.clone()).await;
 
         let accepted = sequencer.accepted().await;
-        assert_eq!(accepted.len(), events.len());
+        assert_eq!(accepted.len(), deposits.len());
 
-        for (tx, event) in accepted.iter().zip(events.iter()) {
+        for (tx, deposit) in accepted.iter().zip(snapshot.iter()) {
             let call = BridgeAuthenticator::decode_serialized_tx(tx).unwrap();
             let runtime_call = match call {
                 EvmAuthenticatorInput::Standard(call) => call,
@@ -508,9 +584,9 @@ mod tests {
                     coins,
                     mint_to_address,
                 }) => {
-                    assert_eq!(coins.amount, event.amount);
+                    assert_eq!(coins.amount, Amount::from(deposit.amount));
                     assert_eq!(coins.token_id, config_gas_token_id());
-                    assert_eq!(&mint_to_address, &event.recipient);
+                    assert_eq!(mint_to_address, deposit.recipient_address());
                 }
                 _ => panic!("unexpected runtime call"),
             }
@@ -525,11 +601,6 @@ mod tests {
 
         let signing_key = PrivateKeyAndAddress::<BridgeSpec>::from_json_file(&signer_path, false)
             .expect("fixture signer loads");
-        let events: Vec<MidnightBridgeEvent<<BridgeSpec as Spec>::Address>> =
-            read_event_file(&events_path)
-                .await
-                .expect("fixture events parse");
-        let event = events.first().expect("fixture event exists").clone();
 
         let settings = RuntimeBridgeSettings {
             signing_key,
@@ -542,8 +613,16 @@ mod tests {
         let sequencer = Arc::new(RecordingSequencer::default());
         let mut bridge = MidnightBridge::new(sequencer, settings);
 
+        let deposit = bridge
+            .fetch_events()
+            .await
+            .expect("fixture events parse")
+            .into_iter()
+            .next()
+            .expect("fixture event exists");
+
         let tx = bridge
-            .build_mint_transaction(&event)
+            .build_mint_transaction(&deposit)
             .expect("tx build succeeds");
         let call = BridgeAuthenticator::decode_serialized_tx(&tx).expect("tx decodes");
         let runtime_call = match call {
@@ -556,9 +635,9 @@ mod tests {
                 coins,
                 mint_to_address,
             }) => {
-                assert_eq!(coins.amount, event.amount);
+                assert_eq!(coins.amount, Amount::from(deposit.amount));
                 assert_eq!(coins.token_id, config_gas_token_id());
-                assert_eq!(mint_to_address, event.recipient);
+                assert_eq!(mint_to_address, deposit.recipient_address());
             }
             _ => panic!("unexpected runtime call"),
         }
@@ -572,11 +651,6 @@ mod tests {
 
         let signing_key = PrivateKeyAndAddress::<BridgeSpec>::from_json_file(&signer_path, false)
             .expect("fixture signer loads");
-        let events: Vec<MidnightBridgeEvent<<BridgeSpec as Spec>::Address>> =
-            read_event_file(&events_path)
-                .await
-                .expect("fixture events parse");
-        let event = events.first().expect("fixture event exists").clone();
 
         let settings = RuntimeBridgeSettings {
             signing_key,
@@ -589,13 +663,21 @@ mod tests {
         let sequencer = Arc::new(RecordingSequencer::default());
         let mut bridge = MidnightBridge::new(sequencer, settings);
 
+        let deposit = bridge
+            .fetch_events()
+            .await
+            .expect("fixture events parse")
+            .into_iter()
+            .next()
+            .expect("fixture event exists");
+
         let tx = bridge
-            .build_mint_transaction(&event)
+            .build_mint_transaction(&deposit)
             .expect("tx build succeeds");
         let tx_base64 = BASE64_STANDARD.encode(&tx.data);
         assert_eq!(
             tx_base64,
-            "AdoAAAAA8M6hxV+IgZZO9tpQ1l7oTlRTHDjIum5K74om3OddGFOJ1YMxiSXsvyQXdGnes0SWbRR2Tlr+bdsrHkjLuhfaBvitJDeieeHIkywHNYyR3E/jSGSpjGwl8pjioBmcFQn/AAOgJSYAAAAAAAAAAAAAAAAAmT78vI7I+oTDqyIWqottPIY1MAtjUhWKVzWRwSjGNFkAe3WL8udnD6+va/ABXOD/WqgCMG/H4/RXYoU//AEAAAAAAAAAAAAAAAAAAAAAQEIPAAAAAAAAAAAAAAAAAADhEAAAAAAAAA==",
+            "AdoAAAAA+Y16HHlbDOH8dRML02ZZG6Mj/MgjDwK4W5s4TU5N5Dj898eel61gGO9ekou/cA59OVGsaRaZiFp+UqSokEOlAPitJDeieeHIkywHNYyR3E/jSGSpjGwl8pjioBmcFQn/AAOgJSYAAAAAAAAAAAAAAAAAmT78vI7I+oTDqyIWqottPIY1MAtjUhWKVzWRwSjGNFkA/ty6mHZUMhABI0VniavN7wARIjNEVWZ3iJmquwEAAAAAAAAAAAAAAAAAAAAAQEIPAAAAAAAAAAAAAAAAAADhEAAAAAAAAA==",
             "fixture payload matches logged base64",
         );
 

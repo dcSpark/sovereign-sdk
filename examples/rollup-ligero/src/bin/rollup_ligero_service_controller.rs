@@ -178,10 +178,7 @@ async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
         std::fs::remove_dir_all(&app.demo_data_dir).map_err(|err| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Failed to remove {}: {err}",
-                    app.demo_data_dir.display()
-                ),
+                format!("Failed to remove {}: {err}", app.demo_data_dir.display()),
             )
         })?;
         Ok(format!(
