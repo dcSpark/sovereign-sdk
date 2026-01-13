@@ -340,6 +340,8 @@ pub struct CreateWalletRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct CreateWalletResult {
+    /// New wallet private key (hex string)
+    pub wallet_private_key: String,
     /// New authority VFK (hex string)
     pub authority_vfk: String,
     /// New privacy pool spending key (hex string)
@@ -1344,6 +1346,7 @@ impl CryptoServer {
         }
 
         let result = CreateWalletResult {
+            wallet_private_key: wallet_private_key_hex,
             authority_vfk: authority_vfk_hex,
             privacy_spend_key: privacy_spend_key_hex,
             privacy_address,
