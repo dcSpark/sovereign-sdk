@@ -428,6 +428,7 @@ pub fn parse_deposit_fields(
 /// Handles multiple formats:
 /// - Hex string: "9c66232d..." -> privpool1...
 /// - Byte array: [213, 214, 8, ...] -> privpool1...
+/// - String array: "[213, 214, 8, ...]" -> privpool1...
 /// - Already bech32m: "privpool1..." -> passed through
 pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<String> {
     let value = value?;
@@ -438,6 +439,18 @@ pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<S
         if s.starts_with("privpool1") {
             return Some(s.to_string());
         }
+
+        // Check if it's a string representation of an array like "[47, 239, 50, ...]"
+        if s.starts_with('[') && s.ends_with(']') {
+            // Try to parse as a JSON array
+            if let Ok(arr) = serde_json::from_str::<Vec<u8>>(s) {
+                if arr.len() == 32 {
+                    let hex_str = hex::encode(&arr);
+                    return hex_to_bech32m_address(&hex_str);
+                }
+            }
+        }
+
         // Otherwise treat as hex and convert to bech32m
         return hex_to_bech32m_address(s);
     }
