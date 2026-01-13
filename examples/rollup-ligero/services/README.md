@@ -10,7 +10,7 @@ and the continuous transfers load generator as background services on Linux.
 - Built Ligero guest programs (from the Ligero repo): `<ligero-prover>/utils/circuits/bins/*.wasm`
 - Configured indexer environment at
   `crates/utils/sov-indexer/.env` (`DA_CONNECTION_STRING`, `INDEX_DB`,
-  `INDEXER_BIND`, optional `MODE`/VFK settings)
+  `INDEXER_BIND`, optional VFK settings)
 - Updated unit files with the correct `User`, `WorkingDirectory`, `ExecStart`,
   and `PATH` values for your environment
 

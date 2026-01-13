@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use sea_orm::{ConnectOptions, Database};
-use tracing::instrument::WithSubscriber;
-use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 mod api;
 mod background_sync;
+mod balance;
 mod db;
 mod index_db;
 mod viewer;
@@ -28,72 +27,49 @@ async fn main() -> anyhow::Result<()> {
     let index_db_url = env::var("INDEX_DB")
         .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
-    let mode = match env::var("MODE")
-        .unwrap_or_else(|_| "direct".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "sync" => api::Mode::Sync,
-        _ => api::Mode::Direct,
-    };
-
     let mut connection_options = ConnectOptions::new(da_conn.clone());
     connection_options.sqlx_logging(false);
     let da_db = Database::connect(connection_options)
         .await
         .with_context(|| format!("Failed to connect DB {}", da_conn))?;
-    let (idx_db, vfk_registry) = if mode == api::Mode::Sync {
-        let mut connection_options = ConnectOptions::new(index_db_url.clone());
-        connection_options.sqlx_logging(false);
-        let idx = Database::connect(connection_options)
-            .await
-            .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
 
-        println!("Initializing index database");
+    let mut connection_options = ConnectOptions::new(index_db_url.clone());
+    connection_options.sqlx_logging(false);
+    let idx_db = Database::connect(connection_options)
+        .await
+        .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
 
-        db::init_index_db(&idx).await?;
+    println!("Initializing index database");
 
-        println!("index database initialized");
+    db::init_index_db(&idx_db).await?;
 
-        // Load VFK registry for multi-address decryption (uses DashMap for lock-free access)
-        let vfk_registry = load_vfk_registry(&idx).await?;
-        let vfk_registry = Arc::new(vfk_registry);
+    println!("index database initialized");
 
-        // Try a one-shot backfill; if DA tables are not ready, log and continue.
-        if let Err(e) = background_sync::backfill_index(&da_db, &idx, &vfk_registry).await {
-            warn!(error = %e, "Initial backfill failed; will retry in background loop");
-        }
-        let idx_clone = idx.clone();
-        let vfk_registry_clone = vfk_registry.clone();
-        tokio::spawn(async move {
-            println!("Starting VFK backfill");
-            if let Err(e) =
-                background_sync::backfill_decrypted_recipients(&idx_clone, &vfk_registry_clone)
-                    .await
-            {
-                warn!(error = %e, "VFK backfill failed");
-            }
-            println!("Finished VFK backfill");
-        });
-        println!("Initializing background sync loop");
-        background_sync::spawn_sync_loop(da_db.clone(), idx.clone(), vfk_registry.clone());
-        (idx, vfk_registry)
-    } else {
-        // Direct mode: create empty registry (no decryption)
-        (da_db.clone(), Arc::new(VfkRegistry::new()))
-    };
+    // Load VFK registry for multi-address decryption (uses DashMap for lock-free access)
+    let vfk_registry = load_vfk_registry(&idx_db).await?;
+    let vfk_registry = Arc::new(vfk_registry);
 
-    if mode == api::Mode::Direct {
-        info!("Indexer running in DIRECT mode; querying worker DB directly");
-    } else {
-        info!("Indexer running in SYNC mode; serving from index DB");
+    // Try a one-shot backfill; if DA tables are not ready, log and continue.
+    if let Err(e) = background_sync::backfill_index(&da_db, &idx_db, &vfk_registry).await {
+        warn!(error = %e, "Initial backfill failed; will retry in background loop");
     }
-
-    let app = api::router(api::AppState {
-        db: idx_db,
-        mode,
-        vfk_registry,
+    let idx_clone = idx_db.clone();
+    let vfk_registry_clone = vfk_registry.clone();
+    tokio::spawn(async move {
+        println!("Starting VFK backfill");
+        if let Err(e) =
+            background_sync::backfill_decrypted_recipients(&idx_clone, &vfk_registry_clone).await
+        {
+            warn!(error = %e, "VFK backfill failed");
+        }
+        println!("Finished VFK backfill");
     });
+    println!("Initializing background sync loop");
+    background_sync::spawn_sync_loop(da_db.clone(), idx_db.clone(), vfk_registry.clone());
+
+    info!("Indexer running in SYNC mode; serving from index DB");
+
+    let app = api::router(api::AppState { db: idx_db, vfk_registry });
 
     let addr: SocketAddr = bind_addr.parse()?;
     info!("sov-indexer listening on {}", addr);

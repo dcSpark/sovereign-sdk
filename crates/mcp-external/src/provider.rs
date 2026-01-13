@@ -70,6 +70,33 @@ pub struct ListTransactionsResponse {
     pub next: Option<String>,
 }
 
+/// Unspent note from the indexer's balance endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct UnspentNote {
+    /// Note value
+    pub value: String,
+    /// Note rho (hex encoded)
+    pub rho: String,
+    /// Optional sender ID (hex encoded, for transfers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    /// Transaction hash where the note was created
+    pub tx_hash: String,
+    /// Timestamp in milliseconds
+    pub timestamp_ms: i64,
+    /// Transaction kind ("deposit", "transfer", etc.)
+    pub kind: String,
+}
+
+/// Response from the indexer's balance endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct BalanceResponse {
+    /// Total balance as string
+    pub balance: String,
+    /// List of unspent notes
+    pub unspent_notes: Vec<UnspentNote>,
+}
+
 /// Provider for RPC communication with the Sovereign rollup
 ///
 /// Responsible for all network communication and chain state queries.
@@ -453,6 +480,81 @@ impl Provider {
         );
 
         Ok(tx_list)
+    }
+
+    /// Get wallet balance from the indexer
+    ///
+    /// Uses the indexer's `/wallets/:address/balance` endpoint which efficiently
+    /// computes the balance by decrypting notes and tracking spent nullifiers.
+    ///
+    /// # Parameters
+    /// * `address` - Privacy address (bech32m format)
+    /// * `spend_sk_hex` - Spending secret key as hex string (with or without 0x prefix)
+    /// * `vfk_hex` - Optional viewing key for decrypting encrypted notes
+    ///
+    /// # Returns
+    /// Balance response with total balance and list of unspent notes
+    pub async fn get_wallet_balance(
+        &self,
+        address: &str,
+        spend_sk_hex: &str,
+        vfk_hex: Option<&str>,
+    ) -> Result<BalanceResponse> {
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/wallets/{}/balance", base_url, address);
+
+        // Build request body
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "spend_sk".to_string(),
+            serde_json::Value::String(spend_sk_hex.to_string()),
+        );
+        if let Some(vfk) = vfk_hex {
+            body.insert(
+                "vfk".to_string(),
+                serde_json::Value::String(vfk.to_string()),
+            );
+        }
+
+        tracing::debug!("Fetching balance from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch balance from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer balance API error at {}: HTTP {} - {}",
+                url,
+                status,
+                if body.is_empty() {
+                    "No error details provided"
+                } else {
+                    &body
+                }
+            );
+        }
+
+        let balance_response: BalanceResponse = response.json().await.with_context(|| {
+            format!(
+                "Failed to parse balance JSON from indexer at {}",
+                url
+            )
+        })?;
+
+        tracing::debug!(
+            "Fetched balance for address {}: {}",
+            address,
+            balance_response.balance
+        );
+
+        Ok(balance_response)
     }
 
     /// Register an authority VFK with the indexer, if supported.

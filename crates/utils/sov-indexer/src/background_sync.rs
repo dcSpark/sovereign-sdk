@@ -73,6 +73,9 @@ pub async fn backfill_index(
             } else {
                 None
             };
+
+            tracing::info!("NOTEEEEE: {:?}", row);
+
             // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
                 .or(recip_from_payload);

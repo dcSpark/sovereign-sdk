@@ -6,11 +6,7 @@ use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{Condition, DatabaseConnection, JsonValue, QueryOrder, QuerySelect, Schema, Set};
 use serde::{Deserialize, Serialize};
-use sov_midnight_da::storable::worker_verified_transactions;
 
-use crate::background_sync::{
-    parse_kind_amount_roots, parse_withdraw_attestations, parse_withdraw_recipient,
-};
 use crate::index_db as idx;
 
 pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
@@ -266,7 +262,46 @@ pub async fn insert_midnight_transfer(
     Ok(())
 }
 
-pub async fn list_wallet_txs_sync(
+/// Convert a privacy address to recipient hash if needed.
+///
+/// If the address is a long privacy address (privpool1... with >50 chars),
+/// it extracts the keys and computes the recipient hash, then encodes it as bech32m.
+/// Otherwise returns the address as-is.
+fn normalize_address_for_query(address: &str) -> String {
+    use midnight_privacy::PrivacyAddress;
+    use crate::viewer::hex_to_bech32m_address;
+
+    // Domain constant used for privacy operations (matches the rest of the codebase)
+    const DOMAIN: [u8; 32] = [1u8; 32];
+
+    // If it's a long privacy address (>50 chars), convert to recipient hash
+    if address.starts_with("privpool1") && address.len() > 50 {
+        // Try to parse as PrivacyAddress
+        if let Ok(privacy_addr) = address.parse::<PrivacyAddress>() {
+            let domain = DOMAIN;
+
+            // Compute recipient hash
+            let pk_spend = privacy_addr.to_pk();
+            let pk_ivk = privacy_addr.pk_ivk();
+            let recipient = midnight_privacy::recipient_from_pk_v2(&domain, &pk_spend, &pk_ivk);
+
+            // Encode as bech32m
+            let recipient_hex = hex::encode(recipient);
+            if let Some(bech32_addr) = hex_to_bech32m_address(&recipient_hex) {
+                tracing::debug!(
+                    "Converted long privacy address {} to recipient hash {}",
+                    address,
+                    bech32_addr
+                );
+                return bech32_addr;
+            }
+        }
+    }
+
+    address.to_string()
+}
+
+pub async fn list_wallet_txs(
     db: &DatabaseConnection,
     address: &str,
     limit: usize,
@@ -277,14 +312,22 @@ pub async fn list_wallet_txs_sync(
 
     let mut collected: Vec<InvolvementItem> = Vec::new();
     info!(
-        "Starting list_wallet_txs_sync for address {}, limit {}, cursor {:?}, type_filter {:?}",
+        "Starting list_wallet_txs for address {}, limit {}, cursor {:?}, type_filter {:?}",
         address, limit, cursor, type_filter
     );
 
-    // Deposits by sender
-    debug!("Fetching midnight_deposit records for sender={}", address);
+    // Normalize address: convert long privacy address to recipient hash if needed
+    let normalized_address = normalize_address_for_query(address);
+    debug!("Normalized address: {} -> {}", address, normalized_address);
+
+    // Deposits by sender OR recipient
+    debug!("Fetching midnight_deposit records for sender or recipient={}", normalized_address);
     let deps = idx::midnight_deposit::Entity::find()
-        .filter(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+        .filter(
+            Condition::any()
+                .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+                .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone())),
+        )
         .all(db)
         .await?;
     debug!("Got {} midnight_deposit records", deps.len());
@@ -482,7 +525,7 @@ pub async fn list_wallet_txs_sync(
         )
     });
     info!(
-        "Finished list_wallet_txs_sync: returning {} items, next cursor {:?}",
+        "Finished list_wallet_txs: returning {} items, next cursor {:?}",
         collected.len(),
         next
     );
@@ -492,182 +535,11 @@ pub async fn list_wallet_txs_sync(
     })
 }
 
-pub async fn list_wallet_txs_direct(
-    db: &DatabaseConnection,
-    address: &str,
-    limit: usize,
-    cursor: Option<CursorInner>,
-    type_filter: Option<String>,
-) -> Result<ListResponse> {
-    let mut collected: Vec<InvolvementItem> = Vec::new();
-
-    let mut query = worker_verified_transactions::Entity::find()
-        .filter(
-            Condition::any()
-                .add(worker_verified_transactions::Column::Sender.eq(address.to_string()))
-                .add(worker_verified_transactions::Column::Recipient.eq(address.to_string())),
-        )
-        .order_by_desc(worker_verified_transactions::Column::CreatedAt);
-
-    if let Some(ref cur) = cursor {
-        let ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms).unwrap();
-        query = query.filter(
-            Condition::any()
-                .add(worker_verified_transactions::Column::CreatedAt.lt(ts))
-                .add(
-                    worker_verified_transactions::Column::CreatedAt
-                        .eq(ts)
-                        .and(worker_verified_transactions::Column::TxHash.lt(cur.tx_hash.clone())),
-                ),
-        );
-    }
-
-    let rows = query.limit(limit as u64).all(db).await?;
-    for row in rows {
-        let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(&row.transaction_data)
-            .unwrap_or(("other".to_string(), None, None, None));
-        if let Some(ref t) = type_filter {
-            if t != &kind {
-                continue;
-            }
-        }
-        let view_fvks = row
-            .view_fvks_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
-        let view_attestations = row
-            .view_attestations_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .or_else(|| {
-                parse_withdraw_attestations(&row.proof_outputs)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            });
-        let recipient = if kind == "withdraw" {
-            row.recipient.clone().or_else(|| {
-                parse_withdraw_recipient(&row.transaction_data)
-                    .ok()
-                    .flatten()
-            })
-        } else {
-            None
-        };
-        let events = extract_events_from_status(row.sequencer_status.as_deref())
-            .ok()
-            .flatten();
-        let status = extract_status_from_status(row.sequencer_status.as_deref());
-        let encrypted_notes = row
-            .encrypted_notes_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-
-        collected.push(InvolvementItem {
-            tx_hash: row.tx_hash.clone(),
-            timestamp_ms: row.created_at.timestamp_millis(),
-            kind,
-            sender: Some(row.sender.clone()),
-            recipient,
-            amount,
-            anchor_root,
-            nullifier,
-            view_fvks,
-            view_attestations,
-            events,
-            status,
-            encrypted_notes,
-            payload: serde_json::from_str(&row.transaction_data).ok(),
-        });
-    }
-
-    let next = collected.last().map(|item| {
-        BASE64_STANDARD.encode(
-            serde_json::to_vec(&CursorInner {
-                ts_ms: item.timestamp_ms,
-                tx_hash: item.tx_hash.clone(),
-            })
-            .unwrap(),
-        )
-    });
-    Ok(ListResponse {
-        items: collected,
-        next,
-    })
-}
-
 pub async fn list_txs(
     db: &DatabaseConnection,
-    mode: crate::api::Mode,
     limit: usize,
     offset: usize,
 ) -> Result<ListResponse> {
-    if mode == crate::api::Mode::Direct {
-        let rows = worker_verified_transactions::Entity::find()
-            .order_by_desc(worker_verified_transactions::Column::CreatedAt)
-            .offset(offset as u64)
-            .limit(limit as u64)
-            .all(db)
-            .await?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(
-                &row.transaction_data,
-            )
-            .unwrap_or(("other".to_string(), None, None, None));
-            let view_fvks = row
-                .view_fvks_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let view_attestations = row
-                .view_attestations_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .or_else(|| {
-                    parse_withdraw_attestations(&row.proof_outputs)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                });
-            let recipient = if kind == "withdraw" {
-                row.recipient.clone().or_else(|| {
-                    parse_withdraw_recipient(&row.transaction_data)
-                        .ok()
-                        .flatten()
-                })
-            } else {
-                None
-            };
-            let events = extract_events_from_status(row.sequencer_status.as_deref())
-                .ok()
-                .flatten();
-            let status = extract_status_from_status(row.sequencer_status.as_deref());
-            let encrypted_notes = row
-                .encrypted_notes_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-
-            items.push(InvolvementItem {
-                tx_hash: row.tx_hash.clone(),
-                timestamp_ms: row.created_at.timestamp_millis(),
-                kind,
-                sender: Some(row.sender.clone()),
-                recipient,
-                amount,
-                anchor_root,
-                nullifier,
-                view_fvks,
-                view_attestations,
-                events,
-                status,
-                encrypted_notes,
-                payload: serde_json::from_str(&row.transaction_data).ok(),
-            });
-        }
-        return Ok(ListResponse { items, next: None });
-    }
-
-    // Sync mode
     let rows = idx::Entity::find()
         .order_by_desc(idx::Column::CreatedAt)
         .offset(offset as u64)
@@ -749,72 +621,9 @@ pub async fn list_txs(
 
 pub async fn get_tx(
     db: &DatabaseConnection,
-    mode: crate::api::Mode,
     tx_hash: &str,
 ) -> Result<Option<InvolvementItem>> {
-    if mode == crate::api::Mode::Direct {
-        let row = worker_verified_transactions::Entity::find()
-            .filter(worker_verified_transactions::Column::TxHash.eq(tx_hash.to_string()))
-            .one(db)
-            .await?;
-        if let Some(row) = row {
-            let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(
-                &row.transaction_data,
-            )
-            .unwrap_or(("other".to_string(), None, None, None));
-            let view_fvks = row
-                .view_fvks_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let view_attestations = row
-                .view_attestations_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .or_else(|| {
-                    parse_withdraw_attestations(&row.proof_outputs)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                });
-            let recipient = if kind == "withdraw" {
-                row.recipient.clone().or_else(|| {
-                    parse_withdraw_recipient(&row.transaction_data)
-                        .ok()
-                        .flatten()
-                })
-            } else {
-                None
-            };
-            let events = extract_events_from_status(row.sequencer_status.as_deref())
-                .ok()
-                .flatten();
-            let status = extract_status_from_status(row.sequencer_status.as_deref());
-            let encrypted_notes = row
-                .encrypted_notes_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-
-            return Ok(Some(InvolvementItem {
-                tx_hash: row.tx_hash.clone(),
-                timestamp_ms: row.created_at.timestamp_millis(),
-                kind,
-                sender: Some(row.sender.clone()),
-                recipient,
-                amount,
-                anchor_root,
-                nullifier,
-                view_fvks,
-                view_attestations,
-                events,
-                status,
-                encrypted_notes,
-                payload: serde_json::from_str(&row.transaction_data).ok(),
-            }));
-        }
-        return Ok(None);
-    }
-
-    // Sync mode: look up by tx_hash in events then related tables
+    // Look up by tx_hash in events then related tables.
     let ev = idx::Entity::find()
         .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
         .one(db)

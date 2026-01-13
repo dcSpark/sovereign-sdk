@@ -21,7 +21,6 @@ Quick start
    - `INDEX_DB` (optional): local index DB, default `sqlite://wallet_index.sqlite?mode=rwc`
    - `INDEXER_BIND` (optional): listen address, default `0.0.0.0:13100`
    - `AUTHORITY_VFK` (optional): 32-byte hex authority viewing key for decrypting encrypted notes
-   - `MODE` (optional): `direct` (default) queries DA directly, `sync` maintains local index
 
 2) Run the service:
    ```bash
@@ -31,11 +30,17 @@ Quick start
 3) Endpoints:
    - Health: `GET /health`
      - Returns `{ "status": "ok" }`
-   - Wallet activity: `GET /wallets/:address/txs?limit=&cursor=&type=`
+   - Wallet activity: `GET /wallets/:address?limit=&cursor=&type=`
      - `address`: bech32 L2 address
      - `limit`: optional, default 50, max 200
      - `cursor`: opaque base64 from previous response for pagination
      - `type`: optional filter: `deposit` or `withdraw`
+   - Wallet balance: `POST /wallets/:address/balance`
+     - `address`: bech32m privacy pool address (`privpool1...`)
+     - JSON body:
+       - `spend_sk`: 32-byte hex spending secret key (required)
+       - `vfk`: 32-byte hex full viewing key (optional)
+     - Returns `{ "balance": "...", "unspent_notes": [...] }`
 
 ## VFK Decryption (Optional)
 
@@ -47,12 +52,12 @@ has its own VFK, so the indexer supports multiple VFKs via a registry.
 1. **VFK Config File** (recommended for multiple addresses):
    Set `VFK_CONFIG_FILE` to point to a JSON file:
    ```bash
-   MODE=sync VFK_CONFIG_FILE=./vfk_config.json cargo run -p sov-indexer
+   VFK_CONFIG_FILE=./vfk_config.json cargo run -p sov-indexer
    ```
 
 2. **Single VFK** (backward compatible):
    ```bash
-   MODE=sync AUTHORITY_VFK=fd3f0fc84254bcbe06977154d4db171a952201685f6ff8d5afe4a3c6e083f2b1 cargo run -p sov-indexer
+   AUTHORITY_VFK=fd3f0fc84254bcbe06977154d4db171a952201685f6ff8d5afe4a3c6e083f2b1 cargo run -p sov-indexer
    ```
 
 ### VFK Config File Format

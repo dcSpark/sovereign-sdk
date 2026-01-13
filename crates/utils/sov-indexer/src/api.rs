@@ -1,4 +1,5 @@
-use crate::db::{list_wallet_txs_direct, list_wallet_txs_sync, CursorInner, ListResponse};
+use crate::balance;
+use crate::db::{list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse};
 use crate::viewer::{self, VfkRegistry};
 use anyhow::Result;
 use axum::{
@@ -17,15 +18,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseConnection,
-    pub mode: Mode,
     /// VFK registry using DashMap for lock-free concurrent access
     pub vfk_registry: Arc<VfkRegistry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Sync,
-    Direct,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +45,7 @@ pub struct TxListQuery {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/wallets/:address", get(list_wallet_txs))
+        .route("/wallets/:address/balance", post(wallet_balance))
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
         .route("/health", get(health))
@@ -75,6 +70,28 @@ async fn list_wallet_txs(
     }
 }
 
+async fn wallet_balance(
+    Path(address): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<balance::BalanceRequest>,
+) -> impl IntoResponse {
+    match balance::get_wallet_balance(&state.db, &address, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            let status = if is_balance_client_error(&e) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status":"ok"})))
 }
@@ -91,14 +108,30 @@ async fn list_wallet_txs_inner(
     } else {
         None
     };
-    if state.mode == Mode::Direct {
-        return list_wallet_txs_direct(&state.db, &address, limit, cursor, q.r#type.clone()).await;
+    list_wallet_txs_db(&state.db, &address, limit, cursor, q.r#type.clone()).await
+}
+
+fn is_balance_client_error(err: &anyhow::Error) -> bool {
+    if err
+        .root_cause()
+        .downcast_ref::<midnight_privacy::PrivacyAddressError>()
+        .is_some()
+    {
+        return true;
     }
-    list_wallet_txs_sync(&state.db, &address, limit, cursor, q.r#type.clone()).await
+    if err.root_cause().downcast_ref::<hex::FromHexError>().is_some() {
+        return true;
+    }
+
+    let message = err.to_string();
+    message.contains("spend_sk")
+        || message.contains("vfk")
+        || message.contains("Invalid privacy address")
+        || message.contains("Expected 32-byte hex")
 }
 
 async fn get_tx(Path(tx_hash): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
-    match crate::db::get_tx(&state.db, state.mode, &tx_hash).await {
+    match crate::db::get_tx(&state.db, &tx_hash).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -119,7 +152,7 @@ async fn list_txs(
 ) -> impl IntoResponse {
     let limit = q.limit.min(200);
     let offset = q.offset;
-    match crate::db::list_txs(&state.db, state.mode, limit, offset).await {
+    match crate::db::list_txs(&state.db, limit, offset).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -241,17 +274,15 @@ async fn add_vfk(
 
     tracing::info!("Added VFK with commitment {}", &commitment_hex[..16]);
 
-    if state.mode == Mode::Sync {
-        let db = state.db.clone();
-        let vfk_registry = state.vfk_registry.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::background_sync::backfill_decrypted_recipients(&db, &vfk_registry).await
-            {
-                tracing::warn!("VFK backfill failed: {}", e);
-            }
-        });
-    }
+    let db = state.db.clone();
+    let vfk_registry = state.vfk_registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::background_sync::backfill_decrypted_recipients(&db, &vfk_registry).await
+        {
+            tracing::warn!("VFK backfill failed: {}", e);
+        }
+    });
 
     (
         StatusCode::CREATED,
