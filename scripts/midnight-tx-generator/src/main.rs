@@ -160,7 +160,7 @@ fn main() -> Result<()> {
 
     let public_output = SpendPublic {
         anchor_root: anchor,
-        // Filled below (defaults to all-allowed).
+        // Filled below after fetching deny-map openings.
         blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount,
@@ -202,9 +202,8 @@ fn main() -> Result<()> {
     } else {
         vec![sender_addr]
     };
-    let node_url = std::env::var("NODE_API_URL").ok();
     let (blacklist_root, deny_openings) =
-        note_spend_guest_v2::deny_map_openings_or_default(node_url.as_deref(), &addr_list)?;
+        note_spend_guest_v2::fetch_deny_map_openings(&node_url, &addr_list)?;
 
     // Bind the transparent withdrawal destination into the statement.
     // The circuit requires:

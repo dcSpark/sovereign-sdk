@@ -69,8 +69,9 @@ if [ "$BUILD_PROFILE" = "release" ]; then
 fi
 
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
+# Note: Chain generation numbers use milliseconds, so we use $(date +%s)000 as fallback
 NONCE_STATE_FILE="$GENERATOR_DIR/.last_nonce"
-BASE_NONCE=$(date +%s)
+BASE_NONCE=$(($(date +%s) * 1000))
 
 # Try to fetch latest from node for this key
 NODE_API_URL="${NODE_API_URL:-http://localhost:12346}"
@@ -99,6 +100,11 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-50}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
+# Optional: Authority VFK for Level-B viewing (32 bytes hex, with or without 0x prefix)
+# If set, proofs will include viewer attestations that allow authorities to decrypt notes
+# Example: AUTHORITY_VFK=0x0102030405060708091011121314151617181920212223242526272829303132
+AUTHORITY_VFK="${AUTHORITY_VFK:-}"
+
 # Optional: fund the sender before shielded deposit (uses bank transfer via seq HTTP API)
 FUNDER_KEY_FILE="${FUNDER_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
 FUND_AMOUNT="${FUND_AMOUNT:-1000}" # clear tokens to send to sender
@@ -113,6 +119,9 @@ echo "  Withdraw: $WITHDRAW_AMOUNT"
 echo "  Change: $((DEPOSIT_AMOUNT - WITHDRAW_AMOUNT)) (stays shielded)"
 echo "  Nonce: $NONCE"
 echo "  Proof Verifier: $VERIFIER_ENDPOINT"
+if [ -n "$AUTHORITY_VFK" ]; then
+    echo "  Authority VFK: ${AUTHORITY_VFK:0:16}... (Level-B viewing enabled)"
+fi
 echo ""
 
 # Build generators if needed
@@ -123,24 +132,17 @@ cd "$REPO_ROOT"
 echo ""
 
 # Step 0: fund sender if requested (native Rust funder)
+# Note: fund binary fetches its own generation from the node, no need to pass FUND_NONCE
 if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
   echo -e "${YELLOW}Step 0: Funding sender with $FUND_AMOUNT tokens${NC}"
   cd "$GENERATOR_DIR"
   SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fund 2>&1 | grep -E "Compiling|Finished" || true
   cd "$REPO_ROOT"
-  FUND_NONCE=""
-  if [ -f "$NONCE_STATE_FILE" ]; then
-    LAST_NONCE=$(cat "$NONCE_STATE_FILE" | tr -d '\n' || echo 0)
-    if [[ "$LAST_NONCE" =~ ^[0-9]+$ ]]; then
-      FUND_NONCE=$((LAST_NONCE + 1))
-    fi
-  fi
   env \
     NODE_API_URL="${NODE_API_URL:-http://localhost:12346}" \
     RECIPIENT="$RECIPIENT" \
     FUND_AMOUNT="$FUND_AMOUNT" \
     FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
-    ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
     "$BIN_DIR/fund"
   echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"
 fi
@@ -242,6 +244,11 @@ cd "$REPO_ROOT"
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
+# Export authority VFK if configured (for Level-B viewing support)
+if [ -n "$AUTHORITY_VFK" ]; then
+    export AUTHORITY_VFK
+    echo "  Authority VFK: ${AUTHORITY_VFK:0:16}... (Level-B viewing enabled)"
+fi
 
 # Map deposit note details into withdraw-generator inputs
 export OUT1_DOMAIN="$NOTE_DOMAIN"

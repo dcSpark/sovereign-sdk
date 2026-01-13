@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 borsh = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
+base64 = { workspace = true }
 digest = { workspace = true, features = ["alloc"] }
 hex = { workspace = true }
 proptest = { workspace = true, features = ["alloc", "std"], optional = true }
@@ -32,7 +33,7 @@ tracing = { workspace = true }
 sov-rollup-interface = { workspace = true }
 # Ligero runner crate (owned by ligero-prover). We use it for `LigeroProofPackage` everywhere,
 # and for host execution only under the `native` feature.
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "cbd3db933044006fea2706727be4b657b8a6b269" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "3ded21f4d11a58ed48f5f202594ad814fb913a34" }
 # Note: sov-metrics doesn't have a ligero-specific feature yet
 # sov-metrics = { workspace = true, optional = true }
 
@@ -44,7 +45,7 @@ sov-ligero-adapter = { path = ".", features = ["native", "arbitrary"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 # Ligetron SDK with native field arithmetic for tests
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "cbd3db933044006fea2706727be4b657b8a6b269", features = ["native"] }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "3ded21f4d11a58ed48f5f202594ad814fb913a34", features = ["native"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

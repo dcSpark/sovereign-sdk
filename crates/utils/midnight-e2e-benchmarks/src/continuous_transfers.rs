@@ -17,9 +17,9 @@ use demo_stf::runtime::{Runtime, RuntimeCall};
 use ligetron::bn254fr_native::submod_checked;
 use ligetron::Bn254Fr;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
-    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
-    PrivacyAddress, SpendPublic,
+    inv_enforce_v2, nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk,
+    recipient_from_pk_v2, recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote,
+    Hash32, MerkleTree, PrivacyAddress, SpendPublic,
 };
 use rand::Rng;
 use reqwest::Client as HttpClient;
@@ -467,10 +467,6 @@ struct VerifierResponse {
     metrics: VerifierMetrics,
 }
 
-#[derive(Deserialize, Clone)]
-struct RootsResp {
-    recent_roots: Vec<Hash32>,
-}
 
 #[derive(Clone, Debug)]
 struct CycleSummary {
@@ -1230,7 +1226,7 @@ async fn perform_transfer_cycle(
     let mut pos_by_cm = std::mem::take(cached_pos_by_cm);
     let mut cached_root_val = *cached_root;
     let mut cached_next_pos = *cached_next_position;
-    let (state, _state_root) = {
+    let (_state, _state_root) = {
         let mut attempt_result = None;
         let mut used_fallback = false;
 
@@ -1368,17 +1364,11 @@ async fn perform_transfer_cycle(
         attempts_made
     );
 
-    let roots_state: RootsResp = client
-        .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
-        .await
-        .context("Failed to query recent roots")?;
-
-    let mut anchor_root = [0u8; 32];
-    if let Some(last_root) = roots_state.recent_roots.last() {
-        anchor_root = *last_root;
-    } else {
-        anchor_root.copy_from_slice(&state.root);
-    }
+    // Use the verified tree root as anchor. Previously we fetched /roots/recent and picked
+    // the last root, but this caused a race condition: if a new block was produced between
+    // the tree rebuild and fetching recent_roots, the anchor wouldn't match our tree and
+    // Merkle proof validation would fail intermittently.
+    let anchor_root: Hash32 = mt.root();
 
     #[derive(Clone)]
     struct TransferInput {
@@ -1423,6 +1413,26 @@ async fn perform_transfer_cycle(
         }
 
         if let Some(position) = position {
+            // Verify the tree actually has the expected commitment at this position
+            let tree_leaf = mt.leaf(position as usize);
+            if tree_leaf != cm {
+                eprintln!(
+                    "[cycle] wallet {}: TREE MISMATCH! position={} expected_cm={} tree_leaf={}",
+                    idx,
+                    position,
+                    hex::encode(&cm[..8]),
+                    hex::encode(&tree_leaf[..8])
+                );
+                eprintln!(
+                    "        wallet values: value={} rho={} spend_sk={} sender_id={}",
+                    wallet.value,
+                    hex::encode(&wallet.rho[..8]),
+                    hex::encode(&wallet.spend_sk[..8]),
+                    hex::encode(&wallet.sender_id[..8])
+                );
+                // Skip this wallet - the tree state is inconsistent
+                continue;
+            }
             inputs.push(TransferInput {
                 wallet_idx: idx,
                 value: wallet.value,
@@ -1678,22 +1688,14 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode(out_pk_spend));
                 host.add_hex_arg(hex::encode(out_pk_ivk));
                 host.add_hex_arg(hex::encode(cm_out));
-                // inv_enforce (PRIVATE)
-                let inv_enforce = {
-                    let mut enforce_prod = Bn254Fr::from_u32(1);
-                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
-                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(value_u64));
-                    let mut delta = Bn254Fr::new();
-                    let mut out_fr = Bn254Fr::new();
-                    out_fr.set_bytes_big(&out_rho);
-                    let mut in_fr = Bn254Fr::new();
-                    in_fr.set_bytes_big(&in_rho);
-                    submod_checked(&mut delta, &out_fr, &in_fr);
-                    enforce_prod.mulmod_checked(&delta);
-                    let mut inv = enforce_prod.clone();
-                    inv.inverse();
-                    inv.to_bytes_be()
-                };
+                // inv_enforce (PRIVATE) - use the canonical formula from midnight_privacy
+                // Formula: Π(in_values) * Π(out_values) * Π(out_rho - in_rho)
+                let inv_enforce = inv_enforce_v2(
+                    &[value_u64],   // in_values
+                    &[in_rho],      // in_rhos
+                    &[value_u64],   // out_values (same as in for value conservation)
+                    &[out_rho],     // out_rhos
+                );
                 host.add_hex_arg(hex::encode(inv_enforce));
 
                 // Deny-map (blacklist) args:
@@ -1747,7 +1749,7 @@ async fn perform_transfer_cycle(
                 }
 
                 // Viewer section (Level-B)
-                if let Some((fvk, att)) = viewer_data {
+                if let Some((ref fvk, ref att)) = viewer_data {
                     host.add_u64_arg(1); // m_viewers
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
                     host.add_hex_arg(hex::encode(fvk));
@@ -1796,6 +1798,7 @@ async fn perform_transfer_cycle(
 
                     let pool = prover_daemon_pool(daemon_workers)
                         .context("initialize ligero prover daemon pool")?;
+
                     let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
                     if !resp.ok {
                         anyhow::bail!(
@@ -1804,10 +1807,10 @@ async fn perform_transfer_cycle(
                             resp.error.unwrap_or_else(|| "unknown error".to_string())
                         );
                     }
-                    // Daemon will echo `proof_path`, but we read from our explicitly-provided path.
+
                     let proof_bytes = std::fs::read(&proof_path)
                         .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
-                    drop(tmp); // cleanup temp directory
+                    drop(tmp);
 
                     let args_json = serde_json::to_vec(&cfg.args)?;
                     let pkg = ligero_runner::LigeroProofPackage::new(

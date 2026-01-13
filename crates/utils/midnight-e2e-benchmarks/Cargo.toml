@@ -17,13 +17,13 @@ sov-proof-verifier-service = { path = "../sov-proof-verifier-service" }
 sov-rollup-interface = { workspace = true }
 demo-stf = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "cbd3db933044006fea2706727be4b657b8a6b269", features = ["native"] }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "3ded21f4d11a58ed48f5f202594ad814fb913a34", features = ["native"] }
 sov-api-spec = { workspace = true }
 sov-cli = { workspace = true }
 sov-test-utils = { workspace = true }
 sov-rollup-ligero = { path = "../../../examples/rollup-ligero" }
 # Daemon-mode Ligero prover support
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "cbd3db933044006fea2706727be4b657b8a6b269" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "3ded21f4d11a58ed48f5f202594ad814fb913a34" }
 borsh = { workspace = true, features = ["bytes", "derive"] }
 bincode = { workspace = true }
 base64 = { workspace = true }

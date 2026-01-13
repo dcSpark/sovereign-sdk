@@ -4,26 +4,87 @@ use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
 use midnight_privacy::{
     note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2, CallMessage,
-    Hash32, MerkleTree, PrivacyAddress, SpendPublic,
+    EncryptedNote, Hash32, MerkleTree, PrivacyAddress, SpendPublic, ViewAttestation,
 };
 use rand::Rng;
+use serde::Deserialize;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
+use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
-use sov_modules_api::Spec;
 use std::fs;
-use serde::Deserialize;
 
 mod note_spend_guest_v2;
 mod rollup_schema;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
+
+/// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
+const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+
+/// Helper to create an EncryptedNote for the transaction (matching mcp-external/viewer.rs)
+fn create_encrypted_note(
+    vfk: &Hash32,
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+    cm: &Hash32,
+) -> EncryptedNote {
+    use midnight_privacy::viewing::{ct_hash, fvk_commitment, view_kdf, view_mac};
+    use midnight_privacy::FullViewingKey;
+
+    let vfk_obj = FullViewingKey(*vfk);
+    let vfk_c = fvk_commitment(&vfk_obj);
+
+    // Encode plaintext
+    let mut pt = [0u8; NOTE_PLAIN_LEN_TRANSFER];
+    pt[0..32].copy_from_slice(domain);
+    pt[32..40].copy_from_slice(&value.to_le_bytes());
+    pt[40..48].copy_from_slice(&[0u8; 8]);
+    pt[48..80].copy_from_slice(rho);
+    pt[80..112].copy_from_slice(recipient);
+    pt[112..144].copy_from_slice(sender_id);
+
+    // Encrypt with Poseidon-based keystream
+    let k = view_kdf(&vfk_obj, cm);
+    let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
+
+    // Stream XOR encryption
+    let block_fn = |ctr: u32| -> Hash32 {
+        let c = ctr.to_le_bytes();
+        midnight_privacy::poseidon2_hash(b"VIEW_STREAM_V1", &[&k, &c])
+    };
+    let mut ctr = 0u32;
+    let mut off = 0usize;
+    while off < pt.len() {
+        let ks = block_fn(ctr);
+        ctr = ctr.wrapping_add(1);
+        let take = core::cmp::min(32, pt.len() - off);
+        for i in 0..take {
+            ct[off + i] = pt[off + i] ^ ks[i];
+        }
+        off += take;
+    }
+
+    let ct_h = ct_hash(&ct);
+    let mac = view_mac(&k, cm, &ct_h);
+
+    EncryptedNote {
+        cm: *cm,
+        nonce: [0u8; 24],
+        ct: sov_modules_api::SafeVec::try_from(ct.to_vec()).expect("ciphertext within limit"),
+        fvk_commitment: vfk_c,
+        mac,
+    }
+}
 
 #[derive(Deserialize)]
 struct NotesResponse {
@@ -106,7 +167,7 @@ fn main() -> Result<()> {
         .context("Invalid OUT1_VALUE")?;
     let rho: Hash32 = decode_hash32_env("OUT1_RHO")?;
     let spend_sk: Hash32 = decode_hash32_env("OUT1_SPEND_SK")?;
-    let spend_pk: Hash32 = pk_from_sk(&spend_sk);
+    let _spend_pk: Hash32 = pk_from_sk(&spend_sk);
     let withdraw_amount: u128 = std::env::var("WITHDRAW_AMOUNT")
         .with_context(|| "Missing env var WITHDRAW_AMOUNT")?
         .parse()
@@ -229,7 +290,7 @@ fn main() -> Result<()> {
 
     let public_output = SpendPublic {
         anchor_root: anchor,
-        // Filled after fetching deny-map openings (defaults to all-allowed when NODE_API_URL is unset).
+        // Filled after fetching deny-map openings.
         blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount,
@@ -278,9 +339,8 @@ fn main() -> Result<()> {
     } else {
         vec![sender_addr]
     };
-    let node_url = std::env::var("NODE_API_URL").ok();
     let (blacklist_root, deny_openings) =
-        note_spend_guest_v2::deny_map_openings_or_default(node_url.as_deref(), &addr_list)?;
+        note_spend_guest_v2::fetch_deny_map_openings(&node_url, &addr_list)?;
 
     let withdraw_to: Hash32 = if withdraw_amount_u64 == 0 {
         [0u8; 32]
@@ -288,7 +348,59 @@ fn main() -> Result<()> {
         note_spend_guest_v2::withdraw_to_from_address_bytes(to_addr.as_ref())?
     };
 
-    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2(
+    // Check for authority VFK and build viewer attestations if configured
+    let authority_vfk = note_spend_guest_v2::load_authority_vfk();
+    let (viewer_atts, view_attestations_pub, view_ciphertexts) = if let Some(vfk) = authority_vfk {
+        // Only create viewer attestations for the change output (if any)
+        if n_out == 1 {
+            let change_value_u64 = u64::try_from(change_value).context("Change value too large")?;
+            let change_recipient: Hash32 = recipient_from_pk_v2(
+                &domain,
+                &change_pk_spend.expect("change_pk_spend"),
+                &change_pk_ivk.expect("change_pk_ivk"),
+            );
+            let change_cm = cm_change.expect("cm_change");
+
+            println!("Authority VFK configured: generating viewer attestation for change output");
+
+            let att = note_spend_guest_v2::make_viewer_attestation(
+                &vfk,
+                &domain,
+                change_value_u64,
+                &change_rho.expect("change_rho"),
+                &change_recipient,
+                &in_recipient, // sender_id_out is the spender's identity
+                &change_cm,
+            );
+
+            let va = ViewAttestation {
+                cm: change_cm,
+                fvk_commitment: att.fvk_commitment,
+                ct_hash: att.ct_hash,
+                mac: att.mac,
+            };
+
+            let enc = create_encrypted_note(
+                &vfk,
+                &domain,
+                change_value_u64,
+                &change_rho.expect("change_rho"),
+                &change_recipient,
+                &in_recipient,
+                &change_cm,
+            );
+
+            (Some(vec![att]), Some(vec![va]), Some(vec![enc]))
+        } else {
+            println!("No change output (full withdrawal): no viewer attestation needed");
+            (None, None, None)
+        }
+    } else {
+        println!("No authority VFK configured: withdrawal will not include viewer attestation");
+        (None, None, None)
+    };
+
+    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2_with_viewer(
         domain,
         spend_sk,
         pk_ivk_owner,
@@ -300,6 +412,8 @@ fn main() -> Result<()> {
         &outputs,
         blacklist_root,
         &deny_openings,
+        authority_vfk,
+        viewer_atts.as_deref(),
     )?;
 
     let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
@@ -309,6 +423,7 @@ fn main() -> Result<()> {
 
     let mut public_output = public_output;
     public_output.blacklist_root = blacklist_root;
+    public_output.view_attestations = view_attestations_pub;
     host.set_public_output(&public_output)?;
 
     println!("Generating proof...");
@@ -330,7 +445,7 @@ fn main() -> Result<()> {
         nullifier: nf,
         withdraw_amount,
         to: to_addr,
-        view_ciphertexts: None,
+        view_ciphertexts,
         gas: None,
     });
 
