@@ -127,7 +127,7 @@ fn encode_note_plain(
 /// Create a viewer attestation for a note (matching `make_viewer_bundle` in mcp-external).
 ///
 /// # Arguments
-/// * `vfk` - The Full Viewing Key (32-byte secret)
+/// * `fvk` - The Full Viewing Key (32-byte secret)
 /// * `domain` - The note domain
 /// * `value` - The token amount (as u64)
 /// * `rho` - The note randomness
@@ -138,7 +138,7 @@ fn encode_note_plain(
 /// # Returns
 /// A ViewerAttestationV2 containing the attestation data for the ZK proof
 pub fn make_viewer_attestation(
-    vfk: &Hash32,
+    fvk: &Hash32,
     domain: &Hash32,
     value: u64,
     rho: &Hash32,
@@ -146,31 +146,31 @@ pub fn make_viewer_attestation(
     sender_id: &Hash32,
     cm: &Hash32,
 ) -> ViewerAttestationV2 {
-    let vfk_obj = FullViewingKey(*vfk);
-    let vfk_c = fvk_commitment(&vfk_obj);
+    let fvk_obj = FullViewingKey(*fvk);
+    let fvk_c = fvk_commitment(&fvk_obj);
     let pt = encode_note_plain(domain, value, rho, recipient, sender_id);
-    let k = view_kdf(&vfk_obj, cm);
+    let k = view_kdf(&fvk_obj, cm);
     let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
     stream_xor_encrypt(&k, &pt, &mut ct);
     let ct_h = ct_hash(&ct);
     let mac = view_mac(&k, cm, &ct_h);
 
     ViewerAttestationV2 {
-        fvk_commitment: vfk_c,
+        fvk_commitment: fvk_c,
         ct_hash: ct_h,
         mac,
     }
 }
 
-/// Load authority viewing key from environment variable AUTHORITY_VFK.
+/// Load authority viewing key from environment variable AUTHORITY_FVK.
 ///
 /// Accepts hex strings with or without `0x` prefix.
 /// Returns `None` if:
 /// - Environment variable is not set
 /// - Hex decoding fails
 /// - Length is not exactly 32 bytes
-pub fn load_authority_vfk() -> Option<Hash32> {
-    let raw = std::env::var("AUTHORITY_VFK").ok()?;
+pub fn load_authority_fvk() -> Option<Hash32> {
+    let raw = std::env::var("AUTHORITY_FVK").ok()?;
     let s = raw.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes = match hex::decode(s) {
@@ -312,7 +312,7 @@ pub fn withdraw_to_from_address_bytes(addr_bytes: &[u8]) -> Result<Hash32> {
 
 /// Build note spend arguments with viewer support.
 ///
-/// When `authority_vfk` and `view_attestations` are provided, the viewer section
+/// When `authority_fvk` and `view_attestations` are provided, the viewer section
 /// is appended to the arguments (matching `transfer.rs` in mcp-external).
 #[allow(dead_code)]
 pub fn build_note_spend_args_v2(
@@ -360,7 +360,7 @@ pub fn build_note_spend_args_v2_with_viewer(
     outputs: &[SpendOutputV2],
     blacklist_root: Hash32,
     deny_map_openings: &[DenyMapOpeningV2],
-    authority_vfk: Option<Hash32>,
+    authority_fvk: Option<Hash32>,
     view_attestations: Option<&[ViewerAttestationV2]>,
 ) -> Result<(Vec<serde_json::Value>, Vec<usize>)> {
     let depth_usize = depth as usize;
@@ -497,12 +497,12 @@ pub fn build_note_spend_args_v2_with_viewer(
 
     // === Viewer section arguments (Level B) ===
     //
-    // If authority VFK is configured, append viewer arguments:
+    // If authority FVK is configured, append viewer arguments:
     //   - n_viewers (PUBLIC)
     //   - fvk_commitment (PUBLIC)
     //   - fvk (PRIVATE)
     //   - for each output: ct_hash (PUBLIC), mac (PUBLIC)
-    if let (Some(vfk), Some(atts)) = (authority_vfk, view_attestations) {
+    if let (Some(fvk), Some(atts)) = (authority_fvk, view_attestations) {
         let n_out = outputs.len();
         anyhow::ensure!(
             atts.len() >= n_out,
@@ -517,7 +517,7 @@ pub fn build_note_spend_args_v2_with_viewer(
         let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
         push(json!({ "hex": hex32(&fvk_commitment) }), false);
         // fvk (private)
-        push(json!({ "hex": hex32(&vfk) }), true);
+        push(json!({ "hex": hex32(&fvk) }), true);
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
             push(json!({ "hex": hex32(&att.ct_hash) }), false);

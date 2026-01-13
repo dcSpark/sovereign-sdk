@@ -1,5 +1,5 @@
 use crate::db::{list_wallet_txs_direct, list_wallet_txs_sync, CursorInner, ListResponse};
-use crate::viewer::{self, VfkRegistry};
+use crate::viewer::{self, FvkRegistry};
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
@@ -18,8 +18,8 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: DatabaseConnection,
     pub mode: Mode,
-    /// VFK registry using DashMap for lock-free concurrent access
-    pub vfk_registry: Arc<VfkRegistry>,
+    /// FVK registry using DashMap for lock-free concurrent access
+    pub fvk_registry: Arc<FvkRegistry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +54,9 @@ pub fn router(state: AppState) -> Router {
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
         .route("/health", get(health))
-        // VFK registry management endpoints
-        .route("/vfks", get(list_vfks).post(add_vfk))
-        .route("/vfks/:fvk_commitment", delete(delete_vfk))
+        // FVK registry management endpoints
+        .route("/fvks", get(list_fvks).post(add_fvk))
+        .route("/fvks/:fvk_commitment", delete(delete_fvk))
         .with_state(state)
 }
 
@@ -129,39 +129,39 @@ async fn list_txs(
     }
 }
 
-// ============== VFK Registry Management ==============
+// ============== FVK Registry Management ==============
 
-/// Request body for adding a new VFK
+/// Request body for adding a new FVK
 #[derive(Debug, Deserialize)]
-pub struct AddVfkRequest {
-    /// The VFK as hex string (32 bytes = 64 hex chars)
-    pub vfk: String,
+pub struct AddFvkRequest {
+    /// The FVK as hex string (32 bytes = 64 hex chars)
+    pub fvk: String,
     /// Optional: expected fvk_commitment (hex) - if provided, we verify it matches
     #[serde(default)]
     pub fvk_commitment: Option<String>,
-    /// The shielded address associated with this VFK (optional)
+    /// The shielded address associated with this FVK (optional)
     #[serde(default)]
     pub shielded_address: Option<String>,
 }
 
-/// Response for VFK operations
+/// Response for FVK operations
 #[derive(Debug, Serialize)]
-pub struct VfkResponse {
+pub struct FvkResponse {
     pub fvk_commitment: String,
-    pub vfk: String,
+    pub fvk: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shielded_address: Option<String>,
 }
 
-/// List all VFKs in the registry
-async fn list_vfks(State(state): State<AppState>) -> impl IntoResponse {
-    let vfks: Vec<VfkResponse> = state
-        .vfk_registry
+/// List all FVKs in the registry
+async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
+    let fvks: Vec<FvkResponse> = state
+        .fvk_registry
         .entries()
         .into_iter()
-        .map(|(commitment, vfk, addr)| VfkResponse {
+        .map(|(commitment, fvk, addr)| FvkResponse {
             fvk_commitment: commitment,
-            vfk: hex::encode(vfk),
+            fvk: hex::encode(fvk),
             shielded_address: addr,
         })
         .collect();
@@ -169,32 +169,32 @@ async fn list_vfks(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": vfks.len(),
-            "vfks": vfks
+            "count": fvks.len(),
+            "fvks": fvks
         })),
     )
 }
 
-/// Add a new VFK to the registry
-async fn add_vfk(
+/// Add a new FVK to the registry
+async fn add_fvk(
     State(state): State<AppState>,
-    Json(req): Json<AddVfkRequest>,
+    Json(req): Json<AddFvkRequest>,
 ) -> impl IntoResponse {
-    // Parse the VFK
-    let vfk = match viewer::parse_vfk_hex(&req.vfk) {
+    // Parse the FVK
+    let fvk = match viewer::parse_fvk_hex(&req.fvk) {
         Ok(v) => v,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid VFK: {}", e)})),
+                Json(serde_json::json!({"error": format!("Invalid FVK: {}", e)})),
             )
                 .into_response();
         }
     };
 
-    // Compute the commitment from the VFK
-    let vfk_obj = midnight_privacy::FullViewingKey(vfk);
-    let commitment = midnight_privacy::viewing::fvk_commitment(&vfk_obj);
+    // Compute the commitment from the FVK
+    let fvk_obj = midnight_privacy::FullViewingKey(fvk);
+    let commitment = midnight_privacy::viewing::fvk_commitment(&fvk_obj);
     let commitment_hex = hex::encode(commitment);
 
     // If user provided an expected fvk_commitment, verify it matches
@@ -211,49 +211,49 @@ async fn add_vfk(
                     "error": "fvk_commitment mismatch",
                     "expected": expected_normalized,
                     "computed": commitment_hex,
-                    "message": "The provided fvk_commitment does not match the commitment computed from the VFK"
+                    "message": "The provided fvk_commitment does not match the commitment computed from the FVK"
                 })),
             )
                 .into_response();
         }
     }
 
-    // Check if this VFK already exists in the registry
-    if state.vfk_registry.get_vfk(&commitment_hex).is_some() {
+    // Check if this FVK already exists in the registry
+    if state.fvk_registry.get_fvk(&commitment_hex).is_some() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": "VFK already exists",
+                "error": "FVK already exists",
                 "fvk_commitment": commitment_hex,
-                "message": "A VFK with this commitment is already registered"
+                "message": "A FVK with this commitment is already registered"
             })),
         )
             .into_response();
     }
 
     // Add to registry (DashMap - no lock needed)
-    state.vfk_registry.add(vfk, req.shielded_address.clone());
+    state.fvk_registry.add(fvk, req.shielded_address.clone());
 
     // Persist to database
-    if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {
-        tracing::warn!("Failed to persist VFK to database: {}", e);
+    if let Err(e) = state.fvk_registry.save_to_db(&state.db).await {
+        tracing::warn!("Failed to persist FVK to database: {}", e);
     }
 
-    tracing::info!("Added VFK with commitment {}", &commitment_hex[..16]);
+    tracing::info!("Added FVK with commitment {}", &commitment_hex[..16]);
 
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "success": true,
             "fvk_commitment": commitment_hex,
-            "message": "VFK added and verified successfully"
+            "message": "FVK added and verified successfully"
         })),
     )
         .into_response()
 }
 
-/// Delete a VFK from the registry
-async fn delete_vfk(
+/// Delete a FVK from the registry
+async fn delete_fvk(
     Path(fvk_commitment): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -261,25 +261,25 @@ async fn delete_vfk(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // Check if it exists and remove (DashMap - no lock needed)
-    if !state.vfk_registry.remove(&fvk_commitment) {
+    if !state.fvk_registry.remove(&fvk_commitment) {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "VFK not found"})),
+            Json(serde_json::json!({"error": "FVK not found"})),
         )
             .into_response();
     }
 
     // Remove from database
-    if let Err(e) = idx::vfk_registry::Entity::delete_many()
-        .filter(idx::vfk_registry::Column::FvkCommitment.eq(&fvk_commitment))
+    if let Err(e) = idx::fvk_registry::Entity::delete_many()
+        .filter(idx::fvk_registry::Column::FvkCommitment.eq(&fvk_commitment))
         .exec(&state.db)
         .await
     {
-        tracing::warn!("Failed to delete VFK from database: {}", e);
+        tracing::warn!("Failed to delete FVK from database: {}", e);
     }
 
     tracing::info!(
-        "Deleted VFK with commitment {}",
+        "Deleted FVK with commitment {}",
         &fvk_commitment[..16.min(fvk_commitment.len())]
     );
 
@@ -287,7 +287,7 @@ async fn delete_vfk(
         StatusCode::OK,
         Json(serde_json::json!({
             "success": true,
-            "message": "VFK deleted successfully"
+            "message": "FVK deleted successfully"
         })),
     )
         .into_response()

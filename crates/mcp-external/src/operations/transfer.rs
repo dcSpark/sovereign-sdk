@@ -445,7 +445,7 @@ pub async fn transfer(
     input_sender_id: Hash32,
     destination_pk_spend: Hash32,
     destination_pk_ivk: Hash32,
-    authority_vfk: Option<[u8; 32]>,
+    authority_fvk: Option<[u8; 32]>,
 ) -> Result<TransferResult> {
     // Validate amounts
     if send_amount == 0 {
@@ -571,15 +571,15 @@ pub async fn transfer(
     let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
     let nf = nullifier(&DOMAIN, &nf_key, &input_rho);
 
-    // Step 4b: Create viewer bundles if authority VFK is provided
-    let (view_attestations, view_ciphertexts) = if let Some(vfk) = authority_vfk {
+    // Step 4b: Create viewer bundles if authority FVK is provided
+    let (view_attestations, view_ciphertexts) = if let Some(fvk) = authority_fvk {
         tracing::info!(
-            "Authority VFK configured: generating viewer attestations for {} output(s)",
+            "Authority FVK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
 
         let (att_0, enc_0) = viewer::make_viewer_bundle(
-            &vfk,
+            &fvk,
             &DOMAIN,
             send_amount,
             &out_rho_0,
@@ -590,7 +590,7 @@ pub async fn transfer(
 
         if has_change {
             let (att_1, enc_1) = viewer::make_viewer_bundle(
-                &vfk,
+                &fvk,
                 &DOMAIN,
                 change_amount,
                 out_rho_1.as_ref().unwrap(),
@@ -604,7 +604,7 @@ pub async fn transfer(
         }
     } else {
         tracing::debug!(
-            "No authority VFK configured: transfer will not include viewer attestation"
+            "No authority FVK configured: transfer will not include viewer attestation"
         );
         (None, None)
     };
@@ -992,8 +992,8 @@ pub async fn transfer(
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
 
-    // Viewer section arguments (Level B) if authority VFK is configured.
-    if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
+    // Viewer section arguments (Level B) if authority FVK is configured.
+    if let (Some(fvk), Some(ref atts)) = (authority_fvk, &view_attestations) {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -1005,7 +1005,7 @@ pub async fn transfer(
         let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
         push(arg32(&fvk_commitment), false, &mut private_indices, &mut proof_args);
         // fvk (private)
-        push(arg32(&vfk), true, &mut private_indices, &mut proof_args);
+        push(arg32(&fvk), true, &mut private_indices, &mut proof_args);
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
             push(arg32(&att.ct_hash), false, &mut private_indices, &mut proof_args);

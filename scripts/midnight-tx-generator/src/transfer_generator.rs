@@ -29,7 +29,7 @@ const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
 
 /// Helper to create an EncryptedNote for the transaction (matching mcp-external/viewer.rs)
 fn create_encrypted_note(
-    vfk: &Hash32,
+    fvk: &Hash32,
     domain: &Hash32,
     value: u64,
     rho: &Hash32,
@@ -40,8 +40,8 @@ fn create_encrypted_note(
     use midnight_privacy::viewing::{ct_hash, fvk_commitment, view_kdf, view_mac};
     use midnight_privacy::FullViewingKey;
 
-    let vfk_obj = FullViewingKey(*vfk);
-    let vfk_c = fvk_commitment(&vfk_obj);
+    let fvk_obj = FullViewingKey(*fvk);
+    let fvk_c = fvk_commitment(&fvk_obj);
 
     // Encode plaintext
     let mut pt = [0u8; NOTE_PLAIN_LEN_TRANSFER];
@@ -53,7 +53,7 @@ fn create_encrypted_note(
     pt[112..144].copy_from_slice(sender_id);
 
     // Encrypt with Poseidon-based keystream
-    let k = view_kdf(&vfk_obj, cm);
+    let k = view_kdf(&fvk_obj, cm);
     let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
 
     // Stream XOR encryption
@@ -80,7 +80,7 @@ fn create_encrypted_note(
         cm: *cm,
         nonce: [0u8; 24],
         ct: sov_modules_api::SafeVec::try_from(ct.to_vec()).expect("ciphertext within limit"),
-        fvk_commitment: vfk_c,
+        fvk_commitment: fvk_c,
         mac,
     }
 }
@@ -336,16 +336,16 @@ fn main() -> Result<()> {
     let (blacklist_root, deny_openings) =
         note_spend_guest_v2::fetch_deny_map_openings(&node_url, &addr_list)?;
 
-    // Check for authority VFK and build viewer attestations if configured
-    let authority_vfk = note_spend_guest_v2::load_authority_vfk();
-    let (viewer_atts, view_attestations_pub, view_ciphertexts) = if let Some(vfk) = authority_vfk {
-        println!("Authority VFK configured: generating viewer attestations for 2 output(s)");
+    // Check for authority FVK and build viewer attestations if configured
+    let authority_fvk = note_spend_guest_v2::load_authority_fvk();
+    let (viewer_atts, view_attestations_pub, view_ciphertexts) = if let Some(fvk) = authority_fvk {
+        println!("Authority FVK configured: generating viewer attestations for 2 output(s)");
 
         let out1_value_u64 = u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?;
         let out2_value_u64 = u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?;
 
         let att1 = note_spend_guest_v2::make_viewer_attestation(
-            &vfk,
+            &fvk,
             &domain,
             out1_value_u64,
             &out1_rho,
@@ -354,7 +354,7 @@ fn main() -> Result<()> {
             &cm_out1,
         );
         let att2 = note_spend_guest_v2::make_viewer_attestation(
-            &vfk,
+            &fvk,
             &domain,
             out2_value_u64,
             &out2_rho,
@@ -378,8 +378,8 @@ fn main() -> Result<()> {
         };
 
         // Create EncryptedNote entries for the transaction
-        let enc1 = create_encrypted_note(&vfk, &domain, out1_value_u64, &out1_rho, &out1_recipient, &sender_id_out, &cm_out1);
-        let enc2 = create_encrypted_note(&vfk, &domain, out2_value_u64, &out2_rho, &out2_recipient, &sender_id_out, &cm_out2);
+        let enc1 = create_encrypted_note(&fvk, &domain, out1_value_u64, &out1_rho, &out1_recipient, &sender_id_out, &cm_out1);
+        let enc2 = create_encrypted_note(&fvk, &domain, out2_value_u64, &out2_rho, &out2_recipient, &sender_id_out, &cm_out2);
 
         (
             Some(vec![att1, att2]),
@@ -387,7 +387,7 @@ fn main() -> Result<()> {
             Some(vec![enc1, enc2]),
         )
     } else {
-        println!("No authority VFK configured: transfer will not include viewer attestation");
+        println!("No authority FVK configured: transfer will not include viewer attestation");
         (None, None, None)
     };
 
@@ -403,7 +403,7 @@ fn main() -> Result<()> {
         &[out1, out2],
         blacklist_root,
         &deny_openings,
-        authority_vfk,
+        authority_fvk,
         viewer_atts.as_deref(),
     )?;
 

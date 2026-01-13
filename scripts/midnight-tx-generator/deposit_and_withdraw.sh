@@ -100,10 +100,10 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-50}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
-# Optional: Authority VFK for Level-B viewing (32 bytes hex, with or without 0x prefix)
+# Optional: Authority FVK for Level-B viewing (32 bytes hex, with or without 0x prefix)
 # If set, proofs will include viewer attestations that allow authorities to decrypt notes
-# Example: AUTHORITY_VFK=0x0102030405060708091011121314151617181920212223242526272829303132
-AUTHORITY_VFK="${AUTHORITY_VFK:-}"
+# Example: AUTHORITY_FVK=0x0102030405060708091011121314151617181920212223242526272829303132
+AUTHORITY_FVK="${AUTHORITY_FVK:-}"
 
 # Optional: fund the sender before shielded deposit (uses bank transfer via seq HTTP API)
 FUNDER_KEY_FILE="${FUNDER_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
@@ -119,8 +119,8 @@ echo "  Withdraw: $WITHDRAW_AMOUNT"
 echo "  Change: $((DEPOSIT_AMOUNT - WITHDRAW_AMOUNT)) (stays shielded)"
 echo "  Nonce: $NONCE"
 echo "  Proof Verifier: $VERIFIER_ENDPOINT"
-if [ -n "$AUTHORITY_VFK" ]; then
-    echo "  Authority VFK: ${AUTHORITY_VFK:0:16}... (Level-B viewing enabled)"
+if [ -n "$AUTHORITY_FVK" ]; then
+    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
 fi
 echo ""
 
@@ -244,10 +244,10 @@ cd "$REPO_ROOT"
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
-# Export authority VFK if configured (for Level-B viewing support)
-if [ -n "$AUTHORITY_VFK" ]; then
-    export AUTHORITY_VFK
-    echo "  Authority VFK: ${AUTHORITY_VFK:0:16}... (Level-B viewing enabled)"
+# Export authority FVK if configured (for Level-B viewing support)
+if [ -n "$AUTHORITY_FVK" ]; then
+    export AUTHORITY_FVK
+    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
 fi
 
 # Map deposit note details into withdraw-generator inputs
