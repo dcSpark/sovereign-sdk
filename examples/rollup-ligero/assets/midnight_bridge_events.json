@@ -1,12 +1,18 @@
 [
   {
-    "id": "evt-bridge-001",
+    "sender": "0x00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "recipient": "0xfedcba98765432100123456789abcdef00112233445566778899aabbccddeeff",
     "amount": "2500000",
-    "recipient": "sov10d6chuh8vu86ltmt7qq4ec8lt25qyvr0cl3lg4mzs5llcfnx69m"
+    "nonce": 1,
+    "gas_limit": 75000,
+    "data_hash": "0x8a8b8c8d8e8f90919293949596979899000102030405060708090a0b0c0d0e0f"
   },
   {
-    "id": "evt-bridge-002",
+    "sender": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "recipient": "0x2222222222222222222222222222222222222222222222222222222222222222",
     "amount": "1000000",
-    "recipient": "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+    "nonce": 2,
+    "gas_limit": 60000,
+    "data_hash": "0x3333333333333333333333333333333333333333333333333333333333333333"
   }
 ]
