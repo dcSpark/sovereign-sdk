@@ -23,6 +23,7 @@ use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProv
 use sov_stf_runner::RollupConfig;
 
 use crate::eth_dev_signer;
+use crate::midnight_bridge::spawn_midnight_bridge;
 
 /// Rollup with a [`ConfigurableSpec`] with [`MidnightDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
 #[derive(Default)]
@@ -105,17 +106,27 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         Seq: Sequencer<Spec = Self::Spec, Rt = Self::Runtime, Da = Self::DaService>,
     {
         let eth_signer = eth_dev_signer();
+        let extension = rollup_config.extension_or_panic();
         let eth_rpc_config = EthRpcConfig {
             eth_signer,
-            extension: rollup_config.extension_or_panic(),
+            extension: extension.clone(),
             buffer_raw_txs: true,
         };
 
-        Ok(NodeEndpoints {
-            jsonrpsee_module: sov_ethereum::get_ethereum_rpc(eth_rpc_config, sequencer)
-                .remove_context(),
+        let mut endpoints = NodeEndpoints {
+            jsonrpsee_module: sov_ethereum::get_ethereum_rpc(
+                eth_rpc_config,
+                Arc::clone(&sequencer),
+            )
+            .remove_context(),
             ..Default::default()
-        })
+        };
+
+        if let Some(handle) = spawn_midnight_bridge(Arc::clone(&sequencer), &extension)? {
+            endpoints.background_handles.push(handle);
+        }
+
+        Ok(endpoints)
     }
 
     async fn create_da_service(

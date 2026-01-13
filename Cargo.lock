@@ -13202,6 +13202,7 @@ dependencies = [
  "sov-db",
  "sov-eth-client",
  "sov-ethereum",
+ "sov-evm",
  "sov-kernels",
  "sov-ligero-adapter",
  "sov-metrics",
