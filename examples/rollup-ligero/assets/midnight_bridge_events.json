@@ -1,0 +1,12 @@
+[
+  {
+    "id": "evt-bridge-001",
+    "amount": "2500000",
+    "recipient": "sov10d6chuh8vu86ltmt7qq4ec8lt25qyvr0cl3lg4mzs5llcfnx69m"
+  },
+  {
+    "id": "evt-bridge-002",
+    "amount": "1000000",
+    "recipient": "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+  }
+]

@@ -21,6 +21,7 @@ const SENDER_PRIV_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5ef
 
 pub(crate) const EVM_EXTENSION: SeqConfigExtension = SeqConfigExtension {
     max_log_limit: 20000,
+    midnight_bridge: None,
 };
 
 /// Starts test rollup node.  

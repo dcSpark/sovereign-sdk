@@ -6,7 +6,7 @@ use anyhow::Context;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::Router;
 use tokio::process::Command;
 use tokio::sync::Mutex;
