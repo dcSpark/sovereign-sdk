@@ -55,9 +55,9 @@ pub struct MidnightBridgeSettings {
     /// Timeout (in milliseconds) for requests to the Midnight indexer.
     #[serde(default = "default_indexer_timeout_ms")]
     pub indexer_timeout_ms: u64,
-    /// Optional chain deposit index to start processing from (defaults to the latest index on startup).
-    #[serde(default)]
-    pub start_index: Option<u64>,
+    /// Optional chain deposit index to start processing from (defaults to zero).
+    #[serde(default = "default_start_deposit_index")]
+    pub start_deposit_index: Option<u64>,
 }
 
 const fn default_bridge_poll_interval_ms() -> u64 {
@@ -70,6 +70,10 @@ const fn default_bridge_max_fee() -> u64 {
 
 const fn default_indexer_timeout_ms() -> u64 {
     30_000
+}
+
+const fn default_start_deposit_index() -> Option<u64> {
+    Some(0)
 }
 
 /// Sequencer configuration.

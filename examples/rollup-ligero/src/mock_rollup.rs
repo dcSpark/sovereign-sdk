@@ -21,9 +21,10 @@ use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
 use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
 use sov_stf_runner::RollupConfig;
+use tracing::warn;
 
 use crate::eth_dev_signer;
-use crate::midnight_bridge::spawn_midnight_bridge;
+use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
 
 /// Rollup with a [`ConfigurableSpec`] with [`MidnightDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
 #[derive(Default)]
@@ -122,7 +123,25 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             ..Default::default()
         };
 
-        if let Some(handle) = spawn_midnight_bridge(Arc::clone(&sequencer), &extension)? {
+        let cursor_store = if extension.midnight_bridge.is_some() {
+            match BridgeCursorStore::open(&rollup_config.storage.path) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    warn!(
+                        error = ?err,
+                        path = %rollup_config.storage.path.display(),
+                        "Midnight bridge cursor persistence disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(handle) =
+            spawn_midnight_bridge(Arc::clone(&sequencer), &extension, cursor_store)?
+        {
             endpoints.background_handles.push(handle);
         }
 
