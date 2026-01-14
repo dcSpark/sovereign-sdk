@@ -106,6 +106,9 @@ max_log_limit = 20000
 # [sequencer.extension.midnight_bridge]
 [sequencer.extension.midnight_bridge]
 signing_key_path = "demo_data/midnight_bridge_signer.json" # JSON PrivateKeyAndAddress
-mock_events_path = "demo_data/midnight_bridge_events.json" # Array of deposit objects
+# mock_events_path = "demo_data/midnight_bridge_events.json" # Uncomment for offline testing
+indexer_http = "https://indexer.preview.midnight.network/api/v3/graphql"
+contract_address = "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12"
+indexer_timeout_ms = 30000
 poll_interval_ms = 1000
 max_fee = 1000000

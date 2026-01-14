@@ -93,6 +93,10 @@ tiny_http = "0.12"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # ligero-runner for the prover service binary
 ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
+midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+base_crypto = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2", package = "midnight-base-crypto" }
 
 [dev-dependencies]
 sov-eth-client = { workspace = true }

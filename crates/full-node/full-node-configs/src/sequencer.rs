@@ -37,6 +37,12 @@ pub struct MidnightBridgeSettings {
     /// Optional JSON file containing mock ingress events for the bridge to consume.
     #[serde(default)]
     pub mock_events_path: Option<PathBuf>,
+    /// HTTP endpoint for the Midnight indexer GraphQL API.
+    #[serde(default)]
+    pub indexer_http: Option<String>,
+    /// Bridge contract address on Midnight (64 hex characters).
+    #[serde(default)]
+    pub contract_address: Option<String>,
     /// How often (in milliseconds) the mock event source should be polled.
     #[serde(default = "default_bridge_poll_interval_ms")]
     pub poll_interval_ms: u64,
@@ -46,6 +52,12 @@ pub struct MidnightBridgeSettings {
     /// Maximum fee (in gas token units) that the bridge will attach to generated transactions.
     #[serde(default = "default_bridge_max_fee")]
     pub max_fee: u64,
+    /// Timeout (in milliseconds) for requests to the Midnight indexer.
+    #[serde(default = "default_indexer_timeout_ms")]
+    pub indexer_timeout_ms: u64,
+    /// Optional chain deposit index to start processing from (defaults to the latest index on startup).
+    #[serde(default)]
+    pub start_index: Option<u64>,
 }
 
 const fn default_bridge_poll_interval_ms() -> u64 {
@@ -54,6 +66,10 @@ const fn default_bridge_poll_interval_ms() -> u64 {
 
 const fn default_bridge_max_fee() -> u64 {
     1_000_000
+}
+
+const fn default_indexer_timeout_ms() -> u64 {
+    30_000
 }
 
 /// Sequencer configuration.
