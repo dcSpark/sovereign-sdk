@@ -89,6 +89,10 @@ rand = { workspace = true }
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 bincode = { workspace = true }
 toml = { workspace = true }
+midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+base_crypto = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2", package = "midnight-base-crypto" }
 
 [dev-dependencies]
 sov-eth-client = { workspace = true }

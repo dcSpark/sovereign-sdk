@@ -13,6 +13,7 @@ use borsh::BorshDeserialize;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use full_node_configs::sequencer::SeqConfigExtension;
 use hex;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sov_bank::{config_gas_token_id, CallMessage as BankCallMessage, Coins, TokenId};
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -38,9 +39,50 @@ use tracing::{debug, info, warn};
 use crate::MockRollupSpec;
 use sov_modules_stf_blueprint::Runtime as StfRuntime;
 
+use crate::midnight_chain::MidnightIndexerClient;
+
 type BridgeSpec = MockRollupSpec<Native>;
 type BridgeRuntime = Runtime<BridgeSpec>;
 type BridgeAuthenticator = <BridgeRuntime as StfRuntime<BridgeSpec>>::Auth;
+
+struct BridgeConfig {
+    runtime: RuntimeBridgeSettings,
+    deposit_source: DepositSource,
+}
+
+enum DepositSource {
+    Mock(MockDepositSource),
+    Indexer(IndexerDepositSource),
+}
+
+struct MockDepositSource {
+    events_path: PathBuf,
+}
+
+impl MockDepositSource {
+    fn path(&self) -> &Path {
+        &self.events_path
+    }
+}
+
+struct IndexerDepositSource {
+    client: Arc<MidnightIndexerClient>,
+    start_index: Option<u64>,
+}
+
+impl IndexerDepositSource {
+    fn client(&self) -> &MidnightIndexerClient {
+        &self.client
+    }
+
+    fn start_index(&self) -> Option<u64> {
+        self.start_index
+    }
+
+    fn client_arc(&self) -> Arc<MidnightIndexerClient> {
+        Arc::clone(&self.client)
+    }
+}
 
 #[async_trait]
 pub(crate) trait BridgeSequencer: Send + Sync + 'static {
@@ -71,22 +113,40 @@ pub(crate) fn spawn_midnight_bridge<Seq>(
 where
     Seq: BridgeSequencer,
 {
-    let Some(settings) = load_runtime_settings(extension)? else {
+    let Some(config) = load_runtime_settings(extension)? else {
         debug!("Midnight bridge disabled");
         return Ok(None);
     };
 
-    info!(
-        poll_interval_ms = settings.poll_interval.as_millis() as u64,
-        path = %settings.events_path.display(),
-        "Starting Midnight bridge background task",
-    );
+    match &config.deposit_source {
+        DepositSource::Mock(mock) => {
+            info!(
+                poll_interval_ms = config.runtime.poll_interval.as_millis() as u64,
+                path = %mock.path().display(),
+                "Starting Midnight bridge background task (mock source)",
+            );
+        }
+        DepositSource::Indexer(indexer) => {
+            info!(
+                poll_interval_ms = config.runtime.poll_interval.as_millis() as u64,
+                indexer_http = %indexer.client().endpoint(),
+                contract_address = %indexer.client().contract_address(),
+                start_index = indexer.start_index(),
+                "Starting Midnight bridge background task (Midnight indexer source)",
+            );
+        }
+    }
 
-    let bridge = MidnightBridge::new(sequencer, settings);
+    let BridgeConfig {
+        runtime,
+        deposit_source,
+    } = config;
+
+    let bridge = MidnightBridge::new(sequencer, runtime, deposit_source);
     Ok(Some(tokio::spawn(async move { bridge.run().await })))
 }
 
-fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<RuntimeBridgeSettings>> {
+fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<BridgeConfig>> {
     let Some(raw) = extension.midnight_bridge.as_ref() else {
         info!("Midnight bridge disabled: missing `[sequencer.extension.midnight_bridge]` block");
         return Ok(None);
@@ -100,10 +160,6 @@ fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<Runtim
                     raw.signing_key_path.display()
                 )
             })?;
-
-    let events_path = raw.mock_events_path.clone().ok_or_else(|| {
-        anyhow!("mock_events_path must be provided when enabling the Midnight bridge")
-    })?;
 
     let token_id = if let Some(token_id_bech32) = &raw.token_id_bech32 {
         TokenId::from_str(token_id_bech32).with_context(|| {
@@ -123,19 +179,50 @@ fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<Runtim
 
     let poll_interval = Duration::from_millis(raw.poll_interval_ms.max(1));
 
-    Ok(Some(RuntimeBridgeSettings {
-        signing_key,
-        poll_interval,
-        events_path,
-        token_id,
-        max_fee,
+    let deposit_source = if let Some(path) = raw.mock_events_path.clone() {
+        DepositSource::Mock(MockDepositSource { events_path: path })
+    } else {
+        let indexer_http = raw.indexer_http.clone().ok_or_else(|| {
+            anyhow!("indexer_http must be provided when mock_events_path is not configured")
+        })?;
+        let contract_address = raw.contract_address.clone().ok_or_else(|| {
+            anyhow!("contract_address must be provided when mock_events_path is not configured")
+        })?;
+        validate_contract_address(&contract_address)?;
+
+        let timeout = Duration::from_millis(raw.indexer_timeout_ms.max(1));
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("Failed to build Midnight indexer HTTP client")?;
+
+        let start_index = raw.start_index;
+
+        let indexer = Arc::new(MidnightIndexerClient::new(
+            client,
+            indexer_http,
+            contract_address,
+        ));
+        DepositSource::Indexer(IndexerDepositSource {
+            client: indexer,
+            start_index,
+        })
+    };
+
+    Ok(Some(BridgeConfig {
+        runtime: RuntimeBridgeSettings {
+            signing_key,
+            poll_interval,
+            token_id,
+            max_fee,
+        },
+        deposit_source,
     }))
 }
 
 struct RuntimeBridgeSettings {
     signing_key: PrivateKeyAndAddress<BridgeSpec>,
     poll_interval: Duration,
-    events_path: PathBuf,
     token_id: TokenId,
     max_fee: Amount,
 }
@@ -143,45 +230,71 @@ struct RuntimeBridgeSettings {
 struct MidnightBridge<Seq> {
     sequencer: Arc<Seq>,
     settings: RuntimeBridgeSettings,
+    deposit_source: DepositSource,
     processed_event_ids: HashSet<String>,
     next_generation: u64,
     idle_notice_sent: bool,
+    next_chain_index: Option<u64>,
 }
 
 impl<Seq> MidnightBridge<Seq>
 where
     Seq: BridgeSequencer,
 {
-    fn new(sequencer: Arc<Seq>, settings: RuntimeBridgeSettings) -> Self {
+    fn new(
+        sequencer: Arc<Seq>,
+        settings: RuntimeBridgeSettings,
+        deposit_source: DepositSource,
+    ) -> Self {
+        let next_chain_index = match &deposit_source {
+            DepositSource::Indexer(source) => source.start_index(),
+            DepositSource::Mock(_) => None,
+        };
+
         Self {
             sequencer,
             settings,
+            deposit_source,
             processed_event_ids: HashSet::new(),
             next_generation: 0,
             idle_notice_sent: false,
+            next_chain_index,
         }
     }
 
     async fn run(mut self) -> Result<()> {
         let mut ticker = interval(self.settings.poll_interval);
+        enum PollRequest {
+            Mock(PathBuf),
+            Indexer(Arc<MidnightIndexerClient>),
+        }
         loop {
             ticker.tick().await;
-            match self.fetch_events().await {
-                Ok(events) => self.process_events(events).await,
-                Err(err) => warn!(error = ?err, "Midnight bridge failed to fetch events"),
+            let request = match &self.deposit_source {
+                DepositSource::Mock(source) => PollRequest::Mock(source.path().to_path_buf()),
+                DepositSource::Indexer(source) => PollRequest::Indexer(source.client_arc()),
+            };
+
+            let poll_result = match request {
+                PollRequest::Mock(path) => {
+                    let events = read_deposit_file(&path).await?;
+                    self.process_mock_events(events, &path).await;
+                    Ok(())
+                }
+                PollRequest::Indexer(client) => self.poll_chain(client.as_ref()).await,
+            };
+
+            if let Err(err) = poll_result {
+                warn!(error = ?err, "Midnight bridge failed to fetch deposits");
             }
         }
     }
 
-    async fn fetch_events(&self) -> Result<Vec<Deposit>> {
-        read_deposit_file(&self.settings.events_path).await
-    }
-
-    async fn process_events(&mut self, events: Vec<Deposit>) {
+    async fn process_mock_events(&mut self, events: Vec<Deposit>, events_path: &Path) {
         if events.is_empty() {
             if !self.idle_notice_sent {
                 info!(
-                    path = %self.settings.events_path.display(),
+                    path = %events_path.display(),
                     "Midnight bridge idle: no mock events detected",
                 );
                 self.idle_notice_sent = true;
@@ -204,7 +317,7 @@ where
                 continue;
             }
 
-            match self.submit_credit(&event_id, deposit).await {
+            match self.submit_credit(&event_id, deposit, None).await {
                 Ok(()) => {
                     self.processed_event_ids.insert(event_id);
                 }
@@ -220,7 +333,93 @@ where
         }
     }
 
-    async fn submit_credit(&mut self, event_id: &str, deposit: &Deposit) -> Result<()> {
+    async fn poll_chain(&mut self, client: &MidnightIndexerClient) -> Result<()> {
+        let snapshot = client.snapshot().await?;
+
+        let latest = snapshot.next_cross_domain_message_index;
+        let cursor = match self.next_chain_index {
+            Some(index) => index,
+            None => {
+                let start = latest.saturating_sub(1);
+                self.next_chain_index = Some(start);
+                info!(
+                    indexer_http = %client.endpoint(),
+                    contract_address = %client.contract_address(),
+                    latest_index = latest,
+                    start_index = start,
+                    "Midnight bridge synchronized cursor to Midnight deposits",
+                );
+                start
+            }
+        };
+
+        if cursor > latest {
+            warn!(
+                cursor = cursor,
+                latest = latest,
+                "Midnight bridge cursor ahead of on-chain index; rewinding",
+            );
+            self.next_chain_index = Some(latest);
+            return Ok(());
+        }
+
+        if cursor == latest {
+            if !self.idle_notice_sent {
+                info!(
+                    indexer_http = %client.endpoint(),
+                    contract_address = %client.contract_address(),
+                    cursor = cursor,
+                    "Midnight bridge idle: no new Midnight deposits",
+                );
+                self.idle_notice_sent = true;
+            }
+            return Ok(());
+        }
+
+        if let Err(details) = self.sequencer.readiness_status().await {
+            debug!(?details, "Midnight bridge waiting for sequencer readiness");
+            return Ok(());
+        }
+
+        self.idle_notice_sent = false;
+
+        for index in cursor..latest {
+            let deposit = match snapshot.deposits.get(&index) {
+                Some(deposit) => deposit,
+                None => {
+                    warn!(
+                        index = index,
+                        "Midnight bridge missing deposit for on-chain index"
+                    );
+                    self.next_chain_index = Some(index.saturating_add(1));
+                    continue;
+                }
+            };
+
+            let event_id = deposit.event_id();
+            if let Err(err) = self.submit_credit(&event_id, deposit, Some(index)).await {
+                warn!(
+                    event_id = %event_id,
+                    index = index,
+                    nonce = deposit.nonce,
+                    error = ?err,
+                    "Midnight bridge failed to submit credit for on-chain deposit",
+                );
+                break;
+            } else {
+                self.next_chain_index = Some(index.saturating_add(1));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn submit_credit(
+        &mut self,
+        event_id: &str,
+        deposit: &Deposit,
+        bridge_index: Option<u64>,
+    ) -> Result<()> {
         let tx = self.build_mint_transaction(deposit)?;
         let tx_for_debug = tx.clone();
         let tx_hash = self.sequencer.accept_bridge_tx(tx).await.map_err(|err| {
@@ -239,10 +438,12 @@ where
             tx_hash = ?tx_hash,
             amount = %amount,
             recipient = ?recipient_address,
+            recipient_bytes = %recipient_hex,
             sender = %sender_hex,
             nonce = deposit.nonce,
             gas_limit = deposit.gas_limit,
             data_hash = %data_hash_hex,
+            bridge_index,
             "Midnight bridge credited rollup funds",
         );
 
@@ -378,17 +579,17 @@ impl BridgeTxPayloadDiagnostics {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct Deposit {
+pub(crate) struct Deposit {
     #[serde(with = "hex_bytes")]
-    sender: [u8; 32],
+    pub(crate) sender: [u8; 32],
     #[serde(with = "hex_bytes")]
-    recipient: [u8; 32],
+    pub(crate) recipient: [u8; 32],
     #[serde(with = "u128_string")]
-    amount: u128,
-    nonce: u64,
-    gas_limit: u64,
+    pub(crate) amount: u128,
+    pub(crate) nonce: u64,
+    pub(crate) gas_limit: u64,
     #[serde(with = "hex_bytes")]
-    data_hash: [u8; 32],
+    pub(crate) data_hash: [u8; 32],
 }
 
 impl Deposit {
@@ -404,6 +605,13 @@ impl Deposit {
     fn recipient_address(&self) -> <BridgeSpec as Spec>::Address {
         <BridgeSpec as Spec>::Address::from(CredentialId::from(self.recipient))
     }
+}
+
+fn validate_contract_address(address: &str) -> Result<()> {
+    if address.len() != 64 || !address.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("contract address must be 64 lowercase hex chars"));
+    }
+    Ok(())
 }
 
 async fn read_deposit_file(path: &Path) -> Result<Vec<Deposit>> {
@@ -555,19 +763,25 @@ mod tests {
         let settings = RuntimeBridgeSettings {
             signing_key: PrivateKeyAndAddress::generate(),
             poll_interval: Duration::from_millis(10),
-            events_path: events_path.clone(),
             token_id: config_gas_token_id(),
             max_fee: Amount::from(1_000_000u64),
         };
 
         let sequencer = Arc::new(RecordingSequencer::default());
-        let mut bridge = MidnightBridge::new(Arc::clone(&sequencer), settings);
+        let deposit_source = DepositSource::Mock(MockDepositSource {
+            events_path: events_path.clone(),
+        });
+        let mut bridge = MidnightBridge::new(Arc::clone(&sequencer), settings, deposit_source);
 
-        let snapshot = bridge.fetch_events().await.unwrap();
+        let snapshot = read_deposit_file(&events_path).await.unwrap();
         assert_eq!(snapshot.len(), deposits.len());
 
-        bridge.process_events(snapshot.clone()).await;
-        bridge.process_events(snapshot.clone()).await;
+        bridge
+            .process_mock_events(snapshot.clone(), &events_path)
+            .await;
+        bridge
+            .process_mock_events(snapshot.clone(), &events_path)
+            .await;
 
         let accepted = sequencer.accepted().await;
         assert_eq!(accepted.len(), deposits.len());
@@ -605,16 +819,17 @@ mod tests {
         let settings = RuntimeBridgeSettings {
             signing_key,
             poll_interval: Duration::from_millis(10),
-            events_path: events_path.clone(),
             token_id: config_gas_token_id(),
             max_fee: Amount::from(1_000_000u64),
         };
 
         let sequencer = Arc::new(RecordingSequencer::default());
-        let mut bridge = MidnightBridge::new(sequencer, settings);
+        let deposit_source = DepositSource::Mock(MockDepositSource {
+            events_path: events_path.clone(),
+        });
+        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source);
 
-        let deposit = bridge
-            .fetch_events()
+        let deposit = read_deposit_file(&events_path)
             .await
             .expect("fixture events parse")
             .into_iter()
@@ -655,16 +870,17 @@ mod tests {
         let settings = RuntimeBridgeSettings {
             signing_key,
             poll_interval: Duration::from_millis(10),
-            events_path: events_path.clone(),
             token_id: config_gas_token_id(),
             max_fee: Amount::from(1_000_000u64),
         };
 
         let sequencer = Arc::new(RecordingSequencer::default());
-        let mut bridge = MidnightBridge::new(sequencer, settings);
+        let deposit_source = DepositSource::Mock(MockDepositSource {
+            events_path: events_path.clone(),
+        });
+        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source);
 
-        let deposit = bridge
-            .fetch_events()
+        let deposit = read_deposit_file(&events_path)
             .await
             .expect("fixture events parse")
             .into_iter()
