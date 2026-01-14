@@ -1,4 +1,3 @@
-use crate::midnight_bridge::Deposit;
 use anyhow::{anyhow, Context, Result};
 use base_crypto::fab::{AlignedValue, ValueAtom};
 use hex::FromHex;
@@ -27,14 +26,16 @@ state
 
 static SET_NORMAL_FORM_FLAG: Once = Once::new();
 
-pub(crate) struct MidnightIndexerClient {
+/// Client wrapper for querying the Midnight GraphQL indexer.
+pub struct MidnightIndexerClient {
     client: Client,
     endpoint: String,
     contract_address: String,
 }
 
 impl MidnightIndexerClient {
-    pub(crate) fn new(client: Client, endpoint: String, contract_address: String) -> Self {
+    /// Builds a client for the Midnight indexer GraphQL endpoint.
+    pub fn new(client: Client, endpoint: String, contract_address: String) -> Self {
         SET_NORMAL_FORM_FLAG.call_once(|| set_allow_non_normal_form_deserialization(true));
         Self {
             client,
@@ -43,15 +44,18 @@ impl MidnightIndexerClient {
         }
     }
 
-    pub(crate) fn endpoint(&self) -> &str {
+    /// Returns the configured GraphQL endpoint URL.
+    pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    pub(crate) fn contract_address(&self) -> &str {
+    /// Returns the Midnight contract address the client tracks.
+    pub fn contract_address(&self) -> &str {
         &self.contract_address
     }
 
-    pub(crate) async fn snapshot(&self) -> Result<BridgeContractSnapshot> {
+    /// Fetches and parses the latest Midnight bridge contract state snapshot.
+    pub async fn snapshot(&self) -> Result<BridgeContractSnapshot> {
         let state_bytes = self.fetch_contract_state().await?;
         let contract_state = deserialize_contract_state(&state_bytes)?;
         analyze_bridge_state(&contract_state)
@@ -103,9 +107,22 @@ impl MidnightIndexerClient {
     }
 }
 
-pub(crate) struct BridgeContractSnapshot {
+/// Raw deposit record extracted from the Midnight bridge contract state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidnightDeposit {
+    pub sender: [u8; 32],
+    pub recipient: [u8; 32],
+    pub amount: u128,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub data_hash: [u8; 32],
+}
+
+/// Snapshot of the Midnight bridge contract state tailored for rollup ingestion.
+#[derive(Debug, Clone)]
+pub struct BridgeContractSnapshot {
     pub next_cross_domain_message_index: u64,
-    pub deposits: BTreeMap<u64, Deposit>,
+    pub deposits: BTreeMap<u64, MidnightDeposit>,
 }
 
 fn analyze_bridge_state(state: &ContractState<InMemoryDB>) -> Result<BridgeContractSnapshot> {
@@ -219,7 +236,7 @@ fn is_deposit_map(value: &StateValue, allow_empty: bool) -> bool {
     has_deposit
 }
 
-fn extract_deposits(value: &StateValue) -> Result<BTreeMap<u64, Deposit>> {
+fn extract_deposits(value: &StateValue) -> Result<BTreeMap<u64, MidnightDeposit>> {
     match value {
         StateValue::Map(map) => {
             let mut result = BTreeMap::new();
@@ -236,7 +253,7 @@ fn extract_deposits(value: &StateValue) -> Result<BTreeMap<u64, Deposit>> {
     }
 }
 
-fn decode_deposit(value: &StateValue) -> Result<Option<Deposit>> {
+fn decode_deposit(value: &StateValue) -> Result<Option<MidnightDeposit>> {
     match value {
         StateValue::Array(fields) if fields.len() == 6 => {
             let mut elems = fields.iter();
@@ -276,7 +293,7 @@ fn decode_deposit(value: &StateValue) -> Result<Option<Deposit>> {
                     .ok_or_else(|| anyhow!("deposit missing data hash"))?
                     .deref(),
             )?;
-            Ok(Some(Deposit {
+            Ok(Some(MidnightDeposit {
                 sender,
                 recipient,
                 amount,
@@ -291,7 +308,7 @@ fn decode_deposit(value: &StateValue) -> Result<Option<Deposit>> {
     }
 }
 
-fn decode_deposit_cell(cell: &AlignedValue) -> Result<Option<Deposit>> {
+fn decode_deposit_cell(cell: &AlignedValue) -> Result<Option<MidnightDeposit>> {
     const EXPECTED_FIELDS: usize = 6;
     if cell.value.0.len() != EXPECTED_FIELDS {
         return Ok(None);
@@ -303,7 +320,7 @@ fn decode_deposit_cell(cell: &AlignedValue) -> Result<Option<Deposit>> {
     let nonce = decode_u64_atom(atoms.next().unwrap(), "nonce")?;
     let gas_limit = decode_u64_atom(atoms.next().unwrap(), "gas limit")?;
     let data_hash = decode_bytes_atom::<32>(atoms.next().unwrap(), "data hash")?;
-    Ok(Some(Deposit {
+    Ok(Some(MidnightDeposit {
         sender,
         recipient,
         amount,
@@ -408,3 +425,51 @@ struct ContractActionState {
 }
 
 type StateValue = midnight_onchain_state::state::StateValue<InMemoryDB>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use std::env;
+    use std::time::Duration;
+
+    const ENDPOINT_ENV: &str = "MIDNIGHT_INDEXER_ENDPOINT";
+    const CONTRACT_ENV: &str = "MIDNIGHT_CONTRACT_ADDRESS";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetches_real_snapshot_when_configured() -> Result<()> {
+        let (endpoint, contract) = match read_real_config() {
+            Some(values) => values,
+            None => {
+                eprintln!(
+                    "Skipping real Midnight indexer test. Set {} and {} to run it.",
+                    ENDPOINT_ENV, CONTRACT_ENV,
+                );
+                return Ok(());
+            }
+        };
+
+        let http = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("failed to build Midnight indexer HTTP client for test")?;
+
+        let client = MidnightIndexerClient::new(http, endpoint, contract);
+        let snapshot = client
+            .snapshot()
+            .await
+            .context("failed to fetch Midnight bridge snapshot")?;
+
+        assert!(snapshot.next_cross_domain_message_index >= snapshot.deposits.len() as u64);
+        Ok(())
+    }
+
+    fn read_real_config() -> Option<(String, String)> {
+        let endpoint = env::var(ENDPOINT_ENV).ok()?.trim().to_owned();
+        let contract = env::var(CONTRACT_ENV).ok()?.trim().to_owned();
+        if endpoint.is_empty() || contract.is_empty() {
+            return None;
+        }
+        Some((endpoint, contract))
+    }
+}

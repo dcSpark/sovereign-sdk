@@ -44,7 +44,7 @@ use rockbound::DB;
 use crate::MockRollupSpec;
 use sov_modules_stf_blueprint::Runtime as StfRuntime;
 
-use crate::midnight_chain::MidnightIndexerClient;
+use sov_midnight_adapter::{MidnightIndexerClient, MidnightDeposit};
 
 type BridgeSpec = MockRollupSpec<Native>;
 type BridgeRuntime = Runtime<BridgeSpec>;
@@ -510,7 +510,7 @@ where
 
         for index in cursor..latest {
             let deposit = match snapshot.deposits.get(&index) {
-                Some(deposit) => deposit,
+                Some(deposit) => Deposit::from(deposit),
                 None => {
                     warn!(
                         index = index,
@@ -522,7 +522,7 @@ where
             };
 
             let event_id = deposit.event_id();
-            if let Err(err) = self.submit_credit(&event_id, deposit, Some(index)).await {
+            if let Err(err) = self.submit_credit(&event_id, &deposit, Some(index)).await {
                 warn!(
                     event_id = %event_id,
                     index = index,
@@ -729,6 +729,19 @@ impl Deposit {
 
     fn recipient_address(&self) -> <BridgeSpec as Spec>::Address {
         <BridgeSpec as Spec>::Address::from(CredentialId::from(self.recipient))
+    }
+}
+
+impl From<&MidnightDeposit> for Deposit {
+    fn from(value: &MidnightDeposit) -> Self {
+        Self {
+            sender: value.sender,
+            recipient: value.recipient,
+            amount: value.amount,
+            nonce: value.nonce,
+            gas_limit: value.gas_limit,
+            data_hash: value.data_hash,
+        }
     }
 }
 
