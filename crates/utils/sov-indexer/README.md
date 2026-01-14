@@ -38,9 +38,10 @@ Quick start
    - Wallet balance: `POST /wallets/:address/balance`
      - `address`: bech32m privacy pool address (`privpool1...`)
      - JSON body:
-       - `spend_sk`: 32-byte hex spending secret key (required)
-       - `vfk`: 32-byte hex full viewing key (optional)
+      - `nf_key`: 32-byte hex nullifier key (required)
+      - `vfk`: 32-byte hex full viewing key (optional)
      - Returns `{ "balance": "...", "unspent_notes": [...] }`
+     - Note: the indexer cannot verify that `nf_key` matches the address.
 
 ## VFK Decryption (Optional)
 

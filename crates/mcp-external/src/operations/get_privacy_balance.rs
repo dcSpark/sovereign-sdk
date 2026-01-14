@@ -44,18 +44,18 @@ pub async fn get_privacy_balance(
         privacy_address
     );
 
-    // Get spend_sk from privacy key
-    let spend_sk = privacy_key
-        .spend_sk()
-        .ok_or_else(|| anyhow::anyhow!("Privacy key must have spend_sk to calculate balance"))?;
-    let spend_sk_hex = hex::encode(spend_sk);
+    // Derive nf_key from privacy key
+    let nf_key = privacy_key
+        .nf_key(&DOMAIN)
+        .ok_or_else(|| anyhow::anyhow!("Privacy key must have spend_sk to derive nf_key"))?;
+    let nf_key_hex = hex::encode(nf_key);
 
     // Get VFK as hex
     let vfk_hex = hex::encode(viewing_key.0);
 
     // Call the indexer's balance endpoint
     let balance_response = provider
-        .get_wallet_balance(&privacy_address, &spend_sk_hex, Some(&vfk_hex))
+        .get_wallet_balance(&privacy_address, None, Some(&nf_key_hex), Some(&vfk_hex))
         .await
         .context("Failed to fetch balance from indexer")?;
 

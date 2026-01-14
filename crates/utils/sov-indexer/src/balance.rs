@@ -6,10 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index_db as idx;
 use crate::viewer;
-use midnight_privacy::{
-    nullifier, nf_key_from_sk, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2, EncryptedNote,
-    Hash32, PrivacyAddress,
-};
+use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, PrivacyAddress};
 
 const DOMAIN: Hash32 = [1u8; 32];
 const LEGACY_NF_KEY: Hash32 = [4u8; 32];
@@ -17,7 +14,7 @@ const NULLIFIER_CHUNK_SIZE: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct BalanceRequest {
-    pub spend_sk: String,
+    pub nf_key: String,
     #[serde(default)]
     pub vfk: Option<String>,
 }
@@ -59,25 +56,15 @@ pub async fn get_wallet_balance(
     address: &str,
     req: BalanceRequest,
 ) -> Result<BalanceResponse> {
-    let spend_sk = parse_hash32_hex(&req.spend_sk, "spend_sk")?;
-    let pk_spend = pk_from_sk(&spend_sk);
-    let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
-    let derived_address = PrivacyAddress::from_keys(&pk_spend, &pk_ivk).to_string();
-
-    let normalized_address = address
+    let parsed_address = address
         .parse::<PrivacyAddress>()
-        .context("Invalid privacy address")?
-        .to_string();
-    if derived_address != normalized_address {
-        anyhow::bail!(
-            "Provided spend_sk does not match address {}",
-            address
-        );
-    }
-    let address = normalized_address;
+        .context("Invalid privacy address")?;
+    let nf_key = parse_hash32_hex(&req.nf_key, "nf_key")?;
 
+    let pk_spend = parsed_address.to_pk();
+    let pk_ivk = parsed_address.pk_ivk();
     let user_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend, &pk_ivk);
-    let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
+
     let vfk = match req.vfk {
         Some(vfk_hex) => Some(parse_hash32_hex(&vfk_hex, "vfk")?),
         None => None,

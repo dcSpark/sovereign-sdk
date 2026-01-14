@@ -489,7 +489,8 @@ impl Provider {
     ///
     /// # Parameters
     /// * `address` - Privacy address (bech32m format)
-    /// * `spend_sk_hex` - Spending secret key as hex string (with or without 0x prefix)
+    /// * `spend_sk_hex` - Optional spending secret key as hex string (with or without 0x prefix)
+    /// * `nf_key_hex` - Optional nullifier key as hex string (with or without 0x prefix)
     /// * `vfk_hex` - Optional viewing key for decrypting encrypted notes
     ///
     /// # Returns
@@ -497,7 +498,8 @@ impl Provider {
     pub async fn get_wallet_balance(
         &self,
         address: &str,
-        spend_sk_hex: &str,
+        spend_sk_hex: Option<&str>,
+        nf_key_hex: Option<&str>,
         vfk_hex: Option<&str>,
     ) -> Result<BalanceResponse> {
         let base_url = self.indexer_url.trim_end_matches('/');
@@ -505,10 +507,21 @@ impl Provider {
 
         // Build request body
         let mut body = serde_json::Map::new();
-        body.insert(
-            "spend_sk".to_string(),
-            serde_json::Value::String(spend_sk_hex.to_string()),
-        );
+        if let Some(spend_sk) = spend_sk_hex {
+            body.insert(
+                "spend_sk".to_string(),
+                serde_json::Value::String(spend_sk.to_string()),
+            );
+        }
+        if let Some(nf_key) = nf_key_hex {
+            body.insert(
+                "nf_key".to_string(),
+                serde_json::Value::String(nf_key.to_string()),
+            );
+        }
+        if body.is_empty() {
+            anyhow::bail!("spend_sk or nf_key is required to fetch wallet balance");
+        }
         if let Some(vfk) = vfk_hex {
             body.insert(
                 "vfk".to_string(),

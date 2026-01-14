@@ -124,7 +124,7 @@ fn is_balance_client_error(err: &anyhow::Error) -> bool {
     }
 
     let message = err.to_string();
-    message.contains("spend_sk")
+    message.contains("nf_key")
         || message.contains("vfk")
         || message.contains("Invalid privacy address")
         || message.contains("Expected 32-byte hex")

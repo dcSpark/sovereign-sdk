@@ -20,6 +20,7 @@ Configure the following environment variables:
 
 - `MCP_SERVER_BIND_ADDRESS` - Server bind address (default: `127.0.0.1:3000`)
 - `WALLET_PRIVATE_KEY` - Hex-encoded private key for wallet operations
+- `ADMIN_WALLET_PRIVATE_KEY` - Optional admin wallet private key used only to auto-fund newly created wallets
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
@@ -50,7 +51,7 @@ The server exposes the following MCP tools:
 - `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
-If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`), calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
 
 ### Local transaction store
 

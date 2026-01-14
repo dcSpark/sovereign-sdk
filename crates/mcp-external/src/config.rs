@@ -22,6 +22,11 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub wallet_private_key: String,
 
+    /// Admin wallet private key used for auto-funding newly created wallets (env: ADMIN_WALLET_PRIVATE_KEY, optional)
+    /// This key remains immutable and is not affected by restoreWallet.
+    #[serde(default)]
+    pub admin_wallet_private_key: Option<String>,
+
     /// Sovereign SDK rollup RPC endpoint (env: ROLLUP_RPC_URL, required)
     #[validate(custom(function = "validate_http_url"))]
     pub rollup_rpc_url: Url,
@@ -70,7 +75,8 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub privpool_spend_key: String,
 
-    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT)
+    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
+    /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
     #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
     pub auto_fund_deposit_amount: Option<String>,
 }

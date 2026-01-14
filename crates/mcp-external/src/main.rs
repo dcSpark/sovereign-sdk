@@ -65,6 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Wallet address: {}", wallet_address);
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
+    let admin_wallet_ctx = cfg
+        .admin_wallet_private_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(WalletContext::from_private_key_hex)
+        .transpose()?
+        .map(Arc::new);
+
+    if let Some(ref admin_wallet_ctx) = admin_wallet_ctx {
+        tracing::info!(
+            "[mcp] Admin wallet address (auto-fund): {}",
+            admin_wallet_ctx.get_address()
+        );
+    }
+
     tracing::info!("[mcp] Connecting to rollup RPC, verifier service, and indexer...");
     let provider = Provider::new(
         cfg.rollup_rpc_url.as_str(),
@@ -180,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let provider_for_service = provider.clone();
     let wallet_ctx_for_service = wallet_ctx.clone();
+    let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
     let authority_vfk_for_service = authority_vfk.clone();
     let privacy_key_for_service = privacy_key.clone();
@@ -192,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(CryptoServer::new(
                 provider_for_service.clone(),
                 wallet_ctx_for_service.clone(),
+                admin_wallet_ctx_for_service.clone(),
                 ligero_for_service.clone(),
                 authority_vfk_for_service.clone(),
                 privacy_key_for_service.clone(),
