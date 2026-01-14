@@ -38,6 +38,7 @@ sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-sequencer = { workspace = true }
 full-node-configs = { workspace = true }
 sov-state = { workspace = true, features = ["native"] }
+rockbound = { workspace = true }
 
 demo-stf = { workspace = true, features = ["native"] }
 
@@ -47,7 +48,10 @@ borsh = { workspace = true, features = ["bytes", "derive"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }
+axum = { workspace = true, default-features = false, features = [
+  "http1",
+  "tokio",
+] }
 jsonrpsee = { workspace = true, features = [
   "http-client",
   "server",

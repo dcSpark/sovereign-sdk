@@ -17,6 +17,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sov_bank::{config_gas_token_id, CallMessage as BankCallMessage, Coins, TokenId};
 use sov_cli::wallet_state::PrivateKeyAndAddress;
+use sov_db::accessory_db::AccessoryDb;
 use sov_evm::EvmAuthenticatorInput;
 use sov_midnight_da::storable::service::StorableMidnightDaService;
 use sov_modules_api::capabilities::UniquenessData;
@@ -29,12 +30,16 @@ use sov_modules_api::transaction::TxDetails;
 use sov_modules_api::transaction::{PriorityFeeBips, Transaction, UnsignedTransaction};
 use sov_modules_api::FullyBakedTx;
 use sov_modules_api::{Amount, CredentialId, RawTx, Spec};
+use sov_rollup_interface::common::SlotNumber;
 use sov_rollup_interface::TxHash;
 use sov_sequencer::{Sequencer, SequencerNotReadyDetails};
 use tokio::fs;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+
+use rockbound::cache::delta_reader::DeltaReader;
+use rockbound::DB;
 
 use crate::MockRollupSpec;
 use sov_modules_stf_blueprint::Runtime as StfRuntime;
@@ -44,6 +49,76 @@ use crate::midnight_chain::MidnightIndexerClient;
 type BridgeSpec = MockRollupSpec<Native>;
 type BridgeRuntime = Runtime<BridgeSpec>;
 type BridgeAuthenticator = <BridgeRuntime as StfRuntime<BridgeSpec>>::Auth;
+
+pub(crate) struct BridgeCursorStore {
+    db: Arc<DB>,
+    accessor: AccessoryDb,
+    key: Vec<u8>,
+}
+
+impl BridgeCursorStore {
+    const KEY_BYTES: &'static [u8] = b"midnight_bridge.cursor";
+    const CURSOR_SUBDIR: &'static str = "midnight_bridge_cursor";
+
+    pub(crate) fn open(storage_path: &Path) -> Result<Self> {
+        let cursor_path = storage_path.join(Self::CURSOR_SUBDIR);
+        std::fs::create_dir_all(&cursor_path).with_context(|| {
+            format!(
+                "Failed to create Midnight bridge cursor directory at {}",
+                cursor_path.display()
+            )
+        })?;
+        let db = Arc::new(
+            AccessoryDb::get_rockbound_options()
+                .default_setup_db_in_path(&cursor_path)
+                .with_context(|| {
+                    format!(
+                        "Failed to open accessory DB for Midnight bridge cursor at {}",
+                        cursor_path.display()
+                    )
+                })?,
+        );
+        let reader = DeltaReader::new(db.clone(), Vec::new());
+        let accessor = AccessoryDb::with_reader(reader)
+            .context("Failed to create accessory DB reader for Midnight bridge cursor")?;
+        Ok(Self {
+            db,
+            accessor,
+            key: Self::KEY_BYTES.to_vec(),
+        })
+    }
+
+    fn load_cursor(&self) -> Result<Option<u64>> {
+        let raw = self
+            .accessor
+            .get_value_option(&self.key, SlotNumber::GENESIS)
+            .context("Failed to read Midnight bridge cursor from accessory DB")?;
+        match raw {
+            Some(bytes) => {
+                anyhow::ensure!(
+                    bytes.len() == 8,
+                    "Midnight bridge cursor payload must be 8 bytes, got {}",
+                    bytes.len()
+                );
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(u64::from_le_bytes(arr)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn persist_cursor(&self, cursor: u64) -> Result<()> {
+        let bytes = cursor.to_le_bytes().to_vec();
+        let batch = AccessoryDb::materialize_values(
+            vec![(self.key.clone(), Some(bytes))],
+            SlotNumber::GENESIS,
+        )?;
+        self.db
+            .write_schemas(batch)
+            .context("Failed to persist Midnight bridge cursor")
+    }
+}
 
 struct BridgeConfig {
     runtime: RuntimeBridgeSettings,
@@ -67,7 +142,7 @@ impl MockDepositSource {
 
 struct IndexerDepositSource {
     client: Arc<MidnightIndexerClient>,
-    start_index: Option<u64>,
+    start_deposit_index: Option<u64>,
 }
 
 impl IndexerDepositSource {
@@ -75,8 +150,8 @@ impl IndexerDepositSource {
         &self.client
     }
 
-    fn start_index(&self) -> Option<u64> {
-        self.start_index
+    fn start_deposit_index(&self) -> Option<u64> {
+        self.start_deposit_index
     }
 
     fn client_arc(&self) -> Arc<MidnightIndexerClient> {
@@ -109,6 +184,7 @@ where
 pub(crate) fn spawn_midnight_bridge<Seq>(
     sequencer: Arc<Seq>,
     extension: &SeqConfigExtension,
+    cursor_store: Option<BridgeCursorStore>,
 ) -> Result<Option<JoinHandle<anyhow::Result<()>>>>
 where
     Seq: BridgeSequencer,
@@ -131,7 +207,7 @@ where
                 poll_interval_ms = config.runtime.poll_interval.as_millis() as u64,
                 indexer_http = %indexer.client().endpoint(),
                 contract_address = %indexer.client().contract_address(),
-                start_index = indexer.start_index(),
+                start_deposit_index = indexer.start_deposit_index(),
                 "Starting Midnight bridge background task (Midnight indexer source)",
             );
         }
@@ -142,7 +218,7 @@ where
         deposit_source,
     } = config;
 
-    let bridge = MidnightBridge::new(sequencer, runtime, deposit_source);
+    let bridge = MidnightBridge::new(sequencer, runtime, deposit_source, cursor_store)?;
     Ok(Some(tokio::spawn(async move { bridge.run().await })))
 }
 
@@ -196,7 +272,7 @@ fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<Bridge
             .build()
             .context("Failed to build Midnight indexer HTTP client")?;
 
-        let start_index = raw.start_index;
+        let start_deposit_index = raw.start_deposit_index;
 
         let indexer = Arc::new(MidnightIndexerClient::new(
             client,
@@ -205,7 +281,7 @@ fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<Bridge
         ));
         DepositSource::Indexer(IndexerDepositSource {
             client: indexer,
-            start_index,
+            start_deposit_index,
         })
     };
 
@@ -235,6 +311,7 @@ struct MidnightBridge<Seq> {
     next_generation: u64,
     idle_notice_sent: bool,
     next_chain_index: Option<u64>,
+    cursor_store: Option<BridgeCursorStore>,
 }
 
 impl<Seq> MidnightBridge<Seq>
@@ -245,13 +322,39 @@ where
         sequencer: Arc<Seq>,
         settings: RuntimeBridgeSettings,
         deposit_source: DepositSource,
-    ) -> Self {
+        mut cursor_store: Option<BridgeCursorStore>,
+    ) -> Result<Self> {
+        let mut restored_cursor = None;
+
+        if matches!(deposit_source, DepositSource::Indexer(_)) {
+            if let Some(store) = cursor_store.as_ref() {
+                match store.load_cursor() {
+                    Ok(Some(cursor)) => {
+                        info!(cursor, "Midnight bridge restored cursor from accessory DB");
+                        restored_cursor = Some(cursor);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = ?err, "Midnight bridge failed to read cursor from accessory DB");
+                    }
+                }
+            } else {
+                warn!(
+                    "Midnight bridge cursor persistence disabled: accessory DB handle unavailable"
+                );
+            }
+        } else {
+            cursor_store = None;
+        }
+
         let next_chain_index = match &deposit_source {
-            DepositSource::Indexer(source) => source.start_index(),
+            DepositSource::Indexer(source) => {
+                restored_cursor.or(source.start_deposit_index()).or(Some(0))
+            }
             DepositSource::Mock(_) => None,
         };
 
-        Self {
+        let bridge = Self {
             sequencer,
             settings,
             deposit_source,
@@ -259,7 +362,29 @@ where
             next_generation: 0,
             idle_notice_sent: false,
             next_chain_index,
+            cursor_store,
+        };
+
+        if restored_cursor.is_none() {
+            if let Some(cursor) = bridge.next_chain_index {
+                bridge.persist_cursor(cursor);
+            }
         }
+
+        Ok(bridge)
+    }
+
+    fn persist_cursor(&self, cursor: u64) {
+        if let Some(store) = &self.cursor_store {
+            if let Err(err) = store.persist_cursor(cursor) {
+                warn!(value = cursor, error = ?err, "Midnight bridge failed to persist cursor");
+            }
+        }
+    }
+
+    fn set_cursor(&mut self, cursor: u64) {
+        self.next_chain_index = Some(cursor);
+        self.persist_cursor(cursor);
     }
 
     async fn run(mut self) -> Result<()> {
@@ -341,12 +466,12 @@ where
             Some(index) => index,
             None => {
                 let start = latest.saturating_sub(1);
-                self.next_chain_index = Some(start);
+                self.set_cursor(start);
                 info!(
                     indexer_http = %client.endpoint(),
                     contract_address = %client.contract_address(),
                     latest_index = latest,
-                    start_index = start,
+                    start_deposit_index = start,
                     "Midnight bridge synchronized cursor to Midnight deposits",
                 );
                 start
@@ -359,7 +484,7 @@ where
                 latest = latest,
                 "Midnight bridge cursor ahead of on-chain index; rewinding",
             );
-            self.next_chain_index = Some(latest);
+            self.set_cursor(latest);
             return Ok(());
         }
 
@@ -391,7 +516,7 @@ where
                         index = index,
                         "Midnight bridge missing deposit for on-chain index"
                     );
-                    self.next_chain_index = Some(index.saturating_add(1));
+                    self.set_cursor(index.saturating_add(1));
                     continue;
                 }
             };
@@ -407,7 +532,7 @@ where
                 );
                 break;
             } else {
-                self.next_chain_index = Some(index.saturating_add(1));
+                self.set_cursor(index.saturating_add(1));
             }
         }
 
@@ -771,7 +896,8 @@ mod tests {
         let deposit_source = DepositSource::Mock(MockDepositSource {
             events_path: events_path.clone(),
         });
-        let mut bridge = MidnightBridge::new(Arc::clone(&sequencer), settings, deposit_source);
+        let mut bridge =
+            MidnightBridge::new(Arc::clone(&sequencer), settings, deposit_source, None).unwrap();
 
         let snapshot = read_deposit_file(&events_path).await.unwrap();
         assert_eq!(snapshot.len(), deposits.len());
@@ -827,7 +953,7 @@ mod tests {
         let deposit_source = DepositSource::Mock(MockDepositSource {
             events_path: events_path.clone(),
         });
-        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source);
+        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source, None).unwrap();
 
         let deposit = read_deposit_file(&events_path)
             .await
@@ -878,7 +1004,7 @@ mod tests {
         let deposit_source = DepositSource::Mock(MockDepositSource {
             events_path: events_path.clone(),
         });
-        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source);
+        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source, None).unwrap();
 
         let deposit = read_deposit_file(&events_path)
             .await

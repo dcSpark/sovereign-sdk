@@ -102,8 +102,7 @@ num_cache_warmup_workers = 10
 num_parallel_tx_workers = 10
 [sequencer.extension]
 max_log_limit = 20000
-# Example Midnight bridge configuration (uncomment to enable the background task).
-# [sequencer.extension.midnight_bridge]
+# Example Midnight bridge configuration
 [sequencer.extension.midnight_bridge]
 signing_key_path = "demo_data/midnight_bridge_signer.json" # JSON PrivateKeyAndAddress
 # mock_events_path = "demo_data/midnight_bridge_events.json" # Uncomment for offline testing

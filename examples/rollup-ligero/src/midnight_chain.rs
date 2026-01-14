@@ -2,9 +2,7 @@ use crate::midnight_bridge::Deposit;
 use anyhow::{anyhow, Context, Result};
 use base_crypto::fab::{AlignedValue, ValueAtom};
 use hex::FromHex;
-use midnight_onchain_state::state::{
-    ChargedState, ContractMaintenanceAuthority, ContractState,
-};
+use midnight_onchain_state::state::{ChargedState, ContractMaintenanceAuthority, ContractState};
 use midnight_serialize::{tagged_deserialize, Deserializable};
 use midnight_storage::arena::{set_allow_non_normal_form_deserialization, Sp};
 use midnight_storage::db::InMemoryDB;
