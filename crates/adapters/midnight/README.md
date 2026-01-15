@@ -3,8 +3,8 @@
 Utilities for querying the Midnight bridge contract state via the public GraphQL indexer and decoding it into Rust structures.
 
 ## Features
-- `MidnightIndexerClient` wraps a `reqwest::Client` and exposes a `snapshot()` helper that downloads, deserializes, and analyzes the on-chain contract state.
-- `BridgeContractSnapshot` reports the next bridge message index plus a `BTreeMap` of parsed deposits.
+- `MidnightIndexerClient` wraps a `reqwest::Client` and exposes a `snapshot()` helper that downloads, deserializes, and returns the on-chain bridge `BridgeLedger` in one call.
+- `BridgeLedger`, `RollupLedger`, `L2GatewayLedger`, `L2MessengerLedger`, and `L2MessageQueueLedger` mirror every section of the bridge state so you can introspect the data without reimplementing the decoder logic.
 - `MidnightDeposit` mirrors the on-chain tuple layout so downstream crates can convert it into their own types.
 
 ## Live indexer test
@@ -30,7 +30,14 @@ use sov_midnight_adapter::MidnightIndexerClient;
 # async fn example() -> anyhow::Result<()> {
 let http = Client::builder().build()?;
 let client = MidnightIndexerClient::new(http, endpoint, contract_address);
-let snapshot = client.snapshot().await?;
+let ledger = client.snapshot().await?;
+
+let cursor = ledger.rollup.next_cross_domain_message_index;
+let deposits = &ledger.rollup.l1_to_l2_deposits;
+
+let owner = ledger.rollup.owner;
+let fee_vault = ledger.rollup.fee_vault;
+let gateway_balances = &ledger.l2_gateway.balances;
 # Ok(())
 # }
 ```
