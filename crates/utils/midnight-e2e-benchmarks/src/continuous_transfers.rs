@@ -1855,62 +1855,81 @@ async fn perform_transfer_cycle(
         w.nonce = b.new_nonce;
         w.rho = b.new_rho;
         w.spend_sk = b.new_spend_sk;
-    eprintln!(
-        "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
-        transfer_txs_ms,
-        transfer_txs_ms / transfer_txs_b64.len() as f64
-    );
+        eprintln!(
+            "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
+            transfer_txs_ms,
+            transfer_txs_ms / transfer_txs_b64.len() as f64
+        );
 
-    eprintln!(
-        "[cycle] Submitting {} transfers to verifier...",
-        transfer_txs_b64.len()
-    );
+        eprintln!(
+            "[cycle] Submitting {} transfers to verifier...",
+            transfer_txs_b64.len()
+        );
 
-    // Track per-tx worker processing metrics (from verifier)
-    let transfer_submit_start = Instant::now();
-    let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
-    let submit_endpoint = format!("{}/midnight-privacy", verifier_url);
-    let concurrency_limit = config.max_concurrent_proofs.max(1);
-    let semaphore = Arc::new(Semaphore::new(concurrency_limit));
-    let mut join_set = JoinSet::new();
+        // Track per-tx worker processing metrics (from verifier)
+        let transfer_submit_start = Instant::now();
+        let mut worker_metrics_by_hash: HashMap<String, VerifierMetrics> = HashMap::new();
+        let submit_endpoint = format!("{}/midnight-privacy", verifier_url);
+        let concurrency_limit = config.max_concurrent_proofs.max(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency_limit));
+        let mut join_set = JoinSet::new();
 
-    #[derive(Debug)]
-    struct TransferSubmitResult {
-        idx: usize,
-        wallet_idx: usize,
-        worker_hash: String,
-        metrics: VerifierMetrics,
-    }
+        #[derive(Debug)]
+        struct TransferSubmitResult {
+            idx: usize,
+            wallet_idx: usize,
+            worker_hash: String,
+            metrics: VerifierMetrics,
+        }
 
-    for (idx, (wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
-        let client = http.clone();
-        let endpoint = submit_endpoint.clone();
-        let permit_pool = semaphore.clone();
-        let transfer_hash = transfer_hashes[idx].clone();
-        let per_tx_delay = config.per_tx_delay_ms;
-        const MAX_SUBMIT_RETRIES: usize = 3;
-        join_set.spawn(async move {
-            let _permit = permit_pool
-                .acquire_owned()
-                .await
-                .expect("submit concurrency semaphore closed");
-            if per_tx_delay > 0 {
-                sleep(Duration::from_millis(per_tx_delay)).await;
-            }
-            let display_idx = idx + 1;
+        for (idx, (wallet_idx, body_b64)) in transfer_txs_b64.into_iter().enumerate() {
+            let client = http.clone();
+            let endpoint = submit_endpoint.clone();
+            let permit_pool = semaphore.clone();
+            let transfer_hash = transfer_hashes[idx].clone();
+            let per_tx_delay = config.per_tx_delay_ms;
+            const MAX_SUBMIT_RETRIES: usize = 3;
+            join_set.spawn(async move {
+                let _permit = permit_pool
+                    .acquire_owned()
+                    .await
+                    .expect("submit concurrency semaphore closed");
+                if per_tx_delay > 0 {
+                    sleep(Duration::from_millis(per_tx_delay)).await;
+                }
+                let display_idx = idx + 1;
 
-            let mut last_err: Option<anyhow::Error> = None;
-            for attempt in 0..=MAX_SUBMIT_RETRIES {
-                let resp = client
-                    .post(&endpoint)
-                    .json(&json!({ "body": body_b64 }))
-                    .send()
-                    .await;
+                let mut last_err: Option<anyhow::Error> = None;
+                for attempt in 0..=MAX_SUBMIT_RETRIES {
+                    let resp = client
+                        .post(&endpoint)
+                        .json(&json!({ "body": body_b64 }))
+                        .send()
+                        .await;
 
-                let resp = match resp {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_err = Some(e.into());
+                    let resp = match resp {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_err = Some(e.into());
+                            if attempt < MAX_SUBMIT_RETRIES {
+                                let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
+                                sleep(Duration::from_millis(backoff_ms)).await;
+                                continue;
+                            } else {
+                                break;
+                            }
+                        }
+                    };
+
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        last_err = Some(anyhow::anyhow!(
+                            "transfer #{} verifier returned status {}: {}",
+                            display_idx,
+                            status,
+                            body
+                        ));
                         if attempt < MAX_SUBMIT_RETRIES {
                             let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
                             sleep(Duration::from_millis(backoff_ms)).await;
@@ -1919,70 +1938,51 @@ async fn perform_transfer_cycle(
                             break;
                         }
                     }
-                };
 
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    last_err = Some(anyhow::anyhow!(
-                        "transfer #{} verifier returned status {}: {}",
-                        display_idx,
-                        status,
-                        body
-                    ));
-                    if attempt < MAX_SUBMIT_RETRIES {
-                        let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
-                        sleep(Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    } else {
-                        break;
-                    }
+                    let vresp: VerifierResponse = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            last_err = Some(e.into());
+                            if attempt < MAX_SUBMIT_RETRIES {
+                                let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
+                                sleep(Duration::from_millis(backoff_ms)).await;
+                                continue;
+                            } else {
+                                break;
+                            }
+                        }
+                    };
+
+                    let worker_hash = vresp.tx_hash.unwrap_or(transfer_hash);
+                    return Ok::<TransferSubmitResult, anyhow::Error>(TransferSubmitResult {
+                        idx,
+                        wallet_idx,
+                        worker_hash,
+                        metrics: vresp.metrics.clone(),
+                    });
                 }
 
-                let vresp: VerifierResponse = match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = Some(e.into());
-                        if attempt < MAX_SUBMIT_RETRIES {
-                            let backoff_ms = 100 * 2_u64.saturating_pow(attempt as u32);
-                            sleep(Duration::from_millis(backoff_ms)).await;
-                            continue;
-                        } else {
-                            break;
-                        }
-                    }
-                };
+                Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "transfer #{} request failed after retries",
+                        display_idx
+                    ))
+                }))
+            });
+        }
 
-                let worker_hash = vresp.tx_hash.unwrap_or(transfer_hash);
-                return Ok::<TransferSubmitResult, anyhow::Error>(TransferSubmitResult {
-                    idx,
-                    wallet_idx,
-                    worker_hash,
-                    metrics: vresp.metrics.clone(),
-                });
-            }
+        while let Some(res) = join_set.join_next().await {
+            let TransferSubmitResult {
+                idx,
+                wallet_idx,
+                worker_hash,
+                metrics,
+            } = res??;
+            worker_metrics_by_hash.insert(worker_hash.clone(), metrics.clone());
 
-            Err(last_err.unwrap_or_else(|| {
-                anyhow::anyhow!(format!(
-                    "transfer #{} request failed after retries",
-                    display_idx
-                ))
-            }))
-        });
-    }
-
-    while let Some(res) = join_set.join_next().await {
-        let TransferSubmitResult {
-            idx,
-            wallet_idx,
-            worker_hash,
-            metrics,
-        } = res??;
-        worker_metrics_by_hash.insert(worker_hash.clone(), metrics.clone());
-
-        if config.detailed_wallet_logs {
-            let display_idx = idx + 1;
-            eprintln!(
+            if config.detailed_wallet_logs {
+                let display_idx = idx + 1;
+                eprintln!(
                 "    [timing][worker] wallet={} idx_in_cycle={} deserialize={:.2}ms parse={:.2}ms sig={:.2}ms proof={:.2}ms db={:.2}ms submit={:.2}ms total={:.2}ms",
                 wallet_idx,
                 display_idx,
@@ -1994,107 +1994,107 @@ async fn perform_transfer_cycle(
                 metrics.node_submit_ms,
                 metrics.total_ms
             );
+            }
         }
-    }
 
-    let transfer_submit_ms = transfer_submit_start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "[cycle] Submitted {} transfers to verifier in {:.2} ms (avg {:.2} ms per tx)",
-        transfer_hashes.len(),
-        transfer_submit_ms,
-        transfer_submit_ms / transfer_hashes.len() as f64
-    );
-    // Interactive gate before flushing to the sequencer.
-    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
-    let flush_start = Instant::now();
-    let resp = http
-        .post(format!("{}/midnight-privacy/flush", verifier_url))
-        .send()
-        .await
-        .context("Submit to sequencer request failed")?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "Submit to sequencer endpoint returned status {}: {}",
-            status,
-            body
-        );
-    }
-    let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
-
-    #[derive(Deserialize, Clone)]
-    struct SeqBreakdown {
-        #[serde(default)]
-        decode_ms: Option<f64>,
-        #[serde(default)]
-        wrap_ms: Option<f64>,
-        #[serde(default)]
-        submit_ms: Option<f64>,
-        #[serde(default)]
-        await_ms: Option<f64>,
-        #[serde(default)]
-        total_ms: Option<f64>,
-        #[serde(default)]
-        stf_execution_ms: Option<f64>,
-    }
-
-    #[derive(Deserialize)]
-    struct FlushResultEntry {
-        tx_hash: Option<String>,
-        #[allow(dead_code)]
-        accepted: bool,
-        #[allow(dead_code)]
-        status: Option<u16>,
-        #[allow(dead_code)]
-        response: Option<serde_json::Value>,
-        #[allow(dead_code)]
-        error: Option<String>,
-        sequencer_ms: Option<f64>,
-        sequencer_breakdown: Option<SeqBreakdown>,
-    }
-
-    #[derive(Deserialize)]
-    struct FlushSummary {
-        flushed: usize,
-        accepted: usize,
-        rejected: usize,
-        results: Vec<FlushResultEntry>,
-    }
-
-    let flush: FlushSummary =
-        serde_json::from_str(&body).context("Failed to parse submit to sequencer JSON response")?;
-    if config.detailed_wallet_logs {
+        let transfer_submit_ms = transfer_submit_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
+            "[cycle] Submitted {} transfers to verifier in {:.2} ms (avg {:.2} ms per tx)",
+            transfer_hashes.len(),
+            transfer_submit_ms,
+            transfer_submit_ms / transfer_hashes.len() as f64
+        );
+        // Interactive gate before flushing to the sequencer.
+        wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+        let flush_start = Instant::now();
+        let resp = http
+            .post(format!("{}/midnight-privacy/flush", verifier_url))
+            .send()
+            .await
+            .context("Submit to sequencer request failed")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Submit to sequencer endpoint returned status {}: {}",
+                status,
+                body
+            );
+        }
+        let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
+
+        #[derive(Deserialize, Clone)]
+        struct SeqBreakdown {
+            #[serde(default)]
+            decode_ms: Option<f64>,
+            #[serde(default)]
+            wrap_ms: Option<f64>,
+            #[serde(default)]
+            submit_ms: Option<f64>,
+            #[serde(default)]
+            await_ms: Option<f64>,
+            #[serde(default)]
+            total_ms: Option<f64>,
+            #[serde(default)]
+            stf_execution_ms: Option<f64>,
+        }
+
+        #[derive(Deserialize)]
+        struct FlushResultEntry {
+            tx_hash: Option<String>,
+            #[allow(dead_code)]
+            accepted: bool,
+            #[allow(dead_code)]
+            status: Option<u16>,
+            #[allow(dead_code)]
+            response: Option<serde_json::Value>,
+            #[allow(dead_code)]
+            error: Option<String>,
+            sequencer_ms: Option<f64>,
+            sequencer_breakdown: Option<SeqBreakdown>,
+        }
+
+        #[derive(Deserialize)]
+        struct FlushSummary {
+            flushed: usize,
+            accepted: usize,
+            rejected: usize,
+            results: Vec<FlushResultEntry>,
+        }
+
+        let flush: FlushSummary = serde_json::from_str(&body)
+            .context("Failed to parse submit to sequencer JSON response")?;
+        if config.detailed_wallet_logs {
+            eprintln!(
             "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
             flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
         );
-    } else {
-        eprintln!(
-            "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
-            flush_elapsed_ms,
-            flush_elapsed_ms / flush.flushed as f64,
-            flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
-        );
-    }
+        } else {
+            eprintln!(
+                "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
+                flush_elapsed_ms,
+                flush_elapsed_ms / flush.flushed as f64,
+                flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
+            );
+        }
 
-    // Track per-tx sequencer times and breakdown for this cycle
-    let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
-    let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
-    for entry in flush.results {
-        if let Some(hash) = entry.tx_hash {
-            if let Some(b) = entry.sequencer_breakdown {
-                let total_ms = b.total_ms.unwrap_or(0.0);
-                let decode_ms = b.decode_ms.unwrap_or(0.0);
-                let wrap_ms = b.wrap_ms.unwrap_or(0.0);
-                let submit_ms = b.submit_ms.unwrap_or(0.0);
-                let await_ms = b.await_ms.unwrap_or(0.0);
-                let stf_str = b
-                    .stf_execution_ms
-                    .map(|v| format!("{:.2}", v))
-                    .unwrap_or_else(|| "n/a".to_string());
-                if config.detailed_wallet_logs {
-                    eprintln!(
+        // Track per-tx sequencer times and breakdown for this cycle
+        let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
+        let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
+        for entry in flush.results {
+            if let Some(hash) = entry.tx_hash {
+                if let Some(b) = entry.sequencer_breakdown {
+                    let total_ms = b.total_ms.unwrap_or(0.0);
+                    let decode_ms = b.decode_ms.unwrap_or(0.0);
+                    let wrap_ms = b.wrap_ms.unwrap_or(0.0);
+                    let submit_ms = b.submit_ms.unwrap_or(0.0);
+                    let await_ms = b.await_ms.unwrap_or(0.0);
+                    let stf_str = b
+                        .stf_execution_ms
+                        .map(|v| format!("{:.2}", v))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    if config.detailed_wallet_logs {
+                        eprintln!(
                         "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
                         hash,
                         total_ms,
@@ -2104,294 +2104,294 @@ async fn perform_transfer_cycle(
                         await_ms,
                         stf_str,
                     );
+                    }
+                    sequencer_times_ms.insert(hash.clone(), total_ms);
+                    sequencer_metrics_by_hash.insert(hash, b);
+                } else if let Some(ms) = entry.sequencer_ms {
+                    if config.detailed_wallet_logs {
+                        eprintln!("    [timing][sequencer] tx={} total_ms={:.2}", hash, ms);
+                    }
+                    sequencer_times_ms.insert(hash, ms);
                 }
-                sequencer_times_ms.insert(hash.clone(), total_ms);
-                sequencer_metrics_by_hash.insert(hash, b);
-            } else if let Some(ms) = entry.sequencer_ms {
-                if config.detailed_wallet_logs {
-                    eprintln!("    [timing][sequencer] tx={} total_ms={:.2}", hash, ms);
-                }
-                sequencer_times_ms.insert(hash, ms);
             }
         }
-    }
 
-    // After flush, verify inclusion and collect per-batch statistics and timing
-    let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut num_included = 0usize;
-    let num_transfers = transfer_hashes.len();
-    let mut first_included_at: Option<Instant> = None;
-    let mut last_included_at: Option<Instant> = None;
-    let mut first_included_wall: Option<SystemTime> = None;
-    let mut last_included_wall: Option<SystemTime> = None;
-    let mut first_batch_number: Option<u64> = None;
-    let mut last_batch_number: Option<u64> = None;
+        // After flush, verify inclusion and collect per-batch statistics and timing
+        let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut num_included = 0usize;
+        let num_transfers = transfer_hashes.len();
+        let mut first_included_at: Option<Instant> = None;
+        let mut last_included_at: Option<Instant> = None;
+        let mut first_included_wall: Option<SystemTime> = None;
+        let mut last_included_wall: Option<SystemTime> = None;
+        let mut first_batch_number: Option<u64> = None;
+        let mut last_batch_number: Option<u64> = None;
 
-    // Aggregate worker / sequencer timing for this cycle
-    let mut worker_sum_ms = 0.0f64;
-    let mut worker_count = 0usize;
-    let mut worker_proof_sum_ms = 0.0f64;
-    let mut worker_db_sum_ms = 0.0f64;
-    let mut sequencer_sum_ms = 0.0f64;
-    let mut sequencer_count = 0usize;
-    let mut seq_decode_sum_ms = 0.0f64;
-    let mut seq_wrap_sum_ms = 0.0f64;
-    let mut seq_submit_sum_ms = 0.0f64;
-    let mut seq_await_sum_ms = 0.0f64;
-    let mut seq_stf_sum_ms = 0.0f64;
+        // Aggregate worker / sequencer timing for this cycle
+        let mut worker_sum_ms = 0.0f64;
+        let mut worker_count = 0usize;
+        let mut worker_proof_sum_ms = 0.0f64;
+        let mut worker_db_sum_ms = 0.0f64;
+        let mut sequencer_sum_ms = 0.0f64;
+        let mut sequencer_count = 0usize;
+        let mut seq_decode_sum_ms = 0.0f64;
+        let mut seq_wrap_sum_ms = 0.0f64;
+        let mut seq_submit_sum_ms = 0.0f64;
+        let mut seq_await_sum_ms = 0.0f64;
+        let mut seq_stf_sum_ms = 0.0f64;
 
-    for hash_hex in &transfer_hashes {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match client
-                .query_rest_endpoint::<api_types::LedgerTx>(&format!(
-                    "/ledger/txs/{}?children=1",
-                    hash_hex
-                ))
-                .await
-            {
-                Ok(ltx) => {
-                    anyhow::ensure!(
-                        ltx.receipt.result == api_types::TxReceiptResult::Successful,
-                        "Transfer {} included but not successful: {:?}",
-                        hash_hex,
-                        ltx.receipt
-                    );
-                    let now_instant = Instant::now();
-                    let now_wall = SystemTime::now();
-                    let batch_number = ltx.batch_number;
-                    if first_included_at.is_none() {
-                        first_included_at = Some(now_instant);
-                        first_included_wall = Some(now_wall);
-                        first_batch_number = Some(batch_number);
-                    }
-                    last_included_at = Some(now_instant);
-                    last_included_wall = Some(now_wall);
-                    last_batch_number = Some(batch_number);
-                    *batches.entry(batch_number).or_insert(0) += 1;
-                    num_included += 1;
-                    break;
-                }
-                Err(_) => {
-                    if Instant::now() > deadline {
-                        eprintln!(
-                            "[cycle] Timeout waiting for transfer {} to appear in ledger",
-                            hash_hex
+        for hash_hex in &transfer_hashes {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                match client
+                    .query_rest_endpoint::<api_types::LedgerTx>(&format!(
+                        "/ledger/txs/{}?children=1",
+                        hash_hex
+                    ))
+                    .await
+                {
+                    Ok(ltx) => {
+                        anyhow::ensure!(
+                            ltx.receipt.result == api_types::TxReceiptResult::Successful,
+                            "Transfer {} included but not successful: {:?}",
+                            hash_hex,
+                            ltx.receipt
                         );
+                        let now_instant = Instant::now();
+                        let now_wall = SystemTime::now();
+                        let batch_number = ltx.batch_number;
+                        if first_included_at.is_none() {
+                            first_included_at = Some(now_instant);
+                            first_included_wall = Some(now_wall);
+                            first_batch_number = Some(batch_number);
+                        }
+                        last_included_at = Some(now_instant);
+                        last_included_wall = Some(now_wall);
+                        last_batch_number = Some(batch_number);
+                        *batches.entry(batch_number).or_insert(0) += 1;
+                        num_included += 1;
                         break;
                     }
-                    sleep(Duration::from_millis(100)).await;
+                    Err(_) => {
+                        if Instant::now() > deadline {
+                            eprintln!(
+                                "[cycle] Timeout waiting for transfer {} to appear in ledger",
+                                hash_hex
+                            );
+                            break;
+                        }
+                        sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
-    }
 
-    // Summarize when the first and last txs were observed in the ledger.
-    if let (
-        Some(first_instant),
-        Some(last_instant),
-        Some(first_wall),
-        Some(last_wall),
-        Some(first_block),
-        Some(last_block),
-    ) = (
-        first_included_at,
-        last_included_at,
-        first_included_wall,
-        last_included_wall,
-        first_batch_number,
-        last_batch_number,
-    ) {
-        let span_ms = last_instant.duration_since(first_instant).as_secs_f64() * 1000.0;
+        // Summarize when the first and last txs were observed in the ledger.
+        if let (
+            Some(first_instant),
+            Some(last_instant),
+            Some(first_wall),
+            Some(last_wall),
+            Some(first_block),
+            Some(last_block),
+        ) = (
+            first_included_at,
+            last_included_at,
+            first_included_wall,
+            last_included_wall,
+            first_batch_number,
+            last_batch_number,
+        ) {
+            let span_ms = last_instant.duration_since(first_instant).as_secs_f64() * 1000.0;
 
-        fn format_time_hhmmss_millis(ts: SystemTime) -> String {
-            match ts.duration_since(SystemTime::UNIX_EPOCH) {
-                Ok(dur) => DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
-                    .map(|dt| dt.with_timezone(&Local))
-                    .unwrap_or_else(Local::now)
-                    .format("%Y-%m-%d %H:%M:%S%.3f")
-                    .to_string(),
-                Err(_) => "invalid-system-time".to_string(),
+            fn format_time_hhmmss_millis(ts: SystemTime) -> String {
+                match ts.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(dur) => DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
+                        .map(|dt| dt.with_timezone(&Local))
+                        .unwrap_or_else(Local::now)
+                        .format("%Y-%m-%d %H:%M:%S%.3f")
+                        .to_string(),
+                    Err(_) => "invalid-system-time".to_string(),
+                }
             }
-        }
 
-        let first_ts = format_time_hhmmss_millis(first_wall);
-        let last_ts = format_time_hhmmss_millis(last_wall);
-        eprintln!(
-            "[cycle] First tx included in block {} at {}",
-            first_block, first_ts
-        );
-        eprintln!(
-            "[cycle] Last tx included in block {} at {}",
-            last_block, last_ts
-        );
-        eprintln!(
-            "[cycle] Total span: {:.2} ms, {} blocks, {} total txs",
-            span_ms,
-            batches.len(),
-            num_included
-        );
-
-        // Per-block statistics
-        for (block_num, tx_count) in &batches {
+            let first_ts = format_time_hhmmss_millis(first_wall);
+            let last_ts = format_time_hhmmss_millis(last_wall);
             eprintln!(
-                "[cycle] Block {} generated with {} txs.",
-                block_num, tx_count
+                "[cycle] First tx included in block {} at {}",
+                first_block, first_ts
             );
-        }
-    }
+            eprintln!(
+                "[cycle] Last tx included in block {} at {}",
+                last_block, last_ts
+            );
+            eprintln!(
+                "[cycle] Total span: {:.2} ms, {} blocks, {} total txs",
+                span_ms,
+                batches.len(),
+                num_included
+            );
 
-    // Aggregate timing only for transfers we attempted this cycle
-    for hash in &transfer_hashes {
-        if let Some(m) = worker_metrics_by_hash.get(hash) {
-            worker_sum_ms += m.total_ms;
-            worker_proof_sum_ms += m.proof_verify_ms;
-            worker_db_sum_ms += m.tx_creation_ms;
-            worker_count += 1;
-        }
-        if let Some(b) = sequencer_metrics_by_hash.get(hash) {
-            let total_ms = b.total_ms.unwrap_or(0.0);
-            let decode_ms = b.decode_ms.unwrap_or(0.0);
-            let wrap_ms = b.wrap_ms.unwrap_or(0.0);
-            let submit_ms = b.submit_ms.unwrap_or(0.0);
-            let await_ms = b.await_ms.unwrap_or(0.0);
-
-            sequencer_sum_ms += total_ms;
-            seq_decode_sum_ms += decode_ms;
-            seq_wrap_sum_ms += wrap_ms;
-            seq_submit_sum_ms += submit_ms;
-            seq_await_sum_ms += await_ms;
-            if let Some(stf) = b.stf_execution_ms {
-                seq_stf_sum_ms += stf;
-            }
-            sequencer_count += 1;
-        } else if let Some(ms) = sequencer_times_ms.get(hash) {
-            // Only total_ms is available (older sequencer)
-            sequencer_sum_ms += *ms;
-            sequencer_count += 1;
-        }
-    }
-
-    // Wait for all new output notes to be indexed before ending the cycle.
-    // This ensures the next cycle can find the note commitments for all wallets.
-    const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
-    const NOTE_SYNC_POLL_MS: u64 = 100;
-
-    // Collect expected output commitments for wallets that participated in this cycle
-    let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
-    for input in &inputs {
-        // The wallet state has already been updated with the new note secrets.
-        let w = &wallets[input.wallet_idx];
-        let value_u64: u64 = w
-            .value
-            .try_into()
-            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
-        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &w.spend_sk);
-        let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_ivk);
-        let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
-        expected_commitments.push((expected_cm, input.wallet_idx));
-    }
-
-    if !expected_commitments.is_empty() {
-        let sync_start = Instant::now();
-        let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
-        let mut pending: HashSet<[u8; 32]> =
-            expected_commitments.iter().map(|(cm, _)| *cm).collect();
-
-        while !pending.is_empty() && Instant::now() < sync_deadline {
-            let fresh_positions = fetch_note_positions(client, false).await?;
-            pending.retain(|cm| !fresh_positions.contains_key(cm));
-
-            if !pending.is_empty() {
-                sleep(Duration::from_millis(NOTE_SYNC_POLL_MS)).await;
-            }
-        }
-
-        let sync_elapsed = sync_start.elapsed();
-        if pending.is_empty() {
-            if config.detailed_wallet_logs {
+            // Per-block statistics
+            for (block_num, tx_count) in &batches {
                 eprintln!(
-                    "[cycle] All {} new output notes indexed in {:.2} ms",
-                    expected_commitments.len(),
-                    sync_elapsed.as_secs_f64() * 1000.0
+                    "[cycle] Block {} generated with {} txs.",
+                    block_num, tx_count
                 );
             }
-            // Update the cached position map with fresh data
-            pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
-        } else {
-            eprintln!(
-                "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
-                pending.len(),
-                expected_commitments.len(),
-                sync_elapsed.as_secs_f64()
-            );
         }
+
+        // Aggregate timing only for transfers we attempted this cycle
+        for hash in &transfer_hashes {
+            if let Some(m) = worker_metrics_by_hash.get(hash) {
+                worker_sum_ms += m.total_ms;
+                worker_proof_sum_ms += m.proof_verify_ms;
+                worker_db_sum_ms += m.tx_creation_ms;
+                worker_count += 1;
+            }
+            if let Some(b) = sequencer_metrics_by_hash.get(hash) {
+                let total_ms = b.total_ms.unwrap_or(0.0);
+                let decode_ms = b.decode_ms.unwrap_or(0.0);
+                let wrap_ms = b.wrap_ms.unwrap_or(0.0);
+                let submit_ms = b.submit_ms.unwrap_or(0.0);
+                let await_ms = b.await_ms.unwrap_or(0.0);
+
+                sequencer_sum_ms += total_ms;
+                seq_decode_sum_ms += decode_ms;
+                seq_wrap_sum_ms += wrap_ms;
+                seq_submit_sum_ms += submit_ms;
+                seq_await_sum_ms += await_ms;
+                if let Some(stf) = b.stf_execution_ms {
+                    seq_stf_sum_ms += stf;
+                }
+                sequencer_count += 1;
+            } else if let Some(ms) = sequencer_times_ms.get(hash) {
+                // Only total_ms is available (older sequencer)
+                sequencer_sum_ms += *ms;
+                sequencer_count += 1;
+            }
+        }
+
+        // Wait for all new output notes to be indexed before ending the cycle.
+        // This ensures the next cycle can find the note commitments for all wallets.
+        const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
+        const NOTE_SYNC_POLL_MS: u64 = 100;
+
+        // Collect expected output commitments for wallets that participated in this cycle
+        let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
+        for input in &inputs {
+            // The wallet state has already been updated with the new note secrets.
+            let w = &wallets[input.wallet_idx];
+            let value_u64: u64 = w.value.try_into().context(
+                "wallet note value does not fit into u64 (required by note_spend_guest v2)",
+            )?;
+            let pk_ivk = pk_ivk_from_sk(&DOMAIN, &w.spend_sk);
+            let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_ivk);
+            let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
+            expected_commitments.push((expected_cm, input.wallet_idx));
+        }
+
+        if !expected_commitments.is_empty() {
+            let sync_start = Instant::now();
+            let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
+            let mut pending: HashSet<[u8; 32]> =
+                expected_commitments.iter().map(|(cm, _)| *cm).collect();
+
+            while !pending.is_empty() && Instant::now() < sync_deadline {
+                let fresh_positions = fetch_note_positions(client, false).await?;
+                pending.retain(|cm| !fresh_positions.contains_key(cm));
+
+                if !pending.is_empty() {
+                    sleep(Duration::from_millis(NOTE_SYNC_POLL_MS)).await;
+                }
+            }
+
+            let sync_elapsed = sync_start.elapsed();
+            if pending.is_empty() {
+                if config.detailed_wallet_logs {
+                    eprintln!(
+                        "[cycle] All {} new output notes indexed in {:.2} ms",
+                        expected_commitments.len(),
+                        sync_elapsed.as_secs_f64() * 1000.0
+                    );
+                }
+                // Update the cached position map with fresh data
+                pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
+            } else {
+                eprintln!(
+                    "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
+                    pending.len(),
+                    expected_commitments.len(),
+                    sync_elapsed.as_secs_f64()
+                );
+            }
+        }
+
+        // Persist rebuilt tree and note index for the next cycle.
+        *cached_tree = Some(mt);
+        *cached_next_position = cached_next_pos;
+        *cached_root = cached_root_val;
+        *cached_pos_by_cm = pos_by_cm;
+
+        let avg_worker_ms = if worker_count > 0 {
+            worker_sum_ms / worker_count as f64
+        } else {
+            0.0
+        };
+        let avg_worker_proof_ms = if worker_count > 0 {
+            worker_proof_sum_ms / worker_count as f64
+        } else {
+            0.0
+        };
+        let avg_worker_db_ms = if worker_count > 0 {
+            worker_db_sum_ms / worker_count as f64
+        } else {
+            0.0
+        };
+        let avg_sequencer_ms = if sequencer_count > 0 {
+            sequencer_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+        let avg_seq_decode_ms = if sequencer_count > 0 {
+            seq_decode_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+        let avg_seq_wrap_ms = if sequencer_count > 0 {
+            seq_wrap_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+        let avg_seq_submit_ms = if sequencer_count > 0 {
+            seq_submit_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+        let avg_seq_await_ms = if sequencer_count > 0 {
+            seq_await_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+        let avg_seq_stf_ms = if sequencer_count > 0 {
+            seq_stf_sum_ms / sequencer_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(CycleSummary {
+            num_transfers,
+            num_included,
+            batches,
+            avg_worker_ms,
+            avg_sequencer_ms,
+            avg_worker_proof_ms,
+            avg_worker_db_ms,
+            avg_seq_decode_ms,
+            avg_seq_wrap_ms,
+            avg_seq_submit_ms,
+            avg_seq_await_ms,
+            avg_seq_stf_ms,
+        })
     }
-
-    // Persist rebuilt tree and note index for the next cycle.
-    *cached_tree = Some(mt);
-    *cached_next_position = cached_next_pos;
-    *cached_root = cached_root_val;
-    *cached_pos_by_cm = pos_by_cm;
-
-    let avg_worker_ms = if worker_count > 0 {
-        worker_sum_ms / worker_count as f64
-    } else {
-        0.0
-    };
-    let avg_worker_proof_ms = if worker_count > 0 {
-        worker_proof_sum_ms / worker_count as f64
-    } else {
-        0.0
-    };
-    let avg_worker_db_ms = if worker_count > 0 {
-        worker_db_sum_ms / worker_count as f64
-    } else {
-        0.0
-    };
-    let avg_sequencer_ms = if sequencer_count > 0 {
-        sequencer_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-    let avg_seq_decode_ms = if sequencer_count > 0 {
-        seq_decode_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-    let avg_seq_wrap_ms = if sequencer_count > 0 {
-        seq_wrap_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-    let avg_seq_submit_ms = if sequencer_count > 0 {
-        seq_submit_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-    let avg_seq_await_ms = if sequencer_count > 0 {
-        seq_await_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-    let avg_seq_stf_ms = if sequencer_count > 0 {
-        seq_stf_sum_ms / sequencer_count as f64
-    } else {
-        0.0
-    };
-
-    Ok(CycleSummary {
-        num_transfers,
-        num_included,
-        batches,
-        avg_worker_ms,
-        avg_sequencer_ms,
-        avg_worker_proof_ms,
-        avg_worker_db_ms,
-        avg_seq_decode_ms,
-        avg_seq_wrap_ms,
-        avg_seq_submit_ms,
-        avg_seq_await_ms,
-        avg_seq_stf_ms,
-    })
 }

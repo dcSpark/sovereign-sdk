@@ -1,5 +1,22 @@
 use alloy_primitives::U256;
+use base64::{
+    alphabet,
+    engine::{self, general_purpose},
+};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
+
+// Re-export the base64 Engine for use in other modules, avoiding imports.
+pub use base64::Engine;
+
+// base64 engine to handle the encoding and decoding of the hash payload.
+pub const BASE64_ENGINE: engine::GeneralPurpose =
+    engine::GeneralPurpose::new(&alphabet::STANDARD, general_purpose::PAD);
+
+#[derive(Serialize, Deserialize)]
+pub struct TEEPayload {
+    pub data: String,
+}
 
 // Batch public data
 #[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize, Eq)]

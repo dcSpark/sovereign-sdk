@@ -23,6 +23,7 @@ pub fn test_genesis_paths(operating_mode: OperatingMode) -> GenesisPaths {
 
     let mut paths = GenesisPaths::from_dir(dir.as_ref());
     paths.chain_state_genesis_path = match operating_mode {
+        OperatingMode::TEE => dir.as_ref().join("chain_state_zk.json"),
         OperatingMode::Zk => dir.as_ref().join("chain_state_zk.json"),
         OperatingMode::Optimistic => dir.as_ref().join("chain_state_op.json"),
         OperatingMode::Operator => dir.as_ref().join("chain_state_operator.json"),

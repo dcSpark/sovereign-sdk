@@ -1,21 +1,14 @@
 use crate::common::BatchPublicDataV1;
 use anyhow::{Context, Result};
-use base64::{
-    alphabet,
-    engine::{self, general_purpose, general_purpose::URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use borsh::{from_slice, to_vec};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     env,
     path::PathBuf,
     process::{Command, Stdio},
 };
-
-// base64 engine to handle the encoding and decoding of the payload.
-const BASE64_ENGINE: engine::GeneralPurpose =
-    engine::GeneralPurpose::new(&alphabet::STANDARD, general_purpose::PAD);
 
 /// Function to decode the JWT payload into a JSON value.
 /// The verification of the JWT signature is not done here, as it is done by the AttestationClient.
@@ -66,18 +59,24 @@ pub fn attest(payload: &BatchPublicDataV1, nonce: &str) -> Result<String> {
     // Get the path to the AttestationClient executable.
     let client = attestation_client_path()?;
 
-    // Serialize the payload to a byte array using rkyv, then encode it to base64.
+    // Serialize the payload to a byte array using borsh, needed for hashing.
     let payload = to_vec(&payload)?;
-    let payload = BASE64_ENGINE.encode(payload);
 
-    println!("Sending payload to AttestationClient: {}", payload);
+    let mut hasher = Sha256::new();
+
+    // Hashing the payload
+    // Domain separation tag
+    hasher.update(b"midnight-l2::batch_data");
+    hasher.update(&payload);
+    let payload_hash = hasher.finalize();
+    let payload_hash = format!("{:x}", payload_hash);
 
     // Call the C++ AttestationClient program with the serialized and encoded payload.
     // Sudo is necessary as AttestationClient will read the vTPM values, most especially the OS values, for the attestation.
     let result = Command::new("sudo")
         .arg(client)
         .arg("-i")
-        .arg(payload)
+        .arg(payload_hash)
         .arg("-n")
         .arg(nonce)
         .stdout(Stdio::piped())
@@ -103,7 +102,7 @@ pub fn attest(payload: &BatchPublicDataV1, nonce: &str) -> Result<String> {
 /// # Arguments
 /// * `payload` - The JWT token to be verified.
 /// * `policy` - The policy JSON to be used for verification.
-pub fn verify(payload: &String, policy: String, nonce: &str) -> Result<()> {
+pub fn verify(payload: &String, policy: &String, nonce: &str) -> Result<()> {
     let client = attestation_client_path()?;
     let result = Command::new(client)
         .arg("-p")
@@ -147,17 +146,6 @@ mod tests {
         // It does NOT provide protection against request forwarding or active
         // man-in-the-middle attacks. In this test, possession of a valid attestation
         // JWT is sufficient to pass verification.
-        //
-        // In production, the attestation MUST be bound to a proof-of-possession key
-        // owned by the attested VM, typically via mTLS:
-        //
-        // - The VM generates an ephemeral keypair.
-        // - The public key is included in the attested client payload.
-        // - The server verifies that the requester proves possession of the
-        //   corresponding private key (e.g. via mTLS or an explicit signature).
-        //
-        // This binds the attestation to the live connection and prevents an attacker
-        // from replaying or forwarding a valid attestation token.
 
         // Create a test payload.
         let payload = BatchPublicDataV1 {
@@ -185,31 +173,42 @@ mod tests {
 
         // Verify the attestation.
         println!("Verifying attestation using policy {}", TEST_POLICY_JSON);
-        let result = verify(&attestation, TEST_POLICY_JSON.to_string(), "midnight-l2");
+        let result: std::result::Result<(), anyhow::Error> =
+            verify(&attestation, &TEST_POLICY_JSON.to_string(), "midnight-l2");
         assert!(result.is_ok(), "Verification failed");
 
         // Decode the JWT payload to verify it contains the expected data.
         let jwt = jwt_payload_json(&attestation).unwrap();
         println!("JWT payload: {:?}", jwt);
-        let client_payload = jwt
+        let client_payload_hash = jwt
             .pointer("/x-ms-runtime/client-payload/midnight_payload")
             .and_then(|s| s.as_str())
             .expect("Payload is empty");
-        assert!(!client_payload.is_empty(), "Expected payload is empty");
-
+        assert!(!client_payload_hash.is_empty(), "Expected payload is empty");
         // Decode the client payload.
-        // Needed, as the payload is encoded twice, once by us, once by MAA...
-        println!("Client payload: {:?}", client_payload);
-        let client_payload = BASE64_ENGINE.decode(client_payload).unwrap();
-        let client_payload = BASE64_ENGINE.decode(client_payload).unwrap();
+        // Needed, as MAA encode the client payload to base64 before including it in the JWT.
+        println!("Client payload: {:?}", client_payload_hash);
+        let client_payload_hash = crate::common::BASE64_ENGINE
+            .decode(client_payload_hash)
+            .unwrap();
+
         // Get back the original payload.
-        let client_payload: BatchPublicDataV1 =
-            from_slice::<BatchPublicDataV1>(&client_payload).unwrap();
-        println!("Client payload (decoded): {:?}", client_payload);
+        let client_payload_hash = String::from_utf8(client_payload_hash).unwrap();
+        println!("Client payload (decoded): {:?}", client_payload_hash);
+
+        // Hashing the original payload for comparison.
+        let mut hasher = Sha256::new();
+        let original_payload_bytes = to_vec(&payload).unwrap();
+        // Domain separation tag
+        hasher.update(b"midnight-l2::batch_data");
+        hasher.update(&original_payload_bytes);
+        let original_payload_hash = hasher.finalize();
+        let original_payload_hash = format!("{:x}", original_payload_hash);
+
         // Check if the client payload is the same as the original payload.
         assert_eq!(
-            payload, client_payload,
-            "Extracted payload does not match the original payload"
+            original_payload_hash, client_payload_hash,
+            "Mismatched payload hash"
         );
     }
 }

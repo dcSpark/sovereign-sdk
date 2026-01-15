@@ -37,9 +37,10 @@ where
         genesis_state_root.clone(),
         0,
         [0u8; 32],
-        1,
+        1, // To be replaced with actual layer2_chain_id
         stf_info_receiver,
         shutdown_receiver,
+        reqwest::Client::new(),
     )
     .post_aggregated_proof_to_da_in_background()
     .await)

@@ -6,7 +6,8 @@ use sov_modules_api::transaction::AuthenticatedTransactionData;
 use sov_modules_api::{
     Amount, BasicGasMeter, DaSpec, Gas, GasArray, GasMeter, GasSpec, InvalidProofError,
     MeteredBorshDeserialize, PreExecWorkingSet, ProofOutcome, ProofReceipt, ProofReceiptContents,
-    Rewards, Spec, StateCheckpoint, StateProvider, TxScratchpad, WorkingSet,
+    Rewards, SerializedAggregatedProof, Spec, StateCheckpoint, StateProvider, TEEAttestation,
+    TxScratchpad, WorkingSet,
 };
 use sov_state::{Storage, StorageProof};
 
@@ -116,7 +117,19 @@ where
                         &mut working_set,
                     )
                     .map(ProofReceiptContents::BlockProof),
-                ProofType::TEEProofAttestation(proof) => todo!(),
+                ProofType::TEEProofAttestation(proof) => {
+                    let att: TEEAttestation =
+                        borsh::from_slice(&proof.tee_raw_attestation).unwrap();
+                    let aggr: SerializedAggregatedProof = SerializedAggregatedProof {
+                        raw_aggregated_proof: att.raw_aggregated_proof.clone(),
+                    };
+                    runtime
+                        .proof_processor()
+                        .process_aggregated_proof(aggr, sequencer_rollup_address, &mut working_set)
+                        .map(|(pub_data, proof)| {
+                            ProofReceiptContents::AggregateProof(pub_data, proof)
+                        })
+                }
             };
 
             let (outcome, mut scratchpad, transaction_consumption) = match receipt_contents {

@@ -450,19 +450,11 @@ dependencies = [
  "bytes",
  "cfg-if",
  "const-hex",
-<<<<<<< HEAD
- "derive_more 2.0.1",
- "foldhash 0.2.0",
- "getrandom 0.3.3",
- "hashbrown 0.16.1",
- "indexmap 2.11.1",
-=======
  "derive_more 2.1.1",
  "foldhash 0.2.0",
  "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "indexmap 2.12.1",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "itoa",
  "k256",
  "keccak-asm",
@@ -1660,7 +1652,7 @@ dependencies = [
  "serde_json",
  "sev 6.3.1",
  "sha2 0.10.9",
- "thiserror 2.0.16",
+ "thiserror 2.0.17",
  "tss-esapi",
  "zerocopy",
 ]
@@ -1677,8 +1669,8 @@ dependencies = [
  "openssl",
  "serde",
  "sev 6.3.1",
- "thiserror 2.0.16",
- "ureq",
+ "thiserror 2.0.17",
+ "ureq 2.12.1",
 ]
 
 [[package]]
@@ -1939,7 +1931,7 @@ checksum = "f48d6ace212fdf1b45fd6b566bb40808415344642b76c3224c07c8df9da81e97"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.106",
+ "syn 2.0.112",
 ]
 
 [[package]]
@@ -2136,7 +2128,7 @@ dependencies = [
  "prost-types 0.14.1",
  "tonic 0.14.2",
  "tonic-prost",
- "ureq",
+ "ureq 3.1.4",
 ]
 
 [[package]]
@@ -4102,7 +4094,7 @@ checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.106",
+ "syn 2.0.112",
 ]
 
 [[package]]
@@ -5486,11 +5478,8 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
-<<<<<<< HEAD
-=======
  "allocator-api2",
  "equivalent",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "foldhash 0.2.0",
  "serde",
  "serde_core",
@@ -6220,26 +6209,12 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "io-uring"
-version = "0.7.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046fa2d4d00aea763528b4950358d0ead425372445dc8ff86312b3c69ff7727b"
-dependencies = [
- "bitflags 2.9.4",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "iocuddle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8972d5be69940353d5347a1344cb375d9b457d6809b428b05bb1ca2fb9ce007"
 
 [[package]]
-=======
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6896,7 +6871,7 @@ version = "0.1.0"
 source = "git+https://github.com/dcSpark/ligero-prover.git?rev=8c69805f001e6c15c967181d5524da8284c94844#8c69805f001e6c15c967181d5524da8284c94844"
 dependencies = [
  "anyhow",
- "bincode",
+ "bincode 1.3.3",
  "hex",
  "ligetron",
  "rand 0.8.5",
@@ -7345,7 +7320,7 @@ dependencies = [
  "anyhow",
  "axum 0.7.9",
  "base64 0.22.1",
- "bincode",
+ "bincode 1.3.3",
  "borsh",
  "chrono",
  "clap",
@@ -7379,13 +7354,8 @@ name = "midnight-privacy"
 version = "0.3.0"
 dependencies = [
  "anyhow",
-<<<<<<< HEAD
- "bech32 0.11.0",
- "bincode 1.3.3",
-=======
  "bech32 0.11.1",
- "bincode",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
+ "bincode 1.3.3",
  "borsh",
  "chacha20poly1305",
  "hex",
@@ -8130,7 +8100,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
-<<<<<<< HEAD
+name = "openssl-probe"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f50d9b3dabb09ecd771ad0aa242ca6894994c130308ca3d7684634df8037391"
+
+[[package]]
 name = "openssl-src"
 version = "300.5.4+3.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8138,16 +8113,6 @@ checksum = "a507b3792995dae9b0df8a1c1e3771e8418b7c2d9f0baeba32e6fe8b06c7cb72"
 dependencies = [
  "cc",
 ]
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.109"
-=======
-name = "openssl-probe"
-version = "0.2.0"
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f50d9b3dabb09ecd771ad0aa242ca6894994c130308ca3d7684634df8037391"
 
 [[package]]
 name = "openssl-sys"
@@ -8254,6 +8219,30 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "oracle"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "borsh",
+ "dotenvy",
+ "envy",
+ "midnight-privacy",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sov-midnight-da",
+ "sov-modules-api",
+ "tee",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "url",
+ "validator",
+]
 
 [[package]]
 name = "ordered-float"
@@ -9342,17 +9331,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.112",
-]
-
-[[package]]
-name = "proptest-derive"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "095a99f75c69734802359b682be8daaf8980296731f6470434ea2c652af1dd30"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
 ]
 
 [[package]]
@@ -10955,10 +10933,7 @@ dependencies = [
  "ark-ff 0.3.0",
  "ark-ff 0.4.2",
  "ark-ff 0.5.0",
-<<<<<<< HEAD
  "borsh",
-=======
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "bytes",
  "fastrlp 0.3.1",
  "fastrlp 0.4.0",
@@ -11866,7 +11841,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
  "bitfield 0.19.4",
- "bitflags 2.9.4",
+ "bitflags 2.10.0",
  "byteorder",
  "codicon",
  "dirs 6.0.0",
@@ -11880,7 +11855,7 @@ dependencies = [
  "serde-big-array",
  "serde_bytes",
  "static_assertions",
- "uuid 1.18.1",
+ "uuid 1.19.0",
 ]
 
 [[package]]
@@ -11891,7 +11866,7 @@ checksum = "c2ff74d7e7d1cc172f3a45adec74fbeee928d71df095b85aaaf66eb84e1e31e6"
 dependencies = [
  "base64 0.22.1",
  "bitfield 0.19.4",
- "bitflags 2.9.4",
+ "bitflags 2.10.0",
  "byteorder",
  "dirs 6.0.0",
  "hex",
@@ -11899,7 +11874,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "static_assertions",
- "uuid 1.18.1",
+ "uuid 1.19.0",
 ]
 
 [[package]]
@@ -12371,13 +12346,8 @@ dependencies = [
  "arbitrary",
  "async-trait",
  "backon",
-<<<<<<< HEAD
- "bech32 0.11.0",
- "bincode 1.3.3",
-=======
  "bech32 0.11.1",
- "bincode",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
+ "bincode 1.3.3",
  "borsh",
  "celestia-rpc",
  "celestia-types",
@@ -12780,11 +12750,7 @@ dependencies = [
  "k256",
  "proptest",
  "proptest-derive 0.5.1",
-<<<<<<< HEAD
- "reqwest 0.12.26",
-=======
  "reqwest 0.12.28",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "ruint",
  "schemars 0.8.22",
  "secp256k1 0.30.0",
@@ -13057,13 +13023,8 @@ dependencies = [
  "arbitrary",
  "async-trait",
  "axum 0.7.9",
-<<<<<<< HEAD
- "bech32 0.11.0",
- "bincode 1.3.3",
-=======
  "bech32 0.11.1",
- "bincode",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
+ "bincode 1.3.3",
  "borsh",
  "bs58",
  "clap",
@@ -13079,11 +13040,7 @@ dependencies = [
  "openapiv3",
  "proptest",
  "proptest-derive 0.5.1",
-<<<<<<< HEAD
- "reqwest 0.12.26",
-=======
  "reqwest 0.12.28",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -13841,6 +13798,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
+ "reqwest 0.12.28",
  "rockbound",
  "serde",
  "sha2 0.10.9",
@@ -14542,14 +14500,7 @@ checksum = "ed3ae8bc52d12e8fbfdb10c4c8ce7651af04b63d390c152e6ce43d7744bbaf6f"
 dependencies = [
  "alloy-sol-types",
  "anyhow",
-<<<<<<< HEAD
- "async-trait",
- "aws-config",
- "aws-sdk-kms",
  "bincode 1.3.3",
-=======
- "bincode",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
  "cfg-if",
  "dirs 5.0.1",
  "futures",
@@ -15234,8 +15185,10 @@ dependencies = [
  "base64 0.22.1",
  "borsh",
  "jsonwebtoken 10.2.0",
+ "serde",
  "serde_json",
  "sev 7.1.0",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -16516,6 +16469,23 @@ checksum = "151ac09978d3c2862c4e39b557f4eceee2cc72150bc4cb4f16abf061b6e381fb"
 
 [[package]]
 name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "once_cell",
+ "rustls 0.23.35",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ureq"
 version = "3.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d39cb1dbab692d82a977c0392ffac19e188bd9186a9f32806f0aaa859d75585a"
@@ -16525,12 +16495,6 @@ dependencies = [
  "percent-encoding",
  "rustls 0.23.35",
  "rustls-pki-types",
-<<<<<<< HEAD
- "serde",
- "serde_json",
- "url",
- "webpki-roots 0.26.11",
-=======
  "ureq-proto",
  "utf-8",
  "webpki-roots 1.0.5",
@@ -16546,7 +16510,6 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
->>>>>>> 2e9cd75a7e8b87a4816705ce4b3f3ab5c17fd39e
 ]
 
 [[package]]

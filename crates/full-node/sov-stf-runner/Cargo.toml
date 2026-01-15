@@ -46,7 +46,7 @@ tower-http = { workspace = true, features = ["normalize-path", "cors"] }
 tee = { workspace = true, features = ["maa"] }
 tower-layer = "0.3.3"
 futures-util = "0.3.31"
-
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 backon = { workspace = true }

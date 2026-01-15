@@ -96,7 +96,7 @@ members = [
     "crates/adapters/sp1",
     "crates/adapters/tee",
     "crates/mcp",
-    "crates/mcp-external", "crates/adapters/tee",
+    "crates/mcp-external", "crates/adapters/tee", "crates/oracle",
 ]
 exclude = [
     "scripts/midnight-tx-generator",

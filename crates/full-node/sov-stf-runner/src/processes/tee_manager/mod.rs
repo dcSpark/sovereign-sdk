@@ -7,7 +7,7 @@ use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
 use sov_rollup_interface::stf::ProofSender;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
-use tee::common::BatchPublicDataV1;
+use tee::common::{BatchPublicDataV1, Engine};
 use tee::maa::*;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
@@ -46,12 +46,12 @@ pub(crate) fn compute_batch_hash_v1(
     let h = midnight_privacy::poseidon2_hash(
         TAG,
         &[
-            &ver,                 // 1
-            &batch_index_le,      // 8
-            parent_batch_hash,    // 32
-            da_commitment,        // 32
-            &da_start_le,         // 8
-            &da_end_le,           // 8
+            &ver,              // 1
+            &batch_index_le,   // 8
+            parent_batch_hash, // 32
+            da_commitment,     // 32
+            &da_start_le,      // 8
+            &da_end_le,        // 8
         ],
     );
 
@@ -93,8 +93,7 @@ pub struct TeeProofManager<Ps: ProverService> {
     layer2_chain_id: u64,
     stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
     shutdown_receiver: tokio::sync::watch::Receiver<()>,
-    // Store DA heights indexed by slot number for later retrieval
-    da_height_cache: HashMap<u64, u64>,
+    http_client: reqwest::Client,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -113,6 +112,7 @@ where
         layer2_chain_id: u64,
         stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
         shutdown_receiver: tokio::sync::watch::Receiver<()>,
+        http_client: reqwest::Client,
     ) -> Self {
         Self {
             prover_service,
@@ -129,7 +129,7 @@ where
             batch_index,
             prev_batch_hash,
             layer2_chain_id,
-            da_height_cache: HashMap::new(),
+            http_client,
         }
     }
 
@@ -285,9 +285,7 @@ where
 
             let da_leaves: Vec<[u8; 32]> = infos
                 .iter()
-                .map(|b| {
-                    hash_to_bytes32(&b.hash).expect("Block hash should be 32 bytes")
-                })
+                .map(|b| hash_to_bytes32(&b.hash).expect("Block hash should be 32 bytes"))
                 .collect();
 
             let da_commitment_root = merkle_root_from_leaves(da_leaves);
@@ -361,13 +359,15 @@ where
             );
             println!("TEE attestation: {:?}", attestation);
 
+            let borshed_attestation = borsh::to_vec(&attestation)?;
+
             let attestation = sov_modules_api::SerializedTEEAttestation {
-                tee_raw_attestation: borsh::to_vec(&attestation)?,
+                tee_raw_attestation: borshed_attestation.clone(),
             };
 
             println!(
                 "Serialized TEE attestation size: {}",
-                borsh::to_vec(&attestation)?.len()
+                borshed_attestation.len()
             );
             println!("Sending aggregated proof and attestation to DA (for now, to be replaced)");
 
@@ -380,6 +380,20 @@ where
                 .inc_next_height_to_receive_by(num_proofs_to_create as u64);
 
             self.batch_index += 1;
+
+            // URL is hardcoded for now, to be replaced with a config value...
+            let res_http = self
+                .http_client
+                .post("http://127.0.0.1:8080/validate")
+                .json(&tee::common::TEEPayload {
+                    data: tee::common::BASE64_ENGINE.encode(borshed_attestation),
+                })
+                .send()
+                .await?;
+
+            let status = res_http.status();
+            let body = res_http.text().await.unwrap_or_default();
+            println!("Oracle response: {} {}", status, body);
 
             self.prev_batch_hash = batch_hash;
         }

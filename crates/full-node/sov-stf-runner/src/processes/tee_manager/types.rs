@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use nmt_rs::{TmSha2Hasher, simple_merkle::{db::MemDb, tree::MerkleTree}};
+use nmt_rs::{
+    simple_merkle::{db::MemDb, tree::MerkleTree},
+    TmSha2Hasher,
+};
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
