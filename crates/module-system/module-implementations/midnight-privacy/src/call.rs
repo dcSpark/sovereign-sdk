@@ -11,8 +11,12 @@ use tracing::{debug, info};
 
 use super::ValueMidnightPrivacy;
 use crate::event::Event;
-use crate::hash::{note_commitment, Hash32, PendingRootKey, RootKey};
-use crate::types::{EncryptedNote, FullViewingKey};
+use crate::hash::{
+    blacklist_pos_from_recipient, mt_combine, note_commitment, recipient_from_pk_v2,
+    sparse_default_nodes, bl_bucket_leaf, empty_blacklist_bucket_entries, BlacklistNodeKey, Hash32,
+    PendingRootKey, RootKey, BLACKLIST_BUCKET_SIZE, BLACKLIST_TREE_DEPTH,
+};
+use crate::types::{EncryptedNote, FullViewingKey, PrivacyAddress};
 
 #[cfg(feature = "native")]
 use anyhow::anyhow;
@@ -22,8 +26,8 @@ use crate::hash::NullifierKey;
 
 /// Max serialized Ligero proof size accepted by the module (in bytes).
 ///
-/// Proofs for `note_spend_guest` are currently ~8MB, so keep headroom.
-const MAX_LIGERO_PROOF_BYTES: usize = 12_000_000;
+/// Proof packages for `note_spend_guest` can be ~25MB (gzip), so keep headroom.
+const MAX_LIGERO_PROOF_BYTES: usize = 40_000_000;
 
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
@@ -130,6 +134,35 @@ pub enum CallMessage<S: Spec> {
         /// The new method ID (32-byte SHA-256 hash)
         new_method_id: [u8; 32],
     },
+
+    /// Freeze a privacy address (pool admin only).
+    ///
+    /// This sets the corresponding deny-map leaf to `1` and updates the on-chain `blacklist_root`.
+    FreezeAddress {
+        /// Privacy pool address (bech32m) to freeze.
+        address: PrivacyAddress,
+    },
+
+    /// Unfreeze a privacy address (pool admin only).
+    ///
+    /// This sets the corresponding deny-map leaf back to `0` and updates the on-chain
+    /// `blacklist_root`.
+    UnfreezeAddress {
+        /// Privacy pool address (bech32m) to unfreeze.
+        address: PrivacyAddress,
+    },
+
+    /// Add a pool admin (module admin only).
+    AddPoolAdmin {
+        /// Address to grant pool-admin rights.
+        admin: S::Address,
+    },
+
+    /// Remove a pool admin (module admin only).
+    RemovePoolAdmin {
+        /// Address to revoke pool-admin rights.
+        admin: S::Address,
+    },
 }
 
 /// Errors that can occur in the MidnightPrivacy module.
@@ -137,13 +170,34 @@ pub enum CallMessage<S: Spec> {
 pub enum MidnightPrivacyError<S: Spec> {
     /// Value tried to be set by a non-admin when updating method ID.
     #[error(
-        "Only admin can update the method ID. The expected admin is {admin}, but the sender is {sender}"
+        "Only module admin can perform this action. The expected admin is {admin}, but the sender is {sender}"
     )]
     WrongSender {
         /// The expected admin.
         admin: S::Address,
         /// The sender.
         sender: S::Address,
+    },
+
+    /// Sender is not a pool admin for operations that require pool-admin rights.
+    #[error("Only pool admins can perform this action. Sender: {sender}")]
+    NotPoolAdmin {
+        /// The sender.
+        sender: S::Address,
+    },
+
+    /// Proof's blacklist root does not match the module's configured root.
+    #[error(
+        "Blacklist root mismatch: expected {}, got {}",
+        hex::encode(.expected),
+        hex::encode(.got)
+    )]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    BlacklistRootMismatch {
+        /// Root expected by the module (from state).
+        expected: Hash32,
+        /// Root provided by the proof (public output).
+        got: Hash32,
     },
 
     /// The proof verification failed.
@@ -170,12 +224,62 @@ pub enum MidnightPrivacyError<S: Spec> {
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     PublicOutputMismatch,
 
+    /// Deposit recipient is frozen under the current deny-map root.
+    #[error("Recipient is blacklisted: {}", hex::encode(.recipient))]
+    RecipientBlacklisted {
+        /// The internal recipient identifier.
+        recipient: Hash32,
+    },
+
     /// Number of output commitments in proof exceeds maximum allowed
     #[error("Too many output commitments: {0} (max: {1})")]
     TooManyOutputs(usize, usize),
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
+    fn ensure_module_admin(
+        &self,
+        context: &Context<S>,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        let admin = self.admin.get_or_err(state)??;
+        if &admin != context.sender() {
+            return Err(MidnightPrivacyError::WrongSender::<S> {
+                admin,
+                sender: context.sender().clone(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn ensure_pool_admin(&self, context: &Context<S>, state: &mut impl TxState<S>) -> Result<()> {
+        let allowed = self
+            .pool_admins
+            .get(context.sender(), state)?
+            .unwrap_or(false);
+        if !allowed {
+            return Err(MidnightPrivacyError::NotPoolAdmin::<S> {
+                sender: context.sender().clone(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn is_recipient_blacklisted(
+        &self,
+        recipient: &Hash32,
+        state: &mut impl TxState<S>,
+    ) -> Result<bool> {
+        let pos = blacklist_pos_from_recipient(recipient);
+        let bucket = self
+            .blacklist_buckets
+            .get(&pos, state)?
+            .unwrap_or_else(empty_blacklist_bucket_entries);
+        Ok(bucket.iter().any(|e| e == recipient))
+    }
+
     /// Internal helper: Queue a single commitment for end-of-block processing.
     /// Used by deposit() and transfer() to append note commitments.
     ///
@@ -249,6 +353,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ) -> Result<()> {
         let gas = gas.unwrap_or(<S::Gas as Gas>::zero());
         st.charge_gas(&gas)?;
+
+        if self.is_recipient_blacklisted(&recipient, st)? {
+            return Err(MidnightPrivacyError::<S>::RecipientBlacklisted { recipient }.into());
+        }
 
         // Convert amount into the bank's amount type (u64 -> Amount)
         let amount_u64: u64 = amount
@@ -380,6 +488,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // SECURITY: Bind transaction fields to proof-committed values
             if public.anchor_root != anchor_root || public.nullifier != nullifier {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+            }
+
+            // Enforce deny-map root binding (freeze/blacklist primitive).
+            let expected_bl_root = self
+                .blacklist_root
+                .get(st)?
+                .unwrap_or_else(crate::default_blacklist_root);
+            if public.blacklist_root != expected_bl_root {
+                return Err(MidnightPrivacyError::<S>::BlacklistRootMismatch {
+                    expected: expected_bl_root,
+                    got: public.blacklist_root,
+                }
+                .into());
             }
 
             // Ensure this is a pure shielded transfer (no withdrawal)
@@ -602,6 +723,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 || public.withdraw_amount != withdraw_amount
             {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
+            }
+
+            // Enforce deny-map root binding (freeze/blacklist primitive).
+            let expected_bl_root = self
+                .blacklist_root
+                .get(st)?
+                .unwrap_or_else(crate::default_blacklist_root);
+            if public.blacklist_root != expected_bl_root {
+                return Err(MidnightPrivacyError::<S>::BlacklistRootMismatch {
+                    expected: expected_bl_root,
+                    got: public.blacklist_root,
+                }
+                .into());
             }
 
             // Ensure there's actually a withdrawal
@@ -999,16 +1133,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         context: &Context<S>,
         state: &mut impl TxState<S>,
     ) -> Result<()> {
-        // Check admin authorization
-        let admin = self.admin.get_or_err(state)??;
-
-        if &admin != context.sender() {
-            return Err(MidnightPrivacyError::WrongSender::<S> {
-                admin,
-                sender: context.sender().clone(),
-            }
-            .into());
-        }
+        self.ensure_module_admin(context, state)?;
 
         // Update the method ID
         self.method_id.set(&new_method_id, state)?;
@@ -1016,6 +1141,232 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         // Emit event
         self.emit_event(state, Event::MethodIdUpdated { new_method_id });
 
+        Ok(())
+    }
+
+    fn update_blacklist_bucket_at_pos(
+        &mut self,
+        pos: u64,
+        bucket_entries: [Hash32; BLACKLIST_BUCKET_SIZE],
+        state: &mut impl TxState<S>,
+    ) -> Result<Hash32> {
+        let defaults = sparse_default_nodes(BLACKLIST_TREE_DEPTH);
+
+        let leaf_key = BlacklistNodeKey { height: 0, index: pos };
+        let is_default_bucket = bucket_entries == empty_blacklist_bucket_entries();
+
+        // Store/remove bucket entries and set/remove the leaf hash.
+        let mut cur = if is_default_bucket {
+            let _ = self.blacklist_buckets.remove(&pos, state)?;
+            let _ = self.blacklist_nodes.remove(&leaf_key, state)?;
+            defaults[0]
+        } else {
+            self.blacklist_buckets.set(&pos, &bucket_entries, state)?;
+            let leaf = bl_bucket_leaf(&bucket_entries);
+            self.blacklist_nodes.set(&leaf_key, &leaf, state)?;
+            leaf
+        };
+
+        // Recompute the path bottom-up, updating only nodes on the path and keeping the tree sparse
+        // by deleting any nodes that match the all-default value at that height.
+        let mut idx = pos;
+        for height in 0..BLACKLIST_TREE_DEPTH {
+            let sibling_idx = idx ^ 1;
+            let sibling_key = BlacklistNodeKey {
+                height,
+                index: sibling_idx,
+            };
+            let sibling = self
+                .blacklist_nodes
+                .get(&sibling_key, state)?
+                .unwrap_or(defaults[height as usize]);
+
+            let parent = if (idx & 1) == 0 {
+                mt_combine(height, &cur, &sibling)
+            } else {
+                mt_combine(height, &sibling, &cur)
+            };
+
+            let parent_key = BlacklistNodeKey {
+                height: height + 1,
+                index: idx >> 1,
+            };
+            let default_parent = defaults[(height + 1) as usize];
+            if parent == default_parent {
+                let _ = self.blacklist_nodes.remove(&parent_key, state)?;
+            } else {
+                self.blacklist_nodes.set(&parent_key, &parent, state)?;
+            }
+
+            cur = parent;
+            idx >>= 1;
+        }
+
+        self.blacklist_root.set(&cur, state)?;
+        Ok(cur)
+    }
+
+    /// Freeze a privacy address (pool admin only).
+    pub(crate) fn freeze_address(
+        &mut self,
+        address: PrivacyAddress,
+        context: &Context<S>,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        self.ensure_pool_admin(context, state)?;
+
+        let domain = self.domain.get_or_err(state)??;
+        let pk_spend = address.to_pk();
+        let pk_ivk = address.pk_ivk();
+        let recipient = recipient_from_pk_v2(&domain, &pk_spend, &pk_ivk);
+        let pos = blacklist_pos_from_recipient(&recipient);
+
+        // Insert into the bucket (idempotent).
+        let mut entries = self
+            .blacklist_buckets
+            .get(&pos, state)?
+            .unwrap_or_else(empty_blacklist_bucket_entries);
+        if entries.iter().any(|e| e == &recipient) {
+            return Ok(());
+        }
+        let mut non_zero: Vec<Hash32> = entries
+            .iter()
+            .copied()
+            .filter(|e| *e != [0u8; 32])
+            .collect();
+        non_zero.push(recipient);
+        anyhow::ensure!(
+            non_zero.len() <= BLACKLIST_BUCKET_SIZE,
+            "deny-map bucket full at pos={} (max {})",
+            pos,
+            BLACKLIST_BUCKET_SIZE
+        );
+        non_zero.sort();
+        entries = empty_blacklist_bucket_entries();
+        for (i, e) in non_zero.into_iter().enumerate() {
+            entries[i] = e;
+        }
+
+        let old_root = self
+            .blacklist_root
+            .get(state)?
+            .unwrap_or_else(crate::default_blacklist_root);
+        let new_root = self.update_blacklist_bucket_at_pos(pos, entries, state)?;
+
+        if new_root != old_root {
+            self.emit_event(
+                state,
+                Event::BlacklistRootUpdated {
+                    old_blacklist_root: old_root,
+                    new_blacklist_root: new_root,
+                },
+            );
+        }
+        self.emit_event(
+            state,
+            Event::AddressFrozen { address, recipient },
+        );
+        Ok(())
+    }
+
+    /// Unfreeze a privacy address (pool admin only).
+    pub(crate) fn unfreeze_address(
+        &mut self,
+        address: PrivacyAddress,
+        context: &Context<S>,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        self.ensure_pool_admin(context, state)?;
+
+        let domain = self.domain.get_or_err(state)??;
+        let pk_spend = address.to_pk();
+        let pk_ivk = address.pk_ivk();
+        let recipient = recipient_from_pk_v2(&domain, &pk_spend, &pk_ivk);
+        let pos = blacklist_pos_from_recipient(&recipient);
+
+        // Remove from the bucket (idempotent).
+        let mut entries = self
+            .blacklist_buckets
+            .get(&pos, state)?
+            .unwrap_or_else(empty_blacklist_bucket_entries);
+        if !entries.iter().any(|e| e == &recipient) {
+            return Ok(());
+        }
+        let mut non_zero: Vec<Hash32> = entries
+            .iter()
+            .copied()
+            .filter(|e| *e != [0u8; 32] && e != &recipient)
+            .collect();
+        non_zero.sort();
+        entries = empty_blacklist_bucket_entries();
+        for (i, e) in non_zero.into_iter().enumerate() {
+            entries[i] = e;
+        }
+
+        let old_root = self
+            .blacklist_root
+            .get(state)?
+            .unwrap_or_else(crate::default_blacklist_root);
+        let new_root = self.update_blacklist_bucket_at_pos(pos, entries, state)?;
+
+        if new_root != old_root {
+            self.emit_event(
+                state,
+                Event::BlacklistRootUpdated {
+                    old_blacklist_root: old_root,
+                    new_blacklist_root: new_root,
+                },
+            );
+        }
+        self.emit_event(
+            state,
+            Event::AddressUnfrozen { address, recipient },
+        );
+        Ok(())
+    }
+
+    /// Add a pool admin (module admin only).
+    pub(crate) fn add_pool_admin(
+        &mut self,
+        admin: S::Address,
+        context: &Context<S>,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        self.ensure_module_admin(context, state)?;
+        if self.pool_admins.get(&admin, state)?.unwrap_or(false) {
+            return Ok(());
+        }
+
+        self.pool_admins.set(&admin, &true, state)?;
+
+        let mut list = self.pool_admin_list.get(state)?.unwrap_or_default();
+        match list.binary_search(&admin) {
+            Ok(_) => {}
+            Err(pos) => list.insert(pos, admin.clone()),
+        }
+        self.pool_admin_list.set::<Vec<S::Address>, _>(&list, state)?;
+
+        self.emit_event(state, Event::PoolAdminAdded { admin });
+        Ok(())
+    }
+
+    /// Remove a pool admin (module admin only).
+    pub(crate) fn remove_pool_admin(
+        &mut self,
+        admin: S::Address,
+        context: &Context<S>,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        self.ensure_module_admin(context, state)?;
+        let removed = self.pool_admins.remove(&admin, state)?.is_some();
+        if removed {
+            let mut list = self.pool_admin_list.get(state)?.unwrap_or_default();
+            if let Ok(pos) = list.binary_search(&admin) {
+                list.remove(pos);
+                self.pool_admin_list.set::<Vec<S::Address>, _>(&list, state)?;
+            }
+            self.emit_event(state, Event::PoolAdminRemoved { admin });
+        }
         Ok(())
     }
 }

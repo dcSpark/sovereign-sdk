@@ -1,7 +1,7 @@
-//! VFK Registry and decryption support for the indexer
+//! FVK Registry and decryption support for the indexer
 //!
-//! Supports multiple VFKs loaded from a config file. Each address has its own VFK,
-//! and the indexer looks up the correct VFK based on the fvk_commitment in each note.
+//! Supports multiple FVKs loaded from a config file. Each address has its own FVK,
+//! and the indexer looks up the correct FVK based on the fvk_commitment in each note.
 //!
 //! Uses DashMap for lock-free concurrent access during indexing.
 
@@ -39,32 +39,32 @@ pub struct DecryptedNote {
     pub sender_id: Option<String>,
 }
 
-/// A single VFK entry from the config file
+/// A single FVK entry from the config file
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VfkEntry {
-    /// The VFK as hex string (32 bytes = 64 hex chars)
-    pub vfk: String,
-    /// The shielded address associated with this VFK (optional)
+pub struct FvkEntry {
+    /// The FVK as hex string (32 bytes = 64 hex chars)
+    pub fvk: String,
+    /// The shielded address associated with this FVK (optional)
     #[serde(default)]
     pub shielded_address: Option<String>,
 }
 
-/// Config file structure for VFK registry
+/// Config file structure for FVK registry
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VfkConfig {
-    /// List of VFK entries
-    pub vfks: Vec<VfkEntry>,
+pub struct FvkConfig {
+    /// List of FVK entries
+    pub fvks: Vec<FvkEntry>,
 }
 
-/// Registry of VFKs indexed by their commitment for fast concurrent lookup.
+/// Registry of FVKs indexed by their commitment for fast concurrent lookup.
 /// Uses DashMap for lock-free concurrent access during indexing.
 #[derive(Debug)]
-pub struct VfkRegistry {
-    /// Map from fvk_commitment (hex) -> (vfk bytes, shielded_address)
+pub struct FvkRegistry {
+    /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address)
     by_commitment: DashMap<String, (Hash32, Option<String>)>,
 }
 
-impl VfkRegistry {
+impl FvkRegistry {
     /// Create an empty registry
     pub fn new() -> Self {
         Self {
@@ -77,31 +77,32 @@ impl VfkRegistry {
         self.by_commitment.is_empty()
     }
 
-    /// Number of VFKs in the registry
+    /// Number of FVKs in the registry
     pub fn len(&self) -> usize {
         self.by_commitment.len()
     }
 
-    /// Add a VFK to the registry (thread-safe, no &mut needed)
-    pub fn add(&self, vfk: Hash32, shielded_address: Option<String>) {
-        let vfk_obj = FullViewingKey(vfk);
-        let commitment = fvk_commitment(&vfk_obj);
+    /// Add a FVK to the registry (thread-safe, no &mut needed)
+    pub fn add(&self, fvk: Hash32, shielded_address: Option<String>) {
+        let fvk_obj = FullViewingKey(fvk);
+        let commitment = fvk_commitment(&fvk_obj);
         let commitment_hex = hex::encode(commitment);
         self.by_commitment
-            .insert(commitment_hex, (vfk, shielded_address));
+            .insert(commitment_hex, (fvk, shielded_address));
     }
 
-    /// Remove a VFK by its commitment (thread-safe)
+    /// Remove a FVK by its commitment (thread-safe)
     pub fn remove(&self, commitment_hex: &str) -> bool {
         self.by_commitment.remove(commitment_hex).is_some()
     }
 
-    /// Look up a VFK by its commitment (hex string) and return a copy
-    pub fn get_vfk(&self, commitment_hex: &str) -> Option<Hash32> {
+    /// Look up a FVK by its commitment (hex string) and return a copy
+    pub fn get_fvk(&self, commitment_hex: &str) -> Option<Hash32> {
         self.by_commitment.get(commitment_hex).map(|r| r.0)
     }
 
     /// Check if a commitment exists in the registry
+    #[allow(unused)]
     pub fn contains(&self, commitment_hex: &str) -> bool {
         self.by_commitment.contains_key(commitment_hex)
     }
@@ -111,28 +112,28 @@ impl VfkRegistry {
         self.by_commitment
             .iter()
             .map(|r| {
-                let (k, (vfk, addr)) = r.pair();
-                (k.clone(), *vfk, addr.clone())
+                let (k, (fvk, addr)) = r.pair();
+                (k.clone(), *fvk, addr.clone())
             })
             .collect()
     }
 
-    /// Load VFKs from a JSON config file
+    /// Load FVKs from a JSON config file
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read VFK config file {:?}: {}", path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read FVK config file {:?}: {}", path, e))?;
 
-        let config: VfkConfig = serde_json::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("Failed to parse VFK config file {:?}: {}", path, e))?;
+        let config: FvkConfig = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("Failed to parse FVK config file {:?}: {}", path, e))?;
 
         let registry = Self::new();
 
-        for entry in config.vfks {
-            let vfk = parse_vfk_hex(&entry.vfk)?;
-            registry.add(vfk, entry.shielded_address);
+        for entry in config.fvks {
+            let fvk = parse_fvk_hex(&entry.fvk)?;
+            registry.add(fvk, entry.shielded_address);
         }
 
-        info!("Loaded {} VFKs from config file {:?}", registry.len(), path);
+        info!("Loaded {} FVKs from config file {:?}", registry.len(), path);
         Ok(registry)
     }
 
@@ -141,20 +142,20 @@ impl VfkRegistry {
         use sea_orm::sea_query::OnConflict;
 
         for entry in self.by_commitment.iter() {
-            let (commitment_hex, (vfk, shielded_address)) = entry.pair();
-            let model = idx::vfk_registry::ActiveModel {
+            let (commitment_hex, (fvk, shielded_address)) = entry.pair();
+            let model = idx::fvk_registry::ActiveModel {
                 fvk_commitment: Set(commitment_hex.clone()),
-                vfk: Set(hex::encode(vfk)),
+                fvk: Set(hex::encode(fvk)),
                 shielded_address: Set(shielded_address.clone()),
                 created_at: Set(Utc::now()),
             };
 
-            idx::vfk_registry::Entity::insert(model)
+            idx::fvk_registry::Entity::insert(model)
                 .on_conflict(
-                    OnConflict::column(idx::vfk_registry::Column::FvkCommitment)
+                    OnConflict::column(idx::fvk_registry::Column::FvkCommitment)
                         .update_columns([
-                            idx::vfk_registry::Column::Vfk,
-                            idx::vfk_registry::Column::ShieldedAddress,
+                            idx::fvk_registry::Column::Fvk,
+                            idx::fvk_registry::Column::ShieldedAddress,
                         ])
                         .to_owned(),
                 )
@@ -162,45 +163,45 @@ impl VfkRegistry {
                 .await?;
         }
 
-        info!("Saved {} VFKs to database", self.len());
+        info!("Saved {} FVKs to database", self.len());
         Ok(())
     }
 
     /// Load the registry from the database
     pub async fn load_from_db(db: &DatabaseConnection) -> Result<Self> {
-        let rows = idx::vfk_registry::Entity::find().all(db).await?;
+        let rows = idx::fvk_registry::Entity::find().all(db).await?;
 
         let registry = Self::new();
 
         for row in rows {
-            let vfk = parse_vfk_hex(&row.vfk)?;
+            let fvk = parse_fvk_hex(&row.fvk)?;
             // We already have the commitment stored, but we re-add to populate our DashMap
-            registry.add(vfk, row.shielded_address);
+            registry.add(fvk, row.shielded_address);
         }
 
         if !registry.is_empty() {
-            info!("Loaded {} VFKs from database", registry.len());
+            info!("Loaded {} FVKs from database", registry.len());
         }
 
         Ok(registry)
     }
 }
 
-impl Default for VfkRegistry {
+impl Default for FvkRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Parse a VFK from a hex string (with or without 0x prefix)
-pub fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
-    let s = vfk_hex.trim();
+/// Parse a FVK from a hex string (with or without 0x prefix)
+pub fn parse_fvk_hex(fvk_hex: &str) -> Result<Hash32> {
+    let s = fvk_hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes =
-        hex::decode(s).map_err(|e| anyhow::anyhow!("Invalid VFK hex '{}': {}", vfk_hex, e))?;
+        hex::decode(s).map_err(|e| anyhow::anyhow!("Invalid FVK hex '{}': {}", fvk_hex, e))?;
     if bytes.len() != 32 {
         anyhow::bail!(
-            "VFK must be 32 bytes (64 hex chars), got {} bytes",
+            "FVK must be 32 bytes (64 hex chars), got {} bytes",
             bytes.len()
         );
     }
@@ -209,22 +210,22 @@ pub fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
     Ok(out)
 }
 
-/// Load authority viewing key from environment variable AUTHORITY_VFK.
-/// This is for backward compatibility with single-VFK mode.
-pub fn load_authority_vfk() -> Option<Hash32> {
-    let raw = std::env::var("AUTHORITY_VFK").ok()?;
-    match parse_vfk_hex(&raw) {
-        Ok(vfk) => Some(vfk),
+/// Load authority full viewing key from environment variable AUTHORITY_FVK.
+/// This is for backward compatibility with single-FVK mode.
+pub fn load_authority_fvk() -> Option<Hash32> {
+    let raw = std::env::var("AUTHORITY_FVK").ok()?;
+    match parse_fvk_hex(&raw) {
+        Ok(fvk) => Some(fvk),
         Err(e) => {
-            warn!("AUTHORITY_VFK is set but invalid: {}", e);
+            warn!("AUTHORITY_FVK is set but invalid: {}", e);
             None
         }
     }
 }
 
-/// Load VFK config file path from environment variable VFK_CONFIG_FILE
-pub fn load_vfk_config_path() -> Option<std::path::PathBuf> {
-    std::env::var("VFK_CONFIG_FILE")
+/// Load FVK config file path from environment variable FVK_CONFIG_FILE
+pub fn load_fvk_config_path() -> Option<std::path::PathBuf> {
+    std::env::var("FVK_CONFIG_FILE")
         .ok()
         .map(std::path::PathBuf::from)
 }
@@ -254,20 +255,20 @@ fn stream_xor_decrypt(k: &Hash32, ct: &[u8], pt_out: &mut [u8]) {
     }
 }
 
-/// Decrypt an encrypted note using the provided VFK.
+/// Decrypt an encrypted note using the provided FVK.
 ///
 /// Supports both deposit notes (112 bytes, no sender_id) and transfer notes (144 bytes, with sender_id).
-pub fn decrypt_note(vfk: &Hash32, encrypted_note: &EncryptedNote) -> Result<DecryptedNote> {
-    let vfk_obj = FullViewingKey(*vfk);
-    let expected_vfk_c = fvk_commitment(&vfk_obj);
+pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<DecryptedNote> {
+    let fvk_obj = FullViewingKey(*fvk);
+    let expected_fvk_c = fvk_commitment(&fvk_obj);
 
-    // Verify VFK commitment matches
-    if encrypted_note.fvk_commitment != expected_vfk_c {
-        anyhow::bail!("VFK commitment mismatch: note is not encrypted for this viewing key");
+    // Verify FVK commitment matches
+    if encrypted_note.fvk_commitment != expected_fvk_c {
+        anyhow::bail!("FVK commitment mismatch: note is not encrypted for this viewing key");
     }
 
     // Derive decryption key
-    let k = view_kdf(&vfk_obj, &encrypted_note.cm);
+    let k = view_kdf(&fvk_obj, &encrypted_note.cm);
 
     // Verify MAC before decryption
     let ct_h = ct_hash(encrypted_note.ct.as_ref());
@@ -323,12 +324,12 @@ pub fn decrypt_note(vfk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
     })
 }
 
-/// Try to decrypt all encrypted notes using the VFK registry.
+/// Try to decrypt all encrypted notes using the FVK registry.
 ///
-/// For each note, looks up the correct VFK based on the fvk_commitment.
+/// For each note, looks up the correct FVK based on the fvk_commitment.
 /// Returns a JSON array of decrypted notes, or None if no notes could be decrypted.
 pub fn try_decrypt_notes_with_registry(
-    registry: &VfkRegistry,
+    registry: &FvkRegistry,
     encrypted_notes_json: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let json = encrypted_notes_json?;
@@ -340,13 +341,13 @@ pub fn try_decrypt_notes_with_registry(
 
     let mut decrypted = Vec::new();
     for (idx, note) in notes.iter().enumerate() {
-        // Look up the VFK by the note's fvk_commitment
+        // Look up the FVK by the note's fvk_commitment
         let commitment_hex = hex::encode(note.fvk_commitment);
-        if let Some(vfk) = registry.get_vfk(&commitment_hex) {
-            match decrypt_note(&vfk, note) {
+        if let Some(fvk) = registry.get_fvk(&commitment_hex) {
+            match decrypt_note(&fvk, note) {
                 Ok(decrypted_note) => {
                     debug!(
-                        "Decrypted note {} with VFK commitment {}: value={}",
+                        "Decrypted note {} with FVK commitment {}: value={}",
                         idx,
                         &commitment_hex[..16],
                         decrypted_note.value
@@ -354,12 +355,12 @@ pub fn try_decrypt_notes_with_registry(
                     decrypted.push(decrypted_note);
                 }
                 Err(e) => {
-                    warn!("Failed to decrypt note {} despite matching VFK: {}", idx, e);
+                    warn!("Failed to decrypt note {} despite matching FVK: {}", idx, e);
                 }
             }
         } else {
             debug!(
-                "No VFK found for note {} with commitment {}",
+                "No FVK found for note {} with commitment {}",
                 idx,
                 &commitment_hex[..16]
             );
@@ -373,9 +374,10 @@ pub fn try_decrypt_notes_with_registry(
     }
 }
 
-/// Backward-compatible function: Try to decrypt with a single VFK
+/// Backward-compatible function: Try to decrypt with a single FVK
+#[allow(unused)]
 pub fn try_decrypt_notes_json(
-    vfk: &Hash32,
+    fvk: &Hash32,
     encrypted_notes_json: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let json = encrypted_notes_json?;
@@ -387,14 +389,14 @@ pub fn try_decrypt_notes_json(
 
     let mut decrypted = Vec::new();
     for (idx, note) in notes.iter().enumerate() {
-        match decrypt_note(vfk, note) {
+        match decrypt_note(fvk, note) {
             Ok(decrypted_note) => {
                 debug!("Decrypted note {}: value={}", idx, decrypted_note.value);
                 decrypted.push(decrypted_note);
             }
             Err(e) => {
                 debug!(
-                    "Failed to decrypt note {} (may not be for this VFK): {}",
+                    "Failed to decrypt note {} (may not be for this FVK): {}",
                     idx, e
                 );
             }

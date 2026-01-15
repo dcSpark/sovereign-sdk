@@ -42,6 +42,25 @@ pub struct PrivacyAddress {
     pk_ivk: [u8; 32],
 }
 
+fn privacy_address_hrp() -> &'static str {
+    PRIVACY_ADDRESS_HRP
+}
+
+// Universal Wallet schema override for `PrivacyAddress`.
+//
+// The Borsh encoding of `PrivacyAddress` is 64 bytes: pk_spend || pk_ivk.
+// We expose that encoding as a single bech32m string for signing/UX purposes.
+#[derive(sov_rollup_interface::sov_universal_wallet::UniversalWallet)]
+#[allow(dead_code)]
+#[doc(hidden)]
+pub struct PrivacyAddressSchema(
+    #[sov_wallet(display(bech32m(prefix = "privacy_address_hrp()")))] [u8; 64],
+);
+
+impl sov_rollup_interface::sov_universal_wallet::schema::OverrideSchema for PrivacyAddress {
+    type Output = PrivacyAddressSchema;
+}
+
 impl PrivacyAddress {
     /// Create a legacy PrivacyAddress from a 32-byte spending public key.
     ///
@@ -223,6 +242,9 @@ impl std::error::Error for PrivacyAddressError {}
 pub struct SpendPublic {
     /// Anchor root used for membership checks.
     pub anchor_root: Hash32,
+    /// Sparse Merkle deny-map root used to enforce sender/recipient freezing.
+    #[serde(default = "crate::hash::default_blacklist_root")]
+    pub blacklist_root: Hash32,
     /// Nullifier of the consumed note (PRF-based; no position).
     pub nullifier: Hash32,
     /// For a single native token, the transparent withdrawal amount authorized by the circuit.

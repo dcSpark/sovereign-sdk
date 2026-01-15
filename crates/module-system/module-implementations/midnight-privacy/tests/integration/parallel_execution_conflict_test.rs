@@ -64,6 +64,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
         root_window_size: 16,
         method_id,
         admin,
+        pool_admins: None,
         domain,
         token_id,
     };
@@ -112,6 +113,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
+            blacklist_root: midnight_privacy::default_blacklist_root(),
             nullifier: nf,
             withdraw_amount: 0,
             output_commitments: vec![out],
@@ -306,6 +308,7 @@ fn sequential_execution_works_with_slot_based_storage() {
         root_window_size: 16,
         method_id,
         admin,
+        pool_admins: None,
         domain,
         token_id,
     };
@@ -347,6 +350,7 @@ fn sequential_execution_works_with_slot_based_storage() {
 
         let pub_input = SpendPublic {
             anchor_root: initial_root,
+            blacklist_root: midnight_privacy::default_blacklist_root(),
             nullifier: nf,
             withdraw_amount: 0,
             output_commitments: vec![out],

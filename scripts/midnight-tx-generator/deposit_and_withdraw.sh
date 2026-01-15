@@ -58,16 +58,27 @@ fi
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="$REPO_ROOT/target"
+fi
+BUILD_PROFILE="${BUILD_PROFILE:-debug}"
+BIN_DIR="$CARGO_TARGET_DIR/$BUILD_PROFILE"
+CARGO_BUILD_FLAGS=()
+if [ "$BUILD_PROFILE" = "release" ]; then
+  CARGO_BUILD_FLAGS+=(--release)
+fi
+
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
+# Note: Chain generation numbers use milliseconds, so we use $(date +%s)000 as fallback
 NONCE_STATE_FILE="$GENERATOR_DIR/.last_nonce"
-BASE_NONCE=$(date +%s)
+BASE_NONCE=$(($(date +%s) * 1000))
 
 # Try to fetch latest from node for this key
 NODE_API_URL="${NODE_API_URL:-http://localhost:12346}"
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fetch-nonce 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "$NODE_API_URL" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 
 if [ -n "$LATEST_ON_NODE" ]; then
   # next usable nonce
@@ -89,6 +100,11 @@ WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-50}"
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"
 
+# Optional: Authority FVK for Level-B viewing (32 bytes hex, with or without 0x prefix)
+# If set, proofs will include viewer attestations that allow authorities to decrypt notes
+# Example: AUTHORITY_FVK=0x0102030405060708091011121314151617181920212223242526272829303132
+AUTHORITY_FVK="${AUTHORITY_FVK:-}"
+
 # Optional: fund the sender before shielded deposit (uses bank transfer via seq HTTP API)
 FUNDER_KEY_FILE="${FUNDER_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/token_deployer_private_key.json}"
 FUND_AMOUNT="${FUND_AMOUNT:-1000}" # clear tokens to send to sender
@@ -103,35 +119,31 @@ echo "  Withdraw: $WITHDRAW_AMOUNT"
 echo "  Change: $((DEPOSIT_AMOUNT - WITHDRAW_AMOUNT)) (stays shielded)"
 echo "  Nonce: $NONCE"
 echo "  Proof Verifier: $VERIFIER_ENDPOINT"
+if [ -n "$AUTHORITY_FVK" ]; then
+    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
+fi
 echo ""
 
 # Build generators if needed
 echo -e "${YELLOW}Building generators...${NC}"
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin midnight-deposit-generator --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin midnight-deposit-generator --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 echo ""
 
 # Step 0: fund sender if requested (native Rust funder)
+# Note: fund binary fetches its own generation from the node, no need to pass FUND_NONCE
 if [ -n "$FUND_AMOUNT" ] && [ "$FUND_AMOUNT" != "0" ]; then
   echo -e "${YELLOW}Step 0: Funding sender with $FUND_AMOUNT tokens${NC}"
   cd "$GENERATOR_DIR"
-  SKIP_GUEST_BUILD=1 cargo build --bin fund 2>&1 | grep -E "Compiling|Finished" || true
+  SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin fund 2>&1 | grep -E "Compiling|Finished" || true
   cd "$REPO_ROOT"
-  FUND_NONCE=""
-  if [ -f "$NONCE_STATE_FILE" ]; then
-    LAST_NONCE=$(cat "$NONCE_STATE_FILE" | tr -d '\n' || echo 0)
-    if [[ "$LAST_NONCE" =~ ^[0-9]+$ ]]; then
-      FUND_NONCE=$((LAST_NONCE + 1))
-    fi
-  fi
   env \
     NODE_API_URL="${NODE_API_URL:-http://localhost:12346}" \
     RECIPIENT="$RECIPIENT" \
     FUND_AMOUNT="$FUND_AMOUNT" \
     FUNDER_KEY_FILE="$FUNDER_KEY_FILE" \
-    ${FUND_NONCE:+FUND_NONCE="$FUND_NONCE"} \
-    "$GENERATOR_DIR/target/debug/fund"
+    "$BIN_DIR/fund"
   echo -e "${GREEN}✓ Funding submitted via native funder${NC}\n"
 fi
 
@@ -139,7 +151,7 @@ fi
 echo -e "${YELLOW}Step 1: Deposit${NC}"
 export DEPOSIT_AMOUNT NONCE PRIVATE_KEY_FILE
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
+"$BIN_DIR/midnight-deposit-generator" "midnight_deposit_tx.bin" > /tmp/deposit.log
 cd "$REPO_ROOT"
 
 # Send deposit to proof verifier (which forwards to sequencer)
@@ -209,7 +221,7 @@ echo ""
 echo -e "${YELLOW}Step 2: Withdraw${NC}"
 
 # Increment nonce for withdrawal (prefer node latest + 1)
-LATEST_ON_NODE=$("$GENERATOR_DIR/target/debug/fetch-nonce" "${NODE_API_URL:-http://localhost:12346}" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
+LATEST_ON_NODE=$("$BIN_DIR/fetch-nonce" "${NODE_API_URL:-http://localhost:12346}" "$PRIVATE_KEY_FILE" 2>/dev/null || echo "")
 if [ -n "$LATEST_ON_NODE" ]; then
   WITHDRAW_NONCE=$((LATEST_ON_NODE + 1))
 else
@@ -225,13 +237,18 @@ NOTE_SPEND_SK=$(cat "$NOTE_DETAILS_FILE" | jq -r '.spend_sk')
 
 # Build the withdrawal generator if needed and run it
 cd "$GENERATOR_DIR"
-SKIP_GUEST_BUILD=1 cargo build --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
+SKIP_GUEST_BUILD=1 cargo build "${CARGO_BUILD_FLAGS[@]}" --bin withdraw-generator 2>&1 | grep -E "Compiling|Finished" || true
 cd "$REPO_ROOT"
 
 # Set environment and generate withdrawal using withdraw_generator.rs (same as transfer flow)
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
+# Export authority FVK if configured (for Level-B viewing support)
+if [ -n "$AUTHORITY_FVK" ]; then
+    export AUTHORITY_FVK
+    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
+fi
 
 # Map deposit note details into withdraw-generator inputs
 export OUT1_DOMAIN="$NOTE_DOMAIN"
@@ -246,7 +263,7 @@ export NODE_API_URL
 export WITHDRAW_AMOUNT RECIPIENT
 
 cd "$GENERATOR_DIR"
-"$GENERATOR_DIR/target/debug/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
+"$BIN_DIR/withdraw-generator" 2>&1 | tee /tmp/withdraw.log
 cd "$REPO_ROOT"
 
 # Send withdrawal to proof verifier (which forwards to sequencer)
