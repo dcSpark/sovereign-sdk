@@ -480,6 +480,7 @@ pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
+    admin_wallet_context: Option<Arc<McpWalletContext>>,
     ligero_prover: Option<Arc<LigeroProver>>,
     authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
@@ -494,6 +495,7 @@ impl CryptoServer {
     pub fn new(
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
+        admin_wallet_context: Option<Arc<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
         authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
@@ -505,6 +507,7 @@ impl CryptoServer {
             tool_router: Self::tool_router(),
             provider: Some(provider),
             wallet_context: Some(wallet_context),
+            admin_wallet_context,
             ligero_prover: Some(ligero_prover),
             authority_vfk,
             privacy_key,
@@ -733,6 +736,40 @@ impl CryptoServer {
             let mut input_rho = [0u8; 32];
             input_rho.copy_from_slice(&rho_bytes);
             let input_recipient = privacy_guard.recipient(&DOMAIN);
+            let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
+                let bytes = match hex::decode(sender_id_hex.trim_start_matches("0x")) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = tx_store
+                            .mark_failed(
+                                &id,
+                                &format!("Invalid sender_id in note (hex decode failed): {}", e),
+                                current_timestamp_ms(),
+                            )
+                            .await;
+                        return;
+                    }
+                };
+                if bytes.len() != 32 {
+                    let _ = tx_store
+                        .mark_failed(
+                            &id,
+                            &format!(
+                                "Invalid sender_id length in note (expected 32 bytes, got {})",
+                                bytes.len()
+                            ),
+                            current_timestamp_ms(),
+                        )
+                        .await;
+                    return;
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                out
+            } else {
+                // Deposit-style note: sender_id is derived deterministically as recipient.
+                input_recipient
+            };
             let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
             tracing::info!(
@@ -770,8 +807,6 @@ impl CryptoServer {
                 }
             };
             let pk_ivk_owner = privacy_guard.pk_ivk(&DOMAIN);
-            let input_sender_id = input_recipient; // Deposit convention / fallback.
-
             let send_res = if let Some(ligero_ref) = ligero.as_ref() {
                 crate::operations::transfer(
                     ligero_ref,
@@ -1222,13 +1257,6 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         use rand::RngCore;
 
-        // Capture the current wallet context before we replace it so we can fund the new wallet using existing funds.
-        let previous_wallet_ctx = if let Some(ref wallet_ctx) = self.wallet_context {
-            Some(wallet_ctx.read().await.clone())
-        } else {
-            None
-        };
-
         // Generate all random bytes first (before any async operations)
         // This ensures the RNG is dropped before any await points
         let (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex) = {
@@ -1307,12 +1335,11 @@ impl CryptoServer {
 
         // Best-effort funding when configured via AUTO_FUND_DEPOSIT_AMOUNT
         if let Some(amount) = self.auto_fund_deposit_amount {
-            if let (Some(provider), Some(funding_ctx)) =
-                (self.provider.clone(), previous_wallet_ctx.clone())
-            {
+            let admin_wallet_ctx = self.admin_wallet_context.clone();
+            if let (Some(provider), Some(funding_ctx)) = (self.provider.clone(), admin_wallet_ctx) {
                 let dest_privacy_key = new_privacy_key_for_deposit.clone();
                 tracing::info!(
-                    "[auto-fund/createWallet] Attempting auto-fund deposit of {} (best-effort) using previous wallet context",
+                    "[auto-fund/createWallet] Attempting auto-fund deposit of {} (best-effort) using admin wallet context",
                     amount
                 );
                 tokio::spawn(async move {
@@ -1340,7 +1367,7 @@ impl CryptoServer {
                 });
             } else {
                 tracing::warn!(
-                    "[auto-fund/createWallet] Auto-fund deposit configured but no funding wallet/provider available; skipping"
+                    "[auto-fund/createWallet] Auto-fund deposit configured but ADMIN_WALLET_PRIVATE_KEY is not set; skipping"
                 );
             }
         }

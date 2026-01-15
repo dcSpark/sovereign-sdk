@@ -13,6 +13,11 @@ const DOMAIN: [u8; 32] = [1u8; 32];
 pub struct UnspentNote {
     pub value: u128,
     pub rho: String,
+    /// Sender identifier bound into NOTE_V2 commitments for transfer notes.
+    /// - `None` for deposit-style notes without sender_id.
+    /// - `Some(hex32)` for transfer outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
     pub tx_hash: String,
     pub timestamp_ms: i64,
     pub kind: String,
@@ -74,6 +79,7 @@ pub async fn get_privacy_balance(
             UnspentNote {
                 value,
                 rho: note.rho,
+                sender_id: note.sender_id,
                 tx_hash: note.tx_hash,
                 timestamp_ms: note.timestamp_ms,
                 kind: note.kind,
