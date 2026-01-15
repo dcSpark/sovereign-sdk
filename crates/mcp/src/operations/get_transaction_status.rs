@@ -20,6 +20,10 @@ pub struct TransactionDetails {
     pub sender: Option<String>,
     /// Recipient address (if available)
     pub recipient: Option<String>,
+    /// Privacy sender address (if available)
+    pub privacy_sender: Option<String>,
+    /// Privacy recipient address (if available)
+    pub privacy_recipient: Option<String>,
     /// Transaction amount (if available)
     pub amount: Option<String>,
     /// Anchor root for privacy transactions
@@ -34,6 +38,8 @@ pub struct TransactionDetails {
     pub events: Option<serde_json::Value>,
     /// Encrypted notes for privacy transactions
     pub encrypted_notes: Option<serde_json::Value>,
+    /// Decrypted notes for privacy transactions (when VFK is provided)
+    pub decrypted_notes: Option<serde_json::Value>,
     /// Full transaction payload
     pub payload: Option<serde_json::Value>,
 }
@@ -47,6 +53,8 @@ impl From<InvolvementItem> for TransactionDetails {
             kind: Some(item.kind),
             sender: item.sender,
             recipient: item.recipient,
+            privacy_sender: item.privacy_sender,
+            privacy_recipient: item.privacy_recipient,
             amount: item.amount,
             anchor_root: item.anchor_root,
             nullifier: item.nullifier,
@@ -54,6 +62,7 @@ impl From<InvolvementItem> for TransactionDetails {
             view_attestations: item.view_attestations,
             events: item.events,
             encrypted_notes: item.encrypted_notes,
+            decrypted_notes: item.decrypted_notes,
             payload: item.payload,
         }
     }

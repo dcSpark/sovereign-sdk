@@ -96,8 +96,8 @@ pub async fn get_wallet_balance(
 
     let withdraw_filter = if vfk.is_some() {
         Condition::any()
-            .add(idx::midnight_withdraw::Column::DecryptedNotes.is_not_null())
             .add(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .add(idx::midnight_withdraw::Column::DecryptedNotes.is_not_null())
     } else {
         Condition::any().add(idx::midnight_withdraw::Column::DecryptedNotes.is_not_null())
     };

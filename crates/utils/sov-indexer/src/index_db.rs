@@ -40,7 +40,7 @@ pub mod midnight_deposit {
         pub view_fvks: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
         #[sea_orm(nullable, column_type = "Json")]
         pub decrypted_notes: Option<JsonValue>,
     }
@@ -70,11 +70,14 @@ pub mod midnight_withdraw {
         pub to_addr: Option<String>,
         #[sea_orm(nullable)]
         pub sender: Option<String>,
+        /// Privacy sender (bech32m), derived from decrypted notes when available
+        #[sea_orm(nullable)]
+        pub privacy_sender: Option<String>,
         #[sea_orm(nullable, column_type = "Json")]
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
         #[sea_orm(nullable, column_type = "Json")]
         pub decrypted_notes: Option<JsonValue>,
     }
@@ -115,6 +118,9 @@ pub mod midnight_transfer {
         pub nullifier: Option<String>,
         #[sea_orm(nullable)]
         pub sender: Option<String>,
+        /// Privacy sender (bech32m), derived from decrypted notes when available
+        #[sea_orm(nullable)]
+        pub privacy_sender: Option<String>,
         /// Recipient address (bech32m format, e.g., privpool1...)
         #[sea_orm(nullable)]
         pub recipient: Option<String>,
@@ -122,7 +128,7 @@ pub mod midnight_transfer {
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted note fields (populated when AUTHORITY_VFK is configured)
+        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
         #[sea_orm(nullable, column_type = "Json")]
         pub decrypted_notes: Option<JsonValue>,
     }

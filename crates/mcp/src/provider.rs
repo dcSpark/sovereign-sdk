@@ -36,6 +36,12 @@ pub struct InvolvementItem {
     pub sender: Option<String>,
     /// Recipient address (if available)
     pub recipient: Option<String>,
+    /// Privacy sender address (if available)
+    #[serde(default)]
+    pub privacy_sender: Option<String>,
+    /// Privacy recipient address (if available)
+    #[serde(default)]
+    pub privacy_recipient: Option<String>,
     /// Transaction amount (if available)
     pub amount: Option<String>,
     /// Anchor root for privacy transactions
@@ -57,6 +63,9 @@ pub struct InvolvementItem {
     /// Encrypted notes for privacy transactions
     #[serde(default)]
     pub encrypted_notes: Option<serde_json::Value>,
+    /// Decrypted notes for privacy transactions (when VFK is provided)
+    #[serde(default)]
+    pub decrypted_notes: Option<serde_json::Value>,
     /// Full transaction payload
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
@@ -69,6 +78,9 @@ pub struct ListTransactionsResponse {
     pub items: Vec<InvolvementItem>,
     /// Cursor for pagination (optional)
     pub next: Option<String>,
+    /// Total number of matching transactions (optional)
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
 /// Provider for RPC communication with the Sovereign rollup
@@ -385,6 +397,7 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
+    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -393,7 +406,9 @@ impl Provider {
     /// ```rust,no_run
     /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
-    /// let transactions = provider.get_wallet_transactions(address, None, None, None).await?;
+    /// let transactions = provider
+    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
     /// # }
@@ -404,6 +419,7 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
+        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
@@ -428,9 +444,11 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let response = self
-            .http_client
-            .get(&url)
+        let mut request = self.http_client.post(&url);
+        if let Some(vfk) = vfk {
+            request = request.json(&serde_json::json!({ "vfk": vfk }));
+        }
+        let response = request
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;

@@ -30,11 +30,16 @@ Quick start
 3) Endpoints:
    - Health: `GET /health`
      - Returns `{ "status": "ok" }`
-   - Wallet activity: `GET /wallets/:address?limit=&cursor=&type=`
+   - Wallet activity: `POST /wallets/:address?limit=&cursor=&type=`
      - `address`: bech32 L2 address
-     - `limit`: optional, default 50, max 200
-     - `cursor`: opaque base64 from previous response for pagination
-     - `type`: optional filter: `deposit` or `withdraw`
+     - Query params:
+       - `limit`: optional, default 50, max 200
+       - `cursor`: opaque base64 from previous response for pagination
+       - `type`: optional filter: `deposit` or `withdraw`
+     - JSON body:
+       - `vfk`: 32-byte hex full viewing key (optional)
+     - If `vfk` is provided, `decrypted_notes` are returned (unshielded mode); otherwise only `encrypted_notes` are returned (shielded mode)
+     - Response includes `total` (count of matching records before pagination)
    - Wallet balance: `POST /wallets/:address/balance`
      - `address`: bech32m privacy pool address (`privpool1...`)
      - JSON body:

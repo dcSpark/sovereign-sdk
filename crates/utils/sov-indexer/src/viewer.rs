@@ -443,3 +443,23 @@ pub fn extract_recipient_from_decrypted_notes(
     }
     None
 }
+
+/// Extract sender address from decrypted notes as bech32m.
+///
+/// Looks for the first note with a `sender_id` field and converts it to bech32m.
+pub fn extract_sender_from_decrypted_notes(
+    decrypted_notes: Option<&serde_json::Value>,
+) -> Option<String> {
+    let notes = decrypted_notes?;
+    let arr = notes.as_array()?;
+
+    for note in arr {
+        if let Some(sender_hex) = note.get("sender_id").and_then(|s| s.as_str()) {
+            if let Some(bech32_addr) = hex_to_bech32m_address(sender_hex) {
+                return Some(bech32_addr);
+            }
+        }
+    }
+
+    None
+}

@@ -2,7 +2,8 @@ use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
 use crate::index_db as idx;
 use crate::viewer::{
-    self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, VfkRegistry,
+    self, extract_recipient_from_decrypted_notes, extract_sender_from_decrypted_notes,
+    hex_to_bech32m_address, VfkRegistry,
 };
 use anyhow::Result;
 use sea_orm::{
@@ -74,8 +75,6 @@ pub async fn backfill_index(
                 None
             };
 
-            tracing::info!("NOTEEEEE: {:?}", row);
-
             // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
                 .or(recip_from_payload);
@@ -88,7 +87,6 @@ pub async fn backfill_index(
                 Some(sender.clone()),
                 view_fvks,
                 encrypted_notes,
-                decrypted_notes,
             )
             .await?;
         } else if kind == "withdraw" {
@@ -138,6 +136,8 @@ pub async fn backfill_index(
                 } else {
                     None
                 };
+                let privacy_sender =
+                    extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
                     idx,
                     event_id,
@@ -146,9 +146,9 @@ pub async fn backfill_index(
                     nullifier.clone(),
                     Some(recipient.clone()),
                     Some(row.sender.clone()),
+                    privacy_sender,
                     view_att,
                     encrypted_notes,
-                    decrypted_notes,
                 )
                 .await?;
             }
@@ -192,18 +192,19 @@ pub async fn backfill_index(
             } else {
                 None
             };
-            // Extract recipient from decrypted notes (as bech32m address)
+            // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
+            let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
             db::insert_midnight_transfer(
                 idx,
                 event_id,
                 anchor_root.clone(),
                 nullifier.clone(),
                 Some(row.sender.clone()),
+                privacy_sender,
                 recipient,
                 view_att,
                 encrypted_notes,
-                decrypted_notes,
             )
             .await?;
         }
@@ -229,7 +230,7 @@ pub fn spawn_sync_loop(
     });
 }
 
-pub async fn backfill_decrypted_recipients(
+pub async fn backfill_privacy_fields(
     idx_db: &DatabaseConnection,
     vfk_registry: &VfkRegistry,
 ) -> Result<()> {
@@ -239,12 +240,14 @@ pub async fn backfill_decrypted_recipients(
 
     let dep_updates = backfill_deposits(idx_db, vfk_registry).await?;
     let transfer_updates = backfill_transfers(idx_db, vfk_registry).await?;
+    let withdraw_updates = backfill_withdraws(idx_db, vfk_registry).await?;
 
-    if dep_updates > 0 || transfer_updates > 0 {
+    if dep_updates > 0 || transfer_updates > 0 || withdraw_updates > 0 {
         tracing::info!(
             deposits = dep_updates,
             transfers = transfer_updates,
-            "Backfilled recipients from encrypted notes"
+            withdraws = withdraw_updates,
+            "Backfilled privacy fields from encrypted notes"
         );
     }
 
@@ -261,11 +264,7 @@ async fn backfill_deposits(
     loop {
         let rows = idx::midnight_deposit::Entity::find()
             .filter(idx::midnight_deposit::Column::EncryptedNotes.is_not_null())
-            .filter(
-                Condition::any()
-                    .add(idx::midnight_deposit::Column::Recipient.is_null())
-                    .add(idx::midnight_deposit::Column::DecryptedNotes.is_null()),
-            )
+            .filter(idx::midnight_deposit::Column::Recipient.is_null())
             .filter(idx::midnight_deposit::Column::EventId.gt(last_id))
             .order_by_asc(idx::midnight_deposit::Column::EventId)
             .limit(500)
@@ -296,7 +295,6 @@ async fn backfill_deposits(
                 event_id: Set(row.event_id),
                 ..Default::default()
             };
-            update.decrypted_notes = Set(Some(decrypted_notes));
             if let Some(recipient) = recipient {
                 update.recipient = Set(Some(recipient));
             }
@@ -322,7 +320,7 @@ async fn backfill_transfers(
             .filter(
                 Condition::any()
                     .add(idx::midnight_transfer::Column::Recipient.is_null())
-                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null()),
+                    .add(idx::midnight_transfer::Column::PrivacySender.is_null()),
             )
             .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
             .order_by_asc(idx::midnight_transfer::Column::EventId)
@@ -349,15 +347,72 @@ async fn backfill_transfers(
             } else {
                 None
             };
+            let privacy_sender = if row.privacy_sender.is_none() {
+                extract_sender_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
 
             let mut update = idx::midnight_transfer::ActiveModel {
                 event_id: Set(row.event_id),
                 ..Default::default()
             };
-            update.decrypted_notes = Set(Some(decrypted_notes));
             if let Some(recipient) = recipient {
                 update.recipient = Set(Some(recipient));
             }
+            if let Some(privacy_sender) = privacy_sender {
+                update.privacy_sender = Set(Some(privacy_sender));
+            }
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_withdraws(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &VfkRegistry,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_withdraw::Entity::find()
+            .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .filter(idx::midnight_withdraw::Column::PrivacySender.is_null())
+            .filter(idx::midnight_withdraw::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_withdraw::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let privacy_sender = extract_sender_from_decrypted_notes(Some(&decrypted_notes));
+            let Some(privacy_sender) = privacy_sender else {
+                continue;
+            };
+
+            let mut update = idx::midnight_withdraw::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            update.privacy_sender = Set(Some(privacy_sender));
 
             update.update(idx_db).await?;
             updated += 1;

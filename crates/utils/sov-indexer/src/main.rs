@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         println!("Starting VFK backfill");
         if let Err(e) =
-            background_sync::backfill_decrypted_recipients(&idx_clone, &vfk_registry_clone).await
+            background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone).await
         {
             warn!(error = %e, "VFK backfill failed");
         }

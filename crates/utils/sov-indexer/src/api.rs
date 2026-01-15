@@ -11,6 +11,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use midnight_privacy::Hash32;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -30,6 +31,12 @@ pub struct ListQuery {
     #[serde(default)]
     pub r#type: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct VfkBody {
+    #[serde(default)]
+    pub vfk: Option<String>,
+}
 fn default_limit() -> usize {
     50
 }
@@ -44,7 +51,7 @@ pub struct TxListQuery {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/wallets/:address", get(list_wallet_txs))
+        .route("/wallets/:address", post(list_wallet_txs))
         .route("/wallets/:address/balance", post(wallet_balance))
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
@@ -59,8 +66,23 @@ async fn list_wallet_txs(
     Path(address): Path<String>,
     Query(q): Query<ListQuery>,
     State(state): State<AppState>,
+    body: Option<Json<VfkBody>>,
 ) -> impl IntoResponse {
-    match list_wallet_txs_inner(address, q, state).await {
+    let vfk = match body.and_then(|Json(body)| body.vfk) {
+        Some(vfk_hex) => match viewer::parse_vfk_hex(&vfk_hex) {
+            Ok(vfk) => Some(vfk),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid VFK: {}", e)})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    match list_wallet_txs_inner(address, q.limit, q.cursor, q.r#type, state, vfk).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -98,17 +120,23 @@ async fn health() -> impl IntoResponse {
 
 async fn list_wallet_txs_inner(
     address: String,
-    q: ListQuery,
+    limit: usize,
+    cursor: Option<String>,
+    type_filter: Option<String>,
     state: AppState,
+    vfk: Option<Hash32>,
 ) -> Result<ListResponse> {
-    let limit = q.limit.min(200);
-    let cursor = if let Some(cur) = q.cursor.as_deref() {
-        let raw = BASE64_STANDARD.decode(cur)?;
-        Some(serde_json::from_slice::<CursorInner>(&raw)?)
-    } else {
-        None
+    let limit = limit.min(200);
+    let cursor = decode_cursor(cursor)?;
+    list_wallet_txs_db(&state.db, &address, limit, cursor, type_filter, vfk).await
+}
+
+fn decode_cursor(cursor: Option<String>) -> Result<Option<CursorInner>> {
+    let Some(cur) = cursor else {
+        return Ok(None);
     };
-    list_wallet_txs_db(&state.db, &address, limit, cursor, q.r#type.clone()).await
+    let raw = BASE64_STANDARD.decode(cur)?;
+    Ok(Some(serde_json::from_slice::<CursorInner>(&raw)?))
 }
 
 fn is_balance_client_error(err: &anyhow::Error) -> bool {
@@ -278,7 +306,7 @@ async fn add_vfk(
     let vfk_registry = state.vfk_registry.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            crate::background_sync::backfill_decrypted_recipients(&db, &vfk_registry).await
+            crate::background_sync::backfill_privacy_fields(&db, &vfk_registry).await
         {
             tracing::warn!("VFK backfill failed: {}", e);
         }
