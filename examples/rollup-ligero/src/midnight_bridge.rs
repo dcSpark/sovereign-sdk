@@ -44,7 +44,7 @@ use rockbound::DB;
 use crate::MockRollupSpec;
 use sov_modules_stf_blueprint::Runtime as StfRuntime;
 
-use sov_midnight_adapter::{MidnightIndexerClient, MidnightDeposit};
+use sov_midnight_adapter::{MidnightDeposit, MidnightIndexerClient};
 
 type BridgeSpec = MockRollupSpec<Native>;
 type BridgeRuntime = Runtime<BridgeSpec>;
@@ -459,9 +459,10 @@ where
     }
 
     async fn poll_chain(&mut self, client: &MidnightIndexerClient) -> Result<()> {
-        let snapshot = client.snapshot().await?;
+        let ledger = client.snapshot().await?;
+        let rollup = &ledger.rollup;
 
-        let latest = snapshot.next_cross_domain_message_index;
+        let latest = rollup.next_cross_domain_message_index;
         let cursor = match self.next_chain_index {
             Some(index) => index,
             None => {
@@ -509,7 +510,7 @@ where
         self.idle_notice_sent = false;
 
         for index in cursor..latest {
-            let deposit = match snapshot.deposits.get(&index) {
+            let deposit = match rollup.l1_to_l2_deposits.get(&index) {
                 Some(deposit) => Deposit::from(deposit),
                 None => {
                     warn!(
