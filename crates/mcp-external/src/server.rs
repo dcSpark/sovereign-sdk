@@ -91,6 +91,8 @@ pub struct GetWalletBalanceResult {
     /// Coins that are pending and not yet available for spending
     #[serde(rename = "pendingBalance")]
     pub pending_balance: String,
+    /// Available unspent notes that back the balance
+    pub unspent_notes: Vec<UnspentNoteInfo>,
 }
 
 // Types for GetTransaction
@@ -326,6 +328,9 @@ pub struct UnspentNoteInfo {
     pub value: String,
     /// Note rho (nonce) as hex string
     pub rho: String,
+    /// Sender identifier bound into NOTE_V2 commitments for transfer notes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
     /// Transaction hash where this note was created
     pub tx_hash: String,
     /// Timestamp when the note was created (milliseconds)
@@ -937,9 +942,24 @@ impl CryptoServer {
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let balance = privacy_result.balance;
+        let unspent_notes = privacy_result
+            .unspent_notes
+            .into_iter()
+            .map(|note| UnspentNoteInfo {
+                value: note.value.to_string(),
+                rho: note.rho,
+                sender_id: note.sender_id,
+                tx_hash: note.tx_hash,
+                timestamp_ms: note.timestamp_ms,
+                kind: note.kind,
+            })
+            .collect();
+
         let result = GetWalletBalanceResult {
-            balance: privacy_result.balance.to_string(),
+            balance: balance.to_string(),
             pending_balance: "0".to_string(),
+            unspent_notes,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

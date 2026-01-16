@@ -40,9 +40,6 @@ pub mod midnight_deposit {
         pub view_fvks: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
-        #[sea_orm(nullable, column_type = "Json")]
-        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -77,9 +74,6 @@ pub mod midnight_withdraw {
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
-        #[sea_orm(nullable, column_type = "Json")]
-        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {
@@ -128,9 +122,6 @@ pub mod midnight_transfer {
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
-        // Decrypted notes are not persisted; use VFK to decrypt on-demand.
-        #[sea_orm(nullable, column_type = "Json")]
-        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {

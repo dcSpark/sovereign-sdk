@@ -21,6 +21,7 @@ Quick start
    - `INDEX_DB` (optional): local index DB, default `sqlite://wallet_index.sqlite?mode=rwc`
    - `INDEXER_BIND` (optional): listen address, default `0.0.0.0:13100`
    - `AUTHORITY_VFK` (optional): 32-byte hex authority viewing key for decrypting encrypted notes
+   - `INDEX_DB_RESET` (optional): set to `1`/`true` to drop all index tables before startup (works for sqlite/postgresql)
 
 2) Run the service:
    ```bash

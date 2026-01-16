@@ -41,6 +41,10 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Initializing index database");
 
+    if should_reset_index_db() {
+        db::reset_index_db(&idx_db).await?;
+    }
+
     db::init_index_db(&idx_db).await?;
 
     println!("index database initialized");
@@ -76,6 +80,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn should_reset_index_db() -> bool {
+    matches!(
+        env::var("INDEX_DB_RESET").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 /// Load VFK registry from:

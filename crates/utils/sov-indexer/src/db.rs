@@ -4,7 +4,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{Condition, DatabaseConnection, JsonValue, QueryOrder, QuerySelect, Schema, Set};
+use sea_orm::{
+    Condition, DatabaseBackend, DatabaseConnection, JsonValue, QueryOrder, QuerySelect, Schema,
+    Set, Statement,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::index_db as idx;
@@ -58,6 +61,80 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     );
     idx_db.execute(stmt).await?;
     Ok(())
+}
+
+pub async fn reset_index_db(idx_db: &DatabaseConnection) -> Result<()> {
+    let backend = idx_db.get_database_backend();
+    set_foreign_key_checks(idx_db, backend, false).await?;
+    let tables = list_all_tables(idx_db, backend).await?;
+    for table in tables {
+        let quoted = quote_table(&table, backend);
+        let sql = match backend {
+            DatabaseBackend::Postgres => format!("DROP TABLE IF EXISTS {} CASCADE", quoted),
+            _ => format!("DROP TABLE IF EXISTS {}", quoted),
+        };
+        idx_db.execute(Statement::from_string(backend, sql)).await?;
+    }
+    set_foreign_key_checks(idx_db, backend, true).await?;
+    Ok(())
+}
+
+async fn set_foreign_key_checks(
+    idx_db: &DatabaseConnection,
+    backend: DatabaseBackend,
+    enabled: bool,
+) -> Result<()> {
+    let sql = match backend {
+        DatabaseBackend::Sqlite => {
+            if enabled {
+                "PRAGMA foreign_keys = ON"
+            } else {
+                "PRAGMA foreign_keys = OFF"
+            }
+        }
+        DatabaseBackend::MySql => {
+            if enabled {
+                "SET FOREIGN_KEY_CHECKS = 1"
+            } else {
+                "SET FOREIGN_KEY_CHECKS = 0"
+            }
+        }
+        DatabaseBackend::Postgres => return Ok(()),
+    };
+    idx_db.execute(Statement::from_string(backend, sql)).await?;
+    Ok(())
+}
+
+async fn list_all_tables(
+    idx_db: &DatabaseConnection,
+    backend: DatabaseBackend,
+) -> Result<Vec<String>> {
+    let sql = match backend {
+        DatabaseBackend::Sqlite => {
+            "SELECT name AS name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema()"
+        }
+        DatabaseBackend::MySql => {
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE()"
+        }
+    };
+    let rows = idx_db.query_all(Statement::from_string(backend, sql)).await?;
+    let mut tables = Vec::new();
+    for row in rows {
+        if let Ok(name) = row.try_get::<String>("", "name") {
+            tables.push(name);
+        }
+    }
+    Ok(tables)
+}
+
+fn quote_table(table: &str, backend: DatabaseBackend) -> String {
+    match backend {
+        DatabaseBackend::MySql => format!("`{}`", table),
+        _ => format!("\"{}\"", table),
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -207,7 +284,6 @@ pub async fn insert_midnight_deposit(
         sender: Set(sender),
         view_fvks: Set(view_fvks),
         encrypted_notes: Set(encrypted_notes),
-        decrypted_notes: Set(None),
     })
     .exec(idx_db)
     .await?;
@@ -236,7 +312,6 @@ pub async fn insert_midnight_withdraw(
         privacy_sender: Set(privacy_sender),
         view_attestations: Set(view_attestations),
         encrypted_notes: Set(encrypted_notes),
-        decrypted_notes: Set(None),
     })
     .exec(idx_db)
     .await?;
@@ -263,7 +338,6 @@ pub async fn insert_midnight_transfer(
         recipient: Set(recipient),
         view_attestations: Set(view_attestations),
         encrypted_notes: Set(encrypted_notes),
-        decrypted_notes: Set(None),
     })
     .exec(idx_db)
     .await?;
@@ -366,7 +440,6 @@ pub async fn list_wallet_txs(
         };
         let decrypted_notes = resolve_decrypted_notes(
             vfk,
-            md.decrypted_notes.as_ref(),
             md.encrypted_notes.as_ref(),
         );
         let privacy_recipient = md
@@ -466,7 +539,6 @@ pub async fn list_wallet_txs(
         };
         let decrypted_notes = resolve_decrypted_notes(
             vfk,
-            mw.decrypted_notes.as_ref(),
             mw.encrypted_notes.as_ref(),
         );
         let privacy_sender = mw
@@ -566,7 +638,6 @@ pub async fn list_wallet_txs(
         };
         let decrypted_notes = resolve_decrypted_notes(
             vfk,
-            mt.decrypted_notes.as_ref(),
             mt.encrypted_notes.as_ref(),
         );
         let privacy_sender = mt
@@ -877,7 +948,6 @@ pub async fn get_tx(
 
 fn resolve_decrypted_notes(
     vfk: Option<&Hash32>,
-    _stored: Option<&JsonValue>,
     encrypted: Option<&JsonValue>,
 ) -> Option<JsonValue> {
     let Some(vfk) = vfk else {

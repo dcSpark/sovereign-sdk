@@ -94,17 +94,14 @@ pub async fn get_wallet_balance(
         .all(db)
         .await?;
 
-    let withdraw_filter = if vfk.is_some() {
-        Condition::any()
-            .add(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
-            .add(idx::midnight_withdraw::Column::DecryptedNotes.is_not_null())
+    let withdraw_rows = if vfk.is_some() {
+        idx::midnight_withdraw::Entity::find()
+            .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .all(db)
+            .await?
     } else {
-        Condition::any().add(idx::midnight_withdraw::Column::DecryptedNotes.is_not_null())
+        Vec::new()
     };
-    let withdraw_rows = idx::midnight_withdraw::Entity::find()
-        .filter(withdraw_filter)
-        .all(db)
-        .await?;
 
     let event_map = load_event_map(db, &deposit_rows, &transfer_rows, &withdraw_rows).await?;
 
@@ -134,11 +131,7 @@ pub async fn get_wallet_balance(
             }
         }
 
-        let decrypted_notes = notes_from_row(
-            row.decrypted_notes.as_ref(),
-            row.encrypted_notes.as_ref(),
-            vfk.as_ref(),
-        );
+        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         for note in decrypted_notes {
             if let Some(record) = note_from_decrypted(
                 &note,
@@ -156,11 +149,7 @@ pub async fn get_wallet_balance(
         let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
             continue;
         };
-        let decrypted_notes = notes_from_row(
-            row.decrypted_notes.as_ref(),
-            row.encrypted_notes.as_ref(),
-            vfk.as_ref(),
-        );
+        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         for note in decrypted_notes {
             if let Some(record) = note_from_decrypted(
                 &note,
@@ -178,11 +167,7 @@ pub async fn get_wallet_balance(
         let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
             continue;
         };
-        let decrypted_notes = notes_from_row(
-            row.decrypted_notes.as_ref(),
-            row.encrypted_notes.as_ref(),
-            vfk.as_ref(),
-        );
+        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         for note in decrypted_notes {
             if let Some(record) = note_from_decrypted(
                 &note,
@@ -288,14 +273,9 @@ fn add_note(notes: &mut Vec<NoteRecord>, seen_rhos: &mut HashSet<Hash32>, note: 
 }
 
 fn notes_from_row(
-    decrypted: Option<&serde_json::Value>,
     encrypted: Option<&serde_json::Value>,
     vfk: Option<&Hash32>,
 ) -> Vec<viewer::DecryptedNote> {
-    if let Some(json) = decrypted {
-        return serde_json::from_value::<Vec<viewer::DecryptedNote>>(json.clone()).unwrap_or_default();
-    }
-
     let Some(vfk) = vfk else {
         return Vec::new();
     };
