@@ -1,8 +1,5 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use url::Url;
 use validator::Validate;
 
 #[derive(Debug, Clone, Deserialize, Validate)]

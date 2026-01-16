@@ -1,5 +1,5 @@
 pub mod config;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     extract::Json, http::StatusCode, response::IntoResponse, routing::get, routing::post, Router,
 };
@@ -7,8 +7,8 @@ use config::Config;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::{collections::HashSet, sync::RwLock};
-use std::{fs, path::Path};
+use std::fs;
+use std::sync::RwLock;
 use tee::common::Engine;
 use tee::common::TEEPayload;
 use tracing::{error, warn};
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
 
     let count = load_policies_from_dir(&cfg.oracle_policies_dir)?;
     tracing::info!(
-        "[oracle] Loaded {} policies from {:?}",
+        "Loaded {} policies from {:?}",
         count,
         cfg.oracle_policies_dir
     );
@@ -125,18 +125,18 @@ async fn main() -> Result<()> {
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.oracle_server_bind_address).await?;
 
     tracing::info!(
-        "[oracle] Server started successfully! Listening on http://{}",
+        "Server started successfully! Listening on http://{}",
         &cfg.oracle_server_bind_address
     );
     tracing::info!(
-        "[oracle] validate endpoint: http://{}/validate",
+        "Validate endpoint: http://{}/validate",
         &cfg.oracle_server_bind_address
     );
 
     let _ = axum::serve(tcp_listener, app)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
-            tracing::info!("\n[oracle] Shutting down gracefully...");
+            tracing::info!("\nShutting down");
         })
         .await;
 
