@@ -74,6 +74,7 @@ where
                 root_window_size: 100,
                 method_id: [0; 32],
                 admin: admin_address,
+                pool_admins: None,
                 domain: [0; 32],
                 token_id: sov_bank::TokenId::from([0; 32]),
             },

@@ -363,8 +363,9 @@ mod note_spend_tests {
         let withdraw_to: Hash32 = [9u8; 32];
         let change_value: u64 = 300;
         let change_rho: Hash32 = [10u8; 32];
-        let change_pk_spend: Hash32 = [11u8; 32];
-        let change_pk_ivk: Hash32 = [12u8; 32];
+        // Withdrawal change outputs must go back to the sender (enforced in-circuit).
+        let change_pk_spend: Hash32 = pk_from_sk(&spend_sk);
+        let change_pk_ivk: Hash32 = pk_ivk_owner;
         let change_rcp = recipient_from_pk(&domain, &change_pk_spend, &change_pk_ivk);
         let sender_id_out = recipient_owner;
         let cm_change = note_commitment_v2(
@@ -397,7 +398,7 @@ mod note_spend_tests {
         //   6: n_in [PUBLIC]
         //
         // Per-input (n_in=1 here):
-        //   value_in, rho_in, sender_id_in, pos_bits[depth], siblings[depth], nullifier
+        //   value_in, rho_in, sender_id_in, pos_i, siblings[depth], nullifier
         //
         // Then:
         //   withdraw_amount [PUBLIC]
@@ -440,12 +441,8 @@ mod note_spend_tests {
         // Input privates.
         let mut idx: usize = 7;
         for _ in 0..n_in {
-            private_indices.extend_from_slice(&[idx, idx + 1, idx + 2]); // value, rho, sender_id
-            idx += 3;
-            for _ in 0..depth {
-                private_indices.push(idx); // pos_bit
-                idx += 1;
-            }
+            private_indices.extend_from_slice(&[idx, idx + 1, idx + 2, idx + 3]); // value, rho, sender_id, pos
+            idx += 4;
             for _ in 0..depth {
                 private_indices.push(idx); // sibling
                 idx += 1;
@@ -460,6 +457,26 @@ mod note_spend_tests {
         }
         // inv_enforce (private).
         private_indices.push(idx);
+        idx += 1;
+
+        // Deny-map (bucketed blacklist) section:
+        //   blacklist_root (public)
+        //   bucket_entries[12] (private)
+        //   bucket_inv (private)
+        //   bucket_siblings[16] (private)
+        const BL_DEPTH: usize = 16;
+        const BL_BUCKET_SIZE: usize = 12;
+        idx += 1; // blacklist_root (public)
+        for _ in 0..BL_BUCKET_SIZE {
+            private_indices.push(idx); // bucket entry
+            idx += 1;
+        }
+        private_indices.push(idx); // bucket_inv
+        idx += 1;
+        for _ in 0..BL_DEPTH {
+            private_indices.push(idx); // bucket sibling
+            idx += 1;
+        }
 
         println!("✓ Private indices: {:?}", private_indices);
 
@@ -478,14 +495,8 @@ mod note_spend_tests {
         host.add_u64_arg(value);
         host.add_hex_arg(hex32(&rho));
         host.add_hex_arg(hex32(&sender_id_in));
-
-        // Position bits (LSB-first), each passed as 32-byte BE 0 or 1.
-        for level in 0..depth {
-            let bit = ((position >> level) & 1) as u8;
-            let mut bit_bytes = [0u8; 32];
-            bit_bytes[31] = bit;
-            host.add_hex_arg(hex32(&bit_bytes));
-        }
+        // pos_i (private i64; bits derived in-circuit).
+        host.add_u64_arg(position);
 
         // Siblings (bottom-up).
         for sibling in &siblings {
@@ -509,6 +520,60 @@ mod note_spend_tests {
 
         // inv_enforce (private).
         host.add_hex_arg(hex32(&inv_enforce));
+
+        // --- Deny-map (bucketed blacklist) args (empty root) ---
+        //
+        // For an all-empty blacklist:
+        // - every bucket leaf is BL_BUCKET_V1(empty_entries)
+        // - every sibling at each height is the default node at that height
+        // so we can reuse the same default siblings for any id position.
+        fn bl_bucket_leaf(entries: &[Hash32; BL_BUCKET_SIZE]) -> Hash32 {
+            let mut buf = Vec::with_capacity(12 + 32 * BL_BUCKET_SIZE);
+            buf.extend_from_slice(b"BL_BUCKET_V1");
+            for e in entries {
+                buf.extend_from_slice(e);
+            }
+            poseidon2_hash_bytes(&buf)
+        }
+
+        fn merkle_default_nodes_from_leaf(depth: usize, leaf0: &Hash32) -> Vec<Hash32> {
+            let mut out = Vec::with_capacity(depth + 1);
+            out.push(*leaf0);
+            for lvl in 0..depth {
+                let prev = out[lvl];
+                out.push(mt_combine(lvl as u8, &prev, &prev));
+            }
+            out
+        }
+
+        let empty_bucket_entries: [Hash32; BL_BUCKET_SIZE] = [[0u8; 32]; BL_BUCKET_SIZE];
+        let leaf0 = bl_bucket_leaf(&empty_bucket_entries);
+        let defaults = merkle_default_nodes_from_leaf(BL_DEPTH, &leaf0);
+        let blacklist_root = defaults[BL_DEPTH];
+        let bucket_siblings: Vec<Hash32> = defaults.iter().take(BL_DEPTH).copied().collect();
+
+        // inv(product(id - entry)) witness for non-membership within the empty bucket.
+        let id_fr = bn254fr_from_hash32_be(&sender_id_out);
+        let mut prod = Bn254Fr::from_u32(1);
+        let mut delta = Bn254Fr::new();
+        for e in empty_bucket_entries.iter() {
+            let e_fr = bn254fr_from_hash32_be(e);
+            submod_checked(&mut delta, &id_fr, &e_fr);
+            prod.mulmod_checked(&delta);
+        }
+        assert!(!prod.is_zero(), "unexpected: sender_id collides with empty bucket");
+        let mut inv = prod.clone();
+        inv.inverse();
+        let bucket_inv = inv.to_bytes_be();
+
+        host.add_hex_arg(hex32(&blacklist_root)); // blacklist_root (public)
+        for e in &empty_bucket_entries {
+            host.add_hex_arg(hex32(e)); // bucket entry (private)
+        }
+        host.add_hex_arg(hex32(&bucket_inv)); // bucket_inv (private)
+        for sib in &bucket_siblings {
+            host.add_hex_arg(hex32(sib)); // bucket sibling (private)
+        }
 
         host.set_public_output(&public_output)?;
 

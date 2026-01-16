@@ -1,7 +1,8 @@
 use sov_modules_api::macros::serialize;
+use sov_modules_api::Spec;
 
 use crate::hash::Hash32;
-use crate::types::EncryptedNote;
+use crate::types::{EncryptedNote, PrivacyAddress};
 
 /// Lightweight viewer attestation for events.
 /// Contains only the essential information for indexers/authorities.
@@ -31,8 +32,9 @@ pub struct ViewerBinding {
 /// 2. Use `AnchorRootRecorded` events which are emitted during flush with real roots
 #[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
 #[serialize(Borsh, Serde)]
-#[serde(rename_all = "snake_case")]
-pub enum Event {
+#[serde(bound = "S: Spec", rename_all = "snake_case")]
+#[schemars(bound = "S: Spec", rename = "Event")]
+pub enum Event<S: Spec> {
     /// A note commitment was queued for addition to the tree.
     ///
     /// **Note:** Position is provisional and will be assigned at end-of-block flush.
@@ -110,5 +112,42 @@ pub enum Event {
     NoteEncrypted {
         /// AEAD-encrypted note bound to its commitment
         enc: EncryptedNote,
+    },
+
+    // === Deny-map (freeze/blacklist) events ===
+    //
+    // IMPORTANT: These variants are intentionally appended at the end of the enum to preserve
+    // the discriminant indices of previously-emitted events under Borsh serialization.
+
+    /// Deny-map root (blacklist) was updated by a pool admin.
+    BlacklistRootUpdated {
+        /// Previous root.
+        old_blacklist_root: Hash32,
+        /// New root.
+        new_blacklist_root: Hash32,
+    },
+    /// A privacy address was frozen (blacklisted) by a pool admin.
+    AddressFrozen {
+        /// The user-facing privacy address.
+        address: PrivacyAddress,
+        /// The internal recipient identifier used as the deny-map key.
+        recipient: Hash32,
+    },
+    /// A privacy address was unfrozen (un-blacklisted) by a pool admin.
+    AddressUnfrozen {
+        /// The user-facing privacy address.
+        address: PrivacyAddress,
+        /// The internal recipient identifier used as the deny-map key.
+        recipient: Hash32,
+    },
+    /// A pool admin was added by the module admin.
+    PoolAdminAdded {
+        /// The admin address that was added.
+        admin: S::Address,
+    },
+    /// A pool admin was removed by the module admin.
+    PoolAdminRemoved {
+        /// The admin address that was removed.
+        admin: S::Address,
     },
 }

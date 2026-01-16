@@ -23,11 +23,8 @@ Configure the following environment variables:
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
-- `LIGERO_PROGRAM_PATH` - Optional Ligero program selector (circuit name like `note_spend_guest` OR a full path to a `.wasm` file). Defaults to `note_spend_guest`.
-- `LIGERO_PROVER_BINARY_PATH` - Optional override to point at a `webgpu_prover` binary
-- `LIGERO_SHADER_PATH` - Optional override to point at a shader directory
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
-- `AUTHORITY_VFK` - Optional authority viewing key for note decryption
+- `AUTHORITY_FVK` - Optional authority viewing key for note decryption
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
 
 ### Start the Server

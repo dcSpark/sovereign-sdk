@@ -27,7 +27,7 @@ sea-orm = { version = "1.1", default-features = false, features = [
 # DA entities
 sov-midnight-da = { package = "sov-midnight-da", path = "../../adapters/midnight-da", default-features = false, features = ["native"] }
 
-# Privacy/viewing support (optional VFK decryption)
+# Privacy/viewing support (optional FVK decryption)
 midnight-privacy = { path = "../../module-system/module-implementations/midnight-privacy", default-features = false, features = ["native"] }
 hex = { workspace = true }
 bech32 = { workspace = true }

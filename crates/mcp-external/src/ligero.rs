@@ -160,6 +160,8 @@ impl Ligero {
             LigeroRunner::new(&program)
         };
         runner.config_mut().packing = packing;
+        // Default to raw proofs (no gzip) to avoid compression overhead during proving.
+        runner.config_mut().gzip_proof = false;
         runner.config_mut().gpu_threads = gpu_threads;
         runner.config_mut().private_indices =
             private_indices.into_iter().map(|v| v as usize).collect();

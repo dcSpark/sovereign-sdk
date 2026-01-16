@@ -122,6 +122,20 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create demo_data directory if it doesn't exist (required for SQLite DB)
 mkdir -p demo_data
 
+# Seed Midnight bridge mock assets if they were wiped by `make clean`
+ASSETS_DIR="$SCRIPT_DIR/assets"
+if [ -d "$ASSETS_DIR" ]; then
+    if [ ! -f "demo_data/midnight_bridge_signer.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_signer.json" ]; then
+        cp "$ASSETS_DIR/midnight_bridge_signer.json" demo_data/
+        echo "  ↳ Restored demo_data/midnight_bridge_signer.json"
+    fi
+
+    if [ ! -f "demo_data/midnight_bridge_events.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_events.json" ]; then
+        cp "$ASSETS_DIR/midnight_bridge_events.json" demo_data/
+        echo "  ↳ Restored demo_data/midnight_bridge_events.json"
+    fi
+fi
+
 # Memory profiling setup (macOS only)
 if [ "$MEMORY_PROFILE" -eq 1 ]; then
     if [[ "$OSTYPE" != "darwin"* ]]; then

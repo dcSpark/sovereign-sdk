@@ -51,7 +51,7 @@ pub struct VerifyTransactionResult {
 /// This operation:
 /// 1. Fetches the transaction from the indexer
 /// 2. Attempts to decrypt the transaction to get the amount
-/// 3. If decryption fails or no VFK is provided, returns "encrypted"
+/// 3. If decryption fails or no FVK is provided, returns "encrypted"
 /// 4. Returns sync status (mocked as fully synced)
 ///
 /// **Important**: For transfer transactions with multiple encrypted notes, this returns
@@ -63,7 +63,7 @@ pub struct VerifyTransactionResult {
 /// # Parameters
 /// * `provider` - Provider for indexer connection
 /// * `identifier` - Transaction hash to verify
-/// * `vfk_hex` - Optional authority VFK (32-byte hex string, with or without 0x prefix)
+/// * `fvk_hex` - Optional authority FVK (32-byte hex string, with or without 0x prefix)
 ///
 /// # Returns
 /// VerifyTransactionResult containing existence status, sync status, and transaction amount
@@ -82,7 +82,7 @@ pub struct VerifyTransactionResult {
 pub async fn verify_transaction(
     provider: &Provider,
     identifier: &str,
-    vfk_hex: Option<&str>,
+    fvk_hex: Option<&str>,
 ) -> Result<VerifyTransactionResult> {
     tracing::info!("Verifying transaction {}", identifier);
 
@@ -112,16 +112,16 @@ pub async fn verify_transaction(
     );
 
     // Try to extract amount from the transaction
-    let transaction_amount = if let Some(vfk) = vfk_hex {
+    let transaction_amount = if let Some(fvk) = fvk_hex {
         // Try to decrypt the transaction to get the amount
-        extract_amount_from_transaction(&tx.encrypted_notes, vfk).await
+        extract_amount_from_transaction(&tx.encrypted_notes, fvk).await
     } else {
-        // No VFK provided, check if there's a plaintext amount field
+        // No FVK provided, check if there's a plaintext amount field
         if let Some(amount_str) = &tx.amount {
             tracing::info!("Using plaintext amount from transaction: {}", amount_str);
             amount_str.clone()
         } else {
-            tracing::info!("No VFK provided and no plaintext amount, marking as encrypted");
+            tracing::info!("No FVK provided and no plaintext amount, marking as encrypted");
             "encrypted".to_string()
         }
     };
@@ -139,13 +139,13 @@ pub async fn verify_transaction(
 /// This is the correct behavior for verifying the sent amount in transfers.
 async fn extract_amount_from_transaction(
     encrypted_notes_field: &Option<serde_json::Value>,
-    vfk_hex: &str,
+    fvk_hex: &str,
 ) -> String {
-    // Try to parse VFK
-    let vfk = match parse_vfk_hex(vfk_hex) {
+    // Try to parse FVK
+    let fvk = match parse_fvk_hex(fvk_hex) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("Failed to parse VFK: {}, marking amount as encrypted", e);
+            tracing::warn!("Failed to parse FVK: {}, marking amount as encrypted", e);
             return "encrypted".to_string();
         }
     };
@@ -174,7 +174,7 @@ async fn extract_amount_from_transaction(
     // We should NOT sum all notes, as that would return the original note value instead of the sent amount.
 
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
-        match viewer::decrypt_note(&vfk, encrypted_note) {
+        match viewer::decrypt_note(&fvk, encrypted_note) {
             Ok((_domain, value, _rho, _recipient, _sender_id)) => {
                 tracing::info!(
                     "Successfully decrypted note {}: value={} (using this as transaction amount)",
@@ -185,7 +185,7 @@ async fn extract_amount_from_transaction(
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to decrypt note {}: {} (note may not be encrypted for this VFK)",
+                    "Failed to decrypt note {}: {} (note may not be encrypted for this FVK)",
                     idx,
                     e
                 );
@@ -197,19 +197,19 @@ async fn extract_amount_from_transaction(
     "encrypted".to_string()
 }
 
-/// Parse a VFK from a hex string (with or without 0x prefix)
-fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
-    let s = vfk_hex.trim();
+/// Parse a FVK from a hex string (with or without 0x prefix)
+fn parse_fvk_hex(fvk_hex: &str) -> Result<Hash32> {
+    let s = fvk_hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).with_context(|| format!("Invalid hex string: {}", vfk_hex))?;
+    let bytes = hex::decode(s).with_context(|| format!("Invalid hex string: {}", fvk_hex))?;
 
     if bytes.len() != 32 {
-        anyhow::bail!("VFK must be exactly 32 bytes, got {} bytes", bytes.len());
+        anyhow::bail!("FVK must be exactly 32 bytes, got {} bytes", bytes.len());
     }
 
-    let mut vfk = [0u8; 32];
-    vfk.copy_from_slice(&bytes);
-    Ok(vfk)
+    let mut fvk = [0u8; 32];
+    fvk.copy_from_slice(&bytes);
+    Ok(fvk)
 }
 
 /// Extract encrypted notes from the transaction's encrypted_notes field
