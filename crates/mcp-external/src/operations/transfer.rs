@@ -1,11 +1,12 @@
 //! Transfer operation for Midnight Privacy module
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
-    SpendPublic,
+    PrivacyAddress, SpendPublic,
 };
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
@@ -444,7 +445,7 @@ pub async fn transfer(
     input_sender_id: Hash32,
     destination_pk_spend: Hash32,
     destination_pk_ivk: Hash32,
-    authority_vfk: Option<[u8; 32]>,
+    authority_fvk: Option<[u8; 32]>,
 ) -> Result<TransferResult> {
     // Validate amounts
     if send_amount == 0 {
@@ -570,15 +571,15 @@ pub async fn transfer(
     let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
     let nf = nullifier(&DOMAIN, &nf_key, &input_rho);
 
-    // Step 4b: Create viewer bundles if authority VFK is provided
-    let (view_attestations, view_ciphertexts) = if let Some(vfk) = authority_vfk {
+    // Step 4b: Create viewer bundles if authority FVK is provided
+    let (view_attestations, view_ciphertexts) = if let Some(fvk) = authority_fvk {
         tracing::info!(
-            "Authority VFK configured: generating viewer attestations for {} output(s)",
+            "Authority FVK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
 
         let (att_0, enc_0) = viewer::make_viewer_bundle(
-            &vfk,
+            &fvk,
             &DOMAIN,
             send_amount,
             &out_rho_0,
@@ -589,7 +590,7 @@ pub async fn transfer(
 
         if has_change {
             let (att_1, enc_1) = viewer::make_viewer_bundle(
-                &vfk,
+                &fvk,
                 &DOMAIN,
                 change_amount,
                 out_rho_1.as_ref().unwrap(),
@@ -603,10 +604,60 @@ pub async fn transfer(
         }
     } else {
         tracing::debug!(
-            "No authority VFK configured: transfer will not include viewer attestation"
+            "No authority FVK configured: transfer will not include viewer attestation"
         );
         (None, None)
     };
+
+    // Step 4c: Fetch deny-map (blacklist) root + Merkle openings.
+    //
+    // The spend circuit binds to `blacklist_root` as a public input and requires BL_DEPTH sibling
+    // paths (private) for:
+    // - sender (spender identity)
+    // - each output recipient
+    let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
+    let dest_addr = PrivacyAddress::from_keys(&destination_pk_spend, &destination_pk_ivk);
+
+    let (sender_opening, dest_opening) = if sender_addr == dest_addr {
+        let opening: midnight_privacy::BlacklistOpeningResponse = provider
+            .query_rest_endpoint(&format!(
+                "/modules/midnight-privacy/blacklist/opening/{sender_addr}"
+            ))
+            .await
+            .context("Failed to query deny-map opening for sender/destination")?;
+        (opening.clone(), opening)
+    } else {
+        tokio::try_join!(
+            async {
+                provider
+                    .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
+                        "/modules/midnight-privacy/blacklist/opening/{sender_addr}"
+                    ))
+                    .await
+            },
+            async {
+                provider
+                    .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
+                        "/modules/midnight-privacy/blacklist/opening/{dest_addr}"
+                    ))
+                    .await
+            }
+        )
+        .context("Failed to query deny-map openings")?
+    };
+
+    anyhow::ensure!(
+        sender_opening.blacklist_root == dest_opening.blacklist_root,
+        "Deny-map root changed while fetching openings (sender vs destination)"
+    );
+    let blacklist_root = sender_opening.blacklist_root;
+
+    if sender_opening.is_blacklisted {
+        anyhow::bail!("Sender privacy address is frozen (blacklisted)");
+    }
+    if dest_opening.is_blacklisted {
+        anyhow::bail!("Destination privacy address is frozen (blacklisted)");
+    }
 
     // Note: The webgpu_prover generates the proof AND packages it with the public output
     // (SpendPublic) internally, so we don't need to create it here.
@@ -683,6 +734,13 @@ pub async fn transfer(
         })
     }
 
+    fn arg32(b: &Hash32) -> LigeroProgramArguments {
+        LigeroProgramArguments::HexBytesB64 {
+            hex: hex::encode(b),
+            bytes_b64: general_purpose::STANDARD.encode(b),
+        }
+    }
+
     // Build args + private indices in the exact order required by note_spend_guest v2.
     let mut private_indices: Vec<u32> = Vec::new();
     let mut proof_args: Vec<LigeroProgramArguments> = Vec::new();
@@ -697,26 +755,10 @@ pub async fn transfer(
     };
 
     // Header:
+    push(arg32(&DOMAIN), false, &mut private_indices, &mut proof_args); // 1 domain
+    push(arg32(&spend_sk), true, &mut private_indices, &mut proof_args); // 2 spend_sk
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(DOMAIN),
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 1 domain
-    push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(spend_sk),
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 2 spend_sk
-    push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(pk_ivk_owner),
-        },
+        arg32(&pk_ivk_owner),
         true,
         &mut private_indices,
         &mut proof_args,
@@ -729,14 +771,7 @@ pub async fn transfer(
         &mut private_indices,
         &mut proof_args,
     ); // 4 depth
-    push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(anchor_root),
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 5 anchor
+    push(arg32(&anchor_root), false, &mut private_indices, &mut proof_args); // 5 anchor
     push(
         LigeroProgramArguments::I64 {
             i64: u64_to_i64(n_in as u64, "n_in")?,
@@ -756,58 +791,35 @@ pub async fn transfer(
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(input_rho),
-        },
+        arg32(&input_rho),
         true,
         &mut private_indices,
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(input_sender_id),
-        },
+        arg32(&input_sender_id),
         true,
         &mut private_indices,
         &mut proof_args,
     );
 
-    // Position bits (LSB-first), each passed as a 32-byte BE 0/1.
-    for level in 0..depth {
-        let bit = ((position >> level) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(bit_bytes),
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-    }
+    // pos_i (private i64; bits derived in-circuit).
+    push(
+        LigeroProgramArguments::I64 {
+            i64: u64_to_i64(position, "pos")?,
+        },
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Siblings (bottom-up).
     for s in &siblings {
-        push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(s),
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(s), true, &mut private_indices, &mut proof_args);
     }
 
     // Nullifier (public).
-    push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(nf),
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
+    push(arg32(&nf), false, &mut private_indices, &mut proof_args);
 
     // Withdraw binding.
     push(
@@ -819,9 +831,7 @@ pub async fn transfer(
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(withdraw_to),
-        },
+        arg32(&withdraw_to),
         false,
         &mut private_indices,
         &mut proof_args,
@@ -845,33 +855,25 @@ pub async fn transfer(
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(out_rho_0),
-        },
+        arg32(&out_rho_0),
         true,
         &mut private_indices,
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(destination_pk_spend),
-        },
+        arg32(&destination_pk_spend),
         true,
         &mut private_indices,
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(destination_pk_ivk),
-        },
+        arg32(&destination_pk_ivk),
         true,
         &mut private_indices,
         &mut proof_args,
     );
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(cm_out_0),
-        },
+        arg32(&cm_out_0),
         false,
         &mut private_indices,
         &mut proof_args,
@@ -890,33 +892,25 @@ pub async fn transfer(
             &mut proof_args,
         );
         push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(rho1),
-            },
+            arg32(&rho1),
             true,
             &mut private_indices,
             &mut proof_args,
         );
         push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(pk_spend_owner),
-            },
+            arg32(&pk_spend_owner),
             true,
             &mut private_indices,
             &mut proof_args,
         );
         push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(pk_ivk_owner),
-            },
+            arg32(&pk_ivk_owner),
             true,
             &mut private_indices,
             &mut proof_args,
         );
         push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(cm1),
-            },
+            arg32(&cm1),
             false,
             &mut private_indices,
             &mut proof_args,
@@ -925,16 +919,81 @@ pub async fn transfer(
 
     // inv_enforce (private).
     push(
-        LigeroProgramArguments::Hex {
-            hex: hex::encode(inv_enforce),
-        },
+        arg32(&inv_enforce),
         true,
         &mut private_indices,
         &mut proof_args,
     );
 
-    // Viewer section arguments (Level B) if authority VFK is configured.
-    if let (Some(vfk), Some(ref atts)) = (authority_vfk, &view_attestations) {
+    // === Deny-map (blacklist) arguments ===
+    //
+    // ABI extension (note_spend_guest v2 w/ deny-map buckets):
+    //   - blacklist_root (PUBLIC)
+    //   - for each checked id:
+    //       bucket_entries[BLACKLIST_BUCKET_SIZE] (PRIVATE)
+    //       bucket_inv (PRIVATE)
+    //       bucket_siblings[BLACKLIST_TREE_DEPTH] (PRIVATE)
+    //
+    // Viewer arguments, if any, come AFTER this section.
+    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+    anyhow::ensure!(
+        sender_opening.siblings.len() == bl_depth,
+        "sender deny-map opening has wrong sibling length: got {}, expected {}",
+        sender_opening.siblings.len(),
+        bl_depth
+    );
+    anyhow::ensure!(
+        dest_opening.siblings.len() == bl_depth,
+        "destination deny-map opening has wrong sibling length: got {}, expected {}",
+        dest_opening.siblings.len(),
+        bl_depth
+    );
+
+    fn bl_bucket_inv_for_id(
+        id: &Hash32,
+        bucket_entries: &midnight_privacy::BlacklistBucketEntries,
+    ) -> Result<Hash32> {
+        let id_fr = bn254fr_from_hash32_be(id);
+        let mut prod = Bn254Fr::from_u32(1);
+        let mut delta = Bn254Fr::new();
+        for e in bucket_entries.iter() {
+            let e_fr = bn254fr_from_hash32_be(e);
+            submod_checked(&mut delta, &id_fr, &e_fr);
+            prod.mulmod_checked(&delta);
+        }
+        anyhow::ensure!(
+            !prod.is_zero(),
+            "deny-map bucket collision: id is present in bucket entries"
+        );
+        let mut inv = prod.clone();
+        inv.inverse();
+        Ok(inv.to_bytes_be())
+    }
+
+    push(arg32(&blacklist_root), false, &mut private_indices, &mut proof_args);
+
+    // Opening 0: sender_id (spender identity)
+    for e in sender_opening.bucket_entries.iter() {
+        push(arg32(e), true, &mut private_indices, &mut proof_args);
+    }
+    let sender_inv = bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
+    push(arg32(&sender_inv), true, &mut private_indices, &mut proof_args);
+    for sib in sender_opening.siblings.iter().take(bl_depth) {
+        push(arg32(sib), true, &mut private_indices, &mut proof_args);
+    }
+
+    // Opening 1: pay recipient (transfer only; change outputs are enforced to be self in-circuit).
+    for e in dest_opening.bucket_entries.iter() {
+        push(arg32(e), true, &mut private_indices, &mut proof_args);
+    }
+    let dest_inv = bl_bucket_inv_for_id(&dest_opening.recipient, &dest_opening.bucket_entries)?;
+    push(arg32(&dest_inv), true, &mut private_indices, &mut proof_args);
+    for sib in dest_opening.siblings.iter().take(bl_depth) {
+        push(arg32(sib), true, &mut private_indices, &mut proof_args);
+    }
+
+    // Viewer section arguments (Level B) if authority FVK is configured.
+    if let (Some(fvk), Some(ref atts)) = (authority_fvk, &view_attestations) {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -944,41 +1003,13 @@ pub async fn transfer(
         );
         // fvk_commitment (public)
         let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
-        push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(fvk_commitment),
-            },
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&fvk_commitment), false, &mut private_indices, &mut proof_args);
         // fvk (private)
-        push(
-            LigeroProgramArguments::Hex {
-                hex: hex::encode(vfk),
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&fvk), true, &mut private_indices, &mut proof_args);
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
-            push(
-                LigeroProgramArguments::Hex {
-                    hex: hex::encode(att.ct_hash),
-                },
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
-            push(
-                LigeroProgramArguments::Hex {
-                    hex: hex::encode(att.mac),
-                },
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
+            push(arg32(&att.ct_hash), false, &mut private_indices, &mut proof_args);
+            push(arg32(&att.mac), false, &mut private_indices, &mut proof_args);
         }
     }
 
@@ -1007,6 +1038,7 @@ pub async fn transfer(
     }
     let public_output = SpendPublic {
         anchor_root,
+        blacklist_root,
         nullifier: nf,
         withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
         output_commitments,

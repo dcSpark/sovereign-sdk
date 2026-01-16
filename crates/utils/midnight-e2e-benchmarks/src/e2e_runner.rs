@@ -13,7 +13,7 @@ use ligetron::Bn254Fr;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
-    SpendPublic,
+    PrivacyAddress, SpendPublic,
 };
 use num_cpus;
 use serde_json::Value as JsonValue;
@@ -302,7 +302,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     )?;
 
     let api_url = env.api_url.clone();
-    let client = NodeClient::new_unchecked(&api_url);
+    let client = Arc::new(NodeClient::new_unchecked(&api_url));
     // With faster DA config above this should be quick; allow up to 90s for first run
     wait_for_ready(&client, Duration::from_secs(90)).await?;
 
@@ -1277,7 +1277,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     for (i, input) in dep_inputs.iter().enumerate() {
         // Try to load from cache first
         if let Some(ref cache_dir) = cache_dir {
-            let cache_file = cache_dir.join(format!("transfer_{}.proof", input.account_idx));
+            let cache_file = cache_dir.join(format!("transfer_bl_{}.proof", input.account_idx));
             if cache_file.exists() {
                 match std::fs::read(&cache_file) {
                     Ok(proof_bytes) => {
@@ -1308,9 +1308,76 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let sem = semaphore.clone();
         let program_path_for_host = program_path_for_host.clone();
         let authority_fvk = authority_fvk; // Option<Hash32>, Copy
+        let client = client.clone();
         proof_tasks.push(tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await.expect("semaphore closed");
+
+            // Fetch deny-map openings (sender + pay recipient). The spend circuit binds to the
+            // current `blacklist_root` as a public input and requires, for each checked id:
+            // - bucket_entries[BLACKLIST_BUCKET_SIZE] (private)
+            // - bucket_inv (private)
+            // - siblings[BLACKLIST_TREE_DEPTH] (private)
+            let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
+            let pk_spend_owner = pk_from_sk(&spend_sk);
+            let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
+
+            let mut out_spend_sk = [0u8; 32];
+            out_spend_sk[0] = (account_idx as u8).wrapping_add(101);
+            let out_pk_spend = pk_from_sk(&out_spend_sk);
+            let out_pk_ivk = pk_ivk_from_sk(&domain, &out_spend_sk);
+            let out_addr = PrivacyAddress::from_keys(&out_pk_spend, &out_pk_ivk);
+
+            let (sender_opening, out_opening) = tokio::try_join!(
+                async {
+                    client
+                        .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
+                            "/modules/midnight-privacy/blacklist/opening/{sender_addr}"
+                        ))
+                        .await
+                },
+                async {
+                    client
+                        .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
+                            "/modules/midnight-privacy/blacklist/opening/{out_addr}"
+                        ))
+                        .await
+                }
+            )
+            .context("Failed to query deny-map openings")?;
+
+            anyhow::ensure!(
+                sender_opening.blacklist_root == out_opening.blacklist_root,
+                "Deny-map root changed while fetching openings (sender vs output)"
+            );
+            let blacklist_root = sender_opening.blacklist_root;
+
+            if sender_opening.is_blacklisted {
+                anyhow::bail!("Sender privacy address is frozen (blacklisted)");
+            }
+            if out_opening.is_blacklisted {
+                anyhow::bail!("Output privacy address is frozen (blacklisted)");
+            }
+
+            let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+            anyhow::ensure!(
+                sender_opening.siblings.len() == bl_depth,
+                "sender deny-map opening has wrong sibling length: got {}, expected {}",
+                sender_opening.siblings.len(),
+                bl_depth
+            );
+            anyhow::ensure!(
+                out_opening.siblings.len() == bl_depth,
+                "output deny-map opening has wrong sibling length: got {}, expected {}",
+                out_opening.siblings.len(),
+                bl_depth
+            );
+
+            let sender_bl_bucket_entries = sender_opening.bucket_entries;
+            let sender_bl_siblings = sender_opening.siblings;
+            let out_bl_bucket_entries = out_opening.bucket_entries;
+            let out_bl_siblings = out_opening.siblings;
+
             tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
                 eprintln!(
                     "  [proof] gen_proof idx={} account={} pos={} value={} sib_len={} anchor={} viewer={}",
@@ -1331,7 +1398,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 }
 
                 // note_spend_guest v2 derives the input recipient from (spend_sk, pk_ivk_owner).
-                let pk_ivk_owner = pk_ivk_from_sk(&domain, &spend_sk);
                 let in_recipient = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
                 let in_sender_id = in_recipient; // deposit convention: sender_id == recipient
                 let sender_id_out = in_recipient;
@@ -1339,10 +1405,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // Output note (same value, fresh rho + fresh address).
                 let mut out_rho = [0u8; 32];
                 out_rho[0] = (account_idx as u8).wrapping_add(100);
-                let mut out_spend_sk = [0u8; 32];
-                out_spend_sk[0] = (account_idx as u8).wrapping_add(101);
-                let out_pk_spend = pk_from_sk(&out_spend_sk);
-                let out_pk_ivk = pk_ivk_from_sk(&domain, &out_spend_sk);
                 let out_recipient = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
                 let cm_out = note_commitment(
                     &domain,
@@ -1375,6 +1437,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // Public output with view_attestations populated
                 let public = midnight_privacy::SpendPublic {
                     anchor_root: anchor,
+                    blacklist_root,
                     nullifier: nf,
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
@@ -1385,28 +1448,49 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 // LigeroConfig private indices are 1-based (by argument position).
                 let mut private_indices: Vec<usize> = Vec::new();
                 private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
-                private_indices.extend_from_slice(&[7, 8, 9]); // value_in, rho_in, sender_id_in
-                // pos_bits [10..10+depth)
+
+                let n_in: usize = 1;
+                let per_in = 5usize + depth_usize;
+                let withdraw_idx = 7usize + n_in * per_in;
+                let outs_base = withdraw_idx + 3;
+
+                // Input 0 private args.
+                private_indices.extend_from_slice(&[7, 8, 9, 10]); // value_in, rho_in, sender_id_in, pos
+                // siblings [11..11+depth)
                 for j in 0..depth_usize {
-                    private_indices.push(10 + j);
+                    private_indices.push(11 + j);
                 }
-                // siblings [10+depth..10+2*depth)
-                for j in 0..depth_usize {
-                    private_indices.push(10 + depth_usize + j);
-                }
+
                 // output 0 private args:
-                let out_base = 14 + 2 * depth_usize;
+                let out_base = outs_base;
                 private_indices.extend_from_slice(&[
                     out_base,     // value_out
                     out_base + 1, // rho_out
                     out_base + 2, // pk_spend_out
                     out_base + 3, // pk_ivk_out
                 ]);
-                // inv_enforce
-                private_indices.push(19 + 2 * depth_usize);
-                // Viewer section: fvk is private
+                // inv_enforce (private)
+                let inv_enforce_idx = outs_base + 5 * n_out;
+                private_indices.push(inv_enforce_idx);
+
+                // Deny-map (blacklist) section:
+                // - blacklist_root is PUBLIC (comes right after inv_enforce)
+                // - for each checked id: bucket_entries[BLACKLIST_BUCKET_SIZE] + bucket_inv + siblings[BLACKLIST_TREE_DEPTH]
+                let bl_root_idx = inv_enforce_idx + 1;
+                let bl_args_start = bl_root_idx + 1;
+                let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+                let bl_per_check =
+                    midnight_privacy::BLACKLIST_BUCKET_SIZE + 1usize + bl_depth;
+                // Transfers: sender_id + pay recipient.
+                let bl_checks = 2usize;
+                for j in 0..(bl_checks * bl_per_check) {
+                    private_indices.push(bl_args_start + j);
+                }
+
+                // Viewer section: fvk is private (when enabled) and comes after the deny-map.
                 if viewer_data.is_some() {
-                    private_indices.push(22 + 2 * depth_usize);
+                    let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
+                    private_indices.push(n_viewers_idx + 2);
                 }
 
                 let program_path = program_path_for_host.as_ref().clone();
@@ -1424,12 +1508,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 host.add_u64_arg(out_value_u64); // 7 value_in (PRIVATE)
                 host.add_hex_arg(hex::encode(rho)); // 8 rho_in (PRIVATE)
                 host.add_hex_arg(hex::encode(in_sender_id)); // 9 sender_id_in (PRIVATE)
-                for lvl in 0..depth_usize {
-                    let bit = ((position >> lvl) & 1) as u8;
-                    let mut bit_bytes = [0u8; 32];
-                    bit_bytes[31] = bit;
-                    host.add_hex_arg(hex::encode(bit_bytes));
-                }
+                host.add_u64_arg(position as u64); // 10 pos (PRIVATE)
                 for s in &siblings {
                     host.add_hex_arg(hex::encode(s));
                 }
@@ -1462,6 +1541,54 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     inv.to_bytes_be()
                 };
                 host.add_hex_arg(hex::encode(inv_enforce));
+
+                // Deny-map (blacklist) args:
+                //   blacklist_root (PUBLIC)
+                //   sender check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
+                //   pay recipient check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
+                let bucket_inv_for_id = |id: &Hash32, bucket_entries: &[Hash32]| -> anyhow::Result<Hash32> {
+                    anyhow::ensure!(
+                        bucket_entries.len() == midnight_privacy::BLACKLIST_BUCKET_SIZE,
+                        "bucket_entries length mismatch: got {}, expected {}",
+                        bucket_entries.len(),
+                        midnight_privacy::BLACKLIST_BUCKET_SIZE
+                    );
+                    let mut id_fr = Bn254Fr::new();
+                    id_fr.set_bytes_big(id);
+                    let mut prod = Bn254Fr::from_u32(1);
+                    let mut delta = Bn254Fr::new();
+                    for e in bucket_entries {
+                        let mut e_fr = Bn254Fr::new();
+                        e_fr.set_bytes_big(e);
+                        submod_checked(&mut delta, &id_fr, &e_fr);
+                        prod.mulmod_checked(&delta);
+                    }
+                    anyhow::ensure!(
+                        !prod.is_zero(),
+                        "bucket_inv undefined: id appears blacklisted or invalid bucket"
+                    );
+                    let mut inv = prod.clone();
+                    inv.inverse();
+                    Ok(inv.to_bytes_be())
+                };
+
+                host.add_hex_arg(hex::encode(blacklist_root));
+                for e in &sender_bl_bucket_entries {
+                    host.add_hex_arg(hex::encode(e));
+                }
+                let sender_bucket_inv = bucket_inv_for_id(&sender_id_out, &sender_bl_bucket_entries)?;
+                host.add_hex_arg(hex::encode(sender_bucket_inv));
+                for sib in sender_bl_siblings.iter().take(bl_depth) {
+                    host.add_hex_arg(hex::encode(sib));
+                }
+                for e in &out_bl_bucket_entries {
+                    host.add_hex_arg(hex::encode(e));
+                }
+                let out_bucket_inv = bucket_inv_for_id(&out_recipient, &out_bl_bucket_entries)?;
+                host.add_hex_arg(hex::encode(out_bucket_inv));
+                for sib in out_bl_siblings.iter().take(bl_depth) {
+                    host.add_hex_arg(hex::encode(sib));
+                }
 
                 // Viewer section (Level-B) - add viewer args if authority FVK is set
                 if let Some((fvk, att)) = viewer_data {
@@ -1510,7 +1637,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Save newly generated proofs to cache
     if let Some(ref cache_dir) = cache_dir {
         for (account_idx, proof_bytes) in &generated_proofs {
-            let cache_file = cache_dir.join(format!("transfer_{}.proof", account_idx));
+            let cache_file = cache_dir.join(format!("transfer_bl_{}.proof", account_idx));
             match std::fs::write(&cache_file, proof_bytes) {
                 Ok(_) => {
                     eprintln!(

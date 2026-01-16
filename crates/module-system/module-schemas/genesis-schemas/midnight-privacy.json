@@ -42,6 +42,16 @@
       "maxItems": 32,
       "minItems": 32
     },
+    "pool_admins": {
+      "description": "Optional initial set of pool admins allowed to update `blacklist_root`.\n\nIf omitted, defaults to a singleton set containing `admin`.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/Address"
+      }
+    },
     "root_window_size": {
       "description": "Size of the recent roots window (how many recent roots to keep)",
       "type": "integer",

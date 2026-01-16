@@ -84,6 +84,11 @@ pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, Pending
 /// - `root_seq`: Monotonic sequence counter for root ordering
 /// - `method_id`: Ligero method ID (code commitment) for proof verification
 /// - `admin`: Administrator who can update the method ID
+/// - `blacklist_root`: Deny-map Merkle root (freeze/blacklist primitive)
+/// - `blacklist_buckets`: Deny-map bucket entries (non-empty buckets)
+/// - `blacklist_nodes`: Deny-map Merkle nodes (non-default)
+/// - `pool_admins`: Addresses allowed to update `blacklist_root` (membership map)
+/// - `pool_admin_list`: Sorted list of pool admins (for queries)
 /// - `domain`: Domain tag for all note/hash operations
 /// - `token_id`: The single supported native token
 /// - `bank`: Bank module for token transfers
@@ -150,6 +155,31 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Administrator address who can update the method ID.
     #[state]
     pub admin: StateValue<S::Address>,
+
+    /// Deny-map Merkle root used by the ZK circuits to enforce address freezing.
+    ///
+    /// The spend (and deposit) circuits take `blacklist_root` as a public input and prove that
+    /// selected identities are not blacklisted under this root.
+    #[state]
+    pub blacklist_root: StateValue<Hash32>,
+
+    /// Deny-map bucket entries stored per leaf position (sparse: only non-empty buckets stored).
+    #[state]
+    pub blacklist_buckets: StateMap<u64, crate::hash::BlacklistBucketEntries>,
+
+    /// Deny-map Merkle nodes (sparse: only non-default nodes stored).
+    ///
+    /// This supports efficient Merkle opening queries for clients constructing ZK proofs.
+    #[state]
+    pub blacklist_nodes: StateMap<BlacklistNodeKey, Hash32>,
+
+    /// Set of pool admin addresses allowed to update `blacklist_root`.
+    #[state]
+    pub pool_admins: StateMap<S::Address, bool>,
+
+    /// Sorted list of pool admins (for enumeration in REST queries).
+    #[state]
+    pub pool_admin_list: StateValue<Vec<S::Address>>,
 
     /// Domain tag used in all note/hash derivations.
     #[state]
@@ -220,7 +250,7 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
 
     type CallMessage = CallMessage<S>;
 
-    type Event = Event;
+    type Event = Event<S>;
 
     fn genesis(
         &mut self,
@@ -286,6 +316,16 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             )?),
             CallMessage::UpdateMethodId { new_method_id } => {
                 Ok(self.update_method_id(new_method_id, context, state)?)
+            }
+            CallMessage::FreezeAddress { address } => {
+                Ok(self.freeze_address(address, context, state)?)
+            }
+            CallMessage::UnfreezeAddress { address } => {
+                Ok(self.unfreeze_address(address, context, state)?)
+            }
+            CallMessage::AddPoolAdmin { admin } => Ok(self.add_pool_admin(admin, context, state)?),
+            CallMessage::RemovePoolAdmin { admin } => {
+                Ok(self.remove_pool_admin(admin, context, state)?)
             }
         };
 

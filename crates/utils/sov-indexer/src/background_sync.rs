@@ -1,7 +1,7 @@
 use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
 use crate::viewer::{
-    self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, VfkRegistry,
+    self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, FvkRegistry,
 };
 use anyhow::Result;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub async fn backfill_index(
     da: &DatabaseConnection,
     idx: &DatabaseConnection,
-    vfk_registry: &VfkRegistry,
+    fvk_registry: &FvkRegistry,
 ) -> Result<()> {
     let last = db::get_last_processed_id(idx).await?.unwrap_or(0);
     let rows = worker_verified_transactions::Entity::find()
@@ -59,13 +59,13 @@ pub async fn backfill_index(
             let Some(event_id) = event_id else {
                 continue;
             };
-            // Try to decrypt encrypted notes using the VFK registry
+            // Try to decrypt encrypted notes using the FVK registry
             let encrypted_notes: Option<serde_json::Value> = row
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !vfk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(vfk_registry, encrypted_notes.as_ref())
+            let decrypted_notes = if !fvk_registry.is_empty() {
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
             } else {
                 None
             };
@@ -121,13 +121,13 @@ pub async fn backfill_index(
                             .flatten()
                             .and_then(|s| serde_json::from_str(&s).ok())
                     });
-                // Try to decrypt encrypted notes using the VFK registry
+                // Try to decrypt encrypted notes using the FVK registry
                 let encrypted_notes: Option<serde_json::Value> = row
                     .encrypted_notes_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
-                let decrypted_notes = if !vfk_registry.is_empty() {
-                    viewer::try_decrypt_notes_with_registry(vfk_registry, encrypted_notes.as_ref())
+                let decrypted_notes = if !fvk_registry.is_empty() {
+                    viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
                 } else {
                     None
                 };
@@ -175,13 +175,13 @@ pub async fn backfill_index(
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                 });
-            // Try to decrypt encrypted notes using the VFK registry
+            // Try to decrypt encrypted notes using the FVK registry
             let encrypted_notes: Option<serde_json::Value> = row
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !vfk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(vfk_registry, encrypted_notes.as_ref())
+            let decrypted_notes = if !fvk_registry.is_empty() {
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
             } else {
                 None
             };
@@ -208,14 +208,14 @@ pub async fn backfill_index(
 pub fn spawn_sync_loop(
     da: DatabaseConnection,
     idx: DatabaseConnection,
-    vfk_registry: Arc<VfkRegistry>,
+    fvk_registry: Arc<FvkRegistry>,
 ) {
     tokio::spawn(async move {
         use tokio::time::{interval, Duration};
         let mut ticker = interval(Duration::from_millis(1000));
         loop {
             ticker.tick().await;
-            if let Err(e) = backfill_index(&da, &idx, &vfk_registry).await {
+            if let Err(e) = backfill_index(&da, &idx, &fvk_registry).await {
                 tracing::warn!(error = %e, "indexer backfill iteration failed");
             }
         }

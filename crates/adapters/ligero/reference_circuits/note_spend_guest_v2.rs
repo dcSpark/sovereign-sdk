@@ -106,7 +106,7 @@
  *   value_in_i         — i64            [PRIVATE]
  *   rho_in_i           — 32 bytes       [PRIVATE]
  *   sender_id_in_i     — 32 bytes       [PRIVATE] (NOTE_V2 leaf binding)
- *   pos_bits_i[k]      — depth × 32 bytes [PRIVATE; each is 0/1]
+ *   pos_i              — i64            [PRIVATE] (leaf position; bits are derived in-circuit)
  *   siblings_i[k]      — depth × 32 bytes [PRIVATE]
  *   nullifier_i        — 32 bytes       [PUBLIC; must equal computed]
  *
@@ -128,15 +128,27 @@
  *     - output rhos differ from all input rhos
  *     - (if n_out==2) output rhos are distinct
  *
+ * Blacklist checks (bucketed non-membership + Merkle membership):
+ *   blacklist_root                   — 32 bytes [PUBLIC]
+ *   For each checked id:
+ *     bl_bucket_entries              — BL_BUCKET_SIZE × 32 bytes [PRIVATE]
+ *     bl_bucket_inv                  — 32 bytes [PRIVATE] BN254 Fr inverse witness for in-bucket non-membership
+ *     bl_siblings[k]                 — BL_DEPTH × 32 bytes [PRIVATE]
+ *
+ * Checked ids:
+ *   - sender_id always
+ *   - pay recipient only for TRANSFER (withdraw_amount == 0)
+ *
  * Expected argc (no viewers) =
- *   1 + 6 + n_in*(4 + 2*depth) + 3 + 5*n_out + 1
+ *   1 + 6 + n_in*(5 + depth) + 3 + 5*n_out + 1(inv_enforce)
+ *     + 1(blacklist_root) + bl_checks*(BL_BUCKET_SIZE + 1 + BL_DEPTH)
+ *   where bl_checks = 1 + (withdraw_amount == 0 ? 1 : 0)
  * (argc includes argv[0]).
  *
  * SECURITY NOTES:
  *   1) All validation paths inject UNSAT constraints before exit (hard_fail)
  *   2) Balance check uses field-level constraint, not runtime boolean comparison
- *   3) Position bits are constrained to be boolean (0 or 1)
- *   4) Merkle path uses field-level MUX to avoid witness-dependent constraints
+ *   3) Merkle path uses field-level MUX to avoid witness-dependent constraints
  *
  * Hashing uses Ligetron's Poseidon2 via bn254fr host functions (Ligero-compatible).
  *
@@ -152,7 +164,7 @@
 
 // Ligetron SDK imports
 use ligetron::api::{get_args, ArgHolder};
-use ligetron::bn254fr::{Bn254Fr, addmod_checked, submod_checked};
+use ligetron::bn254fr::{addmod_checked, submod_checked, Bn254Fr};
 use ligetron::poseidon2::poseidon2_hash_bytes;
 
 /// Exit the program with the given code.
@@ -243,6 +255,13 @@ fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
     result
 }
 
+#[inline(always)]
+fn assert_hash32_eq(a: &Hash32, b: &Hash32) {
+    let a_fr = bn254fr_from_hash32_be(a);
+    let b_fr = bn254fr_from_hash32_be(b);
+    Bn254Fr::assert_equal(&a_fr, &b_fr);
+}
+
 /// Assert that a computed field element equals an expected 32-byte digest (public).
 #[inline(always)]
 fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
@@ -255,35 +274,9 @@ fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
 }
 
 // ============================================================================
-// FIELD-LEVEL SELECT FOR OBLIVIOUS MERKLE PATH
-// Uses arithmetic selection with private bits (no witness-dependent branching).
+// MERKLE PATH (FIELD-LEVEL MUX)
+// Uses arithmetic selection with position bits derived from a private u64 `pos`.
 // ============================================================================
-
-/// Enforce that a field element is a boolean (0 or 1).
-/// Constraint: cond * (cond - 1) == 0
-///
-/// This is critical for soundness: if position bits are not constrained
-/// to be boolean, a malicious prover could use other field values to
-/// manipulate the Merkle path computation.
-#[inline(always)]
-fn assert_bit(cond: &Bn254Fr, one: &Bn254Fr) {
-    // t = cond - 1
-    let mut t = Bn254Fr::new();
-    submod_checked(&mut t, cond, &one);
-    // t = cond * (cond - 1)
-    t.mulmod_checked(cond);
-    // Assert t == 0 (only true if cond is 0 or 1)
-    Bn254Fr::assert_equal_u64(&t, 0);
-}
-
-/// Read a position bit from a 32-byte hex argument.
-/// The bit should be passed as 0x000...0000 (for 0) or 0x000...0001 (for 1).
-/// Returns a Bn254Fr that is either 0 or 1.
-#[inline(always)]
-fn read_position_bit(args: &ArgHolder, index: usize) -> Bn254Fr {
-    let b = read_hash32(args, index);
-    bn254fr_from_hash32_be(&b)
-}
 
 // ============================================================================
 // OPTIMIZED: All values stored as u64 (not u128) to avoid expensive 128-bit ops.
@@ -342,8 +335,15 @@ fn read_hash32(args: &ArgHolder, index: usize) -> Hash32 {
     } else {
         #[cfg(feature = "diagnostics")]
         {
-            eprintln!("read_hash32: idx={} len={} (unexpected)", index, bytes.len());
-            eprintln!("read_hash32: first_bytes={:02x?}", &bytes[..bytes.len().min(16)]);
+            eprintln!(
+                "read_hash32: idx={} len={} (unexpected)",
+                index,
+                bytes.len()
+            );
+            eprintln!(
+                "read_hash32: first_bytes={:02x?}",
+                &bytes[..bytes.len().min(16)]
+            );
         }
         hard_fail(70);
     };
@@ -400,29 +400,28 @@ const VIEW_MAC_BUF_LEN: usize = 11 + 32 + 32 + 32; // "VIEW_MAC_V1" + k + cm + c
 
 /// Merkle tree node hash: H("MT_NODE_V1" || lvl || left || right)
 /// Fixed 75-byte preimage.
-fn mt_combine(h: &Poseidon2Core, level: u8, left: &Hash32, right: &Hash32) -> (Bn254Fr, Hash32) {
+
+fn mt_combine(h: &Poseidon2Core, level: u8, left: &Hash32, right: &Hash32) -> Bn254Fr {
     let mut buf = [0u8; MT_NODE_BUF_LEN];
     buf[..10].copy_from_slice(b"MT_NODE_V1");
     buf[10] = level;
     buf[11..43].copy_from_slice(left);
     buf[43..75].copy_from_slice(right);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+    h.hash_padded_fr(&buf)
 }
 
 /// Note commitment: H("NOTE_V2" || domain || value_16 || rho || recipient || sender_id)
 /// Fixed 151-byte preimage. Value is u64 zero-extended to 16 bytes.
 ///
 /// `sender_id` is the attested sender identity bound into the commitment (not just viewer plaintext).
-fn note_commitment(
+fn note_commitment_fr(
     h: &Poseidon2Core,
     domain: &Hash32,
     value: u64,
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-) -> (Bn254Fr, Hash32) {
+) -> Bn254Fr {
     let mut buf = [0u8; NOTE_CM_BUF_LEN];
     buf[..7].copy_from_slice(b"NOTE_V2");
     buf[7..39].copy_from_slice(domain);
@@ -432,26 +431,24 @@ fn note_commitment(
     buf[55..87].copy_from_slice(rho);
     buf[87..119].copy_from_slice(recipient);
     buf[119..151].copy_from_slice(sender_id);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+    h.hash_padded_fr(&buf)
 }
 
 /// Nullifier: H("PRF_NF_V1" || domain || nf_key || rho)
 /// Fixed 105-byte preimage.
-fn nullifier(h: &Poseidon2Core, domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> (Bn254Fr, Hash32) {
+
+fn nullifier_fr(h: &Poseidon2Core, domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Bn254Fr {
     let mut buf = [0u8; PRF_NF_BUF_LEN];
     buf[..9].copy_from_slice(b"PRF_NF_V1");
     buf[9..41].copy_from_slice(domain);
     buf[41..73].copy_from_slice(nf_key);
     buf[73..105].copy_from_slice(rho);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+    h.hash_padded_fr(&buf)
 }
 
 /// pk = H("PK_V1" || spend_sk)
 /// Fixed 37-byte preimage.
+
 fn pk_from_sk(h: &Poseidon2Core, spend_sk: &Hash32) -> Hash32 {
     let mut buf = [0u8; PK_BUF_LEN];
     buf[..5].copy_from_slice(b"PK_V1");
@@ -473,6 +470,7 @@ fn recipient_from_pk(h: &Poseidon2Core, domain: &Hash32, pk_spend: &Hash32, pk_i
 
 /// nf_key = H("NFKEY_V1" || domain || spend_sk)
 /// Fixed 72-byte preimage.
+
 fn nf_key_from_sk(h: &Poseidon2Core, domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
     let mut buf = [0u8; NFKEY_BUF_LEN];
     buf[..8].copy_from_slice(b"NFKEY_V1");
@@ -481,66 +479,52 @@ fn nf_key_from_sk(h: &Poseidon2Core, domain: &Hash32, spend_sk: &Hash32) -> Hash
     h.hash_padded(&buf)
 }
 
-// ============================================================================
-// OBLIVIOUS MERKLE PATH: Avoid secret-dependent branching.
-// If `pos` is private, `if (pos_bit) { ... }` creates secret branching which
-// is expensive in Ligetron. Instead, use constant-time conditional swap.
-// ============================================================================
-
 /// Compute Merkle root using FIELD-LEVEL MUX operations.
-/// This version works with private position bits and siblings!
+/// Position bits are derived from the low bits of `pos` (LSB-first).
 ///
-/// Arguments:
-/// - h: Poseidon2 hasher instance
-/// - leaf_bytes: The leaf commitment as 32-byte hash
-/// - pos_bits: Position bits as field elements (0 or 1 each), one per level
-/// - siblings_fr: Sibling hashes as field elements, one per level
-/// - depth: Number of levels in the Merkle path
-///
-/// The position bits determine which side the current node is on at each level:
-/// - bit=0: current is left child, sibling is right child
-/// - bit=1: current is right child, sibling is left child
+/// Reads `depth` sibling hashes from `args` starting at `*arg_idx` and advances `*arg_idx`.
 fn root_from_path_field_level(
     h: &Poseidon2Core,
-    leaf_bytes: &Hash32,
-    pos_bits: &[Bn254Fr],
-    siblings_fr: &[Bn254Fr],
+    mut cur_fr: Bn254Fr,
+    mut pos: u64,
+    args: &ArgHolder,
+    arg_idx: &mut usize,
     depth: usize,
 ) -> Bn254Fr {
     if depth == 0 {
         hard_fail(77);
     }
 
-    // Initialize current node from leaf
-    let mut cur_fr = bn254fr_from_hash32_be(leaf_bytes);
-
     // Reuse temporaries; this also reduces per-level host overhead.
     let mut left_fr = Bn254Fr::new();
     let mut right_fr = Bn254Fr::new();
     let mut delta = Bn254Fr::new();
+    let mut bit_fr = Bn254Fr::new();
     let mut left_bytes = [0u8; 32];
     let mut right_bytes = [0u8; 32];
 
     let mut lvl = 0usize;
     while lvl < depth {
-        let bit = &pos_bits[lvl];
-        let sib_fr = &siblings_fr[lvl];
+        let sib = read_hash32(args, *arg_idx);
+        *arg_idx += 1;
+        let sib_fr = bn254fr_from_hash32_be(&sib);
+        bit_fr.set_u32((pos & 1) as u32);
 
         // 1-mul select:
         // delta = bit * (sib - cur)
         // left  = cur + delta
         // right = sib - delta
-        submod_checked(&mut delta, sib_fr, &cur_fr);
-        delta.mulmod_checked(bit);
+        submod_checked(&mut delta, &sib_fr, &cur_fr);
+        delta.mulmod_checked(&bit_fr);
         addmod_checked(&mut left_fr, &cur_fr, &delta);
-        submod_checked(&mut right_fr, sib_fr, &delta);
+        submod_checked(&mut right_fr, &sib_fr, &delta);
 
         left_fr.get_bytes_big(&mut left_bytes);
         right_fr.get_bytes_big(&mut right_bytes);
 
         // Compute hash using byte preimage.
-        let (next_fr, _next_bytes) = mt_combine(h, lvl as u8, &left_bytes, &right_bytes);
-        cur_fr = next_fr;
+        cur_fr = mt_combine(h, lvl as u8, &left_bytes, &right_bytes);
+        pos >>= 1;
         lvl += 1;
     }
 
@@ -551,17 +535,17 @@ fn root_from_path_field_level(
 
 /// FVK commitment: H("FVK_COMMIT_V1" || fvk)
 /// Fixed 45-byte preimage.
-fn fvk_commit(h: &Poseidon2Core, fvk: &Hash32) -> (Bn254Fr, Hash32) {
+
+fn fvk_commit_fr(h: &Poseidon2Core, fvk: &Hash32) -> Bn254Fr {
     let mut buf = [0u8; FVK_COMMIT_BUF_LEN];
     buf[..13].copy_from_slice(b"FVK_COMMIT_V1");
     buf[13..45].copy_from_slice(fvk);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+    h.hash_padded_fr(&buf)
 }
 
 /// View KDF: H("VIEW_KDF_V1" || fvk || cm)
 /// Fixed 75-byte preimage.
+
 fn view_kdf(h: &Poseidon2Core, fvk: &Hash32, cm: &Hash32) -> Hash32 {
     let mut buf = [0u8; VIEW_KDF_BUF_LEN];
     buf[..11].copy_from_slice(b"VIEW_KDF_V1");
@@ -572,6 +556,7 @@ fn view_kdf(h: &Poseidon2Core, fvk: &Hash32, cm: &Hash32) -> Hash32 {
 
 /// Stream block: H("VIEW_STREAM_V1" || k || ctr)
 /// Fixed 50-byte preimage.
+
 fn stream_block(h: &Poseidon2Core, k: &Hash32, ctr: u32) -> Hash32 {
     let mut buf = [0u8; VIEW_STREAM_BUF_LEN];
     buf[..14].copy_from_slice(b"VIEW_STREAM_V1");
@@ -582,6 +567,7 @@ fn stream_block(h: &Poseidon2Core, k: &Hash32, ctr: u32) -> Hash32 {
 
 /// Stream XOR encrypt for exactly 144 bytes (NOTE_PLAIN_LEN).
 /// Optimized: 5 hash calls for 144 bytes (4 full blocks + 16-byte remainder).
+
 fn stream_xor_encrypt_144(h: &Poseidon2Core, k: &Hash32, pt: &[u8; 144], ct_out: &mut [u8; 144]) {
     // Block 0: bytes 0-31
     let ks0 = stream_block(h, k, 0);
@@ -626,6 +612,7 @@ fn stream_xor_encrypt_144(h: &Poseidon2Core, k: &Hash32, pt: &[u8; 144], ct_out:
 
 /// Ciphertext hash: H("CT_HASH_V1" || ct)
 /// Fixed 154-byte preimage for 144-byte ciphertext.
+
 fn ct_hash(h: &Poseidon2Core, ct: &[u8; 144]) -> (Bn254Fr, Hash32) {
     let mut buf = [0u8; CT_HASH_BUF_LEN];
     buf[..10].copy_from_slice(b"CT_HASH_V1");
@@ -637,20 +624,20 @@ fn ct_hash(h: &Poseidon2Core, ct: &[u8; 144]) -> (Bn254Fr, Hash32) {
 
 /// View MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
 /// Fixed 107-byte preimage.
-fn view_mac(h: &Poseidon2Core, k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> (Bn254Fr, Hash32) {
+
+fn view_mac_fr(h: &Poseidon2Core, k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Bn254Fr {
     let mut buf = [0u8; VIEW_MAC_BUF_LEN];
     buf[..11].copy_from_slice(b"VIEW_MAC_V1");
     buf[11..43].copy_from_slice(k);
     buf[43..75].copy_from_slice(cm);
     buf[75..107].copy_from_slice(ct_h);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+    h.hash_padded_fr(&buf)
 }
 
 /// Encode note plaintext for viewer encryption.
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
 /// Value is u64 zero-extended to 16 bytes.
+
 fn encode_note_plain(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32, sender_id: &Hash32, out: &mut [u8; 144]) {
     out[0..32].copy_from_slice(domain);
     // Encode value as 16-byte LE (u64 zero-extended to 16 bytes)
@@ -667,10 +654,73 @@ fn encode_note_plain(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash
 /// Must be ≤ 63 to ensure the bound check `pos >= (1u64 << depth)` is safe
 /// (shifting by 64 would overflow a u64).
 const MAX_DEPTH: usize = 63;
+const BL_DEPTH: usize = 16;
+const BL_BUCKET_SIZE: usize = 12;
+const BL_BUCKET_TAG_LEN: usize = 12; // "BL_BUCKET_V1"
+const BL_BUCKET_BUF_LEN: usize = BL_BUCKET_TAG_LEN + 32 * BL_BUCKET_SIZE;
 const MAX_INS: usize = 4;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
 const NOTE_PLAIN_LEN: usize = 144; // 32 + 16 + 32 + 32 + 32 (domain + value + rho + recipient + sender_id)
+
+#[inline(always)]
+fn bl_bucket_pos_from_id(id: &Hash32) -> u64 {
+    // Derive the bucket index from the low BL_DEPTH bits of `id` (LSB-first).
+    // This prevents the prover from choosing an arbitrary bucket.
+    let mut pos: u64 = 0;
+    let mut i = 0usize;
+    while i < BL_DEPTH {
+        let byte = id[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        pos |= (bit as u64) << (i as u32);
+        i += 1;
+    }
+    pos
+}
+
+#[inline(always)]
+fn bl_bucket_leaf_fr(h: &Poseidon2Core, entries: &[Hash32; BL_BUCKET_SIZE]) -> Bn254Fr {
+    let mut buf = [0u8; BL_BUCKET_BUF_LEN];
+    buf[..BL_BUCKET_TAG_LEN].copy_from_slice(b"BL_BUCKET_V1");
+    let mut i = 0usize;
+    while i < BL_BUCKET_SIZE {
+        let start = BL_BUCKET_TAG_LEN + 32 * i;
+        buf[start..start + 32].copy_from_slice(&entries[i]);
+        i += 1;
+    }
+    h.hash_padded_fr(&buf)
+}
+
+#[inline(always)]
+fn assert_not_blacklisted_bucket_from_args(h: &Poseidon2Core, id: &Hash32, blacklist_root: &Hash32, args: &ArgHolder, arg_idx: &mut usize) {
+    let mut bucket_entries = [[0u8; 32]; BL_BUCKET_SIZE];
+    for i in 0..BL_BUCKET_SIZE {
+        bucket_entries[i] = read_hash32(args, *arg_idx);
+        *arg_idx += 1;
+    }
+    let inv_bytes = read_hash32(args, *arg_idx);
+    *arg_idx += 1;
+
+    let pos = bl_bucket_pos_from_id(id);
+
+    // In-bucket non-membership: prove `id` differs from every entry by supplying inv(product).
+    let id_fr = bn254fr_from_hash32_be(id);
+    let mut prod = Bn254Fr::from_u32(1);
+    let mut delta = Bn254Fr::new();
+    for e in bucket_entries.iter() {
+        let e_fr = bn254fr_from_hash32_be(e);
+        submod_checked(&mut delta, &id_fr, &e_fr);
+        prod.mulmod_checked(&delta);
+    }
+    let inv_fr = bn254fr_from_hash32_be(&inv_bytes);
+    prod.mulmod_checked(&inv_fr);
+    Bn254Fr::assert_equal_u64(&prod, 1);
+
+    // Bucket membership under `blacklist_root`.
+    let leaf_fr = bl_bucket_leaf_fr(h, &bucket_entries);
+    let root_fr = root_from_path_field_level(h, leaf_fr, pos, args, arg_idx, BL_DEPTH);
+    assert_fr_eq_hash32(&root_fr, blacklist_root);
+}
 
 fn main() {
     let args = get_args();
@@ -678,10 +728,6 @@ fn main() {
 
     // Create single hasher instance, reuse for all hashes.
     let h = Poseidon2Core::new();
-    // A real 1 value for boolean constraints.
-    // We set the witness value and also bind it as a constant to avoid relying on backend semantics.
-    let one = Bn254Fr::from_u32(1);
-    Bn254Fr::assert_equal_u64(&one, 1);
 
     // Header:
     // [1] domain (PUBLIC)
@@ -739,37 +785,25 @@ fn main() {
         let sender_id_in_i = read_hash32(&args, arg_idx);
         arg_idx += 1;
 
-        // pos_bits_i[k] [PRIVATE]
-        let mut pos_bits: Vec<Bn254Fr> = Vec::with_capacity(depth);
-        for _lvl in 0..depth {
-            let bit = read_position_bit(&args, arg_idx);
-            assert_bit(&bit, &one);
-            pos_bits.push(bit);
-            arg_idx += 1;
+        // pos_i [PRIVATE]
+        let pos_i = read_u64(&args, arg_idx, 77);
+        arg_idx += 1;
+        if pos_i >= (1u64 << depth) {
+            hard_fail(77);
         }
 
-        // siblings_i[k] [PRIVATE] (field elements for MUX)
-        let mut siblings_fr: Vec<Bn254Fr> = Vec::with_capacity(depth);
-        for _lvl in 0..depth {
-            let sibling = read_hash32(&args, arg_idx);
-            siblings_fr.push(bn254fr_from_hash32_be(&sibling));
-            arg_idx += 1;
-        }
+        // Verify Merkle membership for this input.
+        let cm_i_fr = note_commitment_fr(&h, &domain, v_i, &rho_i, &recipient_owner, &sender_id_in_i);
+        let anchor_i_fr = root_from_path_field_level(&h, cm_i_fr, pos_i, &args, &mut arg_idx, depth);
+        assert_fr_eq_hash32(&anchor_i_fr, &anchor_arg);
 
         // nullifier_i [PUBLIC]
         let nullifier_arg_i = read_hash32(&args, arg_idx);
         arg_idx += 1;
         nullifier_args.push(nullifier_arg_i);
 
-        // Verify Merkle membership for this input.
-        let (_cm_i_fr, cm_i_bytes) =
-            note_commitment(&h, &domain, v_i, &rho_i, &recipient_owner, &sender_id_in_i);
-        let anchor_i_fr =
-            root_from_path_field_level(&h, &cm_i_bytes, &pos_bits[..depth], &siblings_fr[..depth], depth);
-        assert_fr_eq_hash32(&anchor_i_fr, &anchor_arg);
-
         // Verify nullifier for this input.
-        let (nf_i_fr, _nf_i_bytes) = nullifier(&h, &domain, &nf_key, &rho_i);
+        let nf_i_fr = nullifier_fr(&h, &domain, &nf_key, &rho_i);
         assert_fr_eq_hash32(&nf_i_fr, &nullifier_args[nullifier_args.len() - 1]);
     }
 
@@ -817,9 +851,20 @@ fn main() {
     }
 
     // Expected argc without viewers:
-    //   1 + 6 + n_in*(4 + 2*depth) + 3 + 5*n_out + 1(inv_enforce)
-    let per_in = 4u32 + 2u32 * depth_u32;
-    let expected_base = 1u32 + 6u32 + n_in_u32 * per_in + 3u32 + 5u32 * n_out_u32 + 1u32;
+    //   1 + 6 + n_in*(5 + depth) + 3 + 5*n_out + 1(inv_enforce)
+    let per_in = 5u32 + depth_u32;
+    let expected_base_no_blacklist = 1u32 + 6u32 + n_in_u32 * per_in + 3u32 + 5u32 * n_out_u32 + 1u32;
+    // Blacklist arguments are appended after inv_enforce:
+    //   blacklist_root [PUBLIC]
+    //   For each checked id:
+    //     bucket_entries[BL_BUCKET_SIZE] [PRIVATE]
+    //     bucket_inv                 [PRIVATE]
+    //     bucket_siblings[BL_DEPTH]  [PRIVATE]
+    let bl_pay_checks = if withdraw_amount == 0 { 1u32 } else { 0u32 };
+    let bl_checks = 1u32 + bl_pay_checks;
+    let bl_per_check = (BL_BUCKET_SIZE as u32) + 1u32 + (BL_DEPTH as u32);
+    let blacklist_extra = 1u32 + bl_checks * bl_per_check;
+    let expected_base = expected_base_no_blacklist + blacklist_extra;
     if argc < expected_base {
         hard_fail(84);
     }
@@ -832,18 +877,8 @@ fn main() {
         cm: Hash32,
     }
     let mut outs: [OutPlain; MAX_OUTS] = [
-        OutPlain {
-            v: 0,
-            rho: [0; 32],
-            rcp: [0; 32],
-            cm: [0; 32],
-        },
-        OutPlain {
-            v: 0,
-            rho: [0; 32],
-            rcp: [0; 32],
-            cm: [0; 32],
-        },
+        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
     ];
 
     let mut out_sum: u64 = 0;
@@ -876,22 +911,26 @@ fn main() {
         let cm_arg = read_hash32(&args, arg_idx);
         arg_idx += 1;
 
-        let (cm_cmp_fr, _cm_cmp_bytes) =
-            note_commitment(&h, &domain, vj, &rho_j, &rcp_j, &sender_id);
+        let cm_cmp_fr = note_commitment_fr(&h, &domain, vj, &rho_j, &rcp_j, &sender_id);
         assert_fr_eq_hash32(&cm_cmp_fr, &cm_arg);
 
-        outs[j] = OutPlain {
-            v: vj,
-            rho: rho_j,
-            rcp: rcp_j,
-            cm: cm_arg,
-        };
+        outs[j] = OutPlain { v: vj, rho: rho_j, rcp: rcp_j, cm: cm_arg };
+    }
+
+    // Enforce protocol shape: change outputs (if present) go back to the sender.
+    //
+    // This lets us skip blacklist checks for change outputs, cutting blacklist cost roughly in half
+    // for withdraws and by ~33% for 2-output transfers.
+    if withdraw_amount > 0 {
+        if n_out == 1 {
+            assert_hash32_eq(&outs[0].rcp, &sender_id);
+        }
+    } else if n_out == 2 {
+        assert_hash32_eq(&outs[1].rcp, &sender_id);
     }
 
     // Balance: sum_in == withdraw + sum(outputs)
-    let _rhs_check = withdraw_amount
-        .checked_add(out_sum)
-        .unwrap_or_else(|| hard_fail(90));
+    let _rhs_check = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| hard_fail(90));
 
     let sum_in_fr = Bn254Fr::from_u64(sum_in);
     let withdraw_fr = Bn254Fr::from_u64(withdraw_amount);
@@ -942,6 +981,25 @@ fn main() {
     enforce_prod.mulmod_checked(&inv_enforce_fr);
     Bn254Fr::assert_equal_u64(&enforce_prod, 1);
 
+    // --- Blacklist checks (bucketed non-membership + Merkle membership) ---
+    //
+    // Layout appended after inv_enforce:
+    //   blacklist_root                  [PUBLIC]
+    //   For each checked id:
+    //     bucket_entries[BL_BUCKET_SIZE] [PRIVATE]
+    //     bucket_inv                    [PRIVATE]
+    //     bucket_siblings[BL_DEPTH]     [PRIVATE]
+    let blacklist_root = read_hash32(&args, arg_idx);
+    arg_idx += 1;
+
+    // Sender (current owner) must not be blacklisted.
+    assert_not_blacklisted_bucket_from_args(&h, &sender_id, &blacklist_root, &args, &mut arg_idx);
+
+    // Transfers have a "pay recipient" output; withdraws only have change-to-self outputs, already enforced above.
+    if withdraw_amount == 0 {
+        assert_not_blacklisted_bucket_from_args(&h, &outs[0].rcp, &blacklist_root, &args, &mut arg_idx);
+    }
+
     // --- Level B: Viewer Attestations ---
     let base_after_outs = arg_idx;
     if base_after_outs != expected_base as usize {
@@ -973,14 +1031,7 @@ fn main() {
 
     let mut out_pts: [[u8; NOTE_PLAIN_LEN]; MAX_OUTS] = [[0u8; NOTE_PLAIN_LEN]; MAX_OUTS];
     for j in 0..n_out {
-        encode_note_plain(
-            &domain,
-            outs[j].v,
-            &outs[j].rho,
-            &outs[j].rcp,
-            &sender_id,
-            &mut out_pts[j],
-        );
+        encode_note_plain(&domain, outs[j].v, &outs[j].rho, &outs[j].rcp, &sender_id, &mut out_pts[j]);
     }
 
     let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
@@ -993,7 +1044,7 @@ fn main() {
         let fvk = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let (fvk_c_fr, _fvk_c_bytes) = fvk_commit(&h, &fvk);
+        let fvk_c_fr = fvk_commit_fr(&h, &fvk);
         assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_arg);
 
         for j in 0..n_out {
@@ -1002,7 +1053,7 @@ fn main() {
             stream_xor_encrypt_144(&h, &k, &out_pts[j], &mut ct_buf);
 
             let (ct_h_fr, ct_h_bytes) = ct_hash(&h, &ct_buf);
-            let (macv_fr, _macv_bytes) = view_mac(&h, &k, &outp.cm, &ct_h_bytes);
+            let macv_fr = view_mac_fr(&h, &k, &outp.cm, &ct_h_bytes);
 
             let ct_hash_arg = read_hash32(&args, v_idx);
             v_idx += 1;

@@ -202,15 +202,15 @@ async fn test_verify_transaction() -> Result<()> {
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
 
-    // Generate privacy key and VFK
+    // Generate privacy key and FVK
     let mut rng = rand::thread_rng();
     let mut spend_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut spend_key_bytes);
     let privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
 
-    let mut vfk_bytes = [0u8; 32];
-    rng.fill_bytes(&mut vfk_bytes);
-    let vfk_hex = hex::encode(&vfk_bytes);
+    let mut fvk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut fvk_bytes);
+    let fvk_hex = hex::encode(&fvk_bytes);
 
     // Perform a deposit
     let deposit_amount = 75u128;
@@ -223,10 +223,10 @@ async fn test_verify_transaction() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     // Verify the transaction exists
-    let verify_result = verify_transaction(&provider, &tx_hash, Some(&vfk_hex)).await?;
+    let verify_result = verify_transaction(&provider, &tx_hash, Some(&fvk_hex)).await?;
 
     assert!(verify_result.exists, "Transaction should exist");
-    // Note: amount might be "encrypted" if VFK doesn't match, or the actual amount if decryption works
+    // Note: amount might be "encrypted" if FVK doesn't match, or the actual amount if decryption works
     assert!(
         !verify_result.transaction_amount.is_empty(),
         "Transaction amount should not be empty"
@@ -238,7 +238,7 @@ async fn test_verify_transaction() -> Result<()> {
 
     // Test non-existent transaction
     let fake_tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    let verify_result_fake = verify_transaction(&provider, fake_tx_hash, Some(&vfk_hex)).await?;
+    let verify_result_fake = verify_transaction(&provider, fake_tx_hash, Some(&fvk_hex)).await?;
 
     assert!(
         !verify_result_fake.exists,
@@ -277,15 +277,15 @@ async fn test_get_unified_balance() -> Result<()> {
     let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
     let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
 
-    // Generate privacy key and VFK
+    // Generate privacy key and FVK
     let mut rng = rand::thread_rng();
     let mut spend_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut spend_key_bytes);
     let privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
 
-    let mut vfk_bytes = [0u8; 32];
-    rng.fill_bytes(&mut vfk_bytes);
-    let viewing_key = FullViewingKey(vfk_bytes);
+    let mut fvk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut fvk_bytes);
+    let viewing_key = FullViewingKey(fvk_bytes);
 
     // Get initial balance (should be 0)
     let token_id = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
@@ -347,10 +347,10 @@ async fn test_restore_wallet_keys() -> Result<()> {
     rng.fill_bytes(&mut wallet_private_key_bytes);
     let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
 
-    // Generate authority VFK
-    let mut authority_vfk_bytes = [0u8; 32];
-    rng.fill_bytes(&mut authority_vfk_bytes);
-    let _authority_vfk_hex = hex::encode(&authority_vfk_bytes);
+    // Generate authority FVK
+    let mut authority_fvk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut authority_fvk_bytes);
+    let _authority_fvk_hex = hex::encode(&authority_fvk_bytes);
 
     // Generate privacy spend key
     let mut privacy_spend_key_bytes = [0u8; 32];
