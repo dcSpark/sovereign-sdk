@@ -110,6 +110,14 @@ if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
   MCP_PORT="4000"
 fi
 
+PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
+PROVER_HOST="${PROVER_BIND%:*}"
+PROVER_PORT="${PROVER_BIND##*:}"
+if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
+  PROVER_HOST="$PROVER_BIND"
+  PROVER_PORT="1313"
+fi
+
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "${PIDS[0]}"
@@ -125,6 +133,10 @@ wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "${PIDS[2]}"
 echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
 wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "${PIDS[3]}"
+
+echo "Starting prover..."
+start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
+wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "${PIDS[4]}"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."

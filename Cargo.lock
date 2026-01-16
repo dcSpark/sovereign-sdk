@@ -6747,7 +6747,7 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c#e86c3f7119a07eb51b4408dd6fce10b7ad54c45c"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=a581a9ca85ab8365fafae017022103fed98d43b3#a581a9ca85ab8365fafae017022103fed98d43b3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6759,13 +6759,15 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tiny_http 0.12.0",
  "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c#e86c3f7119a07eb51b4408dd6fce10b7ad54c45c"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=a581a9ca85ab8365fafae017022103fed98d43b3#a581a9ca85ab8365fafae017022103fed98d43b3"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -9075,7 +9077,7 @@ dependencies = [
  "log",
  "prometheus",
  "thiserror 1.0.69",
- "tiny_http",
+ "tiny_http 0.10.0",
 ]
 
 [[package]]
@@ -13197,6 +13199,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "ligero",
+ "ligero-runner",
  "midnight-privacy",
  "num_cpus",
  "prometheus_exporter",
@@ -13241,10 +13244,12 @@ dependencies = [
  "sov-universal-wallet",
  "sov-zkvm-utils",
  "tempfile",
+ "tiny_http 0.12.0",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-panic",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
@@ -15164,6 +15169,18 @@ dependencies = [
  "log",
  "time",
  "url",
+]
+
+[[package]]
+name = "tiny_http"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
+dependencies = [
+ "ascii",
+ "chunked_transfer",
+ "httpdate",
+ "log",
 ]
 
 [[package]]
