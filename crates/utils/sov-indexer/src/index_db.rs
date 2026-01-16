@@ -135,24 +135,24 @@ pub mod midnight_transfer {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-/// Registry of known VFKs for decryption.
-/// Maps fvk_commitment -> (vfk, shielded_address) for looking up which key to use.
-pub mod vfk_registry {
+/// Registry of known FVKs for decryption.
+/// Maps fvk_commitment -> (fvk, shielded_address) for looking up which key to use.
+pub mod fvk_registry {
     use super::*;
     #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-    #[sea_orm(table_name = "vfk_registry")]
+    #[sea_orm(table_name = "fvk_registry")]
     pub struct Model {
-        /// FVK commitment: H("FVK_COMMIT_V1" || vfk) - primary key for lookups
+        /// FVK commitment: H("FVK_COMMIT_V1" || fvk) - primary key for lookups
         #[sea_orm(
             primary_key,
             auto_increment = false,
             column_type = "String(StringLen::N(64))"
         )]
         pub fvk_commitment: String,
-        /// The actual VFK (32 bytes hex-encoded)
+        /// The actual FVK (32 bytes hex-encoded)
         #[sea_orm(column_type = "String(StringLen::N(64))")]
-        pub vfk: String,
-        /// The shielded address associated with this VFK (bech32 or hex, optional)
+        pub fvk: String,
+        /// The shielded address associated with this FVK (bech32 or hex, optional)
         #[sea_orm(column_type = "Text", nullable)]
         pub shielded_address: Option<String>,
         /// When this entry was added

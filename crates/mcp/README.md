@@ -24,7 +24,7 @@ Configure the following environment variables:
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
-- `AUTHORITY_VFK` - Optional authority viewing key for note decryption
+- `AUTHORITY_FVK` - Optional authority viewing key for note decryption
 
 #### Ligero Configuration (Optional)
 
@@ -55,7 +55,7 @@ The server exposes the following MCP tools:
 - `transfer` - Transfer funds within the privacy pool (requires ZK proof)
 - `getTransaction` - Retrieve transaction details by hash
 - `getTransactions` - List all transactions for a wallet
-- `getTransactionWithSelectivePrivacy` - Decrypt privacy transaction notes (requires authority VFK)
+- `getTransactionWithSelectivePrivacy` - Decrypt privacy transaction notes (requires authority FVK)
 
 ## Testing
 

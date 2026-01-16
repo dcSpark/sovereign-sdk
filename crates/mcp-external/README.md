@@ -25,7 +25,7 @@ Configure the following environment variables:
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
-- `AUTHORITY_VFK` - Optional authority viewing key for note decryption
+- `AUTHORITY_FVK` - Optional authority viewing key for note decryption
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
 
 ### Start the Server

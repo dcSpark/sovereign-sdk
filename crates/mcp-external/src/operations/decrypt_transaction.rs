@@ -1,6 +1,6 @@
 //! Decrypt transaction operation
 //!
-//! This module provides functionality for decrypting shielded transactions using an authority VFK.
+//! This module provides functionality for decrypting shielded transactions using an authority FVK.
 
 use crate::provider::Provider;
 use crate::viewer;
@@ -44,18 +44,18 @@ pub struct DecryptTransactionResult {
     pub total_encrypted_notes: usize,
 }
 
-/// Decrypt a transaction using the authority VFK
+/// Decrypt a transaction using the authority FVK
 ///
 /// This operation:
 /// 1. Fetches the transaction from the indexer
 /// 2. Extracts encrypted notes from the transaction
-/// 3. Decrypts each note using the provided VFK
+/// 3. Decrypts each note using the provided FVK
 /// 4. Returns decrypted note data along with transaction metadata
 ///
 /// # Parameters
 /// * `provider` - Provider for indexer connection
 /// * `tx_hash` - Transaction hash to decrypt
-/// * `vfk` - Authority VFK (32-byte hex string, with or without 0x prefix)
+/// * `fvk_hex` - Authority FVK (32-byte hex string, with or without 0x prefix)
 ///
 /// # Returns
 /// DecryptTransactionResult containing decrypted notes and transaction metadata
@@ -65,8 +65,8 @@ pub struct DecryptTransactionResult {
 /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
 /// use mcp_external::operations::decrypt_transaction;
 ///
-/// let vfk_hex = "0x1234..."; // Authority VFK
-/// let result = decrypt_transaction(provider, "0xabcd...", vfk_hex).await?;
+/// let fvk_hex = "0x1234..."; // Authority FVK
+/// let result = decrypt_transaction(provider, "0xabcd...", fvk_hex).await?;
 /// println!("Decrypted {} of {} notes", result.decrypted_count, result.total_encrypted_notes);
 /// # Ok(())
 /// # }
@@ -75,12 +75,12 @@ pub struct DecryptTransactionResult {
 pub async fn decrypt_transaction(
     provider: &Provider,
     tx_hash: &str,
-    vfk_hex: &str,
+    fvk_hex: &str,
 ) -> Result<DecryptTransactionResult> {
     tracing::info!("Fetching transaction {} for decryption", tx_hash);
 
-    // Parse VFK from hex string
-    let vfk = parse_vfk_hex(vfk_hex).context("Failed to parse VFK hex string")?;
+    // Parse FVK from hex string
+    let fvk = parse_fvk_hex(fvk_hex).context("Failed to parse FVK hex string")?;
 
     // Fetch transaction from indexer
     let tx_option = provider
@@ -110,7 +110,7 @@ pub async fn decrypt_transaction(
     // Decrypt each note
     let mut decrypted_notes = Vec::new();
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
-        match viewer::decrypt_note(&vfk, encrypted_note) {
+        match viewer::decrypt_note(&fvk, encrypted_note) {
             Ok((domain, value, rho, recipient, sender_id)) => {
                 let note_type = if sender_id.is_some() {
                     "transfer"
@@ -133,7 +133,7 @@ pub async fn decrypt_transaction(
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to decrypt note {}: {} (note may not be encrypted for this VFK)",
+                    "Failed to decrypt note {}: {} (note may not be encrypted for this FVK)",
                     idx,
                     e
                 );
@@ -144,7 +144,7 @@ pub async fn decrypt_transaction(
 
     let decrypted_count = decrypted_notes.len();
     tracing::info!(
-        "Decrypted {}/{} notes using provided VFK",
+        "Decrypted {}/{} notes using provided FVK",
         decrypted_count,
         total_encrypted_notes
     );
@@ -160,20 +160,20 @@ pub async fn decrypt_transaction(
     })
 }
 
-/// Parse a VFK from a hex string (with or without 0x prefix)
+/// Parse a FVK from a hex string (with or without 0x prefix)
 #[allow(dead_code)]
-fn parse_vfk_hex(vfk_hex: &str) -> Result<Hash32> {
-    let s = vfk_hex.trim();
+fn parse_fvk_hex(fvk_hex: &str) -> Result<Hash32> {
+    let s = fvk_hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).with_context(|| format!("Invalid hex string: {}", vfk_hex))?;
+    let bytes = hex::decode(s).with_context(|| format!("Invalid hex string: {}", fvk_hex))?;
 
     if bytes.len() != 32 {
-        anyhow::bail!("VFK must be exactly 32 bytes, got {} bytes", bytes.len());
+        anyhow::bail!("FVK must be exactly 32 bytes, got {} bytes", bytes.len());
     }
 
-    let mut vfk = [0u8; 32];
-    vfk.copy_from_slice(&bytes);
-    Ok(vfk)
+    let mut fvk = [0u8; 32];
+    fvk.copy_from_slice(&bytes);
+    Ok(fvk)
 }
 
 /// Extract encrypted notes from the transaction's encrypted_notes field
@@ -231,25 +231,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_vfk_hex() {
+    fn test_parse_fvk_hex() {
         // Test with 0x prefix
-        let vfk_hex = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let result = parse_vfk_hex(vfk_hex);
+        let fvk_hex = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let result = parse_fvk_hex(fvk_hex);
         assert!(result.is_ok());
 
         // Test without 0x prefix
-        let vfk_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let result = parse_vfk_hex(vfk_hex);
+        let fvk_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let result = parse_fvk_hex(fvk_hex);
         assert!(result.is_ok());
 
         // Test invalid length
-        let vfk_hex = "0x0123";
-        let result = parse_vfk_hex(vfk_hex);
+        let fvk_hex = "0x0123";
+        let result = parse_fvk_hex(fvk_hex);
         assert!(result.is_err());
 
         // Test invalid hex
-        let vfk_hex = "0xGGGG";
-        let result = parse_vfk_hex(vfk_hex);
+        let fvk_hex = "0xGGGG";
+        let result = parse_fvk_hex(fvk_hex);
         assert!(result.is_err());
     }
 }

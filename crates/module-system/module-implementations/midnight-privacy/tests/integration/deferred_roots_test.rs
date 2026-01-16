@@ -62,6 +62,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         root_window_size: 16,
         method_id,
         admin,
+        pool_admins: None,
         domain,
         token_id,
     };
@@ -116,6 +117,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
 
     let pub1 = SpendPublic {
         anchor_root: initial_root,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf1,
         withdraw_amount: 0,
         output_commitments: vec![out1, out2],
@@ -180,6 +182,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf2: Hash32 = make_nf(&domain, 0x9A, 0x22);
     let pub2 = SpendPublic {
         anchor_root: fake_same_block_root,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf2,
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 789, 0x23, 0x33)],
@@ -282,6 +285,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf2_new: Hash32 = make_nf(&domain, 0x9C, 0x25);
     let pub2_new = SpendPublic {
         anchor_root: final_root,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf2_new,
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 789, 0x25, 0x35)],
@@ -320,6 +324,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     let nf3: Hash32 = make_nf(&domain, 0x9B, 0x24);
     let pub3 = SpendPublic {
         anchor_root: foreign_root_1,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf3,
         withdraw_amount: 0,
         output_commitments: vec![make_cm(&domain, 111, 0x24, 0x34)],

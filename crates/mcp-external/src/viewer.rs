@@ -14,7 +14,7 @@ pub const NOTE_PLAIN_LEN_DEPOSIT: usize = 112;
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
 pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
 
-/// Load authority viewing key from environment variable AUTHORITY_VFK.
+/// Load authority viewing key from environment variable AUTHORITY_FVK.
 ///
 /// Accepts hex strings with or without `0x` prefix.
 /// Returns `None` if:
@@ -22,8 +22,8 @@ pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
 /// - Hex decoding fails
 /// - Length is not exactly 32 bytes
 #[allow(dead_code)]
-pub fn load_authority_vfk() -> Option<Hash32> {
-    let raw = std::env::var("AUTHORITY_VFK").ok()?;
+pub fn load_authority_fvk() -> Option<Hash32> {
+    let raw = std::env::var("AUTHORITY_FVK").ok()?;
     let s = raw.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes = match hex::decode(s) {
@@ -85,7 +85,7 @@ pub fn encode_note_plain(
 /// Build both the attestation (for proof) and the EncryptedNote (for tx).
 ///
 /// # Arguments
-/// * `vfk` - The Full Viewing Key (32-byte secret)
+/// * `fvk` - The Full Viewing Key (32-byte secret)
 /// * `domain` - The note domain
 /// * `value` - The token amount
 /// * `rho` - The note randomness
@@ -98,7 +98,7 @@ pub fn encode_note_plain(
 /// - ViewAttestation is included in the ZK proof's public output
 /// - EncryptedNote is attached to the transaction for authority decryption
 pub fn make_viewer_bundle(
-    vfk: &Hash32,
+    fvk: &Hash32,
     domain: &Hash32,
     value: u128,
     rho: &Hash32,
@@ -109,10 +109,10 @@ pub fn make_viewer_bundle(
     let value_u64: u64 = value.try_into().map_err(|_| {
         anyhow::anyhow!("note value does not fit into u64 (required by note_spend_guest v2)")
     })?;
-    let vfk_obj = FullViewingKey(*vfk);
-    let vfk_c = fvk_commitment(&vfk_obj);
+    let fvk_obj = FullViewingKey(*fvk);
+    let fvk_c = fvk_commitment(&fvk_obj);
     let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id);
-    let k = view_kdf(&vfk_obj, cm);
+    let k = view_kdf(&fvk_obj, cm);
     let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
     stream_xor_encrypt(&k, &pt, &mut ct);
     let ct_h = ct_hash(&ct);
@@ -122,13 +122,13 @@ pub fn make_viewer_bundle(
         cm: *cm,
         nonce: [0u8; 24],
         ct: sov_modules_api::SafeVec::try_from(ct.to_vec()).expect("ciphertext within limit"),
-        fvk_commitment: vfk_c,
+        fvk_commitment: fvk_c,
         mac,
     };
 
     let att = ViewAttestation {
         cm: *cm,
-        fvk_commitment: vfk_c,
+        fvk_commitment: fvk_c,
         ct_hash: ct_h,
         mac,
     };
@@ -136,12 +136,12 @@ pub fn make_viewer_bundle(
     Ok((att, enc))
 }
 
-/// Decrypt an encrypted note using the authority VFK.
+/// Decrypt an encrypted note using the authority FVK.
 ///
 /// Supports both deposit notes (112 bytes, no sender_id) and transfer notes (144 bytes, with sender_id).
 ///
 /// # Arguments
-/// * `vfk` - The Full Viewing Key (32-byte secret)
+/// * `fvk` - The Full Viewing Key (32-byte secret)
 /// * `encrypted_note` - The encrypted note from the transaction
 ///
 /// # Returns
@@ -149,19 +149,19 @@ pub fn make_viewer_bundle(
 /// - For deposits (112 bytes): sender_id is None
 /// - For transfers (144 bytes): sender_id is Some(Hash32)
 pub fn decrypt_note(
-    vfk: &Hash32,
+    fvk: &Hash32,
     encrypted_note: &EncryptedNote,
 ) -> anyhow::Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>)> {
-    let vfk_obj = FullViewingKey(*vfk);
-    let expected_vfk_c = fvk_commitment(&vfk_obj);
+    let fvk_obj = FullViewingKey(*fvk);
+    let expected_fvk_c = fvk_commitment(&fvk_obj);
 
-    // Verify VFK commitment matches
-    if encrypted_note.fvk_commitment != expected_vfk_c {
-        anyhow::bail!("VFK commitment mismatch: note is not encrypted for this viewing key");
+    // Verify FVK commitment matches
+    if encrypted_note.fvk_commitment != expected_fvk_c {
+        anyhow::bail!("FVK commitment mismatch: note is not encrypted for this viewing key");
     }
 
     // Derive decryption key
-    let k = view_kdf(&vfk_obj, &encrypted_note.cm);
+    let k = view_kdf(&fvk_obj, &encrypted_note.cm);
 
     // Verify MAC before decryption
     let ct_h = ct_hash(encrypted_note.ct.as_ref());

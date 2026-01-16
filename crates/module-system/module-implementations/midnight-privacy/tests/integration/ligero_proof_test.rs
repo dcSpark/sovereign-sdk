@@ -187,6 +187,12 @@ struct SpendOutputV2 {
     cm: Hash32,
 }
 
+#[derive(Debug, Clone)]
+struct DenyMapOpeningV2 {
+    bucket_entries: midnight_privacy::BlacklistBucketEntries,
+    siblings: Vec<Hash32>,
+}
+
 fn build_note_spend_args_v2(
     domain: Hash32,
     spend_sk: Hash32,
@@ -197,6 +203,44 @@ fn build_note_spend_args_v2(
     withdraw_amount: u64,
     withdraw_to: Hash32,
     outputs: &[SpendOutputV2],
+) -> (Vec<serde_json::Value>, Vec<usize>) {
+    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+    let bl_defaults = midnight_privacy::sparse_default_nodes(midnight_privacy::BLACKLIST_TREE_DEPTH);
+    let default_siblings: Vec<Hash32> = bl_defaults.iter().take(bl_depth).copied().collect();
+    let default_opening = DenyMapOpeningV2 {
+        bucket_entries: midnight_privacy::empty_blacklist_bucket_entries(),
+        siblings: default_siblings,
+    };
+    let expected_checks = if withdraw_amount == 0 { 2 } else { 1 };
+    let openings = vec![default_opening; expected_checks];
+
+    build_note_spend_args_v2_with_deny_map(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        depth,
+        anchor,
+        inputs,
+        withdraw_amount,
+        withdraw_to,
+        outputs,
+        midnight_privacy::default_blacklist_root(),
+        &openings,
+    )
+}
+
+fn build_note_spend_args_v2_with_deny_map(
+    domain: Hash32,
+    spend_sk: Hash32,
+    pk_ivk_owner: Hash32,
+    depth: u8,
+    anchor: Hash32,
+    inputs: &[SpendInputV2],
+    withdraw_amount: u64,
+    withdraw_to: Hash32,
+    outputs: &[SpendOutputV2],
+    blacklist_root: Hash32,
+    deny_map_openings: &[DenyMapOpeningV2],
 ) -> (Vec<serde_json::Value>, Vec<usize>) {
     let depth_usize = depth as usize;
     assert!(!inputs.is_empty());
@@ -225,22 +269,13 @@ fn build_note_spend_args_v2(
 
     // Inputs.
     for input in inputs {
+        let start_idx = args.len() + 1; // 1-based index of value_in
         args.push(json!({"i64": input.value as i64}));
         args.push(json!({"hex": hex32(&input.rho)}));
         args.push(json!({"hex": hex32(&input.sender_id)}));
-
-        // Track private indices for (value, rho, sender_id).
-        let sender_idx = args.len(); // 1-based index of the last pushed arg
-        private_indices.extend_from_slice(&[sender_idx - 2, sender_idx - 1, sender_idx]);
-
-        // Position bits (LSB-first).
-        for lvl in 0..depth_usize {
-            let bit = ((input.pos >> lvl) & 1) as u8;
-            let mut bit_bytes = [0u8; 32];
-            bit_bytes[31] = bit;
-            args.push(json!({"hex": hex32(&bit_bytes)}));
-            private_indices.push(args.len());
-        }
+        args.push(json!({"i64": input.pos as i64}));
+        // Track private indices for (value, rho, sender_id, pos).
+        private_indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx + 3]);
 
         // Siblings.
         assert_eq!(input.siblings.len(), depth_usize);
@@ -278,6 +313,74 @@ fn build_note_spend_args_v2(
     args.push(json!({"hex": hex32(&inv_enforce)}));
     private_indices.push(args.len());
 
+    // === Deny-map (blacklist) enforcement ===
+    //
+    // New ABI: append
+    //   - blacklist_root (PUBLIC)
+    //   - for each checked id:
+    //       bucket_entries[BLACKLIST_BUCKET_SIZE] (PRIVATE)
+    //       bucket_inv (PRIVATE)
+    //       bucket_siblings[BLACKLIST_TREE_DEPTH] (PRIVATE)
+    //
+    args.push(json!({"hex": hex32(&blacklist_root)}));
+
+    fn bl_bucket_inv_for_id(
+        id: &Hash32,
+        bucket_entries: &midnight_privacy::BlacklistBucketEntries,
+    ) -> Hash32 {
+        let id_fr = bn254fr_from_hash32_be(id);
+        let mut prod = Bn254Fr::from_u32(1);
+        let mut delta = Bn254Fr::new();
+        for e in bucket_entries.iter() {
+            let e_fr = bn254fr_from_hash32_be(e);
+            submod_checked(&mut delta, &id_fr, &e_fr);
+            prod.mulmod_checked(&delta);
+        }
+        assert!(!prod.is_zero(), "deny-map bucket collision (id present)");
+        let mut inv = prod.clone();
+        inv.inverse();
+        inv.to_bytes_be()
+    }
+
+    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+    let expected_checks = if withdraw_amount == 0 { 2usize } else { 1usize };
+    assert_eq!(
+        deny_map_openings.len(),
+        expected_checks,
+        "deny-map opening count mismatch"
+    );
+
+    // Checked ids are derived from the spend/output keys (must match the guest program).
+    let pk_spend_owner = midnight_privacy::pk_from_sk(&spend_sk);
+    let sender_id = midnight_privacy::recipient_from_pk_v2(&domain, &pk_spend_owner, &pk_ivk_owner);
+    let pay_recipient = if withdraw_amount == 0 {
+        assert!(!outputs.is_empty(), "transfer must have at least 1 output");
+        midnight_privacy::recipient_from_pk_v2(&domain, &outputs[0].pk_spend, &outputs[0].pk_ivk)
+    } else {
+        [0u8; 32]
+    };
+
+    for (i, opening) in deny_map_openings.iter().enumerate() {
+        let id = if i == 0 { sender_id } else { pay_recipient };
+        for e in opening.bucket_entries.iter() {
+            args.push(json!({"hex": hex32(e)}));
+            private_indices.push(args.len());
+        }
+        let inv = bl_bucket_inv_for_id(&id, &opening.bucket_entries);
+        args.push(json!({"hex": hex32(&inv)}));
+        private_indices.push(args.len());
+
+        assert_eq!(
+            opening.siblings.len(),
+            bl_depth,
+            "deny-map opening sibling length mismatch"
+        );
+        for sib in opening.siblings.iter().take(bl_depth) {
+            args.push(json!({"hex": hex32(sib)}));
+            private_indices.push(args.len());
+        }
+    }
+
     (args, private_indices)
 }
 
@@ -298,6 +401,80 @@ fn add_args_to_host(host: &mut LigeroHost, args: &[serde_json::Value]) -> Result
         anyhow::bail!("Unexpected Ligero arg JSON shape: {a}");
     }
     Ok(())
+}
+
+// === Deny-map (blacklist) helpers ===
+
+type DenyNodeKey = (u8, u64); // (height, index)
+
+fn build_bucketed_deny_map_with_blacklisted_id(
+    pos: u64,
+    blacklisted_id: Hash32,
+) -> (
+    Hash32,
+    HashMap<DenyNodeKey, Hash32>,
+    HashMap<u64, midnight_privacy::BlacklistBucketEntries>,
+    Vec<Hash32>,
+) {
+    let depth = midnight_privacy::BLACKLIST_TREE_DEPTH;
+    let defaults = midnight_privacy::sparse_default_nodes(depth);
+
+    let mut nodes: HashMap<DenyNodeKey, Hash32> = HashMap::new();
+    let mut buckets: HashMap<u64, midnight_privacy::BlacklistBucketEntries> = HashMap::new();
+
+    let mut bucket_entries = midnight_privacy::empty_blacklist_bucket_entries();
+    bucket_entries[0] = blacklisted_id;
+    buckets.insert(pos, bucket_entries);
+    let leaf = midnight_privacy::bl_bucket_leaf(&bucket_entries);
+    nodes.insert((0, pos), leaf);
+
+    let mut cur = leaf;
+    let mut idx = pos;
+    for lvl in 0..depth {
+        let sib_idx = idx ^ 1;
+        let sib = *nodes
+            .get(&(lvl, sib_idx))
+            .unwrap_or(&defaults[lvl as usize]);
+
+        cur = if (idx & 1) == 0 {
+            mt_combine(lvl, &cur, &sib)
+        } else {
+            mt_combine(lvl, &sib, &cur)
+        };
+        idx >>= 1;
+
+        if cur != defaults[(lvl + 1) as usize] {
+            nodes.insert((lvl + 1, idx), cur);
+        }
+    }
+
+    (cur, nodes, buckets, defaults)
+}
+
+fn deny_map_opening_for_pos(
+    pos: u64,
+    buckets: &HashMap<u64, midnight_privacy::BlacklistBucketEntries>,
+    nodes: &HashMap<DenyNodeKey, Hash32>,
+    defaults: &[Hash32],
+) -> DenyMapOpeningV2 {
+    let bucket_entries = buckets
+        .get(&pos)
+        .copied()
+        .unwrap_or_else(midnight_privacy::empty_blacklist_bucket_entries);
+    let depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+    let mut siblings: Vec<Hash32> = Vec::with_capacity(depth);
+    for height in 0..depth {
+        let sib_idx = (pos >> height) ^ 1;
+        let sib = nodes
+            .get(&(height as u8, sib_idx))
+            .copied()
+            .unwrap_or(defaults[height]);
+        siblings.push(sib);
+    }
+    DenyMapOpeningV2 {
+        bucket_entries,
+        siblings,
+    }
 }
 
 /// Local Merkle tree using Ligetron's Poseidon2
@@ -594,6 +771,7 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
 
     let public_output = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
@@ -853,6 +1031,7 @@ fn test_simple_note_spend() -> Result<()> {
     let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_rcp, &sender_id_out);
     let public_output = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
@@ -976,6 +1155,162 @@ fn test_simple_note_spend() -> Result<()> {
     Ok(())
 }
 
+/// Generate and verify a REAL spend proof under a non-default deny-map (blacklist) root.
+///
+/// This is a regression test for the deny-map circuit ABI extension: once the on-chain
+/// `blacklist_root` changes, spend proofs must be bound to the new root and include correct
+/// Merkle openings for sender + output recipients.
+#[test]
+fn test_note_spend_with_non_default_blacklist_root() -> Result<()> {
+    println!("\n=== Note Spend with Non-default Blacklist Root Test ===\n");
+
+    setup_ligero_env()?;
+    let config = LigeroTestConfig::discover()?;
+    config.validate()?;
+
+    // --- Create a note in the commitment tree ---
+    let domain: Hash32 = [1u8; 32];
+    let value: u64 = 123;
+    let rho: Hash32 = [2u8; 32];
+
+    let spend_sk: Hash32 = [4u8; 32];
+    let pk_ivk_owner: Hash32 = [6u8; 32];
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
+    let nf_key = nf_key_from_sk(&domain, &spend_sk);
+
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
+    let nf = nullifier(&domain, &nf_key, &rho);
+
+    let tree_depth: u8 = 16;
+    let mut tree = MerkleTree::new(tree_depth);
+    let position: u64 = 0;
+    tree.set_leaf(position as usize, cm);
+    let anchor = tree.root();
+    let siblings = tree.open(position as usize);
+
+    // --- Create a non-default deny-map root by blacklisting an unrelated identity ---
+    let bl_pk_spend: Hash32 = [0xAAu8; 32];
+    let bl_pk_ivk: Hash32 = [0xBBu8; 32];
+    let bl_recipient = recipient_from_pk_v2(&domain, &bl_pk_spend, &bl_pk_ivk);
+    let bl_pos = midnight_privacy::blacklist_pos_from_recipient(&bl_recipient);
+
+    let out_spend_sk: Hash32 = [5u8; 32];
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = out_pk_spend;
+    let out_rcp = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
+
+    let sender_pos = midnight_privacy::blacklist_pos_from_recipient(&recipient_owner);
+    let out_pos = midnight_privacy::blacklist_pos_from_recipient(&out_rcp);
+    assert_ne!(bl_pos, sender_pos, "unexpected deny-map index collision (blacklisted vs sender)");
+    assert_ne!(bl_pos, out_pos, "unexpected deny-map index collision (blacklisted vs output)");
+
+    let (blacklist_root, bl_nodes, bl_buckets, bl_defaults) =
+        build_bucketed_deny_map_with_blacklisted_id(bl_pos, bl_recipient);
+    assert_ne!(
+        blacklist_root,
+        midnight_privacy::default_blacklist_root(),
+        "blacklist_root should be non-default after blacklisting a leaf"
+    );
+
+    // Openings for sender/output must prove leaf=0 under this non-default root.
+    let sender_opening =
+        deny_map_opening_for_pos(sender_pos, &bl_buckets, &bl_nodes, &bl_defaults);
+    let out_opening = deny_map_opening_for_pos(out_pos, &bl_buckets, &bl_nodes, &bl_defaults);
+
+    // Sanity: blacklisted leaf=1 matches the root, but leaf=0 cannot.
+    let bl_opening = deny_map_opening_for_pos(bl_pos, &bl_buckets, &bl_nodes, &bl_defaults);
+    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH;
+    let leaf0 = midnight_privacy::bl_bucket_leaf(&midnight_privacy::empty_blacklist_bucket_entries());
+    let bl_leaf = midnight_privacy::bl_bucket_leaf(&bl_opening.bucket_entries);
+    assert_eq!(
+        root_from_path(&bl_leaf, bl_pos, &bl_opening.siblings, bl_depth),
+        blacklist_root,
+        "blacklisted opening must match root for its bucket leaf"
+    );
+    assert_ne!(
+        root_from_path(&leaf0, bl_pos, &bl_opening.siblings, bl_depth),
+        blacklist_root,
+        "blacklisted identity must not be able to prove leaf=0"
+    );
+    assert_eq!(
+        root_from_path(&leaf0, sender_pos, &sender_opening.siblings, bl_depth),
+        blacklist_root,
+        "sender must be able to prove leaf=0 under non-default root"
+    );
+    assert_eq!(
+        root_from_path(&leaf0, out_pos, &out_opening.siblings, bl_depth),
+        blacklist_root,
+        "output recipient must be able to prove leaf=0 under non-default root"
+    );
+
+    // --- Build spend proof args with the non-default deny-map root + openings ---
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
+
+    let out_value = value;
+    let out_rho: Hash32 = [9u8; 32];
+    let sender_id_out = recipient_owner;
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_rcp, &sender_id_out);
+
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos: position,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: out_pk_spend,
+        pk_ivk: out_pk_ivk,
+        cm: cm_out,
+    };
+
+    let deny_openings = vec![sender_opening, out_opening];
+    let (args, private_indices) = build_note_spend_args_v2_with_deny_map(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        tree_depth,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+        blacklist_root,
+        &deny_openings,
+    );
+
+    let mut host = <Ligero as Zkvm>::Host::from_args(&config.program)
+        .with_packing(config.packing)
+        .with_private_indices(private_indices);
+    add_args_to_host(&mut host, &args)?;
+
+    let public = SpendPublic {
+        anchor_root: anchor,
+        blacklist_root,
+        nullifier: nf,
+        withdraw_amount: withdraw_amount as u128,
+        output_commitments: vec![cm_out],
+        view_attestations: None,
+    };
+    host.set_public_output(&public)?;
+
+    let proof_data = host.run(true)?;
+    let code_commitment = host.code_commitment();
+    let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)?;
+
+    assert_eq!(verified.anchor_root, anchor);
+    assert_eq!(verified.nullifier, nf);
+    assert_eq!(verified.blacklist_root, blacklist_root);
+    assert_eq!(verified.output_commitments, vec![cm_out]);
+
+    Ok(())
+}
+
 /// Test the full note lifecycle with REAL ZK proofs using Ligero
 ///
 /// This test demonstrates the complete privacy-preserving flow:
@@ -1075,6 +1410,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     );
     let public_output = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
@@ -1295,15 +1631,19 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     println!("\nStep 1: Creating note and building Merkle tree...");
 
     let domain: Hash32 = [1u8; 32];
-    let value: u128 = 42;
+    let value: u64 = 42;
     let rho: Hash32 = [2u8; 32];
     let spend_sk: Hash32 = [4u8; 32]; // SECRET - never revealed
 
-    // Recipient + nf_key are derived from spend_sk (matches the guest program).
-    let recipient = recipient_from_sk(&domain, &spend_sk);
+    // v2 guest program: derive owner recipient from (spend_sk, pk_ivk_owner).
+    // For this test we use a legacy encoding where pk_ivk_owner == pk_spend.
+    let pk_ivk_owner: Hash32 = pk_from_sk(&spend_sk);
+    let recipient_owner = recipient_from_sk_v2(&domain, &spend_sk, &pk_ivk_owner);
     let nf_key = nf_key_from_sk(&domain, &spend_sk);
 
-    let cm = note_commitment(&domain, value, &rho, &recipient);
+    // Input note commitment (NOTE_V2); sender_id_in is a leaf-binding field.
+    let sender_id_in: Hash32 = [0u8; 32];
+    let cm = note_commitment_v2(&domain, value, &rho, &recipient_owner, &sender_id_in);
     let pos: u64 = 0;
 
     println!("✓ Note commitment: {}", hex32(&cm));
@@ -1331,79 +1671,49 @@ fn test_note_spend_with_real_ligero_proof() -> Result<()> {
     let nf = nullifier(&domain, &nf_key, &rho);
     println!("✓ Nullifier: {}", hex32(&nf));
 
-    // ---- 3) Build JSON config for REAL prover ----
+    // ---- 3) Build arguments for REAL prover (v2 note_spend_guest ABI) ----
     println!("\nStep 3: Building prover configuration...");
 
-    // Guest argument layout must match `note_spend_guest`:
-    //   1  domain (hex, 32 bytes)
-    //   2  value (i64)
-    //   3  rho (hex, 32 bytes) [PRIVATE]
-    //   4  recipient (hex, 32 bytes) [PRIVATE] (layout only; derived in-circuit)
-    //   5  spend_sk (hex, 32 bytes) [PRIVATE]
-    //   6  depth (i64)
-    //   7..7+depth-1        pos_bits (hex, 32 bytes each) [PRIVATE]
-    //   7+depth..7+2*depth-1 siblings (hex, 32 bytes each) [PRIVATE]
-    //   7+2*depth           anchor (str, field element)
-    //   8+2*depth           nullifier (str, field element)
-    //   9+2*depth           withdraw_amount (i64)
-    //   10+2*depth          n_out (i64)
-    //   outputs (4*n_out): value_out (i64), rho_out (hex), pk_out (hex), cm_out (hex)
+    let withdraw_amount: u64 = 0;
+    let withdraw_to: Hash32 = [0u8; 32];
 
     // One-output transfer: withdraw=0, out_value=value.
-    let withdraw_amount: u64 = 0;
-    let n_out: u64 = 1;
-    let out_value: u64 = value as u64;
+    let out_value: u64 = value;
     let out_rho: Hash32 = [7u8; 32];
     let out_spend_sk: Hash32 = [8u8; 32];
-    let out_pk = pk_from_sk(&out_spend_sk);
-    let out_recipient = recipient_from_pk(&domain, &out_pk);
-    let cm_out = note_commitment(&domain, value, &out_rho, &out_recipient);
+    let out_pk_spend = pk_from_sk(&out_spend_sk);
+    let out_pk_ivk = out_pk_spend;
+    let out_recipient = recipient_from_pk_v2(&domain, &out_pk_spend, &out_pk_ivk);
+    let sender_id_out = recipient_owner;
+    let cm_out = note_commitment_v2(&domain, out_value, &out_rho, &out_recipient, &sender_id_out);
 
-    let mut args: Vec<serde_json::Value> = Vec::new();
-    args.push(json!({"hex": hex32(&domain)})); // 1
-    args.push(json!({"i64": value as i64})); // 2 (public)
-    args.push(json!({"hex": hex32(&rho)})); // 3 (private)
-    args.push(json!({"hex": hex32(&recipient)})); // 4 (private, layout only)
-    args.push(json!({"hex": hex32(&spend_sk)})); // 5 (private)
-    args.push(json!({"i64": TREE_DEPTH as i64})); // 6 (public)
+    let input = SpendInputV2 {
+        value,
+        rho,
+        sender_id: sender_id_in,
+        pos,
+        siblings: siblings.clone(),
+        nullifier: nf,
+    };
+    let output = SpendOutputV2 {
+        value: out_value,
+        rho: out_rho,
+        pk_spend: out_pk_spend,
+        pk_ivk: out_pk_ivk,
+        cm: cm_out,
+    };
 
-    // Position bits (LSB-first, one bit per level).
-    for lvl in 0..(TREE_DEPTH as usize) {
-        let bit = ((pos >> lvl) & 1) as u8;
-        let mut bit_bytes = [0u8; 32];
-        bit_bytes[31] = bit;
-        args.push(json!({"hex": hex::encode(bit_bytes)})); // 7..7+depth-1 (private)
-    }
-
-    // Siblings (private).
-    for s in &siblings {
-        args.push(json!({"hex": hex32(s)}));
-    }
-
-    // Anchor + nullifier are PUBLIC field elements (string args).
-    args.push(json!({"str": format!("0x{}", hex32(&anchor))}));
-    args.push(json!({"str": format!("0x{}", hex32(&nf))}));
-
-    // Withdraw + outputs.
-    args.push(json!({"i64": withdraw_amount as i64}));
-    args.push(json!({"i64": n_out as i64}));
-    args.push(json!({"i64": out_value as i64}));
-    args.push(json!({"hex": hex32(&out_rho)}));
-    args.push(json!({"hex": hex32(&out_pk)}));
-    args.push(json!({"hex": hex32(&cm_out)}));
-
-    // Mark private indices (1-based indexing), matching other tests in this file.
-    let depth = TREE_DEPTH as usize;
-    let mut private_indices = vec![3usize, 4usize, 5usize]; // rho, recipient, spend_sk
-    for i in 0..depth {
-        private_indices.push(7 + i); // position bits
-    }
-    for i in 0..depth {
-        private_indices.push(7 + depth + i); // siblings
-    }
-    let out_base = 11 + 2 * depth;
-    private_indices.push(out_base + 1); // out_rho
-    private_indices.push(out_base + 2); // out_pk
+    let (args, private_indices) = build_note_spend_args_v2(
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        TREE_DEPTH,
+        anchor,
+        &[input],
+        withdraw_amount,
+        withdraw_to,
+        &[output],
+    );
 
     println!("✓ Arguments prepared: {} total", args.len());
     println!("✓ Private indices: {:?}", private_indices);
@@ -1717,6 +2027,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     let public = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![out1_cm, out2_cm],
@@ -1846,6 +2157,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
 
     let public = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![change_cm],
@@ -2033,6 +2345,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
 
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: deposit_nf,
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
@@ -2169,6 +2482,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
 
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: out1_nf,
         withdraw_amount: withdraw_amount_phase3,
         output_commitments: vec![change_cm],
@@ -2360,6 +2674,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     );
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: deposit_nf,
         withdraw_amount: 0,
         output_commitments: vec![out1_cm, out2_cm],
@@ -2434,6 +2749,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     );
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: out1_nf,
         withdraw_amount: withdraw_amount3 as u128,
         output_commitments: vec![change_cm],
@@ -2534,6 +2850,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
 
     let public = SpendPublic {
         anchor_root: anchor,
+        blacklist_root: midnight_privacy::default_blacklist_root(),
         nullifier: nf,
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![],

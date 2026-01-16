@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
-use crate::hash::{Hash32, RootKey};
+use crate::hash::{default_blacklist_root, Hash32, RootKey};
 use crate::merkle::{MerkleTree, MAX_TREE_DEPTH};
 
 /// Initial configuration for midnight-privacy module.
@@ -24,6 +24,11 @@ pub struct MidnightPrivacyConfig<S: Spec> {
 
     /// Admin of the module who can update the method ID.
     pub admin: S::Address,
+
+    /// Optional initial set of pool admins allowed to update `blacklist_root`.
+    ///
+    /// If omitted, defaults to a singleton set containing `admin`.
+    pub pool_admins: Option<Vec<S::Address>>,
 
     /// Domain tag used in all note/hash derivations
     pub domain: Hash32,
@@ -53,6 +58,23 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
+
+        // Initialize deny-map root (blacklist / freeze primitive).
+        // The on-chain deny-map tree starts empty (all-allowed).
+        let bl_root = default_blacklist_root();
+        self.blacklist_root.set(&bl_root, state)?;
+
+        // Initialize pool admins.
+        let mut admins = config.pool_admins.clone().unwrap_or_default();
+        // Ensure the module admin is always a pool admin unless explicitly removed later.
+        admins.push(config.admin.clone());
+        admins.sort();
+        admins.dedup();
+        for a in &admins {
+            self.pool_admins.set(a, &true, state)?;
+        }
+        self.pool_admin_list
+            .set::<Vec<S::Address>, _>(&admins, state)?;
 
         // New: bind domain + native token in state
         self.domain.set(&config.domain, state)?;
@@ -120,6 +142,7 @@ mod tests {
             method_id,
             tree_depth: 16,
             root_window_size: 100,
+            pool_admins: None,
             domain,
             token_id,
         };

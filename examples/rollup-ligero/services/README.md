@@ -52,7 +52,7 @@ and the continuous transfers load generator as background services on Linux.
 - The indexer service runs `cargo run -p sov-indexer --release` from
   `crates/utils/sov-indexer` and loads `.env` via `EnvironmentFile=`. Ensure
   `DA_CONNECTION_STRING` points to your rollup DA SQLite DB
-  (e.g. `examples/rollup-ligero/demo_data/da.sqlite?mode=ro`) and set any VFK
+  (e.g. `examples/rollup-ligero/demo_data/da.sqlite?mode=ro`) and set any FVK
   config you need.
 - The continuous transfers service runs
   `cargo run -p midnight-e2e-benchmarks --bin continuous_transfers --release`.

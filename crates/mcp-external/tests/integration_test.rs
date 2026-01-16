@@ -194,8 +194,8 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
-                                      // Load authority VFK from environment for test
-    let authority_vfk = std::env::var("AUTHORITY_VFK")
+                                      // Load authority FVK from environment for test
+    let authority_fvk = std::env::var("AUTHORITY_FVK")
         .ok()
         .and_then(|s| {
             let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
@@ -224,7 +224,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         deposit_result.recipient, // deposit convention: sender_id == recipient
         *privacy_key.pk(),
         *privacy_key.pk(),
-        authority_vfk,
+        authority_fvk,
     )
     .await?;
 
@@ -398,12 +398,12 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let new_privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
     tracing::info!("✓ New privacy address: {}", new_privacy_address);
 
-    // Step 4: Generate new authority VFK
-    tracing::info!("Step 4: Generating new authority VFK");
-    let mut vfk_bytes = [0u8; 32];
-    rng.fill_bytes(&mut vfk_bytes);
-    let viewing_key = FullViewingKey(vfk_bytes);
-    tracing::info!("✓ Authority VFK generated");
+    // Step 4: Generate new authority FVK
+    tracing::info!("Step 4: Generating new authority FVK");
+    let mut fvk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut fvk_bytes);
+    let viewing_key = FullViewingKey(fvk_bytes);
+    tracing::info!("✓ Authority FVK generated");
 
     // Step 5: Perform deposit to the new privacy address
     tracing::info!(
@@ -468,8 +468,8 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     const DOMAIN: [u8; 32] = [1u8; 32];
     let input_recipient = new_privacy_key.recipient(&DOMAIN);
 
-    // Use the viewing key bytes as authority VFK for the transfer
-    let authority_vfk_for_transfer = Some(viewing_key.0);
+    // Use the viewing key bytes as authority FVK for the transfer
+    let authority_fvk_for_transfer = Some(viewing_key.0);
 
     let transfer_result = transfer(
         &ligero,
@@ -485,7 +485,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
         input_recipient, // deposit convention: sender_id == recipient
         *new_privacy_key.pk(),
         *new_privacy_key.pk(),
-        authority_vfk_for_transfer,
+        authority_fvk_for_transfer,
     )
     .await?;
 

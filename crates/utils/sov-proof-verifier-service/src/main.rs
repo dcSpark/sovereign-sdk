@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    info!("Note: Using Runtime's CHAIN_HASH for transaction signing (not CLI parameter)");
+    info!("Note: Using /rollup/schema chain_hash for transaction signing/verification");
 
     // Create service configuration
     let config = ServiceConfig {

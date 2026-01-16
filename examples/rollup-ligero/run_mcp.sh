@@ -13,7 +13,7 @@ export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-50}"
 export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export WALLET_PRIVATE_KEY="${WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export PRIVPOOL_SPEND_KEY="${PRIVPOOL_SPEND_KEY:-0xb23e0dc9d1f8869c8bc87ab4eaacd58cbe024a825bdc13fefa4d4c5eaa0b855f}"
-export AUTHORITY_VFK="${AUTHORITY_VFK:-0x7086be0152c51e3f63b7aea8b1bea89ce502c47b94ee7a561c9f4f3ac869a147}"
+export AUTHORITY_FVK="${AUTHORITY_FVK:-0x7086be0152c51e3f63b7aea8b1bea89ce502c47b94ee7a561c9f4f3ac869a147}"
 
 # Provide the ZK guest program via:
 # - LIGERO_PROGRAM_PATH (circuit name like `note_spend_guest` OR full path to a `.wasm` file)
@@ -44,4 +44,4 @@ if [[ -n "${LIGERO_SHADER_PATH:-}" && ! -d "$LIGERO_SHADER_PATH" ]]; then
 fi
 
 cd "$WORKSPACE_ROOT"
-exec cargo run -p mcp-external
+exec cargo run -p mcp-external --release

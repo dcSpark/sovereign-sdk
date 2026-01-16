@@ -21,11 +21,12 @@ use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_modules_api::Spec;
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
-use crate::authority_vfk::AuthorityVfk;
+use crate::authority_fvk::AuthorityFvk;
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
@@ -239,8 +240,8 @@ pub struct DepositRequest {
 pub struct DepositResult {
     /// Transaction hash from the rollup
     pub tx_hash: String,
-    /// VFK commitment (H("FVK_COMMIT_V1" || fvk)) - used to identify which viewing key can decrypt the note
-    pub vfk_commitment: String,
+    /// FVK commitment (H("FVK_COMMIT_V1" || fvk)) - used to identify which viewing key can decrypt the note
+    pub fvk_commitment: String,
     /// Recipient privacy address (bech32 format: privpool1...)
     pub recipient: String,
 }
@@ -281,6 +282,59 @@ pub struct TransferResult {
     /// Recipient of change note - your privacy address (if partial transfer)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_recipient: Option<String>,
+}
+
+// Types for Pool Admin / Freeze (deny-map)
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FreezeAddressRequest {
+    /// Privacy address to freeze (bech32m format: privpool1...)
+    #[serde(rename = "privacyAddress")]
+    pub privacy_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct FreezeAddressResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct UnfreezeAddressRequest {
+    /// Privacy address to unfreeze (bech32m format: privpool1...)
+    #[serde(rename = "privacyAddress")]
+    pub privacy_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct UnfreezeAddressResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AddPoolAdminRequest {
+    /// L2 address to grant pool-admin rights to
+    #[serde(rename = "adminAddress")]
+    pub admin_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct AddPoolAdminResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RemovePoolAdminRequest {
+    /// L2 address to revoke pool-admin rights from
+    #[serde(rename = "adminAddress")]
+    pub admin_address: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct RemovePoolAdminResult {
+    /// Transaction hash from the rollup
+    pub tx_hash: String,
 }
 
 /// Decrypted note information from a transaction
@@ -360,8 +414,8 @@ pub struct CreateWalletResult {
 pub struct RestoreWalletRequest {
     /// Wallet private key (hex string, with or without 0x prefix)
     pub wallet_private_key: String,
-    /// Authority VFK (hex string, with or without 0x prefix)
-    pub authority_vfk: String,
+    /// Authority FVK (hex string, with or without 0x prefix)
+    pub authority_fvk: String,
     /// Privacy pool spending key (hex string, with or without 0x prefix)
     pub privacy_spend_key: String,
 }
@@ -487,7 +541,7 @@ pub struct CryptoServer {
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     admin_wallet_context: Option<Arc<McpWalletContext>>,
     ligero_prover: Option<Arc<LigeroProver>>,
-    authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+    authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
     tx_store: Arc<TransactionStore>,
     log_path: String,
@@ -502,7 +556,7 @@ impl CryptoServer {
         wallet_context: Arc<RwLock<McpWalletContext>>,
         admin_wallet_context: Option<Arc<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
-        authority_vfk: Arc<RwLock<Option<AuthorityVfk>>>,
+        authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
         tx_store: Arc<TransactionStore>,
         log_path: String,
@@ -514,7 +568,7 @@ impl CryptoServer {
             wallet_context: Some(wallet_context),
             admin_wallet_context,
             ligero_prover: Some(ligero_prover),
-            authority_vfk,
+            authority_fvk,
             privacy_key,
             tx_store,
             log_path,
@@ -548,13 +602,13 @@ impl CryptoServer {
             )
         })?;
 
-        let authority_vfk_bytes = {
-            let guard = self.authority_vfk.read().await;
+        let authority_fvk_bytes = {
+            let guard = self.authority_fvk.read().await;
             guard.as_ref().map(|v| *v.as_bytes())
         }
         .ok_or_else(|| {
             ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_VFK to send from the privacy pool.",
+                "Viewing key not configured. Set AUTHORITY_FVK to send from the privacy pool.",
                 None,
             )
         })?;
@@ -598,9 +652,9 @@ impl CryptoServer {
         let destination_address = params.destination_address.clone();
         let output_pk = output_privacy_addr.to_pk();
         let output_pk_ivk = output_privacy_addr.pk_ivk();
-        let viewing_key = midnight_privacy::FullViewingKey(authority_vfk_bytes);
+        let viewing_key = midnight_privacy::FullViewingKey(authority_fvk_bytes);
         let privacy_key = self.privacy_key.clone();
-        let authority_vfk_for_transfer = Some(authority_vfk_bytes);
+        let authority_fvk_for_transfer = Some(authority_fvk_bytes);
 
         tokio::spawn(async move {
             let ctx_guard = wallet_ctx.read().await;
@@ -825,7 +879,7 @@ impl CryptoServer {
                     input_sender_id,
                     output_pk,
                     output_pk_ivk,
-                    authority_vfk_for_transfer,
+                    authority_fvk_for_transfer,
                 )
                 .await
             } else {
@@ -920,12 +974,12 @@ impl CryptoServer {
             )
         })?;
 
-        let authority_vfk_guard = self.authority_vfk.read().await;
-        let viewing_key_bytes = if let Some(ref authority_vfk) = *authority_vfk_guard {
-            *authority_vfk.as_bytes()
+        let authority_fvk_guard = self.authority_fvk.read().await;
+        let viewing_key_bytes = if let Some(ref authority_fvk) = *authority_fvk_guard {
+            *authority_fvk.as_bytes()
         } else {
             return Err(ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_VFK to decrypt privacy pool notes.",
+                "Viewing key not configured. Set AUTHORITY_FVK to decrypt privacy pool notes.",
                 None,
             ));
         };
@@ -1265,11 +1319,11 @@ impl CryptoServer {
     // deposit tool removed; funding is attempted on startup when configured via env
 
     /// Create a new wallet with new keys.
-    /// Generates new wallet private key, authority VFK, and privacy pool spending key.
+    /// Generates new wallet private key, authority FVK, and privacy pool spending key.
     /// All subsequent transactions will use the new keys.
     #[tool(
         name = "createWallet",
-        description = "Create a new wallet with new keys. Generates new wallet private key, authority VFK, and privacy pool spending key. All subsequent operations will use the new keys."
+        description = "Create a new wallet with new keys. Generates new wallet private key, authority FVK, and privacy pool spending key. All subsequent operations will use the new keys."
     )]
     async fn create_wallet(
         &self,
@@ -1279,7 +1333,7 @@ impl CryptoServer {
 
         // Generate all random bytes first (before any async operations)
         // This ensures the RNG is dropped before any await points
-        let (wallet_private_key_hex, authority_vfk_hex, privacy_spend_key_hex) = {
+        let (wallet_private_key_hex, authority_fvk_hex, privacy_spend_key_hex) = {
             let mut rng = rand::thread_rng();
 
             // Generate new wallet private key (32 bytes)
@@ -1287,10 +1341,10 @@ impl CryptoServer {
             rng.fill_bytes(&mut wallet_private_key_bytes);
             let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
 
-            // Generate new authority VFK (32 bytes)
-            let mut authority_vfk_bytes = [0u8; 32];
-            rng.fill_bytes(&mut authority_vfk_bytes);
-            let authority_vfk_hex = hex::encode(&authority_vfk_bytes);
+            // Generate new authority FVK (32 bytes)
+            let mut authority_fvk_bytes = [0u8; 32];
+            rng.fill_bytes(&mut authority_fvk_bytes);
+            let authority_fvk_hex = hex::encode(&authority_fvk_bytes);
 
             // Generate new privacy spend key (32 bytes)
             let mut privacy_spend_key_bytes = [0u8; 32];
@@ -1299,7 +1353,7 @@ impl CryptoServer {
 
             (
                 wallet_private_key_hex,
-                authority_vfk_hex,
+                authority_fvk_hex,
                 privacy_spend_key_hex,
             )
         }; // RNG is dropped here
@@ -1312,9 +1366,9 @@ impl CryptoServer {
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
-        // Create new authority VFK
-        let new_authority_vfk = AuthorityVfk::from_hex(&authority_vfk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None)
+        // Create new authority FVK
+        let new_authority_fvk = AuthorityFvk::from_hex(&authority_fvk_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
         })?;
 
         // Create new privacy key
@@ -1343,8 +1397,8 @@ impl CryptoServer {
             })?;
 
         // Replace the privacy keys (but not the wallet context)
-        let mut authority_vfk_guard = self.authority_vfk.write().await;
-        *authority_vfk_guard = Some(new_authority_vfk);
+        let mut authority_fvk_guard = self.authority_fvk.write().await;
+        *authority_fvk_guard = Some(new_authority_fvk);
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
@@ -1405,11 +1459,11 @@ impl CryptoServer {
     }
 
     /// Restore a wallet from existing keys.
-    /// Loads existing wallet private key, authority VFK, and privacy pool spending key.
+    /// Loads existing wallet private key, authority FVK, and privacy pool spending key.
     /// All subsequent transactions will use the restored keys.
     #[tool(
         name = "restoreWallet",
-        description = "Restore a wallet from existing keys. Loads wallet private key, authority VFK, and privacy pool spending key from hex strings. All subsequent operations will use the restored keys."
+        description = "Restore a wallet from existing keys. Loads wallet private key, authority FVK, and privacy pool spending key from hex strings. All subsequent operations will use the restored keys."
     )]
     async fn restore_wallet(
         &self,
@@ -1417,7 +1471,7 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Strip 0x prefix if present
         let wallet_private_key_hex = params.wallet_private_key.trim_start_matches("0x");
-        let authority_vfk_hex = params.authority_vfk.trim_start_matches("0x");
+        let authority_fvk_hex = params.authority_fvk.trim_start_matches("0x");
         let privacy_spend_key_hex = params.privacy_spend_key.trim_start_matches("0x");
 
         // Validate hex strings are correct length (32 bytes = 64 hex chars)
@@ -1427,9 +1481,9 @@ impl CryptoServer {
                 None,
             ));
         }
-        if authority_vfk_hex.len() != 64 {
+        if authority_fvk_hex.len() != 64 {
             return Err(ErrorData::invalid_params(
-                "authority_vfk must be exactly 32 bytes (64 hex characters).",
+                "authority_fvk must be exactly 32 bytes (64 hex characters).",
                 None,
             ));
         }
@@ -1448,9 +1502,9 @@ impl CryptoServer {
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
-        // Create authority VFK
-        let new_authority_vfk = AuthorityVfk::from_hex(authority_vfk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority VFK: {}", e), None)
+        // Create authority FVK
+        let new_authority_fvk = AuthorityFvk::from_hex(authority_fvk_hex).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
         })?;
 
         // Create privacy key
@@ -1466,8 +1520,8 @@ impl CryptoServer {
             *ctx_guard = new_wallet_ctx;
         }
 
-        let mut authority_vfk_guard = self.authority_vfk.write().await;
-        *authority_vfk_guard = Some(new_authority_vfk);
+        let mut authority_fvk_guard = self.authority_fvk.write().await;
+        *authority_fvk_guard = Some(new_authority_fvk);
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
@@ -1514,9 +1568,9 @@ impl CryptoServer {
         let privacy_key_guard = self.privacy_key.read().await;
 
         // Get the current privacy balance to include in status
-        let authority_vfk_guard = self.authority_vfk.read().await;
-        let privacy_balance = if let Some(ref authority_vfk) = *authority_vfk_guard {
-            let viewing_key_bytes = *authority_vfk.as_bytes();
+        let authority_fvk_guard = self.authority_fvk.read().await;
+        let privacy_balance = if let Some(ref authority_fvk) = *authority_fvk_guard {
+            let viewing_key_bytes = *authority_fvk.as_bytes();
             let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
 
             // Get privacy balance
@@ -1600,16 +1654,16 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        // Get VFK if available for decryption
-        let authority_vfk_guard = self.authority_vfk.read().await;
-        let vfk_hex = if let Some(ref authority_vfk) = *authority_vfk_guard {
-            Some(hex::encode(authority_vfk.as_bytes()))
+        // Get FVK if available for decryption
+        let authority_fvk_guard = self.authority_fvk.read().await;
+        let fvk_hex = if let Some(ref authority_fvk) = *authority_fvk_guard {
+            Some(hex::encode(authority_fvk.as_bytes()))
         } else {
             None
         };
 
         let verify_result =
-            crate::operations::verify_transaction(provider, &params.identifier, vfk_hex.as_deref())
+            crate::operations::verify_transaction(provider, &params.identifier, fvk_hex.as_deref())
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -1636,6 +1690,164 @@ impl CryptoServer {
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Freeze a privacy address (pool admin only).
+    #[tool(
+        name = "freezeAddress",
+        description = "Freeze (blacklist) a privacy pool address (privpool1...). Requires the caller to be a pool admin for the midnight-privacy module."
+    )]
+    async fn freeze_address(
+        &self,
+        Parameters(params): Parameters<FreezeAddressRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::PrivacyAddress;
+
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
+        })?;
+
+        let res = crate::operations::freeze_address(provider, &*ctx, addr)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&FreezeAddressResult { tx_hash: res.tx_hash })
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Unfreeze a privacy address (pool admin only).
+    #[tool(
+        name = "unfreezeAddress",
+        description = "Unfreeze (un-blacklist) a privacy pool address (privpool1...). Requires the caller to be a pool admin for the midnight-privacy module."
+    )]
+    async fn unfreeze_address(
+        &self,
+        Parameters(params): Parameters<UnfreezeAddressRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use midnight_privacy::PrivacyAddress;
+
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
+        })?;
+
+        let res = crate::operations::unfreeze_address(provider, &*ctx, addr)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json =
+            serde_json::to_string_pretty(&UnfreezeAddressResult { tx_hash: res.tx_hash })
+                .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Add a pool admin (module admin only).
+    #[tool(
+        name = "addPoolAdmin",
+        description = "Grant pool-admin rights to an L2 address (module admin only). Pool admins can freeze/unfreeze privacy addresses."
+    )]
+    async fn add_pool_admin(
+        &self,
+        Parameters(params): Parameters<AddPoolAdminRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
+        })?;
+
+        let res = crate::operations::add_pool_admin(provider, &*ctx, admin)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&AddPoolAdminResult { tx_hash: res.tx_hash })
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Remove a pool admin (module admin only).
+    #[tool(
+        name = "removePoolAdmin",
+        description = "Revoke pool-admin rights from an L2 address (module admin only)."
+    )]
+    async fn remove_pool_admin(
+        &self,
+        Parameters(params): Parameters<RemovePoolAdminRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+
+        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
+        })?;
+
+        let res = crate::operations::remove_pool_admin(provider, &*ctx, admin)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json =
+            serde_json::to_string_pretty(&RemovePoolAdminResult { tx_hash: res.tx_hash })
+                .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }

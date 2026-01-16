@@ -2,7 +2,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tracing_subscriber::EnvFilter;
 
-mod authority_vfk;
+mod authority_fvk;
 mod config;
 mod ligero;
 mod operations;
@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
-use crate::authority_vfk::AuthorityVfk;
+use crate::authority_fvk::AuthorityFvk;
 use crate::config::Config;
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
@@ -111,25 +111,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cfg.ligero_program_path.clone()),
     ));
 
-    let authority_vfk = if let Some(ref vfk_hex) = cfg.authority_vfk {
-        tracing::info!("[mcp] Initializing authority VFK from environment variable");
-        match AuthorityVfk::from_hex(vfk_hex) {
-            Ok(vfk) => {
-                tracing::info!("[mcp] Authority VFK initialized successfully");
-                Some(vfk)
+    let authority_fvk = if let Some(ref fvk_hex) = cfg.authority_fvk {
+        tracing::info!("[mcp] Initializing authority FVK from environment variable");
+        match AuthorityFvk::from_hex(fvk_hex) {
+            Ok(fvk) => {
+                tracing::info!("[mcp] Authority FVK initialized successfully");
+                Some(fvk)
             }
             Err(e) => {
-                tracing::warn!("[mcp] Failed to initialize authority VFK: {}", e);
+                tracing::warn!("[mcp] Failed to initialize authority FVK: {}", e);
                 tracing::warn!("[mcp] Note decryption will not be available");
                 None
             }
         }
     } else {
-        tracing::info!("[mcp] No AUTHORITY_VFK provided, note decryption will not be available");
+        tracing::info!("[mcp] No AUTHORITY_FVK provided, note decryption will not be available");
         None
     };
 
-    let authority_vfk = Arc::new(RwLock::new(authority_vfk));
+    let authority_fvk = Arc::new(RwLock::new(authority_fvk));
 
     tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
 
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wallet_ctx_for_service = wallet_ctx.clone();
     let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
-    let authority_vfk_for_service = authority_vfk.clone();
+    let authority_fvk_for_service = authority_fvk.clone();
     let privacy_key_for_service = privacy_key.clone();
     let tx_store_for_service = tx_store.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
@@ -211,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_ctx_for_service.clone(),
                 admin_wallet_ctx_for_service.clone(),
                 ligero_for_service.clone(),
-                authority_vfk_for_service.clone(),
+                authority_fvk_for_service.clone(),
                 privacy_key_for_service.clone(),
                 tx_store_for_service.clone(),
                 log_path_string.clone(),

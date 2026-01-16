@@ -52,10 +52,10 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
-    // VFK registry table for multi-address decryption support
+    // FVK registry table for multi-address decryption support
     let stmt = builder.build(
         &schema
-            .create_table_from_entity(idx::vfk_registry::Entity)
+            .create_table_from_entity(idx::fvk_registry::Entity)
             .if_not_exists()
             .to_owned(),
     );

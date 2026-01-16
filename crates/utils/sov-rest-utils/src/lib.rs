@@ -140,9 +140,9 @@ where
         )
     });
     router
-        // Remove default 2MB body limit and set 10MB for large ZK proofs (e.g. Ligero)
+        // Remove default 2MB body limit and allow larger payloads (e.g. Ligero proof packages).
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(trace_layer)
         // This layer creates a new id for each request and puts it into the request extensions.
         // Note that it should be added after the Trace layer. (Filippo: why? I
