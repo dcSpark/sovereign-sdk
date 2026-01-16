@@ -122,6 +122,8 @@ pub mod midnight_transfer {
         pub view_attestations: Option<JsonValue>,
         #[sea_orm(nullable, column_type = "Json")]
         pub encrypted_notes: Option<JsonValue>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub decrypted_notes: Option<JsonValue>,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {

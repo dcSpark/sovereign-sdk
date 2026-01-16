@@ -328,6 +328,7 @@ pub async fn insert_midnight_transfer(
     recipient: Option<String>,
     view_attestations: Option<JsonValue>,
     encrypted_notes: Option<JsonValue>,
+    decrypted_notes: Option<JsonValue>,
 ) -> Result<()> {
     let _ = idx::midnight_transfer::Entity::insert(idx::midnight_transfer::ActiveModel {
         event_id: Set(event_id),
@@ -338,6 +339,7 @@ pub async fn insert_midnight_transfer(
         recipient: Set(recipient),
         view_attestations: Set(view_attestations),
         encrypted_notes: Set(encrypted_notes),
+        decrypted_notes: Set(decrypted_notes),
     })
     .exec(idx_db)
     .await?;

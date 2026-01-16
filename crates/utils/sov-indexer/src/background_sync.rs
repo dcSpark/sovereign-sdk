@@ -205,6 +205,7 @@ pub async fn backfill_index(
                 recipient,
                 view_att,
                 encrypted_notes,
+                decrypted_notes,
             )
             .await?;
         }
@@ -320,7 +321,8 @@ async fn backfill_transfers(
             .filter(
                 Condition::any()
                     .add(idx::midnight_transfer::Column::Recipient.is_null())
-                    .add(idx::midnight_transfer::Column::PrivacySender.is_null()),
+                    .add(idx::midnight_transfer::Column::PrivacySender.is_null())
+                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null()),
             )
             .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
             .order_by_asc(idx::midnight_transfer::Column::EventId)
@@ -362,6 +364,9 @@ async fn backfill_transfers(
             }
             if let Some(privacy_sender) = privacy_sender {
                 update.privacy_sender = Set(Some(privacy_sender));
+            }
+            if row.decrypted_notes.is_none() {
+                update.decrypted_notes = Set(Some(decrypted_notes));
             }
 
             update.update(idx_db).await?;
