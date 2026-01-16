@@ -3,7 +3,7 @@ use crate::db::{extract_events_from_status, extract_status_from_status};
 use crate::index_db as idx;
 use crate::viewer::{
     self, extract_recipient_from_decrypted_notes, extract_sender_from_decrypted_notes,
-    hex_to_bech32m_address, VfkRegistry,
+    hex_to_bech32m_address, FvkRegistry,
 };
 use anyhow::Result;
 use sea_orm::{
@@ -233,7 +233,7 @@ pub fn spawn_sync_loop(
 
 pub async fn backfill_privacy_fields(
     idx_db: &DatabaseConnection,
-    vfk_registry: &VfkRegistry,
+    vfk_registry: &FvkRegistry,
 ) -> Result<()> {
     if vfk_registry.is_empty() {
         return Ok(());
@@ -257,7 +257,7 @@ pub async fn backfill_privacy_fields(
 
 async fn backfill_deposits(
     idx_db: &DatabaseConnection,
-    vfk_registry: &VfkRegistry,
+    vfk_registry: &FvkRegistry,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;
@@ -310,7 +310,7 @@ async fn backfill_deposits(
 
 async fn backfill_transfers(
     idx_db: &DatabaseConnection,
-    vfk_registry: &VfkRegistry,
+    vfk_registry: &FvkRegistry,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;
@@ -379,7 +379,7 @@ async fn backfill_transfers(
 
 async fn backfill_withdraws(
     idx_db: &DatabaseConnection,
-    vfk_registry: &VfkRegistry,
+    vfk_registry: &FvkRegistry,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;

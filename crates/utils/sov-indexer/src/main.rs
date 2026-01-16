@@ -93,8 +93,8 @@ fn should_reset_index_db() -> bool {
 /// 1. VFK_CONFIG_FILE (JSON file with multiple VFKs)
 /// 2. Database (previously saved VFKs)
 /// 3. AUTHORITY_VFK env var (single VFK, backward compatible)
-async fn load_vfk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Result<VfkRegistry> {
-    let mut registry = VfkRegistry::new();
+async fn load_vfk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Result<FvkRegistry> {
+    let mut registry = FvkRegistry::new();
 
     // 1. Try loading from config file
     if let Some(config_path) = viewer::load_fvk_config_path() {

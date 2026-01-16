@@ -1,12 +1,12 @@
 use crate::balance;
 use crate::db::{list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse};
-use crate::viewer::{self, VfkRegistry};
+use crate::viewer::{self, FvkRegistry};
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: DatabaseConnection,
     /// VFK registry using DashMap for lock-free concurrent access
-    pub vfk_registry: Arc<VfkRegistry>,
+    pub vfk_registry: Arc<FvkRegistry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +69,7 @@ async fn list_wallet_txs(
     body: Option<Json<VfkBody>>,
 ) -> impl IntoResponse {
     let vfk = match body.and_then(|Json(body)| body.vfk) {
-        Some(vfk_hex) => match viewer::parse_vfk_hex(&vfk_hex) {
+        Some(vfk_hex) => match viewer::parse_fvk_hex(&vfk_hex) {
             Ok(vfk) => Some(vfk),
             Err(e) => {
                 return (
@@ -217,7 +217,7 @@ pub struct FvkResponse {
 /// List all FVKs in the registry
 async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
     let fvks: Vec<FvkResponse> = state
-        .fvk_registry
+        .vfk_registry
         .entries()
         .into_iter()
         .map(|(commitment, fvk, addr)| FvkResponse {
@@ -280,7 +280,7 @@ async fn add_fvk(
     }
 
     // Check if this FVK already exists in the registry
-    if state.fvk_registry.get_fvk(&commitment_hex).is_some() {
+    if state.vfk_registry.get_fvk(&commitment_hex).is_some() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -293,10 +293,10 @@ async fn add_fvk(
     }
 
     // Add to registry (DashMap - no lock needed)
-    state.fvk_registry.add(fvk, req.shielded_address.clone());
+    state.vfk_registry.add(fvk, req.shielded_address.clone());
 
     // Persist to database
-    if let Err(e) = state.fvk_registry.save_to_db(&state.db).await {
+    if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {
         tracing::warn!("Failed to persist FVK to database: {}", e);
     }
 
@@ -332,7 +332,7 @@ async fn delete_fvk(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // Check if it exists and remove (DashMap - no lock needed)
-    if !state.fvk_registry.remove(&fvk_commitment) {
+    if !state.vfk_registry.remove(&fvk_commitment) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "FVK not found"})),
