@@ -5,6 +5,7 @@ use alloy_primitives::U256;
 use borsh::BorshSerialize;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::{BlockHeaderTrait, DaSpec, DaVerifier};
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::{
@@ -14,6 +15,7 @@ use sov_rollup_interface::zk::{
     StateTransitionPublicData, StateTransitionWitness, StateTransitionWitnessWithAddress, Zkvm,
     ZkvmHost,
 };
+use tokio::runtime::Runtime;
 use tracing::{error, info, trace};
 
 use super::state::{ProverState, ProverStatus};
@@ -23,6 +25,14 @@ use crate::processes::{
     hash_to_bytes32, state_root_to_bytes32, ProofAggregationStatus, ProofProcessingStatus,
     PublicDataTee, RollupProverConfigDiscriminants, StateTransitionInfo,
 };
+
+#[derive(Clone, Default)]
+pub(crate) struct L1BridgeData {
+    pub withdraw_root: [u8; 32],
+    pub message_queue_hash: [u8; 32],
+    pub last_processed_queue_index: U256,
+    pub layer2_chain_id: u64,
+}
 
 // A prover that generates proofs in parallel using a thread pool. If the pool is saturated,
 // the prover will reject new jobs.
@@ -147,11 +157,6 @@ where
                             final_state_root,
                             slot_hash: block_header_hash.clone(),
                             prover_address,
-                            // Placeholders for now. 
-                            // Those may require to get the data from the hyperlane
-                            withdraw_root: [0u8; 32],
-                            message_queue_hash: <Da::Spec as DaSpec>::SlotHash::try_from([0u8; 32]).unwrap(),
-                            last_processed_queue_index: U256::ZERO,
                         },
                         slot_number: state_transition_info.slot_number,
                     });
@@ -171,6 +176,7 @@ where
         &self,
         mut outer_vm: OuterVm,
         block_header_hashes: &[<Da::Spec as DaSpec>::SlotHash],
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &StateRoot,
     ) -> anyhow::Result<ProofAggregationStatus> {
         assert!(!block_header_hashes.is_empty());
@@ -203,6 +209,23 @@ where
             rewarded_addresses.push(bp.st.prover_address.clone());
         }
 
+        // Mainly here to avoid to init the midnight bridge if not needed.
+        let mut l1_bridge = L1BridgeData::default();
+
+        if let Some(midnight_bridge) = midnight_bridge {
+            let snap = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { midnight_bridge.snapshot().await })
+            })?;
+
+            l1_bridge.last_processed_queue_index =
+                U256::from(snap.l2_messenger.last_processed_l1_index);
+            l1_bridge.message_queue_hash = snap.l2_message_queue.withdraw_root;
+            l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
+        } else {
+            tracing::warn!("No midnight bridge provided, L1 bridge data will be mocked values.");
+        }
+
         let public_data = AggregatedProofPublicData::<Address, Da::Spec, StateRoot> {
             rewarded_addresses,
             initial_slot_number: initial_block_proof.slot_number,
@@ -213,9 +236,8 @@ where
             initial_slot_hash: initial_block_proof.st.slot_hash.clone(),
             final_slot_hash: final_block_proof.st.slot_hash.clone(),
             code_commitment: self.code_commitment.clone(),
-            withdraw_root: final_block_proof.st.withdraw_root,
-            message_queue_hash: final_block_proof.st.message_queue_hash.clone(),
-            last_processed_queue_index: final_block_proof.st.last_processed_queue_index,
+            withdraw_root: l1_bridge.withdraw_root,
+            message_queue_hash: l1_bridge.message_queue_hash,
         };
 
         let public_tee: PublicDataTee = PublicDataTee {
@@ -223,8 +245,9 @@ where
             final_state_root: state_root_to_bytes32(&public_data.final_state_root)?,
             final_slot_hash: hash_to_bytes32(&public_data.final_slot_hash)?,
             withdraw_root: public_data.withdraw_root,
-            message_queue_hash: hash_to_bytes32(&public_data.message_queue_hash)?,
-            last_processed_queue_index: public_data.last_processed_queue_index,
+            message_queue_hash: public_data.message_queue_hash,
+            last_processed_queue_index: l1_bridge.last_processed_queue_index,
+            layer2_chain_id: l1_bridge.layer2_chain_id,
         };
 
         trace!(%public_data, "generating aggregate proof");

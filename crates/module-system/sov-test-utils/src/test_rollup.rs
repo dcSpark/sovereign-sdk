@@ -36,7 +36,7 @@ use sov_rollup_interface::zk::ZkvmHost;
 use sov_rollup_interface::StateUpdateInfo;
 use sov_sequencer::preferred::PreferredSequencerConfig;
 use sov_sequencer::test_stateless::TestStatelessSequencer;
-use sov_sequencer::SeqConfigExtension;
+use sov_sequencer::{SeqConfigExtension, TEEConfiguration};
 use sov_sequencer::{SequencerApis, SequencerConfig, SequencerKindConfig, StateUpdateNotification};
 pub use sov_stf_runner::processes::RollupProverConfig;
 use sov_stf_runner::{
@@ -232,6 +232,9 @@ impl<R: FullNodeBlueprint<Native>, StoragePath: AsPath> RollupBuilder<R, Storage
                 extension: Some(SeqConfigExtension {
                     max_log_limit: 20000,
                     midnight_bridge: None,
+                    tee_configuration: Some(TEEConfiguration {
+                        tee_attestation_oracle_url: "http://127.0.0.1:8080".to_string(),
+                    }),
                 }),
                 num_cache_warmup_workers: TEST_NUM_CACHE_WARMUP_WORKERS,
             },

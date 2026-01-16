@@ -11,6 +11,7 @@ use sov_db::ledger_db::LedgerDb;
 use sov_db::schema::DeltaReader;
 use sov_db::storage_manager::NativeStorageManager;
 use sov_metrics::MonitoringConfig;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_mock_da::{
     BlockProducingConfig, MockAddress, MockBlockHeader, MockDaConfig, MockDaService, MockDaSpec,
     MockDaVerifier, MockHash,
@@ -281,6 +282,12 @@ pub async fn initialize_runner(
             genesis_state_root,
             stf_info_receiver,
             shutdown_receiver.clone(),
+            "http://127.0.0.1:8080".to_owned(),
+            Some(MidnightIndexerClient::new(
+                reqwest::Client::new(),
+                "https://indexer.preview.midnight.network/api/v3/graphql".to_owned(),
+                "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12".to_owned(),
+            )),
         )
         .await
         .unwrap();

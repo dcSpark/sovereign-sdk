@@ -8,6 +8,7 @@ use std::num::NonZero;
 
 use op_manager::attestations::AttestationsManager;
 pub use prover_service::*;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::optimistic::BondingProofService;
 use sov_rollup_interface::stf::ProofSender;
@@ -25,11 +26,19 @@ pub async fn start_tee_workflow_in_background<Ps>(
     genesis_state_root: Ps::StateRoot,
     stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
     shutdown_receiver: tokio::sync::watch::Receiver<()>,
+    oracle_url: String,
+    midnight_bridge: Option<MidnightIndexerClient>,
 ) -> anyhow::Result<JoinHandle<()>>
 where
     Ps: ProverService,
     Ps::DaService: DaService<Error = anyhow::Error>,
 {
+    // Warmup the midnight bridge snapshot
+    // Most likely super inefficient way to do it, but it's fine for now
+    if let Some(client) = midnight_bridge.as_ref() {
+        let _ = client.snapshot().await;
+    }
+
     Ok(TeeProofManager::new(
         prover_service,
         aggregated_proof_block_jump,
@@ -37,10 +46,11 @@ where
         genesis_state_root.clone(),
         0,
         [0u8; 32],
-        1, // To be replaced with actual layer2_chain_id
         stf_info_receiver,
         shutdown_receiver,
         reqwest::Client::new(),
+        oracle_url,
+        midnight_bridge,
     )
     .post_aggregated_proof_to_da_in_background()
     .await)

@@ -42,6 +42,7 @@ sov-modules-api = { workspace = true, features = ["native"] }
 sov-db = { workspace = true }
 sov-rollup-interface = { workspace = true }
 sov-metrics = { workspace = true }
+sov-midnight-adapter = { workspace = true }
 tower-http = { workspace = true, features = ["normalize-path", "cors"] }
 tee = { workspace = true, features = ["maa"] }
 tower-layer = "0.3.3"

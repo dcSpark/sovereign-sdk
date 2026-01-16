@@ -5,14 +5,18 @@ mod telemetry;
 mod wallet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 pub use endpoints::*;
+use reqwest::Client;
 use sov_db::ledger_db::LedgerDb;
 use sov_db::schema::{DeltaReader, SchemaBatch};
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_modules_api::capabilities::{HasCapabilities, HasKernel, ProofProcessor, RollupHeight};
 use sov_modules_api::execution_mode::ExecutionMode;
+use sov_modules_api::prelude::jsonrpsee::ws_client::WsClient;
 use sov_modules_api::provable_height_tracker::MaximumProvableHeight;
 use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::{
@@ -497,6 +501,46 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                     .await?
                 }
                 OperatingMode::TEE => {
+                    let ext = rollup_config.sequencer.extension.as_ref();
+
+                    let oracle_url = ext
+                        .and_then(|e| e.tee_configuration.as_ref())
+                        .map(|t| t.tee_attestation_oracle_url.clone())
+                        .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned());
+
+                    let bridge = ext.and_then(|e| e.midnight_bridge.as_ref());
+
+                    let indexer: Option<MidnightIndexerClient> = match bridge {
+                        None => None,
+
+                        Some(cfg) => {
+                            if cfg.mock_events_path.is_some() {
+                                tracing::warn!(
+                                    "Mock mode is enabled on L1 Bridge. Mock values will be used in the TEE Manager."
+                                );
+                                None
+                            } else {
+                                match (cfg.indexer_http.as_ref(), cfg.contract_address.as_ref()) {
+                                    (Some(indexer_http), Some(contract_address)) => {
+                                        let timeout =
+                                            Duration::from_millis(cfg.indexer_timeout_ms.max(1));
+                                        let client =
+                                            Client::builder().timeout(timeout).build().context(
+                                                "Failed to build Midnight indexer HTTP client",
+                                            )?;
+
+                                        Some(MidnightIndexerClient::new(
+                                            client,
+                                            indexer_http.clone(),
+                                            contract_address.clone(),
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        }
+                    };
+
                     start_tee_workflow_in_background(
                         prover_service,
                         rollup_config.proof_manager.aggregated_proof_block_jump,
@@ -504,6 +548,8 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                         genesis_state_root,
                         stf_info_receiver,
                         secondary_shutdown_receiver,
+                        oracle_url,
+                        indexer,
                     )
                     .await?
                 }

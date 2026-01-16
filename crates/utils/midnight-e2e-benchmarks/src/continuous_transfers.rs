@@ -467,7 +467,6 @@ struct VerifierResponse {
     metrics: VerifierMetrics,
 }
 
-
 #[derive(Clone, Debug)]
 struct CycleSummary {
     num_transfers: usize,

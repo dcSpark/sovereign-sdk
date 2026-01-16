@@ -1674,8 +1674,10 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json = serde_json::to_string_pretty(&FreezeAddressResult { tx_hash: res.tx_hash })
-            .unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&FreezeAddressResult {
+            tx_hash: res.tx_hash,
+        })
+        .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -1714,9 +1716,10 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json =
-            serde_json::to_string_pretty(&UnfreezeAddressResult { tx_hash: res.tx_hash })
-                .unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&UnfreezeAddressResult {
+            tx_hash: res.tx_hash,
+        })
+        .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -1745,16 +1748,19 @@ impl CryptoServer {
 
         let ctx = wallet_ctx.read().await;
 
-        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
-            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
-        })?;
+        let admin: <McpSpec as Spec>::Address = params
+            .admin_address
+            .parse()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid admin address: {e}"), None))?;
 
         let res = crate::operations::add_pool_admin(provider, &*ctx, admin)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json = serde_json::to_string_pretty(&AddPoolAdminResult { tx_hash: res.tx_hash })
-            .unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&AddPoolAdminResult {
+            tx_hash: res.tx_hash,
+        })
+        .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -1783,17 +1789,19 @@ impl CryptoServer {
 
         let ctx = wallet_ctx.read().await;
 
-        let admin: <McpSpec as Spec>::Address = params.admin_address.parse().map_err(|e| {
-            ErrorData::invalid_params(format!("Invalid admin address: {e}"), None)
-        })?;
+        let admin: <McpSpec as Spec>::Address = params
+            .admin_address
+            .parse()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid admin address: {e}"), None))?;
 
         let res = crate::operations::remove_pool_admin(provider, &*ctx, admin)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json =
-            serde_json::to_string_pretty(&RemovePoolAdminResult { tx_hash: res.tx_hash })
-                .unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&RemovePoolAdminResult {
+            tx_hash: res.tx_hash,
+        })
+        .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }

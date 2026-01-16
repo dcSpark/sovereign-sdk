@@ -49,9 +49,7 @@ pub struct AggregatedProofPublicData<Address, Da: DaSpec, Root> {
     /// Undocumented, atm.
     pub withdraw_root: [u8; 32],
     /// Undocumented, atm.
-    pub message_queue_hash: Da::SlotHash,
-    /// Undocumented, atm.
-    pub last_processed_queue_index: U256,
+    pub message_queue_hash: [u8; 32],
 }
 
 impl<Address, Da: DaSpec, Root: AsRef<[u8]>> core::fmt::Display

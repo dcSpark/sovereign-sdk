@@ -26,7 +26,11 @@ enum Command {
 #[derive(Debug, Parser)]
 struct ServeArgs {
     /// Address to bind the HTTP server to
-    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_BIND", default_value = "127.0.0.1:8088")]
+    #[arg(
+        long,
+        env = "MIDNIGHT_FVK_SERVICE_BIND",
+        default_value = "127.0.0.1:8088"
+    )]
     bind: SocketAddr,
 
     /// SQLite connection string for persisted state (issued FVKs + monotonic counter)
@@ -50,7 +54,11 @@ struct ServeArgs {
     last_issued_index: Option<u64>,
 
     /// When true, missing keys are generated in-memory at startup
-    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_ALLOW_EPHEMERAL_KEYS", default_value_t = false)]
+    #[arg(
+        long,
+        env = "MIDNIGHT_FVK_SERVICE_ALLOW_EPHEMERAL_KEYS",
+        default_value_t = false
+    )]
     allow_ephemeral_keys: bool,
 
     /// Log level (trace, debug, info, warn, error)
@@ -92,10 +100,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         args.allow_ephemeral_keys
             .then(|| generate_signing_key_hex())
     });
-    let root_fvk_seed_hex = args.root_fvk_seed_hex.or_else(|| {
-        args.allow_ephemeral_keys
-            .then(|| generate_root_seed_hex())
-    });
+    let root_fvk_seed_hex = args
+        .root_fvk_seed_hex
+        .or_else(|| args.allow_ephemeral_keys.then(|| generate_root_seed_hex()));
 
     let signing_sk_hex = signing_sk_hex.ok_or_else(|| {
         anyhow::anyhow!(

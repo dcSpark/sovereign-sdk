@@ -205,7 +205,8 @@ fn build_note_spend_args_v2(
     outputs: &[SpendOutputV2],
 ) -> (Vec<serde_json::Value>, Vec<usize>) {
     let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-    let bl_defaults = midnight_privacy::sparse_default_nodes(midnight_privacy::BLACKLIST_TREE_DEPTH);
+    let bl_defaults =
+        midnight_privacy::sparse_default_nodes(midnight_privacy::BLACKLIST_TREE_DEPTH);
     let default_siblings: Vec<Hash32> = bl_defaults.iter().take(bl_depth).copied().collect();
     let default_opening = DenyMapOpeningV2 {
         bucket_entries: midnight_privacy::empty_blacklist_bucket_entries(),
@@ -275,7 +276,12 @@ fn build_note_spend_args_v2_with_deny_map(
         args.push(json!({"hex": hex32(&input.sender_id)}));
         args.push(json!({"i64": input.pos as i64}));
         // Track private indices for (value, rho, sender_id, pos).
-        private_indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx + 3]);
+        private_indices.extend_from_slice(&[
+            start_idx,
+            start_idx + 1,
+            start_idx + 2,
+            start_idx + 3,
+        ]);
 
         // Siblings.
         assert_eq!(input.siblings.len(), depth_usize);
@@ -1202,8 +1208,14 @@ fn test_note_spend_with_non_default_blacklist_root() -> Result<()> {
 
     let sender_pos = midnight_privacy::blacklist_pos_from_recipient(&recipient_owner);
     let out_pos = midnight_privacy::blacklist_pos_from_recipient(&out_rcp);
-    assert_ne!(bl_pos, sender_pos, "unexpected deny-map index collision (blacklisted vs sender)");
-    assert_ne!(bl_pos, out_pos, "unexpected deny-map index collision (blacklisted vs output)");
+    assert_ne!(
+        bl_pos, sender_pos,
+        "unexpected deny-map index collision (blacklisted vs sender)"
+    );
+    assert_ne!(
+        bl_pos, out_pos,
+        "unexpected deny-map index collision (blacklisted vs output)"
+    );
 
     let (blacklist_root, bl_nodes, bl_buckets, bl_defaults) =
         build_bucketed_deny_map_with_blacklisted_id(bl_pos, bl_recipient);
@@ -1214,14 +1226,14 @@ fn test_note_spend_with_non_default_blacklist_root() -> Result<()> {
     );
 
     // Openings for sender/output must prove leaf=0 under this non-default root.
-    let sender_opening =
-        deny_map_opening_for_pos(sender_pos, &bl_buckets, &bl_nodes, &bl_defaults);
+    let sender_opening = deny_map_opening_for_pos(sender_pos, &bl_buckets, &bl_nodes, &bl_defaults);
     let out_opening = deny_map_opening_for_pos(out_pos, &bl_buckets, &bl_nodes, &bl_defaults);
 
     // Sanity: blacklisted leaf=1 matches the root, but leaf=0 cannot.
     let bl_opening = deny_map_opening_for_pos(bl_pos, &bl_buckets, &bl_nodes, &bl_defaults);
     let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH;
-    let leaf0 = midnight_privacy::bl_bucket_leaf(&midnight_privacy::empty_blacklist_bucket_entries());
+    let leaf0 =
+        midnight_privacy::bl_bucket_leaf(&midnight_privacy::empty_blacklist_bucket_entries());
     let bl_leaf = midnight_privacy::bl_bucket_leaf(&bl_opening.bucket_entries);
     assert_eq!(
         root_from_path(&bl_leaf, bl_pos, &bl_opening.siblings, bl_depth),

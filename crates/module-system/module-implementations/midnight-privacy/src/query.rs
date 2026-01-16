@@ -1,8 +1,8 @@
 //! Defines REST queries exposed by the MidnightPrivacy module, along with the relevant types.
 
 use crate::hash::{
-    blacklist_pos_from_recipient, recipient_from_pk_v2, sparse_default_nodes, BlacklistNodeKey,
-    empty_blacklist_bucket_entries, Hash32, NullifierKey, BLACKLIST_BUCKET_SIZE,
+    blacklist_pos_from_recipient, empty_blacklist_bucket_entries, recipient_from_pk_v2,
+    sparse_default_nodes, BlacklistNodeKey, Hash32, NullifierKey, BLACKLIST_BUCKET_SIZE,
     BLACKLIST_TREE_DEPTH,
 };
 use crate::types::PrivacyAddress;
@@ -362,11 +362,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .unwrap_infallible()
             .ok_or_else(|| errors::not_found_404("Domain", "domain"))?;
 
-        let recipient = recipient_from_pk_v2(
-            &domain,
-            &privacy_address.to_pk(),
-            &privacy_address.pk_ivk(),
-        );
+        let recipient =
+            recipient_from_pk_v2(&domain, &privacy_address.to_pk(), &privacy_address.pk_ivk());
         let pos = blacklist_pos_from_recipient(&recipient);
 
         let blacklist_root = state

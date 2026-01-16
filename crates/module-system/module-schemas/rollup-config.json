@@ -211,6 +211,82 @@
         }
       }
     },
+    "MidnightBridgeSettings": {
+      "description": "Rollup-specific Midnight bridge settings parsed from `[sequencer.extension.midnight_bridge]`.",
+      "type": "object",
+      "required": [
+        "signing_key_path"
+      ],
+      "properties": {
+        "contract_address": {
+          "description": "Bridge contract address on Midnight (64 hex characters).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "indexer_http": {
+          "description": "HTTP endpoint for the Midnight indexer GraphQL API.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "indexer_timeout_ms": {
+          "description": "Timeout (in milliseconds) for requests to the Midnight indexer.",
+          "default": 30000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_fee": {
+          "description": "Maximum fee (in gas token units) that the bridge will attach to generated transactions.",
+          "default": 1000000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mock_events_path": {
+          "description": "Optional JSON file containing mock ingress events for the bridge to consume.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poll_interval_ms": {
+          "description": "How often (in milliseconds) the mock event source should be polled.",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "signing_key_path": {
+          "description": "Path to the JSON file containing `PrivateKeyAndAddress` that the bridge will use for signing transactions.",
+          "type": "string"
+        },
+        "start_deposit_index": {
+          "description": "Optional chain deposit index to start processing from (defaults to zero).",
+          "default": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "token_id_bech32": {
+          "description": "Optional bech32 token identifier that should be minted; defaults to the runtime gas token.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "MockAddress": {
       "description": "Mock address; 32 bytes in hex-encoded format",
       "type": "string",
@@ -765,6 +841,29 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0.0
+        },
+        "midnight_bridge": {
+          "description": "Optional Midnight bridge configuration that allows custom background services to run alongside the sequencer.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MidnightBridgeSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tee_configuration": {
+          "description": "TEE Extension",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TEEConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -892,6 +991,19 @@
           ],
           "format": "uint",
           "minimum": 1.0
+        }
+      }
+    },
+    "TEEConfiguration": {
+      "description": "TEE configuration.",
+      "type": "object",
+      "required": [
+        "tee_attestation_oracle_url"
+      ],
+      "properties": {
+        "tee_attestation_oracle_url": {
+          "description": "URL of the TEE attestation oracle.",
+          "type": "string"
         }
       }
     },

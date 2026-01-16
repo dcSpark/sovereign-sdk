@@ -12,8 +12,8 @@ use tracing::{debug, info};
 use super::ValueMidnightPrivacy;
 use crate::event::Event;
 use crate::hash::{
-    blacklist_pos_from_recipient, mt_combine, note_commitment, recipient_from_pk_v2,
-    sparse_default_nodes, bl_bucket_leaf, empty_blacklist_bucket_entries, BlacklistNodeKey, Hash32,
+    bl_bucket_leaf, blacklist_pos_from_recipient, empty_blacklist_bucket_entries, mt_combine,
+    note_commitment, recipient_from_pk_v2, sparse_default_nodes, BlacklistNodeKey, Hash32,
     PendingRootKey, RootKey, BLACKLIST_BUCKET_SIZE, BLACKLIST_TREE_DEPTH,
 };
 use crate::types::{EncryptedNote, FullViewingKey, PrivacyAddress};
@@ -237,11 +237,7 @@ pub enum MidnightPrivacyError<S: Spec> {
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
-    fn ensure_module_admin(
-        &self,
-        context: &Context<S>,
-        state: &mut impl TxState<S>,
-    ) -> Result<()> {
+    fn ensure_module_admin(&self, context: &Context<S>, state: &mut impl TxState<S>) -> Result<()> {
         let admin = self.admin.get_or_err(state)??;
         if &admin != context.sender() {
             return Err(MidnightPrivacyError::WrongSender::<S> {
@@ -1152,7 +1148,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ) -> Result<Hash32> {
         let defaults = sparse_default_nodes(BLACKLIST_TREE_DEPTH);
 
-        let leaf_key = BlacklistNodeKey { height: 0, index: pos };
+        let leaf_key = BlacklistNodeKey {
+            height: 0,
+            index: pos,
+        };
         let is_default_bucket = bucket_entries == empty_blacklist_bucket_entries();
 
         // Store/remove bucket entries and set/remove the leaf hash.
@@ -1262,10 +1261,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 },
             );
         }
-        self.emit_event(
-            state,
-            Event::AddressFrozen { address, recipient },
-        );
+        self.emit_event(state, Event::AddressFrozen { address, recipient });
         Ok(())
     }
 
@@ -1318,10 +1314,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 },
             );
         }
-        self.emit_event(
-            state,
-            Event::AddressUnfrozen { address, recipient },
-        );
+        self.emit_event(state, Event::AddressUnfrozen { address, recipient });
         Ok(())
     }
 
@@ -1344,7 +1337,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             Ok(_) => {}
             Err(pos) => list.insert(pos, admin.clone()),
         }
-        self.pool_admin_list.set::<Vec<S::Address>, _>(&list, state)?;
+        self.pool_admin_list
+            .set::<Vec<S::Address>, _>(&list, state)?;
 
         self.emit_event(state, Event::PoolAdminAdded { admin });
         Ok(())
@@ -1363,7 +1357,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             let mut list = self.pool_admin_list.get(state)?.unwrap_or_default();
             if let Ok(pos) = list.binary_search(&admin) {
                 list.remove(pos);
-                self.pool_admin_list.set::<Vec<S::Address>, _>(&list, state)?;
+                self.pool_admin_list
+                    .set::<Vec<S::Address>, _>(&list, state)?;
             }
             self.emit_event(state, Event::PoolAdminRemoved { admin });
         }

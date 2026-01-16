@@ -10,9 +10,9 @@ mod get_transaction_status;
 mod get_transactions;
 mod get_unified_balance;
 mod get_wallet_config;
+mod pool_admin;
 mod send_funds;
 mod transfer;
-mod pool_admin;
 
 pub use decrypt_transaction::decrypt_transaction;
 pub use deposit::deposit;
@@ -22,6 +22,6 @@ pub use get_transaction_status::get_transaction_status;
 pub use get_transactions::get_transactions;
 pub use get_unified_balance::get_unified_balance;
 pub use get_wallet_config::get_wallet_config;
+pub use pool_admin::{add_pool_admin, freeze_address, remove_pool_admin, unfreeze_address};
 pub use send_funds::send_funds;
 pub use transfer::transfer;
-pub use pool_admin::{add_pool_admin, freeze_address, remove_pool_admin, unfreeze_address};

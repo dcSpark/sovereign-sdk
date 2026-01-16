@@ -163,7 +163,9 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(ErrorResponse { error: self.message });
+        let body = Json(ErrorResponse {
+            error: self.message,
+        });
         (self.status, body).into_response()
     }
 }
@@ -207,10 +209,9 @@ pub async fn issue_fvk(
     State(state): State<AppState>,
     Json(req): Json<IssueFvkRequest>,
 ) -> Result<Json<IssueFvkResponse>, ApiError> {
-    let (seed_bytes, seed_hex, seed_kind, index_value) =
-        resolve_seed_bytes(&*state.store, req)
-            .await
-            .map_err(ApiError::bad_request)?;
+    let (seed_bytes, seed_hex, seed_kind, index_value) = resolve_seed_bytes(&*state.store, req)
+        .await
+        .map_err(ApiError::bad_request)?;
 
     let issued_at_ms = now_ms().map_err(ApiError::internal)?;
 

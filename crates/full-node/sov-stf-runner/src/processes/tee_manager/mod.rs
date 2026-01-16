@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 
 use backon::{BackoffBuilder, ExponentialBuilder};
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::BlockHeaderTrait;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::node::{future_or_shutdown, FutureOrShutdownOutput};
@@ -90,10 +91,11 @@ pub struct TeeProofManager<Ps: ProverService> {
     genesis_state_root: Ps::StateRoot,
     batch_index: u64,
     prev_batch_hash: [u8; 32],
-    layer2_chain_id: u64,
     stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
     shutdown_receiver: tokio::sync::watch::Receiver<()>,
     http_client: reqwest::Client,
+    oracle_url: String,
+    midnight_bridge: Option<MidnightIndexerClient>,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -109,10 +111,11 @@ where
         genesis_state_root: Ps::StateRoot,
         batch_index: u64,
         prev_batch_hash: [u8; 32],
-        layer2_chain_id: u64,
         stf_info_receiver: Receiver<Ps::StateRoot, Ps::Witness, <Ps::DaService as DaService>::Spec>,
         shutdown_receiver: tokio::sync::watch::Receiver<()>,
         http_client: reqwest::Client,
+        oracle_url: String,
+        midnight_bridge: Option<MidnightIndexerClient>,
     ) -> Self {
         Self {
             prover_service,
@@ -128,8 +131,9 @@ where
             shutdown_receiver,
             batch_index,
             prev_batch_hash,
-            layer2_chain_id,
             http_client,
+            oracle_url,
+            midnight_bridge,
         }
     }
 
@@ -137,6 +141,7 @@ where
         &self,
         mut metadata: AggregateProofMetadata<Ps>,
         prover_service: &Ps,
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &Ps::StateRoot,
     ) -> anyhow::Result<(SerializedAggregatedProof, PublicDataTee)> {
         let mut attempt_num = 1u32;
@@ -145,7 +150,10 @@ where
         loop {
             let maybe_backoff_duration = backoff_iter.next();
 
-            match metadata.prove(prover_service, genesis_state_root).await {
+            match metadata
+                .prove(prover_service, midnight_bridge, genesis_state_root)
+                .await
+            {
                 Ok((proof, public_data)) => return Ok((proof, public_data)),
                 Err((returned_metadata, error)) => {
                     let error_message = format!("Failed to generate aggregate proof: {error}");
@@ -300,6 +308,7 @@ where
                 .create_aggregate_proof_with_retries(
                     metadata,
                     prover_service,
+                    &self.midnight_bridge,
                     &self.genesis_state_root,
                 )
                 .await?;
@@ -316,27 +325,20 @@ where
 
             tracing::debug!("Generating TEE attestation...");
 
-            let prev_state_root = public_data.initial_state_root;
-            let post_state_root = public_data.final_state_root;
-            let slot_hash = public_data.final_slot_hash;
-            let withdraw_root = public_data.withdraw_root;
-            let message_queue_hash = public_data.message_queue_hash;
-            let last_processed_queue_index = public_data.last_processed_queue_index;
-
             let batch = BatchPublicDataV1 {
                 version: 1,
-                layer2_chain_id: self.layer2_chain_id,
+                layer2_chain_id: public_data.layer2_chain_id,
                 batch_index: self.batch_index,
                 da_start_height,
                 da_end_height,
                 da_commitment: da_commitment_root,
-                prev_state_root,
-                post_state_root,
+                prev_state_root: public_data.initial_state_root,
+                post_state_root: public_data.final_state_root,
                 prev_batch_hash: self.prev_batch_hash,
                 batch_hash,
-                last_processed_queue_index,
-                message_queue_hash,
-                withdraw_root,
+                last_processed_queue_index: public_data.last_processed_queue_index,
+                message_queue_hash: public_data.message_queue_hash,
+                withdraw_root: public_data.withdraw_root,
             };
 
             let attestation = attest(&batch, "midnight-l2")?; // Hardcoded for now, should be replaced.
@@ -384,7 +386,7 @@ where
             // URL is hardcoded for now, to be replaced with a config value...
             let res_http = self
                 .http_client
-                .post("http://127.0.0.1:8080/validate")
+                .post(format!("{}/validate", self.oracle_url))
                 .json(&tee::common::TEEPayload {
                     data: tee::common::BASE64_ENGINE.encode(borshed_attestation),
                 })

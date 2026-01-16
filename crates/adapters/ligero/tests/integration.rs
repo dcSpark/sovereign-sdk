@@ -561,7 +561,10 @@ mod note_spend_tests {
             submod_checked(&mut delta, &id_fr, &e_fr);
             prod.mulmod_checked(&delta);
         }
-        assert!(!prod.is_zero(), "unexpected: sender_id collides with empty bucket");
+        assert!(
+            !prod.is_zero(),
+            "unexpected: sender_id collides with empty bucket"
+        );
         let mut inv = prod.clone();
         inv.inverse();
         let bucket_inv = inv.to_bytes_be();

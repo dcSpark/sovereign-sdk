@@ -5,6 +5,7 @@ use nmt_rs::{
     simple_merkle::{db::MemDb, tree::MerkleTree},
     TmSha2Hasher,
 };
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -141,6 +142,7 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
     pub async fn prove(
         mut self,
         prover_service: &Ps,
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &Ps::StateRoot,
     ) -> Result<(SerializedAggregatedProof, PublicDataTee), (Self, anyhow::Error)> {
         self.prove_any_unproven_blocks(prover_service).await;
@@ -152,7 +154,11 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
 
         loop {
             let status = prover_service
-                .create_aggregated_proof(agg_proof_hashes.as_slice(), genesis_state_root)
+                .create_aggregated_proof(
+                    agg_proof_hashes.as_slice(),
+                    midnight_bridge,
+                    genesis_state_root,
+                )
                 .await;
 
             match status {

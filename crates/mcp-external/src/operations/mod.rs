@@ -10,9 +10,9 @@ mod get_transaction_status;
 mod get_transactions;
 mod get_unified_balance;
 mod get_wallet_config;
+mod pool_admin;
 mod send_funds;
 mod transfer;
-mod pool_admin;
 pub mod verify_transaction;
 pub mod wallet_status;
 
@@ -26,6 +26,6 @@ pub use get_transactions::get_transactions;
 pub use get_unified_balance::get_unified_balance;
 #[allow(unused_imports)]
 pub use get_wallet_config::get_wallet_config;
-pub use transfer::transfer;
 pub use pool_admin::{add_pool_admin, freeze_address, remove_pool_admin, unfreeze_address};
+pub use transfer::transfer;
 pub use verify_transaction::verify_transaction;

@@ -113,12 +113,8 @@ async fn fetch_rollup_chain_hash(node_client: &NodeClient) -> Result<[u8; 32]> {
         .await
         .context("Failed to fetch /rollup/schema from rollup node")?;
     let chain_hash_hex = schema.chain_hash.trim_start_matches("0x");
-    let chain_hash_vec = hex::decode(chain_hash_hex).with_context(|| {
-        format!(
-            "Invalid chain_hash returned by node: {}",
-            schema.chain_hash
-        )
-    })?;
+    let chain_hash_vec = hex::decode(chain_hash_hex)
+        .with_context(|| format!("Invalid chain_hash returned by node: {}", schema.chain_hash))?;
     if chain_hash_vec.len() != 32 {
         return Err(anyhow::anyhow!(
             "chain_hash must be 32 bytes (got {})",
@@ -1411,18 +1407,17 @@ async fn create_and_sign_non_zk_transaction(
     // For now, we'll use a generic approach that creates a transaction structure
     // that matches what sov-cli would create
 
-    let signed_tx_bytes =
-        create_value_setter_tx_bytes(
-            value,
-            nonce,
-            signing_key,
-            state.config.chain_id,
-            &state.rollup_chain_hash,
-        )
-        .map_err(|e| {
-            error!("Failed to create transaction bytes: {}", e);
-            ServiceError::Internal(format!("Failed to create transaction: {}", e))
-        })?;
+    let signed_tx_bytes = create_value_setter_tx_bytes(
+        value,
+        nonce,
+        signing_key,
+        state.config.chain_id,
+        &state.rollup_chain_hash,
+    )
+    .map_err(|e| {
+        error!("Failed to create transaction bytes: {}", e);
+        ServiceError::Internal(format!("Failed to create transaction: {}", e))
+    })?;
 
     debug!(
         "Created signed transaction: {} bytes",
@@ -1467,10 +1462,7 @@ fn create_value_setter_tx_bytes(
         unsigned_tx_bytes.len(),
         hex::encode(&unsigned_tx_bytes)
     );
-    debug!(
-        "CHAIN_HASH for signing: 0x{}",
-        hex::encode(chain_hash)
-    );
+    debug!("CHAIN_HASH for signing: 0x{}", hex::encode(chain_hash));
 
     // Sign the transaction using the rollup chain hash (from /rollup/schema)
     let signed_tx = Transaction::<DemoRuntime<RollupSpec>, RollupSpec>::new_signed_tx(

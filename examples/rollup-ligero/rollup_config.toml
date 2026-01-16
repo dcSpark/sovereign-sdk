@@ -73,6 +73,9 @@ prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
 max_number_of_transitions_in_db = 100
 max_number_of_transitions_in_memory = 30
 
+[tee_configuration]
+tee_attestation_oracle_url = "http://127.0.0.1:8080"
+
 [sequencer]
 blob_processing_timeout_secs = 3000
 # Increased to 500MB to support large ZK proofs (e.g. Ligero proofs are ~3.2MB)
@@ -111,3 +114,5 @@ contract_address = "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc36
 indexer_timeout_ms = 30000
 poll_interval_ms = 1000
 max_fee = 1000000
+[sequencer.extension.tee_configuration]
+tee_attestation_oracle_url = "http://127.0.0.1:8080"

@@ -136,7 +136,7 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
 
         loop {
             let status = prover_service
-                .create_aggregated_proof(agg_proof_hashes.as_slice(), genesis_state_root)
+                .create_aggregated_proof(agg_proof_hashes.as_slice(), &None, genesis_state_root)
                 .await;
 
             match status {

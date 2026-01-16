@@ -11,6 +11,7 @@ use borsh::BorshSerialize;
 pub use parallel::ParallelProverService;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -122,6 +123,8 @@ pub struct PublicDataTee {
     pub message_queue_hash: [u8; 32],
     /// Undocumented, needs to be fetched from the Hyperlane.
     pub last_processed_queue_index: U256,
+    /// Layer 2 Chain ID.
+    pub layer2_chain_id: u64,
 }
 
 /// Represents the status of a DA proof submission.
@@ -199,6 +202,7 @@ pub trait ProverService: Send + Sync + 'static {
     async fn create_aggregated_proof(
         &self,
         block_header_hashes: &[<<Self::DaService as DaService>::Spec as DaSpec>::SlotHash],
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &Self::StateRoot,
     ) -> anyhow::Result<ProofAggregationStatus>;
 }

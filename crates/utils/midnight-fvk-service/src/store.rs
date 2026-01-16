@@ -167,10 +167,7 @@ impl FvkStore {
         signature: &[u8; 64],
     ) -> Result<()> {
         let index_value: Option<i64> = match index_value {
-            Some(v) => Some(
-                v.try_into()
-                    .map_err(|_| anyhow!("index_value too large"))?,
-            ),
+            Some(v) => Some(v.try_into().map_err(|_| anyhow!("index_value too large"))?),
             None => None,
         };
 
@@ -231,4 +228,3 @@ mod tests {
         assert_eq!(store.ensure_next_index_at_least(12).await.unwrap(), 12);
     }
 }
-
