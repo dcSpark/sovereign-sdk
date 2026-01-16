@@ -9,7 +9,6 @@ use crate::viewer;
 use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, PrivacyAddress};
 
 const DOMAIN: Hash32 = [1u8; 32];
-const LEGACY_NF_KEY: Hash32 = [4u8; 32];
 const NULLIFIER_CHUNK_SIZE: usize = 500;
 
 #[derive(Debug, Deserialize)]
@@ -47,8 +46,7 @@ struct NoteRecord {
 
 struct NoteState {
     note: NoteRecord,
-    nullifier_user: String,
-    nullifier_legacy: String,
+    nullifier: String,
 }
 
 pub async fn get_wallet_balance(
@@ -184,20 +182,15 @@ pub async fn get_wallet_balance(
     let mut note_states = Vec::new();
     let mut nullifier_lookup = HashSet::new();
     for note in notes {
-        let nf_user = nullifier(&DOMAIN, &nf_key, &note.rho);
-        let nf_legacy = nullifier(&DOMAIN, &LEGACY_NF_KEY, &note.rho);
-        let nf_user_hex = hex::encode(nf_user);
-        let nf_legacy_hex = hex::encode(nf_legacy);
+        let nf = nullifier(&DOMAIN, &nf_key, &note.rho);
+        let nf_hex = hex::encode(nf);
 
-        nullifier_lookup.insert(nf_user_hex.clone());
-        nullifier_lookup.insert(format!("0x{}", nf_user_hex));
-        nullifier_lookup.insert(nf_legacy_hex.clone());
-        nullifier_lookup.insert(format!("0x{}", nf_legacy_hex));
+        nullifier_lookup.insert(nf_hex.clone());
+        nullifier_lookup.insert(format!("0x{}", nf_hex));
 
         note_states.push(NoteState {
             note,
-            nullifier_user: nf_user_hex,
-            nullifier_legacy: nf_legacy_hex,
+            nullifier: nf_hex,
         });
     }
 
@@ -207,10 +200,7 @@ pub async fn get_wallet_balance(
     let mut balance: u128 = 0;
 
     for state in note_states {
-        let spent_by_user = spent_nullifiers.contains(&state.nullifier_user);
-        let spent_by_legacy = spent_nullifiers.contains(&state.nullifier_legacy);
-
-        if spent_by_user || spent_by_legacy {
+        if spent_nullifiers.contains(&state.nullifier) {
             continue;
         }
 

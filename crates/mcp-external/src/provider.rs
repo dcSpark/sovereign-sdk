@@ -597,10 +597,10 @@ impl Provider {
         shielded_address: Option<&str>,
     ) -> Result<()> {
         let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/vfks", base_url);
+        let url = format!("{}/fvks", base_url);
 
         let mut payload = serde_json::Map::new();
-        payload.insert("vfk".to_string(), serde_json::Value::String(vfk_hex.to_string()));
+        payload.insert("fvk".to_string(), serde_json::Value::String(vfk_hex.to_string()));
         if let Some(address) = shielded_address {
             payload.insert(
                 "shielded_address".to_string(),

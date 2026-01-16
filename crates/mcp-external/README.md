@@ -43,19 +43,19 @@ The server exposes the following MCP tools:
 - `walletAddress` - Get the privacy pool address
 - `walletBalance` - Get the privacy balance and unspent notes
 - `getWalletConfig` - Retrieve wallet configuration (node/indexer/proof server/log paths)
-- `send` - Non-blocking privacy transfer using the first unspent note
-- `getTransaction` - Retrieve transaction details by hash or derived UUID
-- `getTransactionStatus` - Query a transaction by local database UUID
-- `getTransactions` - List all transactions from the local store
+- `send` - Privacy transfer using the first unspent note
+- `getTransaction` - Retrieve transaction details by hash or derived UUID (legacy)
+- `getTransactionStatus` - Query a transaction by hash
+- `getTransactions` - List all transactions from the indexer
 - `walletStatus` - Sync status and balances
 - `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
 If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
 
-### Local transaction store
+### Transactions
 
-An in-memory SQLite database (`sqlite::memory:?cache=shared`) tracks all wallet transactions and is kept in sync with the indexer every ~30 seconds. `send` inserts an `initiated` row immediately and continues in the background; indexer-derived records are upserted by `tx_identifier` to avoid uniqueness conflicts. The `id` returned by `send`/`getTransactions` is a local UUID; the blockchain hash is exposed as `txIdentifier` once known.
+Transactions are fetched directly from the indexer when requested. `send` returns the rollup transaction hash (also exposed as `txIdentifier`), and the `id` field in transaction records matches that hash.
 
 ## Docker
 

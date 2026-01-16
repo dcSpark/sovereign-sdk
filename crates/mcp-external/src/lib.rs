@@ -5,7 +5,6 @@ pub mod operations;
 pub mod privacy_key;
 pub mod provider;
 pub mod server;
-pub mod tx_store;
 pub mod viewer;
 pub mod wallet;
 

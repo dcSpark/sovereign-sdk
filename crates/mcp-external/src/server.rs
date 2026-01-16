@@ -30,7 +30,6 @@ use crate::authority_fvk::AuthorityFvk;
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::tx_store::{StoredTransaction, SyncSummary, TransactionStore, TransactionUpsert};
 use crate::wallet::WalletContext;
 
 pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
@@ -51,7 +50,7 @@ pub struct SendFundsResult {
     /// Transaction hash from the rollup (available once submitted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
-    /// Local database UUID for this transaction
+    /// Transaction hash for this transfer (same as txIdentifier)
     pub id: String,
     /// Transaction identifier (tx_hash echoed for convenience)
     #[serde(rename = "txIdentifier")]
@@ -153,7 +152,7 @@ pub struct GetTransactionsRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct TransactionRecord {
-    /// UUID of the transaction (local database ID)
+    /// Transaction hash
     pub id: String,
     /// Current state ("initiated", "sent", "completed", or "failed")
     pub state: String,
@@ -189,7 +188,7 @@ pub struct GetTransactionsResult {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetTransactionStatusRequest {
-    /// Local database transaction ID (UUID)
+    /// Transaction hash (with or without 0x prefix)
     pub id: String,
 }
 
@@ -543,7 +542,6 @@ pub struct CryptoServer {
     ligero_prover: Option<Arc<LigeroProver>>,
     authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
-    tx_store: Arc<TransactionStore>,
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
 }
@@ -558,7 +556,6 @@ impl CryptoServer {
         ligero_prover: Arc<LigeroProver>,
         authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
-        tx_store: Arc<TransactionStore>,
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
     ) -> Self {
@@ -570,7 +567,6 @@ impl CryptoServer {
             ligero_prover: Some(ligero_prover),
             authority_fvk,
             privacy_key,
-            tx_store,
             log_path,
             auto_fund_deposit_amount,
         }
@@ -579,7 +575,7 @@ impl CryptoServer {
     /// Send funds from the privacy pool using the first available unspent note.
     #[tool(
         name = "send",
-        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and runs a privacy transfer in the background."
+        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and submits a privacy transfer."
     )]
     async fn send_funds(
         &self,
@@ -614,8 +610,6 @@ impl CryptoServer {
         })?;
 
         let privacy_key_guard = self.privacy_key.read().await;
-        let from_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
-
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse().map_err(|e| {
             ErrorData::invalid_params(
                 format!(
@@ -626,319 +620,194 @@ impl CryptoServer {
             )
         })?;
 
-        let id = Uuid::new_v4().to_string();
-        let result_id = id.clone();
-        let now_ms = current_timestamp_ms();
-
-        self.tx_store
-            .upsert(TransactionUpsert {
-                id: id.clone(),
-                state: "initiated".to_string(),
-                from_address: Some(from_address.clone()),
-                to_address: Some(params.destination_address.clone()),
-                amount: Some(params.amount.clone()),
-                tx_identifier: None,
-                created_at: now_ms,
-                updated_at: now_ms,
-                error_message: None,
-            })
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let provider = provider.clone();
-        let wallet_ctx = wallet_ctx.clone();
-        let ligero = self.ligero_prover.clone();
-        let tx_store = self.tx_store.clone();
-        let destination_address = params.destination_address.clone();
         let output_pk = output_privacy_addr.to_pk();
         let output_pk_ivk = output_privacy_addr.pk_ivk();
         let viewing_key = midnight_privacy::FullViewingKey(authority_fvk_bytes);
-        let privacy_key = self.privacy_key.clone();
         let authority_fvk_for_transfer = Some(authority_fvk_bytes);
 
-        tokio::spawn(async move {
-            let ctx_guard = wallet_ctx.read().await;
-            let privacy_guard = privacy_key.read().await;
+        let send_amount = params.amount.parse::<u128>().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid amount format: {}", e), None)
+        })?;
 
-            // Parse the requested send amount first
-            let send_amount = match params.amount.parse::<u128>() {
-                Ok(amt) => amt,
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Invalid amount format: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
+        if send_amount == 0 {
+            return Err(ErrorData::invalid_params(
+                "Amount must be greater than 0".to_string(),
+                None,
+            ));
+        }
+
+        let ctx_guard = wallet_ctx.read().await;
+
+        let privacy_result = crate::operations::get_privacy_balance(
+            provider,
+            &*privacy_key_guard,
+            &viewing_key,
+        )
+        .await
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
+        })?;
+
+        if privacy_result.unspent_notes.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "No unspent notes available to send.".to_string(),
+                None,
+            ));
+        }
+
+        // Smart note selection: choose the best note based on the amount
+        // Strategy:
+        // 1. Look for exact match (no change needed)
+        // 2. If no exact match, find smallest note >= send_amount (minimize change)
+        // 3. If no note is large enough, fail with insufficient funds error
+        let note = {
+            let mut exact_match = None;
+            let mut smallest_sufficient = None;
+            let mut smallest_sufficient_value = u128::MAX;
+
+            for n in &privacy_result.unspent_notes {
+                if n.value == send_amount {
+                    // Perfect match found
+                    exact_match = Some(n);
+                    break;
+                } else if n.value > send_amount && n.value < smallest_sufficient_value {
+                    // Track smallest note that's larger than needed
+                    smallest_sufficient = Some(n);
+                    smallest_sufficient_value = n.value;
                 }
-            };
-
-            if send_amount == 0 {
-                let _ = tx_store
-                    .mark_failed(&id, "Amount must be greater than 0", current_timestamp_ms())
-                    .await;
-                return;
             }
 
-            let privacy_result = match crate::operations::get_privacy_balance(
-                &provider,
-                &*privacy_guard,
-                &viewing_key,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to fetch unspent notes: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-
-            if privacy_result.unspent_notes.is_empty() {
-                let _ = tx_store
-                    .mark_failed(
-                        &id,
-                        "No unspent notes available to send.",
-                        current_timestamp_ms(),
-                    )
-                    .await;
-                return;
-            }
-
-            // Smart note selection: choose the best note based on the amount
-            // Strategy:
-            // 1. Look for exact match (no change needed)
-            // 2. If no exact match, find smallest note >= send_amount (minimize change)
-            // 3. If no note is large enough, fail with insufficient funds error
-            let note = {
-                let mut exact_match = None;
-                let mut smallest_sufficient = None;
-                let mut smallest_sufficient_value = u128::MAX;
-
-                for n in &privacy_result.unspent_notes {
-                    if n.value == send_amount {
-                        // Perfect match found
-                        exact_match = Some(n);
-                        break;
-                    } else if n.value > send_amount && n.value < smallest_sufficient_value {
-                        // Track smallest note that's larger than needed
-                        smallest_sufficient = Some(n);
-                        smallest_sufficient_value = n.value;
-                    }
-                }
-
-                match exact_match.or(smallest_sufficient) {
-                    Some(n) => n,
-                    None => {
-                        let total_balance: u128 =
-                            privacy_result.unspent_notes.iter().map(|n| n.value).sum();
-                        let _ = tx_store
-                            .mark_failed(
-                                &id,
-                                &format!(
-                                    "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
-                                    send_amount,
-                                    total_balance,
-                                    privacy_result.unspent_notes.len()
-                                ),
-                                current_timestamp_ms(),
-                            )
-                            .await;
-                        return;
-                    }
-                }
-            };
-
-            tracing::info!(
-                "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
-                note.value,
-                note.tx_hash,
-                if note.value == send_amount {
-                    "exact match"
-                } else {
-                    "smallest sufficient"
-                }
-            );
-
-            let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
-                Ok(bytes) if bytes.len() == 32 => bytes,
-                Ok(bytes) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Invalid rho length ({} bytes)", bytes.len()),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to decode rho: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-
-            let mut input_rho = [0u8; 32];
-            input_rho.copy_from_slice(&rho_bytes);
-            let input_recipient = privacy_guard.recipient(&DOMAIN);
-            let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
-                let bytes = match hex::decode(sender_id_hex.trim_start_matches("0x")) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let _ = tx_store
-                            .mark_failed(
-                                &id,
-                                &format!("Invalid sender_id in note (hex decode failed): {}", e),
-                                current_timestamp_ms(),
-                            )
-                            .await;
-                        return;
-                    }
-                };
-                if bytes.len() != 32 {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!(
-                                "Invalid sender_id length in note (expected 32 bytes, got {})",
-                                bytes.len()
-                            ),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&bytes);
-                out
-            } else {
-                // Deposit-style note: sender_id is derived deterministically as recipient.
-                input_recipient
-            };
-            let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
-
-            tracing::info!(
-                "[send] Input note - value: {}, rho: {}, recipient: {}",
-                note.value,
-                hex::encode(&input_rho),
-                hex::encode(&input_recipient)
-            );
-            tracing::info!(
-                "[send] Output recipient (destination): {}",
-                hex::encode(&output_recipient)
-            );
-
-            if send_amount < note.value {
-                let change_amt = note.value - send_amount;
-                tracing::info!(
-                    "[send] Transfer includes change output - amount: {}",
-                    change_amt
-                );
-            } else {
-                tracing::info!("[send] No change needed - sending full note value");
-            }
-
-            let spend_sk = match privacy_guard.spend_sk().copied() {
-                Some(sk) => sk,
+            match exact_match.or(smallest_sufficient) {
+                Some(n) => n,
                 None => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            "privacy key missing spend_sk; cannot spend note",
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-            let pk_ivk_owner = privacy_guard.pk_ivk(&DOMAIN);
-            let send_res = if let Some(ligero_ref) = ligero.as_ref() {
-                crate::operations::transfer(
-                    ligero_ref,
-                    &provider,
-                    &*ctx_guard,
-                    spend_sk,
-                    pk_ivk_owner,
-                    note.value,
-                    send_amount,
-                    input_rho,
-                    input_sender_id,
-                    output_pk,
-                    output_pk_ivk,
-                    authority_fvk_for_transfer,
-                )
-                .await
-            } else {
-                Err(anyhow::anyhow!(
-                    "Ligero prover not configured; cannot send privacy transfer."
-                ))
-            };
-
-            match send_res {
-                Ok(transfer_result) => {
-                    let _ = tx_store
-                        .upsert(TransactionUpsert {
-                            id: id.clone(),
-                            state: "sent".to_string(),
-                            from_address: Some(from_address.clone()),
-                            to_address: Some(destination_address.clone()),
-                            amount: Some(send_amount.to_string()),
-                            tx_identifier: Some(transfer_result.tx_hash.clone()),
-                            created_at: note.timestamp_ms,
-                            updated_at: current_timestamp_ms(),
-                            error_message: None,
-                        })
-                        .await;
-
-                    if let Ok(tx_details) = crate::operations::get_transaction_status(
-                        &provider,
-                        &transfer_result.tx_hash,
-                    )
-                    .await
-                    {
-                        let (state, error_message) =
-                            map_state_and_error(Some(tx_details.status.clone()));
-                        let _ = tx_store
-                            .update_state(
-                                &id,
-                                &state,
-                                Some(&transfer_result.tx_hash),
-                                error_message.as_deref(),
-                                current_timestamp_ms(),
-                            )
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to submit privacy transfer: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
+                    let total_balance: u128 =
+                        privacy_result.unspent_notes.iter().map(|n| n.value).sum();
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
+                            send_amount,
+                            total_balance,
+                            privacy_result.unspent_notes.len()
+                        ),
+                        None,
+                    ));
                 }
             }
-        });
+        };
 
+        tracing::info!(
+            "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
+            note.value,
+            note.tx_hash,
+            if note.value == send_amount {
+                "exact match"
+            } else {
+                "smallest sufficient"
+            }
+        );
+
+        let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            Ok(bytes) => {
+                return Err(ErrorData::internal_error(
+                    format!("Invalid rho length ({} bytes)", bytes.len()),
+                    None,
+                ));
+            }
+            Err(e) => {
+                return Err(ErrorData::internal_error(
+                    format!("Failed to decode rho: {}", e),
+                    None,
+                ));
+            }
+        };
+
+        let mut input_rho = [0u8; 32];
+        input_rho.copy_from_slice(&rho_bytes);
+        let input_recipient = privacy_key_guard.recipient(&DOMAIN);
+        let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
+            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Invalid sender_id in note (hex decode failed): {}", e),
+                    None,
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Invalid sender_id length in note (expected 32 bytes, got {})",
+                        bytes.len()
+                    ),
+                    None,
+                ));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        } else {
+            // Deposit-style note: sender_id is derived deterministically as recipient.
+            input_recipient
+        };
+        let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
+
+        tracing::info!(
+            "[send] Input note - value: {}, rho: {}, recipient: {}",
+            note.value,
+            hex::encode(&input_rho),
+            hex::encode(&input_recipient)
+        );
+        tracing::info!(
+            "[send] Output recipient (destination): {}",
+            hex::encode(&output_recipient)
+        );
+
+        if send_amount < note.value {
+            let change_amt = note.value - send_amount;
+            tracing::info!(
+                "[send] Transfer includes change output - amount: {}",
+                change_amt
+            );
+        } else {
+            tracing::info!("[send] No change needed - sending full note value");
+        }
+
+        let spend_sk = privacy_key_guard.spend_sk().copied().ok_or_else(|| {
+            ErrorData::internal_error(
+                "privacy key missing spend_sk; cannot spend note".to_string(),
+                None,
+            )
+        })?;
+        let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
+        let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Ligero prover not configured; cannot send privacy transfer.".to_string(),
+                None,
+            )
+        })?;
+        let transfer_result = crate::operations::transfer(
+            ligero_ref,
+            provider,
+            &*ctx_guard,
+            spend_sk,
+            pk_ivk_owner,
+            note.value,
+            send_amount,
+            input_rho,
+            input_sender_id,
+            output_pk,
+            output_pk_ivk,
+            authority_fvk_for_transfer,
+        )
+        .await
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
+        })?;
+
+        let id = transfer_result.tx_hash.clone();
         let result = SendFundsResult {
-            id: result_id,
-            tx_identifier: None,
-            tx_hash: None,
+            id,
+            tx_identifier: Some(transfer_result.tx_hash.clone()),
+            tx_hash: Some(transfer_result.tx_hash),
             note_tx_hash: None,
             note_tx_identifier: None,
             note_amount: None,
@@ -1059,7 +928,7 @@ impl CryptoServer {
             )
         })?;
 
-        // Allow lookup by either tx_hash or the UUIDv5 id we expose in getTransactions/send
+        // Allow lookup by either tx_hash or a UUIDv5 derived from the tx hash (legacy helper)
         let tx_hash = if Uuid::parse_str(&params.tx_hash).is_ok() {
             let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -1125,13 +994,12 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the status of a transaction by local database ID.
-    /// Uses the in-memory SQLite store as the source of truth and refreshes from the indexer when possible.
+    /// Get the status of a transaction by its transaction hash.
     #[tool(
         name = "getTransactionStatus",
-        description = "Get the status of a transaction by its local database ID. Returns stored state and txIdentifier once available."
+        description = "Get the status of a transaction by its hash. Returns the latest indexed state and txIdentifier."
     )]
-    async fn get_transaction_status_db(
+    async fn get_transaction_status(
         &self,
         Parameters(params): Parameters<GetTransactionStatusRequest>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1142,64 +1010,12 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                None,
-            )
-        })?;
-
-        let ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
-
-        // Keep local store in sync with indexer before reading the record
-        let _ = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        let mut stored = self
-            .tx_store
-            .get_by_id(&params.id)
+        let tx_details = crate::operations::get_transaction_status(provider, &params.id)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("Transaction with id {} not found in local store", params.id),
-                    None,
-                )
-            })?;
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let record = details_to_record(tx_details);
 
-        if let Some(ref tx_identifier) = stored.tx_identifier {
-            if stored.state != "completed" && stored.state != "failed" {
-                if let Ok(tx_details) =
-                    crate::operations::get_transaction_status(provider, tx_identifier).await
-                {
-                    let (state, error_message) =
-                        map_state_and_error(Some(tx_details.status.clone()));
-                    let _ = self
-                        .tx_store
-                        .update_state(
-                            &stored.id,
-                            &state,
-                            Some(tx_identifier.as_str()),
-                            error_message.as_deref(),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-
-                    stored = self
-                        .tx_store
-                        .get_by_id(&params.id)
-                        .await
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-                        .unwrap_or(stored);
-                }
-            }
-        }
-
-        let result = GetTransactionStatusResult {
-            transaction: stored_to_record(stored),
-        };
+        let result = GetTransactionStatusResult { transaction: record };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
@@ -1207,7 +1023,7 @@ impl CryptoServer {
     }
 
     /// Get all transactions for the privacy pool.
-    /// Returns transactions from the local database, filtered by the current privacy pool address.
+    /// Returns transactions from the indexer filtered to the current privacy pool address.
     #[tool(
         name = "getTransactions",
         description = "Get all transactions for the privacy pool. Retrieves all transactions (deposits, transfers, withdrawals) associated with the current privacy pool address."
@@ -1233,38 +1049,13 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        // Sync with indexer (this now only syncs privacy pool transactions)
-        self.sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        // Get current privacy pool address
-        let privacy_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
-
-        // Get all transactions from DB
-        let stored = self
-            .tx_store
-            .list_all()
+        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        // Filter to only include transactions for the current privacy pool address
-        let transaction_records: Vec<TransactionRecord> = stored
+        let transaction_records: Vec<TransactionRecord> = transactions
             .into_iter()
-            .filter(|tx| {
-                // Include transaction if from_address or to_address matches privacy pool address
-                let from_matches = tx
-                    .from_address
-                    .as_ref()
-                    .map(|addr| addr == &privacy_address)
-                    .unwrap_or(false);
-                let to_matches = tx
-                    .to_address
-                    .as_ref()
-                    .map(|addr| addr == &privacy_address)
-                    .unwrap_or(false);
-                from_matches || to_matches
-            })
-            .map(stored_to_record)
+            .map(transaction_to_record)
             .collect();
 
         let result = GetTransactionsResult {
@@ -1387,7 +1178,7 @@ impl CryptoServer {
         })?;
 
         provider
-            .register_vfk(&authority_vfk_hex, Some(&privacy_address))
+            .register_vfk(&authority_fvk_hex, Some(&privacy_address))
             .await
             .map_err(|e| {
                 ErrorData::internal_error(
@@ -1448,7 +1239,7 @@ impl CryptoServer {
 
         let result = CreateWalletResult {
             wallet_private_key: wallet_private_key_hex,
-            authority_vfk: authority_vfk_hex,
+            authority_vfk: authority_fvk_hex,
             privacy_spend_key: privacy_spend_key_hex,
             privacy_address,
         };
@@ -1564,7 +1355,7 @@ impl CryptoServer {
             )
         })?;
 
-        let ctx = wallet_ctx.read().await;
+        let _ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
         // Get the current privacy balance to include in status
@@ -1588,29 +1379,19 @@ impl CryptoServer {
             0
         };
 
-        let sync_summary = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        let total = sync_summary.total.max(1);
-        let completed = total.saturating_sub(sync_summary.pending);
-        let percentage = if sync_summary.total == 0 {
-            100.0
-        } else {
-            (completed as f64 / total as f64) * 100.0
+        let sync_progress = SyncProgressInfo {
+            synced: true,
+            lag: LagInfoData {
+                apply_gap: "0".to_string(),
+                source_gap: "0".to_string(),
+            },
+            percentage: 100.0,
         };
 
         let result = GetWalletStatusResult {
             ready: true,
-            syncing: !sync_summary.is_synced,
-            sync_progress: SyncProgressInfo {
-                synced: sync_summary.is_synced,
-                lag: LagInfoData {
-                    apply_gap: sync_summary.pending.to_string(),
-                    source_gap: "0".to_string(),
-                },
-                percentage,
-            },
+            syncing: false,
+            sync_progress,
             address: privacy_key_guard.privacy_address(&DOMAIN).to_string(),
             balances: BalancesInfo {
                 balance: privacy_balance.to_string(),
@@ -1619,7 +1400,7 @@ impl CryptoServer {
             recovering: false,
             recovery_attempts: 0,
             max_recovery_attempts: 0,
-            is_fully_synced: sync_summary.is_synced,
+            is_fully_synced: true,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1644,16 +1425,6 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                None,
-            )
-        })?;
-
-        let ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
-
         // Get FVK if available for decryption
         let authority_fvk_guard = self.authority_fvk.read().await;
         let fvk_hex = if let Some(ref authority_fvk) = *authority_fvk_guard {
@@ -1667,23 +1438,15 @@ impl CryptoServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let sync_summary = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
         let result = VerifyTransactionResult {
             exists: verify_result.exists,
             sync_status: VerifySyncStatus {
-                synced_indices: if sync_summary.is_synced {
-                    "all".to_string()
-                } else {
-                    "partial".to_string()
-                },
+                synced_indices: "all".to_string(),
                 lag: VerifyLagInfo {
-                    apply_gap: sync_summary.pending.to_string(),
+                    apply_gap: "0".to_string(),
                     source_gap: "0".to_string(),
                 },
-                is_fully_synced: sync_summary.is_synced,
+                is_fully_synced: true,
             },
             transaction_amount: verify_result.transaction_amount,
         };
@@ -1865,24 +1628,6 @@ impl ServerHandler for CryptoServer {
     }
 }
 
-impl CryptoServer {
-    async fn sync_with_indexer(
-        &self,
-        provider: &Provider,
-        ctx: &McpWalletContext,
-        privacy_key: &PrivacyKey,
-    ) -> Result<SyncSummary, ErrorData> {
-        sync_with_indexer_impl(provider, ctx, privacy_key, &self.tx_store).await
-    }
-}
-
-fn current_timestamp_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 fn map_state_and_error(status: Option<String>) -> (String, Option<String>) {
     match status {
         Some(raw) => {
@@ -1912,54 +1657,57 @@ fn reveal_or_encrypted(value: Option<String>) -> String {
     }
 }
 
-fn stored_to_record(row: StoredTransaction) -> TransactionRecord {
+fn record_from_indexer(
+    tx_hash: String,
+    status: Option<String>,
+    timestamp_ms: i64,
+    sender: Option<String>,
+    recipient: Option<String>,
+    privacy_sender: Option<String>,
+    privacy_recipient: Option<String>,
+    amount: Option<String>,
+) -> TransactionRecord {
+    let (state, error_message) = map_state_and_error(status.clone());
+    let from_address = privacy_sender.or(sender);
+    let to_address = privacy_recipient.or(recipient);
+
     TransactionRecord {
-        id: row.id,
-        state: row.state,
-        from_address: reveal_or_encrypted(row.from_address),
-        to_address: reveal_or_encrypted(row.to_address),
-        amount: reveal_or_encrypted(row.amount),
-        tx_identifier: row.tx_identifier,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        error_message: row.error_message,
+        id: tx_hash.clone(),
+        state,
+        from_address: reveal_or_encrypted(from_address),
+        to_address: reveal_or_encrypted(to_address),
+        amount: reveal_or_encrypted(amount),
+        tx_identifier: Some(tx_hash),
+        created_at: timestamp_ms,
+        updated_at: timestamp_ms,
+        error_message,
     }
 }
 
-pub(crate) async fn sync_with_indexer_impl(
-    provider: &Provider,
-    ctx: &McpWalletContext,
-    privacy_key: &PrivacyKey,
-    store: &TransactionStore,
-) -> Result<SyncSummary, ErrorData> {
-    let transactions = crate::operations::get_transactions(provider, ctx, privacy_key)
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+fn transaction_to_record(tx: crate::operations::Transaction) -> TransactionRecord {
+    record_from_indexer(
+        tx.tx_hash,
+        tx.status,
+        tx.timestamp_ms,
+        tx.sender,
+        tx.recipient,
+        tx.privacy_sender,
+        tx.privacy_recipient,
+        tx.amount,
+    )
+}
 
-    for tx in transactions {
-        let (state, error_message) = map_state_and_error(tx.status);
-        let upsert = TransactionUpsert {
-            id: Uuid::new_v5(&Uuid::NAMESPACE_OID, tx.tx_hash.as_bytes()).to_string(),
-            state,
-            from_address: tx.sender,
-            to_address: tx.recipient,
-            amount: tx.amount,
-            tx_identifier: Some(tx.tx_hash),
-            created_at: tx.timestamp_ms,
-            updated_at: tx.timestamp_ms,
-            error_message,
-        };
-
-        store
-            .upsert(upsert)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-    }
-
-    store
-        .summary()
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+fn details_to_record(details: crate::operations::TransactionDetails) -> TransactionRecord {
+    record_from_indexer(
+        details.tx_hash,
+        Some(details.status),
+        details.timestamp_ms.unwrap_or_default(),
+        details.sender,
+        details.recipient,
+        details.privacy_sender,
+        details.privacy_recipient,
+        details.amount,
+    )
 }
 
 #[allow(dead_code)]

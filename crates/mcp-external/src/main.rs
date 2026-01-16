@@ -9,7 +9,6 @@ mod operations;
 mod privacy_key;
 mod provider;
 mod server;
-mod tx_store;
 mod viewer;
 mod wallet;
 
@@ -17,8 +16,6 @@ mod wallet;
 mod test_utils;
 
 use std::sync::Arc;
-use std::time::Duration;
-
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
@@ -27,9 +24,7 @@ use crate::config::Config;
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::server::sync_with_indexer_impl;
 use crate::server::CryptoServer;
-use crate::tx_store::TransactionStore;
 use crate::wallet::WalletContext;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
@@ -159,9 +154,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let privacy_key = Arc::new(RwLock::new(privacy_key));
 
-    // In-memory transaction store
-    let tx_store = Arc::new(TransactionStore::new_in_memory().await?);
-
     let auto_fund_deposit_amount = cfg
         .auto_fund_deposit_amount
         .as_deref()
@@ -200,7 +192,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ligero_for_service = ligero.clone();
     let authority_fvk_for_service = authority_fvk.clone();
     let privacy_key_for_service = privacy_key.clone();
-    let tx_store_for_service = tx_store.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
 
@@ -213,7 +204,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ligero_for_service.clone(),
                 authority_fvk_for_service.clone(),
                 privacy_key_for_service.clone(),
-                tx_store_for_service.clone(),
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
             ))
@@ -224,34 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
-
-    // Background sync loop to keep the in-memory DB aligned with the indexer
-    {
-        let sync_provider = provider.clone();
-        let sync_wallet = wallet_ctx.clone();
-        let sync_privacy_key = privacy_key.clone();
-        let sync_store = tx_store.clone();
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(30);
-            loop {
-                {
-                    let ctx_guard = sync_wallet.read().await;
-                    let privacy_guard = sync_privacy_key.read().await;
-                    if let Err(e) = sync_with_indexer_impl(
-                        &sync_provider,
-                        &*ctx_guard,
-                        &*privacy_guard,
-                        &sync_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Background sync failed: {}", e.message);
-                    }
-                }
-                tokio::time::sleep(interval).await;
-            }
-        });
-    }
 
     tracing::info!(
         "[mcp] Server started successfully! Listening on http://{}",
