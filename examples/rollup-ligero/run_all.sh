@@ -58,17 +58,60 @@ start_service() {
   echo "Started $name (pid $pid)"
 }
 
+kill_tree() {
+  local pid="$1"
+  local signal="${2:-TERM}"
+  # Kill children first (works on macOS and Linux)
+  pkill -"$signal" -P "$pid" 2>/dev/null || true
+  # Then kill the parent
+  kill -"$signal" "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   local exit_code=$?
   set +e
   if [ "${#PIDS[@]}" -gt 0 ]; then
     echo ""
-    echo "Stopping services..."
-    for pid in "${PIDS[@]}"; do
+    echo "Stopping services (SIGTERM)..."
+    for i in "${!PIDS[@]}"; do
+      local pid="${PIDS[$i]}"
+      local name="${NAMES[$i]}"
       if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
+        echo "  Stopping $name (pid $pid)..."
+        kill_tree "$pid" TERM
       fi
     done
+
+    # Wait up to 10 seconds for graceful shutdown
+    local grace_period=10
+    local waited=0
+    while (( waited < grace_period )); do
+      local still_running=0
+      for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+          still_running=1
+          break
+        fi
+      done
+      if (( still_running == 0 )); then
+        echo "All services stopped gracefully."
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      echo "  Waiting for services to stop... ($waited/$grace_period)"
+    done
+
+    # Force kill any remaining processes
+    for i in "${!PIDS[@]}"; do
+      local pid="${PIDS[$i]}"
+      local name="${NAMES[$i]}"
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "  Force killing $name (pid $pid)..."
+        kill_tree "$pid" KILL
+      fi
+    done
+
     wait 2>/dev/null || true
   fi
   exit "$exit_code"

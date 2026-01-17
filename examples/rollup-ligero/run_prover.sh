@@ -43,12 +43,15 @@ fi
 # Cargo uses the first 7 characters of the commit hash for subdirectories
 LIGERO_REV_SHORT="${LIGERO_REV:0:7}"
 
-# Find the checkout: ~/.cargo/git/checkouts/ligero-prover-<url-hash>/<commit-prefix>/
+# Resolve cargo home (respects CARGO_HOME for CI/Nix/isolated builds)
+CARGO_GIT_CHECKOUTS="${CARGO_HOME:-$HOME/.cargo}/git/checkouts"
+
+# Find the checkout: $CARGO_HOME/git/checkouts/ligero-prover-<url-hash>/<commit-prefix>/
 # First find the ligero-prover repo checkout (hash based on git URL)
-LIGERO_REPO=$(find ~/.cargo/git/checkouts -maxdepth 1 -type d -name "ligero-prover-*" 2>/dev/null | head -1)
+LIGERO_REPO=$(find "$CARGO_GIT_CHECKOUTS" -maxdepth 1 -type d -name "ligero-prover-*" 2>/dev/null | head -1)
 
 if [[ -z "$LIGERO_REPO" ]]; then
-    echo "❌ Could not find ligero-prover repo in ~/.cargo/git/checkouts/"
+    echo "❌ Could not find ligero-prover repo in $CARGO_GIT_CHECKOUTS/"
     echo "   Make sure you've run 'cargo build' at least once to fetch dependencies."
     exit 1
 fi
