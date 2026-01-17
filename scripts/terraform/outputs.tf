@@ -1,0 +1,97 @@
+# =============================================================================
+# Output Values
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# VPC Outputs
+# -----------------------------------------------------------------------------
+
+output "vpc_id" {
+  description = "ID of the VPC"
+  value       = aws_vpc.main.id
+}
+
+output "vpc_cidr" {
+  description = "CIDR block of the VPC"
+  value       = aws_vpc.main.cidr_block
+}
+
+# -----------------------------------------------------------------------------
+# Subnet Outputs
+# -----------------------------------------------------------------------------
+
+output "public_subnet_ids" {
+  description = "IDs of the public subnets"
+  value       = aws_subnet.public[*].id
+}
+
+output "private_subnet_ids" {
+  description = "IDs of the private subnets"
+  value       = aws_subnet.private[*].id
+}
+
+output "public_subnet_cidrs" {
+  description = "CIDR blocks of the public subnets"
+  value       = aws_subnet.public[*].cidr_block
+}
+
+output "private_subnet_cidrs" {
+  description = "CIDR blocks of the private subnets"
+  value       = aws_subnet.private[*].cidr_block
+}
+
+# -----------------------------------------------------------------------------
+# Internet Gateway Output
+# -----------------------------------------------------------------------------
+
+output "internet_gateway_id" {
+  description = "ID of the Internet Gateway"
+  value       = aws_internet_gateway.main.id
+}
+
+# -----------------------------------------------------------------------------
+# Security Group Outputs
+# -----------------------------------------------------------------------------
+
+output "default_security_group_id" {
+  description = "ID of the default security group"
+  value       = aws_default_security_group.default.id
+}
+
+output "web_server_security_group_id" {
+  description = "ID of the web server security group"
+  value       = aws_security_group.web_server.id
+}
+
+# -----------------------------------------------------------------------------
+# EC2 Instance Outputs
+# -----------------------------------------------------------------------------
+
+output "instance_id" {
+  description = "ID of the EC2 instance"
+  value       = aws_instance.main.id
+}
+
+output "instance_private_ip" {
+  description = "Private IP address of the EC2 instance"
+  value       = aws_instance.main.private_ip
+}
+
+output "instance_public_ip" {
+  description = "Public IP address of the EC2 instance"
+  value       = aws_instance.main.public_ip
+}
+
+output "instance_public_dns" {
+  description = "Public DNS name of the EC2 instance"
+  value       = aws_instance.main.public_dns
+}
+
+# -----------------------------------------------------------------------------
+# Connection Information
+# -----------------------------------------------------------------------------
+
+output "ssh_connection_command" {
+  description = "SSH command to connect to the instance"
+  value       = "ssh -i <path-to-private-key> ubuntu@${aws_instance.main.public_ip}"
+}
