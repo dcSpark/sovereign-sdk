@@ -27,8 +27,8 @@ bincode.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "a581a9ca85ab8365fafae017022103fed98d43b3" }
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "a581a9ca85ab8365fafae017022103fed98d43b3", features = ["native"] }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "01a2fc5a9c000003ca91cc6017871724b65e7a7f" }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "01a2fc5a9c000003ca91cc6017871724b65e7a7f", features = ["native"] }
 
 # Sovereign SDK dependencies for wallet integration
 sov-cli = { workspace = true }

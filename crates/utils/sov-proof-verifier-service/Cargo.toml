@@ -73,7 +73,7 @@ midnight-privacy = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 
 # Daemon-mode verifier pool (keeps `webgpu_verifier --daemon` workers warm)
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "a581a9ca85ab8365fafae017022103fed98d43b3" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "01a2fc5a9c000003ca91cc6017871724b65e7a7f" }
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }

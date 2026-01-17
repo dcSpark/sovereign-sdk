@@ -27,14 +27,47 @@ KEEP_PROOF_DIRS="${PROVER_KEEP_PROOF_DIRS:-}"
 export RUST_LOG="${RUST_LOG:-info}"
 
 # -----------------------------------------------------------------------------
-# Find ligero-prover git checkout
+# Find ligero-prover git checkout (dynamically from Cargo.toml)
 # -----------------------------------------------------------------------------
 
-# The ligero-runner crate is fetched as a git dependency - find its location
-LIGERO_CHECKOUT=$(find ~/.cargo/git/checkouts/ligero-prover-* -maxdepth 1 -type d -name "a581a9c*" 2>/dev/null | head -1)
+CARGO_TOML="$SCRIPT_DIR/Cargo.toml"
+
+# Extract the ligero-runner rev from Cargo.toml
+LIGERO_REV=$(grep 'ligero-runner' "$CARGO_TOML" | grep -oE '[a-f0-9]{40}' | head -1)
+
+if [[ -z "$LIGERO_REV" ]]; then
+    echo "❌ Could not find ligero-runner rev in $CARGO_TOML"
+    exit 1
+fi
+
+# Cargo uses the first 7 characters of the commit hash for subdirectories
+LIGERO_REV_SHORT="${LIGERO_REV:0:7}"
+
+# Find the checkout: ~/.cargo/git/checkouts/ligero-prover-<url-hash>/<commit-prefix>/
+# First find the ligero-prover repo checkout (hash based on git URL)
+LIGERO_REPO=$(find ~/.cargo/git/checkouts -maxdepth 1 -type d -name "ligero-prover-*" 2>/dev/null | head -1)
+
+if [[ -z "$LIGERO_REPO" ]]; then
+    echo "❌ Could not find ligero-prover repo in ~/.cargo/git/checkouts/"
+    echo "   Make sure you've run 'cargo build' at least once to fetch dependencies."
+    exit 1
+fi
+
+# Then find the commit subdirectory (try exact match first, then any available)
+LIGERO_CHECKOUT=$(find "$LIGERO_REPO" -maxdepth 1 -type d -name "${LIGERO_REV_SHORT}*" 2>/dev/null | head -1)
 
 if [[ -z "$LIGERO_CHECKOUT" ]]; then
-    echo "❌ Could not find ligero-prover git checkout."
+    # Fallback: use any available commit checkout (there's usually only one)
+    LIGERO_CHECKOUT=$(find "$LIGERO_REPO" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+    if [[ -n "$LIGERO_CHECKOUT" ]]; then
+        FOUND_REV=$(basename "$LIGERO_CHECKOUT")
+        echo "⚠️  Warning: Expected commit $LIGERO_REV_SHORT but found $FOUND_REV"
+        echo "   Run 'cargo build' to fetch the correct version, or using available checkout."
+    fi
+fi
+
+if [[ -z "$LIGERO_CHECKOUT" ]]; then
+    echo "❌ Could not find any commit checkout in $LIGERO_REPO"
     echo "   Make sure you've run 'cargo build' at least once to fetch dependencies."
     exit 1
 fi
