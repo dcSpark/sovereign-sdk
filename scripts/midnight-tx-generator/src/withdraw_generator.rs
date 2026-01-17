@@ -7,7 +7,7 @@ use midnight_privacy::{
     EncryptedNote, Hash32, MerkleTree, PrivacyAddress, SpendPublic, ViewAttestation,
 };
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_ligero_adapter::Ligero;
@@ -27,6 +27,91 @@ type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
 const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+
+/// Request body for the prover service
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProverServiceRequest {
+    circuit: String,
+    args: serde_json::Value,
+    private_indices: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packing: Option<u32>,
+}
+
+/// Response from the prover service
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProverServiceResponse {
+    success: bool,
+    exit_code: i32,
+    proof: Option<String>,
+}
+
+/// Generate proof using the remote prover service and wrap it in a LigeroProofPackage.
+fn prove_with_service(
+    service_url: &str,
+    program_path: &str,
+    args: &[serde_json::Value],
+    private_indices: Vec<usize>,
+    packing: u32,
+    public_output: &[u8],
+) -> Result<Vec<u8>> {
+    use base64::Engine;
+    use sov_ligero_adapter::LigeroProofPackage;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for proving
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let request = ProverServiceRequest {
+        circuit: program_path.to_string(),
+        args: serde_json::Value::Array(args.to_vec()),
+        private_indices: private_indices.clone(),
+        packing: Some(packing),
+    };
+
+    let url = format!("{}/prove", service_url.trim_end_matches('/'));
+    let response = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .context("Failed to send request to prover service")?;
+
+    let status = response.status();
+    let resp: ProverServiceResponse = response
+        .json()
+        .context("Failed to parse prover service response")?;
+
+    if !resp.success {
+        anyhow::bail!(
+            "Prover service failed (status={}, exit_code={})",
+            status,
+            resp.exit_code
+        );
+    }
+
+    let proof_b64 = resp
+        .proof
+        .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
+
+    let proof_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&proof_b64)
+        .context("Failed to decode proof from base64")?;
+
+    // Wrap the raw proof bytes in a LigeroProofPackage (same as the local prover does)
+    let args_json = serde_json::to_vec(args).context("Failed to serialize args")?;
+    let package = LigeroProofPackage::new(
+        proof_bytes,
+        public_output.to_vec(),
+        args_json,
+        private_indices,
+    )
+    .context("Failed to build LigeroProofPackage")?;
+
+    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+}
 
 /// Helper to create an EncryptedNote for the transaction (matching mcp-external/viewer.rs)
 fn create_encrypted_note(
@@ -416,20 +501,38 @@ fn main() -> Result<()> {
         viewer_atts.as_deref(),
     )?;
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_packing(packing)
-        .with_private_indices(private_indices);
-    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
-
     let mut public_output = public_output;
     public_output.blacklist_root = blacklist_root;
     public_output.view_attestations = view_attestations_pub;
-    host.set_public_output(&public_output)?;
 
-    println!("Generating proof...");
-    let proof_bytes = host
-        .run(true)
-        .context("Ligero prover did not produce a valid proof")?;
+    // Serialize public output for the proof package
+    let public_output_bytes =
+        bincode::serialize(&public_output).context("Failed to serialize public output")?;
+
+    // Check if we should use the remote prover service
+    let prover_service_url = std::env::var("PROVER_SERVICE_URL").ok();
+
+    let proof_bytes = if let Some(service_url) = prover_service_url {
+        println!("Generating proof via prover service ({})...", service_url);
+        prove_with_service(
+            &service_url,
+            &program_path,
+            &args,
+            private_indices,
+            packing,
+            &public_output_bytes,
+        )?
+    } else {
+        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
+            .with_packing(packing)
+            .with_private_indices(private_indices);
+        note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
+        host.set_public_output(&public_output)?;
+
+        println!("Generating proof (local)...");
+        host.run(true)
+            .context("Ligero prover did not produce a valid proof")?
+    };
     println!("✓ Proof generated: {} bytes", proof_bytes.len());
 
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =

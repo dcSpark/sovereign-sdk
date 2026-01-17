@@ -17,20 +17,20 @@ sov-proof-verifier-service = { path = "../sov-proof-verifier-service" }
 sov-rollup-interface = { workspace = true }
 demo-stf = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c", features = ["native"] }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd", features = ["native"] }
 sov-api-spec = { workspace = true }
 sov-cli = { workspace = true }
 sov-test-utils = { workspace = true }
 sov-rollup-ligero = { path = "../../../examples/rollup-ligero" }
 # Daemon-mode Ligero prover support
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
 borsh = { workspace = true, features = ["bytes", "derive"] }
 bincode = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 num_cpus = "1.16"
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "blocking"] }
 toml = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tempfile = { workspace = true }

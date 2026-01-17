@@ -58,17 +58,60 @@ start_service() {
   echo "Started $name (pid $pid)"
 }
 
+kill_tree() {
+  local pid="$1"
+  local signal="${2:-TERM}"
+  # Kill children first (works on macOS and Linux)
+  pkill -"$signal" -P "$pid" 2>/dev/null || true
+  # Then kill the parent
+  kill -"$signal" "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   local exit_code=$?
   set +e
   if [ "${#PIDS[@]}" -gt 0 ]; then
     echo ""
-    echo "Stopping services..."
-    for pid in "${PIDS[@]}"; do
+    echo "Stopping services (SIGTERM)..."
+    for i in "${!PIDS[@]}"; do
+      local pid="${PIDS[$i]}"
+      local name="${NAMES[$i]}"
       if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
+        echo "  Stopping $name (pid $pid)..."
+        kill_tree "$pid" TERM
       fi
     done
+
+    # Wait up to 10 seconds for graceful shutdown
+    local grace_period=10
+    local waited=0
+    while (( waited < grace_period )); do
+      local still_running=0
+      for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+          still_running=1
+          break
+        fi
+      done
+      if (( still_running == 0 )); then
+        echo "All services stopped gracefully."
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      echo "  Waiting for services to stop... ($waited/$grace_period)"
+    done
+
+    # Force kill any remaining processes
+    for i in "${!PIDS[@]}"; do
+      local pid="${PIDS[$i]}"
+      local name="${NAMES[$i]}"
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "  Force killing $name (pid $pid)..."
+        kill_tree "$pid" KILL
+      fi
+    done
+
     wait 2>/dev/null || true
   fi
   exit "$exit_code"
@@ -110,6 +153,14 @@ if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
   MCP_PORT="4000"
 fi
 
+PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
+PROVER_HOST="${PROVER_BIND%:*}"
+PROVER_PORT="${PROVER_BIND##*:}"
+if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
+  PROVER_HOST="$PROVER_BIND"
+  PROVER_PORT="1313"
+fi
+
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "${PIDS[0]}"
@@ -125,6 +176,10 @@ wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "${PIDS[2]}"
 echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
 wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "${PIDS[3]}"
+
+echo "Starting prover..."
+start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
+wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "${PIDS[4]}"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."
