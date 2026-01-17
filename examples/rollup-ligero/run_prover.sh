@@ -94,12 +94,15 @@ if [[ -n "$THREADS" ]]; then
 fi
 echo ""
 
+# Determine target directory (honor CARGO_TARGET_DIR if set)
+TARGET_DIR="${CARGO_TARGET_DIR:-$RUNNER_DIR/target}"
+
 # Build the binary from the git checkout
 echo "Building ligero-http-server..."
-cargo build --release --manifest-path "$RUNNER_DIR/Cargo.toml" --bin ligero-http-server
+cargo build --release --manifest-path "$RUNNER_DIR/Cargo.toml" --target-dir "$TARGET_DIR" --bin ligero-http-server
 
-# The binary is in the ligero-webgpu-runner's target directory
-BINARY="$RUNNER_DIR/target/release/ligero-http-server"
+# The binary is in the target directory
+BINARY="$TARGET_DIR/release/ligero-http-server"
 
 if [[ ! -x "$BINARY" ]]; then
     echo "❌ Binary not found at: $BINARY"

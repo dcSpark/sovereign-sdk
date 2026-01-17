@@ -8,8 +8,13 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Use remote prover service by default (daemon mode - faster for multiple proofs)
+# Set PROVER_SERVICE_URL="" to use local prover binary instead
+PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-http://127.0.0.1:1313}"
+
 # Best-effort: auto-discover the Ligero portable `webgpu_prover` binary from the Cargo git checkout.
 # This avoids relying on PATH while keeping Sovereign free of extra Ligero env vars.
+# Skip discovery if using remote prover service.
 discover_ligero_prover_bin() {
   command -v python3 >/dev/null 2>&1 || return 1
   python3 - <<'PY'
@@ -48,11 +53,16 @@ print(cands[0])
 PY
 }
 
-if [ -z "${LIGERO_PROVER_BIN:-}" ] && [ -z "${LIGERO_PROVER_BINARY_PATH:-}" ]; then
-  DISCOVERED_PROVER_BIN="$(discover_ligero_prover_bin || true)"
-  if [ -n "$DISCOVERED_PROVER_BIN" ]; then
-    export LIGERO_PROVER_BINARY_PATH="$DISCOVERED_PROVER_BIN"
+# Only discover local prover if not using remote prover service
+if [ -z "$PROVER_SERVICE_URL" ]; then
+  if [ -z "${LIGERO_PROVER_BIN:-}" ] && [ -z "${LIGERO_PROVER_BINARY_PATH:-}" ]; then
+    DISCOVERED_PROVER_BIN="$(discover_ligero_prover_bin || true)"
+    if [ -n "$DISCOVERED_PROVER_BIN" ]; then
+      export LIGERO_PROVER_BINARY_PATH="$DISCOVERED_PROVER_BIN"
+    fi
   fi
+else
+  export PROVER_SERVICE_URL
 fi
 
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -126,6 +136,11 @@ echo "Parameters:"
 echo "  Nonce: $NONCE"
 echo "  Sequencer: $NODE_API_URL"
 echo "  Worker:    $VERIFIER_ENDPOINT"
+if [ -n "$PROVER_SERVICE_URL" ]; then
+    echo "  Prover:    $PROVER_SERVICE_URL (remote)"
+else
+    echo "  Prover:    local binary"
+fi
 if [ -n "$AUTHORITY_FVK" ]; then
     echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
 fi

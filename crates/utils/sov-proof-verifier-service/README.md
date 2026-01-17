@@ -91,13 +91,14 @@ cargo build --release
 ### Run the Service
 
 ```bash
-# Default configuration
+# Default configuration (uses remote prover service at localhost:1313)
 ./target/release/proof-verifier
 
-# Custom configuration
+# Custom configuration with remote prover service
 ./target/release/proof-verifier \
     --bind 0.0.0.0:8080 \
     --node-rpc-url http://127.0.0.1:12346 \
+    --prover-service-url http://localhost:1313 \
     --signing-key-path ../test-data/keys/token_deployer_private_key.json \
     --method-id 0x1234... \
     --max-concurrent 10 \

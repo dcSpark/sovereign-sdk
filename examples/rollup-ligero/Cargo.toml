@@ -90,7 +90,7 @@ toml = { workspace = true }
 tiny_http = "0.12"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # ligero-runner for the prover service binary
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "01a2fc5a9c000003ca91cc6017871724b65e7a7f" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
 
 [dev-dependencies]
 sov-eth-client = { workspace = true }

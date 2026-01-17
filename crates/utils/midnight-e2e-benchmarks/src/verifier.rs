@@ -43,6 +43,7 @@ pub async fn start_local_verifier(
         chain_id: 1,
         da_connection_string: da_connection_string.to_string(),
         defer_sequencer_submission,
+        prover_service_url: None, // Use local daemon pool for benchmarks
     };
 
     let state = AppState::new(verifier_cfg)
