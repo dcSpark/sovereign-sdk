@@ -18,6 +18,7 @@ pub async fn backfill_index(
     da: &DatabaseConnection,
     idx: &DatabaseConnection,
     fvk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<()> {
     let last = db::get_last_processed_id(idx).await?.unwrap_or(0);
     let rows = worker_verified_transactions::Entity::find()
@@ -69,11 +70,15 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !fvk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-            } else {
-                None
-            };
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx,
+                fvk_registry,
+                encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
 
             // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
@@ -131,11 +136,15 @@ pub async fn backfill_index(
                     .encrypted_notes_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
-                let decrypted_notes = if !fvk_registry.is_empty() {
-                    viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-                } else {
-                    None
-                };
+                viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                    idx,
+                    fvk_registry,
+                    encrypted_notes.as_ref(),
+                    fvk_service,
+                )
+                .await?;
+                let decrypted_notes =
+                    viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
                 let privacy_sender =
                     extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
@@ -187,11 +196,15 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !fvk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-            } else {
-                None
-            };
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx,
+                fvk_registry,
+                encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
             // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
             let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
@@ -218,13 +231,14 @@ pub fn spawn_sync_loop(
     da: DatabaseConnection,
     idx: DatabaseConnection,
     fvk_registry: Arc<FvkRegistry>,
+    fvk_service: Option<viewer::FvkServiceClient>,
 ) {
     tokio::spawn(async move {
         use tokio::time::{interval, Duration};
         let mut ticker = interval(Duration::from_millis(1000));
         loop {
             ticker.tick().await;
-            if let Err(e) = backfill_index(&da, &idx, &fvk_registry).await {
+            if let Err(e) = backfill_index(&da, &idx, &fvk_registry, fvk_service.as_ref()).await {
                 tracing::warn!(error = %e, "indexer backfill iteration failed");
             }
         }
@@ -234,14 +248,11 @@ pub fn spawn_sync_loop(
 pub async fn backfill_privacy_fields(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<()> {
-    if vfk_registry.is_empty() {
-        return Ok(());
-    }
-
-    let dep_updates = backfill_deposits(idx_db, vfk_registry).await?;
-    let transfer_updates = backfill_transfers(idx_db, vfk_registry).await?;
-    let withdraw_updates = backfill_withdraws(idx_db, vfk_registry).await?;
+    let dep_updates = backfill_deposits(idx_db, vfk_registry, fvk_service).await?;
+    let transfer_updates = backfill_transfers(idx_db, vfk_registry, fvk_service).await?;
+    let withdraw_updates = backfill_withdraws(idx_db, vfk_registry, fvk_service).await?;
 
     if dep_updates > 0 || transfer_updates > 0 || withdraw_updates > 0 {
         tracing::info!(
@@ -258,6 +269,7 @@ pub async fn backfill_privacy_fields(
 async fn backfill_deposits(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;
@@ -278,6 +290,13 @@ async fn backfill_deposits(
 
         for row in rows {
             last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
             let decrypted_notes = viewer::try_decrypt_notes_with_registry(
                 vfk_registry,
                 row.encrypted_notes.as_ref(),
@@ -311,6 +330,7 @@ async fn backfill_deposits(
 async fn backfill_transfers(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;
@@ -336,6 +356,13 @@ async fn backfill_transfers(
 
         for row in rows {
             last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
             let decrypted_notes = viewer::try_decrypt_notes_with_registry(
                 vfk_registry,
                 row.encrypted_notes.as_ref(),
@@ -380,6 +407,7 @@ async fn backfill_transfers(
 async fn backfill_withdraws(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
     let mut updated = 0usize;
     let mut last_id = 0i32;
@@ -400,6 +428,13 @@ async fn backfill_withdraws(
 
         for row in rows {
             last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
             let decrypted_notes = viewer::try_decrypt_notes_with_registry(
                 vfk_registry,
                 row.encrypted_notes.as_ref(),

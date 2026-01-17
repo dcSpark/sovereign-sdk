@@ -306,7 +306,7 @@ async fn add_fvk(
     let vfk_registry = state.vfk_registry.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            crate::background_sync::backfill_privacy_fields(&db, &vfk_registry).await
+            crate::background_sync::backfill_privacy_fields(&db, &vfk_registry, None).await
         {
             tracing::warn!("VFK backfill failed: {}", e);
         }

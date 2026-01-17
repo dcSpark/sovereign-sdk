@@ -41,9 +41,11 @@ use tokio::time::sleep;
 use toml::Value as TomlValue;
 
 use crate::{
-    find_rollup_binary, load_authority_fvk, make_viewer_bundle, setup_ligero_env,
-    start_local_verifier, wait_for_ready, ChildGuard, LigeroEnv,
+    find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
+    ChildGuard, LigeroEnv,
 };
+use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
+use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -90,9 +92,6 @@ struct ContinuousConfig {
     detailed_wallet_logs: bool,
     continuous: bool,
     managed_mode: bool,
-    /// Authority Full Viewing Key for Level-B compliance.
-    /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
-    authority_fvk: Option<Hash32>,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
     max_cycles: Option<u64>,
 }
@@ -146,9 +145,6 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // Load authority viewing key for Level-B compliance
-        let authority_fvk = load_authority_fvk();
-
         let max_cycles = std::env::var("MAX_CYCLES")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -164,7 +160,6 @@ impl ContinuousConfig {
             detailed_wallet_logs,
             continuous,
             managed_mode,
-            authority_fvk,
             max_cycles,
         })
     }
@@ -558,14 +553,19 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
-    if let Some(ref fvk) = config.authority_fvk {
+
+    // If `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is set, export it as `POOL_FVK_PK` so the in-process
+    // verifier (when spawned) enforces pool-signed viewer commitments.
+    let pool_fvk_pk = ensure_pool_fvk_pk_env()?;
+    if let Some(pool_pk_bytes) = pool_fvk_pk {
         eprintln!(
-            "[config] AUTHORITY_FVK set: Level-B viewing attestations ENABLED (fvk={}...)",
-            hex::encode(&fvk[..8])
+            "[config] POOL_FVK_PK set: enforcing pool-signed viewer commitments (pk={}...)",
+            hex::encode(&pool_pk_bytes[..8]),
         );
     } else {
-        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+        eprintln!("[config] POOL_FVK_PK not set: pool signature enforcement DISABLED");
     }
+    let http = HttpClient::new();
 
     // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
     let ligero_env = setup_ligero_env()?;
@@ -595,7 +595,6 @@ pub async fn run() -> Result<()> {
     );
 
     let client = Arc::new(NodeClient::new_unchecked(&node_url));
-    let http = HttpClient::new();
 
     // Fetch chain hash for signing
     #[derive(Deserialize)]
@@ -685,6 +684,42 @@ pub async fn run() -> Result<()> {
         });
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
+
+    // If pool enforcement is enabled, fetch one viewer FVK per wallet from midnight-fvk-service.
+    // Each wallet will include a distinct viewer commitment and pool signature in its proofs.
+    let viewer_bundles: Option<Arc<Vec<ViewerFvkBundle>>> = if pool_fvk_pk.is_some() {
+        eprintln!(
+            "[config] fetching {} viewer FVKs from midnight-fvk-service (1 per wallet)...",
+            wallets.len()
+        );
+
+        let mut out: Vec<ViewerFvkBundle> = Vec::with_capacity(wallets.len());
+        for (i, _w) in wallets.iter().enumerate() {
+            let bundle = fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?;
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "  [config] viewer wallet={} fvk_commitment=0x{}...",
+                    i,
+                    hex::encode(&bundle.fvk_commitment[..8])
+                );
+            }
+            out.push(bundle);
+        }
+
+        let first = out
+            .first()
+            .map(|b| format!("0x{}...", hex::encode(&b.fvk_commitment[..8])))
+            .unwrap_or_else(|| "<none>".to_string());
+        eprintln!(
+            "[config] pool viewer enabled: fetched {} FVKs (example commitment={})",
+            out.len(),
+            first
+        );
+        Some(Arc::new(out))
+    } else {
+        eprintln!("[config] pool viewer disabled: transfers will NOT emit viewer ciphertexts");
+        None
+    };
 
     // Optional initial deposits to create notes for each wallet
     if config.initial_deposit {
@@ -789,6 +824,7 @@ pub async fn run() -> Result<()> {
                 &chain_hash,
                 &program_path,
                 &config,
+                viewer_bundles.clone(),
                 &verifier_url,
                 &mut cached_tree,
                 &mut cached_next_position,
@@ -1211,6 +1247,7 @@ async fn perform_transfer_cycle(
     chain_hash: &[u8; 32],
     program_path: &str,
     config: &ContinuousConfig,
+    viewer_bundles: Option<Arc<Vec<ViewerFvkBundle>>>,
     verifier_url: &str,
     cached_tree: &mut Option<MerkleTree>,
     cached_next_position: &mut u64,
@@ -1484,7 +1521,7 @@ async fn perform_transfer_cycle(
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_proofs));
     let mut proof_tasks = Vec::with_capacity(inputs.len());
 
-    let authority_fvk = config.authority_fvk;
+    let viewer_bundles = viewer_bundles.clone();
     for input in inputs.iter() {
         let account_idx = input.wallet_idx;
         let value = input.value;
@@ -1496,7 +1533,7 @@ async fn perform_transfer_cycle(
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
-        let authority_fvk = authority_fvk; // Copy for closure
+        let viewer_bundles = viewer_bundles.clone();
         let daemon_workers = config.max_concurrent_proofs;
         let client = client.clone();
         proof_tasks.push(tokio::spawn(async move {
@@ -1568,7 +1605,20 @@ async fn perform_transfer_cycle(
             let out_bl_bucket_entries = out_opening.bucket_entries;
             let out_bl_siblings = out_opening.siblings;
 
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
+            tokio::task::spawn_blocking(
+                move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
+                    let (viewer_fvk, pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
+                        let b = bundles.get(account_idx).ok_or_else(|| {
+                            anyhow!(
+                                "missing viewer bundle for wallet {account_idx} (have {} bundles)",
+                                bundles.len()
+                            )
+                        })?;
+                        (Some(b.fvk), Some(b.pool_sig_hex.clone()))
+                    } else {
+                        (None, None)
+                    };
+
                 let value_u64: u64 = value
                     .try_into()
                     .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
@@ -1588,8 +1638,8 @@ async fn perform_transfer_cycle(
                 let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
                 let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
 
-                // Build viewer attestation if authority FVK is set
-                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
+                // Build viewer attestation if pool viewer is configured.
+                let (view_attestations, viewer_data) = if let Some(fvk) = viewer_fvk {
                     let (att, _enc) = make_viewer_bundle(
                         &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id_out, &cm_out,
                     )?;
@@ -1651,8 +1701,13 @@ async fn perform_transfer_cycle(
                 }
 
                 // Viewer section: fvk is private
+                let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
+                let fvk_commitment_arg_pos = if viewer_data.is_some() {
+                    Some(n_viewers_idx + 1)
+                } else {
+                    None
+                };
                 if viewer_data.is_some() {
-                    let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
                     private_indices.push(n_viewers_idx + 2);
                 }
 
@@ -1749,7 +1804,7 @@ async fn perform_transfer_cycle(
                 }
 
                 // Viewer section (Level-B)
-                if let Some((ref fvk, ref att)) = viewer_data {
+                if let Some((fvk, att)) = viewer_data.as_ref() {
                     host.add_u64_arg(1); // m_viewers
                     host.add_hex_arg(hex::encode(att.fvk_commitment));
                     host.add_hex_arg(hex::encode(fvk));
@@ -1822,8 +1877,27 @@ async fn perform_transfer_cycle(
                     Ok(bincode::serialize(&pkg)?)
                 })()
                 .context("generate second-round transfer proof via daemon")?;
+
+                let proof_data = if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
+                    let Some((_fvk, _att)) = viewer_data.as_ref() else {
+                        bail!("POOL_FVK_PK is set but viewer section is missing in transfer proof args");
+                    };
+                    let fvk_commitment_arg_pos = fvk_commitment_arg_pos.ok_or_else(|| {
+                        anyhow!(
+                            "POOL_FVK_PK is set but fvk_commitment_arg_pos is missing (viewer section not enabled)"
+                        )
+                    })?;
+                    inject_pool_sig_hex_into_proof_bytes(
+                        proof_data,
+                        fvk_commitment_arg_pos,
+                        pool_sig_hex.clone(),
+                    )?
+                } else {
+                    proof_data
+                };
                 Ok((account_idx, proof_data, out_rho, out_spend_sk))
-            })
+                },
+            )
             .await
             .expect("spawn_blocking join failed")
         }));
@@ -1877,7 +1951,17 @@ async fn perform_transfer_cycle(
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;
-        let authority_fvk = authority_fvk; // Copy for closure
+        let viewer_fvk = if let Some(ref bundles) = viewer_bundles {
+            let b = bundles.get(wallet_idx).ok_or_else(|| {
+                anyhow!(
+                    "missing viewer bundle for wallet {wallet_idx} (have {} bundles)",
+                    bundles.len()
+                )
+            })?;
+            Some(b.fvk)
+        } else {
+            None
+        };
         let value = wallet.value; // The output value (same as input for pure transfer)
         build_tasks.push(tokio::task::spawn_blocking(
             move || -> anyhow::Result<BuiltTransfer> {
@@ -1893,8 +1977,8 @@ async fn perform_transfer_cycle(
                 let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
                 let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
-                // Build encrypted note for authority if configured
-                let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+                // Build encrypted note for pool viewer if configured.
+                let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
                     Some(fvk) => {
                         let cm_out = note_commitment(
                             &DOMAIN,

@@ -2,8 +2,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tracing_subscriber::EnvFilter;
 
-mod authority_fvk;
 mod config;
+mod fvk_service;
 mod ligero;
 mod operations;
 mod privacy_key;
@@ -19,8 +19,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
-use crate::authority_fvk::AuthorityFvk;
 use crate::config::Config;
+use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
@@ -107,25 +107,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cfg.ligero_program_path.clone()),
     ));
 
-    let authority_fvk = if let Some(ref fvk_hex) = cfg.authority_fvk {
-        tracing::info!("[mcp] Initializing authority FVK from environment variable");
-        match AuthorityFvk::from_hex(fvk_hex) {
-            Ok(fvk) => {
-                tracing::info!("[mcp] Authority FVK initialized successfully");
-                Some(fvk)
-            }
-            Err(e) => {
-                tracing::warn!("[mcp] Failed to initialize authority FVK: {}", e);
-                tracing::warn!("[mcp] Note decryption will not be available");
-                None
-            }
-        }
+    let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+        .transpose()?;
+
+    let viewer_fvk_bundle: Option<ViewerFvkBundle> = if pool_fvk_pk.is_some() {
+        let http = reqwest::Client::new();
+        let base_url = crate::fvk_service::fvk_service_base_url_from_env();
+        tracing::info!(
+            "[mcp] POOL_FVK_PK set: fetching viewer FVK bundle from midnight-fvk-service ({base_url})"
+        );
+        Some(fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?)
     } else {
-        tracing::info!("[mcp] No AUTHORITY_FVK provided, note decryption will not be available");
+        tracing::info!("[mcp] POOL_FVK_PK not set: viewer FVK bundle disabled");
         None
     };
 
-    let authority_fvk = Arc::new(RwLock::new(authority_fvk));
+    let viewer_fvk_bundle = Arc::new(RwLock::new(viewer_fvk_bundle));
 
     tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
 
@@ -216,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wallet_ctx_for_service = wallet_ctx.clone();
     let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
-    let authority_fvk_for_service = authority_fvk.clone();
+    let viewer_fvk_bundle_for_service = viewer_fvk_bundle.clone();
     let privacy_key_for_service = privacy_key.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
@@ -229,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_ctx_for_service.clone(),
                 admin_wallet_ctx_for_service.clone(),
                 ligero_for_service.clone(),
-                authority_fvk_for_service.clone(),
+                viewer_fvk_bundle_for_service.clone(),
                 privacy_key_for_service.clone(),
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,

@@ -34,3 +34,4 @@ bech32 = { workspace = true }
 
 # Concurrent data structures
 dashmap = "6"
+reqwest = { workspace = true, features = ["json"] }

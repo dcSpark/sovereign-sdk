@@ -28,6 +28,7 @@ bincode = { workspace = true }
 
 # Crypto
 sha2 = { workspace = true }
+ed25519-dalek = { version = "2" }
 hex = { workspace = true }
 
 # Temp files (used for daemon-mode Ligero verifier, which expects a proof file path:

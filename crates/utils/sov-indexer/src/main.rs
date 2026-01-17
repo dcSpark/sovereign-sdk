@@ -53,23 +53,45 @@ async fn main() -> anyhow::Result<()> {
     let vfk_registry = load_vfk_registry(&idx_db).await?;
     let vfk_registry = Arc::new(vfk_registry);
 
+    let fvk_service = viewer::FvkServiceClient::from_env()?;
+    if vfk_registry.is_empty() {
+        if fvk_service.is_some() {
+            info!("FVK registry is empty; auto-fetch enabled (MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN set)");
+        } else {
+            info!("FVK registry is empty; encrypted notes will not be decrypted (no FVKs + no auto-fetch)");
+        }
+    }
+
     // Try a one-shot backfill; if DA tables are not ready, log and continue.
-    if let Err(e) = background_sync::backfill_index(&da_db, &idx_db, &vfk_registry).await {
+    if let Err(e) = background_sync::backfill_index(
+        &da_db,
+        &idx_db,
+        &vfk_registry,
+        fvk_service.as_ref(),
+    )
+    .await
+    {
         warn!(error = %e, "Initial backfill failed; will retry in background loop");
     }
     let idx_clone = idx_db.clone();
     let vfk_registry_clone = vfk_registry.clone();
+    let fvk_service_clone = fvk_service.clone();
     tokio::spawn(async move {
         println!("Starting VFK backfill");
         if let Err(e) =
-            background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone).await
+            background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone, fvk_service_clone.as_ref()).await
         {
             warn!(error = %e, "VFK backfill failed");
         }
         println!("Finished VFK backfill");
     });
     println!("Initializing background sync loop");
-    background_sync::spawn_sync_loop(da_db.clone(), idx_db.clone(), vfk_registry.clone());
+    background_sync::spawn_sync_loop(
+        da_db.clone(),
+        idx_db.clone(),
+        vfk_registry.clone(),
+        fvk_service.clone(),
+    );
 
     info!("Indexer running in SYNC mode; serving from index DB");
 
@@ -92,7 +114,6 @@ fn should_reset_index_db() -> bool {
 /// Load VFK registry from:
 /// 1. VFK_CONFIG_FILE (JSON file with multiple VFKs)
 /// 2. Database (previously saved VFKs)
-/// 3. AUTHORITY_VFK env var (single VFK, backward compatible)
 async fn load_vfk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Result<FvkRegistry> {
     let mut registry = FvkRegistry::new();
 
@@ -134,20 +155,8 @@ async fn load_vfk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Resu
         }
     }
 
-    // 3. Fallback: single AUTHORITY_FVK env var (backward compatible)
     if registry.is_empty() {
-        if let Some(fvk) = viewer::load_authority_fvk() {
-            info!("Using single AUTHORITY_FVK for decryption");
-            registry.add(fvk, None);
-            // Save to database
-            if let Err(e) = registry.save_to_db(idx_db).await {
-                warn!("Failed to save single FVK to database: {}", e);
-            }
-        }
-    }
-
-    if registry.is_empty() {
-        info!("No FVKs configured - encrypted notes will not be decrypted");
+        info!("No FVKs preconfigured (fvk_registry is empty)");
     } else {
         info!(
             "FVK registry initialized with {} keys - decryption enabled",

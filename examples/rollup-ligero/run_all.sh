@@ -7,8 +7,14 @@ export WORKSPACE_ROOT
 
 ROLLUP_ARGS=("$@")
 
+source "$SCRIPT_DIR/pool_fvk_env.sh"
+resolve_pool_fvk_pk
+print_pool_fvk_pk_status
+
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-600}"
 WAIT_SLEEP_SECONDS="${WAIT_SLEEP_SECONDS:-1}"
+SHUTDOWN_GRACE_SECONDS="${SHUTDOWN_GRACE_SECONDS:-10}"
+SHUTDOWN_FORCE_SECONDS="${SHUTDOWN_FORCE_SECONDS:-5}"
 
 PIDS=()
 NAMES=()
@@ -53,23 +59,90 @@ start_service() {
   shift
   "$@" &
   local pid=$!
+  LAST_PID="$pid"
   PIDS+=("$pid")
   NAMES+=("$name")
   echo "Started $name (pid $pid)"
 }
 
+kill_tree() {
+  local sig="$1"
+  local pid="$2"
+
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+
+  local children=""
+  children="$(pgrep -P "$pid" 2>/dev/null || true)"
+  if [[ -n "$children" ]]; then
+    local child
+    for child in $children; do
+      kill_tree "$sig" "$child"
+    done
+  fi
+
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+wait_for_pids() {
+  local timeout_seconds="$1"
+  shift
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local any_alive=0
+    local pid
+    for pid in "$@"; do
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        any_alive=1
+        break
+      fi
+    done
+    if [[ "$any_alive" -eq 0 ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
 cleanup() {
   local exit_code=$?
+  trap - INT TERM EXIT
   set +e
   if [ "${#PIDS[@]}" -gt 0 ]; then
     echo ""
     echo "Stopping services..."
-    for pid in "${PIDS[@]}"; do
+
+    local i pid name
+    for i in "${!PIDS[@]}"; do
+      pid="${PIDS[$i]}"
+      name="${NAMES[$i]:-service}"
       if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
+        echo "  - $name (pid $pid): SIGTERM"
+        kill_tree TERM "$pid"
       fi
     done
-    wait 2>/dev/null || true
+
+    if ! wait_for_pids "$SHUTDOWN_GRACE_SECONDS" "${PIDS[@]}"; then
+      echo "  - timeout after ${SHUTDOWN_GRACE_SECONDS}s; sending SIGKILL..."
+      for i in "${!PIDS[@]}"; do
+        pid="${PIDS[$i]}"
+        name="${NAMES[$i]:-service}"
+        if kill -0 "$pid" 2>/dev/null; then
+          echo "    - $name (pid $pid): SIGKILL"
+          kill_tree KILL "$pid"
+        fi
+      done
+      wait_for_pids "$SHUTDOWN_FORCE_SECONDS" "${PIDS[@]}" || true
+    fi
+
+    # Best-effort reap (won't block if already reparented).
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
   fi
   exit "$exit_code"
 }
@@ -107,24 +180,75 @@ MCP_HOST="${MCP_BIND%:*}"
 MCP_PORT="${MCP_BIND##*:}"
 if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
   MCP_HOST="$MCP_BIND"
-  MCP_PORT="4000"
+  MCP_PORT="3000"
+fi
+
+MCP_2_BIND="${MCP_SERVER_BIND_ADDRESS_2:-0.0.0.0:3001}"
+MCP_2_HOST="${MCP_2_BIND%:*}"
+MCP_2_PORT="${MCP_2_BIND##*:}"
+if [[ "$MCP_2_HOST" == "$MCP_2_PORT" ]]; then
+  MCP_2_HOST="$MCP_2_BIND"
+  MCP_2_PORT="3001"
+fi
+
+FVK_BIND="${MIDNIGHT_FVK_SERVICE_BIND:-}"
+if [[ -n "$FVK_BIND" ]]; then
+  FVK_HOST="${FVK_BIND%:*}"
+  FVK_PORT="${FVK_BIND##*:}"
+  if [[ "$FVK_HOST" == "$FVK_PORT" ]]; then
+    FVK_HOST="$FVK_BIND"
+    FVK_PORT="8088"
+  fi
+else
+  MIDNIGHT_FVK_SERVICE_URL="${MIDNIGHT_FVK_SERVICE_URL:-http://127.0.0.1:8088}"
+  FVK_HOST_PORT="${MIDNIGHT_FVK_SERVICE_URL#*://}"
+  FVK_HOST_PORT="${FVK_HOST_PORT%%/*}"
+  FVK_HOST="${FVK_HOST_PORT%:*}"
+  FVK_PORT="${FVK_HOST_PORT##*:}"
+  if [[ "$FVK_HOST" == "$FVK_PORT" ]]; then
+    FVK_HOST="$FVK_HOST_PORT"
+    FVK_PORT="8088"
+  fi
+  export MIDNIGHT_FVK_SERVICE_BIND="$FVK_HOST:$FVK_PORT"
+fi
+if [[ -z "${MIDNIGHT_FVK_SERVICE_URL:-}" ]]; then
+  export MIDNIGHT_FVK_SERVICE_URL="http://$FVK_HOST:$FVK_PORT"
+fi
+
+if [[ -n "${POOL_FVK_PK:-}" && -z "${MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    export MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN="$(openssl rand -hex 16)"
+  else
+    export MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN="$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
+  fi
+  echo "Generated MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for midnight-fvk-service private lookups."
 fi
 
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
-wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "${PIDS[0]}"
+wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "$LAST_PID"
 
 echo "Starting verifier..."
 start_service "verifier" bash "$SCRIPT_DIR/run_verifier_service.sh"
-wait_for_port "verifier" "$VERIFIER_HOST" "$VERIFIER_PORT" "${PIDS[1]}"
+wait_for_port "verifier" "$VERIFIER_HOST" "$VERIFIER_PORT" "$LAST_PID"
+
+if [[ -n "${POOL_FVK_PK:-}" ]]; then
+  echo "Starting midnight-fvk-service..."
+  start_service "fvk-service" bash "$SCRIPT_DIR/run_fvk_service.sh"
+  wait_for_port "fvk-service" "$FVK_HOST" "$FVK_PORT" "$LAST_PID"
+fi
 
 echo "Starting indexer..."
 start_service "indexer" bash "$SCRIPT_DIR/run_indexer.sh"
-wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "${PIDS[2]}"
+wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "$LAST_PID"
 
 echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
-wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "${PIDS[3]}"
+wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
+
+echo "Starting mcp-2..."
+start_service "mcp-2" bash "$SCRIPT_DIR/run_mcp_2.sh"
+wait_for_port "mcp-2" "$MCP_2_HOST" "$MCP_2_PORT" "$LAST_PID"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."

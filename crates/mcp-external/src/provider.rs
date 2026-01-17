@@ -624,49 +624,4 @@ impl Provider {
         Ok(balance_response)
     }
 
-    /// Register an authority VFK with the indexer, if supported.
-    ///
-    /// This is required for the indexer to decrypt notes for a new privacy address.
-    pub async fn register_vfk(
-        &self,
-        vfk_hex: &str,
-        shielded_address: Option<&str>,
-    ) -> Result<()> {
-        let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/fvks", base_url);
-
-        let mut payload = serde_json::Map::new();
-        payload.insert("fvk".to_string(), serde_json::Value::String(vfk_hex.to_string()));
-        if let Some(address) = shielded_address {
-            payload.insert(
-                "shielded_address".to_string(),
-                serde_json::Value::String(address.to_string()),
-            );
-        }
-
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("Failed to register VFK at {}", url))?;
-
-        let status = response.status();
-        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
-            return Ok(());
-        }
-
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Indexer VFK registration failed at {}: HTTP {} - {}",
-            url,
-            status,
-            if body.is_empty() {
-                "No error details provided"
-            } else {
-                &body
-            }
-        );
-    }
 }

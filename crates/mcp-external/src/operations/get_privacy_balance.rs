@@ -35,9 +35,10 @@ pub struct PrivacyBalanceResult {
 
 /// Get the privacy pool balance for the user.
 ///
-/// Uses the indexer's `/wallets/:address/balance` endpoint which efficiently
-/// computes the balance by decrypting notes and tracking spent nullifiers.
-/// When `viewing_key` is None, relies on decrypted notes already stored by the indexer.
+/// Uses the indexer's `/wallets/:address/balance` endpoint.
+///
+/// The viewing key is **not** sent to the indexer; the indexer is expected to decrypt using
+/// locally-cached viewer keys fetched from `midnight-fvk-service` (admin-token protected).
 pub async fn get_privacy_balance(
     provider: &Provider,
     privacy_key: &PrivacyKey,
@@ -56,8 +57,8 @@ pub async fn get_privacy_balance(
         .ok_or_else(|| anyhow::anyhow!("Privacy key must have spend_sk to derive nf_key"))?;
     let nf_key_hex = hex::encode(nf_key);
 
-    // Get VFK as hex
-    let vfk_hex = viewing_key.map(|vfk| hex::encode(vfk.0));
+    // Viewing key is intentionally not forwarded to the indexer.
+    let _ = viewing_key;
 
     // Call the indexer's balance endpoint
     let balance_response = provider
@@ -65,7 +66,7 @@ pub async fn get_privacy_balance(
             &privacy_address,
             None,
             Some(&nf_key_hex),
-            vfk_hex.as_deref(),
+            None,
         )
         .await
         .context("Failed to fetch balance from indexer")?;

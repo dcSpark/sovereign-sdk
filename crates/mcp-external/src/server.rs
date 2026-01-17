@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use demo_stf::runtime::Runtime;
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -27,7 +28,7 @@ use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
-use crate::authority_fvk::AuthorityFvk;
+use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
@@ -576,8 +577,20 @@ pub struct CreateWalletRequest {}
 pub struct CreateWalletResult {
     /// New wallet private key (hex string)
     pub wallet_private_key: String,
-    /// New authority VFK (hex string)
-    pub authority_vfk: String,
+    /// New wallet address
+    pub wallet_address: String,
+    /// New viewer FVK (hex string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk: Option<String>,
+    /// Viewer FVK commitment (hex string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_commitment: Option<String>,
+    /// Pool signature (hex) over `viewer_fvk_commitment`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_pool_sig_hex: Option<String>,
+    /// Signer public key (hex)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_signer_public_key: Option<String>,
     /// New privacy pool spending key (hex string)
     pub privacy_spend_key: String,
     /// New privacy pool address
@@ -589,8 +602,20 @@ pub struct CreateWalletResult {
 pub struct RestoreWalletRequest {
     /// Wallet private key (hex string, with or without 0x prefix)
     pub wallet_private_key: String,
-    /// Authority FVK (hex string, with or without 0x prefix)
-    pub authority_fvk: String,
+    /// Optional viewer FVK (hex string, with or without 0x prefix).
+    ///
+    /// If omitted and `POOL_FVK_PK` is set, a fresh viewer FVK will be requested from
+    /// `midnight-fvk-service`.
+    #[serde(default, alias = "authority_fvk", alias = "fvk")]
+    pub viewer_fvk: Option<String>,
+    /// Optional pool signature (hex) over the viewer FVK commitment.
+    #[serde(
+        default,
+        alias = "pool_sig_hex",
+        alias = "signature",
+        alias = "pool_signature"
+    )]
+    pub viewer_fvk_pool_sig_hex: Option<String>,
     /// Privacy pool spending key (hex string, with or without 0x prefix)
     pub privacy_spend_key: String,
 }
@@ -716,7 +741,7 @@ pub struct CryptoServer {
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
     admin_wallet_context: Option<Arc<McpWalletContext>>,
     ligero_prover: Option<Arc<LigeroProver>>,
-    authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
+    viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
@@ -731,7 +756,7 @@ impl CryptoServer {
         wallet_context: Arc<RwLock<McpWalletContext>>,
         admin_wallet_context: Option<Arc<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
-        authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
+        viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
@@ -743,7 +768,7 @@ impl CryptoServer {
             wallet_context: Some(wallet_context),
             admin_wallet_context,
             ligero_prover: Some(ligero_prover),
-            authority_fvk,
+            viewer_fvk_bundle,
             privacy_key,
             log_path,
             auto_fund_deposit_amount,
@@ -777,16 +802,16 @@ impl CryptoServer {
             )
         })?;
 
-        let authority_fvk_bytes = {
-            let guard = self.authority_fvk.read().await;
-            guard.as_ref().map(|v| *v.as_bytes())
-        }
-        .ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_FVK to send from the privacy pool.",
-                None,
-            )
-        })?;
+        let viewer_fvk_bundle_for_transfer = self.viewer_fvk_bundle.read().await.clone();
+        let viewer_fvk_bytes = viewer_fvk_bundle_for_transfer
+            .as_ref()
+            .map(|bundle| bundle.fvk)
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "Viewer key not configured. Set POOL_FVK_PK and ensure midnight-fvk-service is running.",
+                    None,
+                )
+            })?;
 
         let privacy_key_guard = self.privacy_key.read().await;
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse().map_err(|e| {
@@ -801,8 +826,7 @@ impl CryptoServer {
 
         let output_pk = output_privacy_addr.to_pk();
         let output_pk_ivk = output_privacy_addr.pk_ivk();
-        let viewing_key = midnight_privacy::FullViewingKey(authority_fvk_bytes);
-        let authority_fvk_for_transfer = Some(authority_fvk_bytes);
+        let viewing_key = midnight_privacy::FullViewingKey(viewer_fvk_bytes);
 
         let send_amount = params.amount.parse::<u128>().map_err(|e| {
             ErrorData::invalid_params(format!("Invalid amount format: {}", e), None)
@@ -975,7 +999,7 @@ impl CryptoServer {
             input_sender_id,
             output_pk,
             output_pk_ivk,
-            authority_fvk_for_transfer,
+            viewer_fvk_bundle_for_transfer,
         )
         .await
         .map_err(|e| {
@@ -1019,10 +1043,10 @@ impl CryptoServer {
             )
         })?;
 
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let viewing_key = authority_fvk_guard
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let viewing_key = viewer_fvk_guard
             .as_ref()
-            .map(|authority_fvk| midnight_privacy::FullViewingKey(*authority_fvk.as_bytes()));
+            .map(|bundle| midnight_privacy::FullViewingKey(bundle.fvk));
 
         let privacy_key_guard = self.privacy_key.read().await;
 
@@ -1279,11 +1303,12 @@ impl CryptoServer {
     // deposit tool removed; funding is attempted on startup when configured via env
 
     /// Create a new wallet with new keys.
-    /// Generates new wallet private key, authority FVK, and privacy pool spending key.
+    /// Generates new wallet private key, viewer FVK (via midnight-fvk-service when POOL_FVK_PK is set),
+    /// and privacy pool spending key.
     /// All subsequent transactions will use the new keys.
     #[tool(
         name = "createWallet",
-        description = "Create a new wallet with new keys. Generates new wallet private key, authority FVK, and privacy pool spending key. All subsequent operations will use the new keys."
+        description = "Create a new wallet with new keys. Generates new wallet private key, viewer FVK (via midnight-fvk-service when POOL_FVK_PK is set), and privacy pool spending key. All subsequent operations will use the new keys."
     )]
     async fn create_wallet(
         &self,
@@ -1293,7 +1318,7 @@ impl CryptoServer {
 
         // Generate all random bytes first (before any async operations)
         // This ensures the RNG is dropped before any await points
-        let (wallet_private_key_hex, authority_fvk_hex, privacy_spend_key_hex) = {
+        let (wallet_private_key_hex, privacy_spend_key_hex) = {
             let mut rng = rand::thread_rng();
 
             // Generate new wallet private key (32 bytes)
@@ -1301,21 +1326,12 @@ impl CryptoServer {
             rng.fill_bytes(&mut wallet_private_key_bytes);
             let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
 
-            // Generate new authority FVK (32 bytes)
-            let mut authority_fvk_bytes = [0u8; 32];
-            rng.fill_bytes(&mut authority_fvk_bytes);
-            let authority_fvk_hex = hex::encode(&authority_fvk_bytes);
-
             // Generate new privacy spend key (32 bytes)
             let mut privacy_spend_key_bytes = [0u8; 32];
             rng.fill_bytes(&mut privacy_spend_key_bytes);
             let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
 
-            (
-                wallet_private_key_hex,
-                authority_fvk_hex,
-                privacy_spend_key_hex,
-            )
+            (wallet_private_key_hex, privacy_spend_key_hex)
         }; // RNG is dropped here
 
         // Create new wallet context from the private key
@@ -1328,11 +1344,6 @@ impl CryptoServer {
 
         let new_wallet_for_deposit = Arc::new(new_wallet_ctx.clone());
 
-        // Create new authority FVK
-        let new_authority_fvk = AuthorityFvk::from_hex(&authority_fvk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
-        })?;
-
         // Create new privacy key
         let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
             ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None)
@@ -1341,22 +1352,33 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
-        let provider = self.provider.as_ref().ok_or_else(|| {
+        // Ensure provider is configured before we swap wallet context.
+        let _ = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
             )
         })?;
 
-        provider
-            .register_vfk(&authority_fvk_hex, Some(&privacy_address))
-            .await
-            .map_err(|e| {
+        let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
+
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let http = reqwest::Client::new();
+            Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
                 ErrorData::internal_error(
-                    format!("Failed to register authority VFK with indexer: {}", e),
+                    format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
                     None,
                 )
-            })?;
+            })?)
+        } else {
+            None
+        };
 
         // Replace the wallet context and privacy keys
         if let Some(ref wallet_ctx) = self.wallet_context {
@@ -1364,8 +1386,8 @@ impl CryptoServer {
             *ctx_guard = new_wallet_ctx;
         }
 
-        let mut authority_fvk_guard = self.authority_fvk.write().await;
-        *authority_fvk_guard = Some(new_authority_fvk);
+        let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+        *viewer_fvk_guard = viewer_fvk_bundle.clone();
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
@@ -1405,7 +1427,15 @@ impl CryptoServer {
 
         let result = CreateWalletResult {
             wallet_private_key: wallet_private_key_hex,
-            authority_vfk: authority_fvk_hex,
+            wallet_address: wallet_address_str,
+            viewer_fvk: viewer_fvk_bundle.as_ref().map(|b| hex::encode(b.fvk)),
+            viewer_fvk_commitment: viewer_fvk_bundle
+                .as_ref()
+                .map(|b| hex::encode(b.fvk_commitment)),
+            viewer_fvk_pool_sig_hex: viewer_fvk_bundle.as_ref().map(|b| b.pool_sig_hex.clone()),
+            viewer_fvk_signer_public_key: viewer_fvk_bundle
+                .as_ref()
+                .map(|b| hex::encode(b.signer_public_key)),
             privacy_spend_key: privacy_spend_key_hex,
             privacy_address,
         };
@@ -1416,12 +1446,14 @@ impl CryptoServer {
     }
 
     /// Restore a wallet from existing keys.
-    /// Loads existing wallet private key, authority FVK, and privacy pool spending key.
+    /// Loads existing wallet private key and privacy pool spending key.
+    ///
+    /// If `POOL_FVK_PK` is set, a fresh viewer FVK bundle is requested from `midnight-fvk-service`.
     /// The L2 wallet context IS updated and will be funded with gas tokens from the admin wallet.
     /// All subsequent operations will use the restored keys.
     #[tool(
         name = "restoreWallet",
-        description = "Restore a wallet from existing keys. Loads wallet private key, authority FVK, and privacy pool spending key from hex strings. All subsequent operations will use the restored keys."
+        description = "Restore a wallet from existing keys. Loads wallet private key and privacy pool spending key from hex strings. If POOL_FVK_PK is set, fetches a fresh viewer FVK from midnight-fvk-service. All subsequent operations will use the restored keys."
     )]
     async fn restore_wallet(
         &self,
@@ -1429,19 +1461,12 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Strip 0x prefix if present
         let wallet_private_key_hex = params.wallet_private_key.trim_start_matches("0x");
-        let authority_fvk_hex = params.authority_fvk.trim_start_matches("0x");
         let privacy_spend_key_hex = params.privacy_spend_key.trim_start_matches("0x");
 
         // Validate hex strings are correct length (32 bytes = 64 hex chars)
         if wallet_private_key_hex.len() != 64 {
             return Err(ErrorData::invalid_params(
                 "wallet_private_key must be exactly 32 bytes (64 hex characters).",
-                None,
-            ));
-        }
-        if authority_fvk_hex.len() != 64 {
-            return Err(ErrorData::invalid_params(
-                "authority_fvk must be exactly 32 bytes (64 hex characters).",
                 None,
             ));
         }
@@ -1460,10 +1485,94 @@ impl CryptoServer {
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
-        // Create authority FVK
-        let new_authority_fvk = AuthorityFvk::from_hex(authority_fvk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
-        })?;
+        let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
+
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let provided_fvk_hex = params
+                .viewer_fvk
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let provided_sig_hex = params
+                .viewer_fvk_pool_sig_hex
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            match (provided_fvk_hex, provided_sig_hex) {
+                (Some(fvk_hex), Some(sig_hex)) => {
+                    let fvk = parse_hex_32("viewer_fvk", fvk_hex).map_err(|e| {
+                        ErrorData::invalid_params(format!("Invalid viewer_fvk: {e}"), None)
+                    })?;
+
+                    let sig_hex_trimmed = sig_hex.strip_prefix("0x").unwrap_or(sig_hex);
+                    let sig_bytes = hex::decode(sig_hex_trimmed).map_err(|e| {
+                        ErrorData::invalid_params(
+                            format!("Invalid hex for viewer_fvk_pool_sig_hex: {e}"),
+                            None,
+                        )
+                    })?;
+                    if sig_bytes.len() != 64 {
+                        return Err(ErrorData::invalid_params(
+                            "viewer_fvk_pool_sig_hex must be 64 bytes (128 hex characters).",
+                            None,
+                        ));
+                    }
+                    let mut sig_arr = [0u8; 64];
+                    sig_arr.copy_from_slice(&sig_bytes);
+
+                    let commitment = midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
+                    let pool_vk = VerifyingKey::from_bytes(&pool_pk).map_err(|e| {
+                        ErrorData::invalid_params(
+                            format!("Invalid POOL_FVK_PK verifying key: {e}"),
+                            None,
+                        )
+                    })?;
+                    pool_vk
+                        .verify_strict(&commitment, &Ed25519Signature::from_bytes(&sig_arr))
+                        .map_err(|e| {
+                            ErrorData::invalid_params(
+                                format!(
+                                    "Invalid viewer_fvk_pool_sig_hex for viewer_fvk_commitment: {e}"
+                                ),
+                                None,
+                            )
+                        })?;
+
+                    Some(ViewerFvkBundle {
+                        fvk,
+                        fvk_commitment: commitment,
+                        pool_sig_hex: sig_hex_trimmed.to_string(),
+                        signer_public_key: pool_pk,
+                    })
+                }
+                (None, None) => {
+                    let http = reqwest::Client::new();
+                    Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
+                        ErrorData::internal_error(
+                            format!(
+                                "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
+                            ),
+                            None,
+                        )
+                    })?)
+                }
+                _ => {
+                    return Err(ErrorData::invalid_params(
+                        "When POOL_FVK_PK is set, restoreWallet must provide both viewer_fvk and viewer_fvk_pool_sig_hex (or neither to fetch a fresh one).",
+                        None,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         // Create privacy key
         let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex).map_err(|e| {
@@ -1472,23 +1581,13 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
-        // Register the VFK with the indexer (required for decrypting notes)
-        let provider = self.provider.as_ref().ok_or_else(|| {
+        // Ensure provider is configured before we swap wallet context.
+        let _ = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
             )
         })?;
-
-        provider
-            .register_vfk(authority_fvk_hex, Some(&privacy_address))
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(
-                    format!("Failed to register authority VFK with indexer: {}", e),
-                    None,
-                )
-            })?;
 
         // Replace the existing keys with the restored ones (including wallet context)
         if let Some(ref wallet_ctx) = self.wallet_context {
@@ -1496,8 +1595,8 @@ impl CryptoServer {
             *ctx_guard = new_wallet_ctx;
         }
 
-        let mut authority_fvk_guard = self.authority_fvk.write().await;
-        *authority_fvk_guard = Some(new_authority_fvk);
+        let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+        *viewer_fvk_guard = viewer_fvk_bundle;
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
@@ -1544,10 +1643,10 @@ impl CryptoServer {
         let privacy_key_guard = self.privacy_key.read().await;
 
         // Get the current privacy balance to include in status
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let viewing_key = authority_fvk_guard
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let viewing_key = viewer_fvk_guard
             .as_ref()
-            .map(|authority_fvk| midnight_privacy::FullViewingKey(*authority_fvk.as_bytes()));
+            .map(|bundle| midnight_privacy::FullViewingKey(bundle.fvk));
 
         let privacy_balance = match crate::operations::get_privacy_balance(
             provider,
@@ -1610,9 +1709,9 @@ impl CryptoServer {
         })?;
 
         // Get FVK if available for decryption
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let fvk_hex = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            Some(hex::encode(authority_fvk.as_bytes()))
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let fvk_hex = if let Some(ref bundle) = *viewer_fvk_guard {
+            Some(hex::encode(bundle.fvk))
         } else {
             None
         };

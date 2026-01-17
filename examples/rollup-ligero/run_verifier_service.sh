@@ -8,6 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+source "$SCRIPT_DIR/pool_fvk_env.sh"
+resolve_pool_fvk_pk
+
 # -----------------------------------------------------------------------------
 # Ligero guest program selection
 #
@@ -80,6 +83,7 @@ echo "   Node RPC: $NODE_RPC_URL"
 echo "   Log level: $LOG_LEVEL"
 echo "   Max concurrent: $MAX_CONCURRENT"
 echo "   Rollup config: $ROLLUP_CONFIG_PATH"
+print_pool_fvk_pk_status
 echo ""
 
 # Run the verifier service

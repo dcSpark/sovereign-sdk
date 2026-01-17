@@ -113,9 +113,20 @@ export SIGNING_KEY_PATH="../test-data/keys/token_deployer_private_key.json"
 export METHOD_ID="0x..."
 export MAX_CONCURRENT_VERIFICATIONS="5"
 export LOG_LEVEL="info"
+# Optional: enforce pool-signed viewing + require ciphertext bytes for Transfer/Withdraw
+export POOL_FVK_PK="0x<32-byte-ed25519-public-key-hex>"
 
 ./target/release/proof-verifier
 ```
+
+### Pool viewing enforcement (`POOL_FVK_PK`)
+
+When `POOL_FVK_PK` is set:
+
+- Transfer/Withdraw proof args must include a pool signature over the viewer `fvk_commitment`.
+- Transfer/Withdraw transaction bodies must include `view_ciphertexts` (the actual encrypted payload `ct`), with one ciphertext per output commitment and `fvk_commitment` matching the signed viewer commitment.
+
+Note: `view_attestations` only contains `ct_hash`/`mac` bindings; the ciphertext bytes live in `view_ciphertexts` (and are stored in the worker DB as `encrypted_notes_json`).
 
 ## API Endpoints
 
@@ -340,4 +351,3 @@ perf report
 ## License
 
 MIT OR Apache-2.0
-

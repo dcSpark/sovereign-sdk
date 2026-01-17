@@ -6,7 +6,7 @@
 //! Uses DashMap for lock-free concurrent access during indexing.
 
 use crate::index_db as idx;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bech32::{Bech32m, Hrp};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -14,6 +14,7 @@ use midnight_privacy::{
     viewing::{ct_hash, fvk_commitment, view_kdf, view_mac},
     EncryptedNote, FullViewingKey, Hash32,
 };
+use reqwest::StatusCode as HttpStatusCode;
 use sea_orm::{ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -62,6 +63,90 @@ pub struct FvkConfig {
 pub struct FvkRegistry {
     /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address)
     by_commitment: DashMap<String, (Hash32, Option<String>)>,
+}
+
+#[derive(Clone)]
+pub struct FvkServiceClient {
+    base_url: String,
+    admin_token: String,
+    http: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct FvkLookupResponse {
+    fvk: String,
+    fvk_commitment: String,
+}
+
+impl FvkServiceClient {
+    pub fn from_env() -> Result<Option<Self>> {
+        let admin_token = std::env::var("MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let Some(admin_token) = admin_token else {
+            return Ok(None);
+        };
+
+        let base_url = std::env::var("MIDNIGHT_FVK_SERVICE_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
+
+        Ok(Some(Self {
+            base_url,
+            admin_token,
+            http: reqwest::Client::new(),
+        }))
+    }
+
+    pub async fn fetch_fvk_by_commitment(
+        &self,
+        expected_fvk_commitment: &Hash32,
+    ) -> Result<Option<Hash32>> {
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/v1/fvk/{}", hex::encode(expected_fvk_commitment));
+
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.admin_token)
+            .send()
+            .await
+            .context("FVK service request failed")?;
+
+        if resp.status() == HttpStatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if resp.status() == HttpStatusCode::UNAUTHORIZED {
+            anyhow::bail!("FVK service unauthorized (check MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN)");
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("FVK service error {status}: {body}");
+        }
+
+        let body: FvkLookupResponse = resp
+            .json()
+            .await
+            .context("Failed to parse FVK service response")?;
+
+        let fvk = parse_fvk_hex(&body.fvk)?;
+        let fvk_obj = FullViewingKey(fvk);
+        let derived = fvk_commitment(&fvk_obj);
+
+        let expected_hex = body.fvk_commitment.trim().trim_start_matches("0x");
+        if expected_hex != hex::encode(derived) {
+            anyhow::bail!("FVK service returned fvk_commitment that does not match fvk");
+        }
+        if &derived != expected_fvk_commitment {
+            anyhow::bail!("FVK service returned fvk that does not match requested commitment");
+        }
+
+        Ok(Some(fvk))
+    }
 }
 
 impl FvkRegistry {
@@ -167,6 +252,39 @@ impl FvkRegistry {
         Ok(())
     }
 
+    pub async fn save_single_to_db(
+        db: &DatabaseConnection,
+        fvk: Hash32,
+        shielded_address: Option<String>,
+    ) -> Result<()> {
+        use sea_orm::sea_query::OnConflict;
+
+        let fvk_obj = FullViewingKey(fvk);
+        let commitment = fvk_commitment(&fvk_obj);
+        let commitment_hex = hex::encode(commitment);
+
+        let model = idx::fvk_registry::ActiveModel {
+            fvk_commitment: Set(commitment_hex),
+            fvk: Set(hex::encode(fvk)),
+            shielded_address: Set(shielded_address),
+            created_at: Set(Utc::now()),
+        };
+
+        idx::fvk_registry::Entity::insert(model)
+            .on_conflict(
+                OnConflict::column(idx::fvk_registry::Column::FvkCommitment)
+                    .update_columns([
+                        idx::fvk_registry::Column::Fvk,
+                        idx::fvk_registry::Column::ShieldedAddress,
+                    ])
+                    .to_owned(),
+            )
+            .exec(db)
+            .await?;
+
+        Ok(())
+    }
+
     /// Load the registry from the database
     pub async fn load_from_db(db: &DatabaseConnection) -> Result<Self> {
         let rows = idx::fvk_registry::Entity::find().all(db).await?;
@@ -210,17 +328,60 @@ pub fn parse_fvk_hex(fvk_hex: &str) -> Result<Hash32> {
     Ok(out)
 }
 
-/// Load authority full viewing key from environment variable AUTHORITY_FVK.
-/// This is for backward compatibility with single-FVK mode.
-pub fn load_authority_fvk() -> Option<Hash32> {
-    let raw = std::env::var("AUTHORITY_FVK").ok()?;
-    match parse_fvk_hex(&raw) {
-        Ok(fvk) => Some(fvk),
-        Err(e) => {
-            warn!("AUTHORITY_FVK is set but invalid: {}", e);
-            None
+pub async fn maybe_fetch_missing_fvks_for_encrypted_notes(
+    idx_db: &DatabaseConnection,
+    registry: &FvkRegistry,
+    encrypted_notes_json: Option<&serde_json::Value>,
+    fvk_service: Option<&FvkServiceClient>,
+) -> Result<()> {
+    let Some(client) = fvk_service else {
+        return Ok(());
+    };
+    let Some(json) = encrypted_notes_json else {
+        return Ok(());
+    };
+
+    let notes: Vec<EncryptedNote> = match serde_json::from_value(json.clone()) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if notes.is_empty() {
+        return Ok(());
+    }
+
+    let mut missing = std::collections::HashSet::<Hash32>::new();
+    for note in notes.iter() {
+        let commitment_hex = hex::encode(note.fvk_commitment);
+        if registry.get_fvk(&commitment_hex).is_none() {
+            missing.insert(note.fvk_commitment);
         }
     }
+
+    for commitment in missing {
+        match client.fetch_fvk_by_commitment(&commitment).await {
+            Ok(Some(fvk)) => {
+                registry.add(fvk, None);
+                if let Err(e) = FvkRegistry::save_single_to_db(idx_db, fvk, None).await {
+                    warn!("Failed to persist fetched FVK to index DB: {}", e);
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    "FVK service did not have commitment 0x{} (cannot decrypt notes for it)",
+                    hex::encode(commitment)
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to fetch FVK for commitment 0x{}: {}",
+                    hex::encode(commitment),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Load FVK config file path from environment variable FVK_CONFIG_FILE

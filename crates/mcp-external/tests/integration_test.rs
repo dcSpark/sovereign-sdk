@@ -194,22 +194,6 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
-                                      // Load authority FVK from environment for test
-    let authority_fvk = std::env::var("AUTHORITY_FVK")
-        .ok()
-        .and_then(|s| {
-            let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-            hex::decode(trimmed).ok()
-        })
-        .and_then(|bytes| {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(arr)
-            } else {
-                None
-            }
-        });
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -224,7 +208,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         deposit_result.recipient, // deposit convention: sender_id == recipient
         *privacy_key.pk(),
         *privacy_key.pk(),
-        authority_fvk,
+        None,
     )
     .await?;
 
@@ -428,9 +412,12 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 7: Get initial wallet balance using get_privacy_balance
     tracing::info!("Step 7: Getting initial wallet balance");
-    let initial_balance_result =
-        mcp_external::operations::get_privacy_balance(&provider, &new_privacy_key, &viewing_key)
-            .await?;
+    let initial_balance_result = mcp_external::operations::get_privacy_balance(
+        &provider,
+        &new_privacy_key,
+        Some(&viewing_key),
+    )
+    .await?;
 
     let initial_balance: u128 = initial_balance_result.balance;
     tracing::info!("✓ Initial privacy balance: {}", initial_balance);
@@ -468,9 +455,6 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     const DOMAIN: [u8; 32] = [1u8; 32];
     let input_recipient = new_privacy_key.recipient(&DOMAIN);
 
-    // Use the viewing key bytes as authority FVK for the transfer
-    let authority_fvk_for_transfer = Some(viewing_key.0);
-
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -485,7 +469,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
         input_recipient, // deposit convention: sender_id == recipient
         *new_privacy_key.pk(),
         *new_privacy_key.pk(),
-        authority_fvk_for_transfer,
+        None,
     )
     .await?;
 
@@ -500,9 +484,12 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 10: Get final wallet balance
     tracing::info!("Step 10: Getting final wallet balance");
-    let final_balance_result =
-        mcp_external::operations::get_privacy_balance(&provider, &new_privacy_key, &viewing_key)
-            .await?;
+    let final_balance_result = mcp_external::operations::get_privacy_balance(
+        &provider,
+        &new_privacy_key,
+        Some(&viewing_key),
+    )
+    .await?;
 
     let final_balance: u128 = final_balance_result.balance;
     tracing::info!("✓ Final privacy balance: {}", final_balance);
