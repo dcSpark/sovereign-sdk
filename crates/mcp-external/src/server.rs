@@ -820,7 +820,7 @@ impl CryptoServer {
         let privacy_result = crate::operations::get_privacy_balance(
             provider,
             &*privacy_key_guard,
-            &viewing_key,
+            Some(&viewing_key),
         )
         .await
         .map_err(|e| {
@@ -1020,23 +1020,16 @@ impl CryptoServer {
         })?;
 
         let authority_fvk_guard = self.authority_fvk.read().await;
-        let viewing_key_bytes = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            *authority_fvk.as_bytes()
-        } else {
-            return Err(ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_FVK to decrypt privacy pool notes.",
-                None,
-            ));
-        };
-
-        let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
+        let viewing_key = authority_fvk_guard
+            .as_ref()
+            .map(|authority_fvk| midnight_privacy::FullViewingKey(*authority_fvk.as_bytes()));
 
         let privacy_key_guard = self.privacy_key.read().await;
 
         let privacy_result = crate::operations::get_privacy_balance(
             provider,
             &*privacy_key_guard,
-            &viewing_key,
+            viewing_key.as_ref(),
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -1552,23 +1545,22 @@ impl CryptoServer {
 
         // Get the current privacy balance to include in status
         let authority_fvk_guard = self.authority_fvk.read().await;
-        let privacy_balance = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            let viewing_key_bytes = *authority_fvk.as_bytes();
-            let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
+        let viewing_key = authority_fvk_guard
+            .as_ref()
+            .map(|authority_fvk| midnight_privacy::FullViewingKey(*authority_fvk.as_bytes()));
 
-            // Get privacy balance
-            let privacy_result = crate::operations::get_privacy_balance(
-                provider,
-                &*privacy_key_guard,
-                &viewing_key,
-            )
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-            privacy_result.balance
-        } else {
-            // No viewing key configured, default to 0
-            0
+        let privacy_balance = match crate::operations::get_privacy_balance(
+            provider,
+            &*privacy_key_guard,
+            viewing_key.as_ref(),
+        )
+        .await
+        {
+            Ok(privacy_result) => privacy_result.balance,
+            Err(e) => {
+                tracing::warn!("[walletStatus] Failed to fetch privacy balance: {}", e);
+                0
+            }
         };
 
         let sync_progress = SyncProgressInfo {

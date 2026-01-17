@@ -78,14 +78,18 @@ pub async fn get_wallet_balance(
         .await?;
 
     // When VFK is provided, fetch ALL transfers with encrypted notes so we can decrypt
-    // and find change notes from outgoing transfers. Otherwise, only fetch transfers
-    // where we are the recipient (based on the stored recipient field).
+    // and find change notes from outgoing transfers. Without a VFK, prefer stored
+    // decrypted notes if available.
     let transfer_filter = if vfk.is_some() {
         Condition::any()
             .add(idx::midnight_transfer::Column::Recipient.eq(recipient_bech32m.clone()))
             .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+            .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
     } else {
-        Condition::any().add(idx::midnight_transfer::Column::Recipient.eq(recipient_bech32m.clone()))
+        Condition::any()
+            .add(idx::midnight_transfer::Column::Recipient.eq(recipient_bech32m.clone()))
+            .add(idx::midnight_transfer::Column::PrivacySender.eq(recipient_bech32m.clone()))
+            .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
     };
     let transfer_rows = idx::midnight_transfer::Entity::find()
         .filter(transfer_filter)
@@ -147,7 +151,10 @@ pub async fn get_wallet_balance(
         let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
             continue;
         };
-        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
+        let mut decrypted_notes = notes_from_decrypted_row(row.decrypted_notes.as_ref());
+        if decrypted_notes.is_empty() {
+            decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
+        }
         for note in decrypted_notes {
             if let Some(record) = note_from_decrypted(
                 &note,
@@ -281,6 +288,14 @@ fn notes_from_row(
         }
     }
     decrypted_notes
+}
+
+fn notes_from_decrypted_row(decrypted: Option<&serde_json::Value>) -> Vec<viewer::DecryptedNote> {
+    let Some(json) = decrypted else {
+        return Vec::new();
+    };
+
+    serde_json::from_value(json.clone()).unwrap_or_default()
 }
 
 fn note_from_decrypted(

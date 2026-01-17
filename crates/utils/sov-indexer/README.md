@@ -21,7 +21,7 @@ Quick start
    - `INDEX_DB` (optional): local index DB, default `sqlite://wallet_index.sqlite?mode=rwc`
    - `INDEXER_BIND` (optional): listen address, default `0.0.0.0:13100`
    - `AUTHORITY_VFK` (optional): 32-byte hex authority viewing key for decrypting encrypted notes
-   - `INDEX_DB_RESET` (optional): set to `1`/`true` to drop all index tables before startup (works for sqlite/postgresql)
+   - `INDEX_DB_RESET` (optional): set to `1`/`true` to drop all index tables before startup (works for sqlite/postgresql). The `fvk_registry` table is preserved.
 
 2) Run the service:
    ```bash
@@ -43,11 +43,11 @@ Quick start
      - Response includes `total` (count of matching records before pagination)
    - Wallet balance: `POST /wallets/:address/balance`
      - `address`: bech32m privacy pool address (`privpool1...`)
-     - JSON body:
-      - `nf_key`: 32-byte hex nullifier key (required)
-      - `vfk`: 32-byte hex full viewing key (optional)
-     - Returns `{ "balance": "...", "unspent_notes": [...] }`
-     - Note: the indexer cannot verify that `nf_key` matches the address.
+  - JSON body:
+   - `nf_key`: 32-byte hex nullifier key (required)
+   - `vfk`: 32-byte hex full viewing key (optional)
+  - Returns `{ "balance": "...", "unspent_notes": [...] }`
+  - Note: the indexer cannot verify that `nf_key` matches the address. If decrypted notes are already stored in the index, `vfk` can be omitted; otherwise some transfer outputs may be missing.
 
 ## FVK Decryption (Optional)
 

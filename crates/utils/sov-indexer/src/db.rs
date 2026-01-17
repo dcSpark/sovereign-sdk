@@ -68,6 +68,9 @@ pub async fn reset_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     set_foreign_key_checks(idx_db, backend, false).await?;
     let tables = list_all_tables(idx_db, backend).await?;
     for table in tables {
+        if table == idx::fvk_registry::Entity::table_name() {
+            continue;
+        }
         let quoted = quote_table(&table, backend);
         let sql = match backend {
             DatabaseBackend::Postgres => format!("DROP TABLE IF EXISTS {} CASCADE", quoted),
