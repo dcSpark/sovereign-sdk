@@ -10,8 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sov_api_spec::types;
+use sov_bank::TokenId;
 use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
+use serde::Deserialize;
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -204,6 +207,39 @@ impl Provider {
             .get_nonce_for_public_key::<S>(public_key)
             .await
             .context("Failed to get nonce from rollup")
+    }
+
+    /// Get a bank balance for the given address and token id.
+    pub async fn get_balance<S: Spec>(
+        &self,
+        account_address: &S::Address,
+        token_id: &TokenId,
+    ) -> Result<sov_bank::Amount> {
+        self.client
+            .get_balance::<S>(account_address, token_id, None)
+            .await
+            .context("Failed to get balance from rollup")
+    }
+
+    pub async fn wait_for_tx_processing(&self, tx_hash: &types::TxHash) -> Result<()> {
+        self.client
+            .wait_for_tx_processing(tx_hash)
+            .await
+            .context("Failed to wait for transaction processing")
+    }
+
+    pub async fn get_gas_token_id(&self) -> Result<TokenId> {
+        #[derive(Deserialize)]
+        struct TokenIdResponse {
+            token_id: TokenId,
+        }
+
+        let response: TokenIdResponse = self
+            .query_rest_endpoint("/modules/bank/tokens/gas_token")
+            .await
+            .context("Failed to fetch gas token id from rollup")?;
+
+        Ok(response.token_id)
     }
 
     /// Submit a raw transaction to the rollup sequencer

@@ -1,6 +1,9 @@
 //! Core wallet operations that are independent of MCP protocol.
 //! These functions contain the business logic and are easy to test.
 
+/// Default max fee applied to MCP-generated transactions.
+pub const DEFAULT_MAX_FEE: u128 = 1_000_000u128;
+
 pub mod decrypt_transaction;
 mod deposit;
 mod get_default_address;
@@ -28,3 +31,4 @@ pub use transfer::transfer;
 pub use get_transaction_status::TransactionDetails;
 pub use pool_admin::{add_pool_admin, freeze_address, remove_pool_admin, unfreeze_address};
 pub use verify_transaction::verify_transaction;
+pub use send_funds::send_funds;

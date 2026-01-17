@@ -27,6 +27,7 @@ Configure the following environment variables:
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
 - `AUTHORITY_FVK` - Optional authority viewing key for note decryption
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
+- `AUTO_FUND_GAS_RESERVE` - Optional gas reserve (in dust) added to the L2 funding transfer for auto-funding (default: 1000000000000). Values below the default are clamped to ensure the deposit can reserve gas.
 
 ### Start the Server
 
@@ -51,11 +52,11 @@ The server exposes the following MCP tools:
 - `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
-If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool.
 
 ### Transactions
 
-Transactions are fetched directly from the indexer when requested. `send` returns the rollup transaction hash (also exposed as `txIdentifier`), and the `id` field in transaction records matches that hash.
+Transactions are fetched directly from the indexer when requested. `send` returns the rollup transaction hash, and the `id` field in transaction records matches that hash.
 
 ## Docker
 

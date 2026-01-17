@@ -79,6 +79,11 @@ pub struct Config {
     /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
     #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
     pub auto_fund_deposit_amount: Option<String>,
+
+    /// Optional gas reserve to add when auto-funding a new wallet (env: AUTO_FUND_GAS_RESERVE, optional).
+    /// This is added to the deposit amount to cover future transaction fees.
+    #[serde(default)]
+    pub auto_fund_gas_reserve: Option<String>,
 }
 
 fn default_server_bind_address() -> String {

@@ -28,6 +28,7 @@ use crate::server::CryptoServer;
 use crate::wallet::WalletContext;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
+const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -182,6 +183,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let auto_fund_gas_reserve = cfg
+        .auto_fund_gas_reserve
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u128>().map_err(|e| {
+                tracing::warn!(
+                    "[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}",
+                    s,
+                    e
+                );
+                e
+            })
+        })
+        .and_then(Result::ok)
+        .unwrap_or(DEFAULT_AUTO_FUND_GAS_RESERVE);
+
+    if auto_fund_deposit_amount.is_some() {
+        tracing::info!(
+            "[auto-fund] Configured auto-fund gas reserve: {}",
+            auto_fund_gas_reserve
+        );
+    }
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -194,6 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let privacy_key_for_service = privacy_key.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
+    let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
     let service = StreamableHttpService::new(
         move || {
@@ -206,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 privacy_key_for_service.clone(),
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
+                auto_fund_gas_reserve_for_service,
             ))
         },
         LocalSessionManager::default().into(),

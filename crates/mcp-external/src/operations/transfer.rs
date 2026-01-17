@@ -23,6 +23,7 @@ use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
 use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
@@ -412,7 +413,7 @@ async fn create_transfer_unsigned_tx(
         nonce
     };
 
-    let max_fee = Amount::from(1_000_000_000_000u128);
+    let max_fee = Amount::from(DEFAULT_MAX_FEE);
 
     let unsigned_tx = UnsignedTransaction::<McpRuntime, McpSpec>::new(
         runtime_call,

@@ -13,6 +13,7 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::{Amount, Spec};
 
+use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
@@ -63,7 +64,7 @@ async fn create_midnight_privacy_unsigned_tx(
         nonce
     };
 
-    let max_fee = Amount::from(1_000_000_000_000u128);
+    let max_fee = Amount::from(DEFAULT_MAX_FEE);
 
     Ok(UnsignedTransaction::<McpRuntime, McpSpec>::new(
         runtime_call,
@@ -162,4 +163,3 @@ pub async fn remove_pool_admin(
 
     Ok(AdminTxResult { tx_hash })
 }
-
