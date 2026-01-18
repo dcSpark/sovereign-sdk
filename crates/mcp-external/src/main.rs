@@ -223,6 +223,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
+    // Track whether a wallet has been loaded (including from environment variables)
+    // Starts as true since the initial wallet is loaded from environment variables
+    let wallet_explicitly_loaded = Arc::new(RwLock::new(true));
+    let wallet_explicitly_loaded_for_service = wallet_explicitly_loaded.clone();
+
     let service = StreamableHttpService::new(
         move || {
             Ok(CryptoServer::new(
@@ -235,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,
+                wallet_explicitly_loaded_for_service.clone(),
             ))
         },
         LocalSessionManager::default().into(),

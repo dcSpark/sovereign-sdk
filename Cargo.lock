@@ -12519,6 +12519,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "utoipa 5.0.0-beta.0",
+ "utoipa-swagger-ui",
 ]
 
 [[package]]
@@ -16237,6 +16239,7 @@ source = "git+https://github.com/juhaku/utoipa.git?rev=a985d8c1340f80ab69b2b0e5d
 dependencies = [
  "proc-macro2",
  "quote",
+ "regex",
  "syn 2.0.114",
 ]
 

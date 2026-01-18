@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::index_db as idx;
 use crate::viewer;
@@ -11,20 +12,20 @@ use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, P
 const DOMAIN: Hash32 = [1u8; 32];
 const NULLIFIER_CHUNK_SIZE: usize = 500;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct BalanceRequest {
     pub nf_key: String,
     #[serde(default)]
     pub vfk: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BalanceResponse {
     pub balance: String,
     pub unspent_notes: Vec<UnspentNote>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UnspentNote {
     pub value: String,
     pub rho: String,
