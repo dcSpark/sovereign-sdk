@@ -80,6 +80,31 @@ fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::D
     Ok(pool)
 }
 
+/// Request body for prover service `/prove` endpoint.
+#[derive(Clone, serde::Serialize)]
+struct ProverServiceRequest {
+    circuit: String,
+    args: Vec<ligero_runner::LigeroArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof: Option<String>,
+    #[serde(rename = "privateIndices")]
+    private_indices: Vec<usize>,
+    /// Optional packing size (defaults to 8192 on server)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packing: Option<u32>,
+}
+
+/// Response body from prover service.
+#[derive(Clone, serde::Deserialize)]
+struct ProverServiceResponse {
+    success: bool,
+    #[serde(rename = "exitCode")]
+    exit_code: i32,
+    proof: Option<String>,
+    error: Option<String>,
+}
+
+
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
     num_wallets: usize,
@@ -88,6 +113,10 @@ struct ContinuousConfig {
     cycle_delay_ms: u64,
     external_node_url: Option<String>,
     external_verifier_url: Option<String>,
+    /// Optional URL of the prover service (e.g., http://127.0.0.1:1313).
+    /// When set, proofs are generated via HTTP calls to this service instead of
+    /// the local daemon pool. This allows offloading proving to a remote GPU server.
+    prover_service_url: Option<String>,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
     continuous: bool,
@@ -126,6 +155,13 @@ impl ContinuousConfig {
             .ok()
             .or_else(|| Some("http://localhost:8080".to_string()));
 
+        // Prover service URL for remote proving (defaults to http://127.0.0.1:1313).
+        // Set PROVER_SERVICE_URL="" to use local daemon pool instead.
+        let prover_service_url = std::env::var("PROVER_SERVICE_URL")
+            .ok()
+            .map(|v| if v.is_empty() { None } else { Some(v) })
+            .unwrap_or_else(|| Some("http://127.0.0.1:1313".to_string()));
+
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -156,6 +192,7 @@ impl ContinuousConfig {
             cycle_delay_ms,
             external_node_url,
             external_verifier_url,
+            prover_service_url,
             max_concurrent_proofs,
             detailed_wallet_logs,
             continuous,
@@ -553,6 +590,11 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
+    if let Some(ref url) = config.prover_service_url {
+        eprintln!("[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)", url);
+    } else {
+        eprintln!("[config] Prover: local daemon pool (PROVER_SERVICE_URL=\"\")");
+    }
 
     // If `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is set, export it as `POOL_FVK_PK` so the in-process
     // verifier (when spawned) enforces pool-signed viewer commitments.
@@ -1522,6 +1564,7 @@ async fn perform_transfer_cycle(
     let mut proof_tasks = Vec::with_capacity(inputs.len());
 
     let viewer_bundles = viewer_bundles.clone();
+    let prover_service_url = config.prover_service_url.clone();
     for input in inputs.iter() {
         let account_idx = input.wallet_idx;
         let value = input.value;
@@ -1536,6 +1579,7 @@ async fn perform_transfer_cycle(
         let viewer_bundles = viewer_bundles.clone();
         let daemon_workers = config.max_concurrent_proofs;
         let client = client.clone();
+        let prover_service_url = prover_service_url.clone();
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
@@ -1815,68 +1859,133 @@ async fn perform_transfer_cycle(
                 host.set_public_output(&public)
                     .context("set public output (round 2)")?;
 
-                // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
-                let proof_data = (|| -> anyhow::Result<Vec<u8>> {
-                    let public_output = host.require_public_output()?;
-                    let cfg = host.runner().config().clone();
-                    let mut cfg_json = serde_json::to_value(&cfg)?;
+                // Generate proof via either prover service (HTTP) or local daemon pool.
+                let proof_data = if let Some(ref service_url) = prover_service_url {
+                    // Use remote prover service via blocking HTTP call.
+                    (|| -> anyhow::Result<Vec<u8>> {
+                        let public_output = host.require_public_output()?;
+                        let cfg = host.runner().config().clone();
+                        let args = cfg.args.clone();
+                        let private_indices = cfg.private_indices.clone();
 
-                    // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
-                    // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
-                    if let serde_json::Value::Object(ref mut map) = cfg_json {
-                        if let Some(serde_json::Value::String(program)) =
-                            map.get("program").cloned()
-                        {
-                            let resolved = ligero_runner::resolve_program(&program)
-                                .with_context(|| format!("Failed to resolve program '{program}'"))?;
-                            map.insert(
-                                "program".to_string(),
-                                serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                        // Resolve program path to ensure consistency with what the HTTP server expects.
+                        // The server's resolve_circuit handles names like "note_spend_guest".
+                        let circuit_name = cfg.program.clone();
+
+                        // Create blocking HTTP client for the prover service call.
+                        let blocking_client = reqwest::blocking::Client::new();
+                        let url = format!("{}/prove", service_url.trim_end_matches('/'));
+
+                        let request = ProverServiceRequest {
+                            circuit: circuit_name,
+                            args: args.clone(),
+                            proof: None,
+                            private_indices: private_indices.clone(),
+                            packing: Some(cfg.packing),
+                        };
+
+                        let resp = blocking_client
+                            .post(&url)
+                            .json(&request)
+                            .send()
+                            .context("Failed to send request to prover service")?;
+
+                        let status = resp.status();
+                        let body: ProverServiceResponse = resp
+                            .json()
+                            .context("Failed to parse prover service response")?;
+
+                        if !status.is_success() || !body.success {
+                            anyhow::bail!(
+                                "Prover service returned error (status={}, exit_code={}): {}",
+                                status,
+                                body.exit_code,
+                                body.error.unwrap_or_else(|| "unknown error".to_string())
                             );
                         }
-                    }
 
-                    // Provide an explicit, unique proof output path to the daemon.
-                    // Relying on the daemon's internal temp-path generator can collide across
-                    // multiple daemon processes started at the same time (same timestamp + per-process counter).
-                    let tmp = tempfile::tempdir()?;
-                    let proof_path = tmp.path().join("proof_data.bin");
-                    if let serde_json::Value::Object(ref mut map) = cfg_json {
-                        map.insert(
-                            "proof-path".to_string(),
-                            serde_json::Value::String(proof_path.to_string_lossy().to_string()),
-                        );
-                        // Request uncompressed proofs: this significantly reduces CPU overhead
-                        // (gzip compress/decompress) while keeping proving/verifying correctness.
-                        map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
-                    }
+                        let proof_b64 = body
+                            .proof
+                            .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
 
-                    let pool = prover_daemon_pool(daemon_workers)
-                        .context("initialize ligero prover daemon pool")?;
+                        let proof_bytes = BASE64_STANDARD
+                            .decode(&proof_b64)
+                            .context("Failed to decode base64 proof from prover service")?;
 
-                    let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
-                    if !resp.ok {
-                        anyhow::bail!(
-                            "prover daemon returned ok=false (exit_code={:?}): {}",
-                            resp.exit_code,
-                            resp.error.unwrap_or_else(|| "unknown error".to_string())
-                        );
-                    }
+                        let args_json = serde_json::to_vec(&args)?;
+                        let pkg = ligero_runner::LigeroProofPackage::new(
+                            proof_bytes,
+                            public_output,
+                            args_json,
+                            private_indices,
+                        )?;
+                        Ok(bincode::serialize(&pkg)?)
+                    })()
+                    .context("generate transfer proof via prover service")?
+                } else {
+                    // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
+                    (|| -> anyhow::Result<Vec<u8>> {
+                        let public_output = host.require_public_output()?;
+                        let cfg = host.runner().config().clone();
+                        let mut cfg_json = serde_json::to_value(&cfg)?;
 
-                    let proof_bytes = std::fs::read(&proof_path)
-                        .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
-                    drop(tmp);
+                        // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
+                        // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
+                        if let serde_json::Value::Object(ref mut map) = cfg_json {
+                            if let Some(serde_json::Value::String(program)) =
+                                map.get("program").cloned()
+                            {
+                                let resolved = ligero_runner::resolve_program(&program)
+                                    .with_context(|| format!("Failed to resolve program '{program}'"))?;
+                                map.insert(
+                                    "program".to_string(),
+                                    serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                                );
+                            }
+                        }
 
-                    let args_json = serde_json::to_vec(&cfg.args)?;
-                    let pkg = ligero_runner::LigeroProofPackage::new(
-                        proof_bytes,
-                        public_output,
-                        args_json,
-                        cfg.private_indices.clone(),
-                    )?;
-                    Ok(bincode::serialize(&pkg)?)
-                })()
-                .context("generate second-round transfer proof via daemon")?;
+                        // Provide an explicit, unique proof output path to the daemon.
+                        // Relying on the daemon's internal temp-path generator can collide across
+                        // multiple daemon processes started at the same time (same timestamp + per-process counter).
+                        let tmp = tempfile::tempdir()?;
+                        let proof_path = tmp.path().join("proof_data.bin");
+                        if let serde_json::Value::Object(ref mut map) = cfg_json {
+                            map.insert(
+                                "proof-path".to_string(),
+                                serde_json::Value::String(proof_path.to_string_lossy().to_string()),
+                            );
+                            // Request uncompressed proofs: this significantly reduces CPU overhead
+                            // (gzip compress/decompress) while keeping proving/verifying correctness.
+                            map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
+                        }
+
+                        let pool = prover_daemon_pool(daemon_workers)
+                            .context("initialize ligero prover daemon pool")?;
+
+                        let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
+                        if !resp.ok {
+                            anyhow::bail!(
+                                "prover daemon returned ok=false (exit_code={:?}): {}",
+                                resp.exit_code,
+                                resp.error.unwrap_or_else(|| "unknown error".to_string())
+                            );
+                        }
+
+                        let proof_bytes = std::fs::read(&proof_path)
+                            .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
+                        drop(tmp);
+
+                        let args_json = serde_json::to_vec(&cfg.args)?;
+                        let pkg = ligero_runner::LigeroProofPackage::new(
+                            proof_bytes,
+                            public_output,
+                            args_json,
+                            cfg.private_indices.clone(),
+                        )?;
+                        Ok(bincode::serialize(&pkg)?)
+                    })()
+                    .context("generate transfer proof via daemon")?
+                };
 
                 let proof_data = if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
                     let Some((_fvk, _att)) = viewer_data.as_ref() else {

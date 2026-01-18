@@ -68,6 +68,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     defer_submission: bool,
 
+    /// URL of the ligero-http-server prover/verifier service for remote proof verification.
+    /// When set, proofs will be verified via REST calls instead of local daemon processes.
+    /// Default: http://localhost:1313
+    #[arg(long, default_value = "http://localhost:1313")]
+    prover_service_url: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -171,7 +177,14 @@ async fn main() -> Result<()> {
         max_concurrent_verifications: args.max_concurrent,
         da_connection_string,
         defer_sequencer_submission: args.defer_submission,
+        prover_service_url: args.prover_service_url,
     };
+
+    if let Some(ref url) = config.prover_service_url {
+        info!("Prover service URL: {} (using remote verification)", url);
+    } else {
+        info!("Prover service URL: not configured (using local daemon pool)");
+    }
 
     // Create application state (loads signing key at startup)
     let state =

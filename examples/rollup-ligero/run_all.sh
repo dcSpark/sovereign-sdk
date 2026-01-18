@@ -73,15 +73,9 @@ kill_tree() {
     return 0
   fi
 
-  local children=""
-  children="$(pgrep -P "$pid" 2>/dev/null || true)"
-  if [[ -n "$children" ]]; then
-    local child
-    for child in $children; do
-      kill_tree "$sig" "$child"
-    done
-  fi
-
+  # Kill children first (works on macOS and Linux)
+  pkill -"$sig" -P "$pid" 2>/dev/null || true
+  # Then kill the parent
   kill "-$sig" "$pid" 2>/dev/null || true
 }
 
@@ -224,6 +218,14 @@ if [[ -n "${POOL_FVK_PK:-}" && -z "${MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN:-}" ]]; th
   echo "Generated MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for midnight-fvk-service private lookups."
 fi
 
+PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
+PROVER_HOST="${PROVER_BIND%:*}"
+PROVER_PORT="${PROVER_BIND##*:}"
+if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
+  PROVER_HOST="$PROVER_BIND"
+  PROVER_PORT="1313"
+fi
+
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "$LAST_PID"
@@ -249,6 +251,10 @@ wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
 echo "Starting mcp-2..."
 start_service "mcp-2" bash "$SCRIPT_DIR/run_mcp_2.sh"
 wait_for_port "mcp-2" "$MCP_2_HOST" "$MCP_2_PORT" "$LAST_PID"
+
+echo "Starting prover..."
+start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
+wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "${PIDS[4]}"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."
