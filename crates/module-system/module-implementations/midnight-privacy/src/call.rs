@@ -280,6 +280,39 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(bucket.iter().any(|e| e == recipient))
     }
 
+    fn add_frozen_address_to_list(
+        &mut self,
+        address: PrivacyAddress,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        let mut list = self.frozen_addresses.get(state)?.unwrap_or_default();
+        let key = (address.to_pk(), address.pk_ivk());
+        match list.binary_search_by(|a| (a.to_pk(), a.pk_ivk()).cmp(&key)) {
+            Ok(_) => Ok(()),
+            Err(pos) => {
+                list.insert(pos, address);
+                self.frozen_addresses
+                    .set::<Vec<PrivacyAddress>, _>(&list, state)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn remove_frozen_address_from_list(
+        &mut self,
+        address: PrivacyAddress,
+        state: &mut impl TxState<S>,
+    ) -> Result<()> {
+        let mut list = self.frozen_addresses.get(state)?.unwrap_or_default();
+        let key = (address.to_pk(), address.pk_ivk());
+        if let Ok(pos) = list.binary_search_by(|a| (a.to_pk(), a.pk_ivk()).cmp(&key)) {
+            list.remove(pos);
+            self.frozen_addresses
+                .set::<Vec<PrivacyAddress>, _>(&list, state)?;
+        }
+        Ok(())
+    }
+
     /// Internal helper: Queue a single commitment for end-of-block processing.
     /// Used by deposit() and transfer() to append note commitments.
     ///
@@ -1227,6 +1260,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .get(&pos, state)?
             .unwrap_or_else(empty_blacklist_bucket_entries);
         if entries.iter().any(|e| e == &recipient) {
+            // Keep frozen-address list in sync even on idempotent calls.
+            self.add_frozen_address_to_list(address, state)?;
             return Ok(());
         }
         let mut non_zero: Vec<Hash32> = entries
@@ -1252,6 +1287,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .get(state)?
             .unwrap_or_else(crate::default_blacklist_root);
         let new_root = self.update_blacklist_bucket_at_pos(pos, entries, state)?;
+
+        self.add_frozen_address_to_list(address, state)?;
 
         if new_root != old_root {
             self.emit_event(
@@ -1290,6 +1327,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .get(&pos, state)?
             .unwrap_or_else(empty_blacklist_bucket_entries);
         if !entries.iter().any(|e| e == &recipient) {
+            // Keep frozen-address list in sync even on idempotent calls.
+            self.remove_frozen_address_from_list(address, state)?;
             return Ok(());
         }
         let mut non_zero: Vec<Hash32> = entries
@@ -1308,6 +1347,8 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .get(state)?
             .unwrap_or_else(crate::default_blacklist_root);
         let new_root = self.update_blacklist_bucket_at_pos(pos, entries, state)?;
+
+        self.remove_frozen_address_from_list(address, state)?;
 
         if new_root != old_root {
             self.emit_event(

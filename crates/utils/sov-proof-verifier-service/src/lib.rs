@@ -1217,6 +1217,80 @@ async fn verify_and_record_midnight_handler(
     let tx_hash = tx.hash().to_string();
     let transaction_data = create_transaction_without_proof(&tx)?;
 
+    async fn handle_no_proof_midnight_call(
+        state: &AppState,
+        tx: &DemoTransaction,
+        tx_hash: &str,
+        transaction_data: &str,
+        full_transaction_blob: &str,
+        start: std::time::Instant,
+        mut metrics: VerificationMetrics,
+    ) -> Result<Json<VerifyAndSubmitResponse>, ServiceError> {
+        let persist_start = std::time::Instant::now();
+        // Populate serialized_tx_base64 so sequencer flush path works uniformly.
+        let pre_auth_data = match extract_pre_authenticated_data(tx) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                error!("⚠️  Failed to extract pre-authenticated data for midnight no-proof call: {e}; falling back to base64 body only");
+                Some((
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    full_transaction_blob.to_string(),
+                ))
+            }
+        };
+
+        store_verified_midnight_transaction(
+            state.da_conn.as_ref(),
+            &state.incoming_worker_tx_saver,
+            tx_hash,
+            None, // No proof outputs for no-proof calls
+            true, // signature_valid
+            None, // proof_verified: NULL (transaction doesn't have a proof)
+            transaction_data,
+            full_transaction_blob,
+            pre_auth_data,
+            None, // No encrypted notes (no view_ciphertexts)
+        )
+        .await?;
+        metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+        metrics.proof_verify_ms = 0.0;
+
+        if state.config.defer_sequencer_submission {
+            // Do not submit now; queued in DB
+            metrics.node_submit_ms = 0.0;
+            metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return Ok(Json(VerifyAndSubmitResponse {
+                success: true,
+                tx_hash: Some(tx_hash.to_string()),
+                sequencer_response: None,
+                error: None,
+                metrics,
+            }));
+        }
+
+        let sequencer_start = std::time::Instant::now();
+        let submission = submit_worker_tx_to_sequencer(state, tx_hash).await?;
+        metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
+        metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let error_message = if submission.accepted {
+            None
+        } else {
+            Some(submission.log_message.clone())
+        };
+
+        Ok(Json(VerifyAndSubmitResponse {
+            success: submission.accepted,
+            tx_hash: Some(tx_hash.to_string()),
+            sequencer_response: submission.response_json.clone(),
+            error: error_message,
+            metrics,
+        }))
+    }
+
     match parsed_call {
         ParsedMidnightCall::Deposit {
             amount,
@@ -1232,76 +1306,16 @@ async fn verify_and_record_midnight_handler(
                 hex::encode(&recipient[..8]),
                 view_fvks.as_ref().map(|v| v.len()),
             );
-
-            let persist_start = std::time::Instant::now();
-            // Populate serialized_tx_base64 so sequencer flush path works uniformly.
-            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    error!("⚠️  Failed to extract pre-authenticated data for deposit: {e}; falling back to base64 body only");
-                    Some((
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        req.body.clone(),
-                    ))
-                }
-            };
-            store_verified_midnight_transaction(
-                state.da_conn.as_ref(),
-                &state.incoming_worker_tx_saver,
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
                 &tx_hash,
-                None, // No proof outputs for deposits
-                true, // signature_valid
-                None, // proof_verified: NULL (transaction doesn't have a proof)
                 &transaction_data,
                 &req.body,
-                pre_auth_data,
-                None, // Deposits don't have encrypted notes (they use view_fvks instead)
+                start,
+                metrics,
             )
-            .await?;
-            metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
-            metrics.proof_verify_ms = 0.0;
-
-            debug!(
-                "✓ Stored verified midnight deposit: amount={}, rho=0x{}, hash={}",
-                amount,
-                hex::encode(&rho[..8]),
-                tx_hash
-            );
-
-            if state.config.defer_sequencer_submission {
-                // Do not submit now; queued in DB
-                metrics.node_submit_ms = 0.0;
-                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                Ok(Json(VerifyAndSubmitResponse {
-                    success: true,
-                    tx_hash: Some(tx_hash),
-                    sequencer_response: None,
-                    error: None,
-                    metrics,
-                }))
-            } else {
-                let sequencer_start = std::time::Instant::now();
-                let submission = submit_worker_tx_to_sequencer(&state, &tx_hash).await?;
-                metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
-                metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-                let error_message = if submission.accepted {
-                    None
-                } else {
-                    Some(submission.log_message.clone())
-                };
-
-                Ok(Json(VerifyAndSubmitResponse {
-                    success: submission.accepted,
-                    tx_hash: Some(tx_hash),
-                    sequencer_response: submission.response_json.clone(),
-                    error: error_message,
-                    metrics,
-                }))
-            }
+            .await
         }
         ParsedMidnightCall::Transfer {
             proof,
@@ -1500,6 +1514,86 @@ async fn verify_and_record_midnight_handler(
                     metrics,
                 }))
             }
+        }
+        ParsedMidnightCall::UpdateMethodId { new_method_id } => {
+            debug!(
+                "Parsed midnight update_method_id: new_method_id=0x{}",
+                hex::encode(new_method_id)
+            );
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
+                &tx_hash,
+                &transaction_data,
+                &req.body,
+                start,
+                metrics,
+            )
+            .await
+        }
+        ParsedMidnightCall::FreezeAddress { address } => {
+            debug!(
+                "Parsed midnight freeze_address: address={}",
+                address.to_string()
+            );
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
+                &tx_hash,
+                &transaction_data,
+                &req.body,
+                start,
+                metrics,
+            )
+            .await
+        }
+        ParsedMidnightCall::UnfreezeAddress { address } => {
+            debug!(
+                "Parsed midnight unfreeze_address: address={}",
+                address.to_string()
+            );
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
+                &tx_hash,
+                &transaction_data,
+                &req.body,
+                start,
+                metrics,
+            )
+            .await
+        }
+        ParsedMidnightCall::AddPoolAdmin { admin } => {
+            debug!(
+                "Parsed midnight add_pool_admin: admin={}",
+                admin.to_string()
+            );
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
+                &tx_hash,
+                &transaction_data,
+                &req.body,
+                start,
+                metrics,
+            )
+            .await
+        }
+        ParsedMidnightCall::RemovePoolAdmin { admin } => {
+            debug!(
+                "Parsed midnight remove_pool_admin: admin={}",
+                admin.to_string()
+            );
+            handle_no_proof_midnight_call(
+                &state,
+                &tx,
+                &tx_hash,
+                &transaction_data,
+                &req.body,
+                start,
+                metrics,
+            )
+            .await
         }
     }
 }
@@ -1822,6 +1916,21 @@ enum ParsedMidnightCall {
         to: <RollupSpec as Spec>::Address,
         view_ciphertexts: Option<Vec<EncryptedNote>>,
     },
+    UpdateMethodId {
+        new_method_id: [u8; 32],
+    },
+    FreezeAddress {
+        address: midnight_privacy::PrivacyAddress,
+    },
+    UnfreezeAddress {
+        address: midnight_privacy::PrivacyAddress,
+    },
+    AddPoolAdmin {
+        admin: <RollupSpec as Spec>::Address,
+    },
+    RemovePoolAdmin {
+        admin: <RollupSpec as Spec>::Address,
+    },
 }
 
 fn parse_midnight_call(
@@ -1869,9 +1978,21 @@ fn parse_midnight_call(
                 to,
                 view_ciphertexts,
             }),
-            other => Err(ServiceError::UnsupportedCall(format!(
-                "Unsupported midnight_privacy call: {other:?}"
-            ))),
+            MidnightCallMessage::UpdateMethodId { new_method_id } => {
+                Ok(ParsedMidnightCall::UpdateMethodId { new_method_id })
+            }
+            MidnightCallMessage::FreezeAddress { address } => {
+                Ok(ParsedMidnightCall::FreezeAddress { address })
+            }
+            MidnightCallMessage::UnfreezeAddress { address } => {
+                Ok(ParsedMidnightCall::UnfreezeAddress { address })
+            }
+            MidnightCallMessage::AddPoolAdmin { admin } => {
+                Ok(ParsedMidnightCall::AddPoolAdmin { admin })
+            }
+            MidnightCallMessage::RemovePoolAdmin { admin } => {
+                Ok(ParsedMidnightCall::RemovePoolAdmin { admin })
+            }
         },
         other => Err(ServiceError::UnsupportedCall(format!(
             "Expected midnight_privacy call, got {other:?}"
@@ -1913,6 +2034,21 @@ pub fn parse_midnight_withdraw_call(
         )),
         ParsedMidnightCall::Transfer { .. } => Err(ServiceError::UnsupportedCall(
             "Expected Withdraw call, got Transfer".to_string(),
+        )),
+        ParsedMidnightCall::UpdateMethodId { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got UpdateMethodId".to_string(),
+        )),
+        ParsedMidnightCall::FreezeAddress { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got FreezeAddress".to_string(),
+        )),
+        ParsedMidnightCall::UnfreezeAddress { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got UnfreezeAddress".to_string(),
+        )),
+        ParsedMidnightCall::AddPoolAdmin { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got AddPoolAdmin".to_string(),
+        )),
+        ParsedMidnightCall::RemovePoolAdmin { .. } => Err(ServiceError::UnsupportedCall(
+            "Expected Withdraw call, got RemovePoolAdmin".to_string(),
         )),
     }
 }

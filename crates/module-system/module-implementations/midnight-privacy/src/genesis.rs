@@ -76,6 +76,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.pool_admin_list
             .set::<Vec<S::Address>, _>(&admins, state)?;
 
+        // Initialize frozen address list (deny-map enumeration helper).
+        self.frozen_addresses
+            .set::<Vec<crate::types::PrivacyAddress>, _>(&Vec::new(), state)?;
+
         // New: bind domain + native token in state
         self.domain.set(&config.domain, state)?;
         self.token_id.set(&config.token_id, state)?;
