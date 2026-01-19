@@ -386,7 +386,7 @@ impl Provider {
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<InvolvementItem>> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/txs/{}", base_url, tx_hash);
+        let url = format!("{}/transactions/{}", base_url, tx_hash);
 
         tracing::debug!("Fetching transaction details from indexer: {}", url);
 
@@ -449,7 +449,6 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
-    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -459,7 +458,7 @@ impl Provider {
     /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
     /// let transactions = provider
-    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .get_wallet_transactions(address, None, None, None)
     ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
@@ -471,11 +470,10 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
-        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/wallets/{}", base_url, address);
+        let mut url = format!("{}/transactions/wallet/{}/god", base_url, address);
 
         // Build query parameters
         let mut query_params = Vec::new();
@@ -496,11 +494,9 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let mut request = self.http_client.post(&url);
-        if let Some(vfk) = vfk {
-            request = request.json(&serde_json::json!({ "vfk": vfk }));
-        }
-        let response = request
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;

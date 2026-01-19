@@ -488,6 +488,17 @@ pub struct UnfreezeAddressResult {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ListFrozenAddressesRequest {}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct ListFrozenAddressesResult {
+    /// Frozen privacy pool addresses (bech32m format: privpool1...)
+    pub addresses: Vec<String>,
+    /// Total count.
+    pub count: u64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct AddPoolAdminRequest {
     /// L2 address to grant pool-admin rights to
     #[serde(rename = "adminAddress")]
@@ -1901,6 +1912,39 @@ impl CryptoServer {
         let json =
             serde_json::to_string_pretty(&UnfreezeAddressResult { tx_hash: res.tx_hash })
                 .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List frozen (blacklisted) privacy addresses.
+    #[tool(
+        name = "listFrozenAddresses",
+        description = "List frozen (blacklisted) privacy pool addresses."
+    )]
+    async fn list_frozen_addresses(
+        &self,
+        Parameters(_params): Parameters<ListFrozenAddressesRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let res = crate::operations::list_frozen_addresses(provider)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = ListFrozenAddressesResult {
+            addresses: res
+                .addresses
+                .into_iter()
+                .map(|addr| addr.to_string())
+                .collect(),
+            count: res.count,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
