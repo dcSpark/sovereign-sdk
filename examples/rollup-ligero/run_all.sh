@@ -226,6 +226,15 @@ if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
   PROVER_PORT="1313"
 fi
 
+# Support both DEFER_SUBMISSION and DEFER_SEQUENCER_SUBMISSION
+if [[ -n "${DEFER_SUBMISSION:-}" && -z "${DEFER_SEQUENCER_SUBMISSION:-}" ]]; then
+  export DEFER_SEQUENCER_SUBMISSION="$DEFER_SUBMISSION"
+fi
+if [[ -n "${DEFER_SEQUENCER_SUBMISSION:-}" ]]; then
+  export DEFER_SEQUENCER_SUBMISSION
+  echo "DEFER_SEQUENCER_SUBMISSION=$DEFER_SEQUENCER_SUBMISSION (verifier will defer sequencer submission)"
+fi
+
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "$LAST_PID"
