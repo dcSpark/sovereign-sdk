@@ -3,6 +3,8 @@
 
 #[cfg(feature = "native")]
 pub mod genesis_config;
+/// Prototype Midnight withdrawal module.
+pub mod midnight_withdrawals;
 mod preverified_authenticator;
 pub mod runtime;
 #[cfg(feature = "test-utils")]
