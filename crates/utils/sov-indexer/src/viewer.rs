@@ -626,3 +626,47 @@ pub fn extract_sender_from_decrypted_notes(
 
     None
 }
+
+/// Extract the transferred amount from decrypted notes.
+///
+/// Only sums notes where recipient != sender_id (excludes change notes).
+/// For transfers: if sender sends 100 but only 20 goes to recipient (80 is change),
+/// this returns 20 (the actual transferred amount).
+pub fn extract_amount_from_decrypted_notes(
+    decrypted_notes: Option<&serde_json::Value>,
+) -> Option<String> {
+    let notes = decrypted_notes?;
+    let arr = notes.as_array()?;
+
+    let mut total: u128 = 0;
+    for note in arr {
+        // Get the value - skip this note if missing
+        let Some(value_str) = note.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(value) = value_str.parse::<u128>() else {
+            continue;
+        };
+
+        let recipient = note.get("recipient").and_then(|v| v.as_str());
+        let sender_id = note.get("sender_id").and_then(|v| v.as_str());
+
+        // Only count notes that are NOT change (recipient != sender)
+        // If sender_id is None (deposit notes), count all notes
+        // If sender_id == recipient, it's a change note - skip it
+        let is_change_note = match (sender_id, recipient) {
+            (Some(sender), Some(recip)) => sender == recip,
+            _ => false,
+        };
+
+        if !is_change_note {
+            total = total.saturating_add(value);
+        }
+    }
+
+    if total > 0 {
+        Some(total.to_string())
+    } else {
+        None
+    }
+}

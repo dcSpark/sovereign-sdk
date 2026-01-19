@@ -1,5 +1,8 @@
 use crate::balance;
-use crate::db::{list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse};
+use crate::db::{
+    list_transactions, list_transactions_god, list_wallet_transactions,
+    list_wallet_transactions_god, list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse,
+};
 use crate::viewer::{self, FvkRegistry};
 use anyhow::Result;
 use axum::{
@@ -51,6 +54,19 @@ pub struct TxListQuery {
     pub offset: usize,
 }
 
+/// Query parameters for paginated transaction endpoints
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TransactionListQuery {
+    /// Maximum number of results (default 50, max 200)
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Pagination cursor (base64 encoded)
+    pub cursor: Option<String>,
+    /// Filter by transaction type: deposit, withdraw, transfer
+    #[serde(default)]
+    pub r#type: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
@@ -86,6 +102,11 @@ pub fn router(state: AppState) -> Router {
         .route("/wallets/:address/balance", post(wallet_balance))
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
+        // New transaction endpoints with privacy modes
+        .route("/transactions", get(get_transactions))
+        .route("/transactions/god", get(get_transactions_god))
+        .route("/transactions/:wallet", get(get_wallet_transactions))
+        .route("/transactions/:wallet/god", get(get_wallet_transactions_god))
         .route("/health", get(health))
         // FVK registry management endpoints
         .route("/fvks", get(list_fvks).post(add_fvk))
@@ -283,6 +304,178 @@ async fn list_txs(
     let limit = q.limit.min(200);
     let offset = q.offset;
     match crate::db::list_txs(&state.db, limit, offset).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ============== New Transaction Endpoints ==============
+
+/// List all transactions (public mode - hides privacy-sensitive fields)
+#[utoipa::path(
+    get,
+    path = "/transactions",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("type" = Option<String>, Query, description = "Filter by tx type: deposit, withdraw, transfer")
+    ),
+    responses(
+        (status = 200, description = "Transaction list (public mode)", body = ListResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "transactions"
+)]
+async fn get_transactions(
+    Query(q): Query<TransactionListQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let limit = q.limit.min(200);
+    let cursor = match decode_cursor(q.cursor) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid cursor: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    match list_transactions(&state.db, limit, cursor, q.r#type).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// List all transactions (god mode - shows all fields including decrypted data)
+#[utoipa::path(
+    get,
+    path = "/transactions/god",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("type" = Option<String>, Query, description = "Filter by tx type: deposit, withdraw, transfer")
+    ),
+    responses(
+        (status = 200, description = "Transaction list (god mode with decrypted data)", body = ListResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "transactions"
+)]
+async fn get_transactions_god(
+    Query(q): Query<TransactionListQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let limit = q.limit.min(200);
+    let cursor = match decode_cursor(q.cursor) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid cursor: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    match list_transactions_god(&state.db, limit, cursor, q.r#type).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// List transactions for a wallet (public mode - hides privacy-sensitive fields)
+#[utoipa::path(
+    get,
+    path = "/transactions/{wallet}",
+    params(
+        ("wallet" = String, Path, description = "Wallet address (L2 or privacy address)"),
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("type" = Option<String>, Query, description = "Filter by tx type: deposit, withdraw, transfer")
+    ),
+    responses(
+        (status = 200, description = "Wallet transactions (public mode)", body = ListResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "transactions"
+)]
+async fn get_wallet_transactions(
+    Path(wallet): Path<String>,
+    Query(q): Query<TransactionListQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let limit = q.limit.min(200);
+    let cursor = match decode_cursor(q.cursor) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid cursor: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    match list_wallet_transactions(&state.db, &wallet, limit, cursor, q.r#type).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// List transactions for a wallet (god mode - shows all fields including decrypted data)
+#[utoipa::path(
+    get,
+    path = "/transactions/{wallet}/god",
+    params(
+        ("wallet" = String, Path, description = "Wallet address (L2 or privacy address)"),
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("type" = Option<String>, Query, description = "Filter by tx type: deposit, withdraw, transfer")
+    ),
+    responses(
+        (status = 200, description = "Wallet transactions (god mode with decrypted data)", body = ListResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "transactions"
+)]
+async fn get_wallet_transactions_god(
+    Path(wallet): Path<String>,
+    Query(q): Query<TransactionListQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let limit = q.limit.min(200);
+    let cursor = match decode_cursor(q.cursor) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid cursor: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    match list_wallet_transactions_god(&state.db, &wallet, limit, cursor, q.r#type).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -511,6 +704,10 @@ async fn delete_fvk(
         wallet_balance,
         get_tx,
         list_txs,
+        get_transactions,
+        get_transactions_god,
+        get_wallet_transactions,
+        get_wallet_transactions_god,
         health,
         list_fvks,
         add_fvk,
@@ -519,6 +716,7 @@ async fn delete_fvk(
     components(schemas(
         ListQuery,
         TxListQuery,
+        TransactionListQuery,
         VfkBody,
         balance::BalanceRequest,
         balance::BalanceResponse,
@@ -535,7 +733,8 @@ async fn delete_fvk(
     )),
     tags(
         (name = "wallets", description = "Wallet-related endpoints"),
-        (name = "txs", description = "Transaction listing and lookup"),
+        (name = "txs", description = "Transaction listing and lookup (legacy)"),
+        (name = "transactions", description = "Transaction endpoints with privacy modes"),
         (name = "fvks", description = "FVK registry management"),
         (name = "health", description = "Service health checks")
     )
