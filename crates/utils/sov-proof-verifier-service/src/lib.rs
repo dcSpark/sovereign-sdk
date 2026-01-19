@@ -836,6 +836,9 @@ pub struct VerificationMetrics {
     pub node_submit_ms: f64,
     /// Total time (ms)
     pub total_ms: f64,
+    /// Timestamp when the response was created (ISO 8601)
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
 }
 
 impl Default for VerificationMetrics {
@@ -848,6 +851,7 @@ impl Default for VerificationMetrics {
             tx_creation_ms: 0.0,
             node_submit_ms: 0.0,
             total_ms: 0.0,
+            created_at: chrono::Utc::now().to_rfc3339(),
         }
     }
 }
