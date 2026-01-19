@@ -662,8 +662,8 @@ pub async fn transfer(
         anyhow::bail!("Destination privacy address is frozen (blacklisted)");
     }
 
-    // Note: The webgpu_prover generates the proof AND packages it with the public output
-    // (SpendPublic) internally, so we don't need to create it here.
+    // Note: The proof service generates raw proof bytes; we still package the proof
+    // with the public output (SpendPublic) for verifier compatibility.
 
     // Step 5: Generate ZK proof
     tracing::info!("Generating ZK proof with {} output(s)...", num_outputs);
@@ -1031,10 +1031,10 @@ pub async fn transfer(
     let private_indices_for_package: Vec<usize> =
         private_indices.iter().map(|i| *i as usize).collect();
 
-    let (packing, gpu_threads) = ligero.resolve_prover_params(8192, None);
     let proof_start = StdInstant::now();
     let proof_bytes_raw = ligero
-        .generate_proof(packing, gpu_threads, private_indices, proof_args)
+        .generate_proof(private_indices, proof_args)
+        .await
         .inspect_err(|e| tracing::error!("Failed to generate Ligero proof for transfer: {:?}", e))
         .context("Failed to generate Ligero proof for transfer")?;
 

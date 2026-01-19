@@ -628,6 +628,18 @@ pub struct RestoreWalletResult {
     pub privacy_address: String,
 }
 
+// Types for RemoveWallet
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RemoveWalletRequest {}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct RemoveWalletResult {
+    /// Whether the wallet was successfully removed
+    pub success: bool,
+    /// Message describing the result
+    pub message: String,
+}
+
 // Types for VerifyTransaction
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct VerifyTransactionRequest {
@@ -746,6 +758,9 @@ pub struct CryptoServer {
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
     auto_fund_gas_reserve: u128,
+    /// Tracks whether a wallet has been explicitly loaded via createWallet or restoreWallet.
+    /// When true, createWallet and restoreWallet will fail until removeWallet is called.
+    wallet_explicitly_loaded: Arc<RwLock<bool>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -761,6 +776,7 @@ impl CryptoServer {
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
         auto_fund_gas_reserve: u128,
+        wallet_explicitly_loaded: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -773,6 +789,7 @@ impl CryptoServer {
             log_path,
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
+            wallet_explicitly_loaded,
         }
     }
 
@@ -983,7 +1000,7 @@ impl CryptoServer {
         let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
         let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Ligero prover not configured; cannot send privacy transfer.".to_string(),
+                "Ligero proof service not configured; set LIGERO_PROOF_SERVICE_URL.".to_string(),
                 None,
             )
         })?;
@@ -1285,14 +1302,19 @@ impl CryptoServer {
         let indexer_ws = "undefined".to_string();
         let node = provider.rpc_url().to_string();
 
+        let (proof_server, use_external_proof_server) = match self.ligero_prover.as_ref() {
+            Some(prover) => (prover.proof_service_url().to_string(), Some(true)),
+            None => ("".to_string(), Some(false)),
+        };
+
         let result = GetWalletConfigResult {
             indexer,
             indexer_ws,
             node,
-            proof_server: "".to_string(),
+            proof_server,
             log_dir: Some(self.log_path.clone()),
             network_id: Some(chain_data.chain_name),
-            use_external_proof_server: Some(false),
+            use_external_proof_server,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1315,6 +1337,15 @@ impl CryptoServer {
         Parameters(_params): Parameters<CreateWalletRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         use rand::RngCore;
+
+        // Check if a wallet is already loaded
+        let is_loaded = *self.wallet_explicitly_loaded.read().await;
+        if is_loaded {
+            return Err(ErrorData::invalid_params(
+                "A wallet is already loaded. Call removeWallet first before creating a new wallet.",
+                None,
+            ));
+        }
 
         // Generate all random bytes first (before any async operations)
         // This ensures the RNG is dropped before any await points
@@ -1392,6 +1423,10 @@ impl CryptoServer {
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
 
+        // Mark the wallet as explicitly loaded
+        let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
+        *loaded_guard = true;
+
         tracing::info!("[createWallet] New wallet created successfully");
         tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
         tracing::info!("[createWallet] Privacy address: {}", privacy_address);
@@ -1459,6 +1494,15 @@ impl CryptoServer {
         &self,
         Parameters(params): Parameters<RestoreWalletRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Check if a wallet is already loaded
+        let is_loaded = *self.wallet_explicitly_loaded.read().await;
+        if is_loaded {
+            return Err(ErrorData::invalid_params(
+                "A wallet is already loaded. Call removeWallet first before restoring a different wallet.",
+                None,
+            ));
+        }
+
         // Strip 0x prefix if present
         let wallet_private_key_hex = params.wallet_private_key.trim_start_matches("0x");
         let privacy_spend_key_hex = params.privacy_spend_key.trim_start_matches("0x");
@@ -1601,6 +1645,10 @@ impl CryptoServer {
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
 
+        // Mark the wallet as explicitly loaded
+        let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
+        *loaded_guard = true;
+
         tracing::info!("[restoreWallet] Wallet restored successfully");
         tracing::info!("[restoreWallet] Wallet address: {}", wallet_address);
         tracing::info!("[restoreWallet] Privacy address: {}", privacy_address);
@@ -1608,6 +1656,42 @@ impl CryptoServer {
         let result = RestoreWalletResult {
             wallet_address,
             privacy_address,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Remove the currently loaded wallet.
+    /// Clears the wallet state so that createWallet or restoreWallet can be called again.
+    /// This prevents accidental overwrites of a loaded wallet.
+    #[tool(
+        name = "removeWallet",
+        description = "Remove the currently loaded wallet. This clears the wallet state so that createWallet or restoreWallet can be called again. Use this to safely switch wallets without accidentally overwriting an existing one."
+    )]
+    async fn remove_wallet(
+        &self,
+        Parameters(_params): Parameters<RemoveWalletRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Check if a wallet is currently loaded
+        let is_loaded = *self.wallet_explicitly_loaded.read().await;
+        if !is_loaded {
+            return Err(ErrorData::invalid_params(
+                "No wallet is currently loaded. Use createWallet or restoreWallet first.",
+                None,
+            ));
+        }
+
+        // Clear the wallet_explicitly_loaded flag
+        let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
+        *loaded_guard = false;
+
+        tracing::info!("[removeWallet] Wallet removed successfully. createWallet and restoreWallet are now available.");
+
+        let result = RemoveWalletResult {
+            success: true,
+            message: "Wallet removed successfully. You can now use createWallet or restoreWallet.".to_string(),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

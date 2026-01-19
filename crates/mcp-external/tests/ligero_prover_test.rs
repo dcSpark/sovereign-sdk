@@ -1,58 +1,44 @@
-//! Integration-style test for the Ligero prover. Requires GPU/WebGPU and Ligero prover assets.
+//! Integration-style test for the Ligero proof service.
 
-use std::{env, path::PathBuf};
-
-use ligero_runner::LigeroRunner;
+use std::env;
 use mcp_external::ligero::{Ligero, LigeroProgramArguments};
-
-fn env_opt(var: &str) -> Option<PathBuf> {
-    env::var(var).ok().map(PathBuf::from)
-}
 
 fn create_test_ligero() -> Option<Ligero> {
     let program =
         env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let proof_service_url =
+        env::var("LIGERO_PROOF_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
 
-    let runner = LigeroRunner::new(&program);
-    let prover = env_opt("LIGERO_PROVER_BIN")
-        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
-        .unwrap_or_else(|| runner.paths().prover_bin.clone());
-    let shader = env_opt("LIGERO_SHADER_PATH")
-        .unwrap_or_else(|| PathBuf::from(runner.config().shader_path.clone()));
-
-    for (label, path) in [("prover", &prover), ("shader", &shader)] {
-        if !path.exists() {
-            eprintln!(
-                "⚠️  Skipping Ligero prover test: {} path not found at {}",
-                label,
-                path.display()
-            );
-            return None;
-        }
+    if program.trim().is_empty() || proof_service_url.trim().is_empty() {
+        eprintln!(
+            "⚠️  Skipping Ligero proof service test: missing LIGERO_PROGRAM_PATH or LIGERO_PROOF_SERVICE_URL"
+        );
+        return None;
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
+    Some(Ligero::new(proof_service_url, program))
 }
 
 #[tracing_test::traced_test]
-#[test]
-fn test_generate_proof() {
+#[tokio::test]
+async fn test_generate_proof() {
     let Some(ligero) = create_test_ligero() else {
         return;
     };
 
-    let proof = match ligero.generate_proof(
-        8192,
-        Some(8000),
-        vec![1],
-        vec![
-            LigeroProgramArguments::I64 { i64: 1 },
-            LigeroProgramArguments::I64 { i64: 1 },
-        ],
-    ) {
+    let proof = match ligero
+        .generate_proof(
+            vec![1],
+            vec![
+                LigeroProgramArguments::I64 { i64: 1 },
+                LigeroProgramArguments::I64 { i64: 1 },
+            ],
+        )
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("⚠️  Skipping Ligero prover test: {}", e);
+            eprintln!("⚠️  Skipping Ligero proof service test: {}", e);
             return;
         }
     };

@@ -3,10 +3,9 @@
 //! This module provides functionality to generate Ligero proofs that demonstrate
 //! a value is within a valid range without revealing the computation details.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
-use ligero_runner::{LigeroPaths, LigeroRunner, ProverRunOptions};
+use base64::{engine::general_purpose, Engine as _};
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 
 /// Program argument encoding expected by the Ligero prover/verifier JSON interface.
@@ -14,72 +13,34 @@ pub use ligero_runner::LigeroArg as LigeroProgramArguments;
 
 /// Minimal wrapper used by MCP to generate Ligero proofs.
 ///
-/// All actual `webgpu_prover` process execution is delegated to `ligero-runner`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Proof generation is delegated to the external `ligero-http-server`.
+#[derive(Debug, Clone)]
 pub struct Ligero {
-    ligero_prover_binary_path: Option<PathBuf>,
-    ligero_shader_path: Option<PathBuf>,
-    /// Program specifier: circuit name (preferred) or a full `.wasm` path.
-    ligero_program: Option<String>,
-    proof_dir_id: Option<String>,
+    proof_service_url: String,
+    /// Circuit name or program specifier understood by the proof service.
+    circuit: String,
+    http: HttpClient,
 }
 
 impl Ligero {
-    pub fn new(
-        ligero_prover_binary_path: Option<PathBuf>,
-        ligero_shader_path: Option<PathBuf>,
-        ligero_program: Option<String>,
-    ) -> Self {
+    pub fn new(proof_service_url: String, circuit: String) -> Self {
+        let proof_service_url = normalize_base_url(&proof_service_url);
         Self {
-            ligero_prover_binary_path,
-            ligero_shader_path,
-            ligero_program,
-            proof_dir_id: None,
+            proof_service_url,
+            circuit,
+            http: HttpClient::new(),
         }
     }
 
-    /// Set a custom identifier for the proof directory (for deterministic paths)
-    /// This is useful for debugging and ensures proof directories have meaningful names
-    #[allow(dead_code)]
-    pub fn set_proof_dir_id(&mut self, id: String) {
-        self.proof_dir_id = Some(id);
-    }
-
-    /// Resolve prover parameters, allowing env overrides:
-    /// - LIGERO_PACKING to override packing
-    /// - LIGERO_GPU_THREADS to set an explicit gpu-threads value (omit to let the prover decide)
-    pub fn resolve_prover_params(
-        &self,
-        default_packing: u32,
-        default_gpu_threads: Option<u32>,
-    ) -> (u32, Option<u32>) {
-        let packing = std::env::var("LIGERO_PACKING")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(default_packing);
-
-        let gpu_threads = std::env::var("LIGERO_GPU_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .or(default_gpu_threads);
-
-        tracing::info!(
-            packing,
-            gpu_threads = gpu_threads.unwrap_or(0),
-            gpu_threads_set = gpu_threads.is_some(),
-            "Using Ligero prover parameters (env overrides allowed)"
-        );
-
-        (packing, gpu_threads)
+    pub fn proof_service_url(&self) -> &str {
+        &self.proof_service_url
     }
 
     /// Generate a proof with automatic handling of string arguments
     /// This is a convenience wrapper that converts string args to the appropriate format
     #[allow(dead_code)]
-    pub fn generate_proof_with_public_output<T: Serialize>(
+    pub async fn generate_proof_with_public_output<T: Serialize>(
         &self,
-        packing: u32,
-        gpu_threads: Option<u32>,
         private_indices: Vec<u32>,
         args: Vec<String>,
         public_output: &T,
@@ -94,86 +55,94 @@ impl Ligero {
         // The public output is handled by the guest program, so we just generate the proof normally
         let _ = public_output; // Public output is validated by guest, not passed explicitly
 
-        self.generate_proof(packing, gpu_threads, private_indices, ligero_args)
+        self.generate_proof(private_indices, ligero_args).await
     }
 
-    pub fn generate_proof(
+    pub async fn generate_proof(
         &self,
-        packing: u32,
-        gpu_threads: Option<u32>,
         private_indices: Vec<u32>,
         args: Vec<LigeroProgramArguments>,
     ) -> Result<Vec<u8>> {
-        let program = self
-            .ligero_program
-            .clone()
-            .or_else(|| std::env::var("LIGERO_PROGRAM_PATH").ok())
-            .context(
-                "ligero program is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)",
-            )?;
+        let circuit = self.circuit.trim();
+        anyhow::ensure!(
+            !circuit.is_empty(),
+            "ligero circuit is required (config.ligero_program_path or LIGERO_PROGRAM_PATH)"
+        );
 
-        let mut runner = if self.ligero_prover_binary_path.is_some()
-            || self.ligero_shader_path.is_some()
-        {
-            // Explicit overrides (backwards compatible with existing MCP config).
-            let prover_bin = self
-                .ligero_prover_binary_path
-                .clone()
-                .or_else(|| {
-                    std::env::var("LIGERO_PROVER_BIN")
-                        .ok()
-                        .or_else(|| std::env::var("LIGERO_PROVER_BINARY_PATH").ok())
-                        .map(PathBuf::from)
-                })
-                .context("ligero prover binary path is required (config.ligero_prover_binary_path or LIGERO_PROVER_BIN/LIGERO_PROVER_BINARY_PATH)")?
-                .canonicalize()
-                .context("Failed to canonicalize Ligero prover binary path")?;
+        let base_url = self.proof_service_url.trim();
+        anyhow::ensure!(
+            !base_url.is_empty(),
+            "ligero proof service URL is required (LIGERO_PROOF_SERVICE_URL)"
+        );
 
-            let shader_dir = self
-                .ligero_shader_path
-                .clone()
-                .or_else(|| std::env::var("LIGERO_SHADER_PATH").ok().map(PathBuf::from))
-                .context("ligero shader path is required (config.ligero_shader_path or LIGERO_SHADER_PATH)")?
-                .canonicalize()
-                .context("Failed to canonicalize Ligero shader path")?;
-
-            let bins_dir = prover_bin
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
-
-            let verifier_bin = std::env::var("LIGERO_VERIFIER_BIN")
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| bins_dir.join("webgpu_verifier"));
-
-            let paths = LigeroPaths {
-                prover_bin: prover_bin.clone(),
-                verifier_bin,
-                shader_dir,
-                bins_dir,
-            };
-
-            LigeroRunner::new_with_paths(&program, paths)
+        let endpoint = if base_url.ends_with("/prove") {
+            base_url.to_string()
         } else {
-            // Prefer runner auto-discovery (uses env overrides + git checkout discovery).
-            LigeroRunner::new(&program)
+            format!("{}/prove", base_url)
         };
-        runner.config_mut().packing = packing;
-        // Default to raw proofs (no gzip) to avoid compression overhead during proving.
-        runner.config_mut().gzip_proof = false;
-        runner.config_mut().gpu_threads = gpu_threads;
-        runner.config_mut().private_indices =
-            private_indices.into_iter().map(|v| v as usize).collect();
-        runner.config_mut().args = args;
-        if let Some(id) = &self.proof_dir_id {
-            runner.set_proof_dir_id(id.clone());
+        let request = ProveRequest {
+            circuit: circuit.to_string(),
+            args,
+            proof: None,
+            private_indices,
+        };
+
+        let response = self
+            .http
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| format!("POST {endpoint}"))?
+            .error_for_status()
+            .with_context(|| format!("POST {endpoint} returned error status"))?;
+
+        let payload: ProveResponse = response
+            .json()
+            .await
+            .context("Failed to deserialize Ligero proof service response")?;
+
+        if !payload.success || payload.exit_code != 0 {
+            let error = payload
+                .error
+                .unwrap_or_else(|| "unknown error".to_string());
+            anyhow::bail!(
+                "Ligero proof service failed (exitCode={}): {}",
+                payload.exit_code,
+                error
+            );
         }
 
-        runner.run_prover_with_options(ProverRunOptions {
-            keep_proof_dir: true,
-            proof_outputs_base: None,
-            write_replay_script: true,
-        })
+        let proof_b64 = payload
+            .proof
+            .context("Ligero proof service response missing proof payload")?;
+        let proof_b64 = proof_b64.trim();
+        let proof_bytes = general_purpose::STANDARD
+            .decode(proof_b64)
+            .context("Failed to decode base64 proof payload")?;
+
+        Ok(proof_bytes)
     }
+}
+
+fn normalize_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProveRequest {
+    circuit: String,
+    args: Vec<LigeroProgramArguments>,
+    proof: Option<String>,
+    private_indices: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProveResponse {
+    success: bool,
+    exit_code: i32,
+    proof: Option<String>,
+    error: Option<String>,
 }

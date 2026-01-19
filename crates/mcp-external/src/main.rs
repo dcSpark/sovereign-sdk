@@ -87,24 +87,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
 
-    // Initialize Ligero prover
-    tracing::info!("[mcp] Initializing Ligero prover");
-    if let Some(ref prover) = cfg.ligero_prover_binary_path {
-        tracing::info!("[mcp] Prover binary (override): {}", prover.display());
-    } else {
-        tracing::info!("[mcp] Prover binary: <auto-discovery>");
-    }
-    if let Some(ref shader) = cfg.ligero_shader_path {
-        tracing::info!("[mcp] Shader path (override): {}", shader.display());
-    } else {
-        tracing::info!("[mcp] Shader path: <auto-discovery>");
-    }
-    tracing::info!("[mcp] Program: {}", cfg.ligero_program_path);
+    // Initialize Ligero proof client (HTTP service)
+    tracing::info!("[mcp] Initializing Ligero proof service client");
+    tracing::info!(
+        "[mcp] Proof service URL: {}",
+        cfg.ligero_proof_service_url
+    );
+    tracing::info!("[mcp] Circuit: {}", cfg.ligero_program_path);
 
     let ligero = Arc::new(Ligero::new(
-        cfg.ligero_prover_binary_path.clone(),
-        cfg.ligero_shader_path.clone(),
-        Some(cfg.ligero_program_path.clone()),
+        cfg.ligero_proof_service_url.to_string(),
+        cfg.ligero_program_path.clone(),
     ));
 
     let pool_fvk_pk = std::env::var("POOL_FVK_PK")
@@ -223,6 +216,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
+    // Track whether a wallet has been loaded (including from environment variables)
+    // Starts as true since the initial wallet is loaded from environment variables
+    let wallet_explicitly_loaded = Arc::new(RwLock::new(true));
+    let wallet_explicitly_loaded_for_service = wallet_explicitly_loaded.clone();
+
     let service = StreamableHttpService::new(
         move || {
             Ok(CryptoServer::new(
@@ -235,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,
+                wallet_explicitly_loaded_for_service.clone(),
             ))
         },
         LocalSessionManager::default().into(),

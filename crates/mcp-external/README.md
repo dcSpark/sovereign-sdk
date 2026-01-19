@@ -12,7 +12,7 @@ This server exposes L2 wallet operations through the MCP protocol, enabling AI a
 
 - Rust toolchain
 - Running Sovereign SDK L2 rollup node
-- Ligero binaries are automatically provided by the `ligero-runner` crate (no manual setup needed)
+- Ligero proof service (`ligero-http-server`) running (default: `http://127.0.0.1:1313`)
 
 ### Configuration
 
@@ -24,6 +24,8 @@ Configure the following environment variables:
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
+- `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:1313`)
+- `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
@@ -75,7 +77,7 @@ Run the fast, self-contained tests:
 cargo test -p mcp
 ```
 
-Integration tests (rollup/indexer/verifier + Ligero) are ignored by default. Run them explicitly with:
+Integration tests (rollup/indexer/verifier + Ligero proof service) are ignored by default. Run them explicitly with:
 
 ```bash
 cargo test --all-targets -- --ignored
@@ -85,11 +87,7 @@ Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be repo
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
-
-Ligero binaries are auto-discovered from `ligero-runner`. Optional overrides:
-
-- `LIGERO_PROGRAM_PATH` - Circuit name (e.g. `note_spend_guest`) or path to `.wasm`
-- `LIGERO_PROVER_BIN` - Override `webgpu_prover` binary path
-- `LIGERO_SHADER_PATH` - Override shader directory path
+- `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:1313`)
+- `LIGERO_PROGRAM_PATH` (defaults to `note_spend_guest`)
 
 Set `RUST_LOG=debug` for verbose logging during development.

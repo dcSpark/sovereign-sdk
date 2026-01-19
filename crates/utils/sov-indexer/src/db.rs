@@ -9,6 +9,7 @@ use sea_orm::{
     Set, Statement,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::index_db as idx;
 use crate::viewer;
@@ -140,7 +141,7 @@ fn quote_table(table: &str, backend: DatabaseBackend) -> String {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct InvolvementItem {
     pub tx_hash: String,
     pub timestamp_ms: i64,
@@ -152,16 +153,22 @@ pub struct InvolvementItem {
     pub amount: Option<String>,
     pub anchor_root: Option<String>,
     pub nullifier: Option<String>,
+    #[schema(value_type = Value)]
     pub view_fvks: Option<JsonValue>,
+    #[schema(value_type = Value)]
     pub view_attestations: Option<JsonValue>,
+    #[schema(value_type = Value)]
     pub events: Option<JsonValue>,
     pub status: Option<String>,
+    #[schema(value_type = Value)]
     pub encrypted_notes: Option<JsonValue>,
+    #[schema(value_type = Value)]
     pub decrypted_notes: Option<JsonValue>,
+    #[schema(value_type = Value)]
     pub payload: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct ListResponse {
     pub items: Vec<InvolvementItem>,
     pub next: Option<String>,

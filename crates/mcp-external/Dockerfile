@@ -31,8 +31,8 @@ RUN cargo build --locked --release -p mcp-external
 # ---------------------------------------------------------------------
 # Fetch Ligero runtime assets (binaries + shader) from ligero-prover
 #
-# Sovereign no longer vendors Ligero binaries/shaders, but downstream
-# images still need the binaries/shaders at runtime.
+# These assets are kept for optional local proving/debugging. MCP-External
+# now uses the Ligero HTTP proof service by default.
 # ---------------------------------------------------------------------
 # Use the Ligero repo branch that includes `ligero-runner` and the prebuilt circuits in
 # `utils/circuits/bins/`.
@@ -88,10 +88,8 @@ RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && chown -R mcp:mcp /app /opt/ligero
 
 ENV MCP_SERVER_BIND_ADDRESS=0.0.0.0:3000 \
-    LIGERO_PROGRAM_PATH=/opt/ligero/programs/note_spend_guest.wasm \
-    LIGERO_PROVER_BINARY_PATH=/opt/ligero/bin/webgpu_prover \
-    LIGERO_SHADER_PATH=/opt/ligero/shader \
-    LD_LIBRARY_PATH=/opt/ligero/lib \
+    LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:1313 \
+    LIGERO_PROGRAM_PATH=note_spend_guest \
     RUST_LOG=info
 
 EXPOSE 3000
