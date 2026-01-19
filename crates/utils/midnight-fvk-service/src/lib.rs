@@ -2,35 +2,33 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use k256::ecdsa::signature::hazmat::PrehashSigner;
-use k256::ecdsa::{Signature, SigningKey};
-use midnight_privacy::{fvk_commitment, poseidon2_hash, FullViewingKey, Hash32};
+use ed25519_dalek::{Signer, SigningKey};
+use midnight_privacy::{fvk_commitment, FullViewingKey, Hash32};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use tracing::info;
 
 mod store;
 pub use store::FvkStore;
 
-const DEFAULT_SEED_MAX_LEN: usize = 1024;
-
 #[derive(Clone)]
 pub struct AppState {
     issuer: Arc<FvkIssuer>,
     store: Arc<FvkStore>,
+    admin_token: Option<String>,
 }
 
 impl AppState {
-    pub fn new(issuer: FvkIssuer, store: FvkStore) -> Self {
+    pub fn new(issuer: FvkIssuer, store: FvkStore, admin_token: Option<String>) -> Self {
         Self {
             issuer: Arc::new(issuer),
             store: Arc::new(store),
+            admin_token,
         }
     }
 }
@@ -38,48 +36,27 @@ impl AppState {
 pub struct FvkIssuer {
     signing_key: SigningKey,
     signing_public_key_hex: String,
-    root_fvk_seed: Hash32,
-    seed_max_len: usize,
 }
 
 impl FvkIssuer {
-    pub fn new(signing_key: SigningKey, root_fvk_seed: Hash32) -> anyhow::Result<Self> {
-        let pub_key = signing_key.verifying_key().to_encoded_point(true);
-        let pub_key_bytes: [u8; 33] = pub_key
-            .as_bytes()
-            .try_into()
-            .map_err(|_| anyhow!("unexpected signer public key size"))?;
-
+    pub fn new(signing_key: SigningKey) -> anyhow::Result<Self> {
         Ok(Self {
+            signing_public_key_hex: hex::encode(signing_key.verifying_key().as_bytes()),
             signing_key,
-            signing_public_key_hex: hex::encode(pub_key_bytes),
-            root_fvk_seed,
-            seed_max_len: DEFAULT_SEED_MAX_LEN,
         })
-    }
-
-    pub fn with_seed_max_len(mut self, seed_max_len: usize) -> Self {
-        self.seed_max_len = seed_max_len;
-        self
     }
 
     pub fn signing_public_key_hex(&self) -> &str {
         &self.signing_public_key_hex
     }
 
-    pub fn issue(&self, seed: &[u8]) -> anyhow::Result<IssuedFvk> {
-        anyhow::ensure!(
-            seed.len() <= self.seed_max_len,
-            "seed too large (max {} bytes)",
-            self.seed_max_len
-        );
-
-        let fvk_bytes = poseidon2_hash(b"FVK_DERIVE_V1", &[&self.root_fvk_seed, seed]);
+    pub fn issue(&self) -> anyhow::Result<IssuedFvk> {
+        let mut fvk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut fvk_bytes);
         let fvk = FullViewingKey(fvk_bytes);
         let commitment = fvk_commitment(&fvk);
 
-        let signature_bytes = sign_keccak256_prehash(&self.signing_key, &commitment)
-            .context("failed to sign fvk_commitment")?;
+        let signature_bytes = sign_ed25519(&self.signing_key, &commitment);
 
         Ok(IssuedFvk {
             fvk: fvk.0,
@@ -108,10 +85,6 @@ pub struct IssueFvkRequest {
 
 #[derive(Debug, Serialize)]
 pub struct IssueFvkResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<u64>,
-    pub seed_hex: String,
-    pub seed_kind: &'static str,
     pub fvk: String,
     pub fvk_commitment: String,
     pub signature: String,
@@ -132,6 +105,12 @@ pub struct InfoResponse {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LookupFvkResponse {
+    pub fvk: String,
+    pub fvk_commitment: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +152,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/info", get(info))
         .route("/v1/fvk", post(issue_fvk))
+        .route("/v1/fvk/:fvk_commitment", get(lookup_fvk))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -196,7 +176,7 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<InfoResponse>, A
 
     Ok(Json(InfoResponse {
         signer_public_key: state.issuer.signing_public_key_hex().to_string(),
-        signature_scheme: "secp256k1-ecdsa-keccak256",
+        signature_scheme: "ed25519",
         fvk_commitment_scheme: r#"Poseidon2 H("FVK_COMMIT_V1" || fvk)"#,
         issued_count,
         next_index,
@@ -207,16 +187,31 @@ pub async fn issue_fvk(
     State(state): State<AppState>,
     Json(req): Json<IssueFvkRequest>,
 ) -> Result<Json<IssueFvkResponse>, ApiError> {
-    let (seed_bytes, seed_hex, seed_kind, index_value) =
-        resolve_seed_bytes(&*state.store, req)
-            .await
-            .map_err(ApiError::bad_request)?;
+    if req.seed.as_deref().map(str::trim).filter(|v| !v.is_empty()).is_some()
+        || req
+            .seed_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+    {
+        return Err(ApiError::bad_request(
+            "seed/seed_hex are disabled; omit them to receive a fresh FVK",
+        ));
+    }
 
     let issued_at_ms = now_ms().map_err(ApiError::internal)?;
+    let index_value = state
+        .store
+        .allocate_index()
+        .await
+        .map(Some)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let seed_bytes = index_value.expect("set above").to_le_bytes();
 
     let issued = state
         .issuer
-        .issue(&seed_bytes)
+        .issue()
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     state
@@ -233,42 +228,41 @@ pub async fn issue_fvk(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(IssueFvkResponse {
-        index: index_value,
-        seed_hex,
-        seed_kind,
         fvk: hex::encode(issued.fvk),
         fvk_commitment: hex::encode(issued.fvk_commitment),
         signature: hex::encode(issued.signature),
         signer_public_key: issued.signer_public_key_hex,
-        signature_scheme: "secp256k1-ecdsa-keccak256",
+        signature_scheme: "ed25519",
         fvk_commitment_scheme: r#"Poseidon2 H("FVK_COMMIT_V1" || fvk)"#,
     }))
 }
 
-async fn resolve_seed_bytes(
-    store: &FvkStore,
-    req: IssueFvkRequest,
-) -> Result<(Vec<u8>, String, &'static str, Option<u64>), String> {
-    match (req.seed, req.seed_hex) {
-        (Some(_), Some(_)) => Err("provide only one of seed or seed_hex".to_string()),
-        (Some(seed), None) => {
-            let bytes = seed.into_bytes();
-            Ok((bytes.clone(), hex::encode(bytes), "user", None))
-        }
-        (None, Some(seed_hex)) => {
-            let bytes = parse_hex_bytes(&seed_hex).map_err(|e| e.to_string())?;
-            Ok((bytes.clone(), hex::encode(bytes), "user", None))
-        }
-        (None, None) => {
-            let idx = store
-                .allocate_index()
-                .await
-                .map_err(|e| format!("failed to allocate index: {e}"))?;
-            let seed = idx.to_le_bytes().to_vec();
-            let seed_hex = hex::encode(&seed);
-            Ok((seed, seed_hex, "index", Some(idx)))
-        }
-    }
+pub async fn lookup_fvk(
+    State(state): State<AppState>,
+    Path(fvk_commitment_hex): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<LookupFvkResponse>, ApiError> {
+    require_admin_token(&state, &headers)?;
+    let fvk_commitment = parse_hex_32("fvk_commitment", &fvk_commitment_hex)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let maybe_fvk = state
+        .store
+        .get_fvk_by_commitment(&fvk_commitment)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let Some(fvk) = maybe_fvk else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "fvk_commitment not found".to_string(),
+        });
+    };
+
+    Ok(Json(LookupFvkResponse {
+        fvk: hex::encode(fvk),
+        fvk_commitment: hex::encode(fvk_commitment),
+    }))
 }
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, anyhow::Error> {
@@ -277,15 +271,34 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, anyhow::Error> {
     hex::decode(hex_str).context("invalid hex")
 }
 
-fn sign_keccak256_prehash(
-    signing_key: &SigningKey,
-    msg: &[u8; 32],
-) -> Result<[u8; 64], anyhow::Error> {
-    let digest: [u8; 32] = Keccak256::digest(msg).into();
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|e| anyhow!("sign_prehash failed: {e}"))?;
-    Ok(sig.to_bytes().into())
+fn require_admin_token(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = state
+        .admin_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "not found".to_string(),
+        })?;
+
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let got = auth.strip_prefix("Bearer ").unwrap_or("");
+    if got == expected {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "unauthorized".to_string(),
+        })
+    }
+}
+
+fn sign_ed25519(signing_key: &SigningKey, msg: &[u8; 32]) -> [u8; 64] {
+    signing_key.sign(msg).to_bytes()
 }
 
 pub fn parse_hex_32(name: &str, value: &str) -> anyhow::Result<[u8; 32]> {
@@ -297,14 +310,8 @@ pub fn parse_hex_32(name: &str, value: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 pub fn generate_signing_key_hex() -> String {
-    let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     hex::encode(signing_key.to_bytes())
-}
-
-pub fn generate_root_seed_hex() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 pub fn log_startup(bind: SocketAddr) {
@@ -312,6 +319,10 @@ pub fn log_startup(bind: SocketAddr) {
     info!("GET  {}/health", bind);
     info!("GET  {}/v1/info", bind);
     info!("POST {}/v1/fvk", bind);
+    info!(
+        "GET  {}/v1/fvk/<fvk_commitment> (requires MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN)",
+        bind
+    );
 }
 
 fn now_ms() -> Result<i64, String> {
@@ -325,35 +336,28 @@ fn now_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    use ed25519_dalek::Signature;
 
     #[test]
-    fn derive_is_deterministic_for_same_seed() {
-        let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
-        let root_seed = [42u8; 32];
-        let issuer = FvkIssuer::new(signing_key, root_seed).unwrap();
+    fn issue_generates_fresh_fvk() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let issuer = FvkIssuer::new(signing_key).unwrap();
 
-        let seed = b"user:alice";
-        let a = issuer.issue(seed).unwrap();
-        let b = issuer.issue(seed).unwrap();
-        assert_eq!(a.fvk, b.fvk);
-        assert_eq!(a.fvk_commitment, b.fvk_commitment);
-        assert_eq!(a.signature, b.signature);
+        let a = issuer.issue().unwrap();
+        let b = issuer.issue().unwrap();
+        assert_ne!(a.fvk, b.fvk);
+        assert_ne!(a.fvk_commitment, b.fvk_commitment);
     }
 
     #[test]
     fn signature_verifies_over_commitment() {
-        let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
-        let verifying_key = signing_key.verifying_key().clone();
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let issuer = FvkIssuer::new(signing_key).unwrap();
 
-        let root_seed = [7u8; 32];
-        let issuer = FvkIssuer::new(signing_key, root_seed).unwrap();
-
-        let issued = issuer.issue(b"seed").unwrap();
-        let digest: [u8; 32] = Keccak256::digest(&issued.fvk_commitment).into();
-        let sig = Signature::from_slice(&issued.signature).unwrap();
+        let issued = issuer.issue().unwrap();
         verifying_key
-            .verify_prehash(&digest, &sig)
+            .verify_strict(&issued.fvk_commitment, &Signature::from_bytes(&issued.signature))
             .expect("signature should verify");
     }
 }

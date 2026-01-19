@@ -295,11 +295,12 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
 
     match verify_midnight_withdraw_proof(
         Some([0u8; 32]).as_ref(),
-        &proof,
+        proof,
         1,
         anchor_root,
         nullifier,
         withdraw_amount,
+        None,
         None,
     )
     .await

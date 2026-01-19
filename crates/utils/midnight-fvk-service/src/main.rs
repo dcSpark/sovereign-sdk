@@ -1,11 +1,26 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use k256::ecdsa::SigningKey;
-use midnight_fvk_service::{create_router, generate_root_seed_hex, generate_signing_key_hex};
+use ed25519_dalek::SigningKey;
+use midnight_fvk_service::{create_router, generate_signing_key_hex};
 use midnight_fvk_service::{log_startup, parse_hex_32, AppState, FvkIssuer, FvkStore};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// Load .env from multiple locations: current dir, then crate directory
+fn load_dotenv() {
+    // Try current directory first
+    if dotenvy::dotenv().is_ok() {
+        return;
+    }
+    // Try the crate's directory (where Cargo.toml lives)
+    let crate_dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+    let env_path = crate_dir.join(".env");
+    if env_path.exists() {
+        let _ = dotenvy::from_path(&env_path);
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "midnight-fvk-service")]
@@ -37,21 +52,21 @@ struct ServeArgs {
     )]
     db: String,
 
-    /// secp256k1 signing secret key (32-byte hex)
+    /// ed25519 signing secret key (32-byte hex)
     #[arg(long, env = "MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX")]
     signing_sk_hex: Option<String>,
 
-    /// Root seed used to deterministically derive FVKs (32-byte hex)
-    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_ROOT_FVK_SEED_HEX")]
-    root_fvk_seed_hex: Option<String>,
+    /// ed25519 signing public key (32-byte hex). Must match `MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX`.
+    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX")]
+    signing_pk_hex: Option<String>,
 
     /// Optional: last issued auto-index (u64). On startup we set `next_index >= last + 1`.
     #[arg(long, env = "MIDNIGHT_FVK_SERVICE_LAST_ISSUED_INDEX")]
     last_issued_index: Option<u64>,
 
-    /// When true, missing keys are generated in-memory at startup
-    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_ALLOW_EPHEMERAL_KEYS", default_value_t = false)]
-    allow_ephemeral_keys: bool,
+    /// Optional: token required for private lookup endpoints (Authorization: Bearer ...).
+    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
@@ -60,18 +75,23 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    load_dotenv();
     let args = Args::parse();
 
     match args.command {
         Command::Keygen => {
+            let sk_hex = generate_signing_key_hex();
+            let sk_bytes = parse_hex_32("signing_sk_hex", &sk_hex)?;
+            let signing_key = SigningKey::from_bytes(&sk_bytes);
+            let pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
+
             println!(
                 "MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX={}",
-                generate_signing_key_hex()
+                sk_hex
             );
             println!(
-                "MIDNIGHT_FVK_SERVICE_ROOT_FVK_SEED_HEX={}",
-                generate_root_seed_hex()
+                "MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX={}",
+                pk_hex
             );
             Ok(())
         }
@@ -88,33 +108,33 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let _ = store.ensure_next_index_at_least(min_next).await?;
     }
 
-    let signing_sk_hex = args.signing_sk_hex.or_else(|| {
-        args.allow_ephemeral_keys
-            .then(|| generate_signing_key_hex())
-    });
-    let root_fvk_seed_hex = args.root_fvk_seed_hex.or_else(|| {
-        args.allow_ephemeral_keys
-            .then(|| generate_root_seed_hex())
-    });
+    let signing_sk_hex = args.signing_sk_hex;
+    let signing_pk_hex = args.signing_pk_hex;
 
     let signing_sk_hex = signing_sk_hex.ok_or_else(|| {
         anyhow::anyhow!(
             "missing signing key: set MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX (or run `keygen`)"
         )
     })?;
-    let root_fvk_seed_hex = root_fvk_seed_hex.ok_or_else(|| {
+    let signing_pk_hex = signing_pk_hex.ok_or_else(|| {
         anyhow::anyhow!(
-            "missing root seed: set MIDNIGHT_FVK_SERVICE_ROOT_FVK_SEED_HEX (or run `keygen`)"
+            "missing signing public key: set MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX (or run `keygen`)"
         )
     })?;
 
     let signing_sk_bytes = parse_hex_32("signing_sk_hex", &signing_sk_hex)?;
-    let root_fvk_seed = parse_hex_32("root_fvk_seed_hex", &root_fvk_seed_hex)?;
+    let signing_pk_bytes = parse_hex_32("signing_pk_hex", &signing_pk_hex)?;
 
-    let signing_key = SigningKey::from_bytes(&signing_sk_bytes.into())
-        .map_err(|e| anyhow::anyhow!("invalid signing key: {e}"))?;
-    let issuer = FvkIssuer::new(signing_key, root_fvk_seed)?;
-    let state = AppState::new(issuer, store);
+    let signing_key = SigningKey::from_bytes(&signing_sk_bytes);
+    let derived_pk = *signing_key.verifying_key().as_bytes();
+    anyhow::ensure!(
+        derived_pk == signing_pk_bytes,
+        "signing key mismatch: MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX derives pk={}, but MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX is pk={}",
+        hex::encode(derived_pk),
+        hex::encode(signing_pk_bytes),
+    );
+    let issuer = FvkIssuer::new(signing_key)?;
+    let state = AppState::new(issuer, store, args.admin_token);
     let app = create_router(state);
 
     log_startup(args.bind);

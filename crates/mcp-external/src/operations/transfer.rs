@@ -23,6 +23,8 @@ use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
 use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::fvk_service::ViewerFvkBundle;
+use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
@@ -412,7 +414,7 @@ async fn create_transfer_unsigned_tx(
         nonce
     };
 
-    let max_fee = Amount::from(1_000_000_000_000u128);
+    let max_fee = Amount::from(DEFAULT_MAX_FEE);
 
     let unsigned_tx = UnsignedTransaction::<McpRuntime, McpSpec>::new(
         runtime_call,
@@ -445,7 +447,7 @@ pub async fn transfer(
     input_sender_id: Hash32,
     destination_pk_spend: Hash32,
     destination_pk_ivk: Hash32,
-    authority_fvk: Option<[u8; 32]>,
+    viewer_fvk_bundle: Option<ViewerFvkBundle>,
 ) -> Result<TransferResult> {
     // Validate amounts
     if send_amount == 0 {
@@ -571,10 +573,11 @@ pub async fn transfer(
     let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
     let nf = nullifier(&DOMAIN, &nf_key, &input_rho);
 
-    // Step 4b: Create viewer bundles if authority FVK is provided
-    let (view_attestations, view_ciphertexts) = if let Some(fvk) = authority_fvk {
+    // Step 4b: Create viewer bundles if a viewer FVK bundle is provided
+    let (view_attestations, view_ciphertexts) = if let Some(ref bundle) = viewer_fvk_bundle {
+        let fvk = bundle.fvk;
         tracing::info!(
-            "Authority FVK configured: generating viewer attestations for {} output(s)",
+            "Viewer FVK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
 
@@ -992,8 +995,10 @@ pub async fn transfer(
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
 
-    // Viewer section arguments (Level B) if authority FVK is configured.
-    if let (Some(fvk), Some(ref atts)) = (authority_fvk, &view_attestations) {
+    // Viewer section arguments (Level B) if viewer FVK is configured.
+    let viewer_fvk_commitment_arg_idx: Option<usize> =
+        if let (Some(ref bundle), Some(ref atts)) = (viewer_fvk_bundle.as_ref(), &view_attestations)
+        {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -1001,17 +1006,25 @@ pub async fn transfer(
             &mut private_indices,
             &mut proof_args,
         );
+        let fvk_commitment_arg_idx = proof_args.len();
         // fvk_commitment (public)
-        let fvk_commitment = atts.first().map(|a| a.fvk_commitment).unwrap_or([0u8; 32]);
-        push(arg32(&fvk_commitment), false, &mut private_indices, &mut proof_args);
+        push(
+            arg32(&bundle.fvk_commitment),
+            false,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // fvk (private)
-        push(arg32(&fvk), true, &mut private_indices, &mut proof_args);
+        push(arg32(&bundle.fvk), true, &mut private_indices, &mut proof_args);
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
             push(arg32(&att.ct_hash), false, &mut private_indices, &mut proof_args);
             push(arg32(&att.mac), false, &mut private_indices, &mut proof_args);
         }
-    }
+        Some(fvk_commitment_arg_idx)
+    } else {
+        None
+    };
 
     // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
     let proof_args_for_package = proof_args.clone();
@@ -1045,7 +1058,25 @@ pub async fn transfer(
         view_attestations,
     };
 
-    let args_json = serde_json::to_vec(&proof_args_for_package)
+    let mut args_json_values: Vec<serde_json::Value> = proof_args_for_package
+        .iter()
+        .map(|a| serde_json::to_value(a))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to serialize Ligero args to JSON values for package")?;
+
+    if let (Some(idx), Some(ref bundle)) = (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref()) {
+        let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"
+            )
+        })?;
+        obj.insert(
+            "pool_sig_hex".to_string(),
+            serde_json::Value::String(bundle.pool_sig_hex.clone()),
+        );
+    }
+
+    let args_json = serde_json::to_vec(&args_json_values)
         .context("Failed to serialize Ligero args for package")?;
     let proof_package = LigeroProofPackage::new(
         proof_bytes_raw,

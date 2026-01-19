@@ -236,6 +236,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         input_sender_id,
         destination_pk_spend,
         destination_pk_ivk,
+        None,
     )
     .await?;
 

@@ -22,6 +22,11 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub wallet_private_key: String,
 
+    /// Admin wallet private key used for auto-funding newly created wallets (env: ADMIN_WALLET_PRIVATE_KEY, optional)
+    /// This key remains immutable and is not affected by restoreWallet.
+    #[serde(default)]
+    pub admin_wallet_private_key: Option<String>,
+
     /// Sovereign SDK rollup RPC endpoint (env: ROLLUP_RPC_URL, required)
     #[validate(custom(function = "validate_http_url"))]
     pub rollup_rpc_url: Url,
@@ -59,20 +64,21 @@ pub struct Config {
     #[validate(custom(function = "validate_file_exists"))]
     pub ligero_shader_path: Option<PathBuf>,
 
-    /// Authority Full Viewing Key (FVK) for decrypting privacy pool notes (env: AUTHORITY_FVK, optional)
-    /// 32-byte hex string with or without 0x prefix
-    #[serde(default)]
-    pub authority_fvk: Option<String>,
-
     /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
     /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
     /// This is REQUIRED to start the MCP server - deposits can only be made to your own privacy address
     #[validate(length(min = 1))]
     pub privpool_spend_key: String,
 
-    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT)
+    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
+    /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
     #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
     pub auto_fund_deposit_amount: Option<String>,
+
+    /// Optional gas reserve to add when auto-funding a new wallet (env: AUTO_FUND_GAS_RESERVE, optional).
+    /// This is added to the deposit amount to cover future transaction fees.
+    #[serde(default)]
+    pub auto_fund_gas_reserve: Option<String>,
 }
 
 fn default_server_bind_address() -> String {

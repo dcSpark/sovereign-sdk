@@ -1,15 +1,17 @@
-use crate::db::{list_wallet_txs_direct, list_wallet_txs_sync, CursorInner, ListResponse};
+use crate::balance;
+use crate::db::{list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse};
 use crate::viewer::{self, FvkRegistry};
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use midnight_privacy::Hash32;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -17,15 +19,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseConnection,
-    pub mode: Mode,
-    /// FVK registry using DashMap for lock-free concurrent access
-    pub fvk_registry: Arc<FvkRegistry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Sync,
-    Direct,
+    /// VFK registry using DashMap for lock-free concurrent access
+    pub vfk_registry: Arc<FvkRegistry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +30,12 @@ pub struct ListQuery {
     pub cursor: Option<String>,
     #[serde(default)]
     pub r#type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VfkBody {
+    #[serde(default)]
+    pub vfk: Option<String>,
 }
 fn default_limit() -> usize {
     50
@@ -50,7 +51,8 @@ pub struct TxListQuery {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/wallets/:address", get(list_wallet_txs))
+        .route("/wallets/:address", post(list_wallet_txs))
+        .route("/wallets/:address/balance", post(wallet_balance))
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
         .route("/health", get(health))
@@ -64,8 +66,23 @@ async fn list_wallet_txs(
     Path(address): Path<String>,
     Query(q): Query<ListQuery>,
     State(state): State<AppState>,
+    body: Option<Json<VfkBody>>,
 ) -> impl IntoResponse {
-    match list_wallet_txs_inner(address, q, state).await {
+    let vfk = match body.and_then(|Json(body)| body.vfk) {
+        Some(vfk_hex) => match viewer::parse_fvk_hex(&vfk_hex) {
+            Ok(vfk) => Some(vfk),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid VFK: {}", e)})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    match list_wallet_txs_inner(address, q.limit, q.cursor, q.r#type, state, vfk).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -75,30 +92,74 @@ async fn list_wallet_txs(
     }
 }
 
+async fn wallet_balance(
+    Path(address): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<balance::BalanceRequest>,
+) -> impl IntoResponse {
+    match balance::get_wallet_balance(&state.db, &address, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            let status = if is_balance_client_error(&e) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status":"ok"})))
 }
 
 async fn list_wallet_txs_inner(
     address: String,
-    q: ListQuery,
+    limit: usize,
+    cursor: Option<String>,
+    type_filter: Option<String>,
     state: AppState,
+    vfk: Option<Hash32>,
 ) -> Result<ListResponse> {
-    let limit = q.limit.min(200);
-    let cursor = if let Some(cur) = q.cursor.as_deref() {
-        let raw = BASE64_STANDARD.decode(cur)?;
-        Some(serde_json::from_slice::<CursorInner>(&raw)?)
-    } else {
-        None
+    let limit = limit.min(200);
+    let cursor = decode_cursor(cursor)?;
+    list_wallet_txs_db(&state.db, &address, limit, cursor, type_filter, vfk).await
+}
+
+fn decode_cursor(cursor: Option<String>) -> Result<Option<CursorInner>> {
+    let Some(cur) = cursor else {
+        return Ok(None);
     };
-    if state.mode == Mode::Direct {
-        return list_wallet_txs_direct(&state.db, &address, limit, cursor, q.r#type.clone()).await;
+    let raw = BASE64_STANDARD.decode(cur)?;
+    Ok(Some(serde_json::from_slice::<CursorInner>(&raw)?))
+}
+
+fn is_balance_client_error(err: &anyhow::Error) -> bool {
+    if err
+        .root_cause()
+        .downcast_ref::<midnight_privacy::PrivacyAddressError>()
+        .is_some()
+    {
+        return true;
     }
-    list_wallet_txs_sync(&state.db, &address, limit, cursor, q.r#type.clone()).await
+    if err.root_cause().downcast_ref::<hex::FromHexError>().is_some() {
+        return true;
+    }
+
+    let message = err.to_string();
+    message.contains("nf_key")
+        || message.contains("vfk")
+        || message.contains("Invalid privacy address")
+        || message.contains("Expected 32-byte hex")
 }
 
 async fn get_tx(Path(tx_hash): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
-    match crate::db::get_tx(&state.db, state.mode, &tx_hash).await {
+    match crate::db::get_tx(&state.db, &tx_hash).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -119,7 +180,7 @@ async fn list_txs(
 ) -> impl IntoResponse {
     let limit = q.limit.min(200);
     let offset = q.offset;
-    match crate::db::list_txs(&state.db, state.mode, limit, offset).await {
+    match crate::db::list_txs(&state.db, limit, offset).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -156,7 +217,7 @@ pub struct FvkResponse {
 /// List all FVKs in the registry
 async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
     let fvks: Vec<FvkResponse> = state
-        .fvk_registry
+        .vfk_registry
         .entries()
         .into_iter()
         .map(|(commitment, fvk, addr)| FvkResponse {
@@ -219,7 +280,7 @@ async fn add_fvk(
     }
 
     // Check if this FVK already exists in the registry
-    if state.fvk_registry.get_fvk(&commitment_hex).is_some() {
+    if state.vfk_registry.get_fvk(&commitment_hex).is_some() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -232,14 +293,24 @@ async fn add_fvk(
     }
 
     // Add to registry (DashMap - no lock needed)
-    state.fvk_registry.add(fvk, req.shielded_address.clone());
+    state.vfk_registry.add(fvk, req.shielded_address.clone());
 
     // Persist to database
-    if let Err(e) = state.fvk_registry.save_to_db(&state.db).await {
+    if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {
         tracing::warn!("Failed to persist FVK to database: {}", e);
     }
 
     tracing::info!("Added FVK with commitment {}", &commitment_hex[..16]);
+
+    let db = state.db.clone();
+    let vfk_registry = state.vfk_registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::background_sync::backfill_privacy_fields(&db, &vfk_registry, None).await
+        {
+            tracing::warn!("VFK backfill failed: {}", e);
+        }
+    });
 
     (
         StatusCode::CREATED,
@@ -261,7 +332,7 @@ async fn delete_fvk(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // Check if it exists and remove (DashMap - no lock needed)
-    if !state.fvk_registry.remove(&fvk_commitment) {
+    if !state.vfk_registry.remove(&fvk_commitment) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "FVK not found"})),

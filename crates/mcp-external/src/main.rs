@@ -2,14 +2,13 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tracing_subscriber::EnvFilter;
 
-mod authority_fvk;
 mod config;
+mod fvk_service;
 mod ligero;
 mod operations;
 mod privacy_key;
 mod provider;
 mod server;
-mod tx_store;
 mod viewer;
 mod wallet;
 
@@ -17,22 +16,19 @@ mod wallet;
 mod test_utils;
 
 use std::sync::Arc;
-use std::time::Duration;
-
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
-use crate::authority_fvk::AuthorityFvk;
 use crate::config::Config;
+use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::server::sync_with_indexer_impl;
 use crate::server::CryptoServer;
-use crate::tx_store::TransactionStore;
 use crate::wallet::WalletContext;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
+const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,6 +61,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Wallet address: {}", wallet_address);
     let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
 
+    let admin_wallet_ctx = cfg
+        .admin_wallet_private_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(WalletContext::from_private_key_hex)
+        .transpose()?
+        .map(Arc::new);
+
+    if let Some(ref admin_wallet_ctx) = admin_wallet_ctx {
+        tracing::info!(
+            "[mcp] Admin wallet address (auto-fund): {}",
+            admin_wallet_ctx.get_address()
+        );
+    }
+
     tracing::info!("[mcp] Connecting to rollup RPC, verifier service, and indexer...");
     let provider = Provider::new(
         cfg.rollup_rpc_url.as_str(),
@@ -95,25 +107,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cfg.ligero_program_path.clone()),
     ));
 
-    let authority_fvk = if let Some(ref fvk_hex) = cfg.authority_fvk {
-        tracing::info!("[mcp] Initializing authority FVK from environment variable");
-        match AuthorityFvk::from_hex(fvk_hex) {
-            Ok(fvk) => {
-                tracing::info!("[mcp] Authority FVK initialized successfully");
-                Some(fvk)
-            }
-            Err(e) => {
-                tracing::warn!("[mcp] Failed to initialize authority FVK: {}", e);
-                tracing::warn!("[mcp] Note decryption will not be available");
-                None
-            }
-        }
+    let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+        .transpose()?;
+
+    let viewer_fvk_bundle: Option<ViewerFvkBundle> = if pool_fvk_pk.is_some() {
+        let http = reqwest::Client::new();
+        let base_url = crate::fvk_service::fvk_service_base_url_from_env();
+        tracing::info!(
+            "[mcp] POOL_FVK_PK set: fetching viewer FVK bundle from midnight-fvk-service ({base_url})"
+        );
+        Some(fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?)
     } else {
-        tracing::info!("[mcp] No AUTHORITY_FVK provided, note decryption will not be available");
+        tracing::info!("[mcp] POOL_FVK_PK not set: viewer FVK bundle disabled");
         None
     };
 
-    let authority_fvk = Arc::new(RwLock::new(authority_fvk));
+    let viewer_fvk_bundle = Arc::new(RwLock::new(viewer_fvk_bundle));
 
     tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
 
@@ -143,9 +156,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let privacy_key = Arc::new(RwLock::new(privacy_key));
 
-    // In-memory transaction store
-    let tx_store = Arc::new(TransactionStore::new_in_memory().await?);
-
     let auto_fund_deposit_amount = cfg
         .auto_fund_deposit_amount
         .as_deref()
@@ -174,30 +184,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let auto_fund_gas_reserve = cfg
+        .auto_fund_gas_reserve
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u128>().map_err(|e| {
+                tracing::warn!(
+                    "[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}",
+                    s,
+                    e
+                );
+                e
+            })
+        })
+        .and_then(Result::ok)
+        .unwrap_or(DEFAULT_AUTO_FUND_GAS_RESERVE);
+
+    if auto_fund_deposit_amount.is_some() {
+        tracing::info!(
+            "[auto-fund] Configured auto-fund gas reserve: {}",
+            auto_fund_gas_reserve
+        );
+    }
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
     );
     let provider_for_service = provider.clone();
     let wallet_ctx_for_service = wallet_ctx.clone();
+    let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
-    let authority_fvk_for_service = authority_fvk.clone();
+    let viewer_fvk_bundle_for_service = viewer_fvk_bundle.clone();
     let privacy_key_for_service = privacy_key.clone();
-    let tx_store_for_service = tx_store.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
+    let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
     let service = StreamableHttpService::new(
         move || {
             Ok(CryptoServer::new(
                 provider_for_service.clone(),
                 wallet_ctx_for_service.clone(),
+                admin_wallet_ctx_for_service.clone(),
                 ligero_for_service.clone(),
-                authority_fvk_for_service.clone(),
+                viewer_fvk_bundle_for_service.clone(),
                 privacy_key_for_service.clone(),
-                tx_store_for_service.clone(),
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
+                auto_fund_gas_reserve_for_service,
             ))
         },
         LocalSessionManager::default().into(),
@@ -206,34 +243,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
-
-    // Background sync loop to keep the in-memory DB aligned with the indexer
-    {
-        let sync_provider = provider.clone();
-        let sync_wallet = wallet_ctx.clone();
-        let sync_privacy_key = privacy_key.clone();
-        let sync_store = tx_store.clone();
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(30);
-            loop {
-                {
-                    let ctx_guard = sync_wallet.read().await;
-                    let privacy_guard = sync_privacy_key.read().await;
-                    if let Err(e) = sync_with_indexer_impl(
-                        &sync_provider,
-                        &*ctx_guard,
-                        &*privacy_guard,
-                        &sync_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Background sync failed: {}", e.message);
-                    }
-                }
-                tokio::time::sleep(interval).await;
-            }
-        });
-    }
 
     tracing::info!(
         "[mcp] Server started successfully! Listening on http://{}",

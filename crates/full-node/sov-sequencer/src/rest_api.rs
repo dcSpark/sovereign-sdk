@@ -373,7 +373,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
 
         // Decide intent based on parsed transaction data and proof outputs.
         enum WorkerTxIntent {
-            Deposit,
+            NoProof,
             Transfer { proof_outputs: SpendPublic },
             Withdraw { proof_outputs: SpendPublic },
         }
@@ -511,19 +511,39 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
             .get("deposit")
             .and_then(|v| v.as_object())
             .is_some()
+            || transaction_data
+                .get("update_method_id")
+                .and_then(|v| v.as_object())
+                .is_some()
+            || transaction_data
+                .get("freeze_address")
+                .and_then(|v| v.as_object())
+                .is_some()
+            || transaction_data
+                .get("unfreeze_address")
+                .and_then(|v| v.as_object())
+                .is_some()
+            || transaction_data
+                .get("add_pool_admin")
+                .and_then(|v| v.as_object())
+                .is_some()
+            || transaction_data
+                .get("remove_pool_admin")
+                .and_then(|v| v.as_object())
+                .is_some()
         {
             let proof_outputs_str = model.proof_outputs.trim();
             if !(proof_outputs_str.is_empty() || proof_outputs_str == "{}") {
                 return Err(errors::bad_request_400(
                     "Unexpected proof outputs",
-                    "Deposit transactions should not include proof outputs",
+                    "Transactions without proofs should not include proof outputs",
                 ));
             }
-            WorkerTxIntent::Deposit
+            WorkerTxIntent::NoProof
         } else {
             return Err(errors::bad_request_400(
                 "Unsupported transaction",
-                "Only deposit, transfer or withdraw transactions can use this endpoint",
+                "Only midnight-privacy transactions (deposit/transfer/withdraw + admin ops) can use this endpoint",
             ));
         };
 
@@ -563,7 +583,7 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 })
                 .await
             }
-            WorkerTxIntent::Deposit => {
+            WorkerTxIntent::NoProof => {
                 let sequencer = state.sequencer.clone();
                 sequencer
                     .accept_serialized_pre_authenticated_tx(

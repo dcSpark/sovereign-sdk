@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use demo_stf::runtime::Runtime;
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -19,18 +20,18 @@ use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
+use sov_bank::config_gas_token_id;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
-use sov_modules_api::Spec;
+use sov_modules_api::{Amount, Spec};
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
-use crate::authority_fvk::AuthorityFvk;
+use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::tx_store::{StoredTransaction, SyncSummary, TransactionStore, TransactionUpsert};
 use crate::wallet::WalletContext;
 
 pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
@@ -38,6 +39,187 @@ pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
+
+async fn run_auto_fund_sequence(
+    provider: Arc<Provider>,
+    admin_ctx: Arc<McpWalletContext>,
+    dest_wallet_address: String,
+    dest_privacy_key: PrivacyKey,
+    new_wallet_for_deposit: Arc<McpWalletContext>,
+    deposit_amount: u128,
+    auto_fund_gas_reserve: u128,
+) {
+    // Total L2 funding: deposit amount + extra for gas fees
+    let min_gas_reserve = crate::operations::DEFAULT_MAX_FEE;
+    let gas_reserve = if auto_fund_gas_reserve < min_gas_reserve {
+        tracing::warn!(
+            "[auto-fund/createWallet] AUTO_FUND_GAS_RESERVE {} is below min {}, using {}",
+            auto_fund_gas_reserve,
+            min_gas_reserve,
+            min_gas_reserve
+        );
+        min_gas_reserve
+    } else {
+        auto_fund_gas_reserve
+    };
+    let l2_funding_amount = deposit_amount + gas_reserve;
+
+    tracing::info!(
+        "[auto-fund/createWallet] Starting funding sequence: {} L2 tokens to wallet (deposit {} + gas reserve {}), then {} deposit to privacy pool",
+        l2_funding_amount,
+        deposit_amount,
+        gas_reserve,
+        deposit_amount
+    );
+
+    let gas_token_id = match provider.get_gas_token_id().await {
+        Ok(token_id) => {
+            let configured_id = config_gas_token_id();
+            if token_id != configured_id {
+                tracing::warn!(
+                    "[auto-fund/createWallet] Gas token mismatch: chain {}, configured {}",
+                    token_id,
+                    configured_id
+                );
+            }
+            token_id
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[auto-fund/createWallet] Failed to fetch gas token id from rollup: {}. Falling back to configured gas token.",
+                e
+            );
+            config_gas_token_id()
+        }
+    };
+
+    // Step 1: Admin sends L2 tokens to the new wallet
+    tracing::info!(
+        "[auto-fund/createWallet] Step 1: Admin sending {} L2 tokens to {}",
+        l2_funding_amount,
+        dest_wallet_address
+    );
+    match crate::operations::send_funds(
+        &provider,
+        &admin_ctx,
+        &dest_wallet_address,
+        &gas_token_id,
+        Amount::from(l2_funding_amount),
+    )
+    .await
+    {
+        Ok(res) => {
+            tracing::info!(
+                "[auto-fund/createWallet] Step 1 complete: L2 funding tx {}",
+                res.tx_hash
+            );
+            let tx_hash = match res.tx_hash.parse() {
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::warn!(
+                        "[auto-fund/createWallet] Failed to parse L2 funding tx hash {}: {}. Skipping Step 2.",
+                        res.tx_hash,
+                        e
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = provider.wait_for_tx_processing(&tx_hash).await {
+                tracing::warn!(
+                    "[auto-fund/createWallet] Failed waiting for L2 funding tx processing: {}. Skipping Step 2.",
+                    e
+                );
+                return;
+            }
+
+            let dest_wallet_address_parsed: <McpSpec as Spec>::Address =
+                match dest_wallet_address.parse() {
+                    Ok(address) => address,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[auto-fund/createWallet] Invalid L2 wallet address '{}': {}. Skipping Step 2.",
+                            dest_wallet_address,
+                            e
+                        );
+                        return;
+                    }
+                };
+
+            let max_wait = std::time::Duration::from_secs(30);
+            let poll_interval = std::time::Duration::from_secs(2);
+            let started = std::time::Instant::now();
+
+            loop {
+                match provider
+                    .get_balance::<McpSpec>(&dest_wallet_address_parsed, &gas_token_id)
+                    .await
+                {
+                    Ok(balance) => {
+                        let balance_u128: u128 = balance.0;
+                        if balance_u128 >= l2_funding_amount {
+                            tracing::info!(
+                                "[auto-fund/createWallet] L2 funding confirmed: {}",
+                                balance_u128
+                            );
+                            break;
+                        }
+
+                        tracing::info!(
+                            "[auto-fund/createWallet] Waiting for L2 funding: {} / {}",
+                            balance_u128,
+                            l2_funding_amount
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "[auto-fund/createWallet] Failed to query L2 balance while waiting for funding: {}",
+                        e
+                    ),
+                }
+
+                if started.elapsed() >= max_wait {
+                    tracing::warn!(
+                        "[auto-fund/createWallet] Timed out waiting for L2 funding; skipping privacy deposit"
+                    );
+                    return;
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
+
+            // Step 2: New wallet deposits to privacy pool
+            tracing::info!(
+                "[auto-fund/createWallet] Step 2: New wallet {} depositing {} to privacy pool",
+                dest_wallet_address,
+                deposit_amount
+            );
+            match crate::operations::deposit(
+                &provider,
+                &new_wallet_for_deposit,
+                deposit_amount,
+                &dest_privacy_key,
+            )
+            .await
+            {
+                Ok(res) => tracing::info!(
+                    "[auto-fund/createWallet] Step 2 complete: Privacy pool deposit tx {}",
+                    res.tx_hash
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "[auto-fund/createWallet] Step 2 failed (privacy pool deposit): {}",
+                        e
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[auto-fund/createWallet] Step 1 failed (L2 funding): {}. Skipping Step 2.",
+                e
+            )
+        }
+    }
+}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct SendFundsRequest {
@@ -51,12 +233,6 @@ pub struct SendFundsResult {
     /// Transaction hash from the rollup (available once submitted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
-    /// Local database UUID for this transaction
-    pub id: String,
-    /// Transaction identifier (tx_hash echoed for convenience)
-    #[serde(rename = "txIdentifier")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_identifier: Option<String>,
     /// Privacy transfer hash if we spent an unspent note
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_tx_hash: Option<String>,
@@ -82,12 +258,6 @@ pub struct GetWalletAddressResult {
     pub address: String,
 }
 
-// Types for GetWalletBalance
-
-/// Default gas token ID
-pub const DEFAULT_TOKEN_ID: &str =
-    "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
-
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetWalletBalanceRequest {}
 
@@ -98,6 +268,8 @@ pub struct GetWalletBalanceResult {
     /// Coins that are pending and not yet available for spending
     #[serde(rename = "pendingBalance")]
     pub pending_balance: String,
+    /// Available unspent notes that back the balance
+    pub unspent_notes: Vec<UnspentNoteInfo>,
 }
 
 // Types for GetTransaction
@@ -157,7 +329,7 @@ pub struct GetTransactionsRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct TransactionRecord {
-    /// UUID of the transaction (local database ID)
+    /// Transaction hash
     pub id: String,
     /// Current state ("initiated", "sent", "completed", or "failed")
     pub state: String,
@@ -193,7 +365,7 @@ pub struct GetTransactionsResult {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetTransactionStatusRequest {
-    /// Local database transaction ID (UUID)
+    /// Transaction hash (with or without 0x prefix)
     pub id: String,
 }
 
@@ -386,6 +558,9 @@ pub struct UnspentNoteInfo {
     pub value: String,
     /// Note rho (nonce) as hex string
     pub rho: String,
+    /// Sender identifier bound into NOTE_V2 commitments for transfer notes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
     /// Transaction hash where this note was created
     pub tx_hash: String,
     /// Timestamp when the note was created (milliseconds)
@@ -400,8 +575,22 @@ pub struct CreateWalletRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct CreateWalletResult {
-    /// New authority FVK (hex string)
-    pub authority_fvk: String,
+    /// New wallet private key (hex string)
+    pub wallet_private_key: String,
+    /// New wallet address
+    pub wallet_address: String,
+    /// New viewer FVK (hex string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk: Option<String>,
+    /// Viewer FVK commitment (hex string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_commitment: Option<String>,
+    /// Pool signature (hex) over `viewer_fvk_commitment`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_pool_sig_hex: Option<String>,
+    /// Signer public key (hex)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_fvk_signer_public_key: Option<String>,
     /// New privacy pool spending key (hex string)
     pub privacy_spend_key: String,
     /// New privacy pool address
@@ -413,8 +602,20 @@ pub struct CreateWalletResult {
 pub struct RestoreWalletRequest {
     /// Wallet private key (hex string, with or without 0x prefix)
     pub wallet_private_key: String,
-    /// Authority FVK (hex string, with or without 0x prefix)
-    pub authority_fvk: String,
+    /// Optional viewer FVK (hex string, with or without 0x prefix).
+    ///
+    /// If omitted and `POOL_FVK_PK` is set, a fresh viewer FVK will be requested from
+    /// `midnight-fvk-service`.
+    #[serde(default, alias = "authority_fvk", alias = "fvk")]
+    pub viewer_fvk: Option<String>,
+    /// Optional pool signature (hex) over the viewer FVK commitment.
+    #[serde(
+        default,
+        alias = "pool_sig_hex",
+        alias = "signature",
+        alias = "pool_signature"
+    )]
+    pub viewer_fvk_pool_sig_hex: Option<String>,
     /// Privacy pool spending key (hex string, with or without 0x prefix)
     pub privacy_spend_key: String,
 }
@@ -538,12 +739,13 @@ pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
+    admin_wallet_context: Option<Arc<McpWalletContext>>,
     ligero_prover: Option<Arc<LigeroProver>>,
-    authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
+    viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
-    tx_store: Arc<TransactionStore>,
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
+    auto_fund_gas_reserve: u128,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -552,30 +754,32 @@ impl CryptoServer {
     pub fn new(
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
+        admin_wallet_context: Option<Arc<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
-        authority_fvk: Arc<RwLock<Option<AuthorityFvk>>>,
+        viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
-        tx_store: Arc<TransactionStore>,
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
+        auto_fund_gas_reserve: u128,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             provider: Some(provider),
             wallet_context: Some(wallet_context),
+            admin_wallet_context,
             ligero_prover: Some(ligero_prover),
-            authority_fvk,
+            viewer_fvk_bundle,
             privacy_key,
-            tx_store,
             log_path,
             auto_fund_deposit_amount,
+            auto_fund_gas_reserve,
         }
     }
 
     /// Send funds from the privacy pool using the first available unspent note.
     #[tool(
         name = "send",
-        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and runs a privacy transfer in the background."
+        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and submits a privacy transfer."
     )]
     async fn send_funds(
         &self,
@@ -598,20 +802,18 @@ impl CryptoServer {
             )
         })?;
 
-        let authority_fvk_bytes = {
-            let guard = self.authority_fvk.read().await;
-            guard.as_ref().map(|v| *v.as_bytes())
-        }
-        .ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_FVK to send from the privacy pool.",
-                None,
-            )
-        })?;
+        let viewer_fvk_bundle_for_transfer = self.viewer_fvk_bundle.read().await.clone();
+        let viewer_fvk_bytes = viewer_fvk_bundle_for_transfer
+            .as_ref()
+            .map(|bundle| bundle.fvk)
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "Viewer key not configured. Set POOL_FVK_PK and ensure midnight-fvk-service is running.",
+                    None,
+                )
+            })?;
 
         let privacy_key_guard = self.privacy_key.read().await;
-        let from_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
-
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse().map_err(|e| {
             ErrorData::invalid_params(
                 format!(
@@ -622,289 +824,190 @@ impl CryptoServer {
             )
         })?;
 
-        let id = Uuid::new_v4().to_string();
-        let result_id = id.clone();
-        let now_ms = current_timestamp_ms();
-
-        self.tx_store
-            .upsert(TransactionUpsert {
-                id: id.clone(),
-                state: "initiated".to_string(),
-                from_address: Some(from_address.clone()),
-                to_address: Some(params.destination_address.clone()),
-                amount: Some(params.amount.clone()),
-                tx_identifier: None,
-                created_at: now_ms,
-                updated_at: now_ms,
-                error_message: None,
-            })
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let provider = provider.clone();
-        let wallet_ctx = wallet_ctx.clone();
-        let ligero = self.ligero_prover.clone();
-        let tx_store = self.tx_store.clone();
-        let destination_address = params.destination_address.clone();
         let output_pk = output_privacy_addr.to_pk();
         let output_pk_ivk = output_privacy_addr.pk_ivk();
-        let viewing_key = midnight_privacy::FullViewingKey(authority_fvk_bytes);
-        let privacy_key = self.privacy_key.clone();
-        let authority_fvk_for_transfer = Some(authority_fvk_bytes);
+        let viewing_key = midnight_privacy::FullViewingKey(viewer_fvk_bytes);
 
-        tokio::spawn(async move {
-            let ctx_guard = wallet_ctx.read().await;
-            let privacy_guard = privacy_key.read().await;
+        let send_amount = params.amount.parse::<u128>().map_err(|e| {
+            ErrorData::invalid_params(format!("Invalid amount format: {}", e), None)
+        })?;
 
-            // Parse the requested send amount first
-            let send_amount = match params.amount.parse::<u128>() {
-                Ok(amt) => amt,
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Invalid amount format: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
+        if send_amount == 0 {
+            return Err(ErrorData::invalid_params(
+                "Amount must be greater than 0".to_string(),
+                None,
+            ));
+        }
+
+        let ctx_guard = wallet_ctx.read().await;
+
+        let privacy_result = crate::operations::get_privacy_balance(
+            provider,
+            &*privacy_key_guard,
+            Some(&viewing_key),
+        )
+        .await
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
+        })?;
+
+        if privacy_result.unspent_notes.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "No unspent notes available to send.".to_string(),
+                None,
+            ));
+        }
+
+        // Smart note selection: choose the best note based on the amount
+        // Strategy:
+        // 1. Look for exact match (no change needed)
+        // 2. If no exact match, find smallest note >= send_amount (minimize change)
+        // 3. If no note is large enough, fail with insufficient funds error
+        let note = {
+            let mut exact_match = None;
+            let mut smallest_sufficient = None;
+            let mut smallest_sufficient_value = u128::MAX;
+
+            for n in &privacy_result.unspent_notes {
+                if n.value == send_amount {
+                    // Perfect match found
+                    exact_match = Some(n);
+                    break;
+                } else if n.value > send_amount && n.value < smallest_sufficient_value {
+                    // Track smallest note that's larger than needed
+                    smallest_sufficient = Some(n);
+                    smallest_sufficient_value = n.value;
                 }
-            };
-
-            if send_amount == 0 {
-                let _ = tx_store
-                    .mark_failed(&id, "Amount must be greater than 0", current_timestamp_ms())
-                    .await;
-                return;
             }
 
-            let unified = match crate::operations::get_unified_balance(
-                &provider,
-                &*ctx_guard,
-                DEFAULT_TOKEN_ID,
-                &*privacy_guard,
-                &viewing_key,
-            )
-            .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to fetch unspent notes: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-
-            if unified.unspent_notes.is_empty() {
-                let _ = tx_store
-                    .mark_failed(
-                        &id,
-                        "No unspent notes available to send.",
-                        current_timestamp_ms(),
-                    )
-                    .await;
-                return;
-            }
-
-            // Smart note selection: choose the best note based on the amount
-            // Strategy:
-            // 1. Look for exact match (no change needed)
-            // 2. If no exact match, find smallest note >= send_amount (minimize change)
-            // 3. If no note is large enough, fail with insufficient funds error
-            let note = {
-                let mut exact_match = None;
-                let mut smallest_sufficient = None;
-                let mut smallest_sufficient_value = u128::MAX;
-
-                for n in &unified.unspent_notes {
-                    if n.value == send_amount {
-                        // Perfect match found
-                        exact_match = Some(n);
-                        break;
-                    } else if n.value > send_amount && n.value < smallest_sufficient_value {
-                        // Track smallest note that's larger than needed
-                        smallest_sufficient = Some(n);
-                        smallest_sufficient_value = n.value;
-                    }
-                }
-
-                match exact_match.or(smallest_sufficient) {
-                    Some(n) => n,
-                    None => {
-                        let total_balance: u128 =
-                            unified.unspent_notes.iter().map(|n| n.value).sum();
-                        let _ = tx_store
-                            .mark_failed(
-                                &id,
-                                &format!(
-                                    "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
-                                    send_amount,
-                                    total_balance,
-                                    unified.unspent_notes.len()
-                                ),
-                                current_timestamp_ms(),
-                            )
-                            .await;
-                        return;
-                    }
-                }
-            };
-
-            tracing::info!(
-                "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
-                note.value,
-                note.tx_hash,
-                if note.value == send_amount {
-                    "exact match"
-                } else {
-                    "smallest sufficient"
-                }
-            );
-
-            let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
-                Ok(bytes) if bytes.len() == 32 => bytes,
-                Ok(bytes) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Invalid rho length ({} bytes)", bytes.len()),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to decode rho: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-
-            let mut input_rho = [0u8; 32];
-            input_rho.copy_from_slice(&rho_bytes);
-            let input_recipient = privacy_guard.recipient(&DOMAIN);
-            let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
-
-            tracing::info!(
-                "[send] Input note - value: {}, rho: {}, recipient: {}",
-                note.value,
-                hex::encode(&input_rho),
-                hex::encode(&input_recipient)
-            );
-            tracing::info!(
-                "[send] Output recipient (destination): {}",
-                hex::encode(&output_recipient)
-            );
-
-            if send_amount < note.value {
-                let change_amt = note.value - send_amount;
-                tracing::info!(
-                    "[send] Transfer includes change output - amount: {}",
-                    change_amt
-                );
-            } else {
-                tracing::info!("[send] No change needed - sending full note value");
-            }
-
-            let spend_sk = match privacy_guard.spend_sk().copied() {
-                Some(sk) => sk,
+            match exact_match.or(smallest_sufficient) {
+                Some(n) => n,
                 None => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            "privacy key missing spend_sk; cannot spend note",
-                            current_timestamp_ms(),
-                        )
-                        .await;
-                    return;
-                }
-            };
-            let pk_ivk_owner = privacy_guard.pk_ivk(&DOMAIN);
-            let input_sender_id = input_recipient; // Deposit convention / fallback.
-
-            let send_res = if let Some(ligero_ref) = ligero.as_ref() {
-                crate::operations::transfer(
-                    ligero_ref,
-                    &provider,
-                    &*ctx_guard,
-                    spend_sk,
-                    pk_ivk_owner,
-                    note.value,
-                    send_amount,
-                    input_rho,
-                    input_sender_id,
-                    output_pk,
-                    output_pk_ivk,
-                    authority_fvk_for_transfer,
-                )
-                .await
-            } else {
-                Err(anyhow::anyhow!(
-                    "Ligero prover not configured; cannot send privacy transfer."
-                ))
-            };
-
-            match send_res {
-                Ok(transfer_result) => {
-                    let _ = tx_store
-                        .upsert(TransactionUpsert {
-                            id: id.clone(),
-                            state: "sent".to_string(),
-                            from_address: Some(from_address.clone()),
-                            to_address: Some(destination_address.clone()),
-                            amount: Some(send_amount.to_string()),
-                            tx_identifier: Some(transfer_result.tx_hash.clone()),
-                            created_at: note.timestamp_ms,
-                            updated_at: current_timestamp_ms(),
-                            error_message: None,
-                        })
-                        .await;
-
-                    if let Ok(tx_details) = crate::operations::get_transaction_status(
-                        &provider,
-                        &transfer_result.tx_hash,
-                    )
-                    .await
-                    {
-                        let (state, error_message) =
-                            map_state_and_error(Some(tx_details.status.clone()));
-                        let _ = tx_store
-                            .update_state(
-                                &id,
-                                &state,
-                                Some(&transfer_result.tx_hash),
-                                error_message.as_deref(),
-                                current_timestamp_ms(),
-                            )
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx_store
-                        .mark_failed(
-                            &id,
-                            &format!("Failed to submit privacy transfer: {}", e),
-                            current_timestamp_ms(),
-                        )
-                        .await;
+                    let total_balance: u128 =
+                        privacy_result.unspent_notes.iter().map(|n| n.value).sum();
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
+                            send_amount,
+                            total_balance,
+                            privacy_result.unspent_notes.len()
+                        ),
+                        None,
+                    ));
                 }
             }
-        });
+        };
+
+        tracing::info!(
+            "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
+            note.value,
+            note.tx_hash,
+            if note.value == send_amount {
+                "exact match"
+            } else {
+                "smallest sufficient"
+            }
+        );
+
+        let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            Ok(bytes) => {
+                return Err(ErrorData::internal_error(
+                    format!("Invalid rho length ({} bytes)", bytes.len()),
+                    None,
+                ));
+            }
+            Err(e) => {
+                return Err(ErrorData::internal_error(
+                    format!("Failed to decode rho: {}", e),
+                    None,
+                ));
+            }
+        };
+
+        let mut input_rho = [0u8; 32];
+        input_rho.copy_from_slice(&rho_bytes);
+        let input_recipient = privacy_key_guard.recipient(&DOMAIN);
+        let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
+            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Invalid sender_id in note (hex decode failed): {}", e),
+                    None,
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Invalid sender_id length in note (expected 32 bytes, got {})",
+                        bytes.len()
+                    ),
+                    None,
+                ));
+            }
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        } else {
+            // Deposit-style note: sender_id is derived deterministically as recipient.
+            input_recipient
+        };
+        let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
+
+        tracing::info!(
+            "[send] Input note - value: {}, rho: {}, recipient: {}",
+            note.value,
+            hex::encode(&input_rho),
+            hex::encode(&input_recipient)
+        );
+        tracing::info!(
+            "[send] Output recipient (destination): {}",
+            hex::encode(&output_recipient)
+        );
+
+        if send_amount < note.value {
+            let change_amt = note.value - send_amount;
+            tracing::info!(
+                "[send] Transfer includes change output - amount: {}",
+                change_amt
+            );
+        } else {
+            tracing::info!("[send] No change needed - sending full note value");
+        }
+
+        let spend_sk = privacy_key_guard.spend_sk().copied().ok_or_else(|| {
+            ErrorData::internal_error(
+                "privacy key missing spend_sk; cannot spend note".to_string(),
+                None,
+            )
+        })?;
+        let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
+        let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Ligero prover not configured; cannot send privacy transfer.".to_string(),
+                None,
+            )
+        })?;
+        let transfer_result = crate::operations::transfer(
+            ligero_ref,
+            provider,
+            &*ctx_guard,
+            spend_sk,
+            pk_ivk_owner,
+            note.value,
+            send_amount,
+            input_rho,
+            input_sender_id,
+            output_pk,
+            output_pk_ivk,
+            viewer_fvk_bundle_for_transfer,
+        )
+        .await
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
+        })?;
 
         let result = SendFundsResult {
-            id: result_id,
-            tx_identifier: None,
-            tx_hash: None,
+            tx_hash: Some(transfer_result.tx_hash),
             note_tx_hash: None,
             note_tx_identifier: None,
             note_amount: None,
@@ -933,41 +1036,46 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let _wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Wallet context not configured. Please set WALLET_PATH environment variable.",
                 None,
             )
         })?;
 
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let viewing_key_bytes = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            *authority_fvk.as_bytes()
-        } else {
-            return Err(ErrorData::invalid_params(
-                "Viewing key not configured. Set AUTHORITY_FVK to decrypt privacy pool notes.",
-                None,
-            ));
-        };
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let viewing_key = viewer_fvk_guard
+            .as_ref()
+            .map(|bundle| midnight_privacy::FullViewingKey(bundle.fvk));
 
-        let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
-
-        let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        let unified_result = crate::operations::get_unified_balance(
+        let privacy_result = crate::operations::get_privacy_balance(
             provider,
-            &*ctx,
-            DEFAULT_TOKEN_ID,
             &*privacy_key_guard,
-            &viewing_key,
+            viewing_key.as_ref(),
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        let balance = privacy_result.balance;
+        let unspent_notes = privacy_result
+            .unspent_notes
+            .into_iter()
+            .map(|note| UnspentNoteInfo {
+                value: note.value.to_string(),
+                rho: note.rho,
+                sender_id: note.sender_id,
+                tx_hash: note.tx_hash,
+                timestamp_ms: note.timestamp_ms,
+                kind: note.kind,
+            })
+            .collect();
+
         let result = GetWalletBalanceResult {
-            balance: unified_result.privacy_balance,
+            balance: balance.to_string(),
             pending_balance: "0".to_string(),
+            unspent_notes,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1013,7 +1121,7 @@ impl CryptoServer {
             )
         })?;
 
-        // Allow lookup by either tx_hash or the UUIDv5 id we expose in getTransactions/send
+        // Allow lookup by either tx_hash or a UUIDv5 derived from the tx hash (legacy helper)
         let tx_hash = if Uuid::parse_str(&params.tx_hash).is_ok() {
             let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -1079,13 +1187,12 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the status of a transaction by local database ID.
-    /// Uses the in-memory SQLite store as the source of truth and refreshes from the indexer when possible.
+    /// Get the status of a transaction by its transaction hash.
     #[tool(
         name = "getTransactionStatus",
-        description = "Get the status of a transaction by its local database ID. Returns stored state and txIdentifier once available."
+        description = "Get the status of a transaction by its hash. Returns the latest indexed state and txIdentifier."
     )]
-    async fn get_transaction_status_db(
+    async fn get_transaction_status(
         &self,
         Parameters(params): Parameters<GetTransactionStatusRequest>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1096,64 +1203,12 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                None,
-            )
-        })?;
-
-        let ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
-
-        // Keep local store in sync with indexer before reading the record
-        let _ = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        let mut stored = self
-            .tx_store
-            .get_by_id(&params.id)
+        let tx_details = crate::operations::get_transaction_status(provider, &params.id)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("Transaction with id {} not found in local store", params.id),
-                    None,
-                )
-            })?;
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let record = details_to_record(tx_details);
 
-        if let Some(ref tx_identifier) = stored.tx_identifier {
-            if stored.state != "completed" && stored.state != "failed" {
-                if let Ok(tx_details) =
-                    crate::operations::get_transaction_status(provider, tx_identifier).await
-                {
-                    let (state, error_message) =
-                        map_state_and_error(Some(tx_details.status.clone()));
-                    let _ = self
-                        .tx_store
-                        .update_state(
-                            &stored.id,
-                            &state,
-                            Some(tx_identifier.as_str()),
-                            error_message.as_deref(),
-                            current_timestamp_ms(),
-                        )
-                        .await;
-
-                    stored = self
-                        .tx_store
-                        .get_by_id(&params.id)
-                        .await
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-                        .unwrap_or(stored);
-                }
-            }
-        }
-
-        let result = GetTransactionStatusResult {
-            transaction: stored_to_record(stored),
-        };
+        let result = GetTransactionStatusResult { transaction: record };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
@@ -1161,7 +1216,7 @@ impl CryptoServer {
     }
 
     /// Get all transactions for the privacy pool.
-    /// Returns transactions from the local database, filtered by the current privacy pool address.
+    /// Returns transactions from the indexer filtered to the current privacy pool address.
     #[tool(
         name = "getTransactions",
         description = "Get all transactions for the privacy pool. Retrieves all transactions (deposits, transfers, withdrawals) associated with the current privacy pool address."
@@ -1187,38 +1242,13 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        // Sync with indexer (this now only syncs privacy pool transactions)
-        self.sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        // Get current privacy pool address
-        let privacy_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
-
-        // Get all transactions from DB
-        let stored = self
-            .tx_store
-            .list_all()
+        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        // Filter to only include transactions for the current privacy pool address
-        let transaction_records: Vec<TransactionRecord> = stored
+        let transaction_records: Vec<TransactionRecord> = transactions
             .into_iter()
-            .filter(|tx| {
-                // Include transaction if from_address or to_address matches privacy pool address
-                let from_matches = tx
-                    .from_address
-                    .as_ref()
-                    .map(|addr| addr == &privacy_address)
-                    .unwrap_or(false);
-                let to_matches = tx
-                    .to_address
-                    .as_ref()
-                    .map(|addr| addr == &privacy_address)
-                    .unwrap_or(false);
-                from_matches || to_matches
-            })
-            .map(stored_to_record)
+            .map(transaction_to_record)
             .collect();
 
         let result = GetTransactionsResult {
@@ -1273,11 +1303,12 @@ impl CryptoServer {
     // deposit tool removed; funding is attempted on startup when configured via env
 
     /// Create a new wallet with new keys.
-    /// Generates new wallet private key, authority FVK, and privacy pool spending key.
+    /// Generates new wallet private key, viewer FVK (via midnight-fvk-service when POOL_FVK_PK is set),
+    /// and privacy pool spending key.
     /// All subsequent transactions will use the new keys.
     #[tool(
         name = "createWallet",
-        description = "Create a new wallet with new keys. Generates new wallet private key, authority FVK, and privacy pool spending key. All subsequent operations will use the new keys."
+        description = "Create a new wallet with new keys. Generates new wallet private key, viewer FVK (via midnight-fvk-service when POOL_FVK_PK is set), and privacy pool spending key. All subsequent operations will use the new keys."
     )]
     async fn create_wallet(
         &self,
@@ -1285,16 +1316,9 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         use rand::RngCore;
 
-        // Capture the current wallet context before we replace it so we can fund the new wallet using existing funds.
-        let previous_wallet_ctx = if let Some(ref wallet_ctx) = self.wallet_context {
-            Some(wallet_ctx.read().await.clone())
-        } else {
-            None
-        };
-
         // Generate all random bytes first (before any async operations)
         // This ensures the RNG is dropped before any await points
-        let (wallet_private_key_hex, authority_fvk_hex, privacy_spend_key_hex) = {
+        let (wallet_private_key_hex, privacy_spend_key_hex) = {
             let mut rng = rand::thread_rng();
 
             // Generate new wallet private key (32 bytes)
@@ -1302,21 +1326,12 @@ impl CryptoServer {
             rng.fill_bytes(&mut wallet_private_key_bytes);
             let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
 
-            // Generate new authority FVK (32 bytes)
-            let mut authority_fvk_bytes = [0u8; 32];
-            rng.fill_bytes(&mut authority_fvk_bytes);
-            let authority_fvk_hex = hex::encode(&authority_fvk_bytes);
-
             // Generate new privacy spend key (32 bytes)
             let mut privacy_spend_key_bytes = [0u8; 32];
             rng.fill_bytes(&mut privacy_spend_key_bytes);
             let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
 
-            (
-                wallet_private_key_hex,
-                authority_fvk_hex,
-                privacy_spend_key_hex,
-            )
+            (wallet_private_key_hex, privacy_spend_key_hex)
         }; // RNG is dropped here
 
         // Create new wallet context from the private key
@@ -1325,12 +1340,9 @@ impl CryptoServer {
                 ErrorData::internal_error(format!("Failed to create wallet context: {}", e), None)
             })?;
 
-        let wallet_address = new_wallet_ctx.get_address().to_string();
+        let wallet_address_str = new_wallet_ctx.get_address().to_string();
 
-        // Create new authority FVK
-        let new_authority_fvk = AuthorityFvk::from_hex(&authority_fvk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
-        })?;
+        let new_wallet_for_deposit = Arc::new(new_wallet_ctx.clone());
 
         // Create new privacy key
         let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
@@ -1340,59 +1352,90 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
-        // Replace the privacy keys (but not the wallet context)
-        let mut authority_fvk_guard = self.authority_fvk.write().await;
-        *authority_fvk_guard = Some(new_authority_fvk);
+        // Ensure provider is configured before we swap wallet context.
+        let _ = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
+
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let http = reqwest::Client::new();
+            Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
+                    None,
+                )
+            })?)
+        } else {
+            None
+        };
+
+        // Replace the wallet context and privacy keys
+        if let Some(ref wallet_ctx) = self.wallet_context {
+            let mut ctx_guard = wallet_ctx.write().await;
+            *ctx_guard = new_wallet_ctx;
+        }
+
+        let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+        *viewer_fvk_guard = viewer_fvk_bundle.clone();
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
 
         tracing::info!("[createWallet] New wallet created successfully");
-        tracing::info!("[createWallet] Wallet address: {}", wallet_address);
+        tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
         tracing::info!("[createWallet] Privacy address: {}", privacy_address);
 
         // Best-effort funding when configured via AUTO_FUND_DEPOSIT_AMOUNT
-        if let Some(amount) = self.auto_fund_deposit_amount {
-            if let (Some(provider), Some(funding_ctx)) =
-                (self.provider.clone(), previous_wallet_ctx.clone())
-            {
+        // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool
+        if let Some(deposit_amount) = self.auto_fund_deposit_amount {
+            let admin_wallet_ctx = self.admin_wallet_context.clone();
+            if let (Some(provider), Some(admin_ctx)) = (self.provider.clone(), admin_wallet_ctx) {
                 let dest_privacy_key = new_privacy_key_for_deposit.clone();
-                tracing::info!(
-                    "[auto-fund/createWallet] Attempting auto-fund deposit of {} (best-effort) using previous wallet context",
-                    amount
-                );
+                let dest_wallet_address = wallet_address_str.clone();
+                let new_wallet_for_deposit = new_wallet_for_deposit.clone();
+                let auto_fund_gas_reserve = self.auto_fund_gas_reserve;
+
                 tokio::spawn(async move {
-                    tracing::info!(
-                        "[auto-fund/createWallet] Submitting deposit of {} to {}",
-                        amount,
-                        dest_privacy_key.privacy_address(&DOMAIN)
-                    );
-                    match crate::operations::deposit(
-                        &provider,
-                        &funding_ctx,
-                        amount,
-                        &dest_privacy_key,
+                    run_auto_fund_sequence(
+                        provider,
+                        admin_ctx,
+                        dest_wallet_address,
+                        dest_privacy_key,
+                        new_wallet_for_deposit,
+                        deposit_amount,
+                        auto_fund_gas_reserve,
                     )
-                    .await
-                    {
-                        Ok(res) => tracing::info!(
-                            "[auto-fund/createWallet] Deposit submitted: {}",
-                            res.tx_hash
-                        ),
-                        Err(e) => {
-                            tracing::warn!("[auto-fund/createWallet] Deposit attempt failed: {}", e)
-                        }
-                    }
+                    .await;
                 });
             } else {
                 tracing::warn!(
-                    "[auto-fund/createWallet] Auto-fund deposit configured but no funding wallet/provider available; skipping"
+                    "[auto-fund/createWallet] Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set; skipping"
                 );
             }
         }
 
         let result = CreateWalletResult {
-            authority_fvk: authority_fvk_hex,
+            wallet_private_key: wallet_private_key_hex,
+            wallet_address: wallet_address_str,
+            viewer_fvk: viewer_fvk_bundle.as_ref().map(|b| hex::encode(b.fvk)),
+            viewer_fvk_commitment: viewer_fvk_bundle
+                .as_ref()
+                .map(|b| hex::encode(b.fvk_commitment)),
+            viewer_fvk_pool_sig_hex: viewer_fvk_bundle.as_ref().map(|b| b.pool_sig_hex.clone()),
+            viewer_fvk_signer_public_key: viewer_fvk_bundle
+                .as_ref()
+                .map(|b| hex::encode(b.signer_public_key)),
             privacy_spend_key: privacy_spend_key_hex,
             privacy_address,
         };
@@ -1403,11 +1446,14 @@ impl CryptoServer {
     }
 
     /// Restore a wallet from existing keys.
-    /// Loads existing wallet private key, authority FVK, and privacy pool spending key.
-    /// All subsequent transactions will use the restored keys.
+    /// Loads existing wallet private key and privacy pool spending key.
+    ///
+    /// If `POOL_FVK_PK` is set, a fresh viewer FVK bundle is requested from `midnight-fvk-service`.
+    /// The L2 wallet context IS updated and will be funded with gas tokens from the admin wallet.
+    /// All subsequent operations will use the restored keys.
     #[tool(
         name = "restoreWallet",
-        description = "Restore a wallet from existing keys. Loads wallet private key, authority FVK, and privacy pool spending key from hex strings. All subsequent operations will use the restored keys."
+        description = "Restore a wallet from existing keys. Loads wallet private key and privacy pool spending key from hex strings. If POOL_FVK_PK is set, fetches a fresh viewer FVK from midnight-fvk-service. All subsequent operations will use the restored keys."
     )]
     async fn restore_wallet(
         &self,
@@ -1415,19 +1461,12 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Strip 0x prefix if present
         let wallet_private_key_hex = params.wallet_private_key.trim_start_matches("0x");
-        let authority_fvk_hex = params.authority_fvk.trim_start_matches("0x");
         let privacy_spend_key_hex = params.privacy_spend_key.trim_start_matches("0x");
 
         // Validate hex strings are correct length (32 bytes = 64 hex chars)
         if wallet_private_key_hex.len() != 64 {
             return Err(ErrorData::invalid_params(
                 "wallet_private_key must be exactly 32 bytes (64 hex characters).",
-                None,
-            ));
-        }
-        if authority_fvk_hex.len() != 64 {
-            return Err(ErrorData::invalid_params(
-                "authority_fvk must be exactly 32 bytes (64 hex characters).",
                 None,
             ));
         }
@@ -1446,10 +1485,94 @@ impl CryptoServer {
 
         let wallet_address = new_wallet_ctx.get_address().to_string();
 
-        // Create authority FVK
-        let new_authority_fvk = AuthorityFvk::from_hex(authority_fvk_hex).map_err(|e| {
-            ErrorData::internal_error(format!("Failed to create authority FVK: {}", e), None)
-        })?;
+        let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
+
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let provided_fvk_hex = params
+                .viewer_fvk
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let provided_sig_hex = params
+                .viewer_fvk_pool_sig_hex
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            match (provided_fvk_hex, provided_sig_hex) {
+                (Some(fvk_hex), Some(sig_hex)) => {
+                    let fvk = parse_hex_32("viewer_fvk", fvk_hex).map_err(|e| {
+                        ErrorData::invalid_params(format!("Invalid viewer_fvk: {e}"), None)
+                    })?;
+
+                    let sig_hex_trimmed = sig_hex.strip_prefix("0x").unwrap_or(sig_hex);
+                    let sig_bytes = hex::decode(sig_hex_trimmed).map_err(|e| {
+                        ErrorData::invalid_params(
+                            format!("Invalid hex for viewer_fvk_pool_sig_hex: {e}"),
+                            None,
+                        )
+                    })?;
+                    if sig_bytes.len() != 64 {
+                        return Err(ErrorData::invalid_params(
+                            "viewer_fvk_pool_sig_hex must be 64 bytes (128 hex characters).",
+                            None,
+                        ));
+                    }
+                    let mut sig_arr = [0u8; 64];
+                    sig_arr.copy_from_slice(&sig_bytes);
+
+                    let commitment = midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
+                    let pool_vk = VerifyingKey::from_bytes(&pool_pk).map_err(|e| {
+                        ErrorData::invalid_params(
+                            format!("Invalid POOL_FVK_PK verifying key: {e}"),
+                            None,
+                        )
+                    })?;
+                    pool_vk
+                        .verify_strict(&commitment, &Ed25519Signature::from_bytes(&sig_arr))
+                        .map_err(|e| {
+                            ErrorData::invalid_params(
+                                format!(
+                                    "Invalid viewer_fvk_pool_sig_hex for viewer_fvk_commitment: {e}"
+                                ),
+                                None,
+                            )
+                        })?;
+
+                    Some(ViewerFvkBundle {
+                        fvk,
+                        fvk_commitment: commitment,
+                        pool_sig_hex: sig_hex_trimmed.to_string(),
+                        signer_public_key: pool_pk,
+                    })
+                }
+                (None, None) => {
+                    let http = reqwest::Client::new();
+                    Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
+                        ErrorData::internal_error(
+                            format!(
+                                "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
+                            ),
+                            None,
+                        )
+                    })?)
+                }
+                _ => {
+                    return Err(ErrorData::invalid_params(
+                        "When POOL_FVK_PK is set, restoreWallet must provide both viewer_fvk and viewer_fvk_pool_sig_hex (or neither to fetch a fresh one).",
+                        None,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         // Create privacy key
         let new_privacy_key = PrivacyKey::from_hex(privacy_spend_key_hex).map_err(|e| {
@@ -1458,14 +1581,22 @@ impl CryptoServer {
 
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
-        // Replace the existing keys with the restored ones
+        // Ensure provider is configured before we swap wallet context.
+        let _ = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        // Replace the existing keys with the restored ones (including wallet context)
         if let Some(ref wallet_ctx) = self.wallet_context {
             let mut ctx_guard = wallet_ctx.write().await;
             *ctx_guard = new_wallet_ctx;
         }
 
-        let mut authority_fvk_guard = self.authority_fvk.write().await;
-        *authority_fvk_guard = Some(new_authority_fvk);
+        let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+        *viewer_fvk_guard = viewer_fvk_bundle;
 
         let mut privacy_key_guard = self.privacy_key.write().await;
         *privacy_key_guard = new_privacy_key;
@@ -1508,55 +1639,42 @@ impl CryptoServer {
             )
         })?;
 
-        let ctx = wallet_ctx.read().await;
+        let _ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
         // Get the current privacy balance to include in status
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let privacy_balance = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            let viewing_key_bytes = *authority_fvk.as_bytes();
-            let viewing_key = midnight_privacy::FullViewingKey(viewing_key_bytes);
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let viewing_key = viewer_fvk_guard
+            .as_ref()
+            .map(|bundle| midnight_privacy::FullViewingKey(bundle.fvk));
 
-            // Get privacy balance
-            let unified_result = crate::operations::get_unified_balance(
-                provider,
-                &*ctx,
-                DEFAULT_TOKEN_ID,
-                &*privacy_key_guard,
-                &viewing_key,
-            )
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-            unified_result.privacy_balance.parse::<u128>().unwrap_or(0)
-        } else {
-            // No viewing key configured, default to 0
-            0
+        let privacy_balance = match crate::operations::get_privacy_balance(
+            provider,
+            &*privacy_key_guard,
+            viewing_key.as_ref(),
+        )
+        .await
+        {
+            Ok(privacy_result) => privacy_result.balance,
+            Err(e) => {
+                tracing::warn!("[walletStatus] Failed to fetch privacy balance: {}", e);
+                0
+            }
         };
 
-        let sync_summary = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
-        let total = sync_summary.total.max(1);
-        let completed = total.saturating_sub(sync_summary.pending);
-        let percentage = if sync_summary.total == 0 {
-            100.0
-        } else {
-            (completed as f64 / total as f64) * 100.0
+        let sync_progress = SyncProgressInfo {
+            synced: true,
+            lag: LagInfoData {
+                apply_gap: "0".to_string(),
+                source_gap: "0".to_string(),
+            },
+            percentage: 100.0,
         };
 
         let result = GetWalletStatusResult {
             ready: true,
-            syncing: !sync_summary.is_synced,
-            sync_progress: SyncProgressInfo {
-                synced: sync_summary.is_synced,
-                lag: LagInfoData {
-                    apply_gap: sync_summary.pending.to_string(),
-                    source_gap: "0".to_string(),
-                },
-                percentage,
-            },
+            syncing: false,
+            sync_progress,
             address: privacy_key_guard.privacy_address(&DOMAIN).to_string(),
             balances: BalancesInfo {
                 balance: privacy_balance.to_string(),
@@ -1565,7 +1683,7 @@ impl CryptoServer {
             recovering: false,
             recovery_attempts: 0,
             max_recovery_attempts: 0,
-            is_fully_synced: sync_summary.is_synced,
+            is_fully_synced: true,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1590,20 +1708,10 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                None,
-            )
-        })?;
-
-        let ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
-
         // Get FVK if available for decryption
-        let authority_fvk_guard = self.authority_fvk.read().await;
-        let fvk_hex = if let Some(ref authority_fvk) = *authority_fvk_guard {
-            Some(hex::encode(authority_fvk.as_bytes()))
+        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
+        let fvk_hex = if let Some(ref bundle) = *viewer_fvk_guard {
+            Some(hex::encode(bundle.fvk))
         } else {
             None
         };
@@ -1613,23 +1721,15 @@ impl CryptoServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let sync_summary = self
-            .sync_with_indexer(provider, &*ctx, &*privacy_key_guard)
-            .await?;
-
         let result = VerifyTransactionResult {
             exists: verify_result.exists,
             sync_status: VerifySyncStatus {
-                synced_indices: if sync_summary.is_synced {
-                    "all".to_string()
-                } else {
-                    "partial".to_string()
-                },
+                synced_indices: "all".to_string(),
                 lag: VerifyLagInfo {
-                    apply_gap: sync_summary.pending.to_string(),
+                    apply_gap: "0".to_string(),
                     source_gap: "0".to_string(),
                 },
-                is_fully_synced: sync_summary.is_synced,
+                is_fully_synced: true,
             },
             transaction_amount: verify_result.transaction_amount,
         };
@@ -1811,24 +1911,6 @@ impl ServerHandler for CryptoServer {
     }
 }
 
-impl CryptoServer {
-    async fn sync_with_indexer(
-        &self,
-        provider: &Provider,
-        ctx: &McpWalletContext,
-        privacy_key: &PrivacyKey,
-    ) -> Result<SyncSummary, ErrorData> {
-        sync_with_indexer_impl(provider, ctx, privacy_key, &self.tx_store).await
-    }
-}
-
-fn current_timestamp_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 fn map_state_and_error(status: Option<String>) -> (String, Option<String>) {
     match status {
         Some(raw) => {
@@ -1858,54 +1940,57 @@ fn reveal_or_encrypted(value: Option<String>) -> String {
     }
 }
 
-fn stored_to_record(row: StoredTransaction) -> TransactionRecord {
+fn record_from_indexer(
+    tx_hash: String,
+    status: Option<String>,
+    timestamp_ms: i64,
+    sender: Option<String>,
+    recipient: Option<String>,
+    privacy_sender: Option<String>,
+    privacy_recipient: Option<String>,
+    amount: Option<String>,
+) -> TransactionRecord {
+    let (state, error_message) = map_state_and_error(status.clone());
+    let from_address = privacy_sender.or(sender);
+    let to_address = privacy_recipient.or(recipient);
+
     TransactionRecord {
-        id: row.id,
-        state: row.state,
-        from_address: reveal_or_encrypted(row.from_address),
-        to_address: reveal_or_encrypted(row.to_address),
-        amount: reveal_or_encrypted(row.amount),
-        tx_identifier: row.tx_identifier,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        error_message: row.error_message,
+        id: tx_hash.clone(),
+        state,
+        from_address: reveal_or_encrypted(from_address),
+        to_address: reveal_or_encrypted(to_address),
+        amount: reveal_or_encrypted(amount),
+        tx_identifier: Some(tx_hash),
+        created_at: timestamp_ms,
+        updated_at: timestamp_ms,
+        error_message,
     }
 }
 
-pub(crate) async fn sync_with_indexer_impl(
-    provider: &Provider,
-    ctx: &McpWalletContext,
-    privacy_key: &PrivacyKey,
-    store: &TransactionStore,
-) -> Result<SyncSummary, ErrorData> {
-    let transactions = crate::operations::get_transactions(provider, ctx, privacy_key)
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+fn transaction_to_record(tx: crate::operations::Transaction) -> TransactionRecord {
+    record_from_indexer(
+        tx.tx_hash,
+        tx.status,
+        tx.timestamp_ms,
+        tx.sender,
+        tx.recipient,
+        tx.privacy_sender,
+        tx.privacy_recipient,
+        tx.amount,
+    )
+}
 
-    for tx in transactions {
-        let (state, error_message) = map_state_and_error(tx.status);
-        let upsert = TransactionUpsert {
-            id: Uuid::new_v5(&Uuid::NAMESPACE_OID, tx.tx_hash.as_bytes()).to_string(),
-            state,
-            from_address: tx.sender,
-            to_address: tx.recipient,
-            amount: tx.amount,
-            tx_identifier: Some(tx.tx_hash),
-            created_at: tx.timestamp_ms,
-            updated_at: tx.timestamp_ms,
-            error_message,
-        };
-
-        store
-            .upsert(upsert)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-    }
-
-    store
-        .summary()
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+fn details_to_record(details: crate::operations::TransactionDetails) -> TransactionRecord {
+    record_from_indexer(
+        details.tx_hash,
+        Some(details.status),
+        details.timestamp_ms.unwrap_or_default(),
+        details.sender,
+        details.recipient,
+        details.privacy_sender,
+        details.privacy_recipient,
+        details.amount,
+    )
 }
 
 #[allow(dead_code)]

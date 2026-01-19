@@ -30,11 +30,9 @@ struct Cli {
     /// Delay (ms) between transfer submissions to the verifier
     #[arg(long)]
     transfer_delay_ms: Option<u64>,
-    /// Authority Full Viewing Key (32-byte hex) for Level-B compliance.
-    /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
-    /// Can also be set via AUTHORITY_FVK environment variable.
-    #[arg(long, env = "AUTHORITY_FVK")]
-    authority_fvk: Option<String>,
+    /// Base URL for `midnight-fvk-service` (used when POOL_FVK_PK enforcement is enabled).
+    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_URL")]
+    fvk_service_url: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -65,23 +63,8 @@ async fn main() -> Result<()> {
     if let Some(ms) = cli.transfer_delay_ms {
         config.transfer_submit_delay_ms = ms;
     }
-    // Parse authority FVK from CLI arg (overrides env var if provided)
-    if let Some(fvk_hex) = cli.authority_fvk {
-        let s = fvk_hex.trim();
-        let s = s.strip_prefix("0x").unwrap_or(s);
-        match hex::decode(s) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut fvk = [0u8; 32];
-                fvk.copy_from_slice(&bytes);
-                config.authority_fvk = Some(fvk);
-            }
-            Ok(_) => {
-                eprintln!("[warn] --authority-fvk must be 32 bytes (64 hex chars), ignoring");
-            }
-            Err(e) => {
-                eprintln!("[warn] --authority-fvk invalid hex: {e}, ignoring");
-            }
-        }
+    if let Some(url) = cli.fvk_service_url {
+        std::env::set_var("MIDNIGHT_FVK_SERVICE_URL", url);
     }
     run(config).await
 }

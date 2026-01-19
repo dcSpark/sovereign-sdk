@@ -6696,7 +6696,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "hex",
- "ligetron",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -6708,9 +6708,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "ligero-runner"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c#e86c3f7119a07eb51b4408dd6fce10b7ad54c45c"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bincode",
+ "hex",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ligetron"
 version = "1.1.0"
 source = "git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd#da388b5f5e0ac9e9fcc465acc3e10289e23de1fd"
+dependencies = [
+ "ark-bn254",
+ "ark-ff 0.5.0",
+ "base64 0.22.1",
+ "hex",
+ "lazy_static",
+ "num-bigint 0.4.6",
+ "paste",
+]
+
+[[package]]
+name = "ligetron"
+version = "1.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c#e86c3f7119a07eb51b4408dd6fce10b7ad54c45c"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
@@ -6982,10 +7014,11 @@ dependencies = [
  "demo-stf",
  "dirs 6.0.0",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "envy",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7023,10 +7056,11 @@ dependencies = [
  "demo-stf",
  "dirs 6.0.0",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "envy",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7044,7 +7078,6 @@ dependencies = [
  "sov-modules-stf-blueprint",
  "sov-node-client",
  "sov-value-setter-zk",
- "sqlx",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -7131,9 +7164,10 @@ dependencies = [
  "chrono",
  "clap",
  "demo-stf",
+ "ed25519-dalek 2.2.0",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "num_cpus",
  "rand 0.8.5",
@@ -7163,13 +7197,12 @@ dependencies = [
  "axum 0.7.9",
  "clap",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "hex",
- "k256",
  "midnight-privacy",
  "rand 0.8.5",
  "serde",
  "serde_json",
- "sha3",
  "sqlx",
  "tempfile",
  "tokio",
@@ -7189,8 +7222,8 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "once_cell",
  "schemars 0.8.22",
  "sea-orm",
@@ -12478,6 +12511,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "midnight-privacy",
+ "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
@@ -12544,8 +12578,8 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "proptest",
  "rand 0.8.5",
  "schemars 0.8.22",
@@ -12924,9 +12958,10 @@ dependencies = [
  "chrono",
  "clap",
  "demo-stf",
+ "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "ligero-runner",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "reqwest 0.12.28",
  "sea-orm",
@@ -13142,7 +13177,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "ligero",
- "ligero-runner",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "num_cpus",
  "prometheus_exporter",

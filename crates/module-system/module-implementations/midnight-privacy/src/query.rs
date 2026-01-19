@@ -152,6 +152,15 @@ pub struct PoolAdminsResponse {
     pub count: u64,
 }
 
+/// Response for listing all frozen (blacklisted) privacy addresses.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct FrozenAddressesResponse {
+    /// Frozen privacy pool addresses (bech32m string form).
+    pub addresses: Vec<PrivacyAddress>,
+    /// Total count.
+    pub count: u64,
+}
+
 /// Response for a deny-map (blacklist) Merkle opening for a given privacy address.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct BlacklistOpeningResponse {
@@ -342,6 +351,24 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         .into())
     }
 
+    /// List frozen (blacklisted) privacy addresses.
+    async fn route_frozen_addresses(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+    ) -> ApiResult<FrozenAddressesResponse> {
+        let addresses = state
+            .frozen_addresses
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_default();
+
+        Ok(FrozenAddressesResponse {
+            count: addresses.len() as u64,
+            addresses,
+        }
+        .into())
+    }
+
     /// Get a deny-map (blacklist) Merkle opening for a given privacy address.
     ///
     /// Clients can use the returned `blacklist_root` (public) and `siblings` (private) to build
@@ -495,6 +522,7 @@ impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
             // Deny-map (blacklist) queries
             .route("/blacklist/root", get(Self::route_blacklist_root))
             .route("/blacklist/admins", get(Self::route_pool_admins))
+            .route("/blacklist/frozen", get(Self::route_frozen_addresses))
             .route(
                 "/blacklist/opening/:privacy_address",
                 get(Self::route_blacklist_opening),

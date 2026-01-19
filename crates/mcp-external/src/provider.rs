@@ -1,7 +1,7 @@
 //! RPC Provider for interacting with the Sovereign rollup
 //!
 //! This module handles all RPC communication with the rollup node, including:
-//! - Chain state queries (nonce, balance)
+//! - Chain state queries (nonce)
 //! - Transaction submission
 //! - Fee estimation
 //! - Block queries
@@ -10,9 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sov_api_spec::types;
 use sov_bank::TokenId;
-use sov_modules_api::{Amount, CryptoSpec, Spec};
+use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
+use serde::Deserialize;
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -36,6 +38,12 @@ pub struct InvolvementItem {
     pub sender: Option<String>,
     /// Recipient address (if available)
     pub recipient: Option<String>,
+    /// Privacy sender address (if available)
+    #[serde(default)]
+    pub privacy_sender: Option<String>,
+    /// Privacy recipient address (if available)
+    #[serde(default)]
+    pub privacy_recipient: Option<String>,
     /// Transaction amount (if available)
     pub amount: Option<String>,
     /// Anchor root for privacy transactions
@@ -57,6 +65,9 @@ pub struct InvolvementItem {
     /// Encrypted notes for privacy transactions
     #[serde(default)]
     pub encrypted_notes: Option<serde_json::Value>,
+    /// Decrypted notes for privacy transactions (when VFK is provided)
+    #[serde(default)]
+    pub decrypted_notes: Option<serde_json::Value>,
     /// Full transaction payload
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
@@ -69,6 +80,36 @@ pub struct ListTransactionsResponse {
     pub items: Vec<InvolvementItem>,
     /// Cursor for pagination (optional)
     pub next: Option<String>,
+    /// Total number of matching transactions (optional)
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+/// Unspent note from the indexer's balance endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct UnspentNote {
+    /// Note value
+    pub value: String,
+    /// Note rho (hex encoded)
+    pub rho: String,
+    /// Optional sender ID (hex encoded, for transfers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    /// Transaction hash where the note was created
+    pub tx_hash: String,
+    /// Timestamp in milliseconds
+    pub timestamp_ms: i64,
+    /// Transaction kind ("deposit", "transfer", etc.)
+    pub kind: String,
+}
+
+/// Response from the indexer's balance endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct BalanceResponse {
+    /// Total balance as string
+    pub balance: String,
+    /// List of unspent notes
+    pub unspent_notes: Vec<UnspentNote>,
 }
 
 /// Provider for RPC communication with the Sovereign rollup
@@ -155,44 +196,7 @@ impl Provider {
         Ok(chain_data)
     }
 
-    /// Get the balance for a specific address and token
-    pub async fn get_balance<S: Spec>(
-        &self,
-        address: &S::Address,
-        token_id: &TokenId,
-    ) -> Result<Amount> {
-        match self.client.get_balance::<S>(address, token_id, None).await {
-            Ok(amount) => Ok(amount),
-            Err(e) => {
-                // If the error is a reqwest 404, return 0
-                if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
-                    if let Some(status) = reqwest_err.status() {
-                        if status == reqwest::StatusCode::NOT_FOUND {
-                            tracing::warn!(
-                                "Token {} does not exist at address {:?} (HTTP 404); returning 0.",
-                                token_id,
-                                address
-                            );
-                            // Amount implements From<u64>
-                            return Ok(Amount::from(0u64));
-                        }
-                    }
-                }
-                tracing::error!(
-                    "Failed to get balance for token {} at address {:?}: {}",
-                    token_id,
-                    address,
-                    e
-                );
-                Err(anyhow::anyhow!(
-                    "Failed to get balance for token {} at address {:?}: {}",
-                    token_id,
-                    address,
-                    e
-                ))
-            }
-        }
-    }
+    
 
     /// Get the nonce for a public key
     pub async fn get_nonce<S: Spec>(
@@ -203,6 +207,39 @@ impl Provider {
             .get_nonce_for_public_key::<S>(public_key)
             .await
             .context("Failed to get nonce from rollup")
+    }
+
+    /// Get a bank balance for the given address and token id.
+    pub async fn get_balance<S: Spec>(
+        &self,
+        account_address: &S::Address,
+        token_id: &TokenId,
+    ) -> Result<sov_bank::Amount> {
+        self.client
+            .get_balance::<S>(account_address, token_id, None)
+            .await
+            .context("Failed to get balance from rollup")
+    }
+
+    pub async fn wait_for_tx_processing(&self, tx_hash: &types::TxHash) -> Result<()> {
+        self.client
+            .wait_for_tx_processing(tx_hash)
+            .await
+            .context("Failed to wait for transaction processing")
+    }
+
+    pub async fn get_gas_token_id(&self) -> Result<TokenId> {
+        #[derive(Deserialize)]
+        struct TokenIdResponse {
+            token_id: TokenId,
+        }
+
+        let response: TokenIdResponse = self
+            .query_rest_endpoint("/modules/bank/tokens/gas_token")
+            .await
+            .context("Failed to fetch gas token id from rollup")?;
+
+        Ok(response.token_id)
     }
 
     /// Submit a raw transaction to the rollup sequencer
@@ -412,6 +449,7 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
+    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -420,7 +458,9 @@ impl Provider {
     /// ```rust,no_run
     /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
-    /// let transactions = provider.get_wallet_transactions(address, None, None, None).await?;
+    /// let transactions = provider
+    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
     /// # }
@@ -431,6 +471,7 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
+        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
@@ -455,9 +496,11 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let response = self
-            .http_client
-            .get(&url)
+        let mut request = self.http_client.post(&url);
+        if let Some(vfk) = vfk {
+            request = request.json(&serde_json::json!({ "vfk": vfk }));
+        }
+        let response = request
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
@@ -493,63 +536,68 @@ impl Provider {
         Ok(tx_list)
     }
 
-    /// Get all transactions from the indexer (global list, not filtered by address)
+    /// Get wallet balance from the indexer
     ///
-    /// This is used for privacy pool balance calculation, where we need to scan all
-    /// transactions to find notes that belong to the user.
+    /// Uses the indexer's `/wallets/:address/balance` endpoint which efficiently
+    /// computes the balance by decrypting notes and tracking spent nullifiers.
     ///
     /// # Parameters
-    /// * `limit` - Optional limit on number of transactions per page (default: 100)
-    /// * `offset` - Optional offset for pagination (default: 0)
+    /// * `address` - Privacy address (bech32m format)
+    /// * `spend_sk_hex` - Optional spending secret key as hex string (with or without 0x prefix)
+    /// * `nf_key_hex` - Optional nullifier key as hex string (with or without 0x prefix)
+    /// * `vfk_hex` - Optional viewing key for decrypting encrypted notes
     ///
     /// # Returns
-    /// A list of all transactions from the indexer
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
-    /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
-    /// println!("Found {} transactions", transactions.items.len());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn get_all_transactions(
+    /// Balance response with total balance and list of unspent notes
+    pub async fn get_wallet_balance(
         &self,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<ListTransactionsResponse> {
-        // Trim trailing slash from indexer_url to avoid double slashes
+        address: &str,
+        spend_sk_hex: Option<&str>,
+        nf_key_hex: Option<&str>,
+        vfk_hex: Option<&str>,
+    ) -> Result<BalanceResponse> {
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/txs", base_url);
+        let url = format!("{}/wallets/{}/balance", base_url, address);
 
-        // Build query parameters
-        let mut query_params = Vec::new();
-        if let Some(limit) = limit {
-            query_params.push(format!("limit={}", limit));
+        // Build request body
+        let mut body = serde_json::Map::new();
+        if let Some(spend_sk) = spend_sk_hex {
+            body.insert(
+                "spend_sk".to_string(),
+                serde_json::Value::String(spend_sk.to_string()),
+            );
         }
-        if let Some(offset) = offset {
-            query_params.push(format!("offset={}", offset));
+        if let Some(nf_key) = nf_key_hex {
+            body.insert(
+                "nf_key".to_string(),
+                serde_json::Value::String(nf_key.to_string()),
+            );
+        }
+        if body.is_empty() {
+            anyhow::bail!("spend_sk or nf_key is required to fetch wallet balance");
+        }
+        if let Some(vfk) = vfk_hex {
+            body.insert(
+                "vfk".to_string(),
+                serde_json::Value::String(vfk.to_string()),
+            );
         }
 
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params.join("&"));
-        }
-
-        tracing::debug!("Fetching all transactions from indexer: {}", url);
+        tracing::debug!("Fetching balance from indexer: {}", url);
 
         let response = self
             .http_client
-            .get(&url)
+            .post(&url)
+            .json(&body)
             .send()
             .await
-            .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
+            .with_context(|| format!("Failed to fetch balance from indexer at {}", url))?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Indexer API error at {}: HTTP {} - {}",
+                "Indexer balance API error at {}: HTTP {} - {}",
                 url,
                 status,
                 if body.is_empty() {
@@ -560,20 +608,20 @@ impl Provider {
             );
         }
 
-        let tx_list: ListTransactionsResponse = response.json().await.with_context(|| {
+        let balance_response: BalanceResponse = response.json().await.with_context(|| {
             format!(
-                "Failed to parse transaction list JSON from indexer at {}",
+                "Failed to parse balance JSON from indexer at {}",
                 url
             )
         })?;
 
         tracing::debug!(
-            "Fetched {} transactions from indexer (offset: {:?}, limit: {:?})",
-            tx_list.items.len(),
-            offset,
-            limit
+            "Fetched balance for address {}: {}",
+            address,
+            balance_response.balance
         );
 
-        Ok(tx_list)
+        Ok(balance_response)
     }
+
 }

@@ -245,6 +245,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/PoolAdminsResponse'
 
+  /modules/midnight-privacy/blacklist/frozen:
+    get:
+      tags:
+        - blacklist
+      summary: List frozen privacy addresses
+      description: |
+        Returns the list of privacy pool addresses currently frozen (blacklisted) by the deny-map.
+      operationId: listFrozenAddresses
+      responses:
+        '200':
+          description: Frozen addresses retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FrozenAddressesResponse'
+
 components:
   schemas:
     NullifierResponse:
@@ -525,6 +541,26 @@ components:
       example:
         admins:
           - sov1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6j5kqz
+        count: 1
+
+    FrozenAddressesResponse:
+      type: object
+      required:
+        - addresses
+        - count
+      properties:
+        addresses:
+          type: array
+          description: Frozen privacy pool addresses (bech32m, e.g. privpool1...)
+          items:
+            type: string
+        count:
+          type: integer
+          format: uint64
+          description: Total number of frozen addresses
+      example:
+        addresses:
+          - privpool1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq0x0y3j
         count: 1
 
     Error:
