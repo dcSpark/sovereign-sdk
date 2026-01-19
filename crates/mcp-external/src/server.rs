@@ -1000,7 +1000,7 @@ impl CryptoServer {
         let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
         let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Ligero prover not configured; cannot send privacy transfer.".to_string(),
+                "Ligero proof service not configured; set LIGERO_PROOF_SERVICE_URL.".to_string(),
                 None,
             )
         })?;
@@ -1302,14 +1302,19 @@ impl CryptoServer {
         let indexer_ws = "undefined".to_string();
         let node = provider.rpc_url().to_string();
 
+        let (proof_server, use_external_proof_server) = match self.ligero_prover.as_ref() {
+            Some(prover) => (prover.proof_service_url().to_string(), Some(true)),
+            None => ("".to_string(), Some(false)),
+        };
+
         let result = GetWalletConfigResult {
             indexer,
             indexer_ws,
             node,
-            proof_server: "".to_string(),
+            proof_server,
             log_dir: Some(self.log_path.clone()),
             network_id: Some(chain_data.chain_name),
-            use_external_proof_server: Some(false),
+            use_external_proof_server,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
