@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
-use mcp_external::operations::{deposit, get_privacy_balance, verify_transaction};
+use mcp_external::operations::{deposit, get_privacy_balance};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::wallet::WalletContext;
@@ -182,81 +182,6 @@ async fn test_get_transaction() -> Result<()> {
 #[tokio::test]
 #[tracing_test::traced_test]
 #[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
-async fn test_verify_transaction() -> Result<()> {
-    let _ = dotenvy::dotenv();
-
-    tracing::info!("Testing verifyTransaction");
-
-    let wallet_private_key =
-        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
-    let rpc_url = std::env::var("ROLLUP_RPC_URL").expect("ROLLUP_RPC_URL must be set in .env");
-    let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
-    let indexer_url =
-        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
-
-    assert!(
-        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
-        "Required services must be running"
-    );
-
-    let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
-    let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
-
-    // Generate privacy key and FVK
-    let mut rng = rand::thread_rng();
-    let mut spend_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut spend_key_bytes);
-    let privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
-
-    let mut fvk_bytes = [0u8; 32];
-    rng.fill_bytes(&mut fvk_bytes);
-    let fvk_hex = hex::encode(&fvk_bytes);
-
-    // Perform a deposit
-    let deposit_amount = 75u128;
-    let deposit_result = deposit(&provider, &wallet, deposit_amount, &privacy_key).await?;
-    let tx_hash = deposit_result.tx_hash.clone();
-
-    tracing::info!("Created deposit transaction: {}", tx_hash);
-
-    // Wait for transaction to be indexed
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-    // Verify the transaction exists
-    let verify_result = verify_transaction(&provider, &tx_hash, Some(&fvk_hex)).await?;
-
-    assert!(verify_result.exists, "Transaction should exist");
-    // Note: amount might be "encrypted" if FVK doesn't match, or the actual amount if decryption works
-    assert!(
-        !verify_result.transaction_amount.is_empty(),
-        "Transaction amount should not be empty"
-    );
-
-    tracing::info!("✅ verifyTransaction test passed");
-    tracing::info!("  Transaction exists: {}", verify_result.exists);
-    tracing::info!("  Amount: {}", verify_result.transaction_amount);
-
-    // Test non-existent transaction
-    let fake_tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    let verify_result_fake = verify_transaction(&provider, fake_tx_hash, Some(&fvk_hex)).await?;
-
-    assert!(
-        !verify_result_fake.exists,
-        "Fake transaction should not exist"
-    );
-    assert_eq!(
-        verify_result_fake.transaction_amount, "0",
-        "Non-existent transaction should have 0 amount"
-    );
-
-    tracing::info!("✅ Non-existent transaction verification passed");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
 async fn test_get_privacy_balance() -> Result<()> {
     let _ = dotenvy::dotenv();
 
@@ -416,32 +341,6 @@ async fn test_privacy_key_formats() -> Result<()> {
     tracing::info!("  Hex format: ✓");
     tracing::info!("  Hex with 0x prefix: ✓");
     tracing::info!("  Bech32m address format: ✓");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
-async fn test_verify_transaction_shows_sent_not_sum() -> Result<()> {
-    // This test validates that verifyTransaction returns the sent amount,
-    // not the sum of all decrypted notes (sent + change).
-    //
-    // Scenario:
-    // 1. Deposit 500 to create a note
-    // 2. Transfer 100 to receiver (creates 2 notes: 100 sent, 400 change)
-    // 3. Verify the transfer transaction
-    // 4. Expected: verifyTransaction should return 100 (sent amount)
-    //    Bug: Currently returns 500 (100 + 400 = sum of all notes)
-
-    let _ = dotenvy::dotenv();
-
-    tracing::info!("Testing verifyTransaction - should return sent amount, not sum of all notes");
-    tracing::info!("Issue: When verifying a transfer, the function sums all decrypted notes");
-    tracing::info!("Expected: Return the first note's value (the sent amount)");
-
-    // For now, this is a placeholder test that documents the expected behavior
-    // The actual fix is in src/operations/verify_transaction.rs
 
     Ok(())
 }

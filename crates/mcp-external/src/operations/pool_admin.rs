@@ -89,11 +89,12 @@ pub async fn freeze_address(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -111,11 +112,12 @@ pub async fn unfreeze_address(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -133,11 +135,12 @@ pub async fn add_pool_admin(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -155,11 +158,12 @@ pub async fn remove_pool_admin(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }

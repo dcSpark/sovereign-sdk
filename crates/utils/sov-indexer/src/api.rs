@@ -1,6 +1,6 @@
 use crate::balance;
 use crate::db::{
-    list_transactions, list_transactions_god, list_wallet_transactions,
+    get_tx_god, list_transactions, list_transactions_god, list_wallet_transactions,
     list_wallet_transactions_god, list_wallet_txs as list_wallet_txs_db, CursorInner,
     InvolvementItem, ListResponse,
 };
@@ -101,6 +101,7 @@ pub fn router(state: AppState) -> Router {
         .route("/wallets/:address/balance", post(wallet_balance))
         // New transaction endpoints with privacy modes
         .route("/transactions/:tx_hash", get(get_transaction))
+        .route("/transactions/:tx_hash/god", get(get_transaction_god))
         .route("/transactions", get(get_transactions))
         .route("/transactions/god", get(get_transactions_god))
         .route("/transactions/wallet/:wallet", get(get_wallet_transactions))
@@ -279,6 +280,38 @@ async fn get_transaction(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match crate::db::get_tx(&state.db, &tx_hash).await {
+        Ok(Some(item)) => (StatusCode::OK, Json(item)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/transactions/{tx_hash}/god",
+    params(
+        ("tx_hash" = String, Path, description = "Transaction hash")
+    ),
+    responses(
+        (status = 200, description = "Transaction details (god mode)", body = InvolvementItem),
+        (status = 404, description = "Transaction not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "transactions"
+)]
+async fn get_transaction_god(
+    Path(tx_hash): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match get_tx_god(&state.db, &tx_hash).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -681,6 +714,7 @@ async fn delete_fvk(
         list_wallet_txs,
         wallet_balance,
         get_transaction,
+        get_transaction_god,
         get_transactions,
         get_transactions_god,
         get_wallet_transactions,

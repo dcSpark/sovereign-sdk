@@ -962,6 +962,22 @@ pub async fn get_tx(
     }))
 }
 
+pub async fn get_tx_god(
+    db: &DatabaseConnection,
+    tx_hash: &str,
+) -> Result<Option<InvolvementItem>> {
+    let ev = idx::Entity::find()
+        .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
+        .one(db)
+        .await?;
+    let Some(ev) = ev else {
+        return Ok(None);
+    };
+
+    let item = build_transaction_item(db, &ev, true).await?;
+    Ok(Some(item))
+}
+
 fn resolve_decrypted_notes(
     vfk: Option<&Hash32>,
     encrypted: Option<&JsonValue>,

@@ -25,6 +25,13 @@ pub struct ChainData {
     pub chain_name: String,
 }
 
+/// Result from the verifier submission endpoint.
+#[derive(Debug, Clone)]
+pub struct VerifierSubmitResult {
+    pub tx_hash: String,
+    pub created_at: Option<i64>,
+}
+
 /// Transaction involvement item from the indexer
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct InvolvementItem {
@@ -264,8 +271,8 @@ impl Provider {
     ///
     /// This method submits a borsh-serialized transaction to the verifier service,
     /// which will verify the proof and then submit to the sequencer.
-    /// Returns the transaction hash from the verifier response.
-    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+    /// Returns the transaction hash (and optional createdAt) from the verifier response.
+    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<VerifierSubmitResult> {
         use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
         use base64::Engine as _;
 
@@ -310,32 +317,35 @@ impl Provider {
             .await
             .context("Failed to read verifier response")?;
 
-        #[derive(serde::Deserialize)]
-        struct VerifierResponse {
-            success: bool,
-            tx_hash: Option<String>,
-            error: Option<String>,
-        }
-
-        let verifier_resp: VerifierResponse =
+        let verifier_resp: serde_json::Value =
             serde_json::from_str(&body).context("Failed to parse verifier response")?;
 
-        if !verifier_resp.success {
-            anyhow::bail!(
-                "Verifier service reported failure: {}",
-                verifier_resp
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string())
-            );
+        let success = verifier_resp.get("success").and_then(|v| v.as_bool());
+        if success == Some(false) {
+            let error = verifier_resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            anyhow::bail!("Verifier service reported failure: {}", error);
         }
 
         let tx_hash = verifier_resp
-            .tx_hash
-            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+            .get("tx_hash")
+            .or_else(|| verifier_resp.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash/id"))?;
+
+        let created_at = verifier_resp
+            .get("createdAt")
+            .or_else(|| verifier_resp.get("created_at"))
+            .and_then(parse_created_at_value);
 
         tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
 
-        Ok(tx_hash)
+        Ok(VerifierSubmitResult {
+            tx_hash: tx_hash.to_string(),
+            created_at,
+        })
     }
 
     /// Get the RPC URL this provider is connected to
@@ -620,4 +630,12 @@ impl Provider {
         Ok(balance_response)
     }
 
+}
+
+fn parse_created_at_value(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(num) => num.as_i64(),
+        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
 }

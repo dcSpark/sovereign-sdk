@@ -230,23 +230,18 @@ pub struct SendFundsRequest {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct SendFundsResult {
-    /// Transaction hash from the rollup (available once submitted)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_hash: Option<String>,
-    /// Privacy transfer hash if we spent an unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note_tx_hash: Option<String>,
-    /// Deterministic UUID derived from the privacy tx hash
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "noteTxIdentifier")]
-    pub note_tx_identifier: Option<String>,
-    /// Amount sent from the unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note_amount: Option<String>,
-    /// Error if we couldn't send an unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "noteError")]
-    pub note_error: Option<String>,
+    /// Transaction hash from the rollup.
+    pub id: String,
+    /// Current transaction state (always "initiated").
+    pub state: String,
+    /// Recipient wallet address.
+    #[serde(rename = "toAddress")]
+    pub to_address: String,
+    /// Amount sent.
+    pub amount: String,
+    /// Timestamp (ms since epoch) when the transaction was created.
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -268,8 +263,6 @@ pub struct GetWalletBalanceResult {
     /// Coins that are pending and not yet available for spending
     #[serde(rename = "pendingBalance")]
     pub pending_balance: String,
-    /// Available unspent notes that back the balance
-    pub unspent_notes: Vec<UnspentNoteInfo>,
 }
 
 // Types for GetTransaction
@@ -280,47 +273,149 @@ pub struct GetTransactionRequest {
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionResult {
+pub struct TransactionView {
     /// Transaction hash
     pub tx_hash: String,
-    /// Transaction status (e.g., "Success", "Failed", or "pending" if not yet indexed)
-    pub status: String,
     /// Timestamp in milliseconds (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<i64>,
     /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Sender address (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
     /// Recipient address (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
+    /// Privacy sender address (if available)
+    pub privacy_sender: Option<String>,
+    /// Privacy recipient address (if available)
+    pub privacy_recipient: Option<String>,
     /// Transaction amount (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
     /// Anchor root for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_root: Option<String>,
     /// Nullifier for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nullifier: Option<String>,
     /// View Full Viewing Keys (FVKs) for note decryption
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_fvks: Option<serde_json::Value>,
     /// View attestations for privacy proofs
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_attestations: Option<serde_json::Value>,
     /// Transaction events from the rollup
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub events: Option<serde_json::Value>,
+    /// Transaction status (e.g., "Success", "Failed", "pending")
+    pub status: Option<String>,
     /// Encrypted notes for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_notes: Option<serde_json::Value>,
+    /// Decrypted notes for privacy transactions (when available)
+    pub decrypted_notes: Option<serde_json::Value>,
     /// Full transaction payload
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionResult {
+    /// Transaction details from the indexer
+    pub transaction: TransactionView,
+}
+
+// Types for VerifyTransaction
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct VerifyTransactionRequest {
+    /// Transaction hash identifier
+    pub identifier: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct VerifyTransactionLag {
+    #[serde(rename = "applyGap")]
+    pub apply_gap: String,
+    #[serde(rename = "sourceGap")]
+    pub source_gap: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct VerifyTransactionSyncStatus {
+    #[serde(rename = "syncedIndices")]
+    pub synced_indices: String,
+    pub lag: VerifyTransactionLag,
+    #[serde(rename = "isFullySynced")]
+    pub is_fully_synced: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct VerifyTransactionResult {
+    /// Whether the transaction exists in the wallet
+    pub exists: bool,
+    #[serde(rename = "syncStatus")]
+    pub sync_status: VerifyTransactionSyncStatus,
+    /// Amount of the transaction (if known)
+    #[serde(rename = "transactionAmount")]
+    pub transaction_amount: String,
+}
+
+// Types for GetTransactionStatus
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusRequest {
+    /// Transaction hash identifier
+    #[serde(rename = "transactionId")]
+    pub transaction_id: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusRecord {
+    /// Transaction hash
+    pub id: String,
+    /// Current transaction state
+    pub state: String,
+    /// Sender address
+    #[serde(rename = "fromAddress")]
+    pub from_address: String,
+    /// Recipient address
+    #[serde(rename = "toAddress")]
+    pub to_address: String,
+    /// Amount in dust format
+    pub amount: String,
+    /// Transaction identifier (when available)
+    #[serde(rename = "txIdentifier", skip_serializing_if = "Option::is_none")]
+    pub tx_identifier: Option<String>,
+    /// Timestamp of creation
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    /// Timestamp of last update
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+    /// Error message if transaction failed
+    #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusLag {
+    #[serde(rename = "applyGap")]
+    pub apply_gap: String,
+    #[serde(rename = "sourceGap")]
+    pub source_gap: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusSyncStatus {
+    #[serde(rename = "syncedIndices")]
+    pub synced_indices: String,
+    pub lag: GetTransactionStatusLag,
+    #[serde(rename = "isFullySynced")]
+    pub is_fully_synced: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusBlockchainStatus {
+    pub exists: bool,
+    #[serde(rename = "syncStatus")]
+    pub sync_status: GetTransactionStatusSyncStatus,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusResult {
+    pub transaction: GetTransactionStatusRecord,
+    #[serde(rename = "blockchainStatus", skip_serializing_if = "Option::is_none")]
+    pub blockchain_status: Option<GetTransactionStatusBlockchainStatus>,
 }
 
 // Types for GetTransactions
@@ -328,50 +423,9 @@ pub struct GetTransactionResult {
 pub struct GetTransactionsRequest {}
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct TransactionRecord {
-    /// Transaction hash
-    pub id: String,
-    /// Current state ("initiated", "sent", "completed", or "failed")
-    pub state: String,
-    /// Sender address (or "encrypted" if unavailable)
-    #[serde(rename = "fromAddress")]
-    pub from_address: String,
-    /// Recipient address (or "encrypted" if unavailable)
-    #[serde(rename = "toAddress")]
-    pub to_address: String,
-    /// Amount in dust format (or "encrypted" if unavailable)
-    pub amount: String,
-    /// Transaction identifier (once available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "txIdentifier")]
-    pub tx_identifier: Option<String>,
-    /// Timestamp of creation (milliseconds)
-    #[serde(rename = "createdAt")]
-    pub created_at: i64,
-    /// Timestamp of last update (milliseconds)
-    #[serde(rename = "updatedAt")]
-    pub updated_at: i64,
-    /// Error message if transaction failed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "errorMessage")]
-    pub error_message: Option<String>,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct GetTransactionsResult {
-    /// Array of transaction records
-    pub transactions: Vec<TransactionRecord>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusRequest {
-    /// Transaction hash (with or without 0x prefix)
-    pub id: String,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusResult {
-    pub transaction: TransactionRecord,
+    /// Array of transactions
+    pub transactions: Vec<TransactionView>,
 }
 
 // Types for GetWalletConfig
@@ -649,50 +703,6 @@ pub struct RemoveWalletResult {
     pub success: bool,
     /// Message describing the result
     pub message: String,
-}
-
-// Types for VerifyTransaction
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct VerifyTransactionRequest {
-    /// The transaction hash (tx_hash) to verify. This is the rollup transaction hash returned from send/deposit operations.
-    /// Can be provided with or without the '0x' prefix.
-    pub identifier: String,
-}
-
-/// Sync status information for transaction verification
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifySyncStatus {
-    /// Indices that have been synced
-    #[serde(rename = "syncedIndices")]
-    pub synced_indices: String,
-    /// Lag information
-    pub lag: VerifyLagInfo,
-    /// Whether the wallet is fully synced
-    #[serde(rename = "isFullySynced")]
-    pub is_fully_synced: bool,
-}
-
-/// Lag information for transaction verification
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifyLagInfo {
-    /// Apply gap value
-    #[serde(rename = "applyGap")]
-    pub apply_gap: String,
-    /// Source gap value
-    #[serde(rename = "sourceGap")]
-    pub source_gap: String,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifyTransactionResult {
-    /// Whether the transaction exists in the wallet
-    pub exists: bool,
-    /// Current sync status information
-    #[serde(rename = "syncStatus")]
-    pub sync_status: VerifySyncStatus,
-    /// The amount of the transaction (in dust format), or "encrypted" if cannot decrypt
-    #[serde(rename = "transactionAmount")]
-    pub transaction_amount: String,
 }
 
 // Types for WalletStatus
@@ -1034,12 +1044,19 @@ impl CryptoServer {
             ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
         })?;
 
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                ErrorData::internal_error(format!("System time before UNIX_EPOCH: {}", e), None)
+            })?
+            .as_millis() as i64;
+
         let result = SendFundsResult {
-            tx_hash: Some(transfer_result.tx_hash),
-            note_tx_hash: None,
-            note_tx_identifier: None,
-            note_amount: None,
-            note_error: None,
+            id: transfer_result.tx_hash,
+            state: "initiated".to_string(),
+            to_address: output_privacy_addr.to_string(),
+            amount: send_amount.to_string(),
+            created_at,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1087,23 +1104,10 @@ impl CryptoServer {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let balance = privacy_result.balance;
-        let unspent_notes = privacy_result
-            .unspent_notes
-            .into_iter()
-            .map(|note| UnspentNoteInfo {
-                value: note.value.to_string(),
-                rho: note.rho,
-                sender_id: note.sender_id,
-                tx_hash: note.tx_hash,
-                timestamp_ms: note.timestamp_ms,
-                kind: note.kind,
-            })
-            .collect();
 
         let result = GetWalletBalanceResult {
             balance: balance.to_string(),
             pending_balance: "0".to_string(),
-            unspent_notes,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1194,20 +1198,7 @@ impl CryptoServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let result = GetTransactionResult {
-            tx_hash: tx_details.tx_hash,
-            status: tx_details.status,
-            timestamp_ms: tx_details.timestamp_ms,
-            kind: tx_details.kind,
-            sender: tx_details.sender,
-            recipient: tx_details.recipient,
-            amount: tx_details.amount,
-            anchor_root: tx_details.anchor_root,
-            nullifier: tx_details.nullifier,
-            view_fvks: tx_details.view_fvks,
-            view_attestations: tx_details.view_attestations,
-            events: tx_details.events,
-            encrypted_notes: tx_details.encrypted_notes,
-            payload: tx_details.payload,
+            transaction: TransactionView::from(tx_details),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1215,10 +1206,73 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the status of a transaction by its transaction hash.
+    /// Verify if a transaction has been received.
+    #[tool(
+        name = "verifyTransaction",
+        description = "Verify if a transaction has been received. Checks whether the transaction hash exists in the wallet."
+    )]
+    async fn verify_transaction(
+        &self,
+        Parameters(params): Parameters<VerifyTransactionRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                None,
+            )
+        })?;
+
+        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                None,
+            )
+        })?;
+
+        let ctx = wallet_ctx.read().await;
+        let privacy_key_guard = self.privacy_key.read().await;
+
+        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let normalize = |value: &str| value.trim().trim_start_matches("0x").to_ascii_lowercase();
+        let target = normalize(&params.identifier);
+
+        let mut exists = false;
+        let mut transaction_amount = "0".to_string();
+        if let Some(tx) = transactions
+            .into_iter()
+            .find(|tx| normalize(&tx.tx_hash) == target)
+        {
+            exists = true;
+            if let Some(amount) = tx.amount {
+                transaction_amount = amount;
+            }
+        }
+
+        let result = VerifyTransactionResult {
+            exists,
+            sync_status: VerifyTransactionSyncStatus {
+                synced_indices: "".to_string(),
+                lag: VerifyTransactionLag {
+                    apply_gap: "".to_string(),
+                    source_gap: "".to_string(),
+                },
+                is_fully_synced: true,
+            },
+            transaction_amount,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get the status of a transaction by its ID.
     #[tool(
         name = "getTransactionStatus",
-        description = "Get the status of a transaction by its hash. Returns the latest indexed state and txIdentifier."
+        description = "Get the status of a transaction by its ID. Retrieves the current status of a specific transaction."
     )]
     async fn get_transaction_status(
         &self,
@@ -1226,17 +1280,82 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
             )
         })?;
 
-        let tx_details = crate::operations::get_transaction_status(provider, &params.id)
+        let tx_option = provider
+            .get_transaction(&params.transaction_id)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let record = details_to_record(tx_details);
+        let tx = tx_option.ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Transaction not found for this wallet.".to_string(),
+                None,
+            )
+        })?;
 
-        let result = GetTransactionStatusResult { transaction: record };
+        let map_state = |status: &str| {
+            let normalized = status.trim().to_ascii_lowercase();
+            if normalized.contains("success") {
+                "completed"
+            } else if normalized.contains("fail") {
+                "failed"
+            } else if normalized.contains("pending") || normalized.contains("submitted") {
+                "sent"
+            } else {
+                "initiated"
+            }
+        };
+
+        let status = tx.status.clone().unwrap_or_else(|| "Unknown".to_string());
+        let state = map_state(&status).to_string();
+        let from_address = tx
+            .privacy_sender
+            .clone()
+            .or(tx.sender.clone())
+            .unwrap_or_default();
+        let to_address = tx
+            .privacy_recipient
+            .clone()
+            .or(tx.recipient.clone())
+            .unwrap_or_default();
+        let amount = tx.amount.clone().unwrap_or_else(|| "0".to_string());
+        let created_at = tx.timestamp_ms;
+
+        let error_message = if state == "failed" {
+            Some(status)
+        } else {
+            None
+        };
+
+        let transaction = GetTransactionStatusRecord {
+            id: tx.tx_hash.clone(),
+            state,
+            from_address,
+            to_address,
+            amount,
+            tx_identifier: Some(tx.tx_hash),
+            created_at,
+            updated_at: created_at,
+            error_message,
+        };
+
+        let result = GetTransactionStatusResult {
+            transaction,
+            blockchain_status: Some(GetTransactionStatusBlockchainStatus {
+                exists: true,
+                sync_status: GetTransactionStatusSyncStatus {
+                    synced_indices: "".to_string(),
+                    lag: GetTransactionStatusLag {
+                        apply_gap: "".to_string(),
+                        source_gap: "".to_string(),
+                    },
+                    is_fully_synced: true,
+                },
+            }),
+        };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
@@ -1274,9 +1393,9 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let transaction_records: Vec<TransactionRecord> = transactions
+        let transaction_records: Vec<TransactionView> = transactions
             .into_iter()
-            .map(transaction_to_record)
+            .map(TransactionView::from)
             .collect();
 
         let result = GetTransactionsResult {
@@ -1786,54 +1905,6 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Verify if a transaction has been received.
-    /// Verifies the status of a transaction and attempts to decrypt it to extract the amount.
-    #[tool(
-        name = "verifyTransaction",
-        description = "Verify if a transaction has been received. Takes a transaction hash (tx_hash) and checks if it exists in the indexer. Attempts to decrypt the transaction to extract the amount if encrypted notes are present. Use this to confirm if a payment has been received."
-    )]
-    async fn verify_transaction(
-        &self,
-        Parameters(params): Parameters<VerifyTransactionRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let provider = self.provider.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
-                None,
-            )
-        })?;
-
-        // Get FVK if available for decryption
-        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
-        let fvk_hex = if let Some(ref bundle) = *viewer_fvk_guard {
-            Some(hex::encode(bundle.fvk))
-        } else {
-            None
-        };
-
-        let verify_result =
-            crate::operations::verify_transaction(provider, &params.identifier, fvk_hex.as_deref())
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let result = VerifyTransactionResult {
-            exists: verify_result.exists,
-            sync_status: VerifySyncStatus {
-                synced_indices: "all".to_string(),
-                lag: VerifyLagInfo {
-                    apply_gap: "0".to_string(),
-                    source_gap: "0".to_string(),
-                },
-                is_fully_synced: true,
-            },
-            transaction_amount: verify_result.transaction_amount,
-        };
-
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
     /// Freeze a privacy address (pool admin only).
     #[tool(
         name = "freezeAddress",
@@ -2039,86 +2110,52 @@ impl ServerHandler for CryptoServer {
     }
 }
 
-fn map_state_and_error(status: Option<String>) -> (String, Option<String>) {
-    match status {
-        Some(raw) => {
-            let normalized = raw.to_ascii_lowercase();
-            if normalized.contains("fail") || normalized.contains("error") {
-                ("failed".to_string(), Some(raw))
-            } else if normalized.contains("success") || normalized.contains("complete") {
-                ("completed".to_string(), None)
-            } else if normalized.contains("pending")
-                || normalized.contains("sent")
-                || normalized.contains("submit")
-                || normalized.contains("queue")
-            {
-                ("sent".to_string(), None)
-            } else {
-                ("sent".to_string(), None)
-            }
+impl From<crate::operations::Transaction> for TransactionView {
+    fn from(tx: crate::operations::Transaction) -> Self {
+        Self {
+            tx_hash: tx.tx_hash,
+            timestamp_ms: Some(tx.timestamp_ms),
+            kind: Some(tx.kind),
+            sender: tx.sender,
+            recipient: tx.recipient,
+            privacy_sender: tx.privacy_sender,
+            privacy_recipient: tx.privacy_recipient,
+            amount: tx.amount,
+            anchor_root: tx.anchor_root,
+            nullifier: tx.nullifier,
+            view_fvks: tx.view_fvks,
+            view_attestations: tx.view_attestations,
+            events: tx.events,
+            status: tx.status,
+            encrypted_notes: tx.encrypted_notes,
+            decrypted_notes: tx.decrypted_notes,
+            payload: tx.payload,
         }
-        None => ("initiated".to_string(), None),
     }
 }
 
-fn reveal_or_encrypted(value: Option<String>) -> String {
-    match value {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => "encrypted".to_string(),
+impl From<crate::operations::TransactionDetails> for TransactionView {
+    fn from(details: crate::operations::TransactionDetails) -> Self {
+        Self {
+            tx_hash: details.tx_hash,
+            timestamp_ms: details.timestamp_ms,
+            kind: details.kind,
+            sender: details.sender,
+            recipient: details.recipient,
+            privacy_sender: details.privacy_sender,
+            privacy_recipient: details.privacy_recipient,
+            amount: details.amount,
+            anchor_root: details.anchor_root,
+            nullifier: details.nullifier,
+            view_fvks: details.view_fvks,
+            view_attestations: details.view_attestations,
+            events: details.events,
+            status: Some(details.status),
+            encrypted_notes: details.encrypted_notes,
+            decrypted_notes: details.decrypted_notes,
+            payload: details.payload,
+        }
     }
-}
-
-fn record_from_indexer(
-    tx_hash: String,
-    status: Option<String>,
-    timestamp_ms: i64,
-    sender: Option<String>,
-    recipient: Option<String>,
-    privacy_sender: Option<String>,
-    privacy_recipient: Option<String>,
-    amount: Option<String>,
-) -> TransactionRecord {
-    let (state, error_message) = map_state_and_error(status.clone());
-    let from_address = privacy_sender.or(sender);
-    let to_address = privacy_recipient.or(recipient);
-
-    TransactionRecord {
-        id: tx_hash.clone(),
-        state,
-        from_address: reveal_or_encrypted(from_address),
-        to_address: reveal_or_encrypted(to_address),
-        amount: reveal_or_encrypted(amount),
-        tx_identifier: Some(tx_hash),
-        created_at: timestamp_ms,
-        updated_at: timestamp_ms,
-        error_message,
-    }
-}
-
-fn transaction_to_record(tx: crate::operations::Transaction) -> TransactionRecord {
-    record_from_indexer(
-        tx.tx_hash,
-        tx.status,
-        tx.timestamp_ms,
-        tx.sender,
-        tx.recipient,
-        tx.privacy_sender,
-        tx.privacy_recipient,
-        tx.amount,
-    )
-}
-
-fn details_to_record(details: crate::operations::TransactionDetails) -> TransactionRecord {
-    record_from_indexer(
-        details.tx_hash,
-        Some(details.status),
-        details.timestamp_ms.unwrap_or_default(),
-        details.sender,
-        details.recipient,
-        details.privacy_sender,
-        details.privacy_recipient,
-        details.amount,
-    )
 }
 
 #[allow(dead_code)]
