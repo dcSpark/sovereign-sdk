@@ -13,6 +13,8 @@ Environment="RUST_LOG=info"
 #Environment="DEFER_SEQUENCER_SUBMISSION=true"
 #Environment="NODE_RPC_URL=http://127.0.0.1:12346"
 #Environment="LIGERO_SKIP_VERIFICATION=1"
+# Pool FVK public key for privacy pool verification
+Environment="POOL_FVK_PK=replace_with_pool_fvk_public_key_hex"
 
 [Install]
 WantedBy=multi-user.target
