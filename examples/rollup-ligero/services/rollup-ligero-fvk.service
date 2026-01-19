@@ -21,6 +21,8 @@ Environment="MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX=replace_with_signing_secret_key
 Environment="MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX=replace_with_signing_public_key_hex"
 # Pool FVK public key - must match MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX when set
 Environment="POOL_FVK_PK=replace_with_pool_fvk_public_key_hex"
+# Admin token for FVK service authentication
+Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=replace_with_admin_token"
 
 [Install]
 WantedBy=multi-user.target
