@@ -35,6 +35,9 @@ Small HTTP API that reports TPS-style metrics from the verifier worker DB
 - `GET /total-transactions`
   - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
     `interval_secs`, and `max_samples`.
+- `GET /failed-transactions-rate`
+  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
+    `interval_secs`, and `max_samples`.
 - Swagger UI: `GET /swagger-ui/`
 - OpenAPI JSON: `GET /api-doc/openapi.json`
 

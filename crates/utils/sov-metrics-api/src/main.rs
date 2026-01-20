@@ -25,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let store = metrics::MetricsStore::new();
     let mut manager = metrics::MetricsManager::new(store.clone());
     manager
+        .register(metrics::collectors::failed_transactions::FailedTransactionsCollector::new(
+            db.clone(),
+        ))
+        .await;
+    manager
         .register(metrics::collectors::total_transactions::TotalTransactionsCollector::new(
             db.clone(),
         ))

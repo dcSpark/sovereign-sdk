@@ -10,6 +10,9 @@ use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::metrics::collectors::failed_transactions::{
+    FailedTransactionsPayload, RETENTION_SECONDS as FAILED_RETENTION_SECONDS,
+};
 use crate::metrics::collectors::tps::{
     TpsPayload, RETENTION_SECONDS as TPS_RETENTION_SECONDS, WINDOW_SECONDS,
 };
@@ -31,6 +34,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/failed-transactions-rate", get(failed_transactions_rate))
         .route("/total-transactions", get(total_transactions))
         .route("/tps", get(tps))
         .merge(swagger_ui)
@@ -98,6 +102,29 @@ async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransact
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/failed-transactions-rate",
+    responses(
+        (status = 200, description = "Rejected transaction rate", body = FailedTransactionsResponse)
+    ),
+    tag = "metrics"
+)]
+async fn failed_transactions_rate(
+    State(state): State<AppState>,
+) -> Json<FailedTransactionsResponse> {
+    let series = state
+        .store
+        .snapshot("failed-transactions-rate")
+        .await
+        .map(map_failed_transactions_series);
+
+    Json(FailedTransactionsResponse {
+        series,
+        retention_seconds: FAILED_RETENTION_SECONDS,
+    })
+}
+
 fn map_tps_series(series: MetricSeriesSnapshot) -> TpsSeriesSnapshot {
     let samples: Vec<TpsSample> = series
         .samples
@@ -132,6 +159,23 @@ fn map_total_transactions_series(series: MetricSeriesSnapshot) -> TotalTransacti
     }
 }
 
+fn map_failed_transactions_series(series: MetricSeriesSnapshot) -> FailedTransactionsSeriesSnapshot {
+    let samples: Vec<FailedTransactionsSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_failed_transactions_sample)
+        .collect();
+    let latest = series.latest.and_then(map_failed_transactions_sample);
+
+    FailedTransactionsSeriesSnapshot {
+        name: series.name,
+        interval_secs: series.interval_secs,
+        max_samples: series.max_samples,
+        latest,
+        samples,
+    }
+}
+
 fn map_tps_sample(sample: MetricSample) -> Option<TpsSample> {
     let payload: TpsPayload = match serde_json::from_value(sample.payload) {
         Ok(payload) => payload,
@@ -157,6 +201,21 @@ fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactio
     };
 
     Some(TotalTransactionsSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransactionsSample> {
+    let payload: FailedTransactionsPayload = match serde_json::from_value(sample.payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(error = %error, "Failed to parse failed transactions payload");
+            return None;
+        }
+    };
+
+    Some(FailedTransactionsSample {
         recorded_at_ms: sample.recorded_at_ms,
         payload,
     })
@@ -210,6 +269,27 @@ struct TotalTransactionsSample {
     payload: TotalTransactionsPayload,
 }
 
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsResponse {
+    series: Option<FailedTransactionsSeriesSnapshot>,
+    retention_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    max_samples: usize,
+    latest: Option<FailedTransactionsSample>,
+    samples: Vec<FailedTransactionsSample>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsSample {
+    recorded_at_ms: i64,
+    payload: FailedTransactionsPayload,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -217,7 +297,7 @@ struct TotalTransactionsSample {
         version = "0.1.0",
         description = "Metrics API for verifier worker DB stats."
     ),
-    paths(health, tps, total_transactions),
+    paths(health, tps, total_transactions, failed_transactions_rate),
     components(schemas(
         HealthResponse,
         TpsResponse,
@@ -227,7 +307,11 @@ struct TotalTransactionsSample {
         TotalTransactionsResponse,
         TotalTransactionsSeriesSnapshot,
         TotalTransactionsSample,
-        TotalTransactionsPayload
+        TotalTransactionsPayload,
+        FailedTransactionsResponse,
+        FailedTransactionsSeriesSnapshot,
+        FailedTransactionsSample,
+        FailedTransactionsPayload
     )),
     tags(
         (name = "health", description = "Service health checks"),
