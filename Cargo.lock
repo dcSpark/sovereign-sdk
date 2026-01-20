@@ -13107,6 +13107,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-metrics-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "chrono",
+ "dotenvy",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sov-midnight-da",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "utoipa 5.0.0-beta.0",
+ "utoipa-swagger-ui",
+]
+
+[[package]]
 name = "sov-midnight-adapter"
 version = "0.3.0"
 dependencies = [
