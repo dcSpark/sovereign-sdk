@@ -422,11 +422,11 @@ pub struct GetTransactionStatusResult {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetTransactionsRequest {}
 
+type GetTransactionsRecord = GetTransactionStatusRecord;
+
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionsResult {
-    /// Array of transactions
-    pub transactions: Vec<TransactionView>,
-}
+#[serde(transparent)]
+pub struct GetTransactionsResult(pub Vec<GetTransactionsRecord>);
 
 // Types for GetWalletConfig
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1044,12 +1044,7 @@ impl CryptoServer {
             ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
         })?;
 
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                ErrorData::internal_error(format!("System time before UNIX_EPOCH: {}", e), None)
-            })?
-            .as_millis() as i64;
+        let created_at = transfer_result.created_at;
 
         let result = SendFundsResult {
             id: transfer_result.tx_hash,
@@ -1296,51 +1291,16 @@ impl CryptoServer {
             )
         })?;
 
-        let map_state = |status: &str| {
-            let normalized = status.trim().to_ascii_lowercase();
-            if normalized.contains("success") {
-                "completed"
-            } else if normalized.contains("fail") {
-                "failed"
-            } else if normalized.contains("pending") || normalized.contains("submitted") {
-                "sent"
-            } else {
-                "initiated"
-            }
-        };
-
-        let status = tx.status.clone().unwrap_or_else(|| "Unknown".to_string());
-        let state = map_state(&status).to_string();
-        let from_address = tx
-            .privacy_sender
-            .clone()
-            .or(tx.sender.clone())
-            .unwrap_or_default();
-        let to_address = tx
-            .privacy_recipient
-            .clone()
-            .or(tx.recipient.clone())
-            .unwrap_or_default();
-        let amount = tx.amount.clone().unwrap_or_else(|| "0".to_string());
-        let created_at = tx.timestamp_ms;
-
-        let error_message = if state == "failed" {
-            Some(status)
-        } else {
-            None
-        };
-
-        let transaction = GetTransactionStatusRecord {
-            id: tx.tx_hash.clone(),
-            state,
-            from_address,
-            to_address,
-            amount,
-            tx_identifier: Some(tx.tx_hash),
-            created_at,
-            updated_at: created_at,
-            error_message,
-        };
+        let transaction = build_transaction_record(
+            tx.tx_hash.clone(),
+            tx.status.clone(),
+            tx.privacy_sender.clone(),
+            tx.sender.clone(),
+            tx.privacy_recipient.clone(),
+            tx.recipient.clone(),
+            tx.amount.clone(),
+            tx.timestamp_ms,
+        );
 
         let result = GetTransactionStatusResult {
             transaction,
@@ -1393,16 +1353,25 @@ impl CryptoServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let transaction_records: Vec<TransactionView> = transactions
+        let transaction_records: Vec<GetTransactionsRecord> = transactions
             .into_iter()
-            .map(TransactionView::from)
+            .map(|tx| {
+                build_transaction_record(
+                    tx.tx_hash,
+                    tx.status,
+                    tx.privacy_sender,
+                    tx.sender,
+                    tx.privacy_recipient,
+                    tx.recipient,
+                    tx.amount,
+                    tx.timestamp_ms,
+                )
+            })
             .collect();
 
-        let result = GetTransactionsResult {
-            transactions: transaction_records,
-        };
+        let result = GetTransactionsResult(transaction_records);
 
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "[]".to_string());
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -2155,6 +2124,53 @@ impl From<crate::operations::TransactionDetails> for TransactionView {
             decrypted_notes: details.decrypted_notes,
             payload: details.payload,
         }
+    }
+}
+
+fn map_state_from_status(status: &str) -> &'static str {
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized.contains("success") {
+        "completed"
+    } else if normalized.contains("fail") {
+        "failed"
+    } else if normalized.contains("pending") || normalized.contains("submitted") {
+        "sent"
+    } else {
+        "initiated"
+    }
+}
+
+fn build_transaction_record(
+    tx_hash: String,
+    status: Option<String>,
+    privacy_sender: Option<String>,
+    sender: Option<String>,
+    privacy_recipient: Option<String>,
+    recipient: Option<String>,
+    amount: Option<String>,
+    timestamp_ms: i64,
+) -> GetTransactionStatusRecord {
+    let status = status.unwrap_or_else(|| "Unknown".to_string());
+    let state = map_state_from_status(&status).to_string();
+    let from_address = privacy_sender.or(sender).unwrap_or_default();
+    let to_address = privacy_recipient.or(recipient).unwrap_or_default();
+    let amount = amount.unwrap_or_else(|| "0".to_string());
+    let error_message = if state == "failed" {
+        Some(status.clone())
+    } else {
+        None
+    };
+
+    GetTransactionStatusRecord {
+        id: tx_hash.clone(),
+        state,
+        from_address,
+        to_address,
+        amount,
+        tx_identifier: Some(tx_hash),
+        created_at: timestamp_ms,
+        updated_at: timestamp_ms,
+        error_message,
     }
 }
 

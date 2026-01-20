@@ -43,7 +43,7 @@ const NOTE_SEARCH_LOG_EVERY: usize = 10;
 #[derive(Debug)]
 pub struct TransferResult {
     pub tx_hash: String,
-    pub created_at: Option<i64>,
+    pub created_at: i64,
     /// Amount sent to destination
     #[allow(dead_code)]
     pub amount_sent: u128,

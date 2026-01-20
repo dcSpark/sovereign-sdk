@@ -29,7 +29,7 @@ pub struct ChainData {
 #[derive(Debug, Clone)]
 pub struct VerifierSubmitResult {
     pub tx_hash: String,
-    pub created_at: Option<i64>,
+    pub created_at: i64,
 }
 
 /// Transaction involvement item from the indexer
@@ -317,28 +317,34 @@ impl Provider {
             .await
             .context("Failed to read verifier response")?;
 
-        let verifier_resp: serde_json::Value =
+        #[derive(Deserialize)]
+        struct VerifierMetrics {
+            #[serde(rename = "createdAt")]
+            created_at: String,
+        }
+
+        #[derive(Deserialize)]
+        struct VerifierResponse {
+            success: bool,
+            #[serde(rename = "tx_hash", alias = "id")]
+            tx_hash: Option<String>,
+            metrics: VerifierMetrics,
+            error: Option<String>,
+        }
+
+        let verifier_resp: VerifierResponse =
             serde_json::from_str(&body).context("Failed to parse verifier response")?;
 
-        let success = verifier_resp.get("success").and_then(|v| v.as_bool());
-        if success == Some(false) {
-            let error = verifier_resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error");
+        if !verifier_resp.success {
+            let error = verifier_resp.error.as_deref().unwrap_or("Unknown error");
             anyhow::bail!("Verifier service reported failure: {}", error);
         }
 
         let tx_hash = verifier_resp
-            .get("tx_hash")
-            .or_else(|| verifier_resp.get("id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash/id"))?;
-
-        let created_at = verifier_resp
-            .get("createdAt")
-            .or_else(|| verifier_resp.get("created_at"))
-            .and_then(parse_created_at_value);
+            .tx_hash
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+        let created_at = parse_rfc3339_to_millis(&verifier_resp.metrics.created_at)
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing metrics.createdAt"))?;
 
         tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
 
@@ -632,10 +638,8 @@ impl Provider {
 
 }
 
-fn parse_created_at_value(value: &serde_json::Value) -> Option<i64> {
-    match value {
-        serde_json::Value::Number(num) => num.as_i64(),
-        serde_json::Value::String(s) => s.parse::<i64>().ok(),
-        _ => None,
-    }
+fn parse_rfc3339_to_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
