@@ -231,6 +231,7 @@ impl<R: FullNodeBlueprint<Native>, StoragePath: AsPath> RollupBuilder<R, Storage
                 stop_at_rollup_height: None,
                 extension: Some(SeqConfigExtension {
                     max_log_limit: 20000,
+                    midnight_bridge: None,
                 }),
                 num_cache_warmup_workers: TEST_NUM_CACHE_WARMUP_WORKERS,
             },
