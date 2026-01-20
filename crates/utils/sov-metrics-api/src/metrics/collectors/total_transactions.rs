@@ -31,7 +31,7 @@ impl TotalTransactionsCollector {
 impl MetricCollector for TotalTransactionsCollector {
     fn spec(&self) -> MetricSpec {
         MetricSpec {
-            name: "total_transactions",
+            name: "total-transactions",
             interval: Duration::from_secs(SAMPLE_INTERVAL_SECS),
             max_samples: MAX_SAMPLES,
         }
@@ -43,7 +43,16 @@ impl MetricCollector for TotalTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let total_transactions = Entity::find().count(&self.db).await?;
+            let paginator = Entity::find()
+                .filter(Column::TransactionState.is_in([
+                    TransactionState::Accepted,
+                    TransactionState::Rejected,
+                ]))
+                .paginate(&self.db, 1);
+            let total_transactions = paginator
+                .num_items()
+                .await
+                .with_context(|| "Failed to count completed transactions")?;
 
             let payload = TotalTransactionsPayload { total_transactions };
 

@@ -1,7 +1,7 @@
 # sov-metrics-api
 
-Small HTTP API that reports TPS-style metrics from the verifier worker DB
-(`worker_verified_transactions`).
+Small HTTP API that exposes raw counter metrics from the verifier worker DB
+(`worker_verified_transactions`) and the indexer DB.
 
 ## Configuration
 
@@ -14,15 +14,14 @@ Small HTTP API that reports TPS-style metrics from the verifier worker DB
 
 ## Behavior
 
-- Every 5 seconds, the service queries completed transactions
-  (`accepted` or `rejected`) from the last 5 seconds.
-- It computes the peak TPS (max transactions in any 1-second slice within
-  that window) and stores it in an in-memory ring buffer.
-- The buffer keeps the most recent 300 seconds of samples (60 samples).
-- Average transaction size is computed from the indexer DB tables
-  `midnight_transfer.amount` joined with `events.created_at` over the last second.
-- Failed transactions rate is computed over the last 5 seconds.
-- Token value spent is computed from `midnight_transfer.amount` over the last 5 seconds.
+- Collectors store raw counters (monotonic totals), not derived rates.
+- `total-transactions` samples every 5 seconds (completed tx counter).
+- `failed-transactions-rate` samples every 5 seconds (completed + rejected counters).
+- `average-transaction-size` samples every 1 second (transfer amount + count counters).
+- `token-value-spent` samples every 5 seconds (transfer amount counter).
+- The API derives TPS, rates, and averages from counter deltas at query time.
+- Derived endpoints accept `window_seconds` to compute deltas over a custom window; otherwise the
+  last two samples are used.
 
 ## Architecture
 
@@ -36,20 +35,22 @@ Small HTTP API that reports TPS-style metrics from the verifier worker DB
 - `GET /health`
   - Returns `{ "status": "ok" }`
 - `GET /tps`
-  - Returns `{ series, window_seconds, retention_seconds }` where `series` includes
-    `latest`, `samples`, `interval_secs`, and `max_samples`.
+  - Returns `{ tps, delta_transactions, delta_ms, latest_total }` derived from counters.
+  - Optional: `?window_seconds=60`.
 - `GET /total-transactions`
-  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
-    `interval_secs`, and `max_samples`.
+  - Returns `{ series, retention_seconds }` with raw counters.
 - `GET /failed-transactions-rate`
-  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
-    `interval_secs`, and `max_samples`.
+  - Returns `{ series, rate_percent, delta_rejected, delta_completed, delta_ms, retention_seconds }`.
+  - Optional: `?window_seconds=60`.
 - `GET /average-transaction-size`
-  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
-    `interval_secs`, and `max_samples`.
+  - Returns `{ series, average_amount, delta_amount, delta_transactions, delta_ms, retention_seconds }`.
+  - Optional: `?window_seconds=60`.
 - `GET /token-value-spent`
-  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
-    `interval_secs`, and `max_samples`.
+  - Returns `{ series, delta_amount, delta_ms, retention_seconds }`.
+  - Optional: `?window_seconds=60`.
+- Derived fields (`tps`, `rate_percent`, `average_amount`, `delta_*`) are computed from the last
+  two counter samples unless `window_seconds` is provided; the `series` fields always carry raw
+  counters.
 - Swagger UI: `GET /swagger-ui/`
 - OpenAPI JSON: `GET /api-doc/openapi.json`
 

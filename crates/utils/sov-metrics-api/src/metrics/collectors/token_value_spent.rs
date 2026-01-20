@@ -1,11 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, QuerySelect,
-    RelationTrait,
-};
+use chrono::Utc;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -14,7 +11,6 @@ use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
-pub const WINDOW_SECONDS: u64 = SAMPLE_INTERVAL_SECS;
 pub const RETENTION_SECONDS: u64 = 300;
 pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usize;
 
@@ -45,13 +41,7 @@ impl MetricCollector for TokenValueSpentCollector {
 
     fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>> {
         Box::pin(async move {
-            let window_end = Utc::now();
-            let window_start = window_end - ChronoDuration::seconds(WINDOW_SECONDS as i64);
-
             let rows = midnight_transfer::Entity::find()
-                .join(JoinType::InnerJoin, midnight_transfer::Relation::Events.def())
-                .filter(crate::indexer_db::Column::CreatedAt.gte(window_start))
-                .filter(crate::indexer_db::Column::CreatedAt.lt(window_end))
                 .filter(midnight_transfer::Column::Amount.is_not_null())
                 .all(&self.db)
                 .await
@@ -79,7 +69,7 @@ impl MetricCollector for TokenValueSpentCollector {
             };
 
             Ok(MetricSample {
-                recorded_at_ms: window_end.timestamp_millis(),
+                recorded_at_ms: Utc::now().timestamp_millis(),
                 payload: serde_json::to_value(payload)
                     .context("Failed to serialize token value spent payload")?,
             })

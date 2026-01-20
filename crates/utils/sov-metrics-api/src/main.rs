@@ -54,9 +54,6 @@ async fn main() -> anyhow::Result<()> {
             db.clone(),
         ))
         .await;
-    manager
-        .register(metrics::collectors::tps::TpsCollector::new(db.clone()))
-        .await;
     manager.start();
 
     let app = api::router(api::AppState { store });

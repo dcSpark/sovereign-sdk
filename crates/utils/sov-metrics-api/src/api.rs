@@ -1,11 +1,11 @@
 use axum::{
-    extract::{Request, State},
+    extract::{Query, Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -19,9 +19,6 @@ use crate::metrics::collectors::failed_transactions::{
 use crate::metrics::collectors::token_value_spent::{
     TokenValueSpentPayload, RETENTION_SECONDS as TOKEN_VALUE_RETENTION_SECONDS,
 };
-use crate::metrics::collectors::tps::{
-    TpsPayload, RETENTION_SECONDS as TPS_RETENTION_SECONDS, WINDOW_SECONDS,
-};
 use crate::metrics::collectors::total_transactions::{
     TotalTransactionsPayload, RETENTION_SECONDS as TOTAL_TX_RETENTION_SECONDS,
 };
@@ -30,6 +27,11 @@ use crate::metrics::{MetricSample, MetricSeriesSnapshot, MetricsStore};
 #[derive(Clone)]
 pub struct AppState {
     pub store: MetricsStore,
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowQuery {
+    window_seconds: Option<u64>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -73,24 +75,6 @@ async fn health() -> Json<HealthResponse> {
 
 #[utoipa::path(
     get,
-    path = "/tps",
-    responses(
-        (status = 200, description = "TPS metrics", body = TpsResponse)
-    ),
-    tag = "metrics"
-)]
-async fn tps(State(state): State<AppState>) -> Json<TpsResponse> {
-    let series = state.store.snapshot("tps").await.map(map_tps_series);
-
-    Json(TpsResponse {
-        series,
-        window_seconds: WINDOW_SECONDS,
-        retention_seconds: TPS_RETENTION_SECONDS,
-    })
-}
-
-#[utoipa::path(
-    get,
     path = "/total-transactions",
     responses(
         (status = 200, description = "Completed transaction totals", body = TotalTransactionsResponse)
@@ -100,7 +84,7 @@ async fn tps(State(state): State<AppState>) -> Json<TpsResponse> {
 async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransactionsResponse> {
     let series = state
         .store
-        .snapshot("total_transactions")
+        .snapshot("total-transactions")
         .await
         .map(map_total_transactions_series);
 
@@ -112,21 +96,72 @@ async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransact
 
 #[utoipa::path(
     get,
+    path = "/tps",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute TPS. Defaults to the last two samples.")
+    ),
+    responses(
+        (status = 200, description = "Derived TPS from transaction counters", body = TpsResponse)
+    ),
+    tag = "metrics"
+)]
+async fn tps(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<TpsResponse> {
+    let series = state
+        .store
+        .snapshot("total-transactions")
+        .await
+        .map(map_total_transactions_series);
+
+    let window_ms = window_ms(params.window_seconds);
+    let (tps, delta_transactions, delta_ms, latest_total) = match series.as_ref() {
+        Some(series) => compute_tps(series, window_ms),
+        None => (None, None, None, None),
+    };
+
+    Json(TpsResponse {
+        tps,
+        delta_transactions,
+        delta_ms,
+        latest_total,
+    })
+}
+
+#[utoipa::path(
+    get,
     path = "/failed-transactions-rate",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the failure rate. Defaults to the last two samples.")
+    ),
     responses(
         (status = 200, description = "Rejected transaction rate", body = FailedTransactionsResponse)
     ),
     tag = "metrics"
 )]
-async fn failed_transactions_rate(State(state): State<AppState>) -> Json<FailedTransactionsResponse> {
+async fn failed_transactions_rate(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<FailedTransactionsResponse> {
     let series = state
         .store
         .snapshot("failed-transactions-rate")
         .await
         .map(map_failed_transactions_series);
 
+    let window_ms = window_ms(params.window_seconds);
+    let (rate_percent, delta_rejected, delta_completed, delta_ms) = match series.as_ref() {
+        Some(series) => compute_failed_rate(series, window_ms),
+        None => (None, None, None, None),
+    };
+
     Json(FailedTransactionsResponse {
         series,
+        rate_percent,
+        delta_rejected,
+        delta_completed,
+        delta_ms,
         retention_seconds: FAILED_RETENTION_SECONDS,
     })
 }
@@ -134,6 +169,9 @@ async fn failed_transactions_rate(State(state): State<AppState>) -> Json<FailedT
 #[utoipa::path(
     get,
     path = "/average-transaction-size",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the average amount. Defaults to the last two samples.")
+    ),
     responses(
         (status = 200, description = "Average transfer amount", body = AverageTransactionSizeResponse)
     ),
@@ -141,6 +179,7 @@ async fn failed_transactions_rate(State(state): State<AppState>) -> Json<FailedT
 )]
 async fn average_transaction_size(
     State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
 ) -> Json<AverageTransactionSizeResponse> {
     let series = state
         .store
@@ -148,8 +187,18 @@ async fn average_transaction_size(
         .await
         .map(map_average_transaction_size_series);
 
+    let window_ms = window_ms(params.window_seconds);
+    let (average_amount, delta_amount, delta_transactions, delta_ms) = match series.as_ref() {
+        Some(series) => compute_average_transaction_size(series, window_ms),
+        None => (None, None, None, None),
+    };
+
     Json(AverageTransactionSizeResponse {
         series,
+        average_amount,
+        delta_amount,
+        delta_transactions,
+        delta_ms,
         retention_seconds: AVERAGE_RETENTION_SECONDS,
     })
 }
@@ -157,38 +206,251 @@ async fn average_transaction_size(
 #[utoipa::path(
     get,
     path = "/token-value-spent",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the token value delta. Defaults to the last two samples.")
+    ),
     responses(
         (status = 200, description = "Token value spent", body = TokenValueSpentResponse)
     ),
     tag = "metrics"
 )]
-async fn token_value_spent(State(state): State<AppState>) -> Json<TokenValueSpentResponse> {
+async fn token_value_spent(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<TokenValueSpentResponse> {
     let series = state
         .store
         .snapshot("token-value-spent")
         .await
         .map(map_token_value_spent_series);
 
+    let window_ms = window_ms(params.window_seconds);
+    let (delta_amount, delta_ms) = series
+        .as_ref()
+        .and_then(|series| compute_token_value_spent_delta(series, window_ms))
+        .map_or((None, None), |(amount, delta_ms)| (Some(amount), Some(delta_ms)));
+
     Json(TokenValueSpentResponse {
         series,
+        delta_amount,
+        delta_ms,
         retention_seconds: TOKEN_VALUE_RETENTION_SECONDS,
     })
 }
 
-fn map_tps_series(series: MetricSeriesSnapshot) -> TpsSeriesSnapshot {
-    let samples: Vec<TpsSample> = series
-        .samples
-        .into_iter()
-        .filter_map(map_tps_sample)
-        .collect();
-    let latest = series.latest.and_then(map_tps_sample);
+fn decode_payload<T: DeserializeOwned>(sample: &MetricSample, label: &str) -> Option<T> {
+    match serde_json::from_value(sample.payload.clone()) {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            warn!(error = %error, label, "Failed to parse metric payload");
+            None
+        }
+    }
+}
 
-    TpsSeriesSnapshot {
-        name: series.name,
-        interval_secs: series.interval_secs,
-        max_samples: series.max_samples,
+struct WindowedSamples<'a, T> {
+    start: &'a T,
+    latest: &'a T,
+    delta_ms: i64,
+}
+
+fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
+    let seconds = window_seconds?;
+    if seconds == 0 {
+        return None;
+    }
+    let millis = seconds.saturating_mul(1000);
+    match i64::try_from(millis) {
+        Ok(ms) => Some(ms),
+        Err(_) => {
+            warn!(seconds, "window_seconds too large, using default window");
+            None
+        }
+    }
+}
+
+fn select_window<'a, T>(
+    samples: &'a [T],
+    window_ms: Option<i64>,
+    timestamp: impl Fn(&T) -> i64,
+) -> Option<WindowedSamples<'a, T>> {
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let latest_idx = samples.len() - 1;
+    let latest = &samples[latest_idx];
+    let latest_ts = timestamp(latest);
+
+    let start_idx = match window_ms {
+        Some(window_ms) if window_ms > 0 => {
+            let target = latest_ts - window_ms;
+            let idx = samples
+                .iter()
+                .rposition(|sample| timestamp(sample) <= target)
+                .unwrap_or(0);
+            if idx == latest_idx {
+                latest_idx - 1
+            } else {
+                idx
+            }
+        }
+        _ => latest_idx - 1,
+    };
+
+    let start = &samples[start_idx];
+    let delta_ms = latest_ts - timestamp(start);
+    if delta_ms <= 0 {
+        return None;
+    }
+
+    Some(WindowedSamples {
+        start,
         latest,
-        samples,
+        delta_ms,
+    })
+}
+
+fn compute_tps(
+    series: &TotalTransactionsSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<u64>, Option<i64>, Option<u64>) {
+    let latest_total = series
+        .samples
+        .last()
+        .map(|sample| sample.payload.total_transactions);
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, latest_total),
+    };
+
+    let delta_transactions = window
+        .latest
+        .payload
+        .total_transactions
+        .saturating_sub(window.start.payload.total_transactions);
+    let delta_ms = window.delta_ms;
+    if delta_ms <= 0 {
+        return (
+            None,
+            Some(delta_transactions),
+            Some(delta_ms),
+            latest_total,
+        );
+    }
+
+    let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
+
+    (
+        Some(tps),
+        Some(delta_transactions),
+        Some(delta_ms),
+        latest_total,
+    )
+}
+
+fn compute_failed_rate(
+    series: &FailedTransactionsSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<u64>, Option<u64>, Option<i64>) {
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, None),
+    };
+
+    let delta_completed = window
+        .latest
+        .payload
+        .total_completed
+        .saturating_sub(window.start.payload.total_completed);
+    let delta_rejected = window
+        .latest
+        .payload
+        .rejected_total
+        .saturating_sub(window.start.payload.rejected_total);
+
+    if delta_completed == 0 {
+        return (
+            None,
+            Some(delta_rejected),
+            Some(delta_completed),
+            Some(window.delta_ms),
+        );
+    }
+
+    let rate_percent = (delta_rejected as f64 / delta_completed as f64) * 100.0;
+
+    (
+        Some(rate_percent),
+        Some(delta_rejected),
+        Some(delta_completed),
+        Some(window.delta_ms),
+    )
+}
+
+fn compute_average_transaction_size(
+    series: &AverageTransactionSizeSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<String>, Option<u64>, Option<i64>) {
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, None),
+    };
+
+    let prev_total = match parse_amount(&window.start.payload.total_amount) {
+        Some(total) => total,
+        None => return (None, None, None, None),
+    };
+    let latest_total = match parse_amount(&window.latest.payload.total_amount) {
+        Some(total) => total,
+        None => return (None, None, None, None),
+    };
+    let delta_amount = latest_total.saturating_sub(prev_total);
+    let delta_transactions = window
+        .latest
+        .payload
+        .total_transactions
+        .saturating_sub(window.start.payload.total_transactions);
+
+    if delta_transactions == 0 {
+        return (
+            None,
+            Some(delta_amount.to_string()),
+            Some(delta_transactions),
+            Some(window.delta_ms),
+        );
+    }
+
+    let average_amount = (delta_amount as f64) / (delta_transactions as f64);
+
+    (
+        Some(average_amount),
+        Some(delta_amount.to_string()),
+        Some(delta_transactions),
+        Some(window.delta_ms),
+    )
+}
+
+fn compute_token_value_spent_delta(
+    series: &TokenValueSpentSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> Option<(String, i64)> {
+    let window = select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms)?;
+
+    let prev_total = parse_amount(&window.start.payload.total_amount)?;
+    let latest_total = parse_amount(&window.latest.payload.total_amount)?;
+    let delta_amount = latest_total.saturating_sub(prev_total);
+
+    Some((delta_amount.to_string(), window.delta_ms))
+}
+
+fn parse_amount(value: &str) -> Option<u128> {
+    match value.parse::<u128>() {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            warn!(error = %error, value, "Failed to parse amount");
+            None
+        }
     }
 }
 
@@ -262,29 +524,8 @@ fn map_token_value_spent_series(series: MetricSeriesSnapshot) -> TokenValueSpent
     }
 }
 
-fn map_tps_sample(sample: MetricSample) -> Option<TpsSample> {
-    let payload: TpsPayload = match serde_json::from_value(sample.payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!(error = %error, "Failed to parse TPS payload");
-            return None;
-        }
-    };
-
-    Some(TpsSample {
-        recorded_at_ms: sample.recorded_at_ms,
-        payload,
-    })
-}
-
 fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactionsSample> {
-    let payload: TotalTransactionsPayload = match serde_json::from_value(sample.payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!(error = %error, "Failed to parse total transactions payload");
-            return None;
-        }
-    };
+    let payload: TotalTransactionsPayload = decode_payload(&sample, "total-transactions")?;
 
     Some(TotalTransactionsSample {
         recorded_at_ms: sample.recorded_at_ms,
@@ -293,13 +534,8 @@ fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactio
 }
 
 fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransactionsSample> {
-    let payload: FailedTransactionsPayload = match serde_json::from_value(sample.payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!(error = %error, "Failed to parse failed transactions payload");
-            return None;
-        }
-    };
+    let payload: FailedTransactionsPayload =
+        decode_payload(&sample, "failed-transactions-rate")?;
 
     Some(FailedTransactionsSample {
         recorded_at_ms: sample.recorded_at_ms,
@@ -310,13 +546,8 @@ fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransact
 fn map_average_transaction_size_sample(
     sample: MetricSample,
 ) -> Option<AverageTransactionSizeSample> {
-    let payload: AverageTransactionSizePayload = match serde_json::from_value(sample.payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!(error = %error, "Failed to parse average transaction size payload");
-            return None;
-        }
-    };
+    let payload: AverageTransactionSizePayload =
+        decode_payload(&sample, "average-transaction-size")?;
 
     Some(AverageTransactionSizeSample {
         recorded_at_ms: sample.recorded_at_ms,
@@ -325,13 +556,7 @@ fn map_average_transaction_size_sample(
 }
 
 fn map_token_value_spent_sample(sample: MetricSample) -> Option<TokenValueSpentSample> {
-    let payload: TokenValueSpentPayload = match serde_json::from_value(sample.payload) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!(error = %error, "Failed to parse token value spent payload");
-            return None;
-        }
-    };
+    let payload: TokenValueSpentPayload = decode_payload(&sample, "token-value-spent")?;
 
     Some(TokenValueSpentSample {
         recorded_at_ms: sample.recorded_at_ms,
@@ -342,28 +567,6 @@ fn map_token_value_spent_sample(sample: MetricSample) -> Option<TokenValueSpentS
 #[derive(Serialize, ToSchema)]
 struct HealthResponse {
     status: String,
-}
-
-#[derive(Serialize, ToSchema)]
-struct TpsResponse {
-    series: Option<TpsSeriesSnapshot>,
-    window_seconds: u64,
-    retention_seconds: u64,
-}
-
-#[derive(Serialize, ToSchema)]
-struct TpsSeriesSnapshot {
-    name: String,
-    interval_secs: u64,
-    max_samples: usize,
-    latest: Option<TpsSample>,
-    samples: Vec<TpsSample>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct TpsSample {
-    recorded_at_ms: i64,
-    payload: TpsPayload,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -388,8 +591,20 @@ struct TotalTransactionsSample {
 }
 
 #[derive(Serialize, ToSchema)]
+struct TpsResponse {
+    tps: Option<f64>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+    latest_total: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
 struct FailedTransactionsResponse {
     series: Option<FailedTransactionsSeriesSnapshot>,
+    rate_percent: Option<f64>,
+    delta_rejected: Option<u64>,
+    delta_completed: Option<u64>,
+    delta_ms: Option<i64>,
     retention_seconds: u64,
 }
 
@@ -411,6 +626,10 @@ struct FailedTransactionsSample {
 #[derive(Serialize, ToSchema)]
 struct AverageTransactionSizeResponse {
     series: Option<AverageTransactionSizeSeriesSnapshot>,
+    average_amount: Option<f64>,
+    delta_amount: Option<String>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
     retention_seconds: u64,
 }
 
@@ -432,6 +651,8 @@ struct AverageTransactionSizeSample {
 #[derive(Serialize, ToSchema)]
 struct TokenValueSpentResponse {
     series: Option<TokenValueSpentSeriesSnapshot>,
+    delta_amount: Option<String>,
+    delta_ms: Option<i64>,
     retention_seconds: u64,
 }
 
@@ -459,22 +680,19 @@ struct TokenValueSpentSample {
     ),
     paths(
         health,
-        tps,
         total_transactions,
+        tps,
         failed_transactions_rate,
         average_transaction_size,
         token_value_spent
     ),
     components(schemas(
         HealthResponse,
-        TpsResponse,
-        TpsSeriesSnapshot,
-        TpsSample,
-        TpsPayload,
         TotalTransactionsResponse,
         TotalTransactionsSeriesSnapshot,
         TotalTransactionsSample,
         TotalTransactionsPayload,
+        TpsResponse,
         FailedTransactionsResponse,
         FailedTransactionsSeriesSnapshot,
         FailedTransactionsSample,

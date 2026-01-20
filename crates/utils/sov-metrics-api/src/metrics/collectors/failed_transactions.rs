@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -10,15 +10,13 @@ use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
-pub const WINDOW_SECONDS: u64 = SAMPLE_INTERVAL_SECS;
 pub const RETENTION_SECONDS: u64 = 300;
 pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usize;
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct FailedTransactionsPayload {
     pub total_completed: u64,
-    pub rejected: u64,
-    pub rejected_rate_percent: f64,
+    pub rejected_total: u64,
 }
 
 pub struct FailedTransactionsCollector {
@@ -46,16 +44,11 @@ impl MetricCollector for FailedTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let window_end = Utc::now();
-            let window_start = window_end - ChronoDuration::seconds(WINDOW_SECONDS as i64);
-
             let total_paginator = Entity::find()
                 .filter(Column::TransactionState.is_in([
                     TransactionState::Accepted,
                     TransactionState::Rejected,
                 ]))
-                .filter(Column::CreatedAt.gte(window_start))
-                .filter(Column::CreatedAt.lt(window_end))
                 .paginate(&self.db, 1);
             let total_completed = total_paginator
                 .num_items()
@@ -64,24 +57,15 @@ impl MetricCollector for FailedTransactionsCollector {
 
             let rejected_paginator = Entity::find()
                 .filter(Column::TransactionState.eq(TransactionState::Rejected))
-                .filter(Column::CreatedAt.gte(window_start))
-                .filter(Column::CreatedAt.lt(window_end))
                 .paginate(&self.db, 1);
-            let rejected = rejected_paginator
+            let rejected_total = rejected_paginator
                 .num_items()
                 .await
                 .with_context(|| "Failed to count rejected transactions")?;
 
-            let rejected_rate_percent = if total_completed == 0 {
-                0.0
-            } else {
-                (rejected as f64 / total_completed as f64) * 100.0
-            };
-
             let payload = FailedTransactionsPayload {
                 total_completed,
-                rejected,
-                rejected_rate_percent,
+                rejected_total,
             };
 
             Ok(MetricSample {
