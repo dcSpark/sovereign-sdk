@@ -26,18 +26,32 @@ pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 /// Length of note plaintext for deposits: 32(domain) + 16(value) + 32(rho) + 32(recipient)
 pub const NOTE_PLAIN_LEN_DEPOSIT: usize = 112;
 
-/// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
-pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+/// Legacy spend/output note plaintext length (no `cm_ins`):
+/// 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
+pub const NOTE_PLAIN_LEN_SPEND_V1: usize = 144;
+
+/// Current spend/output note plaintext length (includes `cm_ins[4]`):
+/// 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id) + 4*32(cm_ins)
+pub const NOTE_PLAIN_LEN_SPEND_V2: usize = 272;
+
+pub const MAX_INS: usize = 4;
 
 /// Decrypted note data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptedNote {
+    /// Output note commitment (cm) this plaintext corresponds to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm: Option<String>,
     pub domain: String,
     pub value: String,
     pub rho: String,
     pub recipient: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
+    /// Commitments of notes spent to produce this tx (padded with zeros).
+    /// Present for spend/output plaintexts using the v2 layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm_ins: Option<Vec<String>>,
 }
 
 /// A single FVK entry from the config file
@@ -438,13 +452,20 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
         anyhow::bail!("MAC verification failed: ciphertext may be corrupted");
     }
 
-    // Decrypt ciphertext - support both 112-byte (deposit) and 144-byte (transfer) formats
+    // Decrypt ciphertext - support:
+    // - 112-byte deposit plaintext
+    // - 144-byte legacy spend/output plaintext
+    // - 272-byte spend/output plaintext with cm_ins[4]
     let ct_bytes = encrypted_note.ct.as_ref();
-    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT && ct_bytes.len() != NOTE_PLAIN_LEN_TRANSFER {
+    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V1
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V2
+    {
         anyhow::bail!(
-            "Invalid ciphertext length: expected {} (deposit) or {} (transfer), got {}",
+            "Invalid ciphertext length: expected {} (deposit), {} (spend_v1), or {} (spend_v2), got {}",
             NOTE_PLAIN_LEN_DEPOSIT,
-            NOTE_PLAIN_LEN_TRANSFER,
+            NOTE_PLAIN_LEN_SPEND_V1,
+            NOTE_PLAIN_LEN_SPEND_V2,
             ct_bytes.len()
         );
     }
@@ -467,8 +488,9 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
     let mut recipient = [0u8; 32];
     recipient.copy_from_slice(&pt[80..112]);
 
-    // Parse sender_id if present (144-byte transfer format)
-    let sender_id = if pt.len() == NOTE_PLAIN_LEN_TRANSFER {
+    // Parse sender_id if present (spend/output formats)
+    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2
+    {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(hex::encode(sender))
@@ -476,12 +498,29 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
         None
     };
 
+    // Parse cm_ins if present (spend/output v2 plaintext)
+    let cm_ins = if pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
+        let mut out = Vec::with_capacity(MAX_INS);
+        let mut off = 144usize;
+        for _ in 0..MAX_INS {
+            let mut cm = [0u8; 32];
+            cm.copy_from_slice(&pt[off..off + 32]);
+            out.push(hex::encode(cm));
+            off += 32;
+        }
+        Some(out)
+    } else {
+        None
+    };
+
     Ok(DecryptedNote {
+        cm: Some(hex::encode(encrypted_note.cm)),
         domain: hex::encode(domain),
         value: value.to_string(),
         rho: hex::encode(rho),
         recipient: hex::encode(recipient),
         sender_id,
+        cm_ins,
     })
 }
 

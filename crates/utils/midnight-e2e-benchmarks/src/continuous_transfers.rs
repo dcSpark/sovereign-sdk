@@ -1684,8 +1684,20 @@ async fn perform_transfer_cycle(
 
                 // Build viewer attestation if pool viewer is configured.
                 let (view_attestations, viewer_data) = if let Some(fvk) = viewer_fvk {
+                    let cm_in =
+                        note_commitment(&DOMAIN, value_u64, &in_rho, &in_recipient, &in_sender_id);
+                    let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                        [[0u8; 32]; crate::viewer::MAX_INS];
+                    cm_ins[0] = cm_in;
                     let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id_out, &cm_out,
+                        &fvk,
+                        &DOMAIN,
+                        value,
+                        &out_rho,
+                        &out_recipient,
+                        &sender_id_out,
+                        &cm_ins,
+                        &cm_out,
                     )?;
                     (Some(vec![att.clone()]), Some((fvk, att)))
                 } else {
@@ -2089,6 +2101,18 @@ async fn perform_transfer_cycle(
                 // Build encrypted note for pool viewer if configured.
                 let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
                     Some(fvk) => {
+                        let in_recipient =
+                            recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
+                        let cm_in = note_commitment(
+                            &DOMAIN,
+                            value_u64,
+                            &wallet.rho,
+                            &in_recipient,
+                            &wallet.sender_id,
+                        );
+                        let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                            [[0u8; 32]; crate::viewer::MAX_INS];
+                        cm_ins[0] = cm_in;
                         let cm_out = note_commitment(
                             &DOMAIN,
                             value_u64,
@@ -2103,6 +2127,7 @@ async fn perform_transfer_cycle(
                             &out_rho,
                             &out_recipient,
                             &sender_id,
+                            &cm_ins,
                             &cm_out,
                         )?;
                         Some(vec![enc])

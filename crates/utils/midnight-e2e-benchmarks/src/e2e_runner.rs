@@ -1521,6 +1521,16 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
                 // Build viewer attestation if pool viewer is configured.
                 let (view_attestations, viewer_data) = if let Some(fvk) = viewer_fvk {
+                    let cm_in = note_commitment(
+                        &domain,
+                        out_value_u64,
+                        &rho,
+                        &in_recipient,
+                        &in_sender_id,
+                    );
+                    let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                        [[0u8; 32]; crate::viewer::MAX_INS];
+                    cm_ins[0] = cm_in;
                     let (att, _enc) = make_viewer_bundle(
                         &fvk,
                         &domain,
@@ -1528,6 +1538,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         &out_rho,
                         &out_recipient,
                         &sender_id_out,
+                        &cm_ins,
                         &cm_out,
                     )?;
                     (Some(vec![att.clone()]), Some((fvk, att)))
@@ -1913,6 +1924,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         // sender_id = spender's address
         let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
             Some(fvk) => {
+                let in_recipient = recipient_from_sk_v2(&domain, &input.spend_sk, &pk_ivk_owner);
+                let in_sender_id = in_recipient; // deposit convention: sender_id == recipient
+                let cm_in =
+                    note_commitment(&domain, out_value_u64, &input.rho, &in_recipient, &in_sender_id);
+                let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                    [[0u8; 32]; crate::viewer::MAX_INS];
+                cm_ins[0] = cm_in;
                 let (_att, enc) = make_viewer_bundle(
                     &fvk,
                     &domain,
@@ -1920,6 +1938,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     &out_rho,
                     &out_recipient,
                     &sender_id,
+                    &cm_ins,
                     &cm_out,
                 )?;
                 Some(vec![enc])

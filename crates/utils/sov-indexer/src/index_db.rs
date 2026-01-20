@@ -165,3 +165,81 @@ pub mod fvk_registry {
     pub enum Relation {}
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// UTXO-like note tracking table for auditors/indexers.
+///
+/// One row per note commitment (`cm`). When a note is spent, `spent_*` fields are set
+/// by observing a later tx that reveals the input commitments (e.g. via `cm_ins` in
+/// decrypted output plaintexts).
+pub mod notes_nullifiers {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "notes_nullifiers")]
+    pub struct Model {
+        /// Note commitment (32 bytes hex, no 0x prefix)
+        #[sea_orm(
+            primary_key,
+            auto_increment = false,
+            column_type = "String(StringLen::N(64))"
+        )]
+        pub cm: String,
+
+        /// Decrypted domain (32 bytes hex)
+        #[sea_orm(column_type = "String(StringLen::N(64))", nullable)]
+        pub domain: Option<String>,
+
+        /// Decrypted value (u128 as decimal string)
+        #[sea_orm(nullable)]
+        pub value: Option<String>,
+
+        /// Decrypted rho (32 bytes hex)
+        #[sea_orm(column_type = "String(StringLen::N(64))", nullable)]
+        pub rho: Option<String>,
+
+        /// Decrypted recipient as bech32m (e.g. `privpool1...`)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub recipient: Option<String>,
+
+        /// Decrypted sender_id as bech32m (e.g. `privpool1...`), when present
+        #[sea_orm(column_type = "Text", nullable)]
+        pub sender_id: Option<String>,
+
+        /// Commitments of notes spent to create this tx (padded), as JSON array of hex strings.
+        #[sea_orm(column_type = "Json", nullable)]
+        pub cm_ins: Option<JsonValue>,
+
+        /// Tx hash that created this note (e.g. 0x...)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub created_tx_hash: Option<String>,
+
+        /// Timestamp of the creating tx (copied from `events.created_at`)
+        #[sea_orm(column_type = "TimestampWithTimeZone", nullable)]
+        pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+
+        /// Kind of creating tx: deposit / transfer / withdraw
+        #[sea_orm(column_type = "Text", nullable)]
+        pub created_kind: Option<String>,
+
+        /// Tx hash that spent this note (e.g. 0x...)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub spent_tx_hash: Option<String>,
+
+        /// Timestamp of the spending tx (copied from `events.created_at`)
+        #[sea_orm(column_type = "TimestampWithTimeZone", nullable)]
+        pub spent_at: Option<chrono::DateTime<chrono::Utc>>,
+
+        /// Public nullifier that spent this note (32 bytes hex, with/without 0x)
+        #[sea_orm(column_type = "String(StringLen::N(64))", nullable, unique)]
+        pub spent_nullifier: Option<String>,
+
+        /// Kind of spending tx: transfer / withdraw
+        #[sea_orm(column_type = "Text", nullable)]
+        pub spent_kind: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

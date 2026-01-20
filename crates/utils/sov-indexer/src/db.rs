@@ -61,6 +61,15 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
+
+    // UTXO-like note tracking table (auditor/indexer view)
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::notes_nullifiers::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
     Ok(())
 }
 
@@ -241,6 +250,26 @@ pub async fn set_last_processed_id(idx_db: &DatabaseConnection, id: i32) -> Resu
     Ok(())
 }
 
+pub async fn get_index_meta(idx_db: &DatabaseConnection, key: &str) -> Result<Option<String>> {
+    let row = idx::index_meta::Entity::find_by_id(key).one(idx_db).await?;
+    Ok(row.map(|m| m.value))
+}
+
+pub async fn set_index_meta(idx_db: &DatabaseConnection, key: &str, value: &str) -> Result<()> {
+    idx::index_meta::Entity::insert(idx::index_meta::ActiveModel {
+        key: Set(key.to_string()),
+        value: Set(value.to_string()),
+    })
+    .on_conflict(
+        OnConflict::column(idx::index_meta::Column::Key)
+            .update_column(idx::index_meta::Column::Value)
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
+    Ok(())
+}
+
 pub async fn insert_event(
     idx_db: &DatabaseConnection,
     tx_hash: &str,
@@ -353,6 +382,168 @@ pub async fn insert_midnight_transfer(
     })
     .exec(idx_db)
     .await?;
+    Ok(())
+}
+
+fn normalize_hash32_hex(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let trimmed = trimmed.to_lowercase();
+    anyhow::ensure!(
+        trimmed.len() == 64,
+        "expected 32-byte hex (64 chars), got {} chars",
+        trimmed.len()
+    );
+    let bytes = hex::decode(&trimmed)?;
+    anyhow::ensure!(bytes.len() == 32, "expected 32 bytes, got {}", bytes.len());
+    Ok(trimmed)
+}
+
+fn normalize_privacy_addr_bech32m(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let hrp_prefix = format!("{}1", viewer::PRIVACY_ADDRESS_HRP);
+    if lower.starts_with(&hrp_prefix) {
+        return Ok(lower);
+    }
+    viewer::hex_to_bech32m_address(&lower).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid privacy address/recipient hash: expected 32-byte hex or {}..., got {}",
+            hrp_prefix,
+            trimmed
+        )
+    })
+}
+
+pub async fn upsert_note_created_metadata(
+    idx_db: &DatabaseConnection,
+    cm: &str,
+    created_tx_hash: &str,
+    created_at: DateTime<Utc>,
+    created_kind: &str,
+) -> Result<()> {
+    let cm = normalize_hash32_hex(cm)?;
+    idx::notes_nullifiers::Entity::insert(idx::notes_nullifiers::ActiveModel {
+        cm: Set(cm),
+        created_tx_hash: Set(Some(created_tx_hash.to_string())),
+        created_at: Set(Some(created_at)),
+        created_kind: Set(Some(created_kind.to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(idx::notes_nullifiers::Column::Cm)
+            .update_columns([
+                idx::notes_nullifiers::Column::CreatedTxHash,
+                idx::notes_nullifiers::Column::CreatedAt,
+                idx::notes_nullifiers::Column::CreatedKind,
+            ])
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_note_created(
+    idx_db: &DatabaseConnection,
+    cm: &str,
+    domain: Option<&str>,
+    value: Option<&str>,
+    rho: Option<&str>,
+    recipient: Option<&str>,
+    sender_id: Option<&str>,
+    cm_ins: Option<JsonValue>,
+    created_tx_hash: Option<&str>,
+    created_at: Option<DateTime<Utc>>,
+    created_kind: Option<&str>,
+) -> Result<()> {
+    let cm = normalize_hash32_hex(cm)?;
+    let domain = match domain {
+        Some(v) => Some(normalize_hash32_hex(v)?),
+        None => None,
+    };
+    let rho = match rho {
+        Some(v) => Some(normalize_hash32_hex(v)?),
+        None => None,
+    };
+    let recipient = match recipient {
+        Some(v) => Some(normalize_privacy_addr_bech32m(v)?),
+        None => None,
+    };
+    let sender_id = match sender_id {
+        Some(v) => Some(normalize_privacy_addr_bech32m(v)?),
+        None => None,
+    };
+
+    idx::notes_nullifiers::Entity::insert(idx::notes_nullifiers::ActiveModel {
+        cm: Set(cm),
+        domain: Set(domain),
+        value: Set(value.map(|s| s.to_string())),
+        rho: Set(rho),
+        recipient: Set(recipient),
+        sender_id: Set(sender_id),
+        cm_ins: Set(cm_ins),
+        created_tx_hash: Set(created_tx_hash.map(|s| s.to_string())),
+        created_at: Set(created_at),
+        created_kind: Set(created_kind.map(|s| s.to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(idx::notes_nullifiers::Column::Cm)
+            .update_columns([
+                idx::notes_nullifiers::Column::Domain,
+                idx::notes_nullifiers::Column::Value,
+                idx::notes_nullifiers::Column::Rho,
+                idx::notes_nullifiers::Column::Recipient,
+                idx::notes_nullifiers::Column::SenderId,
+                idx::notes_nullifiers::Column::CmIns,
+                idx::notes_nullifiers::Column::CreatedTxHash,
+                idx::notes_nullifiers::Column::CreatedAt,
+                idx::notes_nullifiers::Column::CreatedKind,
+            ])
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn upsert_note_spent(
+    idx_db: &DatabaseConnection,
+    cm: &str,
+    spent_tx_hash: Option<&str>,
+    spent_at: Option<DateTime<Utc>>,
+    spent_nullifier: Option<&str>,
+    spent_kind: Option<&str>,
+) -> Result<()> {
+    let cm = normalize_hash32_hex(cm)?;
+    let spent_nullifier = match spent_nullifier {
+        Some(v) => Some(normalize_hash32_hex(v)?),
+        None => None,
+    };
+
+    idx::notes_nullifiers::Entity::insert(idx::notes_nullifiers::ActiveModel {
+        cm: Set(cm),
+        spent_tx_hash: Set(spent_tx_hash.map(|s| s.to_string())),
+        spent_at: Set(spent_at),
+        spent_nullifier: Set(spent_nullifier),
+        spent_kind: Set(spent_kind.map(|s| s.to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(idx::notes_nullifiers::Column::Cm)
+            .update_columns([
+                idx::notes_nullifiers::Column::SpentTxHash,
+                idx::notes_nullifiers::Column::SpentAt,
+                idx::notes_nullifiers::Column::SpentNullifier,
+                idx::notes_nullifiers::Column::SpentKind,
+            ])
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
+
     Ok(())
 }
 

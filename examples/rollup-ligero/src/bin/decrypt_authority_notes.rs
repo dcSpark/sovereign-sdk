@@ -145,6 +145,8 @@ struct DecryptedNote {
     sender_id: Option<String>,
     /// Sender as bech32 privacy address (if sender_id present)
     sender_bech32: Option<String>,
+    /// Commitments of notes spent to produce this tx (padded with zeros), when present.
+    cm_ins: Option<Vec<String>>,
 }
 
 /// Convert a 32-byte hash to a bech32 privacy address string
@@ -212,13 +214,14 @@ fn stream_xor_decrypt(k: &Hash32, ct: &[u8]) -> Vec<u8> {
 ///
 /// Supports two formats:
 /// - 112 bytes: Deposit notes [domain(32) | value(16) | rho(32) | recipient(32)]
-/// - 144 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
+/// - 144 bytes: Legacy spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
+/// - 272 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32) | cm_ins[4](128)]
 fn parse_note_plaintext(
     pt: &[u8],
-) -> Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>), String> {
-    if pt.len() != 112 && pt.len() != 144 {
+) -> Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>, Option<Vec<Hash32>>), String> {
+    if pt.len() != 112 && pt.len() != 144 && pt.len() != 272 {
         return Err(format!(
-            "Expected 112 or 144 bytes plaintext, got {}",
+            "Expected 112, 144, or 272 bytes plaintext, got {}",
             pt.len()
         ));
     }
@@ -236,8 +239,8 @@ fn parse_note_plaintext(
     let mut recipient = [0u8; 32];
     recipient.copy_from_slice(&pt[80..112]);
 
-    // Parse sender_id if present (144-byte format from spend outputs)
-    let sender_id = if pt.len() == 144 {
+    // Parse sender_id if present (spend outputs)
+    let sender_id = if pt.len() == 144 || pt.len() == 272 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(sender)
@@ -245,7 +248,21 @@ fn parse_note_plaintext(
         None
     };
 
-    Ok((domain, value, rho, recipient, sender_id))
+    let cm_ins = if pt.len() == 272 {
+        let mut out = Vec::with_capacity(4);
+        let mut off = 144usize;
+        for _ in 0..4 {
+            let mut cm = [0u8; 32];
+            cm.copy_from_slice(&pt[off..off + 32]);
+            out.push(cm);
+            off += 32;
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    Ok((domain, value, rho, recipient, sender_id, cm_ins))
 }
 
 fn decrypt_note(
@@ -293,8 +310,8 @@ fn decrypt_note(
     // Decrypt
     let pt = stream_xor_decrypt(&k, ct);
 
-    // Parse plaintext (supports both 112-byte deposits and 144-byte spend outputs)
-    let (domain, value, rho, recipient, sender_id) = parse_note_plaintext(&pt)?;
+    // Parse plaintext (supports 112-byte deposits and 144/272-byte spend outputs)
+    let (domain, value, rho, recipient, sender_id, cm_ins) = parse_note_plaintext(&pt)?;
 
     // Convert to bech32 for display
     // Note: recipient is H(domain || pk), not the pk itself, so we display it as-is
@@ -313,6 +330,7 @@ fn decrypt_note(
         recipient_hex: hex::encode(recipient),
         sender_id: sender_id.map(|s| hex::encode(s)),
         sender_bech32,
+        cm_ins: cm_ins.map(|arr| arr.into_iter().map(hex::encode).collect()),
     })
 }
 
@@ -410,11 +428,11 @@ fn main() {
         }
         "csv" => {
             println!(
-                "cm,value,domain,rho,recipient,recipient_hex,sender,sender_hex,fvk_match,mac_valid"
+                "cm,value,domain,rho,recipient,recipient_hex,sender,sender_hex,cm_ins,fvk_match,mac_valid"
             );
             for r in &results {
                 println!(
-                    "{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{}",
                     r.cm,
                     r.value,
                     r.domain,
@@ -423,6 +441,10 @@ fn main() {
                     r.recipient_hex,
                     r.sender_bech32.as_deref().unwrap_or(""),
                     r.sender_id.as_deref().unwrap_or(""),
+                    r.cm_ins
+                        .as_ref()
+                        .map(|v| v.join("|"))
+                        .unwrap_or_default(),
                     r.fvk_match,
                     r.mac_valid
                         .map(|v| v.to_string())
@@ -455,6 +477,12 @@ fn main() {
                 }
                 if let Some(ref sender_hex) = r.sender_id {
                     println!("  Sender (hex):    0x{}", sender_hex);
+                }
+                if let Some(ref cm_ins) = r.cm_ins {
+                    println!("  cm_ins:");
+                    for cm in cm_ins {
+                        println!("    0x{}", cm);
+                    }
                 }
                 println!();
             }

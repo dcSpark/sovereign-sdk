@@ -6,6 +6,7 @@ use crate::viewer::{
     hex_to_bech32m_address, FvkRegistry,
 };
 use anyhow::Result;
+use midnight_privacy::{note_commitment, Hash32};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
@@ -13,6 +14,221 @@ use sea_orm::{
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
 use std::sync::Arc;
+
+const PRIVACY_DOMAIN: Hash32 = [1u8; 32];
+const PRIVACY_DOMAIN_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+fn is_zero_hash32(hex_str: &str) -> bool {
+    let trimmed = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str).to_lowercase();
+    trimmed == "0".repeat(64)
+}
+
+fn hash32_from_hex(hex_str: &str) -> Option<Hash32> {
+    let s = hex_str.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn hash32_from_bech32m(value: &str) -> Option<Hash32> {
+    let (hrp, bytes) = bech32::decode(value).ok()?;
+    if hrp.as_str() != viewer::PRIVACY_ADDRESS_HRP {
+        return None;
+    }
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn compute_deposit_commitment_fallback(
+    amount: Option<&str>,
+    rho: Option<&str>,
+    recipient: Option<&str>,
+) -> Option<String> {
+    let amount = amount?;
+    let rho = rho?;
+    let recipient = recipient?;
+
+    let value_u128 = amount.parse::<u128>().ok()?;
+    let value_u64 = u64::try_from(value_u128).ok()?;
+    let rho = hash32_from_hex(rho)?;
+
+    // `recipient` is stored as bech32m (`privpool1...`) in indexer tables, but accept hex too.
+    let recipient_hash = if recipient
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(&format!("{}1", viewer::PRIVACY_ADDRESS_HRP))
+    {
+        hash32_from_bech32m(recipient)?
+    } else {
+        hash32_from_hex(recipient)?
+    };
+
+    // Deposit commitment binds `sender_id = recipient` (see module `deposit()` implementation).
+    let cm = note_commitment(
+        &PRIVACY_DOMAIN,
+        value_u64,
+        &rho,
+        &recipient_hash,
+        &recipient_hash,
+    );
+    Some(hex::encode(cm))
+}
+
+fn decrypted_notes_from_json(json: Option<&serde_json::Value>) -> Vec<viewer::DecryptedNote> {
+    json.and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn commitment_from_u8_array(value: &serde_json::Value) -> Option<String> {
+    let arr = value.as_array()?;
+    if arr.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in arr.iter().enumerate() {
+        bytes[i] = b.as_u64()? as u8;
+    }
+    Some(hex::encode(bytes))
+}
+
+fn extract_commitment_from_events(
+    events: Option<&serde_json::Value>,
+    key_suffix: &str,
+    value_key: &str,
+) -> Option<String> {
+    let events = events?;
+    let arr = events.as_array()?;
+    for ev in arr {
+        let key = ev.get("key").and_then(|v| v.as_str())?;
+        if !key.ends_with(key_suffix) {
+            continue;
+        }
+        let value = ev.get("value")?;
+        let obj = value.as_object()?;
+        let inner = obj.get(value_key)?.as_object()?;
+        let commitment = inner.get("commitment")?;
+        if let Some(hex_str) = commitment.as_str() {
+            return Some(hex_str.trim().trim_start_matches("0x").to_ascii_lowercase());
+        }
+        if let Some(hex_str) = commitment_from_u8_array(commitment) {
+            return Some(hex_str);
+        }
+    }
+    None
+}
+
+fn extract_deposit_commitment(events: Option<&serde_json::Value>) -> Option<String> {
+    // Prefer the dedicated PoolDeposit event (clearly identifies deposit-created notes).
+    extract_commitment_from_events(events, "/PoolDeposit", "pool_deposit")
+        // Fallback: NoteCreated also carries the commitment.
+        .or_else(|| extract_commitment_from_events(events, "/NoteCreated", "note_created"))
+}
+
+async fn index_output_notes(
+    idx_db: &DatabaseConnection,
+    tx_hash: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    kind: &str,
+    decrypted: &[viewer::DecryptedNote],
+) -> Result<()> {
+    for note in decrypted {
+        let Some(cm) = note.cm.as_deref() else {
+            continue;
+        };
+        let cm_ins_json = note.cm_ins.as_ref().and_then(|arr| {
+            let filtered: Vec<serde_json::Value> = arr
+                .iter()
+                .filter(|cm_in| !is_zero_hash32(cm_in))
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(filtered))
+            }
+        });
+        db::upsert_note_created(
+            idx_db,
+            cm,
+            Some(&note.domain),
+            Some(&note.value),
+            Some(&note.rho),
+            Some(&note.recipient),
+            note.sender_id.as_deref(),
+            cm_ins_json,
+            Some(tx_hash),
+            Some(created_at),
+            Some(kind),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn index_output_note_metadata(
+    idx_db: &DatabaseConnection,
+    tx_hash: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    kind: &str,
+    encrypted_notes: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(arr) = encrypted_notes.and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for note in arr {
+        let Some(cm) = note.get("cm").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        db::upsert_note_created_metadata(idx_db, cm, tx_hash, created_at, kind).await?;
+    }
+    Ok(())
+}
+
+async fn index_spent_inputs(
+    idx_db: &DatabaseConnection,
+    tx_hash: &str,
+    spent_at: chrono::DateTime<chrono::Utc>,
+    kind: &str,
+    spent_nullifier: Option<&str>,
+    decrypted: &[viewer::DecryptedNote],
+) -> Result<()> {
+    // Collect unique, non-zero input commitments from any decrypted output.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for note in decrypted {
+        let Some(cm_ins) = note.cm_ins.as_ref() else {
+            continue;
+        };
+        for cm_in in cm_ins {
+            if is_zero_hash32(cm_in) {
+                continue;
+            }
+            seen.insert(cm_in.clone());
+        }
+    }
+
+    for cm_in in seen {
+        db::upsert_note_spent(
+            idx_db,
+            &cm_in,
+            Some(tx_hash),
+            Some(spent_at),
+            spent_nullifier,
+            Some(kind),
+        )
+        .await?;
+    }
+    Ok(())
+}
 
 pub async fn backfill_index(
     da: &DatabaseConnection,
@@ -49,6 +265,7 @@ pub async fn backfill_index(
             let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
                 .ok()
                 .flatten();
+            let deposit_cm_from_events = extract_deposit_commitment(ev_json.as_ref());
             let status = extract_status_from_status(row.sequencer_status.as_deref());
             let event_id = db::insert_event(
                 idx,
@@ -70,6 +287,14 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
+            index_output_note_metadata(
+                idx,
+                &row.tx_hash,
+                row.created_at,
+                &kind,
+                encrypted_notes.as_ref(),
+            )
+            .await?;
             viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
                 idx,
                 fvk_registry,
@@ -79,10 +304,49 @@ pub async fn backfill_index(
             .await?;
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+            let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+            index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
 
             // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
                 .or(recip_from_payload);
+
+            let deposit_cm = deposit_cm_from_events.or_else(|| {
+                compute_deposit_commitment_fallback(amount.as_deref(), rho.as_deref(), recipient.as_deref())
+            });
+
+            // Deposits may not include any viewer ciphertexts; still index the created output commitment
+            // so later spends (cm_ins) can be linked back to this deposit.
+            if let Some(cm) = deposit_cm.as_deref() {
+                db::upsert_note_created_metadata(idx, cm, &row.tx_hash, row.created_at, &kind)
+                    .await?;
+            }
+
+            // If there were no encrypted notes (common for deposits), still record deposit note fields
+            // using publicly available tx fields + deposit commitment from events.
+            let has_encrypted_notes = encrypted_notes
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_encrypted_notes {
+                if let Some(cm) = deposit_cm.as_deref() {
+                    db::upsert_note_created(
+                        idx,
+                        cm,
+                        Some(PRIVACY_DOMAIN_HEX),
+                        amount.as_deref(),
+                        rho.as_deref(),
+                        recipient.as_deref(),
+                        recipient.as_deref(),
+                        None,
+                        Some(&row.tx_hash),
+                        Some(row.created_at),
+                        Some("deposit"),
+                    )
+                    .await?;
+                }
+            }
             db::insert_midnight_deposit(
                 idx,
                 event_id,
@@ -136,6 +400,14 @@ pub async fn backfill_index(
                     .encrypted_notes_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
+                index_output_note_metadata(
+                    idx,
+                    &row.tx_hash,
+                    row.created_at,
+                    &kind,
+                    encrypted_notes.as_ref(),
+                )
+                .await?;
                 viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
                     idx,
                     fvk_registry,
@@ -145,6 +417,17 @@ pub async fn backfill_index(
                 .await?;
                 let decrypted_notes =
                     viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+                let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+                index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+                index_spent_inputs(
+                    idx,
+                    &row.tx_hash,
+                    row.created_at,
+                    &kind,
+                    nullifier.as_deref(),
+                    &decrypted_vec,
+                )
+                .await?;
                 let privacy_sender =
                     extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
@@ -196,6 +479,14 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
+            index_output_note_metadata(
+                idx,
+                &row.tx_hash,
+                row.created_at,
+                &kind,
+                encrypted_notes.as_ref(),
+            )
+            .await?;
             viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
                 idx,
                 fvk_registry,
@@ -205,6 +496,17 @@ pub async fn backfill_index(
             .await?;
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+            let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+            index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+            index_spent_inputs(
+                idx,
+                &row.tx_hash,
+                row.created_at,
+                &kind,
+                nullifier.as_deref(),
+                &decrypted_vec,
+            )
+            .await?;
             // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
             let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
@@ -264,6 +566,292 @@ pub async fn backfill_privacy_fields(
     }
 
     Ok(())
+}
+
+pub async fn backfill_notes_nullifiers(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<()> {
+    let deposits = backfill_notes_nullifiers_deposits(idx_db, vfk_registry, fvk_service).await?;
+    let transfers = backfill_notes_nullifiers_transfers(idx_db, vfk_registry, fvk_service).await?;
+    let withdraws = backfill_notes_nullifiers_withdraws(idx_db, vfk_registry, fvk_service).await?;
+
+    if deposits > 0 || transfers > 0 || withdraws > 0 {
+        tracing::info!(
+            deposits,
+            transfers,
+            withdraws,
+            "Backfilled notes_nullifiers from encrypted notes"
+        );
+    }
+
+    Ok(())
+}
+
+async fn backfill_notes_nullifiers_deposits(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    // v3: compute deposit `cm` even when `events` are missing/unexpected by falling back to
+    // `cm = note_commitment(domain, amount, rho, recipient, sender_id=recipient)`.
+    const META_KEY: &str = "notes_nullifiers_deposit_last_event_id_v3";
+    let mut updated = 0usize;
+    let mut last_id = db::get_index_meta(idx_db, META_KEY)
+        .await?
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+
+    loop {
+        let rows = idx::midnight_deposit::Entity::find()
+            .filter(idx::midnight_deposit::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_deposit::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        // Batch-load event metadata for this page.
+        let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
+        let events = idx::Entity::find()
+            .filter(idx::Column::Id.is_in(ids))
+            .all(idx_db)
+            .await?;
+        let mut event_map = std::collections::HashMap::new();
+        for ev in events {
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.events));
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let Some((tx_hash, created_at, ev_json)) = event_map.get(&row.event_id) else {
+                continue;
+            };
+
+            let deposit_cm =
+                extract_deposit_commitment(ev_json.as_ref()).or_else(|| {
+                    compute_deposit_commitment_fallback(
+                        row.amount.as_deref(),
+                        row.rho.as_deref(),
+                        row.recipient.as_deref(),
+                    )
+                });
+            if let Some(cm) = deposit_cm.as_deref() {
+                db::upsert_note_created_metadata(idx_db, cm, tx_hash, *created_at, "deposit")
+                    .await?;
+            }
+
+            index_output_note_metadata(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "deposit",
+                row.encrypted_notes.as_ref(),
+            )
+            .await?;
+
+            let has_encrypted_notes = row
+                .encrypted_notes
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_encrypted_notes {
+                if let Some(cm) = deposit_cm.as_deref() {
+                    db::upsert_note_created(
+                        idx_db,
+                        cm,
+                        Some(PRIVACY_DOMAIN_HEX),
+                        row.amount.as_deref(),
+                        row.rho.as_deref(),
+                        row.recipient.as_deref(),
+                        row.recipient.as_deref(),
+                        None,
+                        Some(tx_hash),
+                        Some(*created_at),
+                        Some("deposit"),
+                    )
+                    .await?;
+                }
+            }
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
+            let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+            index_output_notes(idx_db, tx_hash, *created_at, "deposit", &decrypted_vec).await?;
+
+            db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_notes_nullifiers_transfers(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    const META_KEY: &str = "notes_nullifiers_transfer_last_event_id";
+    let mut updated = 0usize;
+    let mut last_id = db::get_index_meta(idx_db, META_KEY)
+        .await?
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+
+    loop {
+        let rows = idx::midnight_transfer::Entity::find()
+            .filter(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+            .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_transfer::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
+        let events = idx::Entity::find()
+            .filter(idx::Column::Id.is_in(ids))
+            .all(idx_db)
+            .await?;
+        let mut event_map = std::collections::HashMap::new();
+        for ev in events {
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at));
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let Some((tx_hash, created_at)) = event_map.get(&row.event_id) else {
+                continue;
+            };
+
+            index_output_note_metadata(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "transfer",
+                row.encrypted_notes.as_ref(),
+            )
+            .await?;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
+            let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+            index_output_notes(idx_db, tx_hash, *created_at, "transfer", &decrypted_vec).await?;
+            index_spent_inputs(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "transfer",
+                row.nullifier.as_deref(),
+                &decrypted_vec,
+            )
+            .await?;
+
+            db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_notes_nullifiers_withdraws(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    const META_KEY: &str = "notes_nullifiers_withdraw_last_event_id";
+    let mut updated = 0usize;
+    let mut last_id = db::get_index_meta(idx_db, META_KEY)
+        .await?
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+
+    loop {
+        let rows = idx::midnight_withdraw::Entity::find()
+            .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .filter(idx::midnight_withdraw::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_withdraw::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
+        let events = idx::Entity::find()
+            .filter(idx::Column::Id.is_in(ids))
+            .all(idx_db)
+            .await?;
+        let mut event_map = std::collections::HashMap::new();
+        for ev in events {
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at));
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            let Some((tx_hash, created_at)) = event_map.get(&row.event_id) else {
+                continue;
+            };
+
+            index_output_note_metadata(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "withdraw",
+                row.encrypted_notes.as_ref(),
+            )
+            .await?;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
+            let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
+            index_output_notes(idx_db, tx_hash, *created_at, "withdraw", &decrypted_vec).await?;
+            index_spent_inputs(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "withdraw",
+                row.nullifier.as_deref(),
+                &decrypted_vec,
+            )
+            .await?;
+
+            db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 async fn backfill_deposits(

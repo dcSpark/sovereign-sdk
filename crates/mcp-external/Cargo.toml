@@ -28,7 +28,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
 ed25519-dalek = { version = "2" }
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133" }
 uuid = { workspace = true, features = ["v5", "v4", "std"] }
 tracing-appender = { workspace = true }
 
@@ -49,7 +49,7 @@ sov-modules-stf-blueprint.workspace = true
 midnight-privacy = { workspace = true }
 rand = { workspace = true }
 sov-api-spec = { workspace = true }
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
+ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133" }
 
 [dev-dependencies]
 dirs = "6.0.0"

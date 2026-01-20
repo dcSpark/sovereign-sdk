@@ -10,8 +10,13 @@ use midnight_privacy::{
 /// Length of note plaintext for deposits: 32(domain) + 16(value) + 32(rho) + 32(recipient)
 pub const NOTE_PLAIN_LEN_DEPOSIT: usize = 112;
 
-/// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
-pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+/// Legacy spend/output note plaintext length (no `cm_ins`).
+pub const NOTE_PLAIN_LEN_SPEND_V1: usize = 144;
+
+pub const MAX_INS: usize = 4;
+
+/// Current spend/output note plaintext length (includes `cm_ins[4]`).
+pub const NOTE_PLAIN_LEN_SPEND_V2: usize = NOTE_PLAIN_LEN_SPEND_V1 + 32 * MAX_INS;
 
 /// Produce the i-th 32-byte stream block for key k using Poseidon2.
 fn stream_block(k: &Hash32) -> impl Fn(u32) -> Hash32 + '_ {
@@ -38,15 +43,16 @@ fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
     }
 }
 
-/// Serialize note plaintext for encryption (144 bytes with sender_id).
+/// Serialize spend/output note plaintext for encryption (includes `cm_ins`).
 pub fn encode_note_plain(
     domain: &Hash32,
     value: u64,
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-) -> [u8; NOTE_PLAIN_LEN_TRANSFER] {
-    let mut out = [0u8; NOTE_PLAIN_LEN_TRANSFER];
+    cm_ins: &[Hash32; MAX_INS],
+) -> [u8; NOTE_PLAIN_LEN_SPEND_V2] {
+    let mut out = [0u8; NOTE_PLAIN_LEN_SPEND_V2];
     out[0..32].copy_from_slice(domain);
     // Encode as 16-byte LE, zero-extended from u64.
     out[32..40].copy_from_slice(&value.to_le_bytes());
@@ -54,6 +60,11 @@ pub fn encode_note_plain(
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
     out
 }
 
@@ -79,6 +90,7 @@ pub fn make_viewer_bundle(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
+    cm_ins: &[Hash32; MAX_INS],
     cm: &Hash32,
 ) -> anyhow::Result<(ViewAttestation, EncryptedNote)> {
     let value_u64: u64 = value.try_into().map_err(|_| {
@@ -86,9 +98,9 @@ pub fn make_viewer_bundle(
     })?;
     let fvk_obj = FullViewingKey(*fvk);
     let fvk_c = fvk_commitment(&fvk_obj);
-    let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id);
+    let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id, cm_ins);
     let k = view_kdf(&fvk_obj, cm);
-    let mut ct = [0u8; NOTE_PLAIN_LEN_TRANSFER];
+    let mut ct = [0u8; NOTE_PLAIN_LEN_SPEND_V2];
     stream_xor_encrypt(&k, &pt, &mut ct);
     let ct_h = ct_hash(&ct);
     let mac = view_mac(&k, cm, &ct_h);
@@ -126,7 +138,7 @@ pub fn make_viewer_bundle(
 pub fn decrypt_note(
     fvk: &Hash32,
     encrypted_note: &EncryptedNote,
-) -> anyhow::Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>)> {
+) -> anyhow::Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>, Option<[Hash32; MAX_INS]>)> {
     let fvk_obj = FullViewingKey(*fvk);
     let expected_fvk_c = fvk_commitment(&fvk_obj);
 
@@ -145,13 +157,17 @@ pub fn decrypt_note(
         anyhow::bail!("MAC verification failed: ciphertext may be corrupted");
     }
 
-    // Decrypt ciphertext - support both 112-byte (deposit) and 144-byte (transfer) formats
+    // Decrypt ciphertext - support deposit (112) and spend/output (144 legacy, 272 current).
     let ct_bytes = encrypted_note.ct.as_ref();
-    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT && ct_bytes.len() != NOTE_PLAIN_LEN_TRANSFER {
+    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V1
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V2
+    {
         anyhow::bail!(
-            "Invalid ciphertext length: expected {} (deposit) or {} (transfer), got {}",
+            "Invalid ciphertext length: expected {} (deposit), {} (spend_v1), or {} (spend_v2), got {}",
             NOTE_PLAIN_LEN_DEPOSIT,
-            NOTE_PLAIN_LEN_TRANSFER,
+            NOTE_PLAIN_LEN_SPEND_V1,
+            NOTE_PLAIN_LEN_SPEND_V2,
             ct_bytes.len()
         );
     }
@@ -174,8 +190,9 @@ pub fn decrypt_note(
     let mut recipient = [0u8; 32];
     recipient.copy_from_slice(&pt[80..112]);
 
-    // Parse sender_id if present (144-byte transfer format)
-    let sender_id = if pt.len() == NOTE_PLAIN_LEN_TRANSFER {
+    // Parse sender_id if present (spend/output formats)
+    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2
+    {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(sender)
@@ -183,5 +200,17 @@ pub fn decrypt_note(
         None
     };
 
-    Ok((domain, value, rho, recipient, sender_id))
+    let cm_ins = if pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
+        let mut out = [[0u8; 32]; MAX_INS];
+        let mut off = 144usize;
+        for i in 0..MAX_INS {
+            out[i].copy_from_slice(&pt[off..off + 32]);
+            off += 32;
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    Ok((domain, value, rho, recipient, sender_id, cm_ins))
 }

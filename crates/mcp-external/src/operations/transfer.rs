@@ -581,6 +581,8 @@ pub async fn transfer(
             num_outputs
         );
 
+        let mut cm_ins: [Hash32; viewer::MAX_INS] = [[0u8; 32]; viewer::MAX_INS];
+        cm_ins[0] = input_cm;
         let (att_0, enc_0) = viewer::make_viewer_bundle(
             &fvk,
             &DOMAIN,
@@ -588,6 +590,7 @@ pub async fn transfer(
             &out_rho_0,
             &out_recipient_0,
             &sender_id_out,
+            &cm_ins,
             &cm_out_0,
         )?;
 
@@ -599,6 +602,7 @@ pub async fn transfer(
                 out_rho_1.as_ref().unwrap(),
                 out_recipient_1.as_ref().unwrap(),
                 &sender_id_out,
+                &cm_ins,
                 cm_out_1.as_ref().unwrap(),
             )?;
             (Some(vec![att_0, att_1]), Some(vec![enc_0, enc_1]))

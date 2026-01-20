@@ -175,7 +175,7 @@ async fn extract_amount_from_transaction(
 
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
         match viewer::decrypt_note(&fvk, encrypted_note) {
-            Ok((_domain, value, _rho, _recipient, _sender_id)) => {
+            Ok((_domain, value, _rho, _recipient, _sender_id, _cm_ins)) => {
                 tracing::info!(
                     "Successfully decrypted note {}: value={} (using this as transaction amount)",
                     idx,
