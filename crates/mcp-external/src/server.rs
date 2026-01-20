@@ -26,7 +26,6 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
 use tokio::sync::RwLock;
 use url::Url;
-use uuid::Uuid;
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
@@ -263,57 +262,6 @@ pub struct GetWalletBalanceResult {
     /// Coins that are pending and not yet available for spending
     #[serde(rename = "pendingBalance")]
     pub pending_balance: String,
-}
-
-// Types for GetTransaction
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetTransactionRequest {
-    /// Transaction hash ID (with or without 0x prefix)
-    pub tx_hash: String,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct TransactionView {
-    /// Transaction hash
-    pub tx_hash: String,
-    /// Timestamp in milliseconds (if available)
-    pub timestamp_ms: Option<i64>,
-    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
-    pub kind: Option<String>,
-    /// Sender address (if available)
-    pub sender: Option<String>,
-    /// Recipient address (if available)
-    pub recipient: Option<String>,
-    /// Privacy sender address (if available)
-    pub privacy_sender: Option<String>,
-    /// Privacy recipient address (if available)
-    pub privacy_recipient: Option<String>,
-    /// Transaction amount (if available)
-    pub amount: Option<String>,
-    /// Anchor root for privacy transactions
-    pub anchor_root: Option<String>,
-    /// Nullifier for privacy transactions
-    pub nullifier: Option<String>,
-    /// View Full Viewing Keys (FVKs) for note decryption
-    pub view_fvks: Option<serde_json::Value>,
-    /// View attestations for privacy proofs
-    pub view_attestations: Option<serde_json::Value>,
-    /// Transaction events from the rollup
-    pub events: Option<serde_json::Value>,
-    /// Transaction status (e.g., "Success", "Failed", "pending")
-    pub status: Option<String>,
-    /// Encrypted notes for privacy transactions
-    pub encrypted_notes: Option<serde_json::Value>,
-    /// Decrypted notes for privacy transactions (when available)
-    pub decrypted_notes: Option<serde_json::Value>,
-    /// Full transaction payload
-    pub payload: Option<serde_json::Value>,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionResult {
-    /// Transaction details from the indexer
-    pub transaction: TransactionView,
 }
 
 // Types for VerifyTransaction
@@ -1124,76 +1072,6 @@ impl CryptoServer {
 
         let result = GetWalletAddressResult {
             address: privacy_address,
-        };
-
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
-    /// Get full details of a transaction by its ID.
-    /// Retrieves complete transaction information from the indexer including status, kind, amounts, and privacy fields.
-    #[tool(
-        name = "getTransaction",
-        description = "Get transaction details by its ID. Retrieves complete transaction information including status, kind, amounts, and privacy-related fields."
-    )]
-    async fn get_transaction(
-        &self,
-        Parameters(params): Parameters<GetTransactionRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let provider = self.provider.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
-                None,
-            )
-        })?;
-
-        // Allow lookup by either tx_hash or a UUIDv5 derived from the tx hash (legacy helper)
-        let tx_hash = if Uuid::parse_str(&params.tx_hash).is_ok() {
-            let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                    None,
-                )
-            })?;
-
-            let ctx = wallet_ctx.read().await;
-            let privacy_key_guard = self.privacy_key.read().await;
-            let target_uuid = Uuid::parse_str(&params.tx_hash).map_err(|e| {
-                ErrorData::invalid_params(format!("Invalid transaction ID format: {}", e), None)
-            })?;
-
-            let transactions =
-                crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-            transactions
-                .into_iter()
-                .find_map(|tx| {
-                    let candidate = Uuid::new_v5(&Uuid::NAMESPACE_OID, tx.tx_hash.as_bytes());
-                    if candidate == target_uuid {
-                        Some(tx.tx_hash)
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| {
-                    ErrorData::invalid_params(
-                        "Transaction ID not found for this wallet. Try querying by tx hash.",
-                        None,
-                    )
-                })?
-        } else {
-            params.tx_hash.clone()
-        };
-
-        let tx_details = crate::operations::get_transaction_status(provider, &tx_hash)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let result = GetTransactionResult {
-            transaction: TransactionView::from(tx_details),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -2075,54 +1953,6 @@ impl ServerHandler for CryptoServer {
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
-        }
-    }
-}
-
-impl From<crate::operations::Transaction> for TransactionView {
-    fn from(tx: crate::operations::Transaction) -> Self {
-        Self {
-            tx_hash: tx.tx_hash,
-            timestamp_ms: Some(tx.timestamp_ms),
-            kind: Some(tx.kind),
-            sender: tx.sender,
-            recipient: tx.recipient,
-            privacy_sender: tx.privacy_sender,
-            privacy_recipient: tx.privacy_recipient,
-            amount: tx.amount,
-            anchor_root: tx.anchor_root,
-            nullifier: tx.nullifier,
-            view_fvks: tx.view_fvks,
-            view_attestations: tx.view_attestations,
-            events: tx.events,
-            status: tx.status,
-            encrypted_notes: tx.encrypted_notes,
-            decrypted_notes: tx.decrypted_notes,
-            payload: tx.payload,
-        }
-    }
-}
-
-impl From<crate::operations::TransactionDetails> for TransactionView {
-    fn from(details: crate::operations::TransactionDetails) -> Self {
-        Self {
-            tx_hash: details.tx_hash,
-            timestamp_ms: details.timestamp_ms,
-            kind: details.kind,
-            sender: details.sender,
-            recipient: details.recipient,
-            privacy_sender: details.privacy_sender,
-            privacy_recipient: details.privacy_recipient,
-            amount: details.amount,
-            anchor_root: details.anchor_root,
-            nullifier: details.nullifier,
-            view_fvks: details.view_fvks,
-            view_attestations: details.view_attestations,
-            events: details.events,
-            status: Some(details.status),
-            encrypted_notes: details.encrypted_notes,
-            decrypted_notes: details.decrypted_notes,
-            payload: details.payload,
         }
     }
 }

@@ -21,7 +21,6 @@ pub use decrypt_transaction::decrypt_transaction;
 pub use deposit::deposit;
 pub use get_default_address::get_default_address;
 pub use get_privacy_balance::{get_privacy_balance, PrivacyBalanceResult, UnspentNote};
-pub use get_transaction_status::get_transaction_status;
 pub use get_transactions::get_transactions;
 pub use get_transactions::Transaction;
 #[allow(unused_imports)]

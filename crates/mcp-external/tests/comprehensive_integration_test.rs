@@ -126,62 +126,6 @@ async fn test_wallet_address() -> Result<()> {
 #[tokio::test]
 #[tracing_test::traced_test]
 #[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
-async fn test_get_transaction() -> Result<()> {
-    let _ = dotenvy::dotenv();
-
-    tracing::info!("Testing getTransaction");
-
-    let wallet_private_key =
-        std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
-    let rpc_url = std::env::var("ROLLUP_RPC_URL").expect("ROLLUP_RPC_URL must be set in .env");
-    let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
-    let indexer_url =
-        std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
-
-    assert!(
-        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
-        "Required services must be running"
-    );
-
-    let wallet = WalletContext::<McpRuntime, McpSpec>::from_private_key_hex(&wallet_private_key)?;
-    let provider = Provider::new(&rpc_url, &verifier_url, &indexer_url).await?;
-
-    // Generate privacy key for deposit
-    let mut rng = rand::thread_rng();
-    let mut spend_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut spend_key_bytes);
-    let privacy_key = PrivacyKey::from_hex(&hex::encode(spend_key_bytes))?;
-
-    // Perform a deposit to create a transaction
-    let deposit_amount = 50u128;
-    let deposit_result = deposit(&provider, &wallet, deposit_amount, &privacy_key).await?;
-    let tx_hash = deposit_result.tx_hash.clone();
-
-    tracing::info!("Created deposit transaction: {}", tx_hash);
-
-    // Wait for transaction to be indexed
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-    // Get the transaction
-    let tx_option = provider.get_transaction(&tx_hash).await?;
-
-    assert!(tx_option.is_some(), "Transaction should exist in indexer");
-
-    let tx = tx_option.unwrap();
-    assert_eq!(tx.tx_hash, tx_hash, "Transaction hash should match");
-    assert_eq!(tx.kind, "deposit", "Transaction kind should be deposit");
-
-    tracing::info!("✅ getTransaction test passed");
-    tracing::info!("  Transaction hash: {}", tx.tx_hash);
-    tracing::info!("  Kind: {}", tx.kind);
-    tracing::info!("  Status: {:?}", tx.status);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
 async fn test_get_privacy_balance() -> Result<()> {
     let _ = dotenvy::dotenv();
 

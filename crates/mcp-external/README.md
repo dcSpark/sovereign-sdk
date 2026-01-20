@@ -48,7 +48,6 @@ The server exposes the following MCP tools:
 - `walletBalance` - Get the privacy balance and unspent notes
 - `getWalletConfig` - Retrieve wallet configuration (node/indexer/proof server/log paths)
 - `send` - Privacy transfer using the first unspent note
-- `getTransaction` - Retrieve transaction details by hash or derived UUID (legacy)
 - `getTransactions` - List all transactions from the indexer
 - `walletStatus` - Sync status and balances
 - `createWallet` / `restoreWallet` - Manage wallet keys
