@@ -1,11 +1,13 @@
-use anyhow::{anyhow, Context};
-use sea_orm::Database;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use sea_orm::{ConnectOptions, Database};
 use tracing::{info, warn};
 mod api;
 mod background_sync;
+mod balance;
 mod db;
 mod index_db;
 mod viewer;
@@ -25,51 +27,75 @@ async fn main() -> anyhow::Result<()> {
     let index_db_url = env::var("INDEX_DB")
         .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
-    let mode = match env::var("MODE")
-        .unwrap_or_else(|_| "direct".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "sync" => api::Mode::Sync,
-        _ => api::Mode::Direct,
-    };
-
-    let da_db = Database::connect(&da_conn)
+    let mut connection_options = ConnectOptions::new(da_conn.clone());
+    connection_options.sqlx_logging(false);
+    let da_db = Database::connect(connection_options)
         .await
         .with_context(|| format!("Failed to connect DB {}", da_conn))?;
 
-    let (idx_db, fvk_registry) = if mode == api::Mode::Sync {
-        let idx = Database::connect(&index_db_url)
-            .await
-            .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
-        db::init_index_db(&idx).await?;
+    let mut connection_options = ConnectOptions::new(index_db_url.clone());
+    connection_options.sqlx_logging(false);
+    let idx_db = Database::connect(connection_options)
+        .await
+        .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
 
-        // Load FVK registry for multi-address decryption (uses DashMap for lock-free access)
-        let fvk_registry = load_fvk_registry(&idx).await?;
-        let fvk_registry = Arc::new(fvk_registry);
+    println!("Initializing index database");
 
-        // Try a one-shot backfill; if DA tables are not ready, log and continue.
-        if let Err(e) = background_sync::backfill_index(&da_db, &idx, &fvk_registry).await {
-            warn!(error = %e, "Initial backfill failed; will retry in background loop");
-        }
-        background_sync::spawn_sync_loop(da_db.clone(), idx.clone(), fvk_registry.clone());
-        (idx, fvk_registry)
-    } else {
-        // Direct mode: create empty registry (no decryption)
-        (da_db.clone(), Arc::new(FvkRegistry::new()))
-    };
-
-    if mode == api::Mode::Direct {
-        info!("Indexer running in DIRECT mode; querying worker DB directly");
-    } else {
-        info!("Indexer running in SYNC mode; serving from index DB");
+    if should_reset_index_db() {
+        db::reset_index_db(&idx_db).await?;
     }
 
-    let app = api::router(api::AppState {
-        db: idx_db,
-        mode,
-        fvk_registry,
+    db::init_index_db(&idx_db).await?;
+
+    println!("index database initialized");
+
+    // Load VFK registry for multi-address decryption (uses DashMap for lock-free access)
+    let vfk_registry = load_vfk_registry(&idx_db).await?;
+    let vfk_registry = Arc::new(vfk_registry);
+
+    let fvk_service = viewer::FvkServiceClient::from_env()?;
+    if vfk_registry.is_empty() {
+        if fvk_service.is_some() {
+            info!("FVK registry is empty; auto-fetch enabled (MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN set)");
+        } else {
+            info!("FVK registry is empty; encrypted notes will not be decrypted (no FVKs + no auto-fetch)");
+        }
+    }
+
+    // Try a one-shot backfill; if DA tables are not ready, log and continue.
+    if let Err(e) = background_sync::backfill_index(
+        &da_db,
+        &idx_db,
+        &vfk_registry,
+        fvk_service.as_ref(),
+    )
+    .await
+    {
+        warn!(error = %e, "Initial backfill failed; will retry in background loop");
+    }
+    let idx_clone = idx_db.clone();
+    let vfk_registry_clone = vfk_registry.clone();
+    let fvk_service_clone = fvk_service.clone();
+    tokio::spawn(async move {
+        println!("Starting VFK backfill");
+        if let Err(e) =
+            background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone, fvk_service_clone.as_ref()).await
+        {
+            warn!(error = %e, "VFK backfill failed");
+        }
+        println!("Finished VFK backfill");
     });
+    println!("Initializing background sync loop");
+    background_sync::spawn_sync_loop(
+        da_db.clone(),
+        idx_db.clone(),
+        vfk_registry.clone(),
+        fvk_service.clone(),
+    );
+
+    info!("Indexer running in SYNC mode; serving from index DB");
+
+    let app = api::router(api::AppState { db: idx_db, vfk_registry });
 
     let addr: SocketAddr = bind_addr.parse()?;
     info!("sov-indexer listening on {}", addr);
@@ -78,11 +104,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load FVK registry from:
-/// 1. FVK_CONFIG_FILE (JSON file with multiple FVKs)
-/// 2. Database (previously saved FVKs)
-/// 3. AUTHORITY_FVK env var (single FVK, backward compatible)
-async fn load_fvk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Result<FvkRegistry> {
+fn should_reset_index_db() -> bool {
+    matches!(
+        env::var("INDEX_DB_RESET").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// Load VFK registry from:
+/// 1. VFK_CONFIG_FILE (JSON file with multiple VFKs)
+/// 2. Database (previously saved VFKs)
+async fn load_vfk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Result<FvkRegistry> {
     let mut registry = FvkRegistry::new();
 
     // 1. Try loading from config file
@@ -123,20 +155,8 @@ async fn load_fvk_registry(idx_db: &sea_orm::DatabaseConnection) -> anyhow::Resu
         }
     }
 
-    // 3. Fallback: single AUTHORITY_FVK env var (backward compatible)
     if registry.is_empty() {
-        if let Some(fvk) = viewer::load_authority_fvk() {
-            info!("Using single AUTHORITY_FVK for decryption");
-            registry.add(fvk, None);
-            // Save to database
-            if let Err(e) = registry.save_to_db(idx_db).await {
-                warn!("Failed to save single FVK to database: {}", e);
-            }
-        }
-    }
-
-    if registry.is_empty() {
-        info!("No FVKs configured - encrypted notes will not be decrypted");
+        info!("No FVKs preconfigured (fvk_registry is empty)");
     } else {
         info!(
             "FVK registry initialized with {} keys - decryption enabled",

@@ -41,9 +41,11 @@ use tokio::time::sleep;
 use toml::Value as TomlValue;
 
 use crate::{
-    find_rollup_binary, load_authority_fvk, make_viewer_bundle, setup_ligero_env,
-    start_local_verifier, wait_for_ready, ChildGuard, LigeroEnv,
+    find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
+    ChildGuard, LigeroEnv,
 };
+use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
+use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -53,7 +55,7 @@ const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
 const MISSING_NOTE_RETRY_MAX: usize = 10;
 const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const INITIAL_DEPOSIT_AMOUNT: u128 = 100;
+const INITIAL_DEPOSIT_AMOUNT: u128 = 200;
 
 fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
     static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
@@ -78,21 +80,51 @@ fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::D
     Ok(pool)
 }
 
+/// Request body for prover service `/prove` endpoint.
+#[derive(Clone, serde::Serialize)]
+struct ProverServiceRequest {
+    circuit: String,
+    args: Vec<ligero_runner::LigeroArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof: Option<String>,
+    #[serde(rename = "privateIndices")]
+    private_indices: Vec<usize>,
+    /// Optional packing size (defaults to 8192 on server)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packing: Option<u32>,
+}
+
+/// Response body from prover service.
+#[derive(Clone, serde::Deserialize)]
+struct ProverServiceResponse {
+    success: bool,
+    #[serde(rename = "exitCode")]
+    exit_code: i32,
+    proof: Option<String>,
+    error: Option<String>,
+}
+
+
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
     num_wallets: usize,
     initial_deposit: bool,
+    /// Amount to deposit initially into each wallet.
+    deposit_amount: u128,
+    /// Amount to transfer in each cycle. Defaults to deposit_amount if not set.
+    transfer_amount: u128,
     per_tx_delay_ms: u64,
     cycle_delay_ms: u64,
     external_node_url: Option<String>,
     external_verifier_url: Option<String>,
+    /// Optional URL of the prover service (e.g., http://127.0.0.1:1313).
+    /// When set, proofs are generated via HTTP calls to this service instead of
+    /// the local daemon pool. This allows offloading proving to a remote GPU server.
+    prover_service_url: Option<String>,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
     continuous: bool,
     managed_mode: bool,
-    /// Authority Full Viewing Key for Level-B compliance.
-    /// When set, transfer proofs include viewer attestations and txs include encrypted notes.
-    authority_fvk: Option<Hash32>,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
     max_cycles: Option<u64>,
 }
@@ -110,6 +142,27 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
 
+        // Deposit amount configurable via DEPOSIT_AMOUNT env var, defaults to INITIAL_DEPOSIT_AMOUNT (200).
+        let deposit_amount = std::env::var("DEPOSIT_AMOUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(INITIAL_DEPOSIT_AMOUNT);
+
+        // Transfer amount defaults to deposit_amount if not specified.
+        // Must be <= deposit_amount to ensure sufficient funds.
+        let transfer_amount = std::env::var("TRANSFER_AMOUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(deposit_amount);
+
+        if transfer_amount > deposit_amount {
+            anyhow::bail!(
+                "TRANSFER_AMOUNT ({}) cannot be greater than DEPOSIT_AMOUNT ({})",
+                transfer_amount,
+                deposit_amount
+            );
+        }
+
         let per_tx_delay_ms = std::env::var("PER_TX_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -126,6 +179,13 @@ impl ContinuousConfig {
         let external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL")
             .ok()
             .or_else(|| Some("http://localhost:8080".to_string()));
+
+        // Prover service URL for remote proving (defaults to http://127.0.0.1:1313).
+        // Set PROVER_SERVICE_URL="" to use local daemon pool instead.
+        let prover_service_url = std::env::var("PROVER_SERVICE_URL")
+            .ok()
+            .map(|v| if v.is_empty() { None } else { Some(v) })
+            .unwrap_or_else(|| Some("http://127.0.0.1:1313".to_string()));
 
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
@@ -146,9 +206,6 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // Load authority viewing key for Level-B compliance
-        let authority_fvk = load_authority_fvk();
-
         let max_cycles = std::env::var("MAX_CYCLES")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -156,15 +213,17 @@ impl ContinuousConfig {
         Ok(Self {
             num_wallets,
             initial_deposit,
+            deposit_amount,
+            transfer_amount,
             per_tx_delay_ms,
             cycle_delay_ms,
             external_node_url,
             external_verifier_url,
+            prover_service_url,
             max_concurrent_proofs,
             detailed_wallet_logs,
             continuous,
             managed_mode,
-            authority_fvk,
             max_cycles,
         })
     }
@@ -538,13 +597,33 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} initial_deposit={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
         config.num_wallets,
         config.initial_deposit,
+        config.deposit_amount,
+        config.transfer_amount,
         config.per_tx_delay_ms,
         config.cycle_delay_ms,
         config.max_concurrent_proofs
     );
+
+    // Log if transfer_amount differs from deposit_amount (change notes will be created)
+    if config.transfer_amount != config.deposit_amount {
+        if config.transfer_amount < config.deposit_amount {
+            eprintln!(
+                "[config] Note: TRANSFER_AMOUNT ({}) < deposit_amount ({}). Change notes will be created.",
+                config.transfer_amount,
+                config.deposit_amount
+            );
+        } else {
+            eprintln!(
+                "[config] Note: TRANSFER_AMOUNT ({}) > deposit_amount ({}). Transfers will use full wallet balance.",
+                config.transfer_amount,
+                config.deposit_amount
+            );
+        }
+    }
+
     eprintln!(
         "[config] node_url={} verifier_url={} managed_mode={}",
         config
@@ -557,14 +636,24 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
-    if let Some(ref fvk) = config.authority_fvk {
+    if let Some(ref url) = config.prover_service_url {
+        eprintln!("[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)", url);
+    } else {
+        eprintln!("[config] Prover: local daemon pool (PROVER_SERVICE_URL=\"\")");
+    }
+
+    // If `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is set, export it as `POOL_FVK_PK` so the in-process
+    // verifier (when spawned) enforces pool-signed viewer commitments.
+    let pool_fvk_pk = ensure_pool_fvk_pk_env()?;
+    if let Some(pool_pk_bytes) = pool_fvk_pk {
         eprintln!(
-            "[config] AUTHORITY_FVK set: Level-B viewing attestations ENABLED (fvk={}...)",
-            hex::encode(&fvk[..8])
+            "[config] POOL_FVK_PK set: enforcing pool-signed viewer commitments (pk={}...)",
+            hex::encode(&pool_pk_bytes[..8]),
         );
     } else {
-        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+        eprintln!("[config] POOL_FVK_PK not set: pool signature enforcement DISABLED");
     }
+    let http = HttpClient::new();
 
     // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
     let ligero_env = setup_ligero_env()?;
@@ -594,7 +683,6 @@ pub async fn run() -> Result<()> {
     );
 
     let client = Arc::new(NodeClient::new_unchecked(&node_url));
-    let http = HttpClient::new();
 
     // Fetch chain hash for signing
     #[derive(Deserialize)]
@@ -685,6 +773,42 @@ pub async fn run() -> Result<()> {
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
 
+    // If pool enforcement is enabled, fetch one viewer FVK per wallet from midnight-fvk-service.
+    // Each wallet will include a distinct viewer commitment and pool signature in its proofs.
+    let viewer_bundles: Option<Arc<Vec<ViewerFvkBundle>>> = if pool_fvk_pk.is_some() {
+        eprintln!(
+            "[config] fetching {} viewer FVKs from midnight-fvk-service (1 per wallet)...",
+            wallets.len()
+        );
+
+        let mut out: Vec<ViewerFvkBundle> = Vec::with_capacity(wallets.len());
+        for (i, _w) in wallets.iter().enumerate() {
+            let bundle = fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?;
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "  [config] viewer wallet={} fvk_commitment=0x{}...",
+                    i,
+                    hex::encode(&bundle.fvk_commitment[..8])
+                );
+            }
+            out.push(bundle);
+        }
+
+        let first = out
+            .first()
+            .map(|b| format!("0x{}...", hex::encode(&b.fvk_commitment[..8])))
+            .unwrap_or_else(|| "<none>".to_string());
+        eprintln!(
+            "[config] pool viewer enabled: fetched {} FVKs (example commitment={})",
+            out.len(),
+            first
+        );
+        Some(Arc::new(out))
+    } else {
+        eprintln!("[config] pool viewer disabled: transfers will NOT emit viewer ciphertexts");
+        None
+    };
+
     // Optional initial deposits to create notes for each wallet
     if config.initial_deposit {
         eprintln!(
@@ -698,6 +822,7 @@ pub async fn run() -> Result<()> {
             &verifier_url,
             &mut wallets,
             &chain_hash,
+            config.deposit_amount,
             config.per_tx_delay_ms,
             config.detailed_wallet_logs,
         )
@@ -711,7 +836,7 @@ pub async fn run() -> Result<()> {
         );
         eprintln!(
             "[setup] Deposited {} tokens in each wallet in {:.2} ms",
-            INITIAL_DEPOSIT_AMOUNT, deposit_ms
+            config.deposit_amount, deposit_ms
         );
         eprintln!(
             "[setup] Total time for initial setup (wallets + deposits): {:.2} ms",
@@ -788,6 +913,7 @@ pub async fn run() -> Result<()> {
                 &chain_hash,
                 &program_path,
                 &config,
+                viewer_bundles.clone(),
                 &verifier_url,
                 &mut cached_tree,
                 &mut cached_next_position,
@@ -997,11 +1123,12 @@ async fn perform_initial_deposits(
     verifier_url: &str,
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
+    deposit_amount: u128,
     per_tx_delay_ms: u64,
     detailed_wallet_logs: bool,
 ) -> Result<()> {
     for (i, wallet) in wallets.iter_mut().enumerate() {
-        let amount: u128 = INITIAL_DEPOSIT_AMOUNT;
+        let amount: u128 = deposit_amount;
         let rho: Hash32 = rand::random();
         let spend_sk: Hash32 = rand::random();
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
@@ -1210,6 +1337,7 @@ async fn perform_transfer_cycle(
     chain_hash: &[u8; 32],
     program_path: &str,
     config: &ContinuousConfig,
+    viewer_bundles: Option<Arc<Vec<ViewerFvkBundle>>>,
     verifier_url: &str,
     cached_tree: &mut Option<MerkleTree>,
     cached_next_position: &mut u64,
@@ -1479,11 +1607,27 @@ async fn perform_transfer_cycle(
 
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 
+    /// Result from proof generation task containing note secrets for wallet update.
+    #[derive(Clone)]
+    struct ProofResult {
+        account_idx: usize,
+        proof_data: Vec<u8>,
+        /// Pay note: fresh recipient address
+        pay_value: u128,
+        pay_rho: Hash32,
+        pay_spend_sk: Hash32,
+        /// Change note (if any): same owner as input, fresh rho
+        change_value: u128,
+        change_rho: Option<Hash32>,
+    }
+
     let depth_usize = TREE_DEPTH as usize;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_proofs));
     let mut proof_tasks = Vec::with_capacity(inputs.len());
 
-    let authority_fvk = config.authority_fvk;
+    let viewer_bundles = viewer_bundles.clone();
+    let prover_service_url = config.prover_service_url.clone();
+    let transfer_amount = config.transfer_amount;
     for input in inputs.iter() {
         let account_idx = input.wallet_idx;
         let value = input.value;
@@ -1495,14 +1639,21 @@ async fn perform_transfer_cycle(
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
-        let authority_fvk = authority_fvk; // Copy for closure
+        let viewer_bundles = viewer_bundles.clone();
         let daemon_workers = config.max_concurrent_proofs;
         let client = client.clone();
+        let prover_service_url = prover_service_url.clone();
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
-            // Fetch deny-map openings (sender + pay recipient). The spend circuit binds to the
-            // current `blacklist_root` as a public input and requires, for each checked id:
+            // Calculate pay and change amounts
+            let pay_value = transfer_amount.min(value);
+            let change_value = value.saturating_sub(pay_value);
+            let has_change = change_value > 0;
+
+            // Fetch deny-map openings (sender + pay recipient + change recipient if needed).
+            // The spend circuit binds to the current `blacklist_root` as a public input and requires,
+            // for each checked id:
             // - bucket_entries[BLACKLIST_BUCKET_SIZE] (private)
             // - bucket_inv (private)
             // - siblings[BLACKLIST_TREE_DEPTH] (private)
@@ -1510,15 +1661,22 @@ async fn perform_transfer_cycle(
             let pk_spend_owner = pk_from_sk(&in_spend_sk);
             let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
 
-            // New output note parameters (chosen off-chain). We query the deny-map opening for the
-            // output address before proving so we can supply the correct sibling path.
-            let out_rho: Hash32 = rand::thread_rng().gen();
-            let out_spend_sk: Hash32 = rand::thread_rng().gen();
-            let out_pk_spend = pk_from_sk(&out_spend_sk);
-            let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
-            let out_addr = PrivacyAddress::from_keys(&out_pk_spend, &out_pk_ivk);
+            // Pay output note parameters (fresh recipient address)
+            let pay_rho: Hash32 = rand::thread_rng().gen();
+            let pay_spend_sk: Hash32 = rand::thread_rng().gen();
+            let pay_pk_spend = pk_from_sk(&pay_spend_sk);
+            let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &pay_spend_sk);
+            let pay_addr = PrivacyAddress::from_keys(&pay_pk_spend, &pay_pk_ivk);
 
-            let (sender_opening, out_opening) = tokio::try_join!(
+            // Change output note parameters (same owner as input, fresh rho)
+            let change_rho: Hash32 = rand::thread_rng().gen();
+            // Change note goes back to sender (same keys)
+            let change_pk_spend = pk_spend_owner;
+            let change_pk_ivk = pk_ivk_owner;
+
+            // Fetch blacklist openings for sender and pay recipient only.
+            // Change recipient is enforced to be self (sender) in-circuit, no separate check needed.
+            let (sender_opening, pay_opening) = tokio::try_join!(
                 async {
                     client
                         .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
@@ -1529,7 +1687,7 @@ async fn perform_transfer_cycle(
                 async {
                     client
                         .query_rest_endpoint::<midnight_privacy::BlacklistOpeningResponse>(&format!(
-                            "/modules/midnight-privacy/blacklist/opening/{out_addr}"
+                            "/modules/midnight-privacy/blacklist/opening/{pay_addr}"
                         ))
                         .await
                 }
@@ -1537,17 +1695,18 @@ async fn perform_transfer_cycle(
             .context("Failed to query deny-map openings")?;
 
             anyhow::ensure!(
-                sender_opening.blacklist_root == out_opening.blacklist_root,
-                "Deny-map root changed while fetching openings (sender vs output)"
+                sender_opening.blacklist_root == pay_opening.blacklist_root,
+                "Deny-map root changed while fetching openings (sender vs pay)"
             );
             let blacklist_root = sender_opening.blacklist_root;
 
             if sender_opening.is_blacklisted {
                 anyhow::bail!("Sender privacy address is frozen (blacklisted)");
             }
-            if out_opening.is_blacklisted {
-                anyhow::bail!("Output privacy address is frozen (blacklisted)");
+            if pay_opening.is_blacklisted {
+                anyhow::bail!("Pay recipient privacy address is frozen (blacklisted)");
             }
+            // Change recipient uses sender's address, already checked above
 
             let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
             anyhow::ensure!(
@@ -1557,44 +1716,92 @@ async fn perform_transfer_cycle(
                 bl_depth
             );
             anyhow::ensure!(
-                out_opening.siblings.len() == bl_depth,
-                "output deny-map opening has wrong sibling length: got {}, expected {}",
-                out_opening.siblings.len(),
+                pay_opening.siblings.len() == bl_depth,
+                "pay recipient deny-map opening has wrong sibling length: got {}, expected {}",
+                pay_opening.siblings.len(),
                 bl_depth
             );
             let sender_bl_bucket_entries = sender_opening.bucket_entries;
             let sender_bl_siblings = sender_opening.siblings;
-            let out_bl_bucket_entries = out_opening.bucket_entries;
-            let out_bl_siblings = out_opening.siblings;
+            let pay_bl_bucket_entries = pay_opening.bucket_entries;
+            let pay_bl_siblings = pay_opening.siblings;
 
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>, Hash32, Hash32)> {
+            tokio::task::spawn_blocking(
+                move || -> anyhow::Result<ProofResult> {
+                    let (viewer_fvk, pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
+                        let b = bundles.get(account_idx).ok_or_else(|| {
+                            anyhow!(
+                                "missing viewer bundle for wallet {account_idx} (have {} bundles)",
+                                bundles.len()
+                            )
+                        })?;
+                        (Some(b.fvk), Some(b.pool_sig_hex.clone()))
+                    } else {
+                        (None, None)
+                    };
+
                 let value_u64: u64 = value
                     .try_into()
                     .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
                 if value_u64 > i64::MAX as u64 {
                     bail!("note value does not fit into i64 (required by note_spend_guest v2 ABI)");
                 }
+                let pay_value_u64: u64 = pay_value
+                    .try_into()
+                    .context("pay value does not fit into u64")?;
+                let change_value_u64: u64 = change_value
+                    .try_into()
+                    .context("change value does not fit into u64")?;
 
                 // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
                 let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
                 let sender_id_out = in_recipient;
 
-                // New output note (same value, fresh rho + fresh address)
-                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
-                let cm_out = note_commitment(&DOMAIN, value_u64, &out_rho, &out_recipient, &sender_id_out);
+                // Pay output note (goes to fresh recipient)
+                let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
+                let cm_pay = note_commitment(&DOMAIN, pay_value_u64, &pay_rho, &pay_recipient, &sender_id_out);
+
+                // Change output note (goes back to owner)
+                let change_recipient = if has_change {
+                    recipient_from_pk_v2(&DOMAIN, &change_pk_spend, &change_pk_ivk)
+                } else {
+                    [0u8; 32] // unused
+                };
+                let cm_change = if has_change {
+                    note_commitment(&DOMAIN, change_value_u64, &change_rho, &change_recipient, &sender_id_out)
+                } else {
+                    [0u8; 32] // unused
+                };
 
                 // Nullifier is derived from spend_sk (nf_key is derived inside the circuit).
                 let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
                 let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
 
-                // Build viewer attestation if authority FVK is set
-                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
-                    let (att, _enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, value, &out_rho, &out_recipient, &sender_id_out, &cm_out,
+                // Build viewer attestations if pool viewer is configured.
+                // The circuit expects: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output.
+                // So view_attestations should include attestations for ALL outputs (pay + change if applicable).
+                let n_out: usize = if has_change { 2 } else { 1 };
+                let (view_attestations, viewer_data_list) = if let Some(fvk) = viewer_fvk {
+                    let (pay_att, _pay_enc) = make_viewer_bundle(
+                        &fvk, &DOMAIN, pay_value, &pay_rho, &pay_recipient, &sender_id_out, &cm_pay,
                     )?;
-                    (Some(vec![att.clone()]), Some((fvk, att)))
+                    if has_change {
+                        let (change_att, _change_enc) = make_viewer_bundle(
+                            &fvk, &DOMAIN, change_value, &change_rho, &change_recipient, &sender_id_out, &cm_change,
+                        )?;
+                        // Include attestations for BOTH outputs
+                        (Some(vec![pay_att.clone(), change_att.clone()]), Some(vec![(fvk, pay_att), (fvk, change_att)]))
+                    } else {
+                        (Some(vec![pay_att.clone()]), Some(vec![(fvk, pay_att)]))
+                    }
                 } else {
                     (None, None)
+                };
+
+                let output_commitments = if has_change {
+                    vec![cm_pay, cm_change]
+                } else {
+                    vec![cm_pay]
                 };
 
                 let public = SpendPublic {
@@ -1602,11 +1809,10 @@ async fn perform_transfer_cycle(
                     blacklist_root,
                     nullifier: nf,
                     withdraw_amount: 0,
-                    output_commitments: vec![cm_out],
+                    output_commitments,
                     view_attestations,
                 };
 
-                let n_out: usize = 1;
                 // LigeroConfig private indices are 1-based (by argument position).
                 let mut private_indices: Vec<usize> = Vec::new();
                 private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
@@ -1623,15 +1829,17 @@ async fn perform_transfer_cycle(
                     private_indices.push(11 + j);
                 }
 
-                // output 0 private args:
-                // value_out, rho_out, pk_spend_out, pk_ivk_out
-                let out_base = outs_base;
-                private_indices.extend_from_slice(&[
-                    out_base,         // value_out
-                    out_base + 1,     // rho_out
-                    out_base + 2,     // pk_spend_out
-                    out_base + 3,     // pk_ivk_out
-                ]);
+                // Output private args (5 args per output: value, rho, pk_spend, pk_ivk, commitment)
+                // value_out, rho_out, pk_spend_out, pk_ivk_out are private; commitment is public
+                for out_idx in 0..n_out {
+                    let out_base = outs_base + out_idx * 5;
+                    private_indices.extend_from_slice(&[
+                        out_base,         // value_out
+                        out_base + 1,     // rho_out
+                        out_base + 2,     // pk_spend_out
+                        out_base + 3,     // pk_ivk_out
+                    ]);
+                }
                 // inv_enforce (private)
                 let inv_enforce_idx = outs_base + 5 * n_out;
                 private_indices.push(inv_enforce_idx);
@@ -1639,19 +1847,26 @@ async fn perform_transfer_cycle(
                 // Deny-map (blacklist) section:
                 // - blacklist_root is PUBLIC (comes right after inv_enforce)
                 // - for each checked id: bucket_entries[BLACKLIST_BUCKET_SIZE] + bucket_inv + siblings[BLACKLIST_TREE_DEPTH]
+                // Note: Only 2 checks (sender + pay recipient). Change outputs are enforced to be self in-circuit.
                 let bl_root_idx = inv_enforce_idx + 1;
                 let bl_args_start = bl_root_idx + 1;
                 let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
                 let bl_per_check =
                     midnight_privacy::BLACKLIST_BUCKET_SIZE + 1usize + bl_depth;
-                let bl_checks = 2usize; // sender_id + pay recipient (transfer)
+                let bl_checks = 2usize; // sender_id + pay recipient (change is enforced to be self in-circuit)
                 for j in 0..(bl_checks * bl_per_check) {
                     private_indices.push(bl_args_start + j);
                 }
 
-                // Viewer section: fvk is private
-                if viewer_data.is_some() {
-                    let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
+                // Viewer section (Level B): n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for each output
+                let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
+                let fvk_commitment_arg_pos = if viewer_data_list.is_some() {
+                    Some(n_viewers_idx + 1)
+                } else {
+                    None
+                };
+                if viewer_data_list.is_some() {
+                    // FVK is private (at position n_viewers_idx + 2)
                     private_indices.push(n_viewers_idx + 2);
                 }
 
@@ -1681,19 +1896,34 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
                 host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
 
-                // output 0 (private except commitment)
-                host.add_u64_arg(value_u64);
-                host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_pk_spend));
-                host.add_hex_arg(hex::encode(out_pk_ivk));
-                host.add_hex_arg(hex::encode(cm_out));
+                // Pay output (output 0)
+                host.add_u64_arg(pay_value_u64);
+                host.add_hex_arg(hex::encode(pay_rho));
+                host.add_hex_arg(hex::encode(pay_pk_spend));
+                host.add_hex_arg(hex::encode(pay_pk_ivk));
+                host.add_hex_arg(hex::encode(cm_pay));
+
+                // Change output (output 1) if applicable
+                if has_change {
+                    host.add_u64_arg(change_value_u64);
+                    host.add_hex_arg(hex::encode(change_rho));
+                    host.add_hex_arg(hex::encode(change_pk_spend));
+                    host.add_hex_arg(hex::encode(change_pk_ivk));
+                    host.add_hex_arg(hex::encode(cm_change));
+                }
+
                 // inv_enforce (PRIVATE) - use the canonical formula from midnight_privacy
                 // Formula: Π(in_values) * Π(out_values) * Π(out_rho - in_rho)
+                let (out_values, out_rhos): (Vec<u64>, Vec<Hash32>) = if has_change {
+                    (vec![pay_value_u64, change_value_u64], vec![pay_rho, change_rho])
+                } else {
+                    (vec![pay_value_u64], vec![pay_rho])
+                };
                 let inv_enforce = inv_enforce_v2(
                     &[value_u64],   // in_values
                     &[in_rho],      // in_rhos
-                    &[value_u64],   // out_values (same as in for value conservation)
-                    &[out_rho],     // out_rhos
+                    &out_values,    // out_values
+                    &out_rhos,      // out_rhos
                 );
                 host.add_hex_arg(hex::encode(inv_enforce));
 
@@ -1701,6 +1931,7 @@ async fn perform_transfer_cycle(
                 //   blacklist_root (PUBLIC)
                 //   sender check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
                 //   pay recipient check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
+                //   change recipient check (if applicable): bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
                 let bucket_inv_for_id =
                     |id: &Hash32, bucket_entries: &[Hash32]| -> anyhow::Result<Hash32> {
                         anyhow::ensure!(
@@ -1729,6 +1960,7 @@ async fn perform_transfer_cycle(
                     };
 
                 host.add_hex_arg(hex::encode(blacklist_root));
+                // Sender check
                 for e in &sender_bl_bucket_entries {
                     host.add_hex_arg(hex::encode(e));
                 }
@@ -1738,97 +1970,236 @@ async fn perform_transfer_cycle(
                 for sib in sender_bl_siblings.iter().take(bl_depth) {
                     host.add_hex_arg(hex::encode(sib));
                 }
-                for e in &out_bl_bucket_entries {
+                // Pay recipient check
+                for e in &pay_bl_bucket_entries {
                     host.add_hex_arg(hex::encode(e));
                 }
-                let out_bucket_inv = bucket_inv_for_id(&out_recipient, &out_bl_bucket_entries)?;
-                host.add_hex_arg(hex::encode(out_bucket_inv));
-                for sib in out_bl_siblings.iter().take(bl_depth) {
+                let pay_bucket_inv = bucket_inv_for_id(&pay_recipient, &pay_bl_bucket_entries)?;
+                host.add_hex_arg(hex::encode(pay_bucket_inv));
+                for sib in pay_bl_siblings.iter().take(bl_depth) {
                     host.add_hex_arg(hex::encode(sib));
                 }
+                // Note: Change recipient blacklist check is NOT needed - the circuit enforces
+                // that change outputs go back to the sender (self) in-circuit.
 
                 // Viewer section (Level-B)
-                if let Some((ref fvk, ref att)) = viewer_data {
-                    host.add_u64_arg(1); // m_viewers
-                    host.add_hex_arg(hex::encode(att.fvk_commitment));
-                    host.add_hex_arg(hex::encode(fvk));
-                    host.add_hex_arg(hex::encode(att.ct_hash));
-                    host.add_hex_arg(hex::encode(att.mac));
+                // Structure: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output
+                if let Some(ref data_list) = viewer_data_list {
+                    host.add_u64_arg(1u64); // n_viewers = 1 (number of distinct FVKs)
+                    // Use the first attestation for fvk_commitment and fvk
+                    if let Some((fvk, att)) = data_list.first() {
+                        host.add_hex_arg(hex::encode(att.fvk_commitment));
+                        host.add_hex_arg(hex::encode(fvk));
+                    }
+                    // Add ct_hash + mac for EACH output
+                    for (_fvk, att) in data_list.iter().take(n_out) {
+                        host.add_hex_arg(hex::encode(att.ct_hash));
+                        host.add_hex_arg(hex::encode(att.mac));
+                    }
                 }
 
                     host.set_public_output(&public)
                         .context("set public output (round 2)")?;
 
-                // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
-                let proof_data = (|| -> anyhow::Result<Vec<u8>> {
-                    let public_output = host.require_public_output()?;
-                    let cfg = host.runner().config().clone();
-                    let mut cfg_json = serde_json::to_value(&cfg)?;
+                // Generate proof via either prover service (HTTP) or local daemon pool.
+                let proof_data = if let Some(ref service_url) = prover_service_url {
+                    // Use remote prover service via blocking HTTP call.
+                    (|| -> anyhow::Result<Vec<u8>> {
+                        let public_output = host.require_public_output()?;
+                        let cfg = host.runner().config().clone();
+                        let args = cfg.args.clone();
+                        let private_indices = cfg.private_indices.clone();
 
-                    // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
-                    // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
-                    if let serde_json::Value::Object(ref mut map) = cfg_json {
-                        if let Some(serde_json::Value::String(program)) =
-                            map.get("program").cloned()
-                        {
-                            let resolved = ligero_runner::resolve_program(&program)
-                                .with_context(|| format!("Failed to resolve program '{program}'"))?;
+                        // Resolve program path to ensure consistency with what the HTTP server expects.
+                        // The server's resolve_circuit handles names like "note_spend_guest".
+                        let circuit_name = cfg.program.clone();
+
+                        // Create blocking HTTP client for the prover service call.
+                        let blocking_client = reqwest::blocking::Client::new();
+                        let url = format!("{}/prove", service_url.trim_end_matches('/'));
+
+                        let request = ProverServiceRequest {
+                            circuit: circuit_name,
+                            args: args.clone(),
+                            proof: None,
+                            private_indices: private_indices.clone(),
+                            packing: Some(cfg.packing),
+                        };
+
+                        // Retry logic for transient failures (timeouts, connection errors)
+                        const MAX_RETRIES: u32 = 3;
+                        const RETRY_DELAY_MS: u64 = 2000;
+
+                        let mut last_error: Option<anyhow::Error> = None;
+                        let mut body: Option<ProverServiceResponse> = None;
+
+                        for attempt in 1..=MAX_RETRIES {
+                            match blocking_client.post(&url).json(&request).send() {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    match resp.json::<ProverServiceResponse>() {
+                                        Ok(parsed) => {
+                                            if !status.is_success() || !parsed.success {
+                                                last_error = Some(anyhow::anyhow!(
+                                                    "Prover service returned error (status={}, exit_code={}): {}",
+                                                    status,
+                                                    parsed.exit_code,
+                                                    parsed.error.clone().unwrap_or_else(|| "unknown error".to_string())
+                                                ));
+                                                // Don't retry on application-level errors
+                                                body = Some(parsed);
+                                                break;
+                                            }
+                                            body = Some(parsed);
+                                            last_error = None;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_error = Some(anyhow::anyhow!("Failed to parse prover service response: {}", e));
+                                            // Don't retry parse errors
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    last_error = Some(anyhow::anyhow!("Failed to send request to prover service: {}", e));
+                                    if attempt < MAX_RETRIES {
+                                        eprintln!(
+                                            "[warn] Prover service request failed (attempt {}/{}): {}. Retrying in {}ms...",
+                                            attempt,
+                                            MAX_RETRIES,
+                                            e,
+                                            RETRY_DELAY_MS
+                                        );
+                                        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(err) = last_error {
+                            return Err(err);
+                        }
+
+                        let body = body.ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
+
+                        let proof_b64 = body
+                            .proof
+                            .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
+
+                        let proof_bytes = BASE64_STANDARD
+                            .decode(&proof_b64)
+                            .context("Failed to decode base64 proof from prover service")?;
+
+                        let args_json = serde_json::to_vec(&args)?;
+                        let pkg = ligero_runner::LigeroProofPackage::new(
+                            proof_bytes,
+                            public_output,
+                            args_json,
+                            private_indices,
+                        )?;
+                        Ok(bincode::serialize(&pkg)?)
+                    })()
+                    .context("generate transfer proof via prover service")?
+                } else {
+                    // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
+                    (|| -> anyhow::Result<Vec<u8>> {
+                        let public_output = host.require_public_output()?;
+                        let cfg = host.runner().config().clone();
+                        let mut cfg_json = serde_json::to_value(&cfg)?;
+
+                        // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
+                        // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
+                        if let serde_json::Value::Object(ref mut map) = cfg_json {
+                            if let Some(serde_json::Value::String(program)) =
+                                map.get("program").cloned()
+                            {
+                                let resolved = ligero_runner::resolve_program(&program)
+                                    .with_context(|| format!("Failed to resolve program '{program}'"))?;
+                                map.insert(
+                                    "program".to_string(),
+                                    serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                                );
+                            }
+                        }
+
+                        // Provide an explicit, unique proof output path to the daemon.
+                        // Relying on the daemon's internal temp-path generator can collide across
+                        // multiple daemon processes started at the same time (same timestamp + per-process counter).
+                        let tmp = tempfile::tempdir()?;
+                        let proof_path = tmp.path().join("proof_data.bin");
+                        if let serde_json::Value::Object(ref mut map) = cfg_json {
                             map.insert(
-                                "program".to_string(),
-                                serde_json::Value::String(resolved.to_string_lossy().to_string()),
+                                "proof-path".to_string(),
+                                serde_json::Value::String(proof_path.to_string_lossy().to_string()),
+                            );
+                            // Request uncompressed proofs: this significantly reduces CPU overhead
+                            // (gzip compress/decompress) while keeping proving/verifying correctness.
+                            map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
+                        }
+
+                        let pool = prover_daemon_pool(daemon_workers)
+                            .context("initialize ligero prover daemon pool")?;
+
+                        let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
+                        if !resp.ok {
+                            anyhow::bail!(
+                                "prover daemon returned ok=false (exit_code={:?}): {}",
+                                resp.exit_code,
+                                resp.error.unwrap_or_else(|| "unknown error".to_string())
                             );
                         }
+
+                        let proof_bytes = std::fs::read(&proof_path)
+                            .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
+                        drop(tmp);
+
+                        let args_json = serde_json::to_vec(&cfg.args)?;
+                        let pkg = ligero_runner::LigeroProofPackage::new(
+                            proof_bytes,
+                            public_output,
+                            args_json,
+                            cfg.private_indices.clone(),
+                        )?;
+                        Ok(bincode::serialize(&pkg)?)
+                    })()
+                    .context("generate transfer proof via daemon")?
+                };
+
+                let proof_data = if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
+                    if viewer_data_list.is_none() {
+                        bail!("POOL_FVK_PK is set but viewer section is missing in transfer proof args");
                     }
-
-                    // Provide an explicit, unique proof output path to the daemon.
-                    // Relying on the daemon's internal temp-path generator can collide across
-                    // multiple daemon processes started at the same time (same timestamp + per-process counter).
-                    let tmp = tempfile::tempdir()?;
-                    let proof_path = tmp.path().join("proof_data.bin");
-                    if let serde_json::Value::Object(ref mut map) = cfg_json {
-                        map.insert(
-                            "proof-path".to_string(),
-                            serde_json::Value::String(proof_path.to_string_lossy().to_string()),
-                        );
-                        // Request uncompressed proofs: this significantly reduces CPU overhead
-                        // (gzip compress/decompress) while keeping proving/verifying correctness.
-                        map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
-                    }
-
-                    let pool = prover_daemon_pool(daemon_workers)
-                        .context("initialize ligero prover daemon pool")?;
-
-                    let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
-                    if !resp.ok {
-                        anyhow::bail!(
-                            "prover daemon returned ok=false (exit_code={:?}): {}",
-                            resp.exit_code,
-                            resp.error.unwrap_or_else(|| "unknown error".to_string())
-                        );
-                    }
-
-                    let proof_bytes = std::fs::read(&proof_path)
-                        .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
-                    drop(tmp);
-
-                    let args_json = serde_json::to_vec(&cfg.args)?;
-                    let pkg = ligero_runner::LigeroProofPackage::new(
-                        proof_bytes,
-                        public_output,
-                        args_json,
-                        cfg.private_indices.clone(),
-                    )?;
-                    Ok(bincode::serialize(&pkg)?)
-                })()
-                .context("generate second-round transfer proof via daemon")?;
-                Ok((account_idx, proof_data, out_rho, out_spend_sk))
-            })
+                    let fvk_commitment_arg_pos = fvk_commitment_arg_pos.ok_or_else(|| {
+                        anyhow!(
+                            "POOL_FVK_PK is set but fvk_commitment_arg_pos is missing (viewer section not enabled)"
+                        )
+                    })?;
+                    inject_pool_sig_hex_into_proof_bytes(
+                        proof_data,
+                        fvk_commitment_arg_pos,
+                        pool_sig_hex.clone(),
+                    )?
+                } else {
+                    proof_data
+                };
+                Ok(ProofResult {
+                    account_idx,
+                    proof_data,
+                    pay_value,
+                    pay_rho,
+                    pay_spend_sk,
+                    change_value,
+                    change_rho: if has_change { Some(change_rho) } else { None },
+                })
+                },
+            )
             .await
             .expect("spawn_blocking join failed")
         }));
     }
 
-    let mut proofs: Vec<(usize, Vec<u8>, Hash32, Hash32)> = Vec::with_capacity(inputs.len());
+    let mut proofs: Vec<ProofResult> = Vec::with_capacity(inputs.len());
     for t in proof_tasks {
         proofs.push(t.await??);
     }
@@ -1865,53 +2236,112 @@ async fn perform_transfer_cycle(
         tx_hash: String,
         tx_b64: String,
         new_nonce: u64,
+        /// The note secrets for the wallet's next spendable note.
+        /// For full transfers: this is the pay note (recipient)
+        /// For partial transfers with change: this is the change note (back to owner)
+        new_value: u128,
         new_rho: Hash32,
         new_spend_sk: Hash32,
         new_sender_id: Hash32,
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
-    for (i, (wallet_idx, proof_bytes, out_rho, out_spend_sk)) in proofs.into_iter().enumerate() {
+    for (i, proof_result) in proofs.into_iter().enumerate() {
+        let wallet_idx = proof_result.account_idx;
+        let proof_bytes = proof_result.proof_data;
+        let pay_value = proof_result.pay_value;
+        let pay_rho = proof_result.pay_rho;
+        let pay_spend_sk = proof_result.pay_spend_sk;
+        let change_value = proof_result.change_value;
+        let change_rho = proof_result.change_rho;
+        let has_change = change_rho.is_some();
+
         let wallet = wallets[wallet_idx].clone();
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;
-        let authority_fvk = authority_fvk; // Copy for closure
-        let value = wallet.value; // The output value (same as input for pure transfer)
+        let viewer_fvk = if let Some(ref bundles) = viewer_bundles {
+            let b = bundles.get(wallet_idx).ok_or_else(|| {
+                anyhow!(
+                    "missing viewer bundle for wallet {wallet_idx} (have {} bundles)",
+                    bundles.len()
+                )
+            })?;
+            Some(b.fvk)
+        } else {
+            None
+        };
         build_tasks.push(tokio::task::spawn_blocking(
             move || -> anyhow::Result<BuiltTransfer> {
                 let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
                 let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
 
-                let value_u64: u64 = value.try_into().context(
-                    "note value does not fit into u64 (required by note_spend_guest v2)",
+                let pay_value_u64: u64 = pay_value.try_into().context(
+                    "pay value does not fit into u64 (required by note_spend_guest v2)",
                 )?;
-                let out_pk_spend = pk_from_sk(&out_spend_sk);
-                let out_pk_ivk = pk_ivk_from_sk(&DOMAIN, &out_spend_sk);
-                let out_recipient = recipient_from_pk_v2(&DOMAIN, &out_pk_spend, &out_pk_ivk);
+
+                // Pay output goes to fresh recipient
+                let pay_pk_spend = pk_from_sk(&pay_spend_sk);
+                let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &pay_spend_sk);
+                let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
+
+                // Owner keys for sender_id calculation
                 let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
+
                 let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
 
-                // Build encrypted note for authority if configured
-                let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+                // Build encrypted notes for pool viewer if configured.
+                // Encrypt both pay output and change output (if applicable).
+                let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
                     Some(fvk) => {
-                        let cm_out = note_commitment(
+                        let mut ciphertexts = Vec::new();
+                        
+                        // Pay note ciphertext
+                        let cm_pay = note_commitment(
                             &DOMAIN,
-                            value_u64,
-                            &out_rho,
-                            &out_recipient,
+                            pay_value_u64,
+                            &pay_rho,
+                            &pay_recipient,
                             &sender_id,
                         );
                         let (_att, enc) = make_viewer_bundle(
                             &fvk,
                             &DOMAIN,
-                            value,
-                            &out_rho,
-                            &out_recipient,
+                            pay_value,
+                            &pay_rho,
+                            &pay_recipient,
                             &sender_id,
-                            &cm_out,
+                            &cm_pay,
                         )?;
-                        Some(vec![enc])
+                        ciphertexts.push(enc);
+
+                        // Change note ciphertext (if applicable)
+                        if let Some(change_rho_val) = change_rho {
+                            let change_value_u64: u64 = change_value.try_into().context(
+                                "change value does not fit into u64",
+                            )?;
+                            let pk_spend_owner = pk_from_sk(&wallet.spend_sk);
+                            let change_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
+                            let cm_change = note_commitment(
+                                &DOMAIN,
+                                change_value_u64,
+                                &change_rho_val,
+                                &change_recipient,
+                                &sender_id,
+                            );
+                            let (_att, enc) = make_viewer_bundle(
+                                &fvk,
+                                &DOMAIN,
+                                change_value,
+                                &change_rho_val,
+                                &change_recipient,
+                                &sender_id,
+                                &cm_change,
+                            )?;
+                            ciphertexts.push(enc);
+                        }
+
+                        Some(ciphertexts)
                     }
                     None => None,
                 };
@@ -1945,15 +2375,40 @@ async fn perform_transfer_cycle(
                 let tx_b64 = BASE64_STANDARD.encode(&tx_bytes);
 
                 if detailed_logs {
-                    eprintln!(
-                        "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={}",
-                        wallet_idx,
-                        i + 1,
-                        wallet.nonce,
-                        tx_hash,
-                        hex::encode(&nf[..8])
-                    );
+                    if has_change {
+                        eprintln!(
+                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={} pay={} change={}",
+                            wallet_idx,
+                            i + 1,
+                            wallet.nonce,
+                            tx_hash,
+                            hex::encode(&nf[..8]),
+                            pay_value,
+                            change_value
+                        );
+                    } else {
+                        eprintln!(
+                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={} value={}",
+                            wallet_idx,
+                            i + 1,
+                            wallet.nonce,
+                            tx_hash,
+                            hex::encode(&nf[..8]),
+                            pay_value
+                        );
+                    }
                 }
+
+                // Determine which note the wallet should track for the next cycle:
+                // - If there's change: track the change note (wallet keeps same keys, new rho)
+                // - If no change (full transfer): track the pay note (wallet adopts new keys)
+                let (new_value, new_rho, new_spend_sk) = if let Some(change_rho_val) = change_rho {
+                    // Partial transfer: wallet keeps the change note
+                    (change_value, change_rho_val, wallet.spend_sk)
+                } else {
+                    // Full transfer: wallet adopts the pay note (new identity)
+                    (pay_value, pay_rho, pay_spend_sk)
+                };
 
                 Ok(BuiltTransfer {
                     idx: i,
@@ -1961,8 +2416,9 @@ async fn perform_transfer_cycle(
                     tx_hash,
                     tx_b64,
                     new_nonce: wallet.nonce + 1,
-                    new_rho: out_rho,
-                    new_spend_sk: out_spend_sk,
+                    new_value,
+                    new_rho,
+                    new_spend_sk,
                     new_sender_id: sender_id,
                 })
             },
@@ -1980,6 +2436,7 @@ async fn perform_transfer_cycle(
         transfer_txs_b64.push((b.wallet_idx, b.tx_b64));
         let w = &mut wallets[b.wallet_idx];
         w.nonce = b.new_nonce;
+        w.value = b.new_value;
         w.rho = b.new_rho;
         w.spend_sk = b.new_spend_sk;
         eprintln!(

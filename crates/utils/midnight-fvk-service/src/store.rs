@@ -190,6 +190,29 @@ impl FvkStore {
 
         Ok(())
     }
+
+    pub async fn get_fvk_by_commitment(&self, fvk_commitment: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        let row: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT fvk
+            FROM issued_fvks
+            WHERE fvk_commitment = ?1
+            "#,
+        )
+        .bind(fvk_commitment.as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .context("select fvk by commitment")?;
+
+        let Some(bytes) = row else {
+            return Ok(None);
+        };
+        let len = bytes.len();
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow!("fvk must be 32 bytes (got {len})"))?;
+        Ok(Some(bytes))
+    }
 }
 
 fn sqlite_returning_unsupported(err: &sqlx::Error) -> bool {

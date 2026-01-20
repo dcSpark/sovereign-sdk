@@ -145,6 +145,23 @@
  *   where bl_checks = 1 + (withdraw_amount == 0 ? 1 : 0)
  * (argc includes argv[0]).
  *
+ * --- Level B: Viewer Attestations (optional; appended after blacklist args) ---
+ *
+ *   n_viewers          — i64 (PUBLIC; number of viewers, 0..=MAX_VIEWERS)
+ *
+ *   For each viewer v in [0..n_viewers):
+ *     fvk_commit_v      — 32 bytes (PUBLIC)  = H("FVK_COMMIT_V1" || fvk_v)
+ *     fvk_v             — 32 bytes (PRIVATE) viewer key material (NOT required for verification)
+ *
+ *     For each output j in [0..n_out):
+ *       ct_hash_v_j     — 32 bytes (PUBLIC)  = H("CT_HASH_V1" || ct_v_j)
+ *       mac_v_j         — 32 bytes (PUBLIC)  = H("VIEW_MAC_V1" || k_v_j || cm_out_j || ct_hash_v_j)
+ *
+ * Notes:
+ *   - The verifier MUST NOT require the real `fvk_v`. Only `fvk_commit_v` is public.
+ *   - Ensure your runner marks each `fvk_v` argv index as PRIVATE (witness) so verification
+ *     only needs the public commitments and digests.
+ *
  * SECURITY NOTES:
  *   1) All validation paths inject UNSAT constraints before exit (hard_fail)
  *   2) Balance check uses field-level constraint, not runtime boolean comparison
@@ -164,8 +181,8 @@
 
 // Ligetron SDK imports
 use ligetron::api::{get_args, ArgHolder};
-use ligetron::bn254fr::{addmod_checked, submod_checked, Bn254Fr};
-use ligetron::poseidon2::poseidon2_hash_bytes;
+use ligetron::bn254fr::{addmod_checked, mulmod_checked, submod_checked, Bn254Fr};
+use ligetron::poseidon2::{poseidon2_hash_bytes, Poseidon2Context};
 
 /// Exit the program with the given code.
 fn exit_with_code(code: i32) -> ! {
@@ -237,6 +254,39 @@ impl Poseidon2Core {
         let digest = self.hash_padded_fr(preimage);
         bn254fr_to_hash32(&digest)
     }
+
+    /// Return Poseidon2 digest as a field element from byte field elements.
+    #[inline(always)]
+    pub fn hash_padded_fr_bytes(&self, preimage: &[Bn254Fr]) -> Bn254Fr {
+        let mut ctx = Poseidon2Context::new();
+        let mut offset = 0usize;
+
+        // Process full 31-byte blocks.
+        while preimage.len().saturating_sub(offset) >= 31 {
+            let chunk_fr = bytes_to_fr_be(&preimage[offset..offset + 31]);
+            ctx.digest_update(&chunk_fr);
+            offset += 31;
+        }
+
+        // Final block: remaining bytes + 0x80 + zero padding.
+        let mut block: Vec<Bn254Fr> = Vec::with_capacity(31);
+        block.extend_from_slice(&preimage[offset..]);
+        block.push(Bn254Fr::from_u32(0x80));
+        while block.len() < 31 {
+            block.push(Bn254Fr::from_u32(0));
+        }
+        let last_fr = bytes_to_fr_be(&block);
+        ctx.digest_update(&last_fr);
+
+        ctx.digest_final_no_pad()
+    }
+
+    /// Return Poseidon2 digest as 32-byte BE (field bytes) from byte field elements.
+    #[inline(always)]
+    pub fn hash_padded_bytes_frs(&self, preimage: &[Bn254Fr]) -> [Bn254Fr; 32] {
+        let digest = self.hash_padded_fr_bytes(preimage);
+        fr_to_bytes_be_bits(&digest)
+    }
 }
 
 /// Convert a Bn254Fr field element to a 32-byte hash.
@@ -271,6 +321,121 @@ fn assert_fr_eq_hash32(computed: &Bn254Fr, expected_be: &Hash32) {
     // without evaluating private inputs: parsing bytes into a field element via `set_bytes_big`
     // does *not* by itself constrain the value to equal those bytes.
     Bn254Fr::assert_equal_bytes_be(computed, expected_be);
+}
+
+// ============================================================================
+// BYTE/FR HELPERS (Constraint-friendly)
+// ============================================================================
+
+/// Pack up to 31 byte field elements into a single field element (big-endian).
+#[inline(always)]
+fn bytes_to_fr_be(bytes: &[Bn254Fr]) -> Bn254Fr {
+    let mut acc = Bn254Fr::from_u32(0);
+    let base = Bn254Fr::from_u32(256);
+    for b in bytes {
+        let mut tmp = Bn254Fr::new();
+        mulmod_checked(&mut tmp, &acc, &base);
+        addmod_checked(&mut acc, &tmp, b);
+    }
+    acc
+}
+
+#[inline(always)]
+fn bits_to_byte_fr(bits: &[Bn254Fr; 8]) -> Bn254Fr {
+    let pow2: [Bn254Fr; 8] = std::array::from_fn(|i| Bn254Fr::from_u32(1u32 << i));
+    let mut out = Bn254Fr::from_u32(0);
+    for i in 0..8 {
+        let mut term = Bn254Fr::new();
+        mulmod_checked(&mut term, &bits[i], &pow2[i]);
+        out.addmod_checked(&term);
+    }
+    out
+}
+
+/// Convert a field element into 32 byte field elements (big-endian) via bit decomposition.
+#[inline(always)]
+fn fr_to_bytes_be_bits(x: &Bn254Fr) -> [Bn254Fr; 32] {
+    let mut out: [Bn254Fr; 32] = std::array::from_fn(|_| Bn254Fr::new());
+    let bits = x.to_bits(254); // LSB-first
+    let zero = Bn254Fr::from_u32(0);
+
+    for i in 0..32 {
+        let mut byte_bits: [Bn254Fr; 8] = std::array::from_fn(|_| Bn254Fr::new());
+        for j in 0..8 {
+            let bit_idx = i * 8 + j;
+            if bit_idx < bits.len() {
+                byte_bits[j] = bits[bit_idx].clone();
+            } else {
+                byte_bits[j] = zero.clone();
+            }
+        }
+        let byte_fr = bits_to_byte_fr(&byte_bits);
+        out[31 - i] = byte_fr;
+    }
+    out
+}
+
+/// Convert a 32-byte array into field-byte elements (byte value only).
+#[inline(always)]
+fn hash32_to_fr_bytes(h: &Hash32) -> [Bn254Fr; 32] {
+    let mut out: [Bn254Fr; 32] = std::array::from_fn(|_| Bn254Fr::new());
+    for i in 0..32 {
+        out[i].set_bytes_big(&h[i..i + 1]);
+    }
+    out
+}
+
+/// Convert a private 32-byte array into field-byte elements and enforce 8-bit range.
+#[inline(always)]
+fn hash32_to_fr_bytes_range_checked(h: &Hash32) -> [Bn254Fr; 32] {
+    let out = hash32_to_fr_bytes(h);
+    for i in 0..32 {
+        let _ = out[i].to_bits(8);
+    }
+    out
+}
+
+/// Convert a public 32-byte array into field-byte elements and bind each byte.
+#[inline(always)]
+fn hash32_to_fr_bytes_constrained(h: &Hash32) -> [Bn254Fr; 32] {
+    let out = hash32_to_fr_bytes(h);
+    for i in 0..32 {
+        Bn254Fr::assert_equal_bytes_be(&out[i], &h[i..i + 1]);
+    }
+    out
+}
+
+/// Convert a 144-byte array into field-byte elements (byte value only).
+#[inline(always)]
+fn bytes144_to_fr_bytes(bytes: &[u8; NOTE_PLAIN_LEN]) -> [Bn254Fr; NOTE_PLAIN_LEN] {
+    let mut out: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
+    for i in 0..NOTE_PLAIN_LEN {
+        out[i].set_bytes_big(&bytes[i..i + 1]);
+    }
+    out
+}
+
+/// XOR two byte field elements using bit-level constraints.
+#[inline(always)]
+fn xor_byte_fr(a: &Bn254Fr, b: &Bn254Fr) -> Bn254Fr {
+    let a_bits = a.to_bits(8);
+    let b_bits = b.to_bits(8);
+    let two = Bn254Fr::from_u32(2);
+    let mut out_bits: [Bn254Fr; 8] = std::array::from_fn(|_| Bn254Fr::new());
+
+    for i in 0..8 {
+        let mut ab = Bn254Fr::new();
+        mulmod_checked(&mut ab, &a_bits[i], &b_bits[i]);
+        let mut sum = Bn254Fr::new();
+        addmod_checked(&mut sum, &a_bits[i], &b_bits[i]);
+        let mut two_ab = Bn254Fr::new();
+        mulmod_checked(&mut two_ab, &ab, &two);
+        let mut out = Bn254Fr::new();
+        submod_checked(&mut out, &sum, &two_ab);
+        out_bits[i] = out;
+    }
+
+    bits_to_byte_fr(&out_bits)
 }
 
 // ============================================================================
@@ -380,6 +545,8 @@ fn read_u32(args: &ArgHolder, index: usize, fail_code: u32) -> u32 {
     v as u32
 }
 
+// (intentionally no public hash -> field helper; use read_hash32 + assert_fr_eq_hash32)
+
 // ============================================================================
 // OPTIMIZED HASH FUNCTIONS: Fixed-size buffers, single hasher instance
 // Each hash type has a dedicated function with exact buffer size.
@@ -459,7 +626,12 @@ fn pk_from_sk(h: &Poseidon2Core, spend_sk: &Hash32) -> Hash32 {
 /// recipient_addr = H("ADDR_V2" || domain || pk_spend || pk_ivk)
 /// Fixed 103-byte preimage.
 #[inline(always)]
-fn recipient_from_pk(h: &Poseidon2Core, domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+fn recipient_from_pk(
+    h: &Poseidon2Core,
+    domain: &Hash32,
+    pk_spend: &Hash32,
+    pk_ivk: &Hash32,
+) -> Hash32 {
     let mut buf = [0u8; ADDR_BUF_LEN];
     buf[..7].copy_from_slice(b"ADDR_V2");
     buf[7..39].copy_from_slice(domain);
@@ -535,110 +707,121 @@ fn root_from_path_field_level(
 
 /// FVK commitment: H("FVK_COMMIT_V1" || fvk)
 /// Fixed 45-byte preimage.
-
-fn fvk_commit_fr(h: &Poseidon2Core, fvk: &Hash32) -> Bn254Fr {
-    let mut buf = [0u8; FVK_COMMIT_BUF_LEN];
-    buf[..13].copy_from_slice(b"FVK_COMMIT_V1");
-    buf[13..45].copy_from_slice(fvk);
-    h.hash_padded_fr(&buf)
+fn fvk_commit_fr(h: &Poseidon2Core, fvk: &[Bn254Fr; 32]) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(FVK_COMMIT_BUF_LEN);
+    for b in b"FVK_COMMIT_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(fvk);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// View KDF: H("VIEW_KDF_V1" || fvk || cm)
 /// Fixed 75-byte preimage.
-
-fn view_kdf(h: &Poseidon2Core, fvk: &Hash32, cm: &Hash32) -> Hash32 {
-    let mut buf = [0u8; VIEW_KDF_BUF_LEN];
-    buf[..11].copy_from_slice(b"VIEW_KDF_V1");
-    buf[11..43].copy_from_slice(fvk);
-    buf[43..75].copy_from_slice(cm);
-    h.hash_padded(&buf)
+fn view_kdf(h: &Poseidon2Core, fvk: &[Bn254Fr; 32], cm: &[Bn254Fr; 32]) -> [Bn254Fr; 32] {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_KDF_BUF_LEN);
+    for b in b"VIEW_KDF_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(fvk);
+    buf.extend_from_slice(cm);
+    h.hash_padded_bytes_frs(&buf)
 }
 
 /// Stream block: H("VIEW_STREAM_V1" || k || ctr)
 /// Fixed 50-byte preimage.
-
-fn stream_block(h: &Poseidon2Core, k: &Hash32, ctr: u32) -> Hash32 {
-    let mut buf = [0u8; VIEW_STREAM_BUF_LEN];
-    buf[..14].copy_from_slice(b"VIEW_STREAM_V1");
-    buf[14..46].copy_from_slice(k);
-    buf[46..50].copy_from_slice(&ctr.to_le_bytes());
-    h.hash_padded(&buf)
+fn stream_block(h: &Poseidon2Core, k: &[Bn254Fr; 32], ctr: u32) -> [Bn254Fr; 32] {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_STREAM_BUF_LEN);
+    for b in b"VIEW_STREAM_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(k);
+    for b in ctr.to_le_bytes() {
+        buf.push(Bn254Fr::from_u32(b as u32));
+    }
+    h.hash_padded_bytes_frs(&buf)
 }
 
 /// Stream XOR encrypt for exactly 144 bytes (NOTE_PLAIN_LEN).
 /// Optimized: 5 hash calls for 144 bytes (4 full blocks + 16-byte remainder).
-
-fn stream_xor_encrypt_144(h: &Poseidon2Core, k: &Hash32, pt: &[u8; 144], ct_out: &mut [u8; 144]) {
+fn stream_xor_encrypt_144(
+    h: &Poseidon2Core,
+    k: &[Bn254Fr; 32],
+    pt: &[Bn254Fr; 144],
+    ct_out: &mut [Bn254Fr; 144],
+) {
     // Block 0: bytes 0-31
     let ks0 = stream_block(h, k, 0);
-    let mut i = 0;
-    while i < 32 {
-        ct_out[i] = pt[i] ^ ks0[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[i] = xor_byte_fr(&pt[i], &ks0[i]);
     }
 
     // Block 1: bytes 32-63
     let ks1 = stream_block(h, k, 1);
-    i = 0;
-    while i < 32 {
-        ct_out[32 + i] = pt[32 + i] ^ ks1[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[32 + i] = xor_byte_fr(&pt[32 + i], &ks1[i]);
     }
 
     // Block 2: bytes 64-95
     let ks2 = stream_block(h, k, 2);
-    i = 0;
-    while i < 32 {
-        ct_out[64 + i] = pt[64 + i] ^ ks2[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[64 + i] = xor_byte_fr(&pt[64 + i], &ks2[i]);
     }
 
     // Block 3: bytes 96-127
     let ks3 = stream_block(h, k, 3);
-    i = 0;
-    while i < 32 {
-        ct_out[96 + i] = pt[96 + i] ^ ks3[i];
-        i += 1;
+    for i in 0..32 {
+        ct_out[96 + i] = xor_byte_fr(&pt[96 + i], &ks3[i]);
     }
 
     // Block 4: bytes 128-143 (16-byte remainder)
     let ks4 = stream_block(h, k, 4);
-    i = 0;
-    while i < 16 {
-        ct_out[128 + i] = pt[128 + i] ^ ks4[i];
-        i += 1;
+    for i in 0..16 {
+        ct_out[128 + i] = xor_byte_fr(&pt[128 + i], &ks4[i]);
     }
 }
 
 /// Ciphertext hash: H("CT_HASH_V1" || ct)
 /// Fixed 154-byte preimage for 144-byte ciphertext.
-
-fn ct_hash(h: &Poseidon2Core, ct: &[u8; 144]) -> (Bn254Fr, Hash32) {
-    let mut buf = [0u8; CT_HASH_BUF_LEN];
-    buf[..10].copy_from_slice(b"CT_HASH_V1");
-    buf[10..154].copy_from_slice(ct);
-    let fr = h.hash_padded_fr(&buf);
-    let bytes = bn254fr_to_hash32(&fr);
-    (fr, bytes)
+fn ct_hash_fr(h: &Poseidon2Core, ct: &[Bn254Fr; 144]) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(CT_HASH_BUF_LEN);
+    for b in b"CT_HASH_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(ct);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// View MAC: H("VIEW_MAC_V1" || k || cm || ct_hash)
 /// Fixed 107-byte preimage.
-
-fn view_mac_fr(h: &Poseidon2Core, k: &Hash32, cm: &Hash32, ct_h: &Hash32) -> Bn254Fr {
-    let mut buf = [0u8; VIEW_MAC_BUF_LEN];
-    buf[..11].copy_from_slice(b"VIEW_MAC_V1");
-    buf[11..43].copy_from_slice(k);
-    buf[43..75].copy_from_slice(cm);
-    buf[75..107].copy_from_slice(ct_h);
-    h.hash_padded_fr(&buf)
+fn view_mac_fr(
+    h: &Poseidon2Core,
+    k: &[Bn254Fr; 32],
+    cm: &[Bn254Fr; 32],
+    ct_h: &[Bn254Fr; 32],
+) -> Bn254Fr {
+    let mut buf: Vec<Bn254Fr> = Vec::with_capacity(VIEW_MAC_BUF_LEN);
+    for b in b"VIEW_MAC_V1" {
+        buf.push(Bn254Fr::from_u32(*b as u32));
+    }
+    buf.extend_from_slice(k);
+    buf.extend_from_slice(cm);
+    buf.extend_from_slice(ct_h);
+    h.hash_padded_fr_bytes(&buf)
 }
 
 /// Encode note plaintext for viewer encryption.
 /// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
 /// Value is u64 zero-extended to 16 bytes.
 
-fn encode_note_plain(domain: &Hash32, value: u64, rho: &Hash32, recipient: &Hash32, sender_id: &Hash32, out: &mut [u8; 144]) {
+fn encode_note_plain(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+    out: &mut [u8; 144],
+) {
     out[0..32].copy_from_slice(domain);
     // Encode value as 16-byte LE (u64 zero-extended to 16 bytes)
     out[32..40].copy_from_slice(&value.to_le_bytes());
@@ -692,7 +875,13 @@ fn bl_bucket_leaf_fr(h: &Poseidon2Core, entries: &[Hash32; BL_BUCKET_SIZE]) -> B
 }
 
 #[inline(always)]
-fn assert_not_blacklisted_bucket_from_args(h: &Poseidon2Core, id: &Hash32, blacklist_root: &Hash32, args: &ArgHolder, arg_idx: &mut usize) {
+fn assert_not_blacklisted_bucket_from_args(
+    h: &Poseidon2Core,
+    id: &Hash32,
+    blacklist_root: &Hash32,
+    args: &ArgHolder,
+    arg_idx: &mut usize,
+) {
     let mut bucket_entries = [[0u8; 32]; BL_BUCKET_SIZE];
     for i in 0..BL_BUCKET_SIZE {
         bucket_entries[i] = read_hash32(args, *arg_idx);
@@ -793,8 +982,10 @@ fn main() {
         }
 
         // Verify Merkle membership for this input.
-        let cm_i_fr = note_commitment_fr(&h, &domain, v_i, &rho_i, &recipient_owner, &sender_id_in_i);
-        let anchor_i_fr = root_from_path_field_level(&h, cm_i_fr, pos_i, &args, &mut arg_idx, depth);
+        let cm_i_fr =
+            note_commitment_fr(&h, &domain, v_i, &rho_i, &recipient_owner, &sender_id_in_i);
+        let anchor_i_fr =
+            root_from_path_field_level(&h, cm_i_fr, pos_i, &args, &mut arg_idx, depth);
         assert_fr_eq_hash32(&anchor_i_fr, &anchor_arg);
 
         // nullifier_i [PUBLIC]
@@ -853,7 +1044,8 @@ fn main() {
     // Expected argc without viewers:
     //   1 + 6 + n_in*(5 + depth) + 3 + 5*n_out + 1(inv_enforce)
     let per_in = 5u32 + depth_u32;
-    let expected_base_no_blacklist = 1u32 + 6u32 + n_in_u32 * per_in + 3u32 + 5u32 * n_out_u32 + 1u32;
+    let expected_base_no_blacklist =
+        1u32 + 6u32 + n_in_u32 * per_in + 3u32 + 5u32 * n_out_u32 + 1u32;
     // Blacklist arguments are appended after inv_enforce:
     //   blacklist_root [PUBLIC]
     //   For each checked id:
@@ -877,8 +1069,18 @@ fn main() {
         cm: Hash32,
     }
     let mut outs: [OutPlain; MAX_OUTS] = [
-        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
-        OutPlain { v: 0, rho: [0; 32], rcp: [0; 32], cm: [0; 32] },
+        OutPlain {
+            v: 0,
+            rho: [0; 32],
+            rcp: [0; 32],
+            cm: [0; 32],
+        },
+        OutPlain {
+            v: 0,
+            rho: [0; 32],
+            rcp: [0; 32],
+            cm: [0; 32],
+        },
     ];
 
     let mut out_sum: u64 = 0;
@@ -914,7 +1116,12 @@ fn main() {
         let cm_cmp_fr = note_commitment_fr(&h, &domain, vj, &rho_j, &rcp_j, &sender_id);
         assert_fr_eq_hash32(&cm_cmp_fr, &cm_arg);
 
-        outs[j] = OutPlain { v: vj, rho: rho_j, rcp: rcp_j, cm: cm_arg };
+        outs[j] = OutPlain {
+            v: vj,
+            rho: rho_j,
+            rcp: rcp_j,
+            cm: cm_arg,
+        };
     }
 
     // Enforce protocol shape: change outputs (if present) go back to the sender.
@@ -930,7 +1137,9 @@ fn main() {
     }
 
     // Balance: sum_in == withdraw + sum(outputs)
-    let _rhs_check = withdraw_amount.checked_add(out_sum).unwrap_or_else(|| hard_fail(90));
+    let _rhs_check = withdraw_amount
+        .checked_add(out_sum)
+        .unwrap_or_else(|| hard_fail(90));
 
     let sum_in_fr = Bn254Fr::from_u64(sum_in);
     let withdraw_fr = Bn254Fr::from_u64(withdraw_amount);
@@ -997,7 +1206,13 @@ fn main() {
 
     // Transfers have a "pay recipient" output; withdraws only have change-to-self outputs, already enforced above.
     if withdraw_amount == 0 {
-        assert_not_blacklisted_bucket_from_args(&h, &outs[0].rcp, &blacklist_root, &args, &mut arg_idx);
+        assert_not_blacklisted_bucket_from_args(
+            &h,
+            &outs[0].rcp,
+            &blacklist_root,
+            &args,
+            &mut arg_idx,
+        );
     }
 
     // --- Level B: Viewer Attestations ---
@@ -1031,33 +1246,50 @@ fn main() {
 
     let mut out_pts: [[u8; NOTE_PLAIN_LEN]; MAX_OUTS] = [[0u8; NOTE_PLAIN_LEN]; MAX_OUTS];
     for j in 0..n_out {
-        encode_note_plain(&domain, outs[j].v, &outs[j].rho, &outs[j].rcp, &sender_id, &mut out_pts[j]);
+        encode_note_plain(
+            &domain,
+            outs[j].v,
+            &outs[j].rho,
+            &outs[j].rcp,
+            &sender_id,
+            &mut out_pts[j],
+        );
     }
 
-    let mut ct_buf = [0u8; NOTE_PLAIN_LEN];
+    let mut out_cm_fr: [[Bn254Fr; 32]; MAX_OUTS] =
+        std::array::from_fn(|_| std::array::from_fn(|_| Bn254Fr::new()));
+    for j in 0..n_out {
+        out_cm_fr[j] = hash32_to_fr_bytes_constrained(&outs[j].cm);
+    }
 
     let mut v_idx = base_after_outs + 1; // start right after n_viewers
     for _vi in 0..n_viewers {
-        let fvk_commit_arg = read_hash32(&args, v_idx);
+        // PUBLIC: commitment/hash of the viewer key material.
+        let fvk_commit_pub = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk = read_hash32(&args, v_idx);
+        // PRIVATE: viewer key material (witness). Verifier must not need the real value.
+        let fvk_priv = read_hash32(&args, v_idx);
         v_idx += 1;
 
-        let fvk_c_fr = fvk_commit_fr(&h, &fvk);
-        assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_arg);
+        let fvk_priv_fr = hash32_to_fr_bytes_range_checked(&fvk_priv);
+        let fvk_c_fr = fvk_commit_fr(&h, &fvk_priv_fr);
+        assert_fr_eq_hash32(&fvk_c_fr, &fvk_commit_pub);
 
         for j in 0..n_out {
-            let outp = &outs[j];
-            let k = view_kdf(&h, &fvk, &outp.cm);
-            stream_xor_encrypt_144(&h, &k, &out_pts[j], &mut ct_buf);
+            let cm_fr = &out_cm_fr[j];
+            let k = view_kdf(&h, &fvk_priv_fr, cm_fr);
+            let pt_fr = bytes144_to_fr_bytes(&out_pts[j]);
+            let mut ct_fr: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
+            stream_xor_encrypt_144(&h, &k, &pt_fr, &mut ct_fr);
 
-            let (ct_h_fr, ct_h_bytes) = ct_hash(&h, &ct_buf);
-            let macv_fr = view_mac_fr(&h, &k, &outp.cm, &ct_h_bytes);
-
+            let ct_h_fr = ct_hash_fr(&h, &ct_fr);
             let ct_hash_arg = read_hash32(&args, v_idx);
             v_idx += 1;
             assert_fr_eq_hash32(&ct_h_fr, &ct_hash_arg);
+
+            let ct_hash_bytes = fr_to_bytes_be_bits(&ct_h_fr);
+            let macv_fr = view_mac_fr(&h, &k, cm_fr, &ct_hash_bytes);
 
             let mac_arg = read_hash32(&args, v_idx);
             v_idx += 1;
@@ -1065,4 +1297,3 @@ fn main() {
         }
     }
 }
-

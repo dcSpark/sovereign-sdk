@@ -89,6 +89,7 @@ pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, Pending
 /// - `blacklist_nodes`: Deny-map Merkle nodes (non-default)
 /// - `pool_admins`: Addresses allowed to update `blacklist_root` (membership map)
 /// - `pool_admin_list`: Sorted list of pool admins (for queries)
+/// - `frozen_addresses`: Sorted list of frozen privacy addresses (for queries)
 /// - `domain`: Domain tag for all note/hash operations
 /// - `token_id`: The single supported native token
 /// - `bank`: Bank module for token transfers
@@ -180,6 +181,10 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// Sorted list of pool admins (for enumeration in REST queries).
     #[state]
     pub pool_admin_list: StateValue<Vec<S::Address>>,
+
+    /// Sorted list of frozen (blacklisted) privacy addresses (for enumeration in REST queries).
+    #[state]
+    pub frozen_addresses: StateValue<Vec<PrivacyAddress>>,
 
     /// Domain tag used in all note/hash derivations.
     #[state]

@@ -2399,9 +2399,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.52"
+version = "1.2.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4932aefd12402b36c60956a4fe0035421f544799057659ff86f923657aada3"
+checksum = "755d2fce177175ffca841e9a06afdb2c4ab0f593d53b4dee48147dfaade85932"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -4693,9 +4693,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f449e6c6c08c865631d4890cfacf252b3d396c9bcc83adb6623cdb02a8336c41"
+checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 
 [[package]]
 name = "fixed-hash"
@@ -6979,19 +6979,53 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd#da388b5f5e0ac9e9fcc465acc3e10289e23de1fd"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bincode 1.3.3",
+ "hex",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tiny_http 0.12.0",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
+name = "ligero-runner"
+version = "0.1.0"
 source = "git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c#e86c3f7119a07eb51b4408dd6fce10b7ad54c45c"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bincode 1.3.3",
  "hex",
- "ligetron",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "ligetron"
+version = "1.1.0"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd#da388b5f5e0ac9e9fcc465acc3e10289e23de1fd"
+dependencies = [
+ "ark-bn254",
+ "ark-ff 0.5.0",
+ "base64 0.22.1",
+ "hex",
+ "lazy_static",
+ "num-bigint 0.4.6",
+ "paste",
 ]
 
 [[package]]
@@ -7279,10 +7313,11 @@ dependencies = [
  "demo-stf",
  "dirs 6.0.0",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "envy",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7320,10 +7355,11 @@ dependencies = [
  "demo-stf",
  "dirs 6.0.0",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "envy",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=e86c3f7119a07eb51b4408dd6fce10b7ad54c45c)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -7341,7 +7377,6 @@ dependencies = [
  "sov-modules-stf-blueprint",
  "sov-node-client",
  "sov-value-setter-zk",
- "sqlx",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -7544,9 +7579,10 @@ dependencies = [
  "chrono",
  "clap",
  "demo-stf",
+ "ed25519-dalek 2.2.0",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "num_cpus",
  "rand 0.8.5",
@@ -7576,13 +7612,12 @@ dependencies = [
  "axum 0.7.9",
  "clap",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "hex",
- "k256",
  "midnight-privacy",
  "rand 0.8.5",
  "serde",
  "serde_json",
- "sha3",
  "sqlx",
  "tempfile",
  "tokio",
@@ -7620,8 +7655,8 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "once_cell",
  "schemars 0.8.22",
  "sea-orm",
@@ -9711,7 +9746,7 @@ dependencies = [
  "log",
  "prometheus",
  "thiserror 1.0.69",
- "tiny_http",
+ "tiny_http 0.10.0",
 ]
 
 [[package]]
@@ -11526,7 +11561,7 @@ dependencies = [
  "once_cell",
  "ring 0.17.14",
  "rustls-pki-types",
- "rustls-webpki 0.103.8",
+ "rustls-webpki 0.103.9",
  "subtle",
  "zeroize",
 ]
@@ -11563,9 +11598,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.13.3"
+version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4910321ebe4151be888e35fe062169554e74aad01beafed60410131420ceffbc"
+checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
  "web-time",
  "zeroize",
@@ -11585,7 +11620,7 @@ dependencies = [
  "rustls 0.23.36",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.8",
+ "rustls-webpki 0.103.9",
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
@@ -11610,9 +11645,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.8"
+version = "0.103.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ffdfa2f5286e2247234e03f680868ac2815974dc39e00ea15adc445d0aafe52"
+checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
 dependencies = [
  "aws-lc-rs",
  "ring 0.17.14",
@@ -13257,6 +13292,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "midnight-privacy",
+ "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
@@ -13264,6 +13300,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "utoipa 5.0.0-beta.0",
+ "utoipa-swagger-ui",
 ]
 
 [[package]]
@@ -13323,8 +13361,8 @@ dependencies = [
  "borsh",
  "digest 0.10.7",
  "hex",
- "ligero-runner",
- "ligetron",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
+ "ligetron 1.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "proptest",
  "rand 0.8.5",
  "schemars 0.8.22",
@@ -13721,9 +13759,10 @@ dependencies = [
  "chrono",
  "clap",
  "demo-stf",
+ "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "ligero-runner",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-privacy",
  "reqwest 0.12.28",
  "sea-orm",
@@ -13941,6 +13980,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "ligero",
+ "ligero-runner 0.1.0 (git+https://github.com/dcSpark/ligero-prover.git?rev=da388b5f5e0ac9e9fcc465acc3e10289e23de1fd)",
  "midnight-base-crypto",
  "midnight-onchain-state",
  "midnight-privacy",
@@ -13992,10 +14032,12 @@ dependencies = [
  "sov-universal-wallet",
  "sov-zkvm-utils",
  "tempfile",
+ "tiny_http 0.12.0",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-panic",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
@@ -15960,6 +16002,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiny_http"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
+dependencies = [
+ "ascii",
+ "chunked_transfer",
+ "httpdate",
+ "log",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17106,6 +17160,7 @@ source = "git+https://github.com/juhaku/utoipa.git?rev=a985d8c1340f80ab69b2b0e5d
 dependencies = [
  "proc-macro2",
  "quote",
+ "regex",
  "syn 2.0.114",
 ]
 

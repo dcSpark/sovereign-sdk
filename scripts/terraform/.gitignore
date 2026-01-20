@@ -1,0 +1,48 @@
+# Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files, which may contain sensitive data
+# Uncomment if you want to keep terraform.tfvars in version control
+# *.tfvars
+# *.tfvars.json
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform directory
+.terraform/
+.terraform.lock.hcl
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Local .terraform directories
+**/.terraform/*
+
+# Terraform plan output files
+*.tfplan
+plans/
+
+# Sensitive variable files
+*.auto.tfvars
+secrets.tfvars
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db

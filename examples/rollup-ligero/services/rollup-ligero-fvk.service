@@ -1,0 +1,28 @@
+[Unit]
+Description=Midnight FVK Service (Full Viewing Key signing service)
+After=network.target
+
+[Service]
+Type=simple
+User=replace_for_linux_user
+WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero
+ExecStart=/bin/bash /home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero/run_fvk_service.sh
+Restart=on-failure
+Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+# Bind address for the FVK service (default: 127.0.0.1:8088)
+#Environment="MIDNIGHT_FVK_SERVICE_BIND=127.0.0.1:8088"
+# Database connection string (default: sqlite in demo_data directory)
+#Environment="MIDNIGHT_FVK_SERVICE_DB=sqlite:///home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero/demo_data/midnight_fvk_service.sqlite?mode=rwc"
+
+# REQUIRED: FVK signing keys (generate with: cargo run -p midnight-fvk-service -- keygen)
+# These must be set explicitly or configured in crates/utils/midnight-fvk-service/.env
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX=replace_with_signing_secret_key_hex"
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX=replace_with_signing_public_key_hex"
+# Pool FVK public key - must match MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX when set
+Environment="POOL_FVK_PK=replace_with_pool_fvk_public_key_hex"
+# Admin token for FVK service authentication
+Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=replace_with_admin_token"
+
+[Install]
+WantedBy=multi-user.target

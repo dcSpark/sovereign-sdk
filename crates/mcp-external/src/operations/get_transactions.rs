@@ -24,6 +24,10 @@ pub struct Transaction {
     pub sender: Option<String>,
     /// Recipient address (if available)
     pub recipient: Option<String>,
+    /// Privacy sender address (if available)
+    pub privacy_sender: Option<String>,
+    /// Privacy recipient address (if available)
+    pub privacy_recipient: Option<String>,
     /// Transaction amount (if available)
     pub amount: Option<String>,
     /// Anchor root for privacy transactions
@@ -40,6 +44,8 @@ pub struct Transaction {
     pub status: Option<String>,
     /// Encrypted notes for privacy transactions
     pub encrypted_notes: Option<serde_json::Value>,
+    /// Decrypted notes for privacy transactions (when VFK is provided)
+    pub decrypted_notes: Option<serde_json::Value>,
     /// Full transaction payload
     pub payload: Option<serde_json::Value>,
 }
@@ -52,6 +58,8 @@ impl From<InvolvementItem> for Transaction {
             kind: item.kind,
             sender: item.sender,
             recipient: item.recipient,
+            privacy_sender: item.privacy_sender,
+            privacy_recipient: item.privacy_recipient,
             amount: item.amount,
             anchor_root: item.anchor_root,
             nullifier: item.nullifier,
@@ -60,6 +68,7 @@ impl From<InvolvementItem> for Transaction {
             events: item.events,
             status: item.status,
             encrypted_notes: item.encrypted_notes,
+            decrypted_notes: item.decrypted_notes,
             payload: item.payload,
         }
     }
@@ -127,7 +136,7 @@ where
 
     // Query the indexer for transactions from the privacy pool address only
     let privacy_response = provider
-        .get_wallet_transactions(&privacy_address, None, None, None)
+        .get_wallet_transactions(&privacy_address, None, None, None, None)
         .await?;
 
     tracing::info!(

@@ -12,7 +12,7 @@ This server exposes L2 wallet operations through the MCP protocol, enabling AI a
 
 - Rust toolchain
 - Running Sovereign SDK L2 rollup node
-- Ligero binaries are automatically provided by the `ligero-runner` crate (no manual setup needed)
+- Ligero proof service (`ligero-http-server`) running (default: `http://127.0.0.1:1313`)
 
 ### Configuration
 
@@ -20,12 +20,17 @@ Configure the following environment variables:
 
 - `MCP_SERVER_BIND_ADDRESS` - Server bind address (default: `127.0.0.1:3000`)
 - `WALLET_PRIVATE_KEY` - Hex-encoded private key for wallet operations
+- `ADMIN_WALLET_PRIVATE_KEY` - Optional admin wallet private key used only to auto-fund newly created wallets
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
+- `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:1313`)
+- `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
 - `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
-- `AUTHORITY_FVK` - Optional authority viewing key for note decryption
+- `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
+- `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
+- `AUTO_FUND_GAS_RESERVE` - Optional gas reserve (in dust) added to the L2 funding transfer for auto-funding (default: 1000000000000). Values below the default are clamped to ensure the deposit can reserve gas.
 
 ### Start the Server
 
@@ -42,19 +47,19 @@ The server exposes the following MCP tools:
 - `walletAddress` - Get the privacy pool address
 - `walletBalance` - Get the privacy balance and unspent notes
 - `getWalletConfig` - Retrieve wallet configuration (node/indexer/proof server/log paths)
-- `send` - Non-blocking privacy transfer using the first unspent note
-- `getTransaction` - Retrieve transaction details by hash or derived UUID
-- `getTransactionStatus` - Query a transaction by local database UUID
-- `getTransactions` - List all transactions from the local store
+- `send` - Privacy transfer using the first unspent note
+- `getTransaction` - Retrieve transaction details by hash or derived UUID (legacy)
+- `getTransactionStatus` - Query a transaction by hash
+- `getTransactions` - List all transactions from the indexer
 - `walletStatus` - Sync status and balances
 - `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
-If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`), calling `createWallet` will kick off a best-effort deposit to fund the new privacy address.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool.
 
-### Local transaction store
+### Transactions
 
-An in-memory SQLite database (`sqlite::memory:?cache=shared`) tracks all wallet transactions and is kept in sync with the indexer every ~30 seconds. `send` inserts an `initiated` row immediately and continues in the background; indexer-derived records are upserted by `tx_identifier` to avoid uniqueness conflicts. The `id` returned by `send`/`getTransactions` is a local UUID; the blockchain hash is exposed as `txIdentifier` once known.
+Transactions are fetched directly from the indexer when requested. `send` returns the rollup transaction hash, and the `id` field in transaction records matches that hash.
 
 ## Docker
 
@@ -72,7 +77,7 @@ Run the fast, self-contained tests:
 cargo test -p mcp
 ```
 
-Integration tests (rollup/indexer/verifier + Ligero) are ignored by default. Run them explicitly with:
+Integration tests (rollup/indexer/verifier + Ligero proof service) are ignored by default. Run them explicitly with:
 
 ```bash
 cargo test --all-targets -- --ignored
@@ -82,11 +87,7 @@ Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be repo
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
-
-Ligero binaries are auto-discovered from `ligero-runner`. Optional overrides:
-
-- `LIGERO_PROGRAM_PATH` - Circuit name (e.g. `note_spend_guest`) or path to `.wasm`
-- `LIGERO_PROVER_BIN` - Override `webgpu_prover` binary path
-- `LIGERO_SHADER_PATH` - Override shader directory path
+- `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:1313`)
+- `LIGERO_PROGRAM_PATH` (defaults to `note_spend_guest`)
 
 Set `RUST_LOG=debug` for verbose logging during development.

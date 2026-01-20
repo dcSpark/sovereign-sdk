@@ -13,6 +13,7 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
 
+use crate::operations::DEFAULT_MAX_FEE;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
@@ -83,7 +84,7 @@ pub async fn create_deposit_unsigned_tx(
         nonce
     };
 
-    let max_fee = Amount::from(1_000_000_000_000u128);
+    let max_fee = Amount::from(DEFAULT_MAX_FEE);
 
     let unsigned_tx = UnsignedTransaction::<McpRuntime, McpSpec>::new(
         runtime_call,

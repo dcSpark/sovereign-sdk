@@ -20,8 +20,9 @@ Quick start
    - `DA_CONNECTION_STRING` (required): e.g. `sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc`
    - `INDEX_DB` (optional): local index DB, default `sqlite://wallet_index.sqlite?mode=rwc`
    - `INDEXER_BIND` (optional): listen address, default `0.0.0.0:13100`
-   - `AUTHORITY_FVK` (optional): 32-byte hex authority viewing key for decrypting encrypted notes
-   - `MODE` (optional): `direct` (default) queries DA directly, `sync` maintains local index
+   - `MIDNIGHT_FVK_SERVICE_URL` (optional): midnight-fvk-service base URL, default `http://127.0.0.1:8088`
+   - `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` (optional): if set, indexer fetches missing per-wallet FVKs on-demand from midnight-fvk-service (and caches them in `fvk_registry`)
+   - `INDEX_DB_RESET` (optional): set to `1`/`true` to drop all index tables before startup (works for sqlite/postgresql). The `fvk_registry` table is preserved.
 
 2) Run the service:
    ```bash
@@ -31,11 +32,23 @@ Quick start
 3) Endpoints:
    - Health: `GET /health`
      - Returns `{ "status": "ok" }`
-   - Wallet activity: `GET /wallets/:address/txs?limit=&cursor=&type=`
+   - Wallet activity: `POST /wallets/:address?limit=&cursor=&type=`
      - `address`: bech32 L2 address
-     - `limit`: optional, default 50, max 200
-     - `cursor`: opaque base64 from previous response for pagination
-     - `type`: optional filter: `deposit` or `withdraw`
+     - Query params:
+       - `limit`: optional, default 50, max 200
+       - `cursor`: opaque base64 from previous response for pagination
+       - `type`: optional filter: `deposit` or `withdraw`
+     - JSON body:
+       - `vfk`: 32-byte hex full viewing key (optional)
+     - If `vfk` is provided, `decrypted_notes` are returned (unshielded mode); otherwise only `encrypted_notes` are returned (shielded mode)
+     - Response includes `total` (count of matching records before pagination)
+   - Wallet balance: `POST /wallets/:address/balance`
+     - `address`: bech32m privacy pool address (`privpool1...`)
+  - JSON body:
+   - `nf_key`: 32-byte hex nullifier key (required)
+   - `vfk`: 32-byte hex full viewing key (optional)
+  - Returns `{ "balance": "...", "unspent_notes": [...] }`
+  - Note: the indexer cannot verify that `nf_key` matches the address. If decrypted notes are already stored in the index, `vfk` can be omitted; otherwise some transfer outputs may be missing.
 
 ## FVK Decryption (Optional)
 
@@ -44,15 +57,17 @@ has its own FVK, so the indexer supports multiple FVKs via a registry.
 
 ### Configuration Options
 
-1. **FVK Config File** (recommended for multiple addresses):
+1. **Auto-fetch from `midnight-fvk-service`** (recommended):
+   Set:
+   - `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` (must match the service)
+   - `MIDNIGHT_FVK_SERVICE_URL` (optional; defaults to `http://127.0.0.1:8088`)
+
+   When enabled, the indexer looks at each encrypted note’s `fvk_commitment` and fetches the corresponding private `fvk` from the service, then stores it in the `fvk_registry` table for reuse.
+
+2. **FVK Config File** (offline/manual):
    Set `FVK_CONFIG_FILE` to point to a JSON file:
    ```bash
-   MODE=sync FVK_CONFIG_FILE=./fvk_config.json cargo run -p sov-indexer
-   ```
-
-2. **Single FVK** (backward compatible):
-   ```bash
-   MODE=sync AUTHORITY_FVK=fd3f0fc84254bcbe06977154d4db171a952201685f6ff8d5afe4a3c6e083f2b1 cargo run -p sov-indexer
+   FVK_CONFIG_FILE=./vfk_config.json cargo run -p sov-indexer
    ```
 
 ### FVK Config File Format
@@ -135,12 +150,12 @@ The API validates:
 curl -X DELETE http://localhost:13100/fvks/<fvk_commitment>
 ```
 
-Changes take effect immediately - new transactions will be decrypted using the updated registry.
+Changes take effect immediately - new transactions will be decrypted using the updated registry,
+and existing indexed deposits/transfers with missing recipients are backfilled from encrypted notes.
 The registry uses DashMap for lock-free concurrent access during indexing.
 
 Notes
 - On startup, if the DA DB is not ready, the service logs a warning and retries in the background.
 - The index DB schema is created automatically on first run.
-- FVK decryption only works in `sync` mode (local index database).
-- FVKs from config files are persisted to the database for reuse across restarts.
-
+- VFK decryption only works in `sync` mode (local index database).
+- VFKs from config files are persisted to the database for reuse across restarts.

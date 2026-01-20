@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use url::Url;
@@ -8,6 +6,10 @@ use validator::Validate;
 fn default_ligero_program() -> String {
     // MCP-External is primarily used for midnight-privacy flows.
     "note_spend_guest".to_string()
+}
+
+fn default_ligero_proof_service_url() -> Url {
+    Url::parse("http://127.0.0.1:1313").expect("default proof service URL is valid")
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -21,6 +23,11 @@ pub struct Config {
     /// No files needed! Just provide the private key hex string.
     #[validate(length(min = 1))]
     pub wallet_private_key: String,
+
+    /// Admin wallet private key used for auto-funding newly created wallets (env: ADMIN_WALLET_PRIVATE_KEY, optional)
+    /// This key remains immutable and is not affected by restoreWallet.
+    #[serde(default)]
+    pub admin_wallet_private_key: Option<String>,
 
     /// Sovereign SDK rollup RPC endpoint (env: ROLLUP_RPC_URL, required)
     #[validate(custom(function = "validate_http_url"))]
@@ -38,31 +45,17 @@ pub struct Config {
     ///
     /// Accepts either:
     /// - a circuit name (e.g. `note_spend_guest`)
-    /// - a full path to a `.wasm` file
+    /// - a full path to a `.wasm` file (for services that accept paths)
     ///
     /// Defaults to `note_spend_guest`.
     #[serde(default = "default_ligero_program", alias = "ZK_PROGRAM_PATH")]
     #[validate(custom(function = "validate_ligero_program"))]
     pub ligero_program_path: String,
 
-    /// Optional path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH).
-    ///
-    /// If unset, `ligero-runner` will auto-discover binaries from the pinned `ligero-prover` git checkout.
-    #[serde(default)]
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_prover_binary_path: Option<PathBuf>,
-
-    /// Optional path to Ligero shader directory (env: LIGERO_SHADER_PATH).
-    ///
-    /// If unset, `ligero-runner` will auto-discover shaders from the pinned `ligero-prover` git checkout.
-    #[serde(default)]
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_shader_path: Option<PathBuf>,
-
-    /// Authority Full Viewing Key (FVK) for decrypting privacy pool notes (env: AUTHORITY_FVK, optional)
-    /// 32-byte hex string with or without 0x prefix
-    #[serde(default)]
-    pub authority_fvk: Option<String>,
+    /// Ligero proof service URL (env: LIGERO_PROOF_SERVICE_URL).
+    #[serde(default = "default_ligero_proof_service_url")]
+    #[validate(custom(function = "validate_http_url"))]
+    pub ligero_proof_service_url: Url,
 
     /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
     /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
@@ -70,21 +63,19 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub privpool_spend_key: String,
 
-    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT)
+    /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
+    /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
     #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
     pub auto_fund_deposit_amount: Option<String>,
+
+    /// Optional gas reserve to add when auto-funding a new wallet (env: AUTO_FUND_GAS_RESERVE, optional).
+    /// This is added to the deposit amount to cover future transaction fees.
+    #[serde(default)]
+    pub auto_fund_gas_reserve: Option<String>,
 }
 
 fn default_server_bind_address() -> String {
     "127.0.0.1:3000".into()
-}
-
-fn validate_file_exists(path: &PathBuf) -> Result<(), validator::ValidationError> {
-    if !path.exists() {
-        return Err(validator::ValidationError::new("file_not_found")
-            .with_message(format!("File does not exist: {}", path.display()).into()));
-    }
-    Ok(())
 }
 
 fn validate_ligero_program(program: &String) -> Result<(), validator::ValidationError> {
@@ -99,13 +90,8 @@ fn validate_ligero_program(program: &String) -> Result<(), validator::Validation
         return Ok(());
     }
 
-    // Otherwise, treat it as a circuit name and ensure `ligero-runner` can resolve it.
-    if ligero_runner::resolve_program(program).is_ok() {
-        return Ok(());
-    }
-
-    Err(validator::ValidationError::new("invalid_program")
-        .with_message(format!("Could not resolve Ligero program '{program}'. Provide a circuit name (e.g. note_spend_guest) or a full path to a .wasm file.").into()))
+    // Otherwise, treat it as a circuit name; the proof service resolves it.
+    Ok(())
 }
 
 fn validate_http_url(url: &Url) -> Result<(), validator::ValidationError> {

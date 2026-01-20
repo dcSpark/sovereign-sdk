@@ -16,6 +16,7 @@ use midnight_privacy::{
     PrivacyAddress, SpendPublic,
 };
 use num_cpus;
+use reqwest::Client as HttpClient;
 use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
@@ -29,8 +30,12 @@ use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
 use crate::{
-    find_rollup_binary, load_authority_fvk, make_viewer_bundle, setup_ligero_env,
-    start_local_verifier, wait_for_ready, ChildGuard,
+    find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
+    ChildGuard,
+};
+use crate::fvk_service::fetch_viewer_fvk_bundle;
+use crate::pool_fvk::{
+    decode_ligero_hash32_arg, ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes,
 };
 use sov_rollup_ligero::MockDemoRollup;
 
@@ -61,9 +66,6 @@ pub struct RunnerConfig {
     pub defer_sequencer_submission: bool,
     /// Optional delay (ms) between submitting transfer requests to the verifier to avoid OS/socket overloads.
     pub transfer_submit_delay_ms: u64,
-    /// Authority Full Viewing Key for Level-B compliance (32-byte hex from AUTHORITY_FVK env var).
-    /// When set, transfer proofs will include viewer attestations and txs will include encrypted notes.
-    pub authority_fvk: Option<Hash32>,
 }
 
 impl Default for RunnerConfig {
@@ -78,7 +80,6 @@ impl Default for RunnerConfig {
             max_concurrent_proofs: 5,
             defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
-            authority_fvk: None,
         }
     }
 }
@@ -117,8 +118,6 @@ impl RunnerConfig {
         }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
-        // Load authority viewing key for Level-B compliance
-        cfg.authority_fvk = load_authority_fvk();
         cfg
     }
 }
@@ -322,15 +321,39 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
 
-    // Log authority viewing key status
-    let authority_fvk = config.authority_fvk;
-    if let Some(ref fvk) = authority_fvk {
+    // If `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is set, export it as `POOL_FVK_PK` so the in-process
+    // verifier (when spawned) enforces pool-signed viewer commitments.
+    let pool_fvk_pk = ensure_pool_fvk_pk_env()?;
+    if let Some(pool_pk_bytes) = pool_fvk_pk {
         eprintln!(
-            "[config] AUTHORITY_FVK set: Level-B viewing attestations ENABLED (fvk={}...)",
-            hex::encode(&fvk[..8])
+            "[config] POOL_FVK_PK set: enforcing pool-signed viewer commitments (pk={}...)",
+            hex::encode(&pool_pk_bytes[..8]),
         );
     } else {
-        eprintln!("[config] AUTHORITY_FVK not set: transfers will NOT emit authority ciphertexts");
+        eprintln!("[config] POOL_FVK_PK not set: pool signature enforcement DISABLED");
+    }
+
+    // Fetch the pool viewer FVK + commitment signature from midnight-fvk-service.
+    // When `POOL_FVK_PK` is set, viewer attestations and ciphertexts are required.
+    let http = HttpClient::new();
+    let viewer_bundle = if pool_fvk_pk.is_some() {
+        Some(fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?)
+    } else {
+        None
+    };
+    let viewer_fvk: Option<Hash32> = viewer_bundle.as_ref().map(|b| b.fvk);
+    let expected_viewer_fvk_commitment: Option<Hash32> =
+        viewer_bundle.as_ref().map(|b| b.fvk_commitment);
+    let pool_sig_hex: Option<Arc<String>> =
+        viewer_bundle.as_ref().map(|b| Arc::new(b.pool_sig_hex.clone()));
+
+    if let Some(b) = viewer_bundle.as_ref() {
+        eprintln!(
+            "[config] pool viewer enabled: fvk_commitment=0x{}...",
+            hex::encode(&b.fvk_commitment[..8])
+        );
+    } else {
+        eprintln!("[config] pool viewer disabled: transfers will NOT emit viewer ciphertexts");
     }
 
     // Use the method_id we already computed when starting the node
@@ -680,7 +703,6 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         }
     }
 
-    let http = reqwest::Client::new();
     let mut tx_hashes_hex: Vec<String> = Vec::with_capacity(num_deposits);
     // (account_idx, tx_hash, amount, rho, spend_sk) - track which account made each deposit
     let mut deposit_secrets: Vec<(usize, String, u128, Hash32, Hash32)> =
@@ -1262,6 +1284,27 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Check cache and generate proofs in parallel (with concurrency limit)
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
     let depth_usize = TREE_DEPTH as usize;
+    let viewer_fvk_commitment_arg_pos: Option<usize> = if expected_viewer_fvk_commitment.is_some()
+    {
+        // note_spend_guest v2 fixed layout:
+        // fvk_commitment lives at (n_viewers_idx + 1), where n_viewers_idx follows the deny-map args.
+        let n_in: usize = 1;
+        let n_out: usize = 1;
+        let per_in = 5usize + depth_usize;
+        let withdraw_idx = 7usize + n_in * per_in;
+        let outs_base = withdraw_idx + 3;
+        let inv_enforce_idx = outs_base + 5 * n_out;
+        let bl_root_idx = inv_enforce_idx + 1;
+        let bl_args_start = bl_root_idx + 1;
+        let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+        let bl_bucket_size = midnight_privacy::BLACKLIST_BUCKET_SIZE as usize;
+        let bl_per_check = bl_bucket_size + 1usize + bl_depth;
+        let bl_checks = 2usize; // sender_id + pay recipient (transfer)
+        let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
+        Some(n_viewers_idx + 1)
+    } else {
+        None
+    };
     let mut proof_tasks = Vec::with_capacity(dep_inputs.len());
     let mut cached_proofs: Vec<Option<(usize, Vec<u8>)>> = vec![None; dep_inputs.len()];
 
@@ -1286,8 +1329,65 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             input.account_idx,
                             cache_file.display()
                         );
-                        cached_proofs[i] = Some((input.account_idx, proof_bytes));
-                        continue;
+
+                        let mut cached_proof_bytes = Some(proof_bytes);
+                        if let (Some(expected_commitment), Some(arg_pos)) = (
+                            expected_viewer_fvk_commitment,
+                            viewer_fvk_commitment_arg_pos,
+                        ) {
+                            let got_commitment = (|| -> Result<Hash32> {
+                                let proof_bytes = cached_proof_bytes
+                                    .as_ref()
+                                    .expect("cached_proof_bytes must be Some here");
+                                let package: sov_ligero_adapter::LigeroProofPackage =
+                                    bincode::deserialize(proof_bytes).context(
+                                        "cached proof payload is not a LigeroProofPackage",
+                                    )?;
+                                let args: Vec<JsonValue> =
+                                    serde_json::from_slice(&package.args_json).context(
+                                        "cached proof args_json is not valid JSON",
+                                    )?;
+                                anyhow::ensure!(args.len() >= arg_pos, "cached proof args too short");
+                                decode_ligero_hash32_arg(
+                                    &args[arg_pos - 1],
+                                    "viewer.fvk_commitment",
+                                )
+                            })()
+                            .ok();
+
+                            if let Some(got_commitment) = got_commitment {
+                                if got_commitment != expected_commitment {
+                                    eprintln!(
+                                        "  [cache] cached proof for account {} does not match current viewer settings; regenerating",
+                                        input.account_idx
+                                    );
+                                    cached_proof_bytes = None;
+                                } else if let Some(pool_sig_hex) = pool_sig_hex.as_deref() {
+                                    let bytes =
+                                        cached_proof_bytes.take().expect("checked Some above");
+                                    cached_proof_bytes = inject_pool_sig_hex_into_proof_bytes(
+                                        bytes,
+                                        arg_pos,
+                                        pool_sig_hex.clone(),
+                                    )
+                                    .map(Some)
+                                    .unwrap_or_else(|e| {
+                                        eprintln!(
+                                            "  [cache] failed to inject pool signature for account {}: {}",
+                                            input.account_idx, e
+                                        );
+                                        None
+                                    });
+                                }
+                            } else {
+                                cached_proof_bytes = None;
+                            }
+                        }
+
+                        if let Some(proof_bytes) = cached_proof_bytes {
+                            cached_proofs[i] = Some((input.account_idx, proof_bytes));
+                            continue;
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -1307,7 +1407,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let anchor = shared_anchor;
         let sem = semaphore.clone();
         let program_path_for_host = program_path_for_host.clone();
-        let authority_fvk = authority_fvk; // Option<Hash32>, Copy
+        let viewer_fvk = viewer_fvk; // Option<Hash32>, Copy
+        let pool_sig_hex = pool_sig_hex.clone();
         let client = client.clone();
         proof_tasks.push(tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
@@ -1387,7 +1488,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     value,
                     siblings.len(),
                     hex::encode(anchor),
-                    authority_fvk.is_some()
+                    viewer_fvk.is_some()
                 );
                 let out_value = value;
                 let out_value_u64: u64 = out_value
@@ -1418,8 +1519,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let nf_key = nf_key_from_sk(&domain, &spend_sk);
                 let nf = nullifier(&domain, &nf_key, &rho);
 
-                // Build viewer attestation if authority FVK is set.
-                let (view_attestations, viewer_data) = if let Some(fvk) = authority_fvk {
+                // Build viewer attestation if pool viewer is configured.
+                let (view_attestations, viewer_data) = if let Some(fvk) = viewer_fvk {
                     let (att, _enc) = make_viewer_bundle(
                         &fvk,
                         &domain,
@@ -1492,6 +1593,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
                     private_indices.push(n_viewers_idx + 2);
                 }
+                let fvk_commitment_arg_pos =
+                    viewer_data
+                        .is_some()
+                        .then_some(bl_args_start + bl_checks * bl_per_check + 1);
 
                 let program_path = program_path_for_host.as_ref().clone();
                 let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
@@ -1590,8 +1695,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     host.add_hex_arg(hex::encode(sib));
                 }
 
-                // Viewer section (Level-B) - add viewer args if authority FVK is set
-                if let Some((fvk, att)) = viewer_data {
+                // Viewer section (Level-B) - add viewer args if configured.
+                if let Some((ref fvk, ref att)) = viewer_data {
                     // m_viewers
                     host.add_u64_arg(1);
                     // public fvk_commitment
@@ -1605,7 +1710,21 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
                 host.set_public_output(&public)
                     .context("set public output")?;
-                let proof_data = host.run(true).context("generate transfer proof")?;
+                let mut proof_data = host.run(true).context("generate transfer proof")?;
+                if let Some(pool_sig_hex) = pool_sig_hex.as_deref() {
+                    let Some(arg_pos) = fvk_commitment_arg_pos else {
+                        bail!("POOL_FVK_PK is set but viewer section is missing in proof args");
+                    };
+                    anyhow::ensure!(
+                        viewer_data.is_some(),
+                        "POOL_FVK_PK is set but viewer section is missing in proof args"
+                    );
+                    proof_data = inject_pool_sig_hex_into_proof_bytes(
+                        proof_data,
+                        arg_pos,
+                        pool_sig_hex.clone(),
+                    )?;
+                }
                 eprintln!(
                     "  [proof] gen_proof ok idx={} account={} pos={} bytes={} nullifier={} out_cm={} viewer={}",
                     i,
@@ -1614,7 +1733,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     proof_data.len(),
                     hex::encode(nf),
                     hex::encode(cm_out),
-                    authority_fvk.is_some()
+                    viewer_fvk.is_some()
                 );
                 Ok((account_idx, proof_data))
             })
@@ -1790,9 +1909,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let sender_id = recipient_from_sk_v2(&domain, &input.spend_sk, &pk_ivk_owner);
         let cm_out = note_commitment(&domain, out_value_u64, &out_rho, &out_recipient, &sender_id);
 
-        // Build EncryptedNote for the authority, if configured
+        // Build EncryptedNote for the pool viewer, if configured.
         // sender_id = spender's address
-        let view_ciphertexts: Option<Vec<EncryptedNote>> = match authority_fvk {
+        let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
             Some(fvk) => {
                 let (_att, enc) = make_viewer_bundle(
                     &fvk,
@@ -1838,7 +1957,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             transfer_nonce,
             tx_hash,
             hex::encode(&nf[..8]),
-            authority_fvk.is_some()
+            viewer_fvk.is_some()
         );
     }
 

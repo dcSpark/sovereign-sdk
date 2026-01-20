@@ -1,8 +1,9 @@
 # Rollup Ligero Services (Linux)
 
 This directory contains systemd unit files for running the Sovereign SDK
-rollup demo, its Ligero proof verifier, the indexer, the MCP external server,
-and the continuous transfers load generator as background services on Linux.
+rollup demo, its Ligero proof verifier, the Ligero prover service, the indexer,
+the MCP external server, and the continuous transfers load generator as
+background services on Linux.
 
 ## Prerequisites
 - A Linux host with `systemd`
@@ -10,7 +11,7 @@ and the continuous transfers load generator as background services on Linux.
 - Built Ligero guest programs (from the Ligero repo): `<ligero-prover>/utils/circuits/bins/*.wasm`
 - Configured indexer environment at
   `crates/utils/sov-indexer/.env` (`DA_CONNECTION_STRING`, `INDEX_DB`,
-  `INDEXER_BIND`, optional `MODE`/FVK settings)
+  `INDEXER_BIND`, optional VFK settings)
 - Updated unit files with the correct `User`, `WorkingDirectory`, `ExecStart`,
   and `PATH` values for your environment
 
@@ -19,6 +20,7 @@ and the continuous transfers load generator as background services on Linux.
    ```bash
    sudo cp rollup-ligero.service /etc/systemd/system/
    sudo cp rollup-ligero-verifier.service /etc/systemd/system/
+   sudo cp rollup-ligero-prover.service /etc/systemd/system/
    sudo cp rollup-ligero-indexer.service /etc/systemd/system/
    sudo cp rollup-ligero-continuous-transfers.service /etc/systemd/system/
    sudo cp rollup-ligero-mcp.service /etc/systemd/system/
@@ -31,9 +33,10 @@ and the continuous transfers load generator as background services on Linux.
    ```bash
    sudo systemctl enable --now rollup-ligero.service
    sudo systemctl enable --now rollup-ligero-verifier.service
+   sudo systemctl enable --now rollup-ligero-prover.service
    sudo systemctl enable --now rollup-ligero-indexer.service
    sudo systemctl enable --now rollup-ligero-continuous-transfers.service
-    sudo systemctl enable --now rollup-ligero-mcp.service
+   sudo systemctl enable --now rollup-ligero-mcp.service
    ```
 
 ## Useful Commands
@@ -49,6 +52,14 @@ and the continuous transfers load generator as background services on Linux.
 - The verifier service wraps `run_verifier_service.sh`, which builds and runs
   `sov-proof-verifier-service`. Adjust environment variables inside the script
   (or in the unit file) if you need non-default Ligero settings.
+- The prover service wraps `run_prover.sh`, which builds and runs the
+  `ligero-http-server` binary from the ligero-prover git dependency. It provides
+  HTTP endpoints for ZK proof generation (`POST /prove`) and verification
+  (`POST /verify`). Configure via environment variables:
+  - `PROVER_BIND_ADDR`: Bind address (default: `0.0.0.0:1313`)
+  - `PROVER_THREADS`: Number of HTTP worker threads (default: CPU count)
+  - `PROVER_PROOF_OUTPUTS`: Directory for proof outputs
+  - `PROVER_KEEP_PROOF_DIRS`: Set to `1` to keep proof directories for debugging
 - The indexer service runs `cargo run -p sov-indexer --release` from
   `crates/utils/sov-indexer` and loads `.env` via `EnvironmentFile=`. Ensure
   `DA_CONNECTION_STRING` points to your rollup DA SQLite DB

@@ -1,7 +1,7 @@
-//! Level-B Viewer Support (Authority Viewing Key)
+//! Level-B Viewer Support (Viewer Full Viewing Key)
 //!
 //! This module provides helpers for generating viewer attestations and encrypted notes
-//! that allow authorities to decrypt shielded transaction data.
+//! that allow configured viewers to decrypt shielded transaction data.
 
 use midnight_privacy::{
     viewing::{ct_hash, fvk_commitment, view_kdf, view_mac},
@@ -10,29 +10,6 @@ use midnight_privacy::{
 
 /// Length of note plaintext: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
 pub const NOTE_PLAIN_LEN: usize = 144;
-
-/// Load authority viewing key from environment variable AUTHORITY_FVK.
-///
-/// Accepts hex strings with or without `0x` prefix.
-/// Returns `None` if:
-/// - Environment variable is not set
-/// - Hex decoding fails
-/// - Length is not exactly 32 bytes
-pub fn load_authority_fvk() -> Option<Hash32> {
-    let raw = std::env::var("AUTHORITY_FVK").ok()?;
-    let s = raw.trim();
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = match hex::decode(s) {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
 
 /// Produce the i-th 32-byte stream block for key k using Poseidon2.
 fn stream_block(k: &Hash32) -> impl Fn(u32) -> Hash32 + '_ {

@@ -1,10 +1,15 @@
 use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
+use crate::index_db as idx;
 use crate::viewer::{
-    self, extract_recipient_from_decrypted_notes, hex_to_bech32m_address, FvkRegistry,
+    self, extract_recipient_from_decrypted_notes, extract_sender_from_decrypted_notes,
+    hex_to_bech32m_address, FvkRegistry,
 };
 use anyhow::Result;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
+};
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
 use std::sync::Arc;
@@ -13,6 +18,7 @@ pub async fn backfill_index(
     da: &DatabaseConnection,
     idx: &DatabaseConnection,
     fvk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<()> {
     let last = db::get_last_processed_id(idx).await?.unwrap_or(0);
     let rows = worker_verified_transactions::Entity::find()
@@ -64,11 +70,16 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !fvk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-            } else {
-                None
-            };
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx,
+                fvk_registry,
+                encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+
             // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
                 .or(recip_from_payload);
@@ -81,7 +92,6 @@ pub async fn backfill_index(
                 Some(sender.clone()),
                 view_fvks,
                 encrypted_notes,
-                decrypted_notes,
             )
             .await?;
         } else if kind == "withdraw" {
@@ -126,11 +136,17 @@ pub async fn backfill_index(
                     .encrypted_notes_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
-                let decrypted_notes = if !fvk_registry.is_empty() {
-                    viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-                } else {
-                    None
-                };
+                viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                    idx,
+                    fvk_registry,
+                    encrypted_notes.as_ref(),
+                    fvk_service,
+                )
+                .await?;
+                let decrypted_notes =
+                    viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+                let privacy_sender =
+                    extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
                     idx,
                     event_id,
@@ -139,9 +155,9 @@ pub async fn backfill_index(
                     nullifier.clone(),
                     Some(recipient.clone()),
                     Some(row.sender.clone()),
+                    privacy_sender,
                     view_att,
                     encrypted_notes,
-                    decrypted_notes,
                 )
                 .await?;
             }
@@ -180,19 +196,25 @@ pub async fn backfill_index(
                 .encrypted_notes_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
-            let decrypted_notes = if !fvk_registry.is_empty() {
-                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref())
-            } else {
-                None
-            };
-            // Extract recipient from decrypted notes (as bech32m address)
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx,
+                fvk_registry,
+                encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
+            // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
+            let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
             db::insert_midnight_transfer(
                 idx,
                 event_id,
                 anchor_root.clone(),
                 nullifier.clone(),
                 Some(row.sender.clone()),
+                privacy_sender,
                 recipient,
                 view_att,
                 encrypted_notes,
@@ -209,17 +231,235 @@ pub fn spawn_sync_loop(
     da: DatabaseConnection,
     idx: DatabaseConnection,
     fvk_registry: Arc<FvkRegistry>,
+    fvk_service: Option<viewer::FvkServiceClient>,
 ) {
     tokio::spawn(async move {
         use tokio::time::{interval, Duration};
         let mut ticker = interval(Duration::from_millis(1000));
         loop {
             ticker.tick().await;
-            if let Err(e) = backfill_index(&da, &idx, &fvk_registry).await {
+            if let Err(e) = backfill_index(&da, &idx, &fvk_registry, fvk_service.as_ref()).await {
                 tracing::warn!(error = %e, "indexer backfill iteration failed");
             }
         }
     });
+}
+
+pub async fn backfill_privacy_fields(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<()> {
+    let dep_updates = backfill_deposits(idx_db, vfk_registry, fvk_service).await?;
+    let transfer_updates = backfill_transfers(idx_db, vfk_registry, fvk_service).await?;
+    let withdraw_updates = backfill_withdraws(idx_db, vfk_registry, fvk_service).await?;
+
+    if dep_updates > 0 || transfer_updates > 0 || withdraw_updates > 0 {
+        tracing::info!(
+            deposits = dep_updates,
+            transfers = transfer_updates,
+            withdraws = withdraw_updates,
+            "Backfilled privacy fields from encrypted notes"
+        );
+    }
+
+    Ok(())
+}
+
+async fn backfill_deposits(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_deposit::Entity::find()
+            .filter(idx::midnight_deposit::Column::EncryptedNotes.is_not_null())
+            .filter(idx::midnight_deposit::Column::Recipient.is_null())
+            .filter(idx::midnight_deposit::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_deposit::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let recipient = if row.recipient.is_none() {
+                extract_recipient_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
+
+            let mut update = idx::midnight_deposit::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            if let Some(recipient) = recipient {
+                update.recipient = Set(Some(recipient));
+            }
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_transfers(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_transfer::Entity::find()
+            .filter(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+            .filter(
+                Condition::any()
+                    .add(idx::midnight_transfer::Column::Recipient.is_null())
+                    .add(idx::midnight_transfer::Column::PrivacySender.is_null())
+                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null()),
+            )
+            .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_transfer::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let recipient = if row.recipient.is_none() {
+                extract_recipient_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
+            let privacy_sender = if row.privacy_sender.is_none() {
+                extract_sender_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
+
+            let mut update = idx::midnight_transfer::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            if let Some(recipient) = recipient {
+                update.recipient = Set(Some(recipient));
+            }
+            if let Some(privacy_sender) = privacy_sender {
+                update.privacy_sender = Set(Some(privacy_sender));
+            }
+            if row.decrypted_notes.is_none() {
+                update.decrypted_notes = Set(Some(decrypted_notes));
+            }
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
+}
+
+async fn backfill_withdraws(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<usize> {
+    let mut updated = 0usize;
+    let mut last_id = 0i32;
+
+    loop {
+        let rows = idx::midnight_withdraw::Entity::find()
+            .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .filter(idx::midnight_withdraw::Column::PrivacySender.is_null())
+            .filter(idx::midnight_withdraw::Column::EventId.gt(last_id))
+            .order_by_asc(idx::midnight_withdraw::Column::EventId)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            last_id = row.event_id;
+            viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
+                idx_db,
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+                fvk_service,
+            )
+            .await?;
+            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
+                vfk_registry,
+                row.encrypted_notes.as_ref(),
+            );
+            let Some(decrypted_notes) = decrypted_notes else {
+                continue;
+            };
+
+            let privacy_sender = extract_sender_from_decrypted_notes(Some(&decrypted_notes));
+            let Some(privacy_sender) = privacy_sender else {
+                continue;
+            };
+
+            let mut update = idx::midnight_withdraw::ActiveModel {
+                event_id: Set(row.event_id),
+                ..Default::default()
+            };
+            update.privacy_sender = Set(Some(privacy_sender));
+
+            update.update(idx_db).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 pub fn parse_kind_amount_roots(
@@ -286,6 +526,7 @@ pub fn parse_deposit_fields(
 /// Handles multiple formats:
 /// - Hex string: "9c66232d..." -> privpool1...
 /// - Byte array: [213, 214, 8, ...] -> privpool1...
+/// - String array: "[213, 214, 8, ...]" -> privpool1...
 /// - Already bech32m: "privpool1..." -> passed through
 pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<String> {
     let value = value?;
@@ -296,6 +537,18 @@ pub fn parse_recipient_to_bech32m(value: Option<&serde_json::Value>) -> Option<S
         if s.starts_with("privpool1") {
             return Some(s.to_string());
         }
+
+        // Check if it's a string representation of an array like "[47, 239, 50, ...]"
+        if s.starts_with('[') && s.ends_with(']') {
+            // Try to parse as a JSON array
+            if let Ok(arr) = serde_json::from_str::<Vec<u8>>(s) {
+                if arr.len() == 32 {
+                    let hex_str = hex::encode(&arr);
+                    return hex_to_bech32m_address(&hex_str);
+                }
+            }
+        }
+
         // Otherwise treat as hex and convert to bech32m
         return hex_to_bech32m_address(s);
     }

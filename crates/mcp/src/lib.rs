@@ -1,5 +1,5 @@
-pub mod authority_fvk;
 pub mod config;
+pub mod fvk_service;
 pub mod ligero;
 pub mod operations;
 pub mod privacy_key;

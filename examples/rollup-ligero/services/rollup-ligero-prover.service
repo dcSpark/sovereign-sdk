@@ -1,0 +1,23 @@
+[Unit]
+Description=Ligero HTTP Prover Service (daemon mode)
+After=network.target
+
+[Service]
+Type=simple
+User=replace_for_linux_user
+WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero
+ExecStart=/bin/bash /home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero/run_prover.sh
+Restart=on-failure
+Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
+# Bind address for the prover service (default: 0.0.0.0:1313)
+#Environment="PROVER_BIND_ADDR=0.0.0.0:1313"
+# Number of prover daemon workers (default: CPU count)
+#Environment="PROVER_THREADS=8"
+# Directory for proof outputs (default: ./proof_outputs)
+#Environment="PROVER_PROOF_OUTPUTS=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-ligero/proof_outputs"
+# Keep proof directories after completion (for debugging)
+#Environment="PROVER_KEEP_PROOF_DIRS=1"
+
+[Install]
+WantedBy=multi-user.target

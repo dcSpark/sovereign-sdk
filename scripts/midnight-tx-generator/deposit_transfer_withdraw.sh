@@ -8,8 +8,13 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Use remote prover service by default (daemon mode - faster for multiple proofs)
+# Set PROVER_SERVICE_URL="" to use local prover binary instead
+PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-http://127.0.0.1:1313}"
+
 # Best-effort: auto-discover the Ligero portable `webgpu_prover` binary from the Cargo git checkout.
 # This avoids relying on PATH while keeping Sovereign free of extra Ligero env vars.
+# Skip discovery if using remote prover service.
 discover_ligero_prover_bin() {
   command -v python3 >/dev/null 2>&1 || return 1
   python3 - <<'PY'
@@ -48,11 +53,16 @@ print(cands[0])
 PY
 }
 
-if [ -z "${LIGERO_PROVER_BIN:-}" ] && [ -z "${LIGERO_PROVER_BINARY_PATH:-}" ]; then
-  DISCOVERED_PROVER_BIN="$(discover_ligero_prover_bin || true)"
-  if [ -n "$DISCOVERED_PROVER_BIN" ]; then
-    export LIGERO_PROVER_BINARY_PATH="$DISCOVERED_PROVER_BIN"
+# Only discover local prover if not using remote prover service
+if [ -z "$PROVER_SERVICE_URL" ]; then
+  if [ -z "${LIGERO_PROVER_BIN:-}" ] && [ -z "${LIGERO_PROVER_BINARY_PATH:-}" ]; then
+    DISCOVERED_PROVER_BIN="$(discover_ligero_prover_bin || true)"
+    if [ -n "$DISCOVERED_PROVER_BIN" ]; then
+      export LIGERO_PROVER_BINARY_PATH="$DISCOVERED_PROVER_BIN"
+    fi
   fi
+else
+  export PROVER_SERVICE_URL
 fi
 
 GENERATOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,10 +85,13 @@ TRANSFER_OUT1="${TRANSFER_OUT1:-600}"
 TRANSFER_OUT2="${TRANSFER_OUT2:-400}"
 WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-200}"
 
-# Optional: Authority FVK for Level-B viewing (32 bytes hex, with or without 0x prefix)
-# If set, proofs will include viewer attestations that allow authorities to decrypt notes
-# Example: AUTHORITY_FVK=0x0102030405060708091011121314151617181920212223242526272829303132
-AUTHORITY_FVK="${AUTHORITY_FVK:-}"
+# Pool FVK public key for Level-B viewing (32 bytes hex, with or without 0x prefix)
+# When set, FVKs are fetched from the FVK service and proofs include pool-signed viewer attestations.
+# Example: POOL_FVK_PK=1ecf7f45dd35e4edc0e09205804211d753725bf7b13c54dd5f98f8e9bfec6abc
+# Deprecated: AUTHORITY_FVK is still supported for backward compatibility but POOL_FVK_PK is preferred.
+POOL_FVK_PK="${POOL_FVK_PK:-}"
+# FVK service URL (default: http://127.0.0.1:8088)
+MIDNIGHT_FVK_SERVICE_URL="${MIDNIGHT_FVK_SERVICE_URL:-http://127.0.0.1:8088}"
 
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
 # Note: Chain generation numbers use milliseconds, so we use $(date +%s)*1000 as fallback
@@ -126,8 +139,14 @@ echo "Parameters:"
 echo "  Nonce: $NONCE"
 echo "  Sequencer: $NODE_API_URL"
 echo "  Worker:    $VERIFIER_ENDPOINT"
-if [ -n "$AUTHORITY_FVK" ]; then
-    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
+if [ -n "$PROVER_SERVICE_URL" ]; then
+    echo "  Prover:    $PROVER_SERVICE_URL (remote)"
+else
+    echo "  Prover:    local binary"
+fi
+if [ -n "$POOL_FVK_PK" ]; then
+    echo "  Pool FVK PK: ${POOL_FVK_PK:0:16}... (Level-B viewing via FVK service)"
+    echo "  FVK Service: $MIDNIGHT_FVK_SERVICE_URL"
 fi
 echo ""
 
@@ -257,10 +276,11 @@ export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
-# Export authority FVK if configured (for Level-B viewing support)
-if [ -n "$AUTHORITY_FVK" ]; then
-    export AUTHORITY_FVK
-    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
+# Export pool FVK configuration (for Level-B viewing support)
+if [ -n "$POOL_FVK_PK" ]; then
+    export POOL_FVK_PK
+    export MIDNIGHT_FVK_SERVICE_URL
+    echo "  Pool FVK PK: ${POOL_FVK_PK:0:16}... (Level-B viewing via FVK service)"
 fi
 
 cd "$GENERATOR_DIR"
@@ -363,10 +383,11 @@ export PRIVATE_KEY_FILE
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"
 export LIGERO_PACKING="${LIGERO_PACKING:-8192}"
 unset LIGERO_SHADER_PATH
-# Export authority FVK if configured (for Level-B viewing support)
-if [ -n "$AUTHORITY_FVK" ]; then
-    export AUTHORITY_FVK
-    echo "  Authority FVK: ${AUTHORITY_FVK:0:16}... (Level-B viewing enabled)"
+# Export pool FVK configuration (for Level-B viewing support)
+if [ -n "$POOL_FVK_PK" ]; then
+    export POOL_FVK_PK
+    export MIDNIGHT_FVK_SERVICE_URL
+    echo "  Pool FVK PK: ${POOL_FVK_PK:0:16}... (Level-B viewing via FVK service)"
 fi
 
 cd "$GENERATOR_DIR"

@@ -1,34 +1,31 @@
-use crate::db::{list_wallet_txs_direct, list_wallet_txs_sync, CursorInner, ListResponse};
+use crate::balance;
+use crate::db::{list_wallet_txs as list_wallet_txs_db, CursorInner, ListResponse};
 use crate::viewer::{self, FvkRegistry};
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use midnight_privacy::Hash32;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseConnection,
-    pub mode: Mode,
-    /// FVK registry using DashMap for lock-free concurrent access
-    pub fvk_registry: Arc<FvkRegistry>,
+    /// VFK registry using DashMap for lock-free concurrent access
+    pub vfk_registry: Arc<FvkRegistry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Sync,
-    Direct,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -36,11 +33,17 @@ pub struct ListQuery {
     #[serde(default)]
     pub r#type: Option<String>,
 }
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VfkBody {
+    #[serde(default)]
+    pub vfk: Option<String>,
+}
 fn default_limit() -> usize {
     50
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TxListQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -48,24 +51,87 @@ pub struct TxListQuery {
     pub offset: usize,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FvkListResponse {
+    pub count: usize,
+    pub fvks: Vec<FvkResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AddFvkResponse {
+    pub success: bool,
+    pub fvk_commitment: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SuccessResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/wallets/:address", get(list_wallet_txs))
+        .route("/wallets/:address", post(list_wallet_txs))
+        .route("/wallets/:address/balance", post(wallet_balance))
         .route("/txs/:tx_hash", get(get_tx))
         .route("/txs", get(list_txs))
         .route("/health", get(health))
         // FVK registry management endpoints
         .route("/fvks", get(list_fvks).post(add_fvk))
         .route("/fvks/:fvk_commitment", delete(delete_fvk))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()))
         .with_state(state)
 }
 
+#[utoipa::path(
+    post,
+    path = "/wallets/{address}",
+    params(
+        ("address" = String, Path, description = "Wallet or privacy address"),
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("type" = Option<String>, Query, description = "Filter by tx type: deposit, withdraw, transfer")
+    ),
+    request_body = Option<VfkBody>,
+    responses(
+        (status = 200, description = "Wallet transactions", body = ListResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "wallets"
+)]
 async fn list_wallet_txs(
     Path(address): Path<String>,
     Query(q): Query<ListQuery>,
     State(state): State<AppState>,
+    body: Option<Json<VfkBody>>,
 ) -> impl IntoResponse {
-    match list_wallet_txs_inner(address, q, state).await {
+    let vfk = match body.and_then(|Json(body)| body.vfk) {
+        Some(vfk_hex) => match viewer::parse_fvk_hex(&vfk_hex) {
+            Ok(vfk) => Some(vfk),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid VFK: {}", e)})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    match list_wallet_txs_inner(address, q.limit, q.cursor, q.r#type, state, vfk).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -75,30 +141,114 @@ async fn list_wallet_txs(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/wallets/{address}/balance",
+    params(
+        ("address" = String, Path, description = "Privacy address (privpool1...)")
+    ),
+    request_body = balance::BalanceRequest,
+    responses(
+        (status = 200, description = "Wallet balance and unspent notes", body = balance::BalanceResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "wallets"
+)]
+async fn wallet_balance(
+    Path(address): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<balance::BalanceRequest>,
+) -> impl IntoResponse {
+    match balance::get_wallet_balance(&state.db, &address, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            let status = if is_balance_client_error(&e) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Service healthy", body = HealthResponse)
+    ),
+    tag = "health"
+)]
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({"status":"ok"})))
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            status: "ok".to_string(),
+        }),
+    )
 }
 
 async fn list_wallet_txs_inner(
     address: String,
-    q: ListQuery,
+    limit: usize,
+    cursor: Option<String>,
+    type_filter: Option<String>,
     state: AppState,
+    vfk: Option<Hash32>,
 ) -> Result<ListResponse> {
-    let limit = q.limit.min(200);
-    let cursor = if let Some(cur) = q.cursor.as_deref() {
-        let raw = BASE64_STANDARD.decode(cur)?;
-        Some(serde_json::from_slice::<CursorInner>(&raw)?)
-    } else {
-        None
-    };
-    if state.mode == Mode::Direct {
-        return list_wallet_txs_direct(&state.db, &address, limit, cursor, q.r#type.clone()).await;
-    }
-    list_wallet_txs_sync(&state.db, &address, limit, cursor, q.r#type.clone()).await
+    let limit = limit.min(200);
+    let cursor = decode_cursor(cursor)?;
+    list_wallet_txs_db(&state.db, &address, limit, cursor, type_filter, vfk).await
 }
 
+fn decode_cursor(cursor: Option<String>) -> Result<Option<CursorInner>> {
+    let Some(cur) = cursor else {
+        return Ok(None);
+    };
+    let raw = BASE64_STANDARD.decode(cur)?;
+    Ok(Some(serde_json::from_slice::<CursorInner>(&raw)?))
+}
+
+fn is_balance_client_error(err: &anyhow::Error) -> bool {
+    if err
+        .root_cause()
+        .downcast_ref::<midnight_privacy::PrivacyAddressError>()
+        .is_some()
+    {
+        return true;
+    }
+    if err.root_cause().downcast_ref::<hex::FromHexError>().is_some() {
+        return true;
+    }
+
+    let message = err.to_string();
+    message.contains("nf_key")
+        || message.contains("vfk")
+        || message.contains("Invalid privacy address")
+        || message.contains("Expected 32-byte hex")
+}
+
+#[utoipa::path(
+    get,
+    path = "/txs/{tx_hash}",
+    params(
+        ("tx_hash" = String, Path, description = "Transaction hash")
+    ),
+    responses(
+        (status = 200, description = "Transaction details", body = crate::db::InvolvementItem),
+        (status = 404, description = "Transaction not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "txs"
+)]
 async fn get_tx(Path(tx_hash): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
-    match crate::db::get_tx(&state.db, state.mode, &tx_hash).await {
+    match crate::db::get_tx(&state.db, &tx_hash).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -113,13 +263,26 @@ async fn get_tx(Path(tx_hash): Path<String>, State(state): State<AppState>) -> i
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/txs",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max results (default 50, max 200)"),
+        ("offset" = Option<usize>, Query, description = "Pagination offset")
+    ),
+    responses(
+        (status = 200, description = "Transaction list", body = ListResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "txs"
+)]
 async fn list_txs(
     Query(q): Query<TxListQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let limit = q.limit.min(200);
     let offset = q.offset;
-    match crate::db::list_txs(&state.db, state.mode, limit, offset).await {
+    match crate::db::list_txs(&state.db, limit, offset).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -132,7 +295,7 @@ async fn list_txs(
 // ============== FVK Registry Management ==============
 
 /// Request body for adding a new FVK
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AddFvkRequest {
     /// The FVK as hex string (32 bytes = 64 hex chars)
     pub fvk: String,
@@ -145,7 +308,7 @@ pub struct AddFvkRequest {
 }
 
 /// Response for FVK operations
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FvkResponse {
     pub fvk_commitment: String,
     pub fvk: String,
@@ -154,9 +317,17 @@ pub struct FvkResponse {
 }
 
 /// List all FVKs in the registry
+#[utoipa::path(
+    get,
+    path = "/fvks",
+    responses(
+        (status = 200, description = "List FVKs", body = FvkListResponse)
+    ),
+    tag = "fvks"
+)]
 async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
     let fvks: Vec<FvkResponse> = state
-        .fvk_registry
+        .vfk_registry
         .entries()
         .into_iter()
         .map(|(commitment, fvk, addr)| FvkResponse {
@@ -168,14 +339,26 @@ async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "count": fvks.len(),
-            "fvks": fvks
-        })),
+        Json(FvkListResponse {
+            count: fvks.len(),
+            fvks,
+        }),
     )
 }
 
 /// Add a new FVK to the registry
+#[utoipa::path(
+    post,
+    path = "/fvks",
+    request_body = AddFvkRequest,
+    responses(
+        (status = 201, description = "FVK added", body = AddFvkResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 409, description = "FVK already exists", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "fvks"
+)]
 async fn add_fvk(
     State(state): State<AppState>,
     Json(req): Json<AddFvkRequest>,
@@ -219,7 +402,7 @@ async fn add_fvk(
     }
 
     // Check if this FVK already exists in the registry
-    if state.fvk_registry.get_fvk(&commitment_hex).is_some() {
+    if state.vfk_registry.get_fvk(&commitment_hex).is_some() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -232,27 +415,50 @@ async fn add_fvk(
     }
 
     // Add to registry (DashMap - no lock needed)
-    state.fvk_registry.add(fvk, req.shielded_address.clone());
+    state.vfk_registry.add(fvk, req.shielded_address.clone());
 
     // Persist to database
-    if let Err(e) = state.fvk_registry.save_to_db(&state.db).await {
+    if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {
         tracing::warn!("Failed to persist FVK to database: {}", e);
     }
 
     tracing::info!("Added FVK with commitment {}", &commitment_hex[..16]);
 
+    let db = state.db.clone();
+    let vfk_registry = state.vfk_registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::background_sync::backfill_privacy_fields(&db, &vfk_registry, None).await
+        {
+            tracing::warn!("VFK backfill failed: {}", e);
+        }
+    });
+
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({
-            "success": true,
-            "fvk_commitment": commitment_hex,
-            "message": "FVK added and verified successfully"
-        })),
+        Json(AddFvkResponse {
+            success: true,
+            fvk_commitment: commitment_hex,
+            message: "FVK added and verified successfully".to_string(),
+        }),
     )
         .into_response()
 }
 
 /// Delete a FVK from the registry
+#[utoipa::path(
+    delete,
+    path = "/fvks/{fvk_commitment}",
+    params(
+        ("fvk_commitment" = String, Path, description = "FVK commitment (hex)")
+    ),
+    responses(
+        (status = 200, description = "FVK deleted", body = SuccessResponse),
+        (status = 404, description = "FVK not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "fvks"
+)]
 async fn delete_fvk(
     Path(fvk_commitment): Path<String>,
     State(state): State<AppState>,
@@ -261,7 +467,7 @@ async fn delete_fvk(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // Check if it exists and remove (DashMap - no lock needed)
-    if !state.fvk_registry.remove(&fvk_commitment) {
+    if !state.vfk_registry.remove(&fvk_commitment) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "FVK not found"})),
@@ -285,10 +491,53 @@ async fn delete_fvk(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "success": true,
-            "message": "FVK deleted successfully"
-        })),
+        Json(SuccessResponse {
+            success: true,
+            message: "FVK deleted successfully".to_string(),
+        }),
     )
         .into_response()
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Sovereign Indexer API",
+        version = "0.1.0",
+        description = "Indexer API for midnight privacy transactions."
+    ),
+    paths(
+        list_wallet_txs,
+        wallet_balance,
+        get_tx,
+        list_txs,
+        health,
+        list_fvks,
+        add_fvk,
+        delete_fvk
+    ),
+    components(schemas(
+        ListQuery,
+        TxListQuery,
+        VfkBody,
+        balance::BalanceRequest,
+        balance::BalanceResponse,
+        balance::UnspentNote,
+        crate::db::InvolvementItem,
+        ListResponse,
+        AddFvkRequest,
+        FvkResponse,
+        FvkListResponse,
+        AddFvkResponse,
+        SuccessResponse,
+        ErrorResponse,
+        HealthResponse
+    )),
+    tags(
+        (name = "wallets", description = "Wallet-related endpoints"),
+        (name = "txs", description = "Transaction listing and lookup"),
+        (name = "fvks", description = "FVK registry management"),
+        (name = "health", description = "Service health checks")
+    )
+)]
+struct ApiDoc;

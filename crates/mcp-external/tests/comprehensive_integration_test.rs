@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
-use mcp_external::operations::{deposit, get_unified_balance, verify_transaction};
+use mcp_external::operations::{deposit, get_privacy_balance, verify_transaction};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::wallet::WalletContext;
@@ -257,10 +257,10 @@ async fn test_verify_transaction() -> Result<()> {
 #[tokio::test]
 #[tracing_test::traced_test]
 #[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
-async fn test_get_unified_balance() -> Result<()> {
+async fn test_get_privacy_balance() -> Result<()> {
     let _ = dotenvy::dotenv();
 
-    tracing::info!("Testing walletBalance (via get_unified_balance)");
+    tracing::info!("Testing walletBalance (via get_privacy_balance)");
 
     let wallet_private_key =
         std::env::var("WALLET_PRIVATE_KEY").expect("WALLET_PRIVATE_KEY must be set in .env");
@@ -288,11 +288,9 @@ async fn test_get_unified_balance() -> Result<()> {
     let viewing_key = FullViewingKey(fvk_bytes);
 
     // Get initial balance (should be 0)
-    let token_id = "token_1nyl0e0yweragfsatygt24zmd8jrr2vqtvdfptzjhxkguz2xxx3vs0y07u7";
-    let initial_balance =
-        get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
+    let initial_balance = get_privacy_balance(&provider, &privacy_key, &viewing_key).await?;
 
-    let initial_privacy_balance: u128 = initial_balance.privacy_balance.parse()?;
+    let initial_privacy_balance = initial_balance.balance;
     tracing::info!("Initial privacy balance: {}", initial_privacy_balance);
 
     // Perform a deposit
@@ -305,10 +303,9 @@ async fn test_get_unified_balance() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // Get balance after deposit
-    let final_balance =
-        get_unified_balance(&provider, &wallet, token_id, &privacy_key, &viewing_key).await?;
+    let final_balance = get_privacy_balance(&provider, &privacy_key, &viewing_key).await?;
 
-    let final_privacy_balance: u128 = final_balance.privacy_balance.parse()?;
+    let final_privacy_balance = final_balance.balance;
     tracing::info!("Final privacy balance: {}", final_privacy_balance);
 
     // Balance should have increased

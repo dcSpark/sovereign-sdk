@@ -27,6 +27,7 @@ bincode.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
+ed25519-dalek = { version = "2" }
 ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c" }
 ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c", features = ["native"] }
 

@@ -28,6 +28,7 @@ bincode = { workspace = true }
 
 # Crypto
 sha2 = { workspace = true }
+ed25519-dalek = { version = "2" }
 hex = { workspace = true }
 
 # Temp files (used for daemon-mode Ligero verifier, which expects a proof file path:
@@ -73,7 +74,7 @@ midnight-privacy = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 
 # Daemon-mode verifier pool (keeps `webgpu_verifier --daemon` workers warm)
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }

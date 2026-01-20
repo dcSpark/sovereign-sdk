@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use borsh;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use hex;
@@ -7,10 +7,10 @@ use midnight_privacy::{
     CallMessage, EncryptedNote, Hash32, MerkleTree, PrivacyAddress, SpendPublic, ViewAttestation,
 };
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_ligero_adapter::Ligero;
+use sov_ligero_adapter::{Ligero, LigeroProofPackage};
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_rollup_blueprint::RollupBlueprint;
@@ -24,8 +24,123 @@ mod rollup_schema;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
+/// Inject pool signature into the proof package at the fvk_commitment argument position.
+fn inject_pool_sig_hex_into_proof_bytes(
+    proof_bytes: Vec<u8>,
+    fvk_commitment_arg_pos: usize,
+    pool_sig_hex: String,
+) -> Result<Vec<u8>> {
+    let mut package: LigeroProofPackage =
+        bincode::deserialize(&proof_bytes).context("Proof payload is not a LigeroProofPackage")?;
+
+    let mut args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json)
+        .context("LigeroProofPackage.args_json is not valid JSON")?;
+
+    let idx = fvk_commitment_arg_pos
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("fvk_commitment_arg_pos must be >= 1"))?;
+    let arg = args
+        .get_mut(idx)
+        .ok_or_else(|| anyhow!("Ligero args too short (missing arg #{fvk_commitment_arg_pos})"))?;
+    let obj = arg.as_object_mut().ok_or_else(|| {
+        anyhow!("Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})")
+    })?;
+    obj.insert(
+        "pool_sig_hex".to_string(),
+        serde_json::Value::String(pool_sig_hex),
+    );
+
+    package.args_json = serde_json::to_vec(&args).context("Failed to reserialize args_json")?;
+    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+}
+
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
 const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+
+/// Request body for the prover service
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProverServiceRequest {
+    circuit: String,
+    args: serde_json::Value,
+    private_indices: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packing: Option<u32>,
+}
+
+/// Response from the prover service
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProverServiceResponse {
+    success: bool,
+    exit_code: i32,
+    proof: Option<String>,
+}
+
+/// Generate proof using the remote prover service and wrap it in a LigeroProofPackage.
+fn prove_with_service(
+    service_url: &str,
+    program_path: &str,
+    args: &[serde_json::Value],
+    private_indices: Vec<usize>,
+    packing: u32,
+    public_output: &[u8],
+) -> Result<Vec<u8>> {
+    use base64::Engine;
+    use sov_ligero_adapter::LigeroProofPackage;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for proving
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let request = ProverServiceRequest {
+        circuit: program_path.to_string(),
+        args: serde_json::Value::Array(args.to_vec()),
+        private_indices: private_indices.clone(),
+        packing: Some(packing),
+    };
+
+    let url = format!("{}/prove", service_url.trim_end_matches('/'));
+    let response = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .context("Failed to send request to prover service")?;
+
+    let status = response.status();
+    let resp: ProverServiceResponse = response
+        .json()
+        .context("Failed to parse prover service response")?;
+
+    if !resp.success {
+        anyhow::bail!(
+            "Prover service failed (status={}, exit_code={})",
+            status,
+            resp.exit_code
+        );
+    }
+
+    let proof_b64 = resp
+        .proof
+        .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
+
+    let proof_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&proof_b64)
+        .context("Failed to decode proof from base64")?;
+
+    // Wrap the raw proof bytes in a LigeroProofPackage (same as the local prover does)
+    let args_json = serde_json::to_vec(args).context("Failed to serialize args")?;
+    let package = LigeroProofPackage::new(
+        proof_bytes,
+        public_output.to_vec(),
+        args_json,
+        private_indices,
+    )
+    .context("Failed to build LigeroProofPackage")?;
+
+    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+}
 
 /// Helper to create an EncryptedNote for the transaction (matching mcp-external/viewer.rs)
 fn create_encrypted_note(
@@ -336,10 +451,15 @@ fn main() -> Result<()> {
     let (blacklist_root, deny_openings) =
         note_spend_guest_v2::fetch_deny_map_openings(&node_url, &addr_list)?;
 
-    // Check for authority FVK and build viewer attestations if configured
-    let authority_fvk = note_spend_guest_v2::load_authority_fvk();
+    // Check for FVK bundle (new: POOL_FVK_PK + FVK service) or authority FVK (deprecated)
+    let fvk_bundle = note_spend_guest_v2::load_fvk_bundle();
+    let authority_fvk = fvk_bundle.as_ref().map(|b| b.fvk).or_else(note_spend_guest_v2::load_authority_fvk);
     let (viewer_atts, view_attestations_pub, view_ciphertexts) = if let Some(fvk) = authority_fvk {
-        println!("Authority FVK configured: generating viewer attestations for 2 output(s)");
+        if fvk_bundle.is_some() {
+            println!("POOL_FVK_PK configured: generating viewer attestations for 2 output(s) (with pool signature)");
+        } else {
+            println!("AUTHORITY_FVK configured (deprecated): generating viewer attestations for 2 output(s)");
+        }
 
         let out1_value_u64 = u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?;
         let out2_value_u64 = u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?;
@@ -387,7 +507,7 @@ fn main() -> Result<()> {
             Some(vec![enc1, enc2]),
         )
     } else {
-        println!("No authority FVK configured: transfer will not include viewer attestation");
+        println!("No FVK configured (set POOL_FVK_PK or AUTHORITY_FVK): transfer will not include viewer attestation");
         (None, None, None)
     };
 
@@ -407,21 +527,69 @@ fn main() -> Result<()> {
         viewer_atts.as_deref(),
     )?;
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_packing(packing)
-        .with_private_indices(private_indices);
-    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
-
     let mut public_output = public_output;
     public_output.blacklist_root = blacklist_root;
     public_output.view_attestations = view_attestations_pub;
-    host.set_public_output(&public_output)?;
 
-    println!("Generating proof...");
-    let proof_bytes = host
-        .run(true)
-        .context("Ligero prover did not produce a valid proof")?;
+    // Serialize public output for the proof package
+    let public_output_bytes =
+        bincode::serialize(&public_output).context("Failed to serialize public output")?;
+
+    // Check if we should use the remote prover service
+    let prover_service_url = std::env::var("PROVER_SERVICE_URL").ok();
+
+    let mut proof_bytes = if let Some(service_url) = prover_service_url {
+        println!("Generating proof via prover service ({})...", service_url);
+        prove_with_service(
+            &service_url,
+            &program_path,
+            &args,
+            private_indices.clone(),
+            packing,
+            &public_output_bytes,
+        )?
+    } else {
+        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
+            .with_packing(packing)
+            .with_private_indices(private_indices.clone());
+        note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
+        host.set_public_output(&public_output)?;
+
+        println!("Generating proof (local)...");
+        host.run(true)
+            .context("Ligero prover did not produce a valid proof")?
+    };
     println!("✓ Proof generated: {} bytes", proof_bytes.len());
+
+    // Inject pool signature if FVK bundle is available (POOL_FVK_PK mode)
+    if let Some(ref bundle) = fvk_bundle {
+        if viewer_atts.is_some() {
+            // Calculate fvk_commitment position in args
+            // Structure: header(6) + inputs(4+depth+1 per input) + withdraw(3) + outputs(5*n_out) + inv_enforce(1) + blacklist(1+openings) + viewer(n_viewers=1, fvk_commitment, ...)
+            let tree_depth: u8 = 16;
+            let depth_usize = tree_depth as usize;
+            let n_in = 1usize;
+            let n_out = 2usize;
+            let inputs_args = n_in * (4 + depth_usize + 1); // value, rho, sender_id, pos, siblings, nullifier
+            let withdraw_args = 3; // withdraw_amount, withdraw_to, n_out
+            let outputs_args = n_out * 5; // value, rho, pk_spend, pk_ivk, cm per output
+            let inv_enforce_args = 1;
+            let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
+            let bl_per_check = midnight_privacy::BLACKLIST_BUCKET_SIZE + 1 + bl_depth;
+            let bl_checks = 2usize; // sender + pay recipient for transfers
+            let blacklist_args = 1 + bl_checks * bl_per_check; // root + openings
+
+            // fvk_commitment is at: header(6) + inputs + withdraw + outputs + inv_enforce + blacklist + n_viewers(1) + fvk_commitment
+            let fvk_commitment_arg_pos = 6 + inputs_args + withdraw_args + outputs_args + inv_enforce_args + blacklist_args + 1 + 1;
+
+            proof_bytes = inject_pool_sig_hex_into_proof_bytes(
+                proof_bytes,
+                fvk_commitment_arg_pos,
+                bundle.pool_sig_hex.clone(),
+            )?;
+            println!("✓ Pool signature injected into proof");
+        }
+    }
 
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =
         serde_json::from_str(&fs::read_to_string(std::env::var("PRIVATE_KEY_FILE")?)?)?;

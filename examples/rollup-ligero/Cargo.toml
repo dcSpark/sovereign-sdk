@@ -94,6 +94,10 @@ rand = { workspace = true }
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 bincode = { workspace = true }
 toml = { workspace = true }
+tiny_http = "0.12"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# ligero-runner for the prover service binary
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
 midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
@@ -184,3 +188,4 @@ path = "src/bin/decrypt_authority_notes.rs"
 [[bin]]
 name = "rollup-ligero-service-controller"
 path = "src/bin/rollup_ligero_service_controller.rs"
+

@@ -1,9 +1,11 @@
 //! Integration tests for the MCP server
 //!
-//! These tests require a running rollup node, sequencer, and verifier service.
+//! These tests require a running rollup node, verifier service, and (for proof flows) the
+//! Ligero proof service.
 //! Make sure all services are running before executing these tests.
 //! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL, PRIVPOOL_SPEND_KEY)
 //! should be set in .env (INDEXER_URL is optional, defaults to http://localhost:13100).
+//! Proof tests also require LIGERO_PROOF_SERVICE_URL (defaults to http://127.0.0.1:1313).
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
@@ -22,35 +24,29 @@ use sov_modules_api::execution_mode::Native;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
-use ligero_runner::LigeroRunner;
-
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-fn env_opt(var: &str) -> Option<std::path::PathBuf> {
-    std::env::var(var).ok().map(std::path::PathBuf::from)
-}
-
-/// Helper to create test ligero prover (skips if assets are missing).
+/// Helper to create test Ligero proof client (skips if env is missing).
 fn create_test_ligero() -> Option<Ligero> {
     let program =
         std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
+    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
 
-    let runner = LigeroRunner::new(&program);
-    let prover = env_opt("LIGERO_PROVER_BIN")
-        .or_else(|| env_opt("LIGERO_PROVER_BINARY_PATH"))
-        .unwrap_or_else(|| runner.paths().prover_bin.clone());
-    let shader = env_opt("LIGERO_SHADER_PATH")
-        .unwrap_or_else(|| std::path::PathBuf::from(runner.config().shader_path.clone()));
-
-    if !prover.exists() || !shader.exists() {
+    if program.trim().is_empty() || proof_service_url.trim().is_empty() {
         return None;
     }
 
-    Some(Ligero::new(Some(prover), Some(shader), Some(program)))
+    Some(Ligero::new(proof_service_url, program))
 }
 
 /// Helper to check if services are available
-async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> bool {
+async fn check_services_available(
+    rpc_url: &str,
+    verifier_url: &str,
+    indexer_url: &str,
+    proof_service_url: &str,
+) -> bool {
     // Check rollup
     let provider_result = Provider::new(rpc_url, verifier_url, indexer_url).await;
     if provider_result.is_err() {
@@ -71,12 +67,25 @@ async fn check_services_available(rpc_url: &str, verifier_url: &str, indexer_url
         return false;
     }
 
+    // Check proof service if provided
+    if !proof_service_url.trim().is_empty() {
+        let proof_url = proof_service_url.trim_end_matches('/');
+        let proof_check = reqwest::get(format!("{}/health", proof_url)).await;
+        if proof_check.is_err() {
+            eprintln!(
+                "⚠️  Proof service not available at {}",
+                proof_service_url
+            );
+            return false;
+        }
+    }
+
     true
 }
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
+#[ignore = "requires running rollup/verifier/indexer services and Ligero proof service"]
 async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Load .env file
     let _ = dotenvy::dotenv();
@@ -91,17 +100,20 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
     let privpool_spend_key = std::env::var("PRIVPOOL_SPEND_KEY")
         .expect("PRIVPOOL_SPEND_KEY must be set in .env (hex or privpool1... address)");
 
     assert!(
-        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
-        "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
+        check_services_available(&rpc_url, &verifier_url, &indexer_url, &proof_service_url).await,
+        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and LIGERO_PROOF_SERVICE_URL"
     );
 
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
+    tracing::info!("Using LIGERO_PROOF_SERVICE_URL: {}", proof_service_url);
 
     // Parse privacy key from either raw spend key hex or bech32m address
     let privacy_key = if privpool_spend_key.starts_with("privpool1") {
@@ -180,36 +192,20 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     tracing::info!("✓ Wait completed");
 
-    // Step 6: Initialize Ligero prover for transfer
-    tracing::info!("Step 6: Initializing Ligero prover");
+    // Step 6: Initialize Ligero proof client for transfer
+    tracing::info!("Step 6: Initializing Ligero proof client");
     let Some(ligero) = create_test_ligero() else {
         eprintln!(
-            "⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)"
+            "⚠️  Skipping integration test: Ligero proof service not configured"
         );
         return Ok(());
     };
-    tracing::info!("✓ Ligero prover initialized");
+    tracing::info!("✓ Ligero proof client initialized");
 
     // Step 7: Perform transfer using deposit outputs
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
-                                      // Load authority FVK from environment for test
-    let authority_fvk = std::env::var("AUTHORITY_FVK")
-        .ok()
-        .and_then(|s| {
-            let trimmed = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-            hex::decode(trimmed).ok()
-        })
-        .and_then(|bytes| {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(arr)
-            } else {
-                None
-            }
-        });
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -224,7 +220,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         deposit_result.recipient, // deposit convention: sender_id == recipient
         *privacy_key.pk(),
         *privacy_key.pk(),
-        authority_fvk,
+        None,
     )
     .await?;
 
@@ -321,7 +317,7 @@ async fn test_balance_check() -> Result<()> {
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
 
     assert!(
-        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
+        check_services_available(&rpc_url, &verifier_url, &indexer_url, "").await,
         "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
     );
 
@@ -348,7 +344,7 @@ async fn test_balance_check() -> Result<()> {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
+#[ignore = "requires running rollup/verifier/indexer services and Ligero proof service"]
 async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     use midnight_privacy::FullViewingKey;
     use rand::RngCore;
@@ -365,16 +361,19 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
+    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
     let startup_deposit_amount = 1000u128; // Test deposit amount
 
     assert!(
-        check_services_available(&rpc_url, &verifier_url, &indexer_url).await,
-        "Required services must be running at ROLLUP_RPC_URL and VERIFIER_URL"
+        check_services_available(&rpc_url, &verifier_url, &indexer_url, &proof_service_url).await,
+        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and LIGERO_PROOF_SERVICE_URL"
     );
 
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
+    tracing::info!("Using LIGERO_PROOF_SERVICE_URL: {}", proof_service_url);
     tracing::info!("Test deposit amount: {}", startup_deposit_amount);
 
     // Step 1: Create funding wallet from private key
@@ -426,18 +425,16 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     tracing::info!("✓ Wait completed");
 
-    // Step 7: Get initial wallet balance using get_unified_balance
+    // Step 7: Get initial wallet balance using get_privacy_balance
     tracing::info!("Step 7: Getting initial wallet balance");
-    let initial_balance_result = mcp_external::operations::get_unified_balance(
+    let initial_balance_result = mcp_external::operations::get_privacy_balance(
         &provider,
-        &funding_wallet,
-        mcp_external::server::DEFAULT_TOKEN_ID,
         &new_privacy_key,
-        &viewing_key,
+        Some(&viewing_key),
     )
     .await?;
 
-    let initial_balance: u128 = initial_balance_result.privacy_balance.parse()?;
+    let initial_balance: u128 = initial_balance_result.balance;
     tracing::info!("✓ Initial privacy balance: {}", initial_balance);
 
     // Validate initial balance matches deposit
@@ -451,10 +448,10 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("Step 8: Sending 50 tokens");
     let send_amount = 50u128;
 
-    // Initialize Ligero prover
+    // Initialize Ligero proof client
     let Some(ligero) = create_test_ligero() else {
         eprintln!(
-            "⚠️  Skipping integration test: Ligero prover assets not found (set LIGERO_* env vars)"
+            "⚠️  Skipping integration test: Ligero proof service not configured"
         );
         return Ok(());
     };
@@ -473,9 +470,6 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     const DOMAIN: [u8; 32] = [1u8; 32];
     let input_recipient = new_privacy_key.recipient(&DOMAIN);
 
-    // Use the viewing key bytes as authority FVK for the transfer
-    let authority_fvk_for_transfer = Some(viewing_key.0);
-
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -490,7 +484,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
         input_recipient, // deposit convention: sender_id == recipient
         *new_privacy_key.pk(),
         *new_privacy_key.pk(),
-        authority_fvk_for_transfer,
+        None,
     )
     .await?;
 
@@ -505,16 +499,14 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Step 10: Get final wallet balance
     tracing::info!("Step 10: Getting final wallet balance");
-    let final_balance_result = mcp_external::operations::get_unified_balance(
+    let final_balance_result = mcp_external::operations::get_privacy_balance(
         &provider,
-        &funding_wallet,
-        mcp_external::server::DEFAULT_TOKEN_ID,
         &new_privacy_key,
-        &viewing_key,
+        Some(&viewing_key),
     )
     .await?;
 
-    let final_balance: u128 = final_balance_result.privacy_balance.parse()?;
+    let final_balance: u128 = final_balance_result.balance;
     tracing::info!("✓ Final privacy balance: {}", final_balance);
 
     // Step 11: Validate final balance
