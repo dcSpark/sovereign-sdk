@@ -1,0 +1,27 @@
+[package]
+name = "sov-midnight-adapter"
+description = "Utilities for interacting with Midnight bridge contract state"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base_crypto = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2", package = "midnight-base-crypto" }
+hex = { workspace = true }
+midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

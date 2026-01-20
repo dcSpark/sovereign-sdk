@@ -18,6 +18,7 @@ const-rollup-config = { path = "../const-rollup-config" }
 sov-address = { workspace = true, features = ["evm"] }
 sov-celestia-adapter = { workspace = true, features = ["native"] }
 sov-midnight-da = { workspace = true, features = ["native"] }
+sov-midnight-adapter = { workspace = true }
 sov-rollup-interface = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 sov-metrics = { workspace = true, features = ["native"] }
@@ -27,6 +28,7 @@ sov-bank = { workspace = true, features = ["native"] }
 sov-cli = { workspace = true }
 sov-db = { workspace = true }
 sov-ethereum = { workspace = true, features = ["local"] }
+sov-evm = { workspace = true, features = ["native"] }
 sov-kernels = { workspace = true, features = ["native"] }
 sov-mock-zkvm = { workspace = true, features = ["native"] }
 sov-modules-api = { workspace = true, features = ["native"] }
@@ -37,6 +39,7 @@ sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-sequencer = { workspace = true }
 full-node-configs = { workspace = true }
 sov-state = { workspace = true, features = ["native"] }
+rockbound = { workspace = true }
 
 demo-stf = { workspace = true, features = ["native"] }
 
@@ -46,7 +49,10 @@ borsh = { workspace = true, features = ["bytes", "derive"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }
+axum = { workspace = true, default-features = false, features = [
+  "http1",
+  "tokio",
+] }
 jsonrpsee = { workspace = true, features = [
   "http-client",
   "server",
@@ -69,6 +75,7 @@ tokio = { workspace = true, features = [
   "sync",
   "time",
   "macros",
+  "fs",
   "tracing",
 ] }
 tracing = { workspace = true }
@@ -91,6 +98,10 @@ tiny_http = "0.12"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # ligero-runner for the prover service binary
 ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "da388b5f5e0ac9e9fcc465acc3e10289e23de1fd" }
+midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+base_crypto = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2", package = "midnight-base-crypto" }
 
 [dev-dependencies]
 sov-eth-client = { workspace = true }
@@ -143,19 +154,19 @@ sov-build = { workspace = true }
 [features]
 default = ["dep:hex"]
 arbitrary = [
-    "dep:hex",
-    "sov-modules-api/arbitrary",
-    "sov-rollup-interface/arbitrary",
-    "sov-state/arbitrary",
-    "sov-address/arbitrary",
-    "sov-mock-da/arbitrary",
-    "sov-midnight-da/arbitrary",
-    "sov-mock-zkvm/arbitrary",
-    "sov-celestia-adapter/arbitrary",
-    "sov-ligero-adapter/arbitrary",
-    "sov-bank/arbitrary",
-    "sov-sequencer-registry/arbitrary",
-    "sov-accounts/arbitrary",
+  "dep:hex",
+  "sov-modules-api/arbitrary",
+  "sov-rollup-interface/arbitrary",
+  "sov-state/arbitrary",
+  "sov-address/arbitrary",
+  "sov-mock-da/arbitrary",
+  "sov-midnight-da/arbitrary",
+  "sov-mock-zkvm/arbitrary",
+  "sov-celestia-adapter/arbitrary",
+  "sov-ligero-adapter/arbitrary",
+  "sov-bank/arbitrary",
+  "sov-sequencer-registry/arbitrary",
+  "sov-accounts/arbitrary",
 ]
 
 [[bin]]

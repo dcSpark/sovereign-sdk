@@ -111,7 +111,14 @@ async fn evm_test_get_logs_range() {
 async fn evm_test_get_logs_range_limit() {
     let max_log_limit = 93;
 
-    let (test_rollup, evm_client, _) = setup(0, SeqConfigExtension { max_log_limit }).await;
+    let (test_rollup, evm_client, _) = setup(
+        0,
+        SeqConfigExtension {
+            max_log_limit,
+            midnight_bridge: None,
+        },
+    )
+    .await;
     let contract_address = evm_client.alloy_deploy_contract().await;
     test_rollup.wait_for_next_blocks(1).await;
 

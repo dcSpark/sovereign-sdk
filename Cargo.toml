@@ -4,6 +4,7 @@ members = [
     "crates/rollup-interface",
     "crates/adapters/mock-da",
     "crates/adapters/midnight-da",
+    "crates/adapters/midnight",
     "crates/adapters/mock-zkvm",
     "scripts/switcheroo",
     # Fuzzing
@@ -140,6 +141,7 @@ sov-celestia-adapter = { path = "crates/adapters/celestia", default-features = f
 sov-ligero-adapter = { path = "crates/adapters/ligero", default-features = false, version = "0.3" }
 sov-risc0-adapter = { path = "crates/adapters/risc0", default-features = false, version = "0.3" }
 sov-sp1-adapter = { path = "crates/adapters/sp1", default-features = false, version = "0.3" }
+sov-midnight-adapter = { path = "crates/adapters/midnight", default-features = false, version = "0.3" }
 sov-ethereum = { path = "crates/full-node/sov-ethereum", default-features = false, version = "0.3" }
 sov-mock-da = { path = "crates/adapters/mock-da", default-features = false, version = "0.3" }
 sov-midnight-da = { path = "crates/adapters/midnight-da", default-features = false, version = "0.3" }
