@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub da_connection_string: String,
+    pub indexer_db_connection_string: String,
     pub bind_addr: SocketAddr,
 }
 
@@ -19,6 +20,17 @@ impl Config {
             return Err(anyhow!("DA_CONNECTION_STRING env var is empty"));
         }
 
+        let indexer_db_connection_string = env::var("INDEXER_DB_CONNECTION_STRING")
+            .or_else(|_| env::var("INDEX_DB"))
+            .map_err(|_| {
+                anyhow!("INDEXER_DB_CONNECTION_STRING (or INDEX_DB) env var is required")
+            })?;
+        if indexer_db_connection_string.trim().is_empty() {
+            return Err(anyhow!(
+                "INDEXER_DB_CONNECTION_STRING (or INDEX_DB) env var is empty"
+            ));
+        }
+
         let bind_addr = env::var("METRICS_API_BIND")
             .unwrap_or_else(|_| "0.0.0.0:13200".to_string());
         if bind_addr.trim().is_empty() {
@@ -30,6 +42,7 @@ impl Config {
 
         Ok(Self {
             da_connection_string,
+            indexer_db_connection_string,
             bind_addr,
         })
     }

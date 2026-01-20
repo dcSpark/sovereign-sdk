@@ -1,0 +1,95 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::{Duration as ChronoDuration, Utc};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, RelationTrait,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::indexer_db::midnight_transfer;
+use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
+use crate::metrics::store::MetricSample;
+
+pub const SAMPLE_INTERVAL_SECS: u64 = 5;
+pub const WINDOW_SECONDS: u64 = 5;
+pub const RETENTION_SECONDS: u64 = 300;
+pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usize;
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct AverageTransactionSizePayload {
+    pub total_amount: String,
+    pub total_transactions: u64,
+    pub average_amount: f64,
+}
+
+pub struct AverageTransactionSizeCollector {
+    db: DatabaseConnection,
+}
+
+impl AverageTransactionSizeCollector {
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+}
+
+impl MetricCollector for AverageTransactionSizeCollector {
+    fn spec(&self) -> MetricSpec {
+        MetricSpec {
+            name: "average-transaction-size",
+            interval: Duration::from_secs(SAMPLE_INTERVAL_SECS),
+            max_samples: MAX_SAMPLES,
+        }
+    }
+
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>> {
+        Box::pin(async move {
+            let window_end = Utc::now();
+            let window_start = window_end - ChronoDuration::seconds(WINDOW_SECONDS as i64);
+
+            let rows = midnight_transfer::Entity::find()
+                .join(JoinType::InnerJoin, midnight_transfer::Relation::Events.def())
+                .filter(crate::indexer_db::Column::CreatedAt.gte(window_start))
+                .filter(crate::indexer_db::Column::CreatedAt.lt(window_end))
+                .filter(midnight_transfer::Column::Amount.is_not_null())
+                .all(&self.db)
+                .await
+                .with_context(|| "Failed to load midnight_transfer rows")?;
+
+            let mut total_amount: u128 = 0;
+            let mut total_transactions: u64 = 0;
+
+            for row in rows {
+                let amount = row
+                    .amount
+                    .as_ref()
+                    .with_context(|| "Missing transfer amount")?
+                    .parse::<u128>()
+                    .with_context(|| "Invalid transfer amount")?;
+                total_amount = total_amount
+                    .checked_add(amount)
+                    .with_context(|| "Transfer amount overflow")?;
+                total_transactions += 1;
+            }
+
+            let average_amount = if total_transactions == 0 {
+                0.0
+            } else {
+                (total_amount as f64) / (total_transactions as f64)
+            };
+
+            let payload = AverageTransactionSizePayload {
+                total_amount: total_amount.to_string(),
+                total_transactions,
+                average_amount,
+            };
+
+            Ok(MetricSample {
+                recorded_at_ms: window_end.timestamp_millis(),
+                payload: serde_json::to_value(payload)
+                    .context("Failed to serialize average transaction size payload")?,
+            })
+        })
+    }
+}

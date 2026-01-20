@@ -10,6 +10,9 @@ use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::metrics::collectors::average_transaction_size::{
+    AverageTransactionSizePayload, RETENTION_SECONDS as AVERAGE_RETENTION_SECONDS,
+};
 use crate::metrics::collectors::failed_transactions::{
     FailedTransactionsPayload, RETENTION_SECONDS as FAILED_RETENTION_SECONDS,
 };
@@ -34,6 +37,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/average-transaction-size", get(average_transaction_size))
         .route("/failed-transactions-rate", get(failed_transactions_rate))
         .route("/total-transactions", get(total_transactions))
         .route("/tps", get(tps))
@@ -110,9 +114,7 @@ async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransact
     ),
     tag = "metrics"
 )]
-async fn failed_transactions_rate(
-    State(state): State<AppState>,
-) -> Json<FailedTransactionsResponse> {
+async fn failed_transactions_rate(State(state): State<AppState>) -> Json<FailedTransactionsResponse> {
     let series = state
         .store
         .snapshot("failed-transactions-rate")
@@ -122,6 +124,29 @@ async fn failed_transactions_rate(
     Json(FailedTransactionsResponse {
         series,
         retention_seconds: FAILED_RETENTION_SECONDS,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/average-transaction-size",
+    responses(
+        (status = 200, description = "Average transfer amount", body = AverageTransactionSizeResponse)
+    ),
+    tag = "metrics"
+)]
+async fn average_transaction_size(
+    State(state): State<AppState>,
+) -> Json<AverageTransactionSizeResponse> {
+    let series = state
+        .store
+        .snapshot("average-transaction-size")
+        .await
+        .map(map_average_transaction_size_series);
+
+    Json(AverageTransactionSizeResponse {
+        series,
+        retention_seconds: AVERAGE_RETENTION_SECONDS,
     })
 }
 
@@ -176,6 +201,25 @@ fn map_failed_transactions_series(series: MetricSeriesSnapshot) -> FailedTransac
     }
 }
 
+fn map_average_transaction_size_series(
+    series: MetricSeriesSnapshot,
+) -> AverageTransactionSizeSeriesSnapshot {
+    let samples: Vec<AverageTransactionSizeSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_average_transaction_size_sample)
+        .collect();
+    let latest = series.latest.and_then(map_average_transaction_size_sample);
+
+    AverageTransactionSizeSeriesSnapshot {
+        name: series.name,
+        interval_secs: series.interval_secs,
+        max_samples: series.max_samples,
+        latest,
+        samples,
+    }
+}
+
 fn map_tps_sample(sample: MetricSample) -> Option<TpsSample> {
     let payload: TpsPayload = match serde_json::from_value(sample.payload) {
         Ok(payload) => payload,
@@ -216,6 +260,23 @@ fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransact
     };
 
     Some(FailedTransactionsSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+fn map_average_transaction_size_sample(
+    sample: MetricSample,
+) -> Option<AverageTransactionSizeSample> {
+    let payload: AverageTransactionSizePayload = match serde_json::from_value(sample.payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(error = %error, "Failed to parse average transaction size payload");
+            return None;
+        }
+    };
+
+    Some(AverageTransactionSizeSample {
         recorded_at_ms: sample.recorded_at_ms,
         payload,
     })
@@ -290,6 +351,27 @@ struct FailedTransactionsSample {
     payload: FailedTransactionsPayload,
 }
 
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeResponse {
+    series: Option<AverageTransactionSizeSeriesSnapshot>,
+    retention_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    max_samples: usize,
+    latest: Option<AverageTransactionSizeSample>,
+    samples: Vec<AverageTransactionSizeSample>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeSample {
+    recorded_at_ms: i64,
+    payload: AverageTransactionSizePayload,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -297,7 +379,13 @@ struct FailedTransactionsSample {
         version = "0.1.0",
         description = "Metrics API for verifier worker DB stats."
     ),
-    paths(health, tps, total_transactions, failed_transactions_rate),
+    paths(
+        health,
+        tps,
+        total_transactions,
+        failed_transactions_rate,
+        average_transaction_size
+    ),
     components(schemas(
         HealthResponse,
         TpsResponse,
@@ -311,7 +399,11 @@ struct FailedTransactionsSample {
         FailedTransactionsResponse,
         FailedTransactionsSeriesSnapshot,
         FailedTransactionsSample,
-        FailedTransactionsPayload
+        FailedTransactionsPayload,
+        AverageTransactionSizeResponse,
+        AverageTransactionSizeSeriesSnapshot,
+        AverageTransactionSizeSample,
+        AverageTransactionSizePayload
     )),
     tags(
         (name = "health", description = "Service health checks"),

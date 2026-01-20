@@ -4,6 +4,7 @@ use tracing::info;
 
 mod api;
 mod config;
+mod indexer_db;
 mod metrics;
 
 #[tokio::main]
@@ -14,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::from_env()?;
     let da_conn = config.da_connection_string;
+    let indexer_conn = config.indexer_db_connection_string;
     let bind_addr = config.bind_addr;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
@@ -22,8 +24,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect DB {da_conn}"))?;
 
+    let mut indexer_options = ConnectOptions::new(indexer_conn.clone());
+    indexer_options.sqlx_logging(false);
+    let indexer_db = Database::connect(indexer_options)
+        .await
+        .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
+
     let store = metrics::MetricsStore::new();
     let mut manager = metrics::MetricsManager::new(store.clone());
+    manager
+        .register(
+            metrics::collectors::average_transaction_size::AverageTransactionSizeCollector::new(
+                indexer_db.clone(),
+            ),
+        )
+        .await;
     manager
         .register(metrics::collectors::failed_transactions::FailedTransactionsCollector::new(
             db.clone(),
