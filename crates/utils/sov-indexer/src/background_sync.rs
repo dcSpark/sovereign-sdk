@@ -2,8 +2,8 @@ use crate::db;
 use crate::db::{extract_events_from_status, extract_status_from_status};
 use crate::index_db as idx;
 use crate::viewer::{
-    self, extract_recipient_from_decrypted_notes, extract_sender_from_decrypted_notes,
-    hex_to_bech32m_address, FvkRegistry,
+    self, extract_amount_from_decrypted_notes, extract_recipient_from_decrypted_notes,
+    extract_sender_from_decrypted_notes, hex_to_bech32m_address, FvkRegistry,
 };
 use anyhow::Result;
 use sea_orm::{
@@ -208,9 +208,11 @@ pub async fn backfill_index(
             // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
             let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
+            let amount = extract_amount_from_decrypted_notes(decrypted_notes.as_ref());
             db::insert_midnight_transfer(
                 idx,
                 event_id,
+                amount,
                 anchor_root.clone(),
                 nullifier.clone(),
                 Some(row.sender.clone()),
@@ -342,7 +344,8 @@ async fn backfill_transfers(
                 Condition::any()
                     .add(idx::midnight_transfer::Column::Recipient.is_null())
                     .add(idx::midnight_transfer::Column::PrivacySender.is_null())
-                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null()),
+                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_null())
+                    .add(idx::midnight_transfer::Column::Amount.is_null()),
             )
             .filter(idx::midnight_transfer::Column::EventId.gt(last_id))
             .order_by_asc(idx::midnight_transfer::Column::EventId)
@@ -381,6 +384,11 @@ async fn backfill_transfers(
             } else {
                 None
             };
+            let amount = if row.amount.is_none() {
+                extract_amount_from_decrypted_notes(Some(&decrypted_notes))
+            } else {
+                None
+            };
 
             let mut update = idx::midnight_transfer::ActiveModel {
                 event_id: Set(row.event_id),
@@ -391,6 +399,9 @@ async fn backfill_transfers(
             }
             if let Some(privacy_sender) = privacy_sender {
                 update.privacy_sender = Set(Some(privacy_sender));
+            }
+            if let Some(amount) = amount {
+                update.amount = Set(Some(amount));
             }
             if row.decrypted_notes.is_none() {
                 update.decrypted_notes = Set(Some(decrypted_notes));

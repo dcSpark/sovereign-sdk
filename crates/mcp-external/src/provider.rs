@@ -25,6 +25,13 @@ pub struct ChainData {
     pub chain_name: String,
 }
 
+/// Result from the verifier submission endpoint.
+#[derive(Debug, Clone)]
+pub struct VerifierSubmitResult {
+    pub tx_hash: String,
+    pub created_at: i64,
+}
+
 /// Transaction involvement item from the indexer
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct InvolvementItem {
@@ -264,8 +271,8 @@ impl Provider {
     ///
     /// This method submits a borsh-serialized transaction to the verifier service,
     /// which will verify the proof and then submit to the sequencer.
-    /// Returns the transaction hash from the verifier response.
-    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+    /// Returns the transaction hash (and optional createdAt) from the verifier response.
+    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<VerifierSubmitResult> {
         use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
         use base64::Engine as _;
 
@@ -310,10 +317,18 @@ impl Provider {
             .await
             .context("Failed to read verifier response")?;
 
-        #[derive(serde::Deserialize)]
+        #[derive(Deserialize)]
+        struct VerifierMetrics {
+            #[serde(rename = "createdAt")]
+            created_at: String,
+        }
+
+        #[derive(Deserialize)]
         struct VerifierResponse {
             success: bool,
+            #[serde(rename = "tx_hash", alias = "id")]
             tx_hash: Option<String>,
+            metrics: VerifierMetrics,
             error: Option<String>,
         }
 
@@ -321,21 +336,22 @@ impl Provider {
             serde_json::from_str(&body).context("Failed to parse verifier response")?;
 
         if !verifier_resp.success {
-            anyhow::bail!(
-                "Verifier service reported failure: {}",
-                verifier_resp
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string())
-            );
+            let error = verifier_resp.error.as_deref().unwrap_or("Unknown error");
+            anyhow::bail!("Verifier service reported failure: {}", error);
         }
 
         let tx_hash = verifier_resp
             .tx_hash
             .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+        let created_at = parse_rfc3339_to_millis(&verifier_resp.metrics.created_at)
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing metrics.createdAt"))?;
 
         tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
 
-        Ok(tx_hash)
+        Ok(VerifierSubmitResult {
+            tx_hash: tx_hash.to_string(),
+            created_at,
+        })
     }
 
     /// Get the RPC URL this provider is connected to
@@ -386,7 +402,7 @@ impl Provider {
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<InvolvementItem>> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/txs/{}", base_url, tx_hash);
+        let url = format!("{}/transactions/{}", base_url, tx_hash);
 
         tracing::debug!("Fetching transaction details from indexer: {}", url);
 
@@ -449,7 +465,6 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
-    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -459,7 +474,7 @@ impl Provider {
     /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
     /// let transactions = provider
-    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .get_wallet_transactions(address, None, None, None)
     ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
@@ -471,11 +486,10 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
-        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/wallets/{}", base_url, address);
+        let mut url = format!("{}/transactions/wallet/{}/god", base_url, address);
 
         // Build query parameters
         let mut query_params = Vec::new();
@@ -496,11 +510,9 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let mut request = self.http_client.post(&url);
-        if let Some(vfk) = vfk {
-            request = request.json(&serde_json::json!({ "vfk": vfk }));
-        }
-        let response = request
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
@@ -624,4 +636,10 @@ impl Provider {
         Ok(balance_response)
     }
 
+}
+
+fn parse_rfc3339_to_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }

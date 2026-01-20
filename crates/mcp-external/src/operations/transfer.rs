@@ -43,6 +43,7 @@ const NOTE_SEARCH_LOG_EVERY: usize = 10;
 #[derive(Debug)]
 pub struct TransferResult {
     pub tx_hash: String,
+    pub created_at: i64,
     /// Amount sent to destination
     #[allow(dead_code)]
     pub amount_sent: u128,
@@ -1122,10 +1123,11 @@ pub async fn transfer(
 
     // Step 7: Submit transaction to verifier service
     let submit_start = StdInstant::now();
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     tracing::info!(
         elapsed_ms = submit_start.elapsed().as_millis(),
@@ -1144,6 +1146,7 @@ pub async fn transfer(
 
     Ok(TransferResult {
         tx_hash,
+        created_at: submit_result.created_at,
         amount_sent: send_amount,
         output_rho: out_rho_0,
         output_recipient: out_recipient_0,

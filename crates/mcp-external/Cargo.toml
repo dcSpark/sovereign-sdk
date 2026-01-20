@@ -31,6 +31,7 @@ ed25519-dalek = { version = "2" }
 ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "e86c3f7119a07eb51b4408dd6fce10b7ad54c45c" }
 uuid = { workspace = true, features = ["v5", "v4", "std"] }
 tracing-appender = { workspace = true }
+chrono = { workspace = true, features = ["std"] }
 
 # Sovereign SDK dependencies for wallet integration
 sov-cli = { workspace = true }

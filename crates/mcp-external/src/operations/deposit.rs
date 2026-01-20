@@ -134,11 +134,12 @@ pub async fn deposit(
 
     tracing::info!("Transaction signed and serialized: {} bytes", raw_tx.len());
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     tracing::info!(
         "Deposit transaction submitted successfully via verifier: {}",

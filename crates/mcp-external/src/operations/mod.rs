@@ -2,7 +2,7 @@
 //! These functions contain the business logic and are easy to test.
 
 /// Default max fee applied to MCP-generated transactions.
-pub const DEFAULT_MAX_FEE: u128 = 1_000_000u128;
+pub const DEFAULT_MAX_FEE: u128 = 2_000_000u128;
 
 pub mod decrypt_transaction;
 mod deposit;
@@ -14,7 +14,6 @@ mod get_wallet_config;
 mod send_funds;
 mod transfer;
 mod pool_admin;
-pub mod verify_transaction;
 pub mod wallet_status;
 
 #[allow(unused_imports)]
@@ -22,13 +21,13 @@ pub use decrypt_transaction::decrypt_transaction;
 pub use deposit::deposit;
 pub use get_default_address::get_default_address;
 pub use get_privacy_balance::{get_privacy_balance, PrivacyBalanceResult, UnspentNote};
-pub use get_transaction_status::get_transaction_status;
 pub use get_transactions::get_transactions;
 pub use get_transactions::Transaction;
 #[allow(unused_imports)]
 pub use get_wallet_config::get_wallet_config;
 pub use transfer::transfer;
 pub use get_transaction_status::TransactionDetails;
-pub use pool_admin::{add_pool_admin, freeze_address, remove_pool_admin, unfreeze_address};
-pub use verify_transaction::verify_transaction;
+pub use pool_admin::{
+    add_pool_admin, freeze_address, list_frozen_addresses, remove_pool_admin, unfreeze_address,
+};
 pub use send_funds::send_funds;
