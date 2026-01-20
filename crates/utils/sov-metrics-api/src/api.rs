@@ -16,6 +16,9 @@ use crate::metrics::collectors::average_transaction_size::{
 use crate::metrics::collectors::failed_transactions::{
     FailedTransactionsPayload, RETENTION_SECONDS as FAILED_RETENTION_SECONDS,
 };
+use crate::metrics::collectors::token_value_spent::{
+    TokenValueSpentPayload, RETENTION_SECONDS as TOKEN_VALUE_RETENTION_SECONDS,
+};
 use crate::metrics::collectors::tps::{
     TpsPayload, RETENTION_SECONDS as TPS_RETENTION_SECONDS, WINDOW_SECONDS,
 };
@@ -39,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/average-transaction-size", get(average_transaction_size))
         .route("/failed-transactions-rate", get(failed_transactions_rate))
+        .route("/token-value-spent", get(token_value_spent))
         .route("/total-transactions", get(total_transactions))
         .route("/tps", get(tps))
         .merge(swagger_ui)
@@ -150,6 +154,27 @@ async fn average_transaction_size(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/token-value-spent",
+    responses(
+        (status = 200, description = "Token value spent", body = TokenValueSpentResponse)
+    ),
+    tag = "metrics"
+)]
+async fn token_value_spent(State(state): State<AppState>) -> Json<TokenValueSpentResponse> {
+    let series = state
+        .store
+        .snapshot("token-value-spent")
+        .await
+        .map(map_token_value_spent_series);
+
+    Json(TokenValueSpentResponse {
+        series,
+        retention_seconds: TOKEN_VALUE_RETENTION_SECONDS,
+    })
+}
+
 fn map_tps_series(series: MetricSeriesSnapshot) -> TpsSeriesSnapshot {
     let samples: Vec<TpsSample> = series
         .samples
@@ -220,6 +245,23 @@ fn map_average_transaction_size_series(
     }
 }
 
+fn map_token_value_spent_series(series: MetricSeriesSnapshot) -> TokenValueSpentSeriesSnapshot {
+    let samples: Vec<TokenValueSpentSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_token_value_spent_sample)
+        .collect();
+    let latest = series.latest.and_then(map_token_value_spent_sample);
+
+    TokenValueSpentSeriesSnapshot {
+        name: series.name,
+        interval_secs: series.interval_secs,
+        max_samples: series.max_samples,
+        latest,
+        samples,
+    }
+}
+
 fn map_tps_sample(sample: MetricSample) -> Option<TpsSample> {
     let payload: TpsPayload = match serde_json::from_value(sample.payload) {
         Ok(payload) => payload,
@@ -277,6 +319,21 @@ fn map_average_transaction_size_sample(
     };
 
     Some(AverageTransactionSizeSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+fn map_token_value_spent_sample(sample: MetricSample) -> Option<TokenValueSpentSample> {
+    let payload: TokenValueSpentPayload = match serde_json::from_value(sample.payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(error = %error, "Failed to parse token value spent payload");
+            return None;
+        }
+    };
+
+    Some(TokenValueSpentSample {
         recorded_at_ms: sample.recorded_at_ms,
         payload,
     })
@@ -372,6 +429,27 @@ struct AverageTransactionSizeSample {
     payload: AverageTransactionSizePayload,
 }
 
+#[derive(Serialize, ToSchema)]
+struct TokenValueSpentResponse {
+    series: Option<TokenValueSpentSeriesSnapshot>,
+    retention_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenValueSpentSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    max_samples: usize,
+    latest: Option<TokenValueSpentSample>,
+    samples: Vec<TokenValueSpentSample>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenValueSpentSample {
+    recorded_at_ms: i64,
+    payload: TokenValueSpentPayload,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -384,7 +462,8 @@ struct AverageTransactionSizeSample {
         tps,
         total_transactions,
         failed_transactions_rate,
-        average_transaction_size
+        average_transaction_size,
+        token_value_spent
     ),
     components(schemas(
         HealthResponse,
@@ -403,7 +482,11 @@ struct AverageTransactionSizeSample {
         AverageTransactionSizeResponse,
         AverageTransactionSizeSeriesSnapshot,
         AverageTransactionSizeSample,
-        AverageTransactionSizePayload
+        AverageTransactionSizePayload,
+        TokenValueSpentResponse,
+        TokenValueSpentSeriesSnapshot,
+        TokenValueSpentSample,
+        TokenValueSpentPayload
     )),
     tags(
         (name = "health", description = "Service health checks"),

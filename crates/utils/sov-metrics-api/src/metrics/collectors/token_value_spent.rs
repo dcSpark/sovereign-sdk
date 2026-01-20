@@ -14,31 +14,30 @@ use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
-pub const WINDOW_SECONDS: u64 = 5;
+pub const WINDOW_SECONDS: u64 = SAMPLE_INTERVAL_SECS;
 pub const RETENTION_SECONDS: u64 = 300;
 pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usize;
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct AverageTransactionSizePayload {
+pub struct TokenValueSpentPayload {
     pub total_amount: String,
     pub total_transactions: u64,
-    pub average_amount: f64,
 }
 
-pub struct AverageTransactionSizeCollector {
+pub struct TokenValueSpentCollector {
     db: DatabaseConnection,
 }
 
-impl AverageTransactionSizeCollector {
+impl TokenValueSpentCollector {
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db }
     }
 }
 
-impl MetricCollector for AverageTransactionSizeCollector {
+impl MetricCollector for TokenValueSpentCollector {
     fn spec(&self) -> MetricSpec {
         MetricSpec {
-            name: "average-transaction-size",
+            name: "token-value-spent",
             interval: Duration::from_secs(SAMPLE_INTERVAL_SECS),
             max_samples: MAX_SAMPLES,
         }
@@ -74,22 +73,15 @@ impl MetricCollector for AverageTransactionSizeCollector {
                 total_transactions += 1;
             }
 
-            let average_amount = if total_transactions == 0 {
-                0.0
-            } else {
-                (total_amount as f64) / (total_transactions as f64)
-            };
-
-            let payload = AverageTransactionSizePayload {
+            let payload = TokenValueSpentPayload {
                 total_amount: total_amount.to_string(),
                 total_transactions,
-                average_amount,
             };
 
             Ok(MetricSample {
                 recorded_at_ms: window_end.timestamp_millis(),
                 payload: serde_json::to_value(payload)
-                    .context("Failed to serialize average transaction size payload")?,
+                    .context("Failed to serialize token value spent payload")?,
             })
         })
     }

@@ -21,6 +21,8 @@ Small HTTP API that reports TPS-style metrics from the verifier worker DB
 - The buffer keeps the most recent 300 seconds of samples (60 samples).
 - Average transaction size is computed from the indexer DB tables
   `midnight_transfer.amount` joined with `events.created_at` over the last second.
+- Failed transactions rate is computed over the last 5 seconds.
+- Token value spent is computed from `midnight_transfer.amount` over the last 5 seconds.
 
 ## Architecture
 
@@ -43,6 +45,9 @@ Small HTTP API that reports TPS-style metrics from the verifier worker DB
   - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
     `interval_secs`, and `max_samples`.
 - `GET /average-transaction-size`
+  - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
+    `interval_secs`, and `max_samples`.
+- `GET /token-value-spent`
   - Returns `{ series, retention_seconds }` where `series` includes `latest`, `samples`,
     `interval_secs`, and `max_samples`.
 - Swagger UI: `GET /swagger-ui/`

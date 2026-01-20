@@ -40,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     manager
+        .register(metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
+            indexer_db.clone(),
+        ))
+        .await;
+    manager
         .register(metrics::collectors::failed_transactions::FailedTransactionsCollector::new(
             db.clone(),
         ))
