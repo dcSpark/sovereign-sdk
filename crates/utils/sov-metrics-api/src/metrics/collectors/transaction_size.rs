@@ -15,9 +15,6 @@ use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
-pub const RETENTION_SECONDS: u64 = 86_400;
-pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usize;
-
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct TransactionSizePayload {
     pub amount: String,
@@ -42,7 +39,6 @@ impl MetricCollector for TransactionSizeCollector {
         MetricSpec {
             name: "transaction-size",
             interval: Duration::from_secs(SAMPLE_INTERVAL_SECS),
-            max_samples: MAX_SAMPLES,
         }
     }
 

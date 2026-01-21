@@ -10,7 +10,6 @@ use crate::metrics::store::MetricSample;
 pub struct MetricSpec {
     pub name: &'static str,
     pub interval: Duration,
-    pub max_samples: usize,
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

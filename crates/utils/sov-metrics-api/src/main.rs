@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let indexer_conn = config.indexer_db_connection_string;
     let bind_addr = config.bind_addr;
     let tsink_data_path = config.tsink_data_path;
+    let tsink_retention_secs = config.tsink_retention_secs;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
     connection_options.sqlx_logging(false);
@@ -31,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
 
-    let store = metrics::MetricsStore::new(tsink_data_path)?;
+    let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());
     manager
         .register(
@@ -67,7 +68,10 @@ async fn main() -> anyhow::Result<()> {
         .await;
     manager.start();
 
-    let app = api::router(api::AppState { store });
+    let app = api::router(api::AppState {
+        store,
+        retention_secs: tsink_retention_secs,
+    });
 
     info!("sov-metrics-api listening on {}", bind_addr);
 

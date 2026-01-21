@@ -12,8 +12,6 @@ use tokio::task;
 use tracing::warn;
 use tsink::{DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision};
 
-const RETENTION_SECS: u64 = 86_400;
-
 #[derive(Clone, Debug, Serialize)]
 pub struct MetricSample {
     pub recorded_at_ms: i64,
@@ -24,7 +22,6 @@ pub struct MetricSample {
 pub struct MetricSeriesSnapshot {
     pub name: String,
     pub interval_secs: u64,
-    pub max_samples: usize,
     pub latest: Option<MetricSample>,
     pub samples: Vec<MetricSample>,
 }
@@ -32,17 +29,17 @@ pub struct MetricSeriesSnapshot {
 #[derive(Clone, Debug)]
 struct MetricSeriesConfig {
     interval_secs: u64,
-    max_samples: usize,
 }
 
 #[derive(Clone)]
 pub struct MetricsStore {
     storage: Arc<dyn Storage>,
     inner: Arc<RwLock<HashMap<&'static str, MetricSeriesConfig>>>,
+    retention_secs: u64,
 }
 
 impl MetricsStore {
-    pub fn new(data_path: PathBuf) -> Result<Self> {
+    pub fn new(data_path: PathBuf, retention_secs: u64) -> Result<Self> {
         fs::create_dir_all(&data_path).with_context(|| {
             format!("Failed to create tsink data path at {}", data_path.display())
         })?;
@@ -50,22 +47,22 @@ impl MetricsStore {
         let storage = StorageBuilder::new()
             .with_data_path(&data_path)
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
-            .with_retention(Duration::from_secs(RETENTION_SECS))
+            .with_retention(Duration::from_secs(retention_secs))
             .build()
             .context("Failed to initialize tsink storage")?;
 
         Ok(Self {
             storage,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            retention_secs,
         })
     }
 
-    pub async fn register_metric(&self, name: &'static str, interval_secs: u64, max_samples: usize) {
+    pub async fn register_metric(&self, name: &'static str, interval_secs: u64) {
         let mut guard = self.inner.write().await;
-        guard.entry(name).or_insert(MetricSeriesConfig {
-            interval_secs,
-            max_samples,
-        });
+        guard
+            .entry(name)
+            .or_insert(MetricSeriesConfig { interval_secs });
     }
 
     pub async fn record(&self, name: &'static str, samples: Vec<MetricSample>) -> bool {
@@ -152,10 +149,7 @@ impl MetricsStore {
         }?;
 
         let end_ms = chrono::Utc::now().timestamp_millis();
-        let retention_ms = config
-            .interval_secs
-            .saturating_mul(config.max_samples as u64)
-            .saturating_mul(1000);
+        let retention_ms = self.retention_secs.saturating_mul(1000);
         let retention_ms = match i64::try_from(retention_ms) {
             Ok(value) => value,
             Err(_) => {
@@ -165,6 +159,42 @@ impl MetricsStore {
         };
         let start_ms = end_ms.saturating_sub(retention_ms);
 
+        self.snapshot_with_range(name, config, start_ms, end_ms)
+            .await
+    }
+
+    pub async fn snapshot_range(
+        &self,
+        name: &'static str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Option<MetricSeriesSnapshot> {
+        if start_ms >= end_ms || start_ms < 0 || end_ms < 0 {
+            warn!(
+                metric = name,
+                start_ms,
+                end_ms,
+                "Invalid snapshot range"
+            );
+            return None;
+        }
+
+        let config = {
+            let guard = self.inner.read().await;
+            guard.get(name).cloned()
+        }?;
+
+        self.snapshot_with_range(name, config, start_ms, end_ms)
+            .await
+    }
+
+    async fn snapshot_with_range(
+        &self,
+        name: &'static str,
+        config: MetricSeriesConfig,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Option<MetricSeriesSnapshot> {
         let storage = self.storage.clone();
         let result = task::spawn_blocking(move || storage.select_all(name, start_ms, end_ms)).await;
         let series = match result {
@@ -197,7 +227,7 @@ impl MetricsStore {
             }
         }
 
-        let mut samples: Vec<MetricSample> = buckets
+        let samples: Vec<MetricSample> = buckets
             .into_iter()
             .map(|(timestamp, payload)| MetricSample {
                 recorded_at_ms: timestamp,
@@ -205,17 +235,11 @@ impl MetricsStore {
             })
             .collect();
 
-        if samples.len() > config.max_samples {
-            let start = samples.len() - config.max_samples;
-            samples = samples.split_off(start);
-        }
-
         let latest = samples.last().cloned();
 
         Some(MetricSeriesSnapshot {
             name: name.to_string(),
             interval_secs: config.interval_secs,
-            max_samples: config.max_samples,
             latest,
             samples,
         })

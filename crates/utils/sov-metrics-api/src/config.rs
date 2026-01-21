@@ -4,12 +4,15 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 
+const DEFAULT_RETENTION_SECS: u64 = 5 * 24 * 60 * 60;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub da_connection_string: String,
     pub indexer_db_connection_string: String,
     pub bind_addr: SocketAddr,
     pub tsink_data_path: PathBuf,
+    pub tsink_retention_secs: u64,
 }
 
 impl Config {
@@ -48,11 +51,29 @@ impl Config {
             return Err(anyhow!("TSINK_DATA_PATH env var is empty"));
         }
 
+        let tsink_retention_secs = match env::var("TSINK_RETENTION_SECONDS") {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("TSINK_RETENTION_SECONDS env var is empty"));
+                }
+                let parsed = trimmed.parse::<u64>().map_err(|_| {
+                    anyhow!("TSINK_RETENTION_SECONDS must be a positive integer")
+                })?;
+                if parsed == 0 {
+                    return Err(anyhow!("TSINK_RETENTION_SECONDS must be > 0"));
+                }
+                parsed
+            }
+            Err(_) => DEFAULT_RETENTION_SECS,
+        };
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
             bind_addr,
             tsink_data_path: PathBuf::from(tsink_data_path),
+            tsink_retention_secs,
         })
     }
 }

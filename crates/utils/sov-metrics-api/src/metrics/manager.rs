@@ -27,7 +27,7 @@ impl MetricsManager {
     pub async fn register<C: MetricCollector + 'static>(&mut self, collector: C) {
         let spec = collector.spec();
         self.store
-            .register_metric(spec.name, spec.interval.as_secs(), spec.max_samples)
+            .register_metric(spec.name, spec.interval.as_secs())
             .await;
         self.collectors.push(RegisteredCollector {
             spec,
