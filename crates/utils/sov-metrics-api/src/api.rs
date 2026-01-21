@@ -1,0 +1,1742 @@
+use axum::{
+    extract::{Query, Request, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+    Json, Router,
+};
+use std::collections::BTreeMap;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tracing::warn;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
+
+use crate::metrics::collectors::average_transaction_size::AverageTransactionSizePayload;
+use crate::metrics::collectors::failed_transactions::FailedTransactionsPayload;
+use crate::metrics::collectors::transaction_size::TransactionSizePayload;
+use crate::metrics::collectors::token_value_spent::TokenValueSpentPayload;
+use crate::metrics::collectors::total_tokens_economy::TotalTokensEconomyPayload;
+use crate::metrics::collectors::total_transactions::TotalTransactionsPayload;
+use crate::metrics::{MetricSample, MetricSeriesSnapshot, MetricsStore};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: MetricsStore,
+    pub retention_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowQuery {
+    window_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenVelocityQuery {
+    window_seconds: Option<u64>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoricRangeQuery {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoricWindowQuery {
+    window_seconds: Option<u64>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+pub fn router(state: AppState) -> Router {
+    let swagger_ui = Router::from(
+        SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()),
+    )
+    .layer(middleware::from_fn(swagger_ui_redirect));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/average-transaction-size", get(average_transaction_size))
+        .route(
+            "/average-transaction-size/historic",
+            get(average_transaction_size_historic),
+        )
+        .route("/failed-transactions-rate", get(failed_transactions_rate))
+        .route(
+            "/failed-transactions-rate/historic",
+            get(failed_transactions_rate_historic),
+        )
+        .route("/median-transaction-size", get(median_transaction_size))
+        .route(
+            "/median-transaction-size/historic",
+            get(median_transaction_size_historic),
+        )
+        .route("/token-value-spent", get(token_value_spent))
+        .route("/token-value-spent/historic", get(token_value_spent_historic))
+        .route("/token-velocity", get(token_velocity))
+        .route("/token-velocity/historic", get(token_velocity_historic))
+        .route("/total-transactions", get(total_transactions))
+        .route("/total-transactions/historic", get(total_transactions_historic))
+        .route("/tps", get(tps))
+        .route("/tps/historic", get(tps_historic))
+        .merge(swagger_ui)
+        .with_state(state)
+}
+
+async fn swagger_ui_redirect(req: Request, next: Next) -> Response {
+    if req.uri().path() == "/swagger-ui" {
+        return Redirect::permanent("/swagger-ui/").into_response();
+    }
+
+    next.run(req).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Service health", body = HealthResponse)
+    ),
+    tag = "health"
+)]
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/total-transactions",
+    responses(
+        (status = 200, description = "Cumulative completed transaction totals", body = TotalTransactionsResponse)
+    ),
+    tag = "metrics"
+)]
+async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransactionsResponse> {
+    let latest = state
+        .store
+        .snapshot("total-transactions")
+        .await
+        .and_then(|series| series.latest.or_else(|| series.samples.last().cloned()));
+
+    let (total_transactions, as_of_ms) = match latest {
+        Some(sample) => match decode_payload::<TotalTransactionsPayload>(&sample, "total-transactions") {
+            Some(payload) => (Some(payload.total_transactions), Some(sample.recorded_at_ms)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+
+    Json(TotalTransactionsResponse {
+        total_transactions,
+        as_of_ms,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/total-transactions/historic",
+    params(
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical transaction totals", body = TotalTransactionsSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn total_transactions_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricRangeQuery>,
+) -> Json<TotalTransactionsSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let mut series = load_series(&state.store, "total-transactions", range)
+        .await
+        .map(map_total_transactions_series)
+        .unwrap_or_else(|| TotalTransactionsSeriesSnapshot {
+            name: "total-transactions".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    series.samples =
+        filter_samples_by_range(series.samples, range, |sample| sample.recorded_at_ms);
+    series.latest = series.samples.last().cloned();
+
+    Json(series)
+}
+
+#[utoipa::path(
+    get,
+    path = "/tps",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute TPS. Defaults to the last two samples.")
+    ),
+    responses(
+        (status = 200, description = "Derived TPS from transaction counters", body = TpsResponse)
+    ),
+    tag = "metrics"
+)]
+async fn tps(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<TpsResponse> {
+    let series = state
+        .store
+        .snapshot("total-transactions")
+        .await
+        .map(map_total_transactions_series);
+
+    let window_ms = window_ms(params.window_seconds);
+    let (tps, delta_transactions, delta_ms, latest_total) = match series.as_ref() {
+        Some(series) => compute_tps(series, window_ms),
+        None => (None, None, None, None),
+    };
+
+    Json(TpsResponse {
+        tps,
+        delta_transactions,
+        delta_ms,
+        latest_total,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/tps/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute TPS per sample. Defaults to the last two samples."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical TPS samples", body = TpsSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn tps_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<TpsSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let window_ms = window_ms(params.window_seconds);
+    let query_range = extend_range(range, window_ms);
+
+    let series = load_series(&state.store, "total-transactions", query_range)
+        .await
+        .map(map_total_transactions_series)
+        .unwrap_or_else(|| TotalTransactionsSeriesSnapshot {
+            name: "total-transactions".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let mut samples = derive_series_with_window(
+        &series.samples,
+        window_ms,
+        |sample| sample.recorded_at_ms,
+        |start, latest, delta_ms| {
+            let delta_transactions = latest
+                .payload
+                .total_transactions
+                .saturating_sub(start.payload.total_transactions);
+            let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
+
+            Some(TpsSample {
+                recorded_at_ms: latest.recorded_at_ms,
+                tps: Some(tps),
+                delta_transactions: Some(delta_transactions),
+                delta_ms: Some(delta_ms),
+                latest_total: Some(latest.payload.total_transactions),
+            })
+        },
+    );
+
+    samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
+    let latest = samples.last().cloned();
+
+    Json(TpsSeriesSnapshot {
+        name: "tps".to_string(),
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/failed-transactions-rate",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the failure rate. Defaults to the last two samples.")
+    ),
+    responses(
+        (status = 200, description = "Rejected transaction rate", body = FailedTransactionsResponse)
+    ),
+    tag = "metrics"
+)]
+async fn failed_transactions_rate(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<FailedTransactionsResponse> {
+    let series_snapshot = state
+        .store
+        .snapshot("failed-transactions-rate")
+        .await
+        .map(map_failed_transactions_series);
+
+    let window_ms = window_ms(params.window_seconds);
+    let (rate_percent, failed_transactions, total_transactions, delta_ms) =
+        match series_snapshot.as_ref() {
+        Some(series) => compute_failed_rate(series, window_ms),
+        None => (None, None, None, None),
+    };
+
+    Json(FailedTransactionsResponse {
+        rate_percent,
+        failed_transactions,
+        total_transactions,
+        delta_ms,
+        retention_seconds: state.retention_secs,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/failed-transactions-rate/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the failure rate per sample. Defaults to the last two samples."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical failure rate samples", body = FailedTransactionsRateSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn failed_transactions_rate_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<FailedTransactionsRateSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let window_ms = window_ms(params.window_seconds);
+    let query_range = extend_range(range, window_ms);
+
+    let series = load_series(&state.store, "failed-transactions-rate", query_range)
+        .await
+        .map(map_failed_transactions_series)
+        .unwrap_or_else(|| FailedTransactionsSeriesSnapshot {
+            name: "failed-transactions-rate".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let mut samples = derive_series_with_window(
+        &series.samples,
+        window_ms,
+        |sample| sample.recorded_at_ms,
+        |start, latest, delta_ms| {
+            let delta_total = latest
+                .payload
+                .total_transactions
+                .saturating_sub(start.payload.total_transactions);
+            let delta_failed = latest
+                .payload
+                .failed_transactions
+                .saturating_sub(start.payload.failed_transactions);
+
+            let rate_percent = if delta_total == 0 {
+                None
+            } else {
+                Some((delta_failed as f64 / delta_total as f64) * 100.0)
+            };
+
+            Some(FailedTransactionsRateSample {
+                recorded_at_ms: latest.recorded_at_ms,
+                rate_percent,
+                failed_transactions: Some(delta_failed),
+                total_transactions: Some(delta_total),
+                delta_ms: Some(delta_ms),
+            })
+        },
+    );
+
+    samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
+    let latest = samples.last().cloned();
+
+    Json(FailedTransactionsRateSeriesSnapshot {
+        name: "failed-transactions-rate".to_string(),
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/average-transaction-size",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the average amount. Defaults to 24 hours.")
+    ),
+    responses(
+        (status = 200, description = "Average transfer amount", body = AverageTransactionSizeResponse)
+    ),
+    tag = "metrics"
+)]
+async fn average_transaction_size(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<AverageTransactionSizeResponse> {
+    let series_snapshot = state
+        .store
+        .snapshot("token-value-spent")
+        .await
+        .map(map_average_transaction_size_series);
+
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+    let (average_amount, delta_amount, delta_transactions, delta_ms) =
+        match series_snapshot.as_ref() {
+        Some(series) => compute_average_transaction_size(series, window_ms),
+        None => (None, None, None, None),
+    };
+
+    Json(AverageTransactionSizeResponse {
+        average_amount,
+        delta_amount,
+        delta_transactions,
+        delta_ms,
+        retention_seconds: state.retention_secs,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/average-transaction-size/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the average amount per sample. Defaults to 24 hours."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical average transaction size samples", body = AverageTransactionSizeHistoricSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn average_transaction_size_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<AverageTransactionSizeHistoricSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+    let query_range = extend_range(range, window_ms);
+
+    let series = load_series(&state.store, "token-value-spent", query_range)
+        .await
+        .map(map_average_transaction_size_series)
+        .unwrap_or_else(|| AverageTransactionSizeSeriesSnapshot {
+            name: "average-transaction-size".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let mut samples = derive_series_with_window(
+        &series.samples,
+        window_ms,
+        |sample| sample.recorded_at_ms,
+        |start, latest, delta_ms| {
+            let prev_total = parse_amount(&start.payload.total_amount)?;
+            let latest_total = parse_amount(&latest.payload.total_amount)?;
+            let delta_amount = latest_total.saturating_sub(prev_total);
+            let delta_transactions = latest
+                .payload
+                .total_transactions
+                .saturating_sub(start.payload.total_transactions);
+            let average_amount = if delta_transactions == 0 {
+                None
+            } else {
+                Some(delta_amount as f64 / delta_transactions as f64)
+            };
+
+            Some(AverageTransactionSizeHistoricSample {
+                recorded_at_ms: latest.recorded_at_ms,
+                average_amount,
+                delta_amount: Some(delta_amount.to_string()),
+                delta_transactions: Some(delta_transactions),
+                delta_ms: Some(delta_ms),
+            })
+        },
+    );
+
+    samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
+    let latest = samples.last().cloned();
+
+    Json(AverageTransactionSizeHistoricSeriesSnapshot {
+        name: "average-transaction-size".to_string(),
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/median-transaction-size",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the median amount. Defaults to 24 hours.")
+    ),
+    responses(
+        (status = 200, description = "Median transaction size", body = MedianTransactionSizeResponse)
+    ),
+    tag = "metrics"
+)]
+async fn median_transaction_size(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<MedianTransactionSizeResponse> {
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let start_ms = window_ms
+        .and_then(|window_ms| now_ms.checked_sub(window_ms))
+        .unwrap_or(now_ms);
+
+    let mut values = state
+        .store
+        .values_in_range("transaction-size", start_ms, now_ms)
+        .await
+        .unwrap_or_default();
+
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return Json(MedianTransactionSizeResponse { median_amount: None });
+    }
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    let median = if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    };
+
+    Json(MedianTransactionSizeResponse {
+        median_amount: Some(median),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/median-transaction-size/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Bucket size in seconds used to compute median values. Defaults to 24 hours."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical median transaction sizes", body = MedianTransactionSizeSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn median_transaction_size_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<MedianTransactionSizeSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let (bucket_ms, bucket_seconds) = median_bucket_ms(params.window_seconds);
+
+    let series = load_series(&state.store, "transaction-size", range)
+        .await
+        .unwrap_or_else(|| MetricSeriesSnapshot {
+            name: "transaction-size".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let samples = filter_samples_by_range(series.samples, range, |sample| sample.recorded_at_ms);
+    let mut buckets: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+
+    for sample in samples {
+        let payload: TransactionSizePayload = match decode_payload(&sample, "transaction-size") {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let value = match parse_amount(&payload.amount) {
+            Some(value) => value as f64,
+            None => continue,
+        };
+
+        let bucket_start = sample.recorded_at_ms.div_euclid(bucket_ms) * bucket_ms;
+        buckets.entry(bucket_start).or_default().push(value);
+    }
+
+    let mut median_samples = Vec::with_capacity(buckets.len());
+    for (bucket_start, mut values) in buckets {
+        values.retain(|value| value.is_finite());
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = values.len() / 2;
+        let median = if values.len() % 2 == 0 {
+            (values[mid - 1] + values[mid]) / 2.0
+        } else {
+            values[mid]
+        };
+
+        median_samples.push(MedianTransactionSizeSample {
+            recorded_at_ms: bucket_start,
+            median_amount: Some(median),
+        });
+    }
+
+    let latest = median_samples.last().cloned();
+
+    Json(MedianTransactionSizeSeriesSnapshot {
+        name: "median-transaction-size".to_string(),
+        bucket_seconds,
+        latest,
+        samples: median_samples,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/token-value-spent",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute total tokens transferred. Defaults to 24 hours.")
+    ),
+    responses(
+        (status = 200, description = "Token value spent", body = TokenValueSpentResponse)
+    ),
+    tag = "metrics"
+)]
+async fn token_value_spent(
+    State(state): State<AppState>,
+    Query(params): Query<WindowQuery>,
+) -> Json<TokenValueSpentResponse> {
+    let series = state.store.snapshot("token-value-spent").await;
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+    let value_spent = series
+        .as_ref()
+        .and_then(|series| compute_token_value_spent(series, window_ms));
+
+    Json(TokenValueSpentResponse {
+        value_spent,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/token-value-spent/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute token value spent per sample. Defaults to 24 hours."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical token value spent samples", body = TokenValueSpentHistoricSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn token_value_spent_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<TokenValueSpentHistoricSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+    let query_range = extend_range(range, window_ms);
+
+    let series = load_series(&state.store, "token-value-spent", query_range)
+        .await
+        .unwrap_or_else(|| MetricSeriesSnapshot {
+            name: "token-value-spent".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let mut samples = derive_series_with_window(
+        &series.samples,
+        window_ms,
+        |sample| sample.recorded_at_ms,
+        |start, latest, delta_ms| {
+            let value_spent = token_value_spent_from_samples(start, latest)?;
+            Some(TokenValueSpentHistoricSample {
+                recorded_at_ms: latest.recorded_at_ms,
+                value_spent: Some(value_spent),
+                delta_ms: Some(delta_ms),
+            })
+        },
+    );
+
+    samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
+    let latest = samples.last().cloned();
+
+    Json(TokenValueSpentHistoricSeriesSnapshot {
+        name: "token-value-spent".to_string(),
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/token-velocity",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute token velocity. Defaults to 24 hours."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Token velocity", body = TokenVelocityResponse)
+    ),
+    tag = "metrics"
+)]
+async fn token_velocity(
+    State(state): State<AppState>,
+    Query(params): Query<TokenVelocityQuery>,
+) -> Json<TokenVelocityResponse> {
+    let range = match (params.from_ms, params.to_ms) {
+        (Some(from_ms), Some(to_ms)) => {
+            if from_ms >= to_ms {
+                warn!(from_ms, to_ms, "Invalid token velocity range");
+                None
+            } else if from_ms < 0 || to_ms < 0 {
+                warn!(from_ms, to_ms, "Negative token velocity range not supported");
+                None
+            } else {
+                Some((from_ms, to_ms))
+            }
+        }
+        _ => None,
+    };
+
+    let value_spent = state
+        .store
+        .snapshot("token-value-spent")
+        .await
+        .and_then(|series| match range {
+            Some((from_ms, to_ms)) => compute_token_value_spent_range(&series, from_ms, to_ms),
+            None => {
+                let window_ms = match params.window_seconds {
+                    Some(window_seconds) => window_ms(Some(window_seconds)),
+                    None => window_ms(Some(86_400)),
+                };
+                compute_token_value_spent(&series, window_ms)
+            }
+        });
+
+    let total_tokens = state
+        .store
+        .snapshot("total-tokens-economy")
+        .await
+        .and_then(|series| match range {
+            Some((from_ms, to_ms)) => compute_total_tokens_average_range(&series, from_ms, to_ms),
+            None => {
+                let window_ms = match params.window_seconds {
+                    Some(window_seconds) => window_ms(Some(window_seconds)),
+                    None => window_ms(Some(86_400)),
+                };
+                compute_total_tokens_average_window(&series, window_ms)
+            }
+        });
+
+    let token_velocity = match (
+        value_spent.as_ref().and_then(|value| parse_amount(value)),
+        total_tokens.as_ref().and_then(|value| parse_amount(value)),
+    ) {
+        (Some(spent), Some(total)) => {
+            if total == 0 {
+                None
+            } else {
+                Some(spent as f64 / total as f64)
+            }
+        }
+        _ => None,
+    };
+
+    Json(TokenVelocityResponse {
+        token_velocity,
+        value_spent,
+        total_tokens,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/token-velocity/historic",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute token velocity per sample. Defaults to 24 hours."),
+        ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
+        ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
+    ),
+    responses(
+        (status = 200, description = "Historical token velocity samples", body = TokenVelocityHistoricSeriesSnapshot)
+    ),
+    tag = "metrics"
+)]
+async fn token_velocity_historic(
+    State(state): State<AppState>,
+    Query(params): Query<HistoricWindowQuery>,
+) -> Json<TokenVelocityHistoricSeriesSnapshot> {
+    let range = resolve_range(params.from_ms, params.to_ms);
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+    let query_range = extend_range(range, window_ms);
+
+    let value_series = load_series(&state.store, "token-value-spent", query_range)
+        .await
+        .unwrap_or_else(|| MetricSeriesSnapshot {
+            name: "token-value-spent".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+    let total_series = load_series(&state.store, "total-tokens-economy", query_range)
+        .await
+        .unwrap_or_else(|| MetricSeriesSnapshot {
+            name: "total-tokens-economy".to_string(),
+            interval_secs: 0,
+            latest: None,
+            samples: Vec::new(),
+        });
+
+    let mut samples = derive_token_velocity_series(
+        &value_series.samples,
+        &total_series.samples,
+        window_ms,
+    );
+
+    samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
+    let latest = samples.last().cloned();
+
+    Json(TokenVelocityHistoricSeriesSnapshot {
+        name: "token-velocity".to_string(),
+        interval_secs: value_series.interval_secs,
+        latest,
+        samples,
+    })
+}
+
+fn decode_payload<T: DeserializeOwned>(sample: &MetricSample, label: &str) -> Option<T> {
+    match serde_json::from_value(sample.payload.clone()) {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            warn!(error = %error, label, "Failed to parse metric payload");
+            None
+        }
+    }
+}
+
+struct WindowedSamples<'a, T> {
+    start: &'a T,
+    latest: &'a T,
+    delta_ms: i64,
+}
+
+fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
+    let seconds = window_seconds?;
+    if seconds == 0 {
+        return None;
+    }
+    let millis = seconds.saturating_mul(1000);
+    match i64::try_from(millis) {
+        Ok(ms) => Some(ms),
+        Err(_) => {
+            warn!(seconds, "window_seconds too large, using default window");
+            None
+        }
+    }
+}
+
+fn resolve_range(from_ms: Option<i64>, to_ms: Option<i64>) -> Option<(i64, i64)> {
+    match (from_ms, to_ms) {
+        (Some(from_ms), Some(to_ms)) => {
+            if from_ms >= to_ms {
+                warn!(from_ms, to_ms, "Invalid historic range");
+                None
+            } else if from_ms < 0 || to_ms < 0 {
+                warn!(from_ms, to_ms, "Negative historic range not supported");
+                None
+            } else {
+                Some((from_ms, to_ms))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extend_range(range: Option<(i64, i64)>, window_ms: Option<i64>) -> Option<(i64, i64)> {
+    match (range, window_ms) {
+        (Some((start_ms, end_ms)), Some(window_ms)) => {
+            Some((start_ms.saturating_sub(window_ms), end_ms))
+        }
+        (Some(range), None) => Some(range),
+        _ => None,
+    }
+}
+
+async fn load_series(
+    store: &MetricsStore,
+    name: &'static str,
+    range: Option<(i64, i64)>,
+) -> Option<MetricSeriesSnapshot> {
+    match range {
+        Some((start_ms, end_ms)) => store.snapshot_range(name, start_ms, end_ms).await,
+        None => store.snapshot(name).await,
+    }
+}
+
+fn filter_samples_by_range<T, F>(
+    samples: Vec<T>,
+    range: Option<(i64, i64)>,
+    timestamp: F,
+) -> Vec<T>
+where
+    F: Fn(&T) -> i64,
+{
+    let (from_ms, to_ms) = match range {
+        Some(range) => range,
+        None => return samples,
+    };
+
+    samples
+        .into_iter()
+        .filter(|sample| {
+            let ts = timestamp(sample);
+            ts >= from_ms && ts <= to_ms
+        })
+        .collect()
+}
+
+fn derive_series_with_window<T, U, F, TS>(
+    samples: &[T],
+    window_ms: Option<i64>,
+    timestamp: TS,
+    mut derive: F,
+) -> Vec<U>
+where
+    F: FnMut(&T, &T, i64) -> Option<U>,
+    TS: Fn(&T) -> i64,
+{
+    if samples.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut derived = Vec::new();
+
+    match window_ms {
+        Some(window_ms) if window_ms > 0 => {
+            let mut start_idx = 0usize;
+            for latest_idx in 1..samples.len() {
+                let latest_ts = timestamp(&samples[latest_idx]);
+                let target = latest_ts - window_ms;
+                while start_idx + 1 < latest_idx && timestamp(&samples[start_idx + 1]) <= target {
+                    start_idx += 1;
+                }
+                if start_idx >= latest_idx {
+                    start_idx = latest_idx - 1;
+                }
+                let start_ts = timestamp(&samples[start_idx]);
+                let delta_ms = latest_ts - start_ts;
+                if delta_ms <= 0 {
+                    continue;
+                }
+                if let Some(sample) = derive(&samples[start_idx], &samples[latest_idx], delta_ms)
+                {
+                    derived.push(sample);
+                }
+            }
+        }
+        _ => {
+            for latest_idx in 1..samples.len() {
+                let start = &samples[latest_idx - 1];
+                let latest = &samples[latest_idx];
+                let delta_ms = timestamp(latest) - timestamp(start);
+                if delta_ms <= 0 {
+                    continue;
+                }
+                if let Some(sample) = derive(start, latest, delta_ms) {
+                    derived.push(sample);
+                }
+            }
+        }
+    }
+
+    derived
+}
+
+fn median_bucket_ms(window_seconds: Option<u64>) -> (i64, u64) {
+    let default_seconds = 86_400;
+    let default_ms = window_ms(Some(default_seconds)).unwrap_or(86_400_000);
+
+    match window_seconds {
+        Some(seconds) => match window_ms(Some(seconds)) {
+            Some(ms) => (ms, seconds),
+            None => (default_ms, default_seconds),
+        },
+        None => (default_ms, default_seconds),
+    }
+}
+
+fn select_window<'a, T>(
+    samples: &'a [T],
+    window_ms: Option<i64>,
+    timestamp: impl Fn(&T) -> i64,
+) -> Option<WindowedSamples<'a, T>> {
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let latest_idx = samples.len() - 1;
+    let latest = &samples[latest_idx];
+    let latest_ts = timestamp(latest);
+
+    let start_idx = match window_ms {
+        Some(window_ms) if window_ms > 0 => {
+            let target = latest_ts - window_ms;
+            let idx = samples
+                .iter()
+                .rposition(|sample| timestamp(sample) <= target)
+                .unwrap_or(0);
+            if idx == latest_idx {
+                latest_idx - 1
+            } else {
+                idx
+            }
+        }
+        _ => latest_idx - 1,
+    };
+
+    let start = &samples[start_idx];
+    let delta_ms = latest_ts - timestamp(start);
+    if delta_ms <= 0 {
+        return None;
+    }
+
+    Some(WindowedSamples {
+        start,
+        latest,
+        delta_ms,
+    })
+}
+
+fn compute_tps(
+    series: &TotalTransactionsSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<u64>, Option<i64>, Option<u64>) {
+    let latest_total = series
+        .samples
+        .last()
+        .map(|sample| sample.payload.total_transactions);
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, latest_total),
+    };
+
+    let delta_transactions = window
+        .latest
+        .payload
+        .total_transactions
+        .saturating_sub(window.start.payload.total_transactions);
+    let delta_ms = window.delta_ms;
+    if delta_ms <= 0 {
+        return (
+            None,
+            Some(delta_transactions),
+            Some(delta_ms),
+            latest_total,
+        );
+    }
+
+    let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
+
+    (
+        Some(tps),
+        Some(delta_transactions),
+        Some(delta_ms),
+        latest_total,
+    )
+}
+
+fn compute_failed_rate(
+    series: &FailedTransactionsSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<u64>, Option<u64>, Option<i64>) {
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, None),
+    };
+
+    let delta_total = window
+        .latest
+        .payload
+        .total_transactions
+        .saturating_sub(window.start.payload.total_transactions);
+    let delta_failed = window
+        .latest
+        .payload
+        .failed_transactions
+        .saturating_sub(window.start.payload.failed_transactions);
+
+    if delta_total == 0 {
+        return (
+            None,
+            Some(delta_failed),
+            Some(delta_total),
+            Some(window.delta_ms),
+        );
+    }
+
+    let rate_percent = (delta_failed as f64 / delta_total as f64) * 100.0;
+
+    (
+        Some(rate_percent),
+        Some(delta_failed),
+        Some(delta_total),
+        Some(window.delta_ms),
+    )
+}
+
+fn compute_average_transaction_size(
+    series: &AverageTransactionSizeSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> (Option<f64>, Option<String>, Option<u64>, Option<i64>) {
+    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
+        Some(window) => window,
+        None => return (None, None, None, None),
+    };
+
+    let prev_total = match parse_amount(&window.start.payload.total_amount) {
+        Some(total) => total,
+        None => return (None, None, None, None),
+    };
+    let latest_total = match parse_amount(&window.latest.payload.total_amount) {
+        Some(total) => total,
+        None => return (None, None, None, None),
+    };
+    let delta_amount = latest_total.saturating_sub(prev_total);
+    let delta_transactions = window
+        .latest
+        .payload
+        .total_transactions
+        .saturating_sub(window.start.payload.total_transactions);
+
+    if delta_transactions == 0 {
+        return (
+            None,
+            Some(delta_amount.to_string()),
+            Some(delta_transactions),
+            Some(window.delta_ms),
+        );
+    }
+
+    let average_amount = (delta_amount as f64) / (delta_transactions as f64);
+
+    (
+        Some(average_amount),
+        Some(delta_amount.to_string()),
+        Some(delta_transactions),
+        Some(window.delta_ms),
+    )
+}
+
+fn compute_token_value_spent(
+    series: &MetricSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> Option<String> {
+    let window = select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms)?;
+
+    let prev_payload: TokenValueSpentPayload =
+        decode_payload(window.start, "token-value-spent")?;
+    let latest_payload: TokenValueSpentPayload =
+        decode_payload(window.latest, "token-value-spent")?;
+    let prev_total = parse_amount(&prev_payload.total_amount)?;
+    let latest_total = parse_amount(&latest_payload.total_amount)?;
+    let delta_amount = latest_total.saturating_sub(prev_total);
+
+    Some(delta_amount.to_string())
+}
+
+fn token_value_spent_from_samples(start: &MetricSample, latest: &MetricSample) -> Option<String> {
+    let prev_payload: TokenValueSpentPayload =
+        decode_payload(start, "token-value-spent")?;
+    let latest_payload: TokenValueSpentPayload =
+        decode_payload(latest, "token-value-spent")?;
+    let prev_total = parse_amount(&prev_payload.total_amount)?;
+    let latest_total = parse_amount(&latest_payload.total_amount)?;
+    let delta_amount = latest_total.saturating_sub(prev_total);
+
+    Some(delta_amount.to_string())
+}
+
+fn parse_amount(value: &str) -> Option<u128> {
+    match value.parse::<u128>() {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            warn!(error = %error, value, "Failed to parse amount");
+            None
+        }
+    }
+}
+
+
+fn select_range<'a, T>(
+    samples: &'a [T],
+    from_ms: i64,
+    to_ms: i64,
+    timestamp: impl Fn(&T) -> i64,
+) -> Option<WindowedSamples<'a, T>> {
+    if samples.len() < 2 {
+        return None;
+    }
+
+    if from_ms >= to_ms {
+        return None;
+    }
+
+    let end_idx = samples
+        .iter()
+        .rposition(|sample| timestamp(sample) <= to_ms)?;
+    let mut start_idx = samples
+        .iter()
+        .rposition(|sample| timestamp(sample) <= from_ms)
+        .unwrap_or(0);
+
+    if start_idx >= end_idx {
+        if end_idx == 0 {
+            return None;
+        }
+        start_idx = end_idx - 1;
+    }
+
+    let start = &samples[start_idx];
+    let latest = &samples[end_idx];
+    let delta_ms = timestamp(latest) - timestamp(start);
+    if delta_ms <= 0 {
+        return None;
+    }
+
+    Some(WindowedSamples {
+        start,
+        latest,
+        delta_ms,
+    })
+}
+
+fn compute_token_value_spent_range(
+    series: &MetricSeriesSnapshot,
+    from_ms: i64,
+    to_ms: i64,
+) -> Option<String> {
+    let window = select_range(&series.samples, from_ms, to_ms, |sample| sample.recorded_at_ms)?;
+    let prev_payload: TokenValueSpentPayload =
+        decode_payload(window.start, "token-value-spent")?;
+    let latest_payload: TokenValueSpentPayload =
+        decode_payload(window.latest, "token-value-spent")?;
+    let prev_total = parse_amount(&prev_payload.total_amount)?;
+    let latest_total = parse_amount(&latest_payload.total_amount)?;
+    let delta_amount = latest_total.saturating_sub(prev_total);
+
+    Some(delta_amount.to_string())
+}
+
+fn compute_total_tokens_average_window(
+    series: &MetricSeriesSnapshot,
+    window_ms: Option<i64>,
+) -> Option<String> {
+    let window = select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms)?;
+    total_tokens_average_from_samples(window.start, window.latest)
+}
+
+fn compute_total_tokens_average_range(
+    series: &MetricSeriesSnapshot,
+    from_ms: i64,
+    to_ms: i64,
+) -> Option<String> {
+    let window = select_range(&series.samples, from_ms, to_ms, |sample| sample.recorded_at_ms)?;
+    total_tokens_average_from_samples(window.start, window.latest)
+}
+
+fn total_tokens_average_from_samples(
+    start: &MetricSample,
+    latest: &MetricSample,
+) -> Option<String> {
+    let start_payload: TotalTokensEconomyPayload = decode_payload(start, "total-tokens-economy")?;
+    let latest_payload: TotalTokensEconomyPayload =
+        decode_payload(latest, "total-tokens-economy")?;
+    let start_total = parse_amount(&start_payload.total_amount)?;
+    let latest_total = parse_amount(&latest_payload.total_amount)?;
+    let sum = match start_total.checked_add(latest_total) {
+        Some(sum) => sum,
+        None => {
+            warn!("Total token supply overflow while averaging");
+            return None;
+        }
+    };
+    let average = sum / 2;
+
+    Some(average.to_string())
+}
+
+fn total_tokens_average_for_window(
+    samples: &[MetricSample],
+    start_ms: i64,
+    end_ms: i64,
+    start_idx: &mut usize,
+    end_idx: &mut usize,
+) -> Option<String> {
+    if samples.len() < 2 || start_ms >= end_ms {
+        return None;
+    }
+
+    while *end_idx + 1 < samples.len() && samples[*end_idx + 1].recorded_at_ms <= end_ms {
+        *end_idx += 1;
+    }
+    if samples[*end_idx].recorded_at_ms > end_ms {
+        return None;
+    }
+
+    while *start_idx + 1 < samples.len() && samples[*start_idx + 1].recorded_at_ms <= start_ms {
+        *start_idx += 1;
+    }
+    if *start_idx >= *end_idx {
+        if *end_idx == 0 {
+            return None;
+        }
+        *start_idx = *end_idx - 1;
+    }
+
+    total_tokens_average_from_samples(&samples[*start_idx], &samples[*end_idx])
+}
+
+fn derive_token_velocity_series(
+    value_samples: &[MetricSample],
+    total_samples: &[MetricSample],
+    window_ms: Option<i64>,
+) -> Vec<TokenVelocityHistoricSample> {
+    if value_samples.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut derived = Vec::new();
+    let mut value_start_idx = 0usize;
+    let mut total_start_idx = 0usize;
+    let mut total_end_idx = 0usize;
+
+    for latest_idx in 1..value_samples.len() {
+        let latest = &value_samples[latest_idx];
+        let latest_ts = latest.recorded_at_ms;
+
+        let start_idx = match window_ms {
+            Some(window_ms) if window_ms > 0 => {
+                let target = latest_ts - window_ms;
+                while value_start_idx + 1 < latest_idx
+                    && value_samples[value_start_idx + 1].recorded_at_ms <= target
+                {
+                    value_start_idx += 1;
+                }
+                if value_start_idx >= latest_idx {
+                    value_start_idx = latest_idx - 1;
+                }
+                value_start_idx
+            }
+            _ => latest_idx - 1,
+        };
+
+        let start = &value_samples[start_idx];
+        let delta_ms = latest_ts - start.recorded_at_ms;
+        if delta_ms <= 0 {
+            continue;
+        }
+
+        let value_spent = token_value_spent_from_samples(start, latest);
+        let total_tokens = total_tokens_average_for_window(
+            total_samples,
+            start.recorded_at_ms,
+            latest_ts,
+            &mut total_start_idx,
+            &mut total_end_idx,
+        );
+
+        let token_velocity = match (
+            value_spent.as_ref().and_then(|value| parse_amount(value)),
+            total_tokens.as_ref().and_then(|value| parse_amount(value)),
+        ) {
+            (Some(spent), Some(total)) => {
+                if total == 0 {
+                    None
+                } else {
+                    Some(spent as f64 / total as f64)
+                }
+            }
+            _ => None,
+        };
+
+        derived.push(TokenVelocityHistoricSample {
+            recorded_at_ms: latest_ts,
+            token_velocity,
+            value_spent,
+            total_tokens,
+            delta_ms: Some(delta_ms),
+        });
+    }
+
+    derived
+}
+
+fn map_total_transactions_series(series: MetricSeriesSnapshot) -> TotalTransactionsSeriesSnapshot {
+    let samples: Vec<TotalTransactionsSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_total_transactions_sample)
+        .collect();
+    let latest = series.latest.and_then(map_total_transactions_sample);
+
+    TotalTransactionsSeriesSnapshot {
+        name: series.name,
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    }
+}
+
+fn map_failed_transactions_series(series: MetricSeriesSnapshot) -> FailedTransactionsSeriesSnapshot {
+    let samples: Vec<FailedTransactionsSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_failed_transactions_sample)
+        .collect();
+    let latest = series.latest.and_then(map_failed_transactions_sample);
+
+    FailedTransactionsSeriesSnapshot {
+        name: series.name,
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    }
+}
+
+fn map_average_transaction_size_series(
+    series: MetricSeriesSnapshot,
+) -> AverageTransactionSizeSeriesSnapshot {
+    let samples: Vec<AverageTransactionSizeSample> = series
+        .samples
+        .into_iter()
+        .filter_map(map_average_transaction_size_sample)
+        .collect();
+    let latest = series.latest.and_then(map_average_transaction_size_sample);
+
+    AverageTransactionSizeSeriesSnapshot {
+        name: "average-transaction-size".to_string(),
+        interval_secs: series.interval_secs,
+        latest,
+        samples,
+    }
+}
+
+
+fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactionsSample> {
+    let payload: TotalTransactionsPayload = decode_payload(&sample, "total-transactions")?;
+
+    Some(TotalTransactionsSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransactionsSample> {
+    let payload: FailedTransactionsPayload =
+        decode_payload(&sample, "failed-transactions-rate")?;
+
+    Some(FailedTransactionsSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+fn map_average_transaction_size_sample(
+    sample: MetricSample,
+) -> Option<AverageTransactionSizeSample> {
+    let payload: AverageTransactionSizePayload =
+        decode_payload(&sample, "average-transaction-size")?;
+
+    Some(AverageTransactionSizeSample {
+        recorded_at_ms: sample.recorded_at_ms,
+        payload,
+    })
+}
+
+
+#[derive(Serialize, ToSchema)]
+struct HealthResponse {
+    status: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TotalTransactionsResponse {
+    total_transactions: Option<u64>,
+    as_of_ms: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TotalTransactionsSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<TotalTransactionsSample>,
+    samples: Vec<TotalTransactionsSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct TotalTransactionsSample {
+    recorded_at_ms: i64,
+    payload: TotalTransactionsPayload,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TpsResponse {
+    tps: Option<f64>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+    latest_total: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TpsSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<TpsSample>,
+    samples: Vec<TpsSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct TpsSample {
+    recorded_at_ms: i64,
+    tps: Option<f64>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+    latest_total: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsResponse {
+    rate_percent: Option<f64>,
+    failed_transactions: Option<u64>,
+    total_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+    retention_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsRateSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<FailedTransactionsRateSample>,
+    samples: Vec<FailedTransactionsRateSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct FailedTransactionsRateSample {
+    recorded_at_ms: i64,
+    rate_percent: Option<f64>,
+    failed_transactions: Option<u64>,
+    total_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FailedTransactionsSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<FailedTransactionsSample>,
+    samples: Vec<FailedTransactionsSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct FailedTransactionsSample {
+    recorded_at_ms: i64,
+    payload: FailedTransactionsPayload,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeResponse {
+    average_amount: Option<f64>,
+    delta_amount: Option<String>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+    retention_seconds: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeHistoricSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<AverageTransactionSizeHistoricSample>,
+    samples: Vec<AverageTransactionSizeHistoricSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct AverageTransactionSizeHistoricSample {
+    recorded_at_ms: i64,
+    average_amount: Option<f64>,
+    delta_amount: Option<String>,
+    delta_transactions: Option<u64>,
+    delta_ms: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AverageTransactionSizeSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<AverageTransactionSizeSample>,
+    samples: Vec<AverageTransactionSizeSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct AverageTransactionSizeSample {
+    recorded_at_ms: i64,
+    payload: AverageTransactionSizePayload,
+}
+
+#[derive(Serialize, ToSchema)]
+struct MedianTransactionSizeResponse {
+    median_amount: Option<f64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct MedianTransactionSizeSeriesSnapshot {
+    name: String,
+    bucket_seconds: u64,
+    latest: Option<MedianTransactionSizeSample>,
+    samples: Vec<MedianTransactionSizeSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct MedianTransactionSizeSample {
+    recorded_at_ms: i64,
+    median_amount: Option<f64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenValueSpentResponse {
+    value_spent: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenValueSpentHistoricSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<TokenValueSpentHistoricSample>,
+    samples: Vec<TokenValueSpentHistoricSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct TokenValueSpentHistoricSample {
+    recorded_at_ms: i64,
+    value_spent: Option<String>,
+    delta_ms: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenVelocityResponse {
+    token_velocity: Option<f64>,
+    value_spent: Option<String>,
+    total_tokens: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TokenVelocityHistoricSeriesSnapshot {
+    name: String,
+    interval_secs: u64,
+    latest: Option<TokenVelocityHistoricSample>,
+    samples: Vec<TokenVelocityHistoricSample>,
+}
+
+#[derive(Serialize, ToSchema, Clone)]
+struct TokenVelocityHistoricSample {
+    recorded_at_ms: i64,
+    token_velocity: Option<f64>,
+    value_spent: Option<String>,
+    total_tokens: Option<String>,
+    delta_ms: Option<i64>,
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Sovereign Metrics API",
+        version = "0.1.0",
+        description = "Metrics API for verifier worker DB stats."
+    ),
+    paths(
+        health,
+        total_transactions,
+        total_transactions_historic,
+        tps,
+        tps_historic,
+        failed_transactions_rate,
+        failed_transactions_rate_historic,
+        average_transaction_size,
+        average_transaction_size_historic,
+        median_transaction_size,
+        median_transaction_size_historic,
+        token_value_spent,
+        token_value_spent_historic,
+        token_velocity,
+        token_velocity_historic
+    ),
+    components(schemas(
+        HealthResponse,
+        TotalTransactionsResponse,
+        TotalTransactionsSeriesSnapshot,
+        TotalTransactionsSample,
+        TpsResponse,
+        TpsSeriesSnapshot,
+        TpsSample,
+        FailedTransactionsResponse,
+        FailedTransactionsRateSeriesSnapshot,
+        FailedTransactionsRateSample,
+        AverageTransactionSizeResponse,
+        AverageTransactionSizeHistoricSeriesSnapshot,
+        AverageTransactionSizeHistoricSample,
+        MedianTransactionSizeResponse,
+        MedianTransactionSizeSeriesSnapshot,
+        MedianTransactionSizeSample,
+        TokenValueSpentResponse,
+        TokenValueSpentHistoricSeriesSnapshot,
+        TokenValueSpentHistoricSample,
+        TokenVelocityResponse,
+        TokenVelocityHistoricSeriesSnapshot,
+        TokenVelocityHistoricSample
+    )),
+    tags(
+        (name = "health", description = "Service health checks"),
+        (name = "metrics", description = "Metrics endpoints")
+    )
+)]
+struct ApiDoc;

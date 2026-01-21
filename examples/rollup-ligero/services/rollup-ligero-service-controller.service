@@ -10,6 +10,16 @@ ExecStart=/usr/bin/env cargo run -p sov-rollup-ligero --bin rollup-ligero-servic
 Restart=on-failure
 Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 #Environment="SERVICE_CONTROLLER_BIND=127.0.0.1:9090"
+# FVK service signing keys
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX=SECRET_KEY"
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX=PUBLIC_KEY"
+Environment="POOL_FVK_PK=PUBLIC_KEY"
+Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=ADMIN_TOKEN"
+# Auto-funding configuration
+Environment="AUTO_FUND_DEPOSIT_AMOUNT=100"
+Environment="AUTO_FUND_GAS_RESERVE=1000000"
+# Defer sequencer submission
+#Environment="DEFER_SUBMISSION=1"
 
 [Install]
 WantedBy=multi-user.target

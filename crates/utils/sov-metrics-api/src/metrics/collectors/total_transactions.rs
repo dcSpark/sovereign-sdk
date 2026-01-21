@@ -1,0 +1,62 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
+use crate::metrics::store::MetricSample;
+
+pub const SAMPLE_INTERVAL_SECS: u64 = 5;
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct TotalTransactionsPayload {
+    pub total_transactions: u64,
+}
+
+pub struct TotalTransactionsCollector {
+    db: DatabaseConnection,
+}
+
+impl TotalTransactionsCollector {
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+}
+
+impl MetricCollector for TotalTransactionsCollector {
+    fn spec(&self) -> MetricSpec {
+        MetricSpec {
+            name: "total-transactions",
+            interval: Duration::from_secs(SAMPLE_INTERVAL_SECS),
+        }
+    }
+
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
+        Box::pin(async move {
+            use sov_midnight_da::storable::worker_verified_transactions::{
+                Column, Entity, TransactionState,
+            };
+
+            let paginator = Entity::find()
+                .filter(Column::TransactionState.is_in([
+                    TransactionState::Accepted,
+                    TransactionState::Rejected,
+                ]))
+                .paginate(&self.db, 1);
+            let total_transactions = paginator
+                .num_items()
+                .await
+                .with_context(|| "Failed to count completed transactions")?;
+
+            let payload = TotalTransactionsPayload { total_transactions };
+
+            Ok(vec![MetricSample {
+                recorded_at_ms: Utc::now().timestamp_millis(),
+                payload: serde_json::to_value(payload)
+                    .context("Failed to serialize total transactions payload")?,
+            }])
+        })
+    }
+}

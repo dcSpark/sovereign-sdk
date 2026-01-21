@@ -35,6 +35,7 @@ members = [
     "crates/utils/midnight-fvk-service",
     "crates/utils/sov-proof-verifier-service",
     "crates/utils/sov-indexer",
+    "crates/utils/sov-metrics-api",
     # Module System
     "crates/module-system/sov-cli",
     "crates/module-system/sov-modules-stf-blueprint",
