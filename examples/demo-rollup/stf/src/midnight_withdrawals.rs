@@ -1,9 +1,11 @@
 //! Minimal Midnight L2 -> L1 withdrawal prototype.
 
+use std::array;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::LazyLock;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use hex::{decode, encode};
 use schemars::JsonSchema;
@@ -20,7 +22,7 @@ use sov_modules_api::{
 use strum::{EnumDiscriminants, EnumIs, VariantArray};
 
 #[cfg(feature = "native")]
-use sov_modules_api::prelude::axum::{self, routing::get, Router};
+use sov_modules_api::prelude::axum::{self, extract::Query, routing::get, Router};
 #[cfg(feature = "native")]
 use sov_modules_api::prelude::UnwrapInfallible;
 #[cfg(feature = "native")]
@@ -127,6 +129,54 @@ pub struct StoredWithdrawal<S: Spec> {
     leaf_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone)]
+struct WithdrawalProofBundle<S: Spec> {
+    record: StoredWithdrawal<S>,
+    siblings: [[u8; 32]; TREE_DEPTH],
+    index_bits_le: [bool; TREE_DEPTH],
+    leaf_count: u64,
+    withdraw_root: [u8; 32],
+}
+
+/// Rust-side representation of Compact's `WithdrawProof16` struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1WithdrawProof16Binary {
+    /// Finalized batch index that attested the withdraw root.
+    pub batch_index: u64,
+    /// Nonce assigned by the withdrawal queue.
+    pub nonce: u64,
+    /// Merkle index bits (little-endian, level 0 first).
+    pub index_bits_le: [bool; TREE_DEPTH],
+    /// Merkle sibling nodes ordered from leaves to root.
+    pub siblings: [[u8; 32]; TREE_DEPTH],
+}
+
+impl L1WithdrawProof16Binary {
+    fn new(
+        batch_index: u64,
+        nonce: u64,
+        index_bits_le: [bool; TREE_DEPTH],
+        siblings: [[u8; 32]; TREE_DEPTH],
+    ) -> Self {
+        Self {
+            batch_index,
+            nonce,
+            index_bits_le,
+            siblings,
+        }
+    }
+
+    #[cfg(feature = "native")]
+    fn into_response(self) -> L1WithdrawProof16Response {
+        L1WithdrawProof16Response {
+            batch_index: self.batch_index,
+            nonce: self.nonce,
+            index_bits_le: self.index_bits_le,
+            sibling_hashes_hex: array::from_fn(|idx| encode(self.siblings[idx])),
+        }
+    }
+}
+
 const TREE_DEPTH: usize = 16;
 const MAX_LEAVES: u64 = 1u64 << TREE_DEPTH;
 
@@ -149,6 +199,101 @@ fn zero_sibling(level: usize) -> [u8; 32] {
     } else {
         zero_hash(level - 1)
     }
+}
+
+fn index_bits_le(nonce: u64) -> [bool; TREE_DEPTH] {
+    let mut bits = [false; TREE_DEPTH];
+    for level in 0..TREE_DEPTH {
+        bits[level] = ((nonce >> level) & 1) == 1;
+    }
+    bits
+}
+
+struct MerkleArtifacts {
+    siblings: [[u8; 32]; TREE_DEPTH],
+    index_bits_le: [bool; TREE_DEPTH],
+    root: [u8; 32],
+}
+
+fn compute_merkle_artifacts<F>(
+    nonce: u64,
+    leaf_count: u64,
+    fetch_leaf: &mut F,
+) -> Result<MerkleArtifacts>
+where
+    F: FnMut(u64) -> Result<[u8; 32]>,
+{
+    ensure!(leaf_count <= MAX_LEAVES, "Invalid withdrawal queue depth");
+    ensure!(
+        nonce < leaf_count,
+        "Withdrawal {nonce} has not been enqueued yet"
+    );
+
+    let index_bits = index_bits_le(nonce);
+    let mut cache = BTreeMap::new();
+    let mut siblings = [[0u8; 32]; TREE_DEPTH];
+
+    for level in 0..TREE_DEPTH {
+        let block_size = 1u64 << level;
+        let block_index = nonce / block_size;
+        let sibling_index = block_index ^ 1;
+        let sibling_start = sibling_index.saturating_mul(block_size);
+
+        siblings[level] = if sibling_start >= MAX_LEAVES {
+            if level == 0 {
+                ZERO_BYTES32
+            } else {
+                zero_hash(level - 1)
+            }
+        } else {
+            compute_subtree_hash(level, sibling_start, leaf_count, &mut cache, fetch_leaf)?
+        };
+    }
+
+    let root = compute_subtree_hash(TREE_DEPTH, 0, leaf_count, &mut cache, fetch_leaf)?;
+    Ok(MerkleArtifacts {
+        siblings,
+        index_bits_le: index_bits,
+        root,
+    })
+}
+
+fn compute_subtree_hash<F>(
+    level: usize,
+    start_index: u64,
+    leaf_count: u64,
+    cache: &mut BTreeMap<(usize, u64), [u8; 32]>,
+    fetch_leaf: &mut F,
+) -> Result<[u8; 32]>
+where
+    F: FnMut(u64) -> Result<[u8; 32]>,
+{
+    if let Some(value) = cache.get(&(level, start_index)) {
+        return Ok(*value);
+    }
+
+    let value = if start_index >= MAX_LEAVES {
+        if level == 0 {
+            ZERO_BYTES32
+        } else {
+            zero_hash(level - 1)
+        }
+    } else if level == 0 {
+        if start_index < leaf_count {
+            fetch_leaf(start_index)?
+        } else {
+            ZERO_BYTES32
+        }
+    } else {
+        let half = 1u64 << (level - 1);
+        let left = compute_subtree_hash(level - 1, start_index, leaf_count, cache, fetch_leaf)?;
+        let right_start = start_index.checked_add(half).unwrap_or(MAX_LEAVES);
+        let right = compute_subtree_hash(level - 1, right_start, leaf_count, cache, fetch_leaf)?;
+        hash_merkle_node(&left, &right)
+    };
+
+    cache.insert((level, start_index), value);
+    Ok(value)
 }
 
 /// Call messages accepted by [`MidnightWithdrawals`].
@@ -325,6 +470,55 @@ impl<S: Spec> MidnightWithdrawals<S> {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    fn build_withdrawal_proof(
+        &mut self,
+        nonce: u64,
+        state: &mut impl TxState<S>,
+    ) -> Result<WithdrawalProofBundle<S>> {
+        let total = self.message_count.get(state)?.unwrap_or(0);
+        ensure!(nonce < total, "Withdrawal {nonce} is not available yet");
+        let withdraw_root = self
+            .withdraw_root
+            .get(state)?
+            .unwrap_or(zero_hash(TREE_DEPTH - 1));
+        let record = self
+            .withdrawals
+            .get(&nonce, state)?
+            .with_context(|| format!("Missing withdrawal record {nonce}"))?;
+
+        let mut cached_leaves = BTreeMap::new();
+        let mut fetch_leaf = |index: u64| -> Result<[u8; 32]> {
+            if let Some(value) = cached_leaves.get(&index) {
+                return Ok(*value);
+            }
+            if index >= total {
+                return Ok(ZERO_BYTES32);
+            }
+            let leaf = self
+                .withdrawals
+                .get(&index, state)?
+                .with_context(|| format!("Missing withdrawal record {index}"))?
+                .leaf_hash;
+            cached_leaves.insert(index, leaf);
+            Ok(leaf)
+        };
+
+        let artifacts = compute_merkle_artifacts(nonce, total, &mut fetch_leaf)?;
+        ensure!(
+            artifacts.root == withdraw_root,
+            "Reconstructed withdraw root mismatch while building proof"
+        );
+
+        Ok(WithdrawalProofBundle {
+            record,
+            siblings: artifacts.siblings,
+            index_bits_le: artifacts.index_bits_le,
+            leaf_count: total,
+            withdraw_root,
+        })
+    }
+
     fn branch_state(&mut self, level: usize) -> &mut StateValue<[u8; 32]> {
         match level {
             0 => &mut self.branch_0,
@@ -431,6 +625,75 @@ where
         }
         .into())
     }
+
+    async fn route_withdrawal_proof(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+        Path(nonce): Path<u64>,
+        Query(params): Query<ProofQuery>,
+    ) -> ApiResult<WithdrawalProofResponse> {
+        let total = state
+            .message_count
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or(0);
+        let Some(record) = state
+            .withdrawals
+            .get(&nonce, &mut accessor)
+            .unwrap_infallible()
+        else {
+            return Err(errors::not_found_404("Midnight withdrawal", nonce));
+        };
+        if nonce >= total {
+            return Err(errors::bad_request_400(
+                "Withdrawal has not been enqueued yet",
+                format!("nonce {nonce} >= message_count {total}"),
+            ));
+        }
+        let withdraw_root = state
+            .withdraw_root
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or(zero_hash(TREE_DEPTH - 1));
+
+        let mut cached_leaves = BTreeMap::new();
+        let mut fetch_leaf = |index: u64| -> Result<[u8; 32]> {
+            if let Some(value) = cached_leaves.get(&index) {
+                return Ok(*value);
+            }
+            if index >= total {
+                return Ok(ZERO_BYTES32);
+            }
+            let Some(withdrawal) = state
+                .withdrawals
+                .get(&index, &mut accessor)
+                .unwrap_infallible()
+            else {
+                bail!("Missing withdrawal record {index}");
+            };
+            cached_leaves.insert(index, withdrawal.leaf_hash);
+            Ok(withdrawal.leaf_hash)
+        };
+
+        let artifacts = compute_merkle_artifacts(nonce, total, &mut fetch_leaf)
+            .map_err(|err| errors::internal_server_error_response_500(err))?;
+        if artifacts.root != withdraw_root {
+            return Err(errors::internal_server_error_response_500(
+                "Merkle root mismatch while reconstructing proof",
+            ));
+        }
+
+        let bundle = WithdrawalProofBundle {
+            record,
+            siblings: artifacts.siblings,
+            index_bits_le: artifacts.index_bits_le,
+            leaf_count: total,
+            withdraw_root,
+        };
+        let response =
+            WithdrawalProofResponse::from_bundle(bundle, params.batch_index.unwrap_or_default());
+        Ok(response.into())
+    }
 }
 
 #[cfg(feature = "native")]
@@ -444,6 +707,10 @@ where
     fn custom_rest_api(&self, state: ApiState<S>) -> Router<()> {
         Router::new()
             .route("/withdrawals/:nonce", get(Self::route_get_withdrawal))
+            .route(
+                "/withdrawals/:nonce/proof",
+                get(Self::route_withdrawal_proof),
+            )
             .route("/withdrawals/queue", get(Self::route_queue_status))
             .with_state(state.with(self.clone()))
     }
@@ -483,4 +750,131 @@ struct QueueStatusResponse {
     pub next_nonce: u64,
     /// Hex encoding of the current withdraw root.
     pub withdraw_root_hex: String,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+struct ProofQuery {
+    batch_index: Option<u64>,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+struct WithdrawalProofResponse {
+    pub nonce: u64,
+    pub midnight_address: MidnightAddress,
+    pub amount: Amount,
+    pub token_id: TokenId,
+    pub l2_sender_debug: String,
+    pub gas_limit: Option<u64>,
+    pub sender_bytes_hex: String,
+    pub recipient_bytes_hex: String,
+    pub message_hash_hex: String,
+    pub leaf_hash_hex: String,
+    pub leaf_count: u64,
+    pub withdraw_root_hex: String,
+    pub l1_proof: L1WithdrawProof16Response,
+}
+
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+struct L1WithdrawProof16Response {
+    pub batch_index: u64,
+    pub nonce: u64,
+    pub index_bits_le: [bool; TREE_DEPTH],
+    pub sibling_hashes_hex: [String; TREE_DEPTH],
+}
+
+#[cfg(feature = "native")]
+impl WithdrawalProofResponse {
+    fn from_bundle<S>(bundle: WithdrawalProofBundle<S>, batch_index: u64) -> Self
+    where
+        S: Spec,
+        S::Address: Debug,
+    {
+        let WithdrawalProofBundle {
+            record,
+            siblings,
+            index_bits_le,
+            leaf_count,
+            withdraw_root,
+        } = bundle;
+        let l1_proof =
+            L1WithdrawProof16Binary::new(batch_index, record.nonce, index_bits_le, siblings)
+                .into_response();
+        WithdrawalProofResponse {
+            nonce: record.nonce,
+            midnight_address: record.midnight_address,
+            amount: record.amount,
+            token_id: record.token_id,
+            l2_sender_debug: format!("{:?}", record.l2_sender),
+            gas_limit: record.gas_limit,
+            sender_bytes_hex: encode(record.sender_bytes),
+            recipient_bytes_hex: encode(record.recipient_bytes),
+            message_hash_hex: encode(record.message_hash),
+            leaf_hash_hex: encode(record.leaf_hash),
+            leaf_count,
+            withdraw_root_hex: encode(withdraw_root),
+            l1_proof,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_leaf(index: u64) -> [u8; 32] {
+        let sender = [index as u8; 32];
+        let mut recipient = [0u8; 32];
+        recipient.fill(index as u8 + 1);
+        let msg = WithdrawMessage::new(sender, recipient, (index as u128) + 1, index);
+        let message_hash = hash_withdraw_message(&msg);
+        hash_withdraw_leaf(&message_hash)
+    }
+
+    fn compute_naive_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        let mut level = vec![[0u8; 32]; MAX_LEAVES as usize];
+        for (idx, leaf) in leaves.iter().enumerate() {
+            level[idx] = *leaf;
+        }
+        let mut size = MAX_LEAVES as usize;
+        while size > 1 {
+            let mut next = 0;
+            for i in 0..size / 2 {
+                let left = level[2 * i];
+                let right = level[2 * i + 1];
+                level[next] = hash_merkle_node(&left, &right);
+                next += 1;
+            }
+            size /= 2;
+        }
+        level[0]
+    }
+
+    #[test]
+    fn merkle_artifacts_round_trip() {
+        let total = 4u64;
+        let leaves: Vec<[u8; 32]> = (0..total).map(sample_leaf).collect();
+        let mut fetch = |idx: u64| -> Result<[u8; 32]> {
+            Ok(*leaves.get(idx as usize).unwrap_or(&ZERO_BYTES32))
+        };
+        let artifacts = compute_merkle_artifacts(2, total, &mut fetch).unwrap();
+        let naive_root = compute_naive_root(&leaves);
+        assert_eq!(artifacts.root, naive_root);
+        let mut acc = leaves[2];
+        for level in 0..TREE_DEPTH {
+            let sibling = artifacts.siblings[level];
+            let (left, right) = if artifacts.index_bits_le[level] {
+                (sibling, acc)
+            } else {
+                (acc, sibling)
+            };
+            acc = hash_merkle_node(&left, &right);
+        }
+        assert_eq!(acc, artifacts.root);
+    }
 }

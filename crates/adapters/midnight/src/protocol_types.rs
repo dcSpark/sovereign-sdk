@@ -98,8 +98,7 @@ mod tests {
     use hex::ToHex;
     use serde::Deserialize;
 
-    const GOLDEN_VECTORS: &str =
-        include_str!("../test-data/protocol/golden-vectors-v1.json");
+    const GOLDEN_VECTORS: &str = include_str!("../test-data/protocol/golden-vectors-v1.json");
 
     #[derive(Deserialize)]
     struct GoldenVectors {
