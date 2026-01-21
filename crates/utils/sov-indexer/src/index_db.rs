@@ -108,6 +108,9 @@ pub mod midnight_transfer {
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false, column_type = "Integer")]
         pub event_id: i32,
+        /// Amount transferred (from decrypted notes)
+        #[sea_orm(nullable)]
+        pub amount: Option<String>,
         pub anchor_root: Option<String>,
         pub nullifier: Option<String>,
         #[sea_orm(nullable)]

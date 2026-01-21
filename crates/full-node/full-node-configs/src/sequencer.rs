@@ -2,6 +2,7 @@ use std::num::NonZero;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// See [`SequencerConfig::sequencer_kind_config`].
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -23,6 +24,56 @@ impl Default for SequencerKindConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SeqConfigExtension {
     pub max_log_limit: usize,
+    /// Optional Midnight bridge configuration that allows custom background services to run alongside the sequencer.
+    #[serde(default)]
+    pub midnight_bridge: Option<MidnightBridgeSettings>,
+}
+
+/// Rollup-specific Midnight bridge settings parsed from `[sequencer.extension.midnight_bridge]`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MidnightBridgeSettings {
+    /// Path to the JSON file containing `PrivateKeyAndAddress` that the bridge will use for signing transactions.
+    pub signing_key_path: PathBuf,
+    /// Optional JSON file containing mock ingress events for the bridge to consume.
+    #[serde(default)]
+    pub mock_events_path: Option<PathBuf>,
+    /// HTTP endpoint for the Midnight indexer GraphQL API.
+    #[serde(default)]
+    pub indexer_http: Option<String>,
+    /// Bridge contract address on Midnight (64 hex characters).
+    #[serde(default)]
+    pub contract_address: Option<String>,
+    /// How often (in milliseconds) the mock event source should be polled.
+    #[serde(default = "default_bridge_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Optional bech32 token identifier that should be minted; defaults to the runtime gas token.
+    #[serde(default)]
+    pub token_id_bech32: Option<String>,
+    /// Maximum fee (in gas token units) that the bridge will attach to generated transactions.
+    #[serde(default = "default_bridge_max_fee")]
+    pub max_fee: u64,
+    /// Timeout (in milliseconds) for requests to the Midnight indexer.
+    #[serde(default = "default_indexer_timeout_ms")]
+    pub indexer_timeout_ms: u64,
+    /// Optional chain deposit index to start processing from (defaults to zero).
+    #[serde(default = "default_start_deposit_index")]
+    pub start_deposit_index: Option<u64>,
+}
+
+const fn default_bridge_poll_interval_ms() -> u64 {
+    1_000
+}
+
+const fn default_bridge_max_fee() -> u64 {
+    1_000_000
+}
+
+const fn default_indexer_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_start_deposit_index() -> Option<u64> {
+    Some(0)
 }
 
 /// Sequencer configuration.

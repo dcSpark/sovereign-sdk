@@ -140,7 +140,7 @@ where
 
     // Query the indexer for transactions from the normal wallet address (deposits)
     let normal_response = provider
-        .get_wallet_transactions(&address_str, None, None, None, None)
+        .get_wallet_transactions(&address_str, None, None, None)
         .await?;
 
     tracing::info!(
@@ -151,7 +151,7 @@ where
 
     // Query the indexer for transactions from the privacy address (transfers)
     let privacy_response = provider
-        .get_wallet_transactions(&privacy_address, None, None, None, None)
+        .get_wallet_transactions(&privacy_address, None, None, None)
         .await?;
 
     tracing::info!(

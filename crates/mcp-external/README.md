@@ -48,11 +48,8 @@ The server exposes the following MCP tools:
 - `walletBalance` - Get the privacy balance and unspent notes
 - `getWalletConfig` - Retrieve wallet configuration (node/indexer/proof server/log paths)
 - `send` - Privacy transfer using the first unspent note
-- `getTransaction` - Retrieve transaction details by hash or derived UUID (legacy)
-- `getTransactionStatus` - Query a transaction by hash
 - `getTransactions` - List all transactions from the indexer
 - `walletStatus` - Sync status and balances
-- `verifyTransaction` - Verify receipt and decrypt amount when possible
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
 If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool.

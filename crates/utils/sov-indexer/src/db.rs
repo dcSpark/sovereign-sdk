@@ -360,6 +360,7 @@ pub async fn insert_midnight_withdraw(
 pub async fn insert_midnight_transfer(
     idx_db: &DatabaseConnection,
     event_id: i32,
+    amount: Option<String>,
     anchor_root: Option<String>,
     nullifier: Option<String>,
     sender: Option<String>,
@@ -371,6 +372,7 @@ pub async fn insert_midnight_transfer(
 ) -> Result<()> {
     let _ = idx::midnight_transfer::Entity::insert(idx::midnight_transfer::ActiveModel {
         event_id: Set(event_id),
+        amount: Set(amount),
         anchor_root: Set(anchor_root),
         nullifier: Set(nullifier),
         sender: Set(sender),
@@ -1021,6 +1023,7 @@ pub async fn list_txs(
                     recipient = mt.recipient;
                     privacy_sender = mt.privacy_sender;
                     privacy_recipient = recipient.clone();
+                    amount = mt.amount;
                     anchor_root = mt.anchor_root;
                     nullifier = mt.nullifier;
                     view_attestations = mt.view_attestations;
@@ -1119,6 +1122,7 @@ pub async fn get_tx(
                 recipient = mt.recipient;
                 privacy_sender = mt.privacy_sender;
                 privacy_recipient = recipient.clone();
+                amount = mt.amount;
                 anchor_root = mt.anchor_root;
                 nullifier = mt.nullifier;
                 view_attestations = mt.view_attestations;
@@ -1149,6 +1153,22 @@ pub async fn get_tx(
     }))
 }
 
+pub async fn get_tx_god(
+    db: &DatabaseConnection,
+    tx_hash: &str,
+) -> Result<Option<InvolvementItem>> {
+    let ev = idx::Entity::find()
+        .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
+        .one(db)
+        .await?;
+    let Some(ev) = ev else {
+        return Ok(None);
+    };
+
+    let item = build_transaction_item(db, &ev, true).await?;
+    Ok(Some(item))
+}
+
 fn resolve_decrypted_notes(
     vfk: Option<&Hash32>,
     encrypted: Option<&JsonValue>,
@@ -1157,6 +1177,434 @@ fn resolve_decrypted_notes(
         return None;
     };
     viewer::try_decrypt_notes_json(vfk, encrypted)
+}
+
+/// List all transactions with pagination (public mode - hides privacy-sensitive fields).
+/// Uses cursor-based pagination for efficiency.
+pub async fn list_transactions(
+    db: &DatabaseConnection,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+) -> Result<ListResponse> {
+    list_transactions_internal(db, limit, cursor, type_filter, false).await
+}
+
+/// List all transactions with pagination (god mode - shows all fields including decrypted data).
+/// Uses cursor-based pagination for efficiency.
+pub async fn list_transactions_god(
+    db: &DatabaseConnection,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+) -> Result<ListResponse> {
+    list_transactions_internal(db, limit, cursor, type_filter, true).await
+}
+
+async fn list_transactions_internal(
+    db: &DatabaseConnection,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+    god_mode: bool,
+) -> Result<ListResponse> {
+    use tracing::debug;
+
+    let mut query = idx::Entity::find().order_by_desc(idx::Column::CreatedAt);
+
+    if let Some(ref kind) = type_filter {
+        query = query.filter(idx::Column::Kind.eq(kind.to_string()));
+    }
+
+    // Apply cursor filter for efficient pagination
+    if let Some(ref cur) = cursor {
+        let cursor_ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms)
+            .unwrap_or_else(|| Utc::now());
+        // Fetch records where (created_at < cursor_ts) OR (created_at == cursor_ts AND tx_hash < cursor_tx_hash)
+        query = query.filter(
+            Condition::any()
+                .add(idx::Column::CreatedAt.lt(cursor_ts))
+                .add(
+                    Condition::all()
+                        .add(idx::Column::CreatedAt.eq(cursor_ts))
+                        .add(idx::Column::TxHash.lt(cur.tx_hash.clone())),
+                ),
+        );
+    }
+
+    // Fetch limit + 1 to determine if there are more results
+    let rows = query.limit((limit + 1) as u64).all(db).await?;
+
+    let has_more = rows.len() > limit;
+    let rows: Vec<_> = rows.into_iter().take(limit).collect();
+
+    debug!(
+        "list_transactions: fetched {} events, has_more={}",
+        rows.len(),
+        has_more
+    );
+
+    let mut items = Vec::new();
+    for ev in &rows {
+        let item = build_transaction_item(db, ev, god_mode).await?;
+        items.push(item);
+    }
+
+    // Build next cursor from last item
+    let next = if has_more {
+        items.last().map(|item| {
+            BASE64_STANDARD.encode(
+                serde_json::to_vec(&CursorInner {
+                    ts_ms: item.timestamp_ms,
+                    tx_hash: item.tx_hash.clone(),
+                })
+                .unwrap(),
+            )
+        })
+    } else {
+        None
+    };
+
+    Ok(ListResponse {
+        items,
+        next,
+        total: None,
+    })
+}
+
+/// List transactions filtered by wallet address (public mode - hides privacy-sensitive fields).
+/// Uses cursor-based pagination for efficiency.
+pub async fn list_wallet_transactions(
+    db: &DatabaseConnection,
+    address: &str,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+) -> Result<ListResponse> {
+    list_wallet_transactions_internal(db, address, limit, cursor, type_filter, false).await
+}
+
+/// List transactions filtered by wallet address (god mode - shows all fields).
+/// Uses cursor-based pagination for efficiency.
+pub async fn list_wallet_transactions_god(
+    db: &DatabaseConnection,
+    address: &str,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+) -> Result<ListResponse> {
+    list_wallet_transactions_internal(db, address, limit, cursor, type_filter, true).await
+}
+
+async fn list_wallet_transactions_internal(
+    db: &DatabaseConnection,
+    address: &str,
+    limit: usize,
+    cursor: Option<CursorInner>,
+    type_filter: Option<String>,
+    god_mode: bool,
+) -> Result<ListResponse> {
+    use tracing::{debug, trace};
+
+    let normalized_address = normalize_address_for_query(address);
+    let address_is_privacy = address.starts_with("privpool1");
+
+    debug!(
+        "list_wallet_transactions: address={}, normalized={}, is_privacy={}, god_mode={}",
+        address, normalized_address, address_is_privacy, god_mode
+    );
+
+    // We need to query all three tables and merge results
+    // To make this efficient with cursor pagination, we:
+    // 1. Query each table separately with the cursor filter
+    // 2. Merge, sort, and take the top `limit` items
+
+    let mut collected: Vec<InvolvementItem> = Vec::new();
+
+    // Deposits
+    if type_filter.is_none() || type_filter.as_deref() == Some("deposit") {
+        let deposit_filter = if address_is_privacy {
+            Condition::any()
+                .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
+        } else {
+            Condition::any()
+                .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+        };
+
+        let deps = idx::midnight_deposit::Entity::find()
+            .filter(deposit_filter)
+            .all(db)
+            .await?;
+
+        trace!("Found {} deposit records for wallet", deps.len());
+
+        for md in deps {
+            let Some(ev) = idx::Entity::find_by_id(md.event_id).one(db).await? else {
+                continue;
+            };
+
+            // Apply cursor filter
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    continue;
+                }
+            }
+
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: md.sender.clone(),
+                recipient: if god_mode { md.recipient.clone() } else { None },
+                privacy_sender: None,
+                privacy_recipient: if god_mode { md.recipient.clone() } else { None },
+                amount: md.amount.clone(),
+                anchor_root: None,
+                nullifier: None,
+                view_fvks: md.view_fvks.clone(),
+                view_attestations: None,
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: md.encrypted_notes.clone(),
+                decrypted_notes: None,
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
+    }
+
+    // Withdrawals
+    if type_filter.is_none() || type_filter.as_deref() == Some("withdraw") {
+        let wds = idx::midnight_withdraw::Entity::find()
+            .filter(if address_is_privacy {
+                Condition::any()
+                    .add(idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()))
+            } else {
+                Condition::any()
+                    .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
+                    .add(idx::midnight_withdraw::Column::ToAddr.eq(address.to_string()))
+            })
+            .all(db)
+            .await?;
+
+        trace!("Found {} withdraw records for wallet", wds.len());
+
+        for mw in wds {
+            let Some(ev) = idx::Entity::find_by_id(mw.event_id).one(db).await? else {
+                continue;
+            };
+
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    continue;
+                }
+            }
+
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: mw.sender.clone(),
+                recipient: mw.to_addr.clone(),
+                privacy_sender: if god_mode { mw.privacy_sender.clone() } else { None },
+                privacy_recipient: None,
+                amount: mw.amount.clone(),
+                anchor_root: mw.anchor_root.clone(),
+                nullifier: mw.nullifier.clone(),
+                view_fvks: None,
+                view_attestations: mw.view_attestations.clone(),
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: mw.encrypted_notes.clone(),
+                decrypted_notes: None,
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
+    }
+
+    // Transfers
+    if type_filter.is_none() || type_filter.as_deref() == Some("transfer") {
+        let tfs = idx::midnight_transfer::Entity::find()
+            .filter(if address_is_privacy {
+                Condition::any()
+                    .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
+                    .add(idx::midnight_transfer::Column::PrivacySender.eq(normalized_address.clone()))
+            } else {
+                Condition::any()
+                    .add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+            })
+            .all(db)
+            .await?;
+
+        trace!("Found {} transfer records for wallet", tfs.len());
+
+        for mt in tfs {
+            let Some(ev) = idx::Entity::find_by_id(mt.event_id).one(db).await? else {
+                continue;
+            };
+
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    continue;
+                }
+            }
+
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: mt.sender.clone(),
+                recipient: if god_mode { mt.recipient.clone() } else { None },
+                privacy_sender: if god_mode { mt.privacy_sender.clone() } else { None },
+                privacy_recipient: if god_mode { mt.recipient.clone() } else { None },
+                amount: if god_mode { mt.amount.clone() } else { None },
+                anchor_root: mt.anchor_root.clone(),
+                nullifier: mt.nullifier.clone(),
+                view_fvks: None,
+                view_attestations: mt.view_attestations.clone(),
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: mt.encrypted_notes.clone(),
+                decrypted_notes: if god_mode { mt.decrypted_notes.clone() } else { None },
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
+    }
+
+    // Sort by timestamp descending, then tx_hash descending
+    collected.sort_by(|a, b| {
+        b.timestamp_ms
+            .cmp(&a.timestamp_ms)
+            .then(b.tx_hash.cmp(&a.tx_hash))
+    });
+
+    // Take limit + 1 to check if there are more
+    let has_more = collected.len() > limit;
+    collected.truncate(limit);
+
+    // Build next cursor
+    let next = if has_more {
+        collected.last().map(|item| {
+            BASE64_STANDARD.encode(
+                serde_json::to_vec(&CursorInner {
+                    ts_ms: item.timestamp_ms,
+                    tx_hash: item.tx_hash.clone(),
+                })
+                .unwrap(),
+            )
+        })
+    } else {
+        None
+    };
+
+    debug!(
+        "list_wallet_transactions: returning {} items, has_more={}",
+        collected.len(),
+        has_more
+    );
+
+    Ok(ListResponse {
+        items: collected,
+        next,
+        total: None,
+    })
+}
+
+/// Build a transaction item from an event row.
+/// If god_mode is false, privacy-sensitive fields are hidden.
+async fn build_transaction_item(
+    db: &DatabaseConnection,
+    ev: &idx::Model,
+    god_mode: bool,
+) -> Result<InvolvementItem> {
+    let mut sender = None;
+    let mut recipient = None;
+    let mut privacy_sender = None;
+    let mut privacy_recipient = None;
+    let mut amount = None;
+    let mut anchor_root = None;
+    let mut nullifier = None;
+    let mut view_fvks = None;
+    let mut view_attestations = None;
+    let mut encrypted_notes = None;
+    let mut decrypted_notes = None;
+
+    match ev.kind.as_str() {
+        "deposit" => {
+            if let Some(md) = idx::midnight_deposit::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = md.sender;
+                amount = md.amount;
+                view_fvks = md.view_fvks;
+                encrypted_notes = md.encrypted_notes;
+                // Only show recipient (privacy address) in god mode
+                if god_mode {
+                    recipient = md.recipient.clone();
+                    privacy_recipient = md.recipient;
+                }
+            }
+        }
+        "withdraw" => {
+            if let Some(mw) = idx::midnight_withdraw::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = mw.sender;
+                recipient = mw.to_addr; // L2 address, always visible
+                amount = mw.amount;
+                anchor_root = mw.anchor_root;
+                nullifier = mw.nullifier;
+                view_attestations = mw.view_attestations;
+                encrypted_notes = mw.encrypted_notes;
+                // Only show privacy_sender in god mode
+                if god_mode {
+                    privacy_sender = mw.privacy_sender;
+                }
+            }
+        }
+        "transfer" => {
+            if let Some(mt) = idx::midnight_transfer::Entity::find_by_id(ev.id)
+                .one(db)
+                .await?
+            {
+                sender = mt.sender;
+                anchor_root = mt.anchor_root;
+                nullifier = mt.nullifier;
+                view_attestations = mt.view_attestations;
+                encrypted_notes = mt.encrypted_notes;
+                // Only show privacy fields, amount, and decrypted notes in god mode
+                if god_mode {
+                    amount = mt.amount;
+                    recipient = mt.recipient.clone();
+                    privacy_sender = mt.privacy_sender;
+                    privacy_recipient = mt.recipient;
+                    decrypted_notes = mt.decrypted_notes;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(InvolvementItem {
+        tx_hash: ev.tx_hash.clone(),
+        timestamp_ms: ev.created_at.timestamp_millis(),
+        kind: ev.kind.clone(),
+        sender,
+        recipient,
+        privacy_sender,
+        privacy_recipient,
+        amount,
+        anchor_root,
+        nullifier,
+        view_fvks,
+        view_attestations,
+        events: ev.events.clone(),
+        status: ev.status.clone(),
+        encrypted_notes,
+        decrypted_notes,
+        payload: serde_json::from_str(&ev.payload).ok(),
+    })
 }
 
 fn decrypted_notes_match_recipient(

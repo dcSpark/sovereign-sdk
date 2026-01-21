@@ -162,14 +162,28 @@ pub fn make_viewer_attestation(
     }
 }
 
-/// Load authority viewing key from environment variable AUTHORITY_FVK.
+/// FVK bundle returned from the FVK service (includes pool signature).
+#[derive(Debug, Clone)]
+pub struct FvkBundle {
+    pub fvk: Hash32,
+    pub fvk_commitment: Hash32,
+    pub pool_sig_hex: String,
+}
+
+/// Load authority viewing key from environment.
 ///
-/// Accepts hex strings with or without `0x` prefix.
-/// Returns `None` if:
-/// - Environment variable is not set
-/// - Hex decoding fails
-/// - Length is not exactly 32 bytes
+/// Priority:
+/// 1. If `POOL_FVK_PK` is set, fetch FVK from the FVK service (new recommended approach)
+/// 2. Fall back to `AUTHORITY_FVK` for backward compatibility (deprecated)
+///
+/// Returns `None` if neither is configured.
 pub fn load_authority_fvk() -> Option<Hash32> {
+    // First, try the new FVK service approach
+    if let Some(bundle) = load_fvk_from_service() {
+        return Some(bundle.fvk);
+    }
+
+    // Fall back to deprecated AUTHORITY_FVK
     let raw = std::env::var("AUTHORITY_FVK").ok()?;
     let s = raw.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
@@ -183,6 +197,113 @@ pub fn load_authority_fvk() -> Option<Hash32> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Some(out)
+}
+
+/// Load FVK bundle from the FVK service when POOL_FVK_PK is configured.
+///
+/// Returns `None` if POOL_FVK_PK is not set or if the service call fails.
+pub fn load_fvk_from_service() -> Option<FvkBundle> {
+    // Check if POOL_FVK_PK is set
+    let pool_fvk_pk = std::env::var("POOL_FVK_PK").ok()?;
+    let pool_fvk_pk = pool_fvk_pk.trim();
+    if pool_fvk_pk.is_empty() {
+        return None;
+    }
+
+    // Validate POOL_FVK_PK is valid hex
+    let pool_pk_bytes: [u8; 32] = {
+        let s = pool_fvk_pk.strip_prefix("0x").unwrap_or(pool_fvk_pk);
+        let bytes = hex::decode(s).ok()?;
+        bytes.try_into().ok()?
+    };
+
+    // Fetch FVK from the service
+    let base_url = std::env::var("MIDNIGHT_FVK_SERVICE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
+    let base_url = base_url.trim_end_matches('/');
+    let endpoint = format!("{}/v1/fvk", base_url);
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&endpoint)
+        .json(&serde_json::json!({}))
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        eprintln!(
+            "Warning: FVK service returned error status: {}",
+            resp.status()
+        );
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IssueFvkResponse {
+        fvk: String,
+        fvk_commitment: String,
+        signature: String,
+        signer_public_key: String,
+        #[allow(dead_code)]
+        signature_scheme: String,
+    }
+
+    let fvk_resp: IssueFvkResponse = resp.json().ok()?;
+
+    // Parse response
+    let fvk = parse_hex_32("fvk", &fvk_resp.fvk)?;
+    let fvk_commitment_resp = parse_hex_32("fvk_commitment", &fvk_resp.fvk_commitment)?;
+    let signer_pk = parse_hex_32("signer_public_key", &fvk_resp.signer_public_key)?;
+
+    // Verify the signer matches POOL_FVK_PK
+    if signer_pk != pool_pk_bytes {
+        eprintln!(
+            "Warning: FVK service signer ({}) does not match POOL_FVK_PK ({})",
+            hex::encode(signer_pk),
+            hex::encode(pool_pk_bytes)
+        );
+        return None;
+    }
+
+    // Verify the commitment matches the FVK
+    let computed_commitment = fvk_commitment(&FullViewingKey(fvk));
+    if computed_commitment != fvk_commitment_resp {
+        eprintln!("Warning: FVK commitment from service does not match computed commitment");
+        return None;
+    }
+
+    println!(
+        "FVK obtained from service: fvk_commitment=0x{}...",
+        hex::encode(&fvk_commitment_resp[..8])
+    );
+
+    Some(FvkBundle {
+        fvk,
+        fvk_commitment: fvk_commitment_resp,
+        pool_sig_hex: fvk_resp.signature,
+    })
+}
+
+fn parse_hex_32(_label: &str, value: &str) -> Option<[u8; 32]> {
+    let s = value.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+/// Load FVK bundle with pool signature (for injection into proof).
+///
+/// Returns the full bundle when POOL_FVK_PK is set and service is available.
+pub fn load_fvk_bundle() -> Option<FvkBundle> {
+    load_fvk_from_service()
 }
 
 pub fn add_args_to_host(host: &mut LigeroHost, args: &[serde_json::Value]) -> Result<()> {

@@ -86,17 +86,17 @@ pub async fn get_privacy_balance(
             }
         };
 
-    let mut offset = 0;
+    let mut cursor: Option<String> = None;
     loop {
-        tracing::debug!("Fetching transactions at offset {}", offset);
+        tracing::debug!("Fetching transactions at cursor {:?}", cursor);
 
         let tx_list = provider
-            .get_all_transactions(Some(DEFAULT_PAGE_SIZE), Some(offset))
+            .get_all_transactions(Some(DEFAULT_PAGE_SIZE), cursor.as_deref())
             .await
             .context("Failed to fetch transactions from indexer")?;
 
         if tx_list.items.is_empty() {
-            tracing::info!("Reached end of transactions at offset {}", offset);
+            tracing::info!("Reached end of transactions at cursor {:?}", cursor);
             break;
         }
 
@@ -198,11 +198,11 @@ pub async fn get_privacy_balance(
             }
         }
 
-        offset += tx_list.items.len();
-
-        if tx_list.items.len() < DEFAULT_PAGE_SIZE {
+        if tx_list.next.is_none() {
             break;
         }
+
+        cursor = tx_list.next;
     }
 
     tracing::info!(
