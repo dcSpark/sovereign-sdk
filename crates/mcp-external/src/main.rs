@@ -1,5 +1,9 @@
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -240,7 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Default::default(),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .route("/health", axum::routing::get(health_handler));
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
 
     tracing::info!(
@@ -249,6 +255,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(
         "[mcp] MCP endpoint: http://{}/mcp",
+        cfg.mcp_server_bind_address
+    );
+    tracing::info!(
+        "[mcp] Health endpoint: http://{}/health",
         cfg.mcp_server_bind_address
     );
 
@@ -260,4 +270,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     Ok(())
+}
+
+/// Health check response
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+    service: String,
+    #[serde(rename = "checkedAt")]
+    checked_at: String,
+}
+
+/// Health check endpoint handler
+async fn health_handler() -> impl IntoResponse {
+    let response = HealthResponse {
+        status: "healthy".to_string(),
+        service: "mcp-external".to_string(),
+        checked_at: chrono::Utc::now().to_rfc3339(),
+    };
+    (StatusCode::OK, Json(response))
 }
