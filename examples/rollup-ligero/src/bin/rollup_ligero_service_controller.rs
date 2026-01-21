@@ -383,7 +383,7 @@ async fn health_check(
             optional_env: None,
         },
         ServiceDefinition {
-            name: "verifier",
+            name: "worker",
             env_var: "BIND_ADDR",
             default_url: "http://127.0.0.1:8080",
             health_path: "/health",
@@ -418,9 +418,16 @@ async fn health_check(
             optional_env: None,
         },
         ServiceDefinition {
-            name: "prover",
+            name: "ligero-proving-system",
             env_var: "PROVER_BIND_ADDR",
             default_url: "http://127.0.0.1:1313",
+            health_path: "/health",
+            optional_env: None,
+        },
+        ServiceDefinition {
+            name: "metrics",
+            env_var: "METRICS_API_BIND",
+            default_url: "http://127.0.0.1:13200",
             health_path: "/health",
             optional_env: None,
         },

@@ -185,6 +185,14 @@ if [[ "$MCP_2_HOST" == "$MCP_2_PORT" ]]; then
   MCP_2_PORT="3001"
 fi
 
+METRICS_BIND="${METRICS_API_BIND:-0.0.0.0:13200}"
+METRICS_HOST="${METRICS_BIND%:*}"
+METRICS_PORT="${METRICS_BIND##*:}"
+if [[ "$METRICS_HOST" == "$METRICS_PORT" ]]; then
+  METRICS_HOST="$METRICS_BIND"
+  METRICS_PORT="13200"
+fi
+
 FVK_BIND="${MIDNIGHT_FVK_SERVICE_BIND:-}"
 if [[ -n "$FVK_BIND" ]]; then
   FVK_HOST="${FVK_BIND%:*}"
@@ -263,7 +271,11 @@ wait_for_port "mcp-2" "$MCP_2_HOST" "$MCP_2_PORT" "$LAST_PID"
 
 echo "Starting prover..."
 start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
-wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "${PIDS[4]}"
+wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "$LAST_PID"
+
+echo "Starting metrics..."
+start_service "metrics" bash "$SCRIPT_DIR/run_metrics.sh"
+wait_for_port "metrics" "$METRICS_HOST" "$METRICS_PORT" "$LAST_PID"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."

@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { HealthResponse, ActionType, ActionResult } from './types';
-import { fetchHealth, performAction } from './api';
+import type { HealthResponse, ActionType, ActionResult, MetricsData } from './types';
+import { fetchHealth, performAction, fetchMetrics } from './api';
 import './styles.css';
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [metrics, setMetrics] = useState<MetricsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<ActionType | null>(null);
@@ -23,13 +24,22 @@ function App() {
     }
   }, []);
 
+  const loadMetrics = useCallback(async () => {
+    const data = await fetchMetrics();
+    setMetrics(data);
+  }, []);
+
   useEffect(() => {
     loadHealth();
+    loadMetrics();
     if (autoRefresh) {
-      const interval = setInterval(loadHealth, 5000);
+      const interval = setInterval(() => {
+        loadHealth();
+        loadMetrics();
+      }, 5000);
       return () => clearInterval(interval);
     }
-  }, [loadHealth, autoRefresh]);
+  }, [loadHealth, loadMetrics, autoRefresh]);
 
   const handleAction = async (action: ActionType) => {
     setActionLoading(action);
@@ -58,6 +68,40 @@ function App() {
 
   const formatServiceNumber = (index: number) => {
     return String(index + 1).padStart(2, '0');
+  };
+
+  const formatNumber = (value: number | undefined | null, decimals: number = 2): string => {
+    if (value === undefined || value === null) return '-';
+    if (Math.abs(value) >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(decimals)}M`;
+    }
+    if (Math.abs(value) >= 1_000) {
+      return `${(value / 1_000).toFixed(decimals)}K`;
+    }
+    return value.toFixed(decimals);
+  };
+
+  const formatPercent = (value: number | undefined | null): string => {
+    if (value === undefined || value === null) return '-';
+    return `${value.toFixed(2)}%`;
+  };
+
+  const formatTps = (value: number | undefined | null): string => {
+    if (value === undefined || value === null) return '-';
+    return value.toFixed(3);
+  };
+
+  const formatTokenAmount = (value: number | undefined | null): string => {
+    if (value === undefined || value === null) return '-';
+    // Format as token amount (divide by 10^8 for display)
+    const tokenValue = value / 100_000_000;
+    if (Math.abs(tokenValue) >= 1_000_000) {
+      return `${(tokenValue / 1_000_000).toFixed(2)}M`;
+    }
+    if (Math.abs(tokenValue) >= 1_000) {
+      return `${(tokenValue / 1_000).toFixed(2)}K`;
+    }
+    return tokenValue.toFixed(2);
   };
 
   return (
@@ -183,6 +227,130 @@ function App() {
                   </div>
                 ))}
               </div>
+            </section>
+
+            {/* Metrics Section */}
+            <section className="metrics-section">
+              <h2>Network Metrics</h2>
+              {metrics?.error ? (
+                <div className="metrics-error">
+                  <span>Metrics unavailable: {metrics.error}</span>
+                </div>
+              ) : (
+                <div className="metrics-grid">
+                  {/* TPS Card */}
+                  <div className="metric-card highlight">
+                    <div className="metric-header">
+                      <span className="metric-icon">⚡</span>
+                      <h3>TPS</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatTps(metrics?.tps?.tps)}
+                    </div>
+                    <div className="metric-subtitle">transactions per second</div>
+                    {metrics?.tps && (
+                      <div className="metric-details">
+                        <div className="metric-detail">
+                          <span className="label">Delta</span>
+                          <span className="value">{formatNumber(metrics.tps.delta_transactions, 0)} tx</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Total Transactions Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">📊</span>
+                      <h3>Total Transactions</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatNumber(metrics?.totalTransactions?.total_transactions, 0)}
+                    </div>
+                    <div className="metric-subtitle">cumulative</div>
+                  </div>
+
+                  {/* Failed Transactions Rate Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">⚠️</span>
+                      <h3>Failed Rate</h3>
+                    </div>
+                    <div className={`metric-value-large ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
+                      {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
+                    </div>
+                    <div className="metric-subtitle">failure rate</div>
+                    {metrics?.failedTransactionsRate && (
+                      <div className="metric-details">
+                        <div className="metric-detail">
+                          <span className="label">Failed</span>
+                          <span className="value">{formatNumber(metrics.failedTransactionsRate.failed_transactions, 0)}</span>
+                        </div>
+                        <div className="metric-detail">
+                          <span className="label">Total</span>
+                          <span className="value">{formatNumber(metrics.failedTransactionsRate.total_transactions, 0)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Average Transaction Size Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">📏</span>
+                      <h3>Avg Tx Size</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}
+                    </div>
+                    <div className="metric-subtitle">tokens (24h avg)</div>
+                  </div>
+
+                  {/* Median Transaction Size Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">📐</span>
+                      <h3>Median Tx Size</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatTokenAmount(metrics?.medianTransactionSize?.median_amount)}
+                    </div>
+                    <div className="metric-subtitle">tokens (24h median)</div>
+                  </div>
+
+                  {/* Token Value Spent Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">💰</span>
+                      <h3>Value Spent</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}
+                    </div>
+                    <div className="metric-subtitle">tokens (24h)</div>
+                  </div>
+
+                  {/* Token Velocity Card */}
+                  <div className="metric-card">
+                    <div className="metric-header">
+                      <span className="metric-icon">🔄</span>
+                      <h3>Token Velocity</h3>
+                    </div>
+                    <div className="metric-value-large">
+                      {formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}
+                    </div>
+                    <div className="metric-subtitle">turnover rate (24h)</div>
+                    {metrics?.tokenVelocity && (
+                      <div className="metric-details">
+                        <div className="metric-detail">
+                          <span className="label">Supply</span>
+                          <span className="value">{formatTokenAmount(metrics.tokenVelocity.total_tokens)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </section>
           </>
         ) : (
