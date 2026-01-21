@@ -19,6 +19,7 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
+use std::collections::HashMap;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
@@ -38,7 +39,6 @@ const INCLUSION_POLL_INTERVAL_MS: u64 = 100;
 const INCLUSION_TIMEOUT_SECS: u64 = 60;
 const INCLUSION_LOG_INTERVAL_SECS: u64 = 5;
 const MERKLE_FETCH_LOG_EVERY: usize = 10;
-const NOTE_SEARCH_LOG_EVERY: usize = 10;
 
 #[derive(Debug)]
 pub struct TransferResult {
@@ -64,6 +64,14 @@ pub struct TransferResult {
     pub change_recipient: Option<[u8; 32]>,
 }
 
+/// A spendable input note (owned by the same `(spend_sk, pk_ivk_owner)`).
+#[derive(Debug, Clone)]
+pub struct TransferInputNote {
+    pub value: u128,
+    pub rho: Hash32,
+    pub sender_id: Hash32,
+}
+
 #[derive(Deserialize, Clone)]
 struct TreeState {
     root: Vec<u8>,
@@ -83,14 +91,8 @@ struct NotesResp {
     notes: Vec<NoteInfo>,
 }
 
-/// Recent roots response from the rollup API
-#[derive(Deserialize, Clone)]
-struct RootsResp {
-    recent_roots: Vec<Hash32>,
-}
-
 /// Fetch and rebuild the Merkle tree from the rollup state
-async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> {
+async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32, HashMap<Hash32, u64>)> {
     let start = StdInstant::now();
     tracing::info!("Fetching tree state for Merkle rebuild");
     let state: TreeState = provider
@@ -105,6 +107,7 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
     );
 
     let mut tree = MerkleTree::new(TREE_DEPTH);
+    let mut pos_by_cm: HashMap<Hash32, u64> = HashMap::new();
     let target_leaves = state.next_position as usize;
 
     tracing::info!(
@@ -145,6 +148,7 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
                         tree.grow_to_fit(n.position as usize + 1);
                     }
                     tree.set_leaf(n.position as usize, cm);
+                    pos_by_cm.insert(cm, n.position);
                 }
             }
 
@@ -185,126 +189,7 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
         "Finished rebuilding Merkle tree"
     );
 
-    Ok((tree, root))
-}
-
-/// Find a note in the tree by its commitment
-async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> Result<Option<u64>> {
-    let search_start = StdInstant::now();
-    let commitment_hex = hex::encode(note_commitment);
-    tracing::info!("Searching for input note commitment {}", commitment_hex);
-    let batch_size = 1000;
-    let mut offset = 0;
-    let mut batches = 0usize;
-    let mut scanned = 0usize;
-
-    loop {
-        let endpoint = format!(
-            "/modules/midnight-privacy/notes?limit={}&offset={}",
-            batch_size, offset
-        );
-        let batch_resp: NotesResp = provider
-            .query_rest_endpoint(&endpoint)
-            .await
-            .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
-
-        batches += 1;
-        let len = batch_resp.notes.len();
-        scanned += len;
-
-        for n in batch_resp.notes.iter() {
-            if n.commitment.len() == 32 {
-                let mut cm = [0u8; 32];
-                cm.copy_from_slice(&n.commitment);
-                if cm == note_commitment {
-                    tracing::info!(
-                        position = n.position,
-                        batches_scanned = batches,
-                        elapsed_ms = search_start.elapsed().as_millis(),
-                        "Found input note commitment in tree"
-                    );
-                    return Ok(Some(n.position));
-                }
-            }
-        }
-
-        if batches == 1 || batches % NOTE_SEARCH_LOG_EVERY == 0 || len < batch_size {
-            tracing::info!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                elapsed_ms = search_start.elapsed().as_millis(),
-                "Scanning notes for input commitment"
-            );
-        } else {
-            tracing::debug!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                "Scanning notes for input commitment"
-            );
-        }
-
-        if len < batch_size {
-            tracing::warn!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                elapsed_ms = search_start.elapsed().as_millis(),
-                target_commitment = commitment_hex,
-                "Finished scanning notes without finding input commitment. \
-                 Total notes in tree: {}. Enable DEBUG logging to see all commitments.",
-                scanned
-            );
-
-            // Log first few commitments at INFO level to help debug
-            if scanned > 0 && scanned <= 10 {
-                tracing::info!("Notes found in tree (showing up to 10):");
-                // Re-fetch first batch to show commitments
-                let first_batch: NotesResp = provider
-                    .query_rest_endpoint("/modules/midnight-privacy/notes?limit=10&offset=0")
-                    .await
-                    .ok()
-                    .unwrap_or_else(|| NotesResp { notes: vec![] });
-
-                for (i, n) in first_batch.notes.iter().enumerate() {
-                    if n.commitment.len() == 32 {
-                        tracing::info!(
-                            "  Note {}: position={}, commitment={}",
-                            i,
-                            n.position,
-                            hex::encode(&n.commitment)
-                        );
-                    }
-                }
-            }
-            break;
-        }
-        offset += batch_size;
-    }
-
-    Ok(None)
-}
-
-/// Get a recent valid anchor root
-async fn get_anchor_root(provider: &Provider) -> Result<Hash32> {
-    let start = StdInstant::now();
-    tracing::info!("Fetching recent anchor root");
-    let roots_state: RootsResp = provider
-        .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
-        .await
-        .context("Failed to query recent roots")?;
-
-    let anchor = roots_state
-        .recent_roots
-        .last()
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("No recent roots available"))?;
-
-    tracing::info!(
-        elapsed_ms = start.elapsed().as_millis(),
-        anchor_root = %hex::encode(anchor),
-        "Fetched anchor root"
-    );
-
-    Ok(anchor)
+    Ok((tree, root, pos_by_cm))
 }
 
 /// Poll the ledger for transaction inclusion
@@ -366,13 +251,13 @@ async fn wait_for_inclusion(provider: &Provider, tx_hash: &str) -> Result<()> {
     }
 }
 
-/// Create an unsigned transaction for shielded transfer
+/// Create an unsigned transaction for shielded transfer (multi-input, up to 4 nullifiers).
 async fn create_transfer_unsigned_tx(
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     proof_bytes: Vec<u8>,
     anchor_root: Hash32,
-    nullifier: Hash32,
+    nullifiers: Vec<Hash32>,
     view_ciphertexts: Option<Vec<EncryptedNote>>,
 ) -> Result<UnsignedTransaction<McpRuntime, McpSpec>> {
     let chain_data = provider
@@ -389,7 +274,7 @@ async fn create_transfer_unsigned_tx(
     let transfer_call = MidnightCallMessage::<McpSpec>::Transfer {
         proof: safe_proof,
         anchor_root,
-        nullifier,
+        nullifiers,
         view_ciphertexts,
         gas: None,
     };
@@ -429,23 +314,23 @@ async fn create_transfer_unsigned_tx(
     Ok(unsigned_tx)
 }
 
-/// Transfer funds within the Midnight Privacy shielded pool
+/// Transfer funds within the Midnight Privacy shielded pool (multi-input, up to 4 inputs).
 ///
-/// If `send_amount` < `note_value`, creates 2 outputs:
-///   - Output 0: `send_amount` → `output_recipient` (destination)
-///   - Output 1: `note_value - send_amount` → `change_recipient` (change back to sender)
+/// Uses `inputs` (largest-first, typically) to fund `send_amount`.
 ///
-/// If `send_amount` == `note_value`, creates 1 output (full transfer, no change).
+/// If `send_amount` < `sum(inputs)`, creates 2 outputs:
+///   - Output 0: `send_amount` → destination
+///   - Output 1: `sum(inputs) - send_amount` → change back to sender
+///
+/// If `send_amount` == `sum(inputs)`, creates 1 output (no change).
 pub async fn transfer(
     ligero: &Ligero,
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     spend_sk: Hash32,
     pk_ivk_owner: Hash32,
-    note_value: u128,
     send_amount: u128,
-    input_rho: [u8; 32],
-    input_sender_id: Hash32,
+    inputs: Vec<TransferInputNote>,
     destination_pk_spend: Hash32,
     destination_pk_ivk: Hash32,
     viewer_fvk_bundle: Option<ViewerFvkBundle>,
@@ -454,33 +339,55 @@ pub async fn transfer(
     if send_amount == 0 {
         anyhow::bail!("send_amount must be greater than 0");
     }
-    if send_amount > note_value {
-        anyhow::bail!(
-            "send_amount ({}) exceeds note value ({})",
-            send_amount,
-            note_value
-        );
+    anyhow::ensure!(!inputs.is_empty(), "at least 1 input note is required");
+    anyhow::ensure!(
+        inputs.len() <= viewer::MAX_INS,
+        "at most {} input notes are supported",
+        viewer::MAX_INS
+    );
+
+    let mut in_values_u64: Vec<u64> = Vec::with_capacity(inputs.len());
+    let mut in_rhos: Vec<Hash32> = Vec::with_capacity(inputs.len());
+    let mut in_sender_ids: Vec<Hash32> = Vec::with_capacity(inputs.len());
+    let mut sum_in_u64: u64 = 0;
+    for note in &inputs {
+        let v_u64: u64 = note
+            .value
+            .try_into()
+            .context("input note value does not fit into u64 (required by note_spend_guest v2)")?;
+        sum_in_u64 = sum_in_u64
+            .checked_add(v_u64)
+            .ok_or_else(|| anyhow::anyhow!("sum of input values overflows u64"))?;
+        in_values_u64.push(v_u64);
+        in_rhos.push(note.rho);
+        in_sender_ids.push(note.sender_id);
     }
 
-    let has_change = send_amount < note_value;
-    let change_amount = if has_change {
-        note_value - send_amount
-    } else {
-        0
-    };
-    let note_value_u64: u64 = note_value
-        .try_into()
-        .context("note_value does not fit into u64 (required by note_spend_guest v2)")?;
     let send_amount_u64: u64 = send_amount
         .try_into()
         .context("send_amount does not fit into u64 (required by note_spend_guest v2)")?;
+    if send_amount_u64 > sum_in_u64 {
+        anyhow::bail!(
+            "send_amount ({}) exceeds sum(inputs) ({})",
+            send_amount,
+            sum_in_u64
+        );
+    }
+
+    let has_change = send_amount_u64 < sum_in_u64;
+    let change_amount = if has_change {
+        (sum_in_u64 - send_amount_u64) as u128
+    } else {
+        0
+    };
     let change_amount_u64: u64 = change_amount
         .try_into()
         .context("change_amount does not fit into u64 (required by note_spend_guest v2)")?;
 
     tracing::info!(
-        "Starting transfer: note_value={}, send_amount={}, change_amount={}",
-        note_value,
+        "Starting transfer: n_in={}, sum_in={}, send_amount={}, change_amount={}",
+        inputs.len(),
+        sum_in_u64,
         send_amount,
         change_amount
     );
@@ -492,57 +399,49 @@ pub async fn transfer(
     let sender_id_out = input_recipient;
     let pk_spend_owner = pk_from_sk(&spend_sk);
 
-    // Step 1: Fetch Merkle tree and find the note
+    // Step 1: Fetch Merkle tree and build commitment -> position map.
     let tree_start = StdInstant::now();
-    let (tree, _current_root) = fetch_merkle_tree(provider).await?;
+    let (tree, anchor_root, pos_by_cm) = fetch_merkle_tree(provider).await?;
     tracing::info!(
         elapsed_ms = tree_start.elapsed().as_millis(),
+        anchor_root = %hex::encode(anchor_root),
         "Merkle tree fetch and rebuild completed"
     );
 
-    let input_cm = note_commitment(
-        &DOMAIN,
-        note_value_u64,
-        &input_rho,
-        &input_recipient,
-        &input_sender_id,
-    );
-    tracing::info!(
-        "Looking for note with commitment: {}, computed from value={}, rho={}, recipient={}, sender_id={}",
-        hex::encode(&input_cm),
-        note_value,
-        hex::encode(&input_rho),
-        hex::encode(&input_recipient),
-        hex::encode(&input_sender_id),
-    );
+    // Resolve positions + auth paths for each input.
+    let mut input_cms: Vec<Hash32> = Vec::with_capacity(inputs.len());
+    let mut positions: Vec<u64> = Vec::with_capacity(inputs.len());
+    let mut siblings_by_input: Vec<Vec<Hash32>> = Vec::with_capacity(inputs.len());
 
-    let position_start = StdInstant::now();
-    let position = find_note_position(provider, input_cm)
-        .await?
-        .ok_or_else(|| {
+    for i in 0..inputs.len() {
+        let cm_i = note_commitment(
+            &DOMAIN,
+            in_values_u64[i],
+            &in_rhos[i],
+            &input_recipient,
+            &in_sender_ids[i],
+        );
+        let pos_i = *pos_by_cm.get(&cm_i).ok_or_else(|| {
             anyhow::anyhow!(
-                "Input note not found in tree. Searched for commitment: {}. \
-                 This could mean: (1) the deposit transaction hasn't been included yet, \
-                 (2) the verifier is in defer mode and needs /midnight-privacy/flush, \
-                 (3) wrong rho/recipient values were provided, \
-                 (4) wrong value amount",
-                hex::encode(&input_cm)
+                "Input note not found in tree. Searched for commitment: {}",
+                hex::encode(cm_i)
             )
         })?;
+        let siblings_i = tree.open(pos_i as usize);
 
-    tracing::info!(
-        position,
-        elapsed_ms = position_start.elapsed().as_millis(),
-        "Found input note position"
-    );
+        input_cms.push(cm_i);
+        positions.push(pos_i);
+        siblings_by_input.push(siblings_i);
+    }
 
-    // Step 2: Get anchor root
-    let anchor_start = StdInstant::now();
-    let anchor_root = get_anchor_root(provider).await?;
-    tracing::info!(
-        elapsed_ms = anchor_start.elapsed().as_millis(),
-        anchor_root = %hex::encode(anchor_root),
-        "Anchor root ready"
+    let depth = siblings_by_input
+        .first()
+        .map(|s| s.len())
+        .unwrap_or(0);
+    anyhow::ensure!(depth > 0, "Merkle tree depth is zero");
+    anyhow::ensure!(
+        siblings_by_input.iter().all(|s| s.len() == depth),
+        "inconsistent Merkle path depth across inputs"
     );
 
     // Step 3: Generate output note parameters
@@ -570,9 +469,12 @@ pub async fn transfer(
 
     let num_outputs: u32 = if has_change { 2 } else { 1 };
 
-    // Step 4: Compute nullifier
+    // Step 4: Compute nullifiers (one per input)
     let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
-    let nf = nullifier(&DOMAIN, &nf_key, &input_rho);
+    let nullifiers: Vec<Hash32> = in_rhos
+        .iter()
+        .map(|rho| nullifier(&DOMAIN, &nf_key, rho))
+        .collect();
 
     // Step 4b: Create viewer bundles if a viewer FVK bundle is provided
     let (view_attestations, view_ciphertexts) = if let Some(ref bundle) = viewer_fvk_bundle {
@@ -583,7 +485,9 @@ pub async fn transfer(
         );
 
         let mut cm_ins: [Hash32; viewer::MAX_INS] = [[0u8; 32]; viewer::MAX_INS];
-        cm_ins[0] = input_cm;
+        for (i, cm) in input_cms.iter().enumerate().take(viewer::MAX_INS) {
+            cm_ins[i] = *cm;
+        }
         let (att_0, enc_0) = viewer::make_viewer_bundle(
             &fvk,
             &DOMAIN,
@@ -673,9 +577,6 @@ pub async fn transfer(
     // Step 5: Generate ZK proof
     tracing::info!("Generating ZK proof with {} output(s)...", num_outputs);
 
-    let siblings = tree.open(position as usize);
-    let depth = siblings.len();
-
     use ligetron::bn254fr_native::submod_checked;
     use ligetron::Bn254Fr;
 
@@ -721,20 +622,18 @@ pub async fn transfer(
         inv.to_bytes_be()
     }
 
-    let n_in: usize = 1;
+    let n_in: usize = inputs.len();
     let n_out: usize = if has_change { 2 } else { 1 };
     let withdraw_amount: u64 = 0;
     let withdraw_to: Hash32 = [0u8; 32];
 
-    let in_values = [note_value_u64];
-    let in_rhos = [input_rho];
     let mut out_values: Vec<u64> = vec![send_amount_u64];
     let mut out_rhos: Vec<Hash32> = vec![out_rho_0];
     if has_change {
         out_values.push(change_amount_u64);
         out_rhos.push(out_rho_1.expect("change rho set when has_change"));
     }
-    let inv_enforce = inv_enforce_v2(&in_values, &in_rhos, &out_values, &out_rhos);
+    let inv_enforce = inv_enforce_v2(&in_values_u64, &in_rhos, &out_values, &out_rhos);
 
     fn u64_to_i64(v: u64, label: &'static str) -> Result<i64> {
         i64::try_from(v).with_context(|| {
@@ -789,45 +688,52 @@ pub async fn transfer(
         &mut proof_args,
     ); // 6 n_in
 
-    // Input 0:
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(note_value_u64, "value_in")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&input_rho),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&input_sender_id),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // pos_i (private i64; bits derived in-circuit).
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(position, "pos")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Siblings (bottom-up).
-    for s in &siblings {
-        push(arg32(s), true, &mut private_indices, &mut proof_args);
+    // Inputs (0..n_in)
+    for i in 0..n_in {
+        // value_in_i [PRIVATE]
+        push(
+            LigeroProgramArguments::I64 {
+                i64: u64_to_i64(in_values_u64[i], "value_in")?,
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        // rho_in_i [PRIVATE]
+        push(
+            arg32(&in_rhos[i]),
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        // sender_id_in_i [PRIVATE]
+        push(
+            arg32(&in_sender_ids[i]),
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        // pos_i [PRIVATE]
+        push(
+            LigeroProgramArguments::I64 {
+                i64: u64_to_i64(positions[i], "pos")?,
+            },
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
+        // siblings_i[k] [PRIVATE]
+        for s in &siblings_by_input[i] {
+            push(arg32(s), true, &mut private_indices, &mut proof_args);
+        }
+        // nullifier_i [PUBLIC]
+        push(
+            arg32(&nullifiers[i]),
+            false,
+            &mut private_indices,
+            &mut proof_args,
+        );
     }
-
-    // Nullifier (public).
-    push(arg32(&nf), false, &mut private_indices, &mut proof_args);
 
     // Withdraw binding.
     push(
@@ -1057,7 +963,7 @@ pub async fn transfer(
     let public_output = SpendPublic {
         anchor_root,
         blacklist_root,
-        nullifier: nf,
+        nullifiers: nullifiers.clone(),
         withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
         output_commitments,
         view_attestations,
@@ -1105,7 +1011,7 @@ pub async fn transfer(
         wallet,
         proof_bytes,
         anchor_root,
-        nf,
+        nullifiers,
         view_ciphertexts,
     )
     .await?;

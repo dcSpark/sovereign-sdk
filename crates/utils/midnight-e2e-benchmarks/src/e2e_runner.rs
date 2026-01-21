@@ -1550,7 +1550,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let public = midnight_privacy::SpendPublic {
                     anchor_root: anchor,
                     blacklist_root,
-                    nullifier: nf,
+                    nullifiers: vec![nf],
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
                     view_attestations,
@@ -1823,9 +1823,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
                     let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
-                    let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                    let expected_nfs = [nf_exp];
                     if public.anchor_root != shared_anchor
-                        || public.nullifier != nf_exp
+                        || public.nullifiers.as_slice() != expected_nfs
                         || public.withdraw_amount != 0
                     {
                         eprintln!(
@@ -1833,7 +1834,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             idx,
                             account_idx,
                             public.anchor_root == shared_anchor,
-                            public.nullifier == nf_exp,
+                            public.nullifiers.as_slice() == expected_nfs,
                             public.withdraw_amount == 0
                         );
                         eprintln!(
@@ -1844,7 +1845,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         eprintln!(
                             "         proof anchor={} nullifier={} withdraw={}",
                             hex::encode(public.anchor_root),
-                            hex::encode(public.nullifier),
+                            public
+                                .nullifiers
+                                .first()
+                                .map(|n| hex::encode(n))
+                                .unwrap_or_else(|| "<empty>".to_string()),
                             public.withdraw_amount
                         );
                     }
@@ -1951,7 +1956,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
-            nullifier: nf,
+            nullifiers: vec![nf],
             view_ciphertexts,
             gas: None,
         });

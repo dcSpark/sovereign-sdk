@@ -68,8 +68,8 @@ pub enum Event<S: Spec> {
     ///
     /// **Note:** Output positions are provisional. Final positions assigned at flush.
     PoolTransfer {
-        /// The nullifier that was spent
-        nullifier: Hash32,
+        /// Nullifiers spent by this transfer (1..=4).
+        nullifiers: Vec<Hash32>,
         /// The anchor root used
         anchor_root: Hash32,
         /// Output note commitments added by this transfer

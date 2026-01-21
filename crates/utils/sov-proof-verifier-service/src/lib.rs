@@ -1328,7 +1328,8 @@ async fn verify_and_record_midnight_handler(
             state.da_conn.as_ref(),
             &state.incoming_worker_tx_saver,
             tx_hash,
-            None, // No proof outputs for no-proof calls
+            "{}".to_string(), // No proof outputs for no-proof calls
+            None,             // No view_attestations_json
             true, // signature_valid
             None, // proof_verified: NULL (transaction doesn't have a proof)
             transaction_data,
@@ -1402,26 +1403,26 @@ async fn verify_and_record_midnight_handler(
         ParsedMidnightCall::Transfer {
             proof,
             anchor_root,
-            nullifier,
+            nullifiers,
             view_ciphertexts,
-	        } => {
-	            // Transfers have proofs but zero withdraw amount; outputs contain new commitments
-	            debug!(
-	                "Parsed midnight transfer: nullifier=0x{}, anchor_root=0x{}, proof_size={} bytes",
-                hex::encode(nullifier),
+        } => {
+            // Transfers have proofs but zero withdraw amount; outputs contain new commitments
+            debug!(
+                "Parsed midnight transfer: n_nullifiers={}, anchor_root=0x{}, proof_size={} bytes",
+                nullifiers.len(),
                 hex::encode(anchor_root),
                 proof.len()
-	            );
+            );
 
-	            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
-	            let proof_start = std::time::Instant::now();
-	            // For transfers, expected withdraw_amount is 0
-	            let proof_public = verify_midnight_withdraw_proof(
-	                state.config.midnight_method_id.as_ref(),
-	                proof,
+            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
+            let proof_start = std::time::Instant::now();
+            // For transfers, expected withdraw_amount is 0
+            let proof_public = verify_midnight_withdraw_proof(
+                state.config.midnight_method_id.as_ref(),
+                proof,
                 state.config.max_concurrent_verifications,
                 anchor_root,
-                nullifier,
+                &nullifiers,
                 0u128,
                 state.pool_fvk_pk.clone(),
                 ciphertexts_meta,
@@ -1444,11 +1445,27 @@ async fn verify_and_record_midnight_handler(
                 }
             };
 
+            let proof_outputs_json = serde_json::to_string(&proof_public).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
+            })?;
+            let view_attestations_json = proof_public
+                .view_attestations
+                .as_ref()
+                .map(|atts| {
+                    serde_json::to_string(atts).map_err(|err| {
+                        ServiceError::Internal(format!(
+                            "Failed to serialize view_attestations: {err}"
+                        ))
+                    })
+                })
+                .transpose()?;
+
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &state.incoming_worker_tx_saver,
                 &tx_hash,
-                Some(&proof_public), // Proof outputs from verification
+                proof_outputs_json,
+                view_attestations_json,
                 true,                // signature_valid
                 Some(true),          // proof_verified: true
                 &transaction_data,
@@ -1459,8 +1476,8 @@ async fn verify_and_record_midnight_handler(
             .await?;
             metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
             debug!(
-                "✓ Stored verified midnight transfer: nullifier=0x{}, anchor_root=0x{}, hash={}, encrypted_notes={}",
-                hex::encode(nullifier),
+                "✓ Stored verified midnight transfer: n_nullifiers={}, anchor_root=0x{}, hash={}, encrypted_notes={}",
+                nullifiers.len(),
                 hex::encode(anchor_root),
                 tx_hash,
                 view_ciphertexts.as_ref().map(|v| v.len()).unwrap_or(0)
@@ -1523,7 +1540,7 @@ async fn verify_and_record_midnight_handler(
                 proof,
                 state.config.max_concurrent_verifications,
                 anchor_root,
-                nullifier,
+                std::slice::from_ref(&nullifier),
                 withdraw_amount,
                 state.pool_fvk_pk.clone(),
                 ciphertexts_meta,
@@ -1545,11 +1562,26 @@ async fn verify_and_record_midnight_handler(
                     None
                 }
             };
+            let proof_outputs_json = serde_json::to_string(&proof_public).map_err(|err| {
+                ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
+            })?;
+            let view_attestations_json = proof_public
+                .view_attestations
+                .as_ref()
+                .map(|atts| {
+                    serde_json::to_string(atts).map_err(|err| {
+                        ServiceError::Internal(format!(
+                            "Failed to serialize view_attestations: {err}"
+                        ))
+                    })
+                })
+                .transpose()?;
             store_verified_midnight_transaction(
                 state.da_conn.as_ref(),
                 &state.incoming_worker_tx_saver,
                 &tx_hash,
-                Some(&proof_public), // Proof outputs from verification
+                proof_outputs_json,
+                view_attestations_json,
                 true,                // signature_valid
                 Some(true),          // proof_verified: true (has proof and verified correctly)
                 &transaction_data,
@@ -1999,7 +2031,7 @@ enum ParsedMidnightCall {
     Transfer {
         proof: Vec<u8>,
         anchor_root: MidnightHash32,
-        nullifier: MidnightHash32,
+        nullifiers: Vec<MidnightHash32>,
         view_ciphertexts: Option<Vec<EncryptedNote>>,
     },
     Withdraw {
@@ -2047,13 +2079,13 @@ fn parse_midnight_call(
             MidnightCallMessage::Transfer {
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 view_ciphertexts,
                 ..
             } => Ok(ParsedMidnightCall::Transfer {
                 proof: proof.into(),
                 anchor_root,
-                nullifier,
+                nullifiers,
                 view_ciphertexts,
             }),
             MidnightCallMessage::Withdraw {
@@ -2161,7 +2193,7 @@ pub async fn verify_midnight_withdraw_proof(
     proof: Vec<u8>,
     workers: usize,
     expected_anchor_root: MidnightHash32,
-    expected_nullifier: MidnightHash32,
+    expected_nullifiers: &[MidnightHash32],
     expected_withdraw_amount: u128,
     pool_fvk_pk: Option<Ed25519VerifyingKey>,
     view_ciphertexts_meta: Option<ViewCiphertextsMeta>,
@@ -2266,11 +2298,18 @@ pub async fn verify_midnight_withdraw_proof(
             hex::encode(public.anchor_root)
         )));
     }
-    if public.nullifier != expected_nullifier {
+    if public.nullifiers.as_slice() != expected_nullifiers {
         return Err(ServiceError::ProofError(format!(
-            "Nullifier mismatch: expected 0x{}, proof 0x{}",
-            hex::encode(expected_nullifier),
-            hex::encode(public.nullifier)
+            "Nullifiers mismatch: expected {:?}, proof {:?}",
+            expected_nullifiers
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n)))
+                .collect::<Vec<_>>(),
+            public
+                .nullifiers
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n)))
+                .collect::<Vec<_>>(),
         )));
     }
     if public.withdraw_amount != expected_withdraw_amount {
@@ -2386,16 +2425,18 @@ pub fn create_transaction_without_proof(tx: &DemoTransaction) -> Result<String, 
                 }
                 MidnightCallMessage::Transfer {
                     anchor_root,
-                    nullifier,
+                    nullifiers,
                     view_ciphertexts,
                     gas,
                     ..
                 } => {
+                    let nullifiers: Vec<String> =
+                        nullifiers.iter().map(|n| hex::encode(n)).collect();
                     serde_json::json!({
                         "transfer": {
                             "proof": "REMOVED",
                             "anchor_root": hex::encode(anchor_root),
-                            "nullifier": hex::encode(nullifier),
+                            "nullifiers": nullifiers,
                             "view_ciphertexts": view_ciphertexts,
                             "gas": gas
                         }
@@ -2594,7 +2635,7 @@ fn extract_pre_authenticated_data(
                             CallMessage::Transfer {
                                 proof: _,
                                 anchor_root,
-                                nullifier,
+                                nullifiers,
                                 view_ciphertexts,
                                 gas,
                             } => {
@@ -2602,7 +2643,7 @@ fn extract_pre_authenticated_data(
                                 RuntimeCall::MidnightPrivacy(CallMessage::Transfer {
                                     proof: SafeVec::new(), // EMPTY! Saves ~3MB transfer
                                     anchor_root: *anchor_root,
-                                    nullifier: *nullifier,
+                                    nullifiers: nullifiers.clone(),
                                     view_ciphertexts: view_ciphertexts.clone(),
                                     gas: gas.clone(),
                                 })
@@ -2666,7 +2707,8 @@ pub async fn store_verified_midnight_transaction(
     conn: &DatabaseConnection,
     incoming_worker_tx_saver: &IncomingWorkerTxSaver,
     tx_hash: &str,
-    proof_output: Option<&SpendPublic>,
+    proof_outputs_json: String,
+    view_attestations_json: Option<String>,
     signature_valid: bool,
     proof_verified: Option<bool>,
     transaction_data: &str,
@@ -2694,24 +2736,7 @@ pub async fn store_verified_midnight_transaction(
         }
     };
 
-    // Serialize proof outputs to JSON (empty object if no proof)
-    let proof_outputs_json = if let Some(proof) = proof_output {
-        serde_json::to_string(proof).map_err(|err| {
-            ServiceError::Internal(format!("Failed to serialize proof outputs: {err}"))
-        })?
-    } else {
-        "{}".to_string()
-    };
-
     // Extract optional viewing data
-    let view_attestations_json = proof_output
-        .and_then(|p| p.view_attestations.as_ref())
-        .map(|atts| {
-            serde_json::to_string(atts).map_err(|err| {
-                ServiceError::Internal(format!("Failed to serialize view_attestations: {err}"))
-            })
-        })
-        .transpose()?;
     let view_fvks_json =
         (|| -> Option<Result<String, ServiceError>> {
             let v: serde_json::Value = serde_json::from_str(transaction_data).ok()?;

@@ -762,10 +762,10 @@ impl CryptoServer {
         }
     }
 
-    /// Send funds from the privacy pool using the first available unspent note.
+    /// Send funds from the privacy pool using up to 4 unspent notes (largest-first).
     #[tool(
         name = "send",
-        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and submits a privacy transfer."
+        description = "Send funds from the privacy pool to a destination privacy address. Selects up to 4 unspent notes (largest-first) and submits a privacy transfer."
     )]
     async fn send_funds(
         &self,
@@ -827,7 +827,7 @@ impl CryptoServer {
 
         let ctx_guard = wallet_ctx.read().await;
 
-        let privacy_result = crate::operations::get_privacy_balance(
+        let notes = crate::operations::get_privacy_notes(
             provider,
             &*privacy_key_guard,
             Some(&viewing_key),
@@ -837,121 +837,84 @@ impl CryptoServer {
             ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
         })?;
 
-        if privacy_result.unspent_notes.is_empty() {
+        if notes.is_empty() {
             return Err(ErrorData::invalid_params(
                 "No unspent notes available to send.".to_string(),
                 None,
             ));
         }
 
-        // Smart note selection: choose the best note based on the amount
-        // Strategy:
-        // 1. Look for exact match (no change needed)
-        // 2. If no exact match, find smallest note >= send_amount (minimize change)
-        // 3. If no note is large enough, fail with insufficient funds error
-        let note = {
-            let mut exact_match = None;
-            let mut smallest_sufficient = None;
-            let mut smallest_sufficient_value = u128::MAX;
+        let selected = crate::operations::select_largest_notes_covering_amount(
+            notes,
+            send_amount,
+            crate::viewer::MAX_INS,
+        )
+        .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
 
-            for n in &privacy_result.unspent_notes {
-                if n.value == send_amount {
-                    // Perfect match found
-                    exact_match = Some(n);
-                    break;
-                } else if n.value > send_amount && n.value < smallest_sufficient_value {
-                    // Track smallest note that's larger than needed
-                    smallest_sufficient = Some(n);
-                    smallest_sufficient_value = n.value;
-                }
-            }
-
-            match exact_match.or(smallest_sufficient) {
-                Some(n) => n,
-                None => {
-                    let total_balance: u128 =
-                        privacy_result.unspent_notes.iter().map(|n| n.value).sum();
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
-                            send_amount,
-                            total_balance,
-                            privacy_result.unspent_notes.len()
-                        ),
-                        None,
-                    ));
-                }
-            }
-        };
-
+        let total_in: u128 = selected.iter().map(|n| n.value).sum();
         tracing::info!(
-            "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
-            note.value,
-            note.tx_hash,
-            if note.value == send_amount {
-                "exact match"
-            } else {
-                "smallest sufficient"
-            }
+            "[send] Selected {} input notes (total_in={}, send_amount={})",
+            selected.len(),
+            total_in,
+            send_amount
         );
 
-        let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
-            Ok(bytes) if bytes.len() == 32 => bytes,
-            Ok(bytes) => {
+        let mut inputs: Vec<crate::operations::TransferInputNote> = Vec::with_capacity(selected.len());
+        for (idx, n) in selected.iter().enumerate() {
+            let rho_bytes = hex::decode(n.rho.trim_start_matches("0x")).map_err(|e| {
+                ErrorData::internal_error(format!("Failed to decode rho for input {}: {}", idx, e), None)
+            })?;
+            if rho_bytes.len() != 32 {
                 return Err(ErrorData::internal_error(
-                    format!("Invalid rho length ({} bytes)", bytes.len()),
+                    format!("Invalid rho length for input {} ({} bytes)", idx, rho_bytes.len()),
                     None,
                 ));
             }
-            Err(e) => {
-                return Err(ErrorData::internal_error(
-                    format!("Failed to decode rho: {}", e),
-                    None,
-                ));
-            }
-        };
-
-        let mut input_rho = [0u8; 32];
-        input_rho.copy_from_slice(&rho_bytes);
-        let input_recipient = privacy_key_guard.recipient(&DOMAIN);
-        let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
-            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|e| {
+            let sender_id_bytes = hex::decode(n.sender_id.trim_start_matches("0x")).map_err(|e| {
                 ErrorData::internal_error(
-                    format!("Invalid sender_id in note (hex decode failed): {}", e),
+                    format!("Failed to decode sender_id for input {}: {}", idx, e),
                     None,
                 )
             })?;
-            if bytes.len() != 32 {
+            if sender_id_bytes.len() != 32 {
                 return Err(ErrorData::internal_error(
                     format!(
-                        "Invalid sender_id length in note (expected 32 bytes, got {})",
-                        bytes.len()
+                        "Invalid sender_id length for input {} (expected 32 bytes, got {})",
+                        idx,
+                        sender_id_bytes.len()
                     ),
                     None,
                 ));
             }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            out
-        } else {
-            // Deposit-style note: sender_id is derived deterministically as recipient.
-            input_recipient
-        };
+            let mut rho = [0u8; 32];
+            rho.copy_from_slice(&rho_bytes);
+            let mut sender_id = [0u8; 32];
+            sender_id.copy_from_slice(&sender_id_bytes);
+
+            tracing::info!(
+                "[send] Input[{}] value={} rho={} sender_id={} created_tx={}",
+                idx,
+                n.value,
+                &n.rho,
+                &n.sender_id,
+                n.tx_hash
+            );
+
+            inputs.push(crate::operations::TransferInputNote {
+                value: n.value,
+                rho,
+                sender_id,
+            });
+        }
         let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
-        tracing::info!(
-            "[send] Input note - value: {}, rho: {}, recipient: {}",
-            note.value,
-            hex::encode(&input_rho),
-            hex::encode(&input_recipient)
-        );
         tracing::info!(
             "[send] Output recipient (destination): {}",
             hex::encode(&output_recipient)
         );
 
-        if send_amount < note.value {
-            let change_amt = note.value - send_amount;
+        if total_in > send_amount {
+            let change_amt = total_in - send_amount;
             tracing::info!(
                 "[send] Transfer includes change output - amount: {}",
                 change_amt
@@ -979,10 +942,8 @@ impl CryptoServer {
             &*ctx_guard,
             spend_sk,
             pk_ivk_owner,
-            note.value,
             send_amount,
-            input_rho,
-            input_sender_id,
+            inputs,
             output_pk,
             output_pk_ivk,
             viewer_fvk_bundle_for_transfer,

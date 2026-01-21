@@ -2,8 +2,7 @@
 //!
 //! This module provides functionality for retrieving the current status and details of a specific transaction.
 
-use crate::provider::{InvolvementItem, Provider};
-use anyhow::{anyhow, Context, Result};
+use crate::provider::InvolvementItem;
 
 /// Transaction status and details from the indexer
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

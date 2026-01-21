@@ -199,30 +199,60 @@ async fn index_spent_inputs(
     tx_hash: &str,
     spent_at: chrono::DateTime<chrono::Utc>,
     kind: &str,
-    spent_nullifier: Option<&str>,
+    spent_nullifiers: Option<&[String]>,
     decrypted: &[viewer::DecryptedNote],
 ) -> Result<()> {
-    // Collect unique, non-zero input commitments from any decrypted output.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Map each input commitment -> the corresponding spent nullifier (by input index).
+    //
+    // The v2 plaintext includes cm_ins[4] padded with zeros; we align by index with the
+    // transaction's public `nullifiers` list.
+    let mut cm_to_nf: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     for note in decrypted {
         let Some(cm_ins) = note.cm_ins.as_ref() else {
             continue;
         };
-        for cm_in in cm_ins {
+        for (idx, cm_in) in cm_ins.iter().enumerate() {
             if is_zero_hash32(cm_in) {
                 continue;
             }
-            seen.insert(cm_in.clone());
+            let nf = spent_nullifiers
+                .and_then(|nfs| nfs.get(idx))
+                .map(|s| s.clone());
+
+            match cm_to_nf.entry(cm_in.clone()) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(nf);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let existing = e.get().as_deref();
+                    let incoming = nf.as_deref();
+                    if existing.is_some() && incoming.is_some() && existing != incoming {
+                        tracing::warn!(
+                            tx_hash,
+                            kind,
+                            cm_in,
+                            existing = existing.unwrap(),
+                            incoming = incoming.unwrap(),
+                            "Conflicting nullifier mapping for cm_in; keeping existing"
+                        );
+                        continue;
+                    }
+                    if existing.is_none() && incoming.is_some() {
+                        e.insert(nf);
+                    }
+                }
+            }
         }
     }
 
-    for cm_in in seen {
+    for (cm_in, nf) in cm_to_nf {
         db::upsert_note_spent(
             idx_db,
             &cm_in,
             Some(tx_hash),
             Some(spent_at),
-            spent_nullifier,
+            nf.as_deref(),
             Some(kind),
         )
         .await?;
@@ -250,8 +280,9 @@ pub async fn backfill_index(
     let mut cur = last;
     for row in rows.iter() {
         cur = row.id;
-        let (kind, amount, anchor_root, nullifier) = parse_kind_amount_roots(&row.transaction_data)
+        let (kind, amount, anchor_root, nullifiers) = parse_kind_amount_roots(&row.transaction_data)
             .unwrap_or(("other".to_string(), None, None, None));
+        let first_nullifier = nullifiers.as_ref().and_then(|v| v.first().cloned());
         let payload = row.transaction_data.clone();
         if kind == "deposit" {
             let sender = row.sender.clone();
@@ -424,10 +455,22 @@ pub async fn backfill_index(
                     &row.tx_hash,
                     row.created_at,
                     &kind,
-                    nullifier.as_deref(),
+                    nullifiers.as_deref(),
                     &decrypted_vec,
                 )
                 .await?;
+                if let Some(nfs) = nullifiers.as_ref() {
+                    for nf in nfs {
+                        db::upsert_spent_nullifier(
+                            idx,
+                            nf,
+                            &row.tx_hash,
+                            row.created_at,
+                            &kind,
+                        )
+                        .await?;
+                    }
+                }
                 let privacy_sender =
                     extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
@@ -435,7 +478,7 @@ pub async fn backfill_index(
                     event_id,
                     amount.clone(),
                     anchor_root.clone(),
-                    nullifier.clone(),
+                    first_nullifier.clone(),
                     Some(recipient.clone()),
                     Some(row.sender.clone()),
                     privacy_sender,
@@ -503,10 +546,16 @@ pub async fn backfill_index(
                 &row.tx_hash,
                 row.created_at,
                 &kind,
-                nullifier.as_deref(),
+                nullifiers.as_deref(),
                 &decrypted_vec,
             )
             .await?;
+            if let Some(nfs) = nullifiers.as_ref() {
+                for nf in nfs {
+                    db::upsert_spent_nullifier(idx, nf, &row.tx_hash, row.created_at, &kind)
+                        .await?;
+                }
+            }
             // Extract privacy fields from decrypted notes (as bech32m addresses)
             let recipient = extract_recipient_from_decrypted_notes(decrypted_notes.as_ref());
             let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
@@ -516,7 +565,7 @@ pub async fn backfill_index(
                 event_id,
                 amount,
                 anchor_root.clone(),
-                nullifier.clone(),
+                first_nullifier.clone(),
                 Some(row.sender.clone()),
                 privacy_sender,
                 recipient,
@@ -589,6 +638,54 @@ pub async fn backfill_notes_nullifiers(
     }
 
     Ok(())
+}
+
+/// Backfill the flattened spent-nullifier set from already-indexed `events` rows.
+///
+/// This is required for correctness when upgrading from single-nullifier transfers to
+/// multi-input transfers (up to 4 nullifiers), because the legacy `midnight_transfer.nullifier`
+/// column can only store one.
+pub async fn backfill_spent_nullifiers(idx_db: &DatabaseConnection) -> Result<usize> {
+    const META_KEY: &str = "spent_nullifiers_last_event_id_v1";
+    let mut updated = 0usize;
+    let mut last_id = db::get_index_meta(idx_db, META_KEY)
+        .await?
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+
+    loop {
+        let rows = idx::Entity::find()
+            .filter(idx::Column::Id.gt(last_id))
+            .filter(
+                Condition::any()
+                    .add(idx::Column::Kind.eq("transfer"))
+                    .add(idx::Column::Kind.eq("withdraw")),
+            )
+            .order_by_asc(idx::Column::Id)
+            .limit(500)
+            .all(idx_db)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for ev in rows {
+            last_id = ev.id;
+            let nullifiers = parse_kind_amount_roots(&ev.payload)
+                .ok()
+                .and_then(|(_, _, _, nfs)| nfs)
+                .unwrap_or_default();
+            for nf in &nullifiers {
+                db::upsert_spent_nullifier(idx_db, nf, &ev.tx_hash, ev.created_at, &ev.kind)
+                    .await?;
+            }
+            db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 async fn backfill_notes_nullifiers_deposits(
@@ -705,7 +802,8 @@ async fn backfill_notes_nullifiers_transfers(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
-    const META_KEY: &str = "notes_nullifiers_transfer_last_event_id";
+    // v2: use tx payload `nullifiers[]` and align with decrypted `cm_ins[]` to fill `spent_nullifier`.
+    const META_KEY: &str = "notes_nullifiers_transfer_last_event_id_v2";
     let mut updated = 0usize;
     let mut last_id = db::get_index_meta(idx_db, META_KEY)
         .await?
@@ -732,14 +830,17 @@ async fn backfill_notes_nullifiers_transfers(
             .await?;
         let mut event_map = std::collections::HashMap::new();
         for ev in events {
-            event_map.insert(ev.id, (ev.tx_hash, ev.created_at));
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload));
         }
 
         for row in rows {
             last_id = row.event_id;
-            let Some((tx_hash, created_at)) = event_map.get(&row.event_id) else {
+            let Some((tx_hash, created_at, payload)) = event_map.get(&row.event_id) else {
                 continue;
             };
+            let nullifiers = parse_kind_amount_roots(payload)
+                .ok()
+                .and_then(|(_, _, _, nfs)| nfs);
 
             index_output_note_metadata(
                 idx_db,
@@ -765,10 +866,16 @@ async fn backfill_notes_nullifiers_transfers(
                 tx_hash,
                 *created_at,
                 "transfer",
-                row.nullifier.as_deref(),
+                nullifiers.as_deref(),
                 &decrypted_vec,
             )
             .await?;
+            if let Some(nfs) = nullifiers.as_ref() {
+                for nf in nfs {
+                    db::upsert_spent_nullifier(idx_db, nf, tx_hash, *created_at, "transfer")
+                        .await?;
+                }
+            }
 
             db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
             updated += 1;
@@ -783,7 +890,8 @@ async fn backfill_notes_nullifiers_withdraws(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
-    const META_KEY: &str = "notes_nullifiers_withdraw_last_event_id";
+    // v2: use tx payload `nullifiers[]` (or `nullifier`) and align with decrypted `cm_ins[]`.
+    const META_KEY: &str = "notes_nullifiers_withdraw_last_event_id_v2";
     let mut updated = 0usize;
     let mut last_id = db::get_index_meta(idx_db, META_KEY)
         .await?
@@ -810,14 +918,17 @@ async fn backfill_notes_nullifiers_withdraws(
             .await?;
         let mut event_map = std::collections::HashMap::new();
         for ev in events {
-            event_map.insert(ev.id, (ev.tx_hash, ev.created_at));
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload));
         }
 
         for row in rows {
             last_id = row.event_id;
-            let Some((tx_hash, created_at)) = event_map.get(&row.event_id) else {
+            let Some((tx_hash, created_at, payload)) = event_map.get(&row.event_id) else {
                 continue;
             };
+            let nullifiers = parse_kind_amount_roots(payload)
+                .ok()
+                .and_then(|(_, _, _, nfs)| nfs);
 
             index_output_note_metadata(
                 idx_db,
@@ -843,10 +954,16 @@ async fn backfill_notes_nullifiers_withdraws(
                 tx_hash,
                 *created_at,
                 "withdraw",
-                row.nullifier.as_deref(),
+                nullifiers.as_deref(),
                 &decrypted_vec,
             )
             .await?;
+            if let Some(nfs) = nullifiers.as_ref() {
+                for nf in nfs {
+                    db::upsert_spent_nullifier(idx_db, nf, tx_hash, *created_at, "withdraw")
+                        .await?;
+                }
+            }
 
             db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
             updated += 1;
@@ -1063,7 +1180,7 @@ async fn backfill_withdraws(
 
 pub fn parse_kind_amount_roots(
     tx_json: &str,
-) -> Result<(String, Option<String>, Option<String>, Option<String>)> {
+) -> Result<(String, Option<String>, Option<String>, Option<Vec<String>>)> {
     let v: serde_json::Value = serde_json::from_str(tx_json)?;
     if let Some(obj) = v.get("deposit").and_then(|x| x.as_object()) {
         let amount = obj.get("amount").and_then(|x| match x {
@@ -1083,22 +1200,40 @@ pub fn parse_kind_amount_roots(
             .get("anchor_root")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string());
-        let nullifier = obj
-            .get("nullifier")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
-        return Ok(("withdraw".to_string(), amount, anchor_root, nullifier));
+        let nullifiers = obj
+            .get("nullifiers")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                obj.get("nullifier")
+                    .and_then(|x| x.as_str())
+                    .map(|s| vec![s.to_string()])
+            });
+        return Ok(("withdraw".to_string(), amount, anchor_root, nullifiers));
     }
     if let Some(obj) = v.get("transfer").and_then(|x| x.as_object()) {
         let anchor_root = obj
             .get("anchor_root")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string());
-        let nullifier = obj
-            .get("nullifier")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
-        return Ok(("transfer".to_string(), None, anchor_root, nullifier));
+        let nullifiers = obj
+            .get("nullifiers")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                obj.get("nullifier")
+                    .and_then(|x| x.as_str())
+                    .map(|s| vec![s.to_string()])
+            });
+        return Ok(("transfer".to_string(), None, anchor_root, nullifiers));
     }
     Ok(("other".to_string(), None, None, None))
 }

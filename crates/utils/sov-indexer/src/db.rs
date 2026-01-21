@@ -3,7 +3,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Index, IndexCreateStatement, OnConflict};
 use sea_orm::{
     Condition, DatabaseBackend, DatabaseConnection, JsonValue, QueryOrder, QuerySelect, Schema,
     Set, Statement,
@@ -46,6 +46,15 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
+
+    // Flattened nullifier set (for multi-input transfers).
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::midnight_spent_nullifiers::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
     let stmt = builder.build(
         &schema
             .create_table_from_entity(idx::index_meta::Entity)
@@ -70,6 +79,110 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
+
+    // === Indexes ===
+    //
+    // These are additive (no migrations). We create them with IF NOT EXISTS so existing DBs
+    // can pick them up on restart.
+
+    // Cursor pagination: ORDER BY created_at DESC, tie-breaker tx_hash.
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_events_created_at_tx_hash")
+        .table(idx::Entity)
+        .col(idx::Column::CreatedAt)
+        .col(idx::Column::TxHash)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    // Optional type filter + cursor pagination.
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_events_kind_created_at_tx_hash")
+        .table(idx::Entity)
+        .col(idx::Column::Kind)
+        .col(idx::Column::CreatedAt)
+        .col(idx::Column::TxHash)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    // Wallet filters (privacy side).
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_deposit_recipient")
+        .table(idx::midnight_deposit::Entity)
+        .col(idx::midnight_deposit::Column::Recipient)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_deposit_sender")
+        .table(idx::midnight_deposit::Entity)
+        .col(idx::midnight_deposit::Column::Sender)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_transfer_recipient")
+        .table(idx::midnight_transfer::Entity)
+        .col(idx::midnight_transfer::Column::Recipient)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_transfer_privacy_sender")
+        .table(idx::midnight_transfer::Entity)
+        .col(idx::midnight_transfer::Column::PrivacySender)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_transfer_sender")
+        .table(idx::midnight_transfer::Entity)
+        .col(idx::midnight_transfer::Column::Sender)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_withdraw_privacy_sender")
+        .table(idx::midnight_withdraw::Entity)
+        .col(idx::midnight_withdraw::Column::PrivacySender)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_withdraw_sender")
+        .table(idx::midnight_withdraw::Entity)
+        .col(idx::midnight_withdraw::Column::Sender)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_withdraw_to_addr")
+        .table(idx::midnight_withdraw::Entity)
+        .col(idx::midnight_withdraw::Column::ToAddr)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    // UTXO-style note tracking: common query is recipient + unspent.
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_notes_nullifiers_recipient")
+        .table(idx::notes_nullifiers::Entity)
+        .col(idx::notes_nullifiers::Column::Recipient)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_notes_nullifiers_recipient_spent_tx_hash")
+        .table(idx::notes_nullifiers::Entity)
+        .col(idx::notes_nullifiers::Column::Recipient)
+        .col(idx::notes_nullifiers::Column::SpentTxHash)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
     Ok(())
 }
 
@@ -546,6 +659,34 @@ pub async fn upsert_note_spent(
     .exec(idx_db)
     .await?;
 
+    Ok(())
+}
+
+pub async fn upsert_spent_nullifier(
+    idx_db: &DatabaseConnection,
+    nullifier: &str,
+    spent_tx_hash: &str,
+    spent_at: DateTime<Utc>,
+    spent_kind: &str,
+) -> Result<()> {
+    let nullifier = normalize_hash32_hex(nullifier)?;
+    idx::midnight_spent_nullifiers::Entity::insert(idx::midnight_spent_nullifiers::ActiveModel {
+        nullifier: Set(nullifier),
+        spent_tx_hash: Set(spent_tx_hash.to_string()),
+        spent_at: Set(spent_at),
+        spent_kind: Set(spent_kind.to_string()),
+    })
+    .on_conflict(
+        OnConflict::column(idx::midnight_spent_nullifiers::Column::Nullifier)
+            .update_columns([
+                idx::midnight_spent_nullifiers::Column::SpentTxHash,
+                idx::midnight_spent_nullifiers::Column::SpentAt,
+                idx::midnight_spent_nullifiers::Column::SpentKind,
+            ])
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
     Ok(())
 }
 

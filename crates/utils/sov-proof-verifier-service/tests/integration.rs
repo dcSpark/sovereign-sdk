@@ -182,17 +182,19 @@ async fn test_store_verified_midnight_transaction_upsert() {
     let mut proof_public = SpendPublic {
         anchor_root: [1u8; 32],
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: [2u8; 32],
+        nullifiers: vec![[2u8; 32]],
         withdraw_amount: 55,
         output_commitments: vec![],
         view_attestations: None,
     };
     let saver = IncomingWorkerTxSaver::disabled();
+    let proof_outputs_json = serde_json::to_string(&proof_public).unwrap();
     store_verified_midnight_transaction(
         &conn,
         &saver,
         &tx_hash,
-        Some(&proof_public),
+        proof_outputs_json,
+        None,
         true,
         Some(true),
         &tx_json,
@@ -204,11 +206,13 @@ async fn test_store_verified_midnight_transaction_upsert() {
     .unwrap();
 
     proof_public.withdraw_amount = 99;
+    let proof_outputs_json = serde_json::to_string(&proof_public).unwrap();
     store_verified_midnight_transaction(
         &conn,
         &saver,
         &tx_hash,
-        Some(&proof_public),
+        proof_outputs_json,
+        None,
         true,
         Some(true),
         &tx_json,
@@ -233,7 +237,7 @@ async fn test_store_verified_midnight_transaction_upsert() {
     let proof_outputs: SpendPublic = serde_json::from_str(&record.proof_outputs).unwrap();
     assert_eq!(proof_outputs.withdraw_amount, proof_public.withdraw_amount);
     assert_eq!(proof_outputs.anchor_root, proof_public.anchor_root);
-    assert_eq!(proof_outputs.nullifier, proof_public.nullifier);
+    assert_eq!(proof_outputs.nullifiers, proof_public.nullifiers);
     assert_eq!(record.transaction_data, tx_json);
 }
 
@@ -255,7 +259,8 @@ async fn test_store_deposit_transaction_without_proof() {
         &conn,
         &saver,
         &tx_hash,
-        None, // No proof outputs for deposits
+        "{}".to_string(), // No proof outputs for deposits
+        None,             // No view_attestations_json
         true, // signature_valid
         None, // proof_verified: NULL (transaction doesn't have a proof)
         &transaction_data,
@@ -298,8 +303,10 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
         proof,
         1,
         anchor_root,
-        nullifier,
+        std::slice::from_ref(&nullifier),
         withdraw_amount,
+        None,
+        None,
         None,
         None,
     )
@@ -427,7 +434,7 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let simulated_proof_output = SpendPublic {
         anchor_root,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier,
+        nullifiers: vec![nullifier],
         withdraw_amount,
         output_commitments: vec![],
         view_attestations: None,
@@ -439,11 +446,13 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let transaction_data =
         create_transaction_without_proof(&tx).expect("Should create transaction data");
 
+    let proof_outputs_json = serde_json::to_string(&simulated_proof_output).unwrap();
     store_verified_midnight_transaction(
         &conn,
         &saver,
         &tx_hash,
-        Some(&simulated_proof_output),
+        proof_outputs_json,
+        None,
         true,       // signature_valid
         Some(true), // proof_verified (has proof and verified)
         &transaction_data,
@@ -482,7 +491,8 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
         "Stored anchor root should match"
     );
     assert_eq!(
-        stored_proof_output.nullifier, nullifier,
+        stored_proof_output.nullifiers,
+        vec![nullifier],
         "Stored nullifier should match"
     );
     assert_eq!(
@@ -514,11 +524,13 @@ async fn test_end_to_end_midnight_withdrawal_flow() {
     let mut updated_proof_output = simulated_proof_output.clone();
     updated_proof_output.withdraw_amount = 999; // Change amount
 
+    let proof_outputs_json = serde_json::to_string(&updated_proof_output).unwrap();
     store_verified_midnight_transaction(
         &conn,
         &saver,
         &tx_hash,
-        Some(&updated_proof_output),
+        proof_outputs_json,
+        None,
         true,
         Some(true),
         &transaction_data,

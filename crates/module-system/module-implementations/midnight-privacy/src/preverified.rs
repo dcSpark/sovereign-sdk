@@ -52,12 +52,14 @@ pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
     match fetch_proof_outputs(tx_hash) {
         Ok(Some(public)) => {
             let mut guard = map().lock().unwrap();
-            guard.insert(public.nullifier, public.clone());
+            for nf in &public.nullifiers {
+                guard.insert(*nf, public.clone());
+            }
             primed_hashes().lock().unwrap().insert(*tx_hash);
             tracing::debug!(
                 target: "midnight_privacy::preverified",
-                "[PRE-VERIFIED] hydrated proof outputs from DB for tx_hash={tx_hash} (nullifier={:?})",
-                public.nullifier
+                "[PRE-VERIFIED] hydrated proof outputs from DB for tx_hash={tx_hash} (n_nullifiers={})",
+                public.nullifiers.len(),
             );
         }
         Ok(None) => {
@@ -79,11 +81,13 @@ pub fn prime_pre_verified_spend(tx_hash: &TxHash) {
 /// This remains for compatibility with existing call sites that already have the public outputs.
 pub fn cache_pre_verified_spend(public: SpendPublic) {
     let mut guard = map().lock().unwrap();
-    guard.insert(public.nullifier, public.clone());
+    for nf in &public.nullifiers {
+        guard.insert(*nf, public.clone());
+    }
     tracing::debug!(
         target: "midnight_privacy::preverified",
-        "[PRE-VERIFIED] cached pre-verified spend for nullifier={:?}, map_len={}",
-        public.nullifier,
+        "[PRE-VERIFIED] cached pre-verified spend for n_nullifiers={}, map_len={}",
+        public.nullifiers.len(),
         guard.len(),
     );
 }

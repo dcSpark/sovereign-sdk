@@ -397,126 +397,145 @@ def _render_chain_diagram(
     show_addresses: bool = True,
     max_chains: int = 20,
 ) -> str:
-    """Render UTXO chains as connected ASCII diagrams."""
-    adj, indeg = _build_note_graph(notes)
+    """Render transactions in chronological order, showing inputs consumed and outputs created."""
     
-    # Find roots (UTXOs with no inputs, i.e., sources)
-    roots = sorted([n for n, d in indeg.items() if d == 0])
-    if not roots:
-        roots = sorted(adj.keys())
+    # Group notes by the transaction that created them
+    tx_outputs: Dict[str, List[Note]] = {}
+    tx_inputs: Dict[str, Set[str]] = {}
+    tx_times: Dict[str, Optional[datetime]] = {}
+    tx_kinds: Dict[str, Optional[str]] = {}
+    
+    for note in notes.values():
+        tx = note.created_tx_hash
+        if tx:
+            tx_outputs.setdefault(tx, []).append(note)
+            if note.created_at and (tx not in tx_times or tx_times[tx] is None):
+                tx_times[tx] = note.created_at
+            if note.created_kind and (tx not in tx_kinds or tx_kinds[tx] is None):
+                tx_kinds[tx] = note.created_kind
+            for cm_in in note.cm_ins:
+                tx_inputs.setdefault(tx, set()).add(cm_in)
+    
+    # Sort transactions by time
+    sorted_txs = sorted(tx_outputs.keys(), key=lambda t: (tx_times.get(t) or datetime.max, t))
     
     lines: List[str] = []
     lines.append("")
     lines.append("╔════════════════════════════════════════════════════════════════════════════════╗")
-    lines.append("║                           UTXO CHAIN PATHS                                     ║")
+    lines.append("║                         TRANSACTION FLOW                                       ║")
     lines.append("╚════════════════════════════════════════════════════════════════════════════════╝")
     lines.append("")
     
-    chains_printed = 0
-    
-    def render_chain(path: List[str], chain_num: int) -> None:
-        nonlocal chains_printed
+    def render_note_box(
+        note: Note,
+        prefix: str,
+        label: str,
+        show_values: bool,
+        show_addresses: bool,
+    ) -> None:
+        cm_short = _short_hex(note.cm)
+        value = note.value
+        recipient = note.recipient
+        sender = note.sender_id
+        spent = note.spent
         
-        # Chain header
-        lines.append(f"╔═══ Chain #{chain_num} " + "═" * 55 + "╗")
-        lines.append("║")
-        
-        for i, cm in enumerate(path):
-            note = notes.get(cm)
-            is_last = i == len(path) - 1
-            
-            # Get note info
-            value = note.value if note else None
-            recipient = note.recipient if note else None
-            sender = note.sender_id if note else None
-            spent = note.spent if note else False
-            
-            cm_short = _short_hex(cm)
-            
-            # Build status indicator and info
-            if not spent:
-                status_icon = "🟢"
-                status_text = "LIVE"
-            else:
-                status_icon = "🔴"
-                status_text = "SPENT"
-            
-            # Build the UTXO box
-            if not spent:
-                # Live UTXO - double line box
-                top_line    = "╔" + "═" * 62 + "╗"
-                bottom_line = "╚" + "═" * 62 + "╝"
-                side = "║"
-            else:
-                # Spent UTXO - single line box
-                top_line    = "┌" + "─" * 62 + "┐"
-                bottom_line = "└" + "─" * 62 + "┘"
-                side = "│"
-            
-            # Format content lines
-            cm_line = f"{cm_short}  {status_icon} {status_text}"
-            if show_values and value:
-                cm_line += f"  💰 {value}"
-            
-            if show_addresses:
-                addr_parts = []
-                if sender:
-                    addr_parts.append(f"← {_short_addr(sender, 6, 6)}")
-                if recipient:
-                    addr_parts.append(f"→ {_short_addr(recipient, 6, 6)}")
-                addr_line = "   ".join(addr_parts) if addr_parts else ""
-            else:
-                addr_line = ""
-            
-            # Render UTXO box
-            lines.append(f"║     {top_line}")
-            lines.append(f"║     {side}  {cm_line:<60}{side}")
-            lines.append(f"║     {side}{' ' * 62}{side}")
-            if addr_line:
-                lines.append(f"║     {side}  {addr_line:<60}{side}")
-            lines.append(f"║     {bottom_line}")
-            
-            # Arrow to next UTXO (if not last)
-            if not is_last:
-                lines.append("║                                  │")
-                lines.append("║                                  ▼")
-        
-        # Chain footer
-        lines.append("║")
-        lines.append("╚" + "═" * 68 + "╝")
-        lines.append("")
-        lines.append("")
-    
-    def dfs(cur: str, path: List[str], seen: Set[str]) -> None:
-        nonlocal chains_printed
-        if chains_printed >= max_chains:
-            return
-        if cur in seen:
-            return
-        seen.add(cur)
-        path.append(cur)
-        
-        nexts = sorted(adj.get(cur, set()))
-        if not nexts:
-            # End of chain - render it
-            chains_printed += 1
-            render_chain(path, chains_printed)
+        # Build status indicator
+        if not spent:
+            status_icon = "🟢"
+            status_text = "LIVE"
+            box_chars = ("╔", "═", "╗", "║", "╚", "╝")
         else:
-            for nxt in nexts:
-                if chains_printed >= max_chains:
-                    break
-                dfs(nxt, path, seen)
+            status_icon = "🔴"
+            status_text = "SPENT"
+            box_chars = ("┌", "─", "┐", "│", "└", "┘")
         
-        path.pop()
-        seen.remove(cur)
+        tl, h, tr, v, bl, br = box_chars
+        
+        # Format content
+        cm_line = f"{cm_short}  {status_icon} {status_text}"
+        if show_values and value:
+            cm_line += f"  💰 {value}"
+        
+        # Add spent reference if applicable
+        if spent and note.spent_tx_hash:
+            spent_tx_idx = sorted_txs.index(note.spent_tx_hash) + 1 if note.spent_tx_hash in sorted_txs else "?"
+            cm_line += f"  → TX#{spent_tx_idx}"
+        
+        addr_line = ""
+        if show_addresses:
+            addr_parts = []
+            if sender:
+                addr_parts.append(f"← {_short_addr(sender, 6, 6)}")
+            if recipient:
+                addr_parts.append(f"→ {_short_addr(recipient, 6, 6)}")
+            addr_line = "   ".join(addr_parts)
+        
+        box_width = 66
+        lines.append(f"{prefix}{label}")
+        lines.append(f"{prefix}{tl}{h * box_width}{tr}")
+        lines.append(f"{prefix}{v}  {cm_line:<{box_width - 2}}{v}")
+        if addr_line:
+            lines.append(f"{prefix}{v}  {addr_line:<{box_width - 2}}{v}")
+        lines.append(f"{prefix}{bl}{h * box_width}{br}")
     
-    for r in roots:
-        if chains_printed >= max_chains:
+    for tx_idx, tx_hash in enumerate(sorted_txs):
+        if tx_idx >= max_chains:
+            lines.append(f"... (truncated after {max_chains} transactions)")
             break
-        dfs(r, [], set())
-    
-    if chains_printed >= max_chains:
-        lines.append(f"... (truncated after {max_chains} chains)")
+        
+        outputs = tx_outputs.get(tx_hash, [])
+        inputs = tx_inputs.get(tx_hash, set())
+        kind = tx_kinds.get(tx_hash) or "unknown"
+        time = tx_times.get(tx_hash)
+        
+        # Sort outputs: transfers first (recipient != sender), then change
+        outputs = sorted(outputs, key=lambda n: (n.recipient == n.sender_id, n.cm))
+        
+        # Transaction header
+        lines.append(f"╔═══ TX #{tx_idx + 1}: {kind.upper()} " + "═" * 55 + "╗")
+        lines.append(f"║  Hash: {_short_hex(tx_hash, 8, 8)}")
+        if time:
+            lines.append(f"║  Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("║")
+        
+        # Show inputs
+        if inputs:
+            lines.append("║  INPUTS (consumed):")
+            for cm_in in sorted(inputs):
+                in_note = notes.get(cm_in)
+                if in_note:
+                    val_str = f" 💰 {in_note.value}" if show_values and in_note.value else ""
+                    from_str = f" ← {_short_addr(in_note.sender_id, 6, 6)}" if show_addresses and in_note.sender_id else ""
+                    lines.append(f"║    • {_short_hex(cm_in)}{val_str}{from_str}")
+                else:
+                    lines.append(f"║    • {_short_hex(cm_in)}")
+        else:
+            lines.append("║  INPUTS: ∅ (mint/deposit)")
+        
+        # Calculate totals
+        input_total = sum(int(notes[cm].value or 0) for cm in inputs if cm in notes)
+        output_total = sum(int(n.value or 0) for n in outputs)
+        
+        lines.append("║")
+        lines.append(f"║                    │  (total in: {input_total})")
+        lines.append("║                    ▼")
+        lines.append("║")
+        
+        # Show outputs
+        lines.append(f"║  OUTPUTS (created): (total out: {output_total})")
+        for out_note in outputs:
+            # Determine label
+            if out_note.sender_id == out_note.recipient:
+                label = "[change]"
+            else:
+                label = "[transfer]"
+            
+            render_note_box(out_note, "║    ", label, show_values, show_addresses)
+            lines.append("║")
+        
+        lines.append("╚" + "═" * 72 + "╝")
+        lines.append("")
+        lines.append("")
     
     return "\n".join(lines)
 

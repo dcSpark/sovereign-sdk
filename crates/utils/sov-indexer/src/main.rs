@@ -92,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         {
             warn!(error = %e, "notes_nullifiers backfill failed");
         }
+        if let Err(e) = background_sync::backfill_spent_nullifiers(&idx_clone).await {
+            warn!(error = %e, "spent_nullifiers backfill failed");
+        }
         println!("Finished encrypted-note backfills");
     });
     println!("Initializing background sync loop");
