@@ -2,8 +2,8 @@
 
 This directory contains systemd unit files for running the Sovereign SDK
 rollup demo, its Ligero proof verifier, the Ligero prover service, the indexer,
-the MCP external server, and the continuous transfers load generator as
-background services on Linux.
+the MCP external server, the service controller, and the continuous transfers
+load generator as background services on Linux.
 
 ## Prerequisites
 - A Linux host with `systemd`
@@ -24,6 +24,7 @@ background services on Linux.
    sudo cp rollup-ligero-indexer.service /etc/systemd/system/
    sudo cp rollup-ligero-continuous-transfers.service /etc/systemd/system/
    sudo cp rollup-ligero-mcp.service /etc/systemd/system/
+   sudo cp rollup-ligero-service-controller.service /etc/systemd/system/
    ```
 2. Reload systemd so it detects the new files:
    ```bash
@@ -37,6 +38,7 @@ background services on Linux.
    sudo systemctl enable --now rollup-ligero-indexer.service
    sudo systemctl enable --now rollup-ligero-continuous-transfers.service
    sudo systemctl enable --now rollup-ligero-mcp.service
+   sudo systemctl enable --now rollup-ligero-service-controller.service
    ```
 
 ## Useful Commands
@@ -73,5 +75,15 @@ background services on Linux.
 - The MCP external service wraps `crates/mcp-external/run_mcp.sh`. It loads
   environment from `crates/mcp-external/.env` (or inline `Environment=` overrides)
   for MCP address, rollup/verifier/indexer endpoints, keys, and Ligero paths.
+- The service controller runs
+  `cargo run -p sov-rollup-ligero --bin rollup_ligero_service_controller --release`.
+  It provides HTTP endpoints for managing all other services:
+  - `POST /start`: Start all services via `run_all.sh`
+  - `POST /stop`: Stop all running services
+  - `POST /restart`: Restart all services
+  - `POST /clean`: Remove the `demo_data` directory
+  - `GET /health`: Check health of all services (rollup, verifier, indexer, mcp, prover, fvk)
+  Configure via environment variables:
+  - `SERVICE_CONTROLLER_BIND`: Bind address (default: `127.0.0.1:9090`)
 - Ensure that all services run under a user with permission to access the
   workspace and required key material.

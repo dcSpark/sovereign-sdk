@@ -16,6 +16,7 @@ use rmcp::{
     ErrorData,
     ServerHandler,
 };
+use sov_api_spec::types::TxReceiptResult;
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero;
 use sov_mock_da::MockDaSpec;
@@ -25,8 +26,6 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
 use tokio::sync::RwLock;
-use url::Url;
-
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
@@ -39,7 +38,7 @@ pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-async fn run_auto_fund_sequence(
+pub(crate) async fn run_auto_fund_sequence(
     provider: Arc<Provider>,
     admin_ctx: Arc<McpWalletContext>,
     dest_wallet_address: String,
@@ -47,7 +46,7 @@ async fn run_auto_fund_sequence(
     new_wallet_for_deposit: Arc<McpWalletContext>,
     deposit_amount: u128,
     auto_fund_gas_reserve: u128,
-) {
+) -> anyhow::Result<()> {
     // Total L2 funding: deposit amount + extra for gas fees
     let min_gas_reserve = crate::operations::DEFAULT_MAX_FEE;
     let gas_reserve = if auto_fund_gas_reserve < min_gas_reserve {
@@ -108,27 +107,65 @@ async fn run_auto_fund_sequence(
     .await
     {
         Ok(res) => {
+            let tx_hash = res.tx_hash.trim().to_string();
             tracing::info!(
                 "[auto-fund/createWallet] Step 1 complete: L2 funding tx {}",
-                res.tx_hash
+                tx_hash
             );
-            let tx_hash = match res.tx_hash.parse() {
-                Ok(hash) => hash,
-                Err(e) => {
-                    tracing::warn!(
-                        "[auto-fund/createWallet] Failed to parse L2 funding tx hash {}: {}. Skipping Step 2.",
-                        res.tx_hash,
-                        e
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = provider.wait_for_tx_processing(&tx_hash).await {
+            if tx_hash.is_empty() {
                 tracing::warn!(
-                    "[auto-fund/createWallet] Failed waiting for L2 funding tx processing: {}. Skipping Step 2.",
-                    e
+                    "[auto-fund/createWallet] L2 funding tx hash is empty; skipping Step 2."
                 );
-                return;
+                anyhow::bail!("L2 funding tx hash is empty");
+            }
+
+            let tx_max_wait = std::time::Duration::from_secs(300);
+            let tx_poll_interval = std::time::Duration::from_secs(2);
+            let tx_started = std::time::Instant::now();
+
+            loop {
+                match provider.get_sequencer_tx(&tx_hash).await {
+                    Ok(Some(tx)) => match &tx.receipt.result {
+                        TxReceiptResult::Successful => {
+                            tracing::info!(
+                                "[auto-fund/createWallet] L2 funding tx accepted by sequencer: receipt={:?}",
+                                tx.receipt.result
+                            );
+                            break;
+                        }
+                        TxReceiptResult::Reverted | TxReceiptResult::Skipped => {
+                                tracing::warn!(
+                                    "[auto-fund/createWallet] L2 funding tx failed in sequencer: receipt={:?}. Skipping Step 2.",
+                                    tx.receipt.result
+                                );
+                                anyhow::bail!(
+                                    "L2 funding tx failed in sequencer: receipt={:?}",
+                                    tx.receipt.result
+                                );
+                            }
+                        },
+                    Ok(None) => {
+                        tracing::info!(
+                            "[auto-fund/createWallet] Waiting for L2 funding tx {} to appear in sequencer",
+                            tx_hash
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[auto-fund/createWallet] Failed to query sequencer for L2 funding tx receipt: {}",
+                            e
+                        );
+                    }
+                }
+
+                if tx_started.elapsed() >= tx_max_wait {
+                    tracing::warn!(
+                        "[auto-fund/createWallet] Timed out waiting for L2 funding tx in sequencer; skipping Step 2."
+                    );
+                    anyhow::bail!("Timed out waiting for L2 funding tx in sequencer");
+                }
+
+                tokio::time::sleep(tx_poll_interval).await;
             }
 
             let dest_wallet_address_parsed: <McpSpec as Spec>::Address =
@@ -140,7 +177,11 @@ async fn run_auto_fund_sequence(
                             dest_wallet_address,
                             e
                         );
-                        return;
+                        anyhow::bail!(
+                            "Invalid L2 wallet address '{}': {}",
+                            dest_wallet_address,
+                            e
+                        );
                     }
                 };
 
@@ -179,7 +220,7 @@ async fn run_auto_fund_sequence(
                     tracing::warn!(
                         "[auto-fund/createWallet] Timed out waiting for L2 funding; skipping privacy deposit"
                     );
-                    return;
+                    anyhow::bail!("Timed out waiting for L2 funding balance");
                 }
 
                 tokio::time::sleep(poll_interval).await;
@@ -199,15 +240,22 @@ async fn run_auto_fund_sequence(
             )
             .await
             {
-                Ok(res) => tracing::info!(
-                    "[auto-fund/createWallet] Step 2 complete: Privacy pool deposit tx {}",
-                    res.tx_hash
-                ),
+                Ok(res) => {
+                    tracing::info!(
+                        "[auto-fund/createWallet] Step 2 complete: Privacy pool deposit tx {}",
+                        res.tx_hash
+                    );
+                    Ok(())
+                }
                 Err(e) => {
                     tracing::warn!(
                         "[auto-fund/createWallet] Step 2 failed (privacy pool deposit): {}",
                         e
-                    )
+                    );
+                    Err(anyhow::anyhow!(
+                        "Step 2 failed (privacy pool deposit): {}",
+                        e
+                    ))
                 }
             }
         }
@@ -215,7 +263,8 @@ async fn run_auto_fund_sequence(
             tracing::warn!(
                 "[auto-fund/createWallet] Step 1 failed (L2 funding): {}. Skipping Step 2.",
                 e
-            )
+            );
+            Err(anyhow::anyhow!("Step 1 failed (L2 funding): {}", e))
         }
     }
 }
@@ -1322,7 +1371,7 @@ impl CryptoServer {
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
         // Ensure provider is configured before we swap wallet context.
-        let _ = self.provider.as_ref().ok_or_else(|| {
+        let provider = self.provider.clone().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
@@ -1349,6 +1398,33 @@ impl CryptoServer {
             None
         };
 
+        // Auto-fund when configured via AUTO_FUND_DEPOSIT_AMOUNT
+        // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool
+        if let Some(deposit_amount) = self.auto_fund_deposit_amount {
+            let admin_ctx = self.admin_wallet_context.clone().ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set.",
+                    None,
+                )
+            })?;
+            let dest_privacy_key = new_privacy_key_for_deposit.clone();
+            let dest_wallet_address = wallet_address_str.clone();
+            let new_wallet_for_deposit = new_wallet_for_deposit.clone();
+            let auto_fund_gas_reserve = self.auto_fund_gas_reserve;
+
+            run_auto_fund_sequence(
+                provider,
+                admin_ctx,
+                dest_wallet_address,
+                dest_privacy_key,
+                new_wallet_for_deposit,
+                deposit_amount,
+                auto_fund_gas_reserve,
+            )
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Auto-fund failed: {e}"), None))?;
+        }
+
         // Replace the wallet context and privacy keys
         if let Some(ref wallet_ctx) = self.wallet_context {
             let mut ctx_guard = wallet_ctx.write().await;
@@ -1368,35 +1444,6 @@ impl CryptoServer {
         tracing::info!("[createWallet] New wallet created successfully");
         tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
         tracing::info!("[createWallet] Privacy address: {}", privacy_address);
-
-        // Best-effort funding when configured via AUTO_FUND_DEPOSIT_AMOUNT
-        // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool
-        if let Some(deposit_amount) = self.auto_fund_deposit_amount {
-            let admin_wallet_ctx = self.admin_wallet_context.clone();
-            if let (Some(provider), Some(admin_ctx)) = (self.provider.clone(), admin_wallet_ctx) {
-                let dest_privacy_key = new_privacy_key_for_deposit.clone();
-                let dest_wallet_address = wallet_address_str.clone();
-                let new_wallet_for_deposit = new_wallet_for_deposit.clone();
-                let auto_fund_gas_reserve = self.auto_fund_gas_reserve;
-
-                tokio::spawn(async move {
-                    run_auto_fund_sequence(
-                        provider,
-                        admin_ctx,
-                        dest_wallet_address,
-                        dest_privacy_key,
-                        new_wallet_for_deposit,
-                        deposit_amount,
-                        auto_fund_gas_reserve,
-                    )
-                    .await;
-                });
-            } else {
-                tracing::warn!(
-                    "[auto-fund/createWallet] Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set; skipping"
-                );
-            }
-        }
 
         let result = CreateWalletResult {
             wallet_private_key: wallet_private_key_hex,
@@ -1920,7 +1967,10 @@ impl ServerHandler for CryptoServer {
 
 fn map_state_from_status(status: &str) -> &'static str {
     let normalized = status.trim().to_ascii_lowercase();
-    if normalized.contains("success") {
+    if normalized.contains("success")
+        || normalized.contains("processed")
+        || normalized.contains("finalized")
+    {
         "completed"
     } else if normalized.contains("fail") {
         "failed"
@@ -1963,20 +2013,4 @@ fn build_transaction_record(
         updated_at: timestamp_ms,
         error_message,
     }
-}
-
-#[allow(dead_code)]
-fn to_ws_url(http_url: &str) -> String {
-    Url::parse(http_url)
-        .map(|mut url| {
-            let scheme = url.scheme().to_string();
-            let new_scheme = match scheme.as_str() {
-                "https" => "wss",
-                "http" => "ws",
-                other => other,
-            };
-            let _ = url.set_scheme(new_scheme);
-            url.to_string()
-        })
-        .unwrap_or_else(|_| http_url.to_string())
 }

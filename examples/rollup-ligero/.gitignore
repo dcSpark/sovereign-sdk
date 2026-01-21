@@ -19,3 +19,6 @@ demo_data/
 # Test scripts
 tps_test_verifier_temp
 proof_fraud_test
+
+# TSink data
+tsink-data

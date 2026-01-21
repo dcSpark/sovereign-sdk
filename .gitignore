@@ -76,3 +76,4 @@ bug_private.txt
 logs/mcp-external.log
 midnight_fvk_service.sqlite
 scripts/__pycache__
+tsink

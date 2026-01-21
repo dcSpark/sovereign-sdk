@@ -228,13 +228,6 @@ impl Provider {
             .context("Failed to get balance from rollup")
     }
 
-    pub async fn wait_for_tx_processing(&self, tx_hash: &types::TxHash) -> Result<()> {
-        self.client
-            .wait_for_tx_processing(tx_hash)
-            .await
-            .context("Failed to wait for transaction processing")
-    }
-
     pub async fn get_gas_token_id(&self) -> Result<TokenId> {
         #[derive(Deserialize)]
         struct TokenIdResponse {
@@ -247,6 +240,36 @@ impl Provider {
             .context("Failed to fetch gas token id from rollup")?;
 
         Ok(response.token_id)
+    }
+
+    /// Get transaction details from the sequencer by tx hash.
+    pub async fn get_sequencer_tx(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<types::ApiAcceptedTx>> {
+        let parsed: types::TxHash = tx_hash
+            .parse()
+            .with_context(|| format!("Failed to parse tx hash '{}'", tx_hash))?;
+
+        match self.client.client.sequencer_get_tx(&parsed).await {
+            Ok(tx_info) => Ok(Some(tx_info.into_inner())),
+            Err(sov_api_spec::Error::ErrorResponse(response)) => {
+                if response.status().as_u16() == 404 {
+                    Ok(None)
+                } else {
+                    let status = response.status();
+                    let error = response.into_inner();
+                    anyhow::bail!(
+                        "Sequencer returned error status {}: {}",
+                        status,
+                        error.message
+                    );
+                }
+            }
+            Err(err) => Err(anyhow::anyhow!(
+                "Failed to fetch tx details from sequencer: {err}"
+            )),
+        }
     }
 
     /// Submit a raw transaction to the rollup sequencer

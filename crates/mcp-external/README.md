@@ -19,14 +19,15 @@ This server exposes L2 wallet operations through the MCP protocol, enabling AI a
 Configure the following environment variables:
 
 - `MCP_SERVER_BIND_ADDRESS` - Server bind address (default: `127.0.0.1:3000`)
-- `WALLET_PRIVATE_KEY` - Hex-encoded private key for wallet operations
+- `START_WITH_NEW_WALLET` - When `true`, generates a new wallet and privacy spend key at startup and ignores `WALLET_PRIVATE_KEY`/`PRIVPOOL_SPEND_KEY` (default: `false`)
+- `WALLET_PRIVATE_KEY` - Hex-encoded private key for wallet operations (required unless `START_WITH_NEW_WALLET=true`)
 - `ADMIN_WALLET_PRIVATE_KEY` - Optional admin wallet private key used only to auto-fund newly created wallets
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
 - `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:1313`)
 - `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
-- `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address)
+- `PRIVPOOL_SPEND_KEY` - Privacy pool spend key (hex or bech32m address, required unless `START_WITH_NEW_WALLET=true`)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
@@ -52,7 +53,7 @@ The server exposes the following MCP tools:
 - `walletStatus` - Sync status and balances
 - `createWallet` / `restoreWallet` - Manage wallet keys
 
-If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool. When `START_WITH_NEW_WALLET=true`, the same auto-fund flow runs during startup.
 
 ### Transactions
 
