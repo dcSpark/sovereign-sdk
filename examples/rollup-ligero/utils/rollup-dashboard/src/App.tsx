@@ -72,7 +72,7 @@ function App() {
   };
 
   const formatNumber = (value: number | undefined | null, decimals: number = 2): string => {
-    if (value === undefined || value === null) return '-';
+    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     if (Math.abs(value) >= 1_000_000) {
       return `${(value / 1_000_000).toFixed(decimals)}M`;
     }
@@ -83,17 +83,17 @@ function App() {
   };
 
   const formatPercent = (value: number | undefined | null): string => {
-    if (value === undefined || value === null) return '-';
+    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     return `${value.toFixed(2)}%`;
   };
 
   const formatTps = (value: number | undefined | null): string => {
-    if (value === undefined || value === null) return '-';
+    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     return value.toFixed(3);
   };
 
   const formatTokenAmount = (value: number | undefined | null): string => {
-    if (value === undefined || value === null) return '-';
+    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     // Values from API are already in human-readable format (not raw)
     if (Math.abs(value) >= 1_000_000) {
       return `${(value / 1_000_000).toFixed(2)}M`;

@@ -118,7 +118,12 @@ function transformVelocityData(data: TokenVelocityHistoricResponse | null): Char
     .sort((a, b) => a.timestamp - b.timestamp);
 }
 
-function formatYAxisValue(value: number, metric: string): string {
+function formatYAxisValue(value: unknown, metric: string): string {
+  // Ensure value is a valid number
+  if (value === null || value === undefined || typeof value !== 'number' || !isFinite(value)) {
+    return '-';
+  }
+
   if (metric === 'tps') {
     if (value >= 100) return value.toFixed(0);
     if (value >= 10) return value.toFixed(1);
@@ -159,7 +164,12 @@ function formatYAxisValue(value: number, metric: string): string {
   return value.toFixed(0);
 }
 
-function formatTooltipValue(value: number, metric: string): string {
+function formatTooltipValue(value: unknown, metric: string): string {
+  // Ensure value is a valid number
+  if (value === null || value === undefined || typeof value !== 'number' || !isFinite(value)) {
+    return '-';
+  }
+
   if (metric === 'tps') {
     return `${value.toFixed(4)} tx/s`;
   }
