@@ -10,6 +10,14 @@ import type {
   MedianTransactionSizeResponse,
   TokenValueSpentResponse,
   TokenVelocityResponse,
+  HistoricMetricsData,
+  TpsHistoricResponse,
+  TotalTransactionsHistoricResponse,
+  FailedTransactionsRateHistoricResponse,
+  AverageTransactionSizeHistoricResponse,
+  MedianTransactionSizeHistoricResponse,
+  TokenValueSpentHistoricResponse,
+  TokenVelocityHistoricResponse,
 } from './types';
 
 const API_BASE = '/controller';
@@ -104,6 +112,58 @@ export async function fetchMetrics(): Promise<MetricsData> {
       tokenValueSpent: null,
       tokenVelocity: null,
       error: error instanceof Error ? error.message : 'Failed to fetch metrics',
+    };
+  }
+}
+
+// Historic metrics API functions
+export async function fetchHistoricMetrics(windowMinutes: number = 60): Promise<HistoricMetricsData> {
+  const now = Date.now();
+  const fromMs = now - windowMinutes * 60 * 1000;
+  const queryParams = `?from_ms=${fromMs}&to_ms=${now}`;
+
+  try {
+    const [
+      tps,
+      totalTransactions,
+      failedTransactionsRate,
+      averageTransactionSize,
+      medianTransactionSize,
+      tokenValueSpent,
+      tokenVelocity,
+    ] = await Promise.all([
+      fetchMetricEndpoint<TpsHistoricResponse>(`/tps/historic${queryParams}`),
+      fetchMetricEndpoint<TotalTransactionsHistoricResponse>(`/total-transactions/historic${queryParams}`),
+      fetchMetricEndpoint<FailedTransactionsRateHistoricResponse>(`/failed-transactions-rate/historic${queryParams}`),
+      fetchMetricEndpoint<AverageTransactionSizeHistoricResponse>(`/average-transaction-size/historic${queryParams}`),
+      fetchMetricEndpoint<MedianTransactionSizeHistoricResponse>(`/median-transaction-size/historic${queryParams}`),
+      fetchMetricEndpoint<TokenValueSpentHistoricResponse>(`/token-value-spent/historic${queryParams}`),
+      fetchMetricEndpoint<TokenVelocityHistoricResponse>(`/token-velocity/historic${queryParams}`),
+    ]);
+
+    const allNull = [tps, totalTransactions, failedTransactionsRate, averageTransactionSize,
+                     medianTransactionSize, tokenValueSpent, tokenVelocity].every(m => m === null);
+
+    return {
+      tps,
+      totalTransactions,
+      failedTransactionsRate,
+      averageTransactionSize,
+      medianTransactionSize,
+      tokenValueSpent,
+      tokenVelocity,
+      error: allNull ? 'Historic metrics unavailable' : undefined,
+    };
+  } catch (error) {
+    return {
+      tps: null,
+      totalTransactions: null,
+      failedTransactionsRate: null,
+      averageTransactionSize: null,
+      medianTransactionSize: null,
+      tokenValueSpent: null,
+      tokenVelocity: null,
+      error: error instanceof Error ? error.message : 'Failed to fetch historic metrics',
     };
   }
 }

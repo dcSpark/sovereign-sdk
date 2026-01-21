@@ -72,3 +72,119 @@ export interface MetricsData {
   tokenVelocity: TokenVelocityResponse | null;
   error?: string;
 }
+
+// Historic endpoint types - samples have different structures per metric
+export interface TpsSample {
+  recorded_at_ms: number;
+  tps: number | null;
+  delta_transactions?: number | null;
+  delta_ms?: number | null;
+  latest_total?: number | null;
+}
+
+export interface TotalTransactionsSample {
+  recorded_at_ms: number;
+  payload: {
+    total_transactions: number;
+  };
+}
+
+export interface FailedTransactionsRateSample {
+  recorded_at_ms: number;
+  rate_percent: number | null;
+  failed_transactions?: number | null;
+  total_transactions?: number | null;
+  delta_ms?: number | null;
+}
+
+export interface AverageTransactionSizeSample {
+  recorded_at_ms: number;
+  average_amount: number | null;
+  delta_amount?: string | null;
+  delta_transactions?: number | null;
+  delta_ms?: number | null;
+}
+
+export interface MedianTransactionSizeSample {
+  recorded_at_ms: number;
+  median_amount: number | null;
+}
+
+export interface TokenValueSpentSample {
+  recorded_at_ms: number;
+  value_spent: number | null;
+}
+
+export interface TokenVelocitySample {
+  recorded_at_ms: number;
+  token_velocity: number | null;
+  value_spent?: number | null;
+  total_tokens?: number | null;
+}
+
+export interface TpsHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: TpsSample | null;
+  samples: TpsSample[];
+}
+
+export interface TotalTransactionsHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: TotalTransactionsSample | null;
+  samples: TotalTransactionsSample[];
+}
+
+export interface FailedTransactionsRateHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: FailedTransactionsRateSample | null;
+  samples: FailedTransactionsRateSample[];
+}
+
+export interface AverageTransactionSizeHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: AverageTransactionSizeSample | null;
+  samples: AverageTransactionSizeSample[];
+}
+
+export interface MedianTransactionSizeHistoricResponse {
+  name: string;
+  bucket_seconds: number;
+  latest: MedianTransactionSizeSample | null;
+  samples: MedianTransactionSizeSample[];
+}
+
+export interface TokenValueSpentHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: TokenValueSpentSample | null;
+  samples: TokenValueSpentSample[];
+}
+
+export interface TokenVelocityHistoricResponse {
+  name: string;
+  interval_secs: number;
+  latest: TokenVelocitySample | null;
+  samples: TokenVelocitySample[];
+}
+
+export interface HistoricMetricsData {
+  tps: TpsHistoricResponse | null;
+  totalTransactions: TotalTransactionsHistoricResponse | null;
+  failedTransactionsRate: FailedTransactionsRateHistoricResponse | null;
+  averageTransactionSize: AverageTransactionSizeHistoricResponse | null;
+  medianTransactionSize: MedianTransactionSizeHistoricResponse | null;
+  tokenValueSpent: TokenValueSpentHistoricResponse | null;
+  tokenVelocity: TokenVelocityHistoricResponse | null;
+  error?: string;
+}
+
+// Chart display data point
+export interface ChartDataPoint {
+  time: string;
+  timestamp: number;
+  value: number;
+}

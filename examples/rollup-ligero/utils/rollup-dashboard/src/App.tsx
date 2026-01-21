@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { HealthResponse, ActionType, ActionResult, MetricsData } from './types';
 import { fetchHealth, performAction, fetchMetrics } from './api';
+import { MetricsCharts } from './MetricsCharts';
 import './styles.css';
 
 function App() {
@@ -93,15 +94,17 @@ function App() {
 
   const formatTokenAmount = (value: number | undefined | null): string => {
     if (value === undefined || value === null) return '-';
-    // Format as token amount (divide by 10^8 for display)
-    const tokenValue = value / 100_000_000;
-    if (Math.abs(tokenValue) >= 1_000_000) {
-      return `${(tokenValue / 1_000_000).toFixed(2)}M`;
+    // Values from API are already in human-readable format (not raw)
+    if (Math.abs(value) >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(2)}M`;
     }
-    if (Math.abs(tokenValue) >= 1_000) {
-      return `${(tokenValue / 1_000).toFixed(2)}K`;
+    if (Math.abs(value) >= 1_000) {
+      return `${(value / 1_000).toFixed(2)}K`;
     }
-    return tokenValue.toFixed(2);
+    if (Math.abs(value) >= 1) {
+      return value.toFixed(2);
+    }
+    return value.toFixed(4);
   };
 
   return (
@@ -352,6 +355,9 @@ function App() {
                 </div>
               )}
             </section>
+
+            {/* Historic Metrics Charts */}
+            <MetricsCharts autoRefresh={autoRefresh} />
           </>
         ) : (
           <div className="loading">Loading services...</div>
