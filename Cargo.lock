@@ -3710,6 +3710,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "hex",
  "midnight-privacy",
  "schemars 0.8.22",
  "serde",
@@ -3722,6 +3723,7 @@ dependencies = [
  "sov-chain-state",
  "sov-evm",
  "sov-kernels",
+ "sov-midnight-adapter",
  "sov-modules-api",
  "sov-modules-stf-blueprint",
  "sov-operator-incentives",
