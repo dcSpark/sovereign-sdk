@@ -46,8 +46,11 @@ impl MetricsManager {
                 loop {
                     ticker.tick().await;
                     match collector.collect().await {
-                        Ok(sample) => {
-                            if !store.record(spec.name, sample).await {
+                        Ok(samples) => {
+                            if samples.is_empty() {
+                                continue;
+                            }
+                            if !store.record(spec.name, samples).await {
                                 warn!(metric = spec.name, "Metric not registered");
                             }
                         }

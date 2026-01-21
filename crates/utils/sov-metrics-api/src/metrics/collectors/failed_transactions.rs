@@ -15,8 +15,10 @@ pub const MAX_SAMPLES: usize = (RETENTION_SECONDS / SAMPLE_INTERVAL_SECS) as usi
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct FailedTransactionsPayload {
-    pub total_completed: u64,
-    pub rejected_total: u64,
+    #[serde(alias = "total_completed")]
+    pub total_transactions: u64,
+    #[serde(alias = "rejected_total")]
+    pub failed_transactions: u64,
 }
 
 pub struct FailedTransactionsCollector {
@@ -38,7 +40,7 @@ impl MetricCollector for FailedTransactionsCollector {
         }
     }
 
-    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>> {
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
             use sov_midnight_da::storable::worker_verified_transactions::{
                 Column, Entity, TransactionState,
@@ -50,7 +52,7 @@ impl MetricCollector for FailedTransactionsCollector {
                     TransactionState::Rejected,
                 ]))
                 .paginate(&self.db, 1);
-            let total_completed = total_paginator
+            let total_transactions = total_paginator
                 .num_items()
                 .await
                 .with_context(|| "Failed to count completed transactions")?;
@@ -58,21 +60,21 @@ impl MetricCollector for FailedTransactionsCollector {
             let rejected_paginator = Entity::find()
                 .filter(Column::TransactionState.eq(TransactionState::Rejected))
                 .paginate(&self.db, 1);
-            let rejected_total = rejected_paginator
+            let failed_transactions = rejected_paginator
                 .num_items()
                 .await
                 .with_context(|| "Failed to count rejected transactions")?;
 
             let payload = FailedTransactionsPayload {
-                total_completed,
-                rejected_total,
+                total_transactions,
+                failed_transactions,
             };
 
-            Ok(MetricSample {
+            Ok(vec![MetricSample {
                 recorded_at_ms: Utc::now().timestamp_millis(),
                 payload: serde_json::to_value(payload)
                     .context("Failed to serialize failed transactions payload")?,
-            })
+            }])
         })
     }
 }

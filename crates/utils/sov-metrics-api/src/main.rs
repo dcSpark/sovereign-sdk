@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let da_conn = config.da_connection_string;
     let indexer_conn = config.indexer_db_connection_string;
     let bind_addr = config.bind_addr;
+    let tsink_data_path = config.tsink_data_path;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
     connection_options.sqlx_logging(false);
@@ -30,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
 
-    let store = metrics::MetricsStore::new();
+    let store = metrics::MetricsStore::new(tsink_data_path)?;
     let mut manager = metrics::MetricsManager::new(store.clone());
     manager
         .register(
@@ -41,6 +42,16 @@ async fn main() -> anyhow::Result<()> {
         .await;
     manager
         .register(metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
+            indexer_db.clone(),
+        ))
+        .await;
+    manager
+        .register(metrics::collectors::total_tokens_economy::TotalTokensEconomyCollector::new(
+            indexer_db.clone(),
+        ))
+        .await;
+    manager
+        .register(metrics::collectors::transaction_size::TransactionSizeCollector::new(
             indexer_db.clone(),
         ))
         .await;

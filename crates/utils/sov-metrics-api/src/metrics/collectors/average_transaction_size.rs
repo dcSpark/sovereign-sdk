@@ -39,7 +39,7 @@ impl MetricCollector for AverageTransactionSizeCollector {
         }
     }
 
-    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>> {
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
             let rows = midnight_transfer::Entity::find()
                 .filter(midnight_transfer::Column::Amount.is_not_null())
@@ -68,11 +68,11 @@ impl MetricCollector for AverageTransactionSizeCollector {
                 total_transactions,
             };
 
-            Ok(MetricSample {
+            Ok(vec![MetricSample {
                 recorded_at_ms: Utc::now().timestamp_millis(),
                 payload: serde_json::to_value(payload)
                     .context("Failed to serialize average transaction size payload")?,
-            })
+            }])
         })
     }
 }

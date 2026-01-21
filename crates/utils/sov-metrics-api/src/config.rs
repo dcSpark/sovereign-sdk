@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 
@@ -8,6 +9,7 @@ pub struct Config {
     pub da_connection_string: String,
     pub indexer_db_connection_string: String,
     pub bind_addr: SocketAddr,
+    pub tsink_data_path: PathBuf,
 }
 
 impl Config {
@@ -40,10 +42,17 @@ impl Config {
             .parse()
             .map_err(|_| anyhow!("METRICS_API_BIND must be a valid host:port"))?;
 
+        let tsink_data_path = env::var("TSINK_DATA_PATH")
+            .map_err(|_| anyhow!("TSINK_DATA_PATH env var is required"))?;
+        if tsink_data_path.trim().is_empty() {
+            return Err(anyhow!("TSINK_DATA_PATH env var is empty"));
+        }
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
             bind_addr,
+            tsink_data_path: PathBuf::from(tsink_data_path),
         })
     }
 }

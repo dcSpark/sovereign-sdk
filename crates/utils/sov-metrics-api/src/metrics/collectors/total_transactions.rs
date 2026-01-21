@@ -37,7 +37,7 @@ impl MetricCollector for TotalTransactionsCollector {
         }
     }
 
-    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>> {
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
             use sov_midnight_da::storable::worker_verified_transactions::{
                 Column, Entity, TransactionState,
@@ -56,11 +56,11 @@ impl MetricCollector for TotalTransactionsCollector {
 
             let payload = TotalTransactionsPayload { total_transactions };
 
-            Ok(MetricSample {
+            Ok(vec![MetricSample {
                 recorded_at_ms: Utc::now().timestamp_millis(),
                 payload: serde_json::to_value(payload)
                     .context("Failed to serialize total transactions payload")?,
-            })
+            }])
         })
     }
 }

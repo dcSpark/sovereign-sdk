@@ -17,5 +17,5 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait MetricCollector: Send + Sync {
     fn spec(&self) -> MetricSpec;
-    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<MetricSample>>;
+    fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>>;
 }
