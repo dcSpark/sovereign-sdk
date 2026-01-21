@@ -127,10 +127,85 @@ if ! command -v curl &> /dev/null; then
   exit 1
 fi
 
+# Convert hex string to bech32m format (privacy pool addresses)
+hex_to_bech32m() {
+  local hex="$1"
+  local prefix="${2:-privpool}"
+  
+  # Use Python for bech32m encoding (inline implementation)
+  python3 << PYEOF
+import sys
+
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+BECH32M_CONST = 0x2bc830a3
+
+def bech32_polymod(values):
+    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            chk ^= GEN[i] if ((b >> i) & 1) else 0
+    return chk
+
+def bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+def bech32m_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ BECH32M_CONST
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+def convertbits(data, frombits, tobits, pad=True):
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad and bits:
+        ret.append((acc << (tobits - bits)) & maxv)
+    return ret
+
+def encode_bech32m(hrp, data_bytes):
+    data5 = convertbits(data_bytes, 8, 5)
+    checksum = bech32m_create_checksum(hrp, data5)
+    return hrp + "1" + "".join([CHARSET[d] for d in data5 + checksum])
+
+hex_str = "${hex}"
+prefix = "${prefix}"
+
+try:
+    data_bytes = bytes.fromhex(hex_str)
+    result = encode_bech32m(prefix, data_bytes)
+    print(result)
+except Exception as e:
+    print(hex_str)  # Return original on error
+PYEOF
+}
+
+# Check if a field should be displayed as bech32m address
+is_address_field() {
+  local key="$1"
+  case "$key" in
+    recipient|sender_id|sender|privacy_sender|privacy_recipient)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Fetch transactions from indexer
 fetch_transactions() {
   local response
-  response=$(curl -s -w "\n%{http_code}" "${INDEXER_URL}/txs?limit=${LIMIT}" 2>/dev/null) || {
+  response=$(curl -s -w "\n%{http_code}" "${INDEXER_URL}/transactions?limit=${LIMIT}" 2>/dev/null) || {
     echo -e "${RED}Error: Failed to connect to indexer at ${INDEXER_URL}${NC}"
     echo "Make sure the indexer is running (run_indexer.sh or run_all.sh)"
     exit 1
@@ -424,20 +499,38 @@ print_transaction() {
     echo -e "  ${BOLD}${GREEN}Decrypted Notes (${decrypted_count}):${NC}"
     local i=0
     while [[ $i -lt $decrypted_count ]]; do
-      local note_value note_recipient note_rho
-      note_value=$(echo "$decrypted_notes" | jq -r ".[$i].value // \"N/A\"")
-      note_recipient=$(echo "$decrypted_notes" | jq -r ".[$i].recipient // \"N/A\"")
-      note_rho=$(echo "$decrypted_notes" | jq -r ".[$i].rho // \"N/A\"")
       echo -e "    ${GREEN}Note $((i+1)):${NC}"
-      if [[ "$note_value" != "N/A" && "$note_value" != "null" ]]; then
-        echo -e "      ${GREEN}Value:     ${note_value}${NC}"
-      fi
-      if [[ "$note_recipient" != "N/A" && "$note_recipient" != "null" ]]; then
-        echo -e "      ${GREEN}Recipient: $(truncate_string "$note_recipient" 50)${NC}"
-      fi
-      if [[ "$note_rho" != "N/A" && "$note_rho" != "null" ]]; then
-        echo -e "      ${GREEN}Rho:       $(truncate_string "$note_rho" 50)${NC}"
-      fi
+      # Iterate over all keys in the decrypted note and display them
+      local note_json
+      note_json=$(echo "$decrypted_notes" | jq -c ".[$i]")
+      echo "$note_json" | jq -r 'to_entries | sort_by(.key) | .[] | "\(.key)|\(.value)"' 2>/dev/null | while IFS='|' read -r key val; do
+        if [[ -n "$val" && "$val" != "null" ]]; then
+          # Capitalize first letter of each word and replace underscores with spaces
+          local display_key display_val
+          display_key=$(echo "$key" | sed 's/_/ /g' | awk '{for(j=1;j<=NF;j++) $j=toupper(substr($j,1,1)) substr($j,2)}1')
+          # Pad the key for alignment (max 20 chars)
+          printf -v padded_key "%-20s" "$display_key:"
+          
+          # Check if this is an address field that should be converted to bech32m
+          if is_address_field "$key"; then
+            # Convert hex to bech32m and show full value
+            display_val=$(hex_to_bech32m "$val")
+            echo -e "      ${GREEN}${padded_key} ${display_val}${NC}"
+          else
+            # For non-address fields, show value (truncate only very long non-essential fields)
+            case "$key" in
+              domain|rho|cm|ct|nonce|mac)
+                # These are cryptographic values - show truncated
+                echo -e "      ${GREEN}${padded_key} $(truncate_string "$val" 64)${NC}"
+                ;;
+              *)
+                # Show full value for other fields
+                echo -e "      ${GREEN}${padded_key} ${val}${NC}"
+                ;;
+            esac
+          fi
+        fi
+      done
       i=$((i+1))
     done
   elif [[ "$show_decrypt" == "true" && "$encrypted_count" -gt 0 ]]; then
