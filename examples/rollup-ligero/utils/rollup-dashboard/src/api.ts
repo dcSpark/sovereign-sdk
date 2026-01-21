@@ -1,6 +1,6 @@
 import type { HealthResponse, ActionType, ActionResult } from './types';
 
-const API_BASE = '/api';
+const API_BASE = '/controller';
 
 export async function fetchHealth(): Promise<HealthResponse> {
   const response = await fetch(`${API_BASE}/health`);

@@ -11,6 +11,7 @@ use axum::Json;
 use axum::Router;
 use serde::Serialize;
 use tokio::process::Command;
+use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
@@ -131,13 +132,155 @@ async fn main() -> anyhow::Result<()> {
         .route("/restart", post(restart).get(restart))
         .route("/clean", post(clean).get(clean))
         .route("/health", get(health_check))
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("Failed to bind to {bind_addr}"))?;
     println!("Service controller listening on http://{bind_addr}");
-    axum::serve(listener, app).await?;
+
+    // Run the server with graceful shutdown on SIGTERM/SIGINT
+    let shutdown_state = app_state.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .await?;
+
+    // Final cleanup after server stops
+    println!("Service controller shutting down, stopping child services...");
+    if let Err(e) = shutdown_services(&app_state).await {
+        eprintln!("Error during shutdown cleanup: {e}");
+    }
+
+    Ok(())
+}
+
+/// Wait for shutdown signal (SIGTERM or SIGINT) and stop services
+async fn shutdown_signal(app_state: Arc<AppState>) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            println!("\nReceived SIGINT (Ctrl+C), initiating shutdown...");
+        }
+        _ = terminate => {
+            println!("\nReceived SIGTERM, initiating shutdown...");
+        }
+    }
+
+    // Stop services before the server shuts down
+    if let Err(e) = shutdown_services(&app_state).await {
+        eprintln!("Error stopping services during shutdown: {e}");
+    }
+}
+
+/// Gracefully stop all running services
+async fn shutdown_services(app: &Arc<AppState>) -> Result<(), String> {
+    let mut state = app.state.lock().await;
+    if !state.is_running() {
+        println!("No services running, nothing to stop.");
+        return Ok(());
+    }
+
+    println!("Stopping child services...");
+
+    let pid = state.child.as_ref().and_then(|child| child.id());
+    let pgid = state.process_group;
+
+    // Send SIGTERM first
+    if let Some(pgid) = pgid {
+        if let Err(e) = send_signal_to_group_sync(pgid, "-TERM") {
+            eprintln!("Warning: failed to send SIGTERM to process group: {e}");
+        }
+    } else if let Some(pid) = pid {
+        if let Err(e) = send_signal_sync(pid, "-TERM") {
+            eprintln!("Warning: failed to send SIGTERM to process: {e}");
+        }
+    }
+
+    // Wait for graceful shutdown
+    let stopped = if let Some(child) = state.child.as_mut() {
+        match timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => {
+                eprintln!("Error waiting for child process: {err}");
+                false
+            }
+            Err(_) => false,
+        }
+    } else if let Some(pgid) = pgid {
+        wait_for_group_exit(pgid, Duration::from_secs(10)).await
+    } else {
+        true
+    };
+
+    if stopped {
+        state.child = None;
+        state.process_group = None;
+        println!("Services stopped gracefully.");
+        return Ok(());
+    }
+
+    // Force kill if still running
+    println!("Services did not stop gracefully, sending SIGKILL...");
+    if let Some(pgid) = pgid {
+        let _ = send_signal_to_group_sync(pgid, "-KILL");
+    } else if let Some(pid) = pid {
+        let _ = send_signal_sync(pid, "-KILL");
+    }
+
+    if let Some(child) = state.child.as_mut() {
+        let _ = child.wait().await;
+    } else if let Some(pgid) = pgid {
+        let _ = wait_for_group_exit(pgid, Duration::from_secs(5)).await;
+    }
+
+    state.child = None;
+    state.process_group = None;
+    println!("Services stopped (forced).");
+    Ok(())
+}
+
+/// Synchronous signal sending for use during shutdown
+fn send_signal_sync(pid: u32, signal: &str) -> Result<(), String> {
+    let status = std::process::Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .map_err(|e| format!("Failed to send {signal} to {pid}: {e}"))?;
+
+    if !status.success() {
+        eprintln!("kill {signal} {pid} exited with status {status}");
+    }
+    Ok(())
+}
+
+/// Synchronous signal sending to process group for use during shutdown
+fn send_signal_to_group_sync(pgid: i32, signal: &str) -> Result<(), String> {
+    let status = std::process::Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .status()
+        .map_err(|e| format!("Failed to send {signal} to group {pgid}: {e}"))?;
+
+    if !status.success() {
+        eprintln!("kill {signal} -- -{pgid} exited with status {status}");
+    }
     Ok(())
 }
 

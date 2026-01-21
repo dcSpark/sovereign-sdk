@@ -68,9 +68,28 @@ The built files will be in the `dist/` directory.
 
 ## Configuration
 
-The Vite dev server proxies `/api/*` requests to the service controller at `http://127.0.0.1:9090`. To change this, edit `vite.config.ts`.
+### Environment Variables
 
-For production, configure your web server to proxy API requests to the service controller.
+Create a `.env` file (or `.env.local`) to configure the dashboard:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_API_TARGET` | `http://127.0.0.1:9090` | Service Controller API URL |
+| `VITE_PORT` | `3333` | Dev server port |
+
+Example:
+```bash
+# .env.local
+VITE_API_TARGET=http://192.168.1.100:9090
+VITE_PORT=8080
+```
+
+Or pass inline:
+```bash
+VITE_API_TARGET=http://remote-server:9090 npm run dev
+```
+
+The dashboard uses `/controller/` for API calls, which nginx already proxies to the service controller.
 
 ## Monitored Services
 
