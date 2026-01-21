@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use sov_api_spec::types;
 use sov_bank::TokenId;
 use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
-use serde::Deserialize;
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -203,8 +203,6 @@ impl Provider {
         Ok(chain_data)
     }
 
-    
-
     /// Get the nonce for a public key
     pub async fn get_nonce<S: Spec>(
         &self,
@@ -243,10 +241,7 @@ impl Provider {
     }
 
     /// Get transaction details from the sequencer by tx hash.
-    pub async fn get_sequencer_tx(
-        &self,
-        tx_hash: &str,
-    ) -> Result<Option<types::ApiAcceptedTx>> {
+    pub async fn get_sequencer_tx(&self, tx_hash: &str) -> Result<Option<types::ApiAcceptedTx>> {
         let parsed: types::TxHash = tx_hash
             .parse()
             .with_context(|| format!("Failed to parse tx hash '{}'", tx_hash))?;
@@ -643,12 +638,10 @@ impl Provider {
             );
         }
 
-        let balance_response: BalanceResponse = response.json().await.with_context(|| {
-            format!(
-                "Failed to parse balance JSON from indexer at {}",
-                url
-            )
-        })?;
+        let balance_response: BalanceResponse = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse balance JSON from indexer at {}", url))?;
 
         tracing::debug!(
             "Fetched balance for address {}: {}",
@@ -658,7 +651,6 @@ impl Provider {
 
         Ok(balance_response)
     }
-
 }
 
 fn parse_rfc3339_to_millis(value: &str) -> Option<i64> {

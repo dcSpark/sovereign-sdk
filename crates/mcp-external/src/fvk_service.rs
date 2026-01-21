@@ -103,8 +103,8 @@ pub async fn fetch_viewer_fvk_bundle(
         "midnight-fvk-service returned fvk_commitment that does not match fvk"
     );
 
-    let signer_vk =
-        VerifyingKey::from_bytes(&signer_pk).map_err(|e| anyhow!("Invalid signer_public_key: {e}"))?;
+    let signer_vk = VerifyingKey::from_bytes(&signer_pk)
+        .map_err(|e| anyhow!("Invalid signer_public_key: {e}"))?;
     verify_commitment_signature(&signer_vk, &fvk_commitment_resp, &signature)?;
 
     if let Some(pool_pk) = pool_fvk_pk {
@@ -124,4 +124,3 @@ pub async fn fetch_viewer_fvk_bundle(
         signer_public_key: signer_pk,
     })
 }
-

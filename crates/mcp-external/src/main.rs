@@ -20,19 +20,15 @@ mod wallet;
 mod test_utils;
 
 use std::sync::Arc;
-use rand::RngCore;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
-use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero;
-use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::server::{run_auto_fund_sequence, CryptoServer, McpWalletContext};
+use crate::server::CryptoServer;
 use crate::wallet::WalletContext;
 
-const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
 
 #[tokio::main]
@@ -59,14 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
     tracing::info!("[mcp] Verifier URL: {}", cfg.verifier_url);
     tracing::info!("[mcp] Indexer URL: {}", cfg.indexer_url);
-    let start_with_new_wallet = cfg.start_with_new_wallet;
-    if start_with_new_wallet {
-        tracing::info!("[mcp] START_WITH_NEW_WALLET=true: creating a new wallet at startup");
-        if cfg.wallet_private_key.is_some() || cfg.privpool_spend_key.is_some() {
-            tracing::warn!(
-                "[mcp] START_WITH_NEW_WALLET=true: ignoring WALLET_PRIVATE_KEY and PRIVPOOL_SPEND_KEY"
-            );
-        }
+    if cfg.start_with_new_wallet {
+        tracing::warn!(
+            "[mcp] START_WITH_NEW_WALLET is deprecated/ignored: sessions start empty. Use createWallet per MCP session."
+        );
     }
 
     let admin_wallet_ctx = cfg
@@ -97,37 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Ligero proof client (HTTP service)
     tracing::info!("[mcp] Initializing Ligero proof service client");
-    tracing::info!(
-        "[mcp] Proof service URL: {}",
-        cfg.ligero_proof_service_url
-    );
+    tracing::info!("[mcp] Proof service URL: {}", cfg.ligero_proof_service_url);
     tracing::info!("[mcp] Circuit: {}", cfg.ligero_program_path);
 
     let ligero = Arc::new(Ligero::new(
         cfg.ligero_proof_service_url.to_string(),
         cfg.ligero_program_path.clone(),
     ));
-
-    let pool_fvk_pk = std::env::var("POOL_FVK_PK")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(|s| parse_hex_32("POOL_FVK_PK", &s))
-        .transpose()?;
-
-    let viewer_fvk_bundle: Option<ViewerFvkBundle> = if pool_fvk_pk.is_some() {
-        let http = reqwest::Client::new();
-        let base_url = crate::fvk_service::fvk_service_base_url_from_env();
-        tracing::info!(
-            "[mcp] POOL_FVK_PK set: fetching viewer FVK bundle from midnight-fvk-service ({base_url})"
-        );
-        Some(fetch_viewer_fvk_bundle(&http, pool_fvk_pk).await?)
-    } else {
-        tracing::info!("[mcp] POOL_FVK_PK not set: viewer FVK bundle disabled");
-        None
-    };
-
-    let viewer_fvk_bundle = Arc::new(RwLock::new(viewer_fvk_bundle));
 
     let auto_fund_deposit_amount = cfg
         .auto_fund_deposit_amount
@@ -164,11 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<u128>().map_err(|e| {
-                tracing::warn!(
-                    "[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}",
-                    s,
-                    e
-                );
+                tracing::warn!("[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}", s, e);
                 e
             })
         })
@@ -182,146 +146,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (wallet_ctx, privacy_key): (McpWalletContext, PrivacyKey) = if start_with_new_wallet {
-        let (wallet_private_key_hex, privacy_spend_key_hex) = {
-            let mut rng = rand::thread_rng();
-
-            let mut wallet_private_key_bytes = [0u8; 32];
-            rng.fill_bytes(&mut wallet_private_key_bytes);
-            let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
-
-            let mut privacy_spend_key_bytes = [0u8; 32];
-            rng.fill_bytes(&mut privacy_spend_key_bytes);
-            let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
-
-            (wallet_private_key_hex, privacy_spend_key_hex)
-        };
-
-        tracing::info!("[mcp] Initializing wallet from generated private key...");
-        let wallet_ctx: McpWalletContext =
-            WalletContext::from_private_key_hex(&wallet_private_key_hex)?;
-        let wallet_address = wallet_ctx.get_address().to_string();
-        tracing::info!("[mcp] Wallet address: {}", wallet_address);
-
-        tracing::info!("[mcp] Initializing privacy key from generated spend key");
-        let privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
-            format!(
-                "Failed to initialize generated privacy key: {}. \
-                Please ensure key generation is producing valid 32-byte hex strings.",
-                e
-            )
-        })?;
-
-        tracing::info!("[mcp] Privacy key initialized successfully");
-        tracing::info!(
-            "[mcp] Privacy address: {}",
-            privacy_key.privacy_address(&DOMAIN)
-        );
-        tracing::info!(
-            "[mcp] All deposits will be made to this privacy address: {}",
-            privacy_key.privacy_address(&DOMAIN)
-        );
-
-        if let Some(deposit_amount) = auto_fund_deposit_amount {
-            let admin_ctx = admin_wallet_ctx.clone().ok_or_else(|| {
-                "Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set.".to_string()
-            })?;
-            let new_wallet_for_deposit = Arc::new(wallet_ctx.clone());
-            run_auto_fund_sequence(
-                provider.clone(),
-                admin_ctx,
-                wallet_address,
-                privacy_key.clone(),
-                new_wallet_for_deposit,
-                deposit_amount,
-                auto_fund_gas_reserve,
-            )
-            .await
-            .map_err(|e| format!("Auto-fund failed: {e}"))?;
-        }
-
-        (wallet_ctx, privacy_key)
-    } else {
-        tracing::info!("[mcp] Initializing wallet from private key...");
-        let wallet_private_key = cfg
-            .wallet_private_key
-            .as_deref()
-            .ok_or_else(|| {
-                "WALLET_PRIVATE_KEY must be set unless START_WITH_NEW_WALLET=true".to_string()
-            })?;
-        let wallet_ctx: McpWalletContext = WalletContext::from_private_key_hex(wallet_private_key)?;
-        let wallet_address = wallet_ctx.get_address();
-        tracing::info!("[mcp] Wallet address: {}", wallet_address);
-
-        tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
-        let privpool_spend_key = cfg
-            .privpool_spend_key
-            .as_deref()
-            .ok_or_else(|| {
-                "PRIVPOOL_SPEND_KEY must be set unless START_WITH_NEW_WALLET=true".to_string()
-            })?;
-        let privacy_key = if privpool_spend_key.starts_with("privpool1") {
-            PrivacyKey::from_address(privpool_spend_key)
-        } else {
-            PrivacyKey::from_hex(privpool_spend_key)
-        }
-        .map_err(|e| {
-            format!(
-                "Failed to initialize privacy key from PRIVPOOL_SPEND_KEY: {}. \
-                Please provide a valid 32-byte hex string (with or without 0x prefix) \
-                or a bech32m privacy address (privpool1...)",
-                e
-            )
-        })?;
-
-        tracing::info!("[mcp] Privacy key initialized successfully");
-        tracing::info!(
-            "[mcp] Privacy address: {}",
-            privacy_key.privacy_address(&DOMAIN)
-        );
-        tracing::info!(
-            "[mcp] All deposits will be made to this privacy address: {}",
-            privacy_key.privacy_address(&DOMAIN)
-        );
-
-        (wallet_ctx, privacy_key)
-    };
-
-    let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
-    let privacy_key = Arc::new(RwLock::new(privacy_key));
-
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
     );
     let provider_for_service = provider.clone();
-    let wallet_ctx_for_service = wallet_ctx.clone();
     let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
-    let viewer_fvk_bundle_for_service = viewer_fvk_bundle.clone();
-    let privacy_key_for_service = privacy_key.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
-    // Track whether a wallet has been loaded (including from environment variables or startup generation)
-    // Starts as true since the initial wallet is loaded before serving requests
-    let wallet_explicitly_loaded = Arc::new(RwLock::new(true));
-    let wallet_explicitly_loaded_for_service = wallet_explicitly_loaded.clone();
-
     let service = StreamableHttpService::new(
         move || {
+            // Each MCP session starts with no wallet loaded and gets isolated state (no cross-talk
+            // between providers). Call createWallet or restoreWallet to set per-session keys.
+            let wallet_ctx = Arc::new(RwLock::new(None));
+            let privacy_key = Arc::new(RwLock::new(None));
+            let viewer_fvk_bundle = Arc::new(RwLock::new(None));
+            // This flag is only used to prevent accidentally overwriting a wallet that was
+            // created/restored via MCP tools within this session.
+            // Sessions start empty and remain "unlocked" by default.
+            let wallet_explicitly_loaded = Arc::new(RwLock::new(false));
+
             Ok(CryptoServer::new(
                 provider_for_service.clone(),
-                wallet_ctx_for_service.clone(),
+                wallet_ctx,
                 admin_wallet_ctx_for_service.clone(),
                 ligero_for_service.clone(),
-                viewer_fvk_bundle_for_service.clone(),
-                privacy_key_for_service.clone(),
+                viewer_fvk_bundle,
+                privacy_key,
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,
-                wallet_explicitly_loaded_for_service.clone(),
+                wallet_explicitly_loaded,
             ))
         },
         LocalSessionManager::default().into(),

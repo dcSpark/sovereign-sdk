@@ -77,6 +77,7 @@ impl PrivacyKey {
     ///
     /// # Parameters
     /// * `address` - Privacy address in bech32m format (e.g., "privpool1...")
+    #[allow(dead_code)]
     pub fn from_address(address: impl AsRef<str>) -> Result<Self> {
         let privacy_addr: PrivacyAddress = address
             .as_ref()

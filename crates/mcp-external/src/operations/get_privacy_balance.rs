@@ -62,12 +62,7 @@ pub async fn get_privacy_balance(
 
     // Call the indexer's balance endpoint
     let balance_response = provider
-        .get_wallet_balance(
-            &privacy_address,
-            None,
-            Some(&nf_key_hex),
-            None,
-        )
+        .get_wallet_balance(&privacy_address, None, Some(&nf_key_hex), None)
         .await
         .context("Failed to fetch balance from indexer")?;
 
@@ -102,7 +97,10 @@ pub async fn get_privacy_balance(
 
     // Calculate transaction counts from notes
     let deposit_count = unspent_notes.iter().filter(|n| n.kind == "deposit").count();
-    let transfer_count = unspent_notes.iter().filter(|n| n.kind == "transfer").count();
+    let transfer_count = unspent_notes
+        .iter()
+        .filter(|n| n.kind == "transfer")
+        .count();
     let withdraw_count = 0; // Withdrawals don't create unspent notes for the user
 
     Ok(PrivacyBalanceResult {

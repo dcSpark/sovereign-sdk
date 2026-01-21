@@ -13,16 +13,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum LigeroProgramArguments {
-    STR { str: String },
-    I64 { i64: i64 },
+    STR {
+        str: String,
+    },
+    I64 {
+        i64: i64,
+    },
     /// Backwards/forwards compatible byte argument: carries both `hex` and `bytes_b64`.
     ///
     /// - New binaries will prefer `bytes_b64` and pass raw bytes to the guest.
     /// - Older binaries will ignore `bytes_b64` and fall back to `hex`.
-    HexBytesB64 { hex: String, bytes_b64: String },
+    HexBytesB64 {
+        hex: String,
+        bytes_b64: String,
+    },
     /// Base64-encoded raw bytes argument.
-    BytesB64 { bytes_b64: String },
-    HEX { hex: String },
+    BytesB64 {
+        bytes_b64: String,
+    },
+    HEX {
+        hex: String,
+    },
 }
 
 /// Minimal wrapper used by MCP to generate Ligero proofs.
