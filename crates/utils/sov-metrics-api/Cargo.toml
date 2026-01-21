@@ -16,7 +16,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "si
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 chrono = { workspace = true }
-tsink = { path = "../../../tsink" }
+tsink = { git = "https://github.com/h2337/tsink.git", rev = "412698519f0ba47c8f879cf2d25be312318464cc" }
 sea-orm = { version = "1.1", default-features = false, features = [
     "sqlx-sqlite",
     "sqlx-postgres",
