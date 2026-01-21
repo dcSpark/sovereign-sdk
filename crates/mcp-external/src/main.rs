@@ -20,6 +20,7 @@ mod wallet;
 mod test_utils;
 
 use std::sync::Arc;
+use rand::RngCore;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
@@ -28,7 +29,7 @@ use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle}
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::server::CryptoServer;
+use crate::server::{run_auto_fund_sequence, CryptoServer, McpWalletContext};
 use crate::wallet::WalletContext;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
@@ -58,12 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
     tracing::info!("[mcp] Verifier URL: {}", cfg.verifier_url);
     tracing::info!("[mcp] Indexer URL: {}", cfg.indexer_url);
-    tracing::info!("[mcp] Initializing wallet from private key...");
-
-    let wallet_ctx = WalletContext::from_private_key_hex(&cfg.wallet_private_key)?;
-    let wallet_address = wallet_ctx.get_address();
-    tracing::info!("[mcp] Wallet address: {}", wallet_address);
-    let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
+    let start_with_new_wallet = cfg.start_with_new_wallet;
+    if start_with_new_wallet {
+        tracing::info!("[mcp] START_WITH_NEW_WALLET=true: creating a new wallet at startup");
+        if cfg.wallet_private_key.is_some() || cfg.privpool_spend_key.is_some() {
+            tracing::warn!(
+                "[mcp] START_WITH_NEW_WALLET=true: ignoring WALLET_PRIVATE_KEY and PRIVPOOL_SPEND_KEY"
+            );
+        }
+    }
 
     let admin_wallet_ctx = cfg
         .admin_wallet_private_key
@@ -125,34 +129,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let viewer_fvk_bundle = Arc::new(RwLock::new(viewer_fvk_bundle));
 
-    tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
-
-    let privacy_key = if cfg.privpool_spend_key.starts_with("privpool1") {
-        PrivacyKey::from_address(&cfg.privpool_spend_key)
-    } else {
-        PrivacyKey::from_hex(&cfg.privpool_spend_key)
-    }
-    .map_err(|e| {
-        format!(
-            "Failed to initialize privacy key from PRIVPOOL_SPEND_KEY: {}. \
-            Please provide a valid 32-byte hex string (with or without 0x prefix) \
-            or a bech32m privacy address (privpool1...)",
-            e
-        )
-    })?;
-
-    tracing::info!("[mcp] Privacy key initialized successfully");
-    tracing::info!(
-        "[mcp] Privacy address: {}",
-        privacy_key.privacy_address(&DOMAIN)
-    );
-    tracing::info!(
-        "[mcp] All deposits will be made to this privacy address: {}",
-        privacy_key.privacy_address(&DOMAIN)
-    );
-
-    let privacy_key = Arc::new(RwLock::new(privacy_key));
-
     let auto_fund_deposit_amount = cfg
         .auto_fund_deposit_amount
         .as_deref()
@@ -206,6 +182,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let (wallet_ctx, privacy_key): (McpWalletContext, PrivacyKey) = if start_with_new_wallet {
+        let (wallet_private_key_hex, privacy_spend_key_hex) = {
+            let mut rng = rand::thread_rng();
+
+            let mut wallet_private_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut wallet_private_key_bytes);
+            let wallet_private_key_hex = hex::encode(&wallet_private_key_bytes);
+
+            let mut privacy_spend_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut privacy_spend_key_bytes);
+            let privacy_spend_key_hex = hex::encode(&privacy_spend_key_bytes);
+
+            (wallet_private_key_hex, privacy_spend_key_hex)
+        };
+
+        tracing::info!("[mcp] Initializing wallet from generated private key...");
+        let wallet_ctx: McpWalletContext =
+            WalletContext::from_private_key_hex(&wallet_private_key_hex)?;
+        let wallet_address = wallet_ctx.get_address().to_string();
+        tracing::info!("[mcp] Wallet address: {}", wallet_address);
+
+        tracing::info!("[mcp] Initializing privacy key from generated spend key");
+        let privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
+            format!(
+                "Failed to initialize generated privacy key: {}. \
+                Please ensure key generation is producing valid 32-byte hex strings.",
+                e
+            )
+        })?;
+
+        tracing::info!("[mcp] Privacy key initialized successfully");
+        tracing::info!(
+            "[mcp] Privacy address: {}",
+            privacy_key.privacy_address(&DOMAIN)
+        );
+        tracing::info!(
+            "[mcp] All deposits will be made to this privacy address: {}",
+            privacy_key.privacy_address(&DOMAIN)
+        );
+
+        if let Some(deposit_amount) = auto_fund_deposit_amount {
+            let admin_ctx = admin_wallet_ctx.clone().ok_or_else(|| {
+                "Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set.".to_string()
+            })?;
+            let new_wallet_for_deposit = Arc::new(wallet_ctx.clone());
+            run_auto_fund_sequence(
+                provider.clone(),
+                admin_ctx,
+                wallet_address,
+                privacy_key.clone(),
+                new_wallet_for_deposit,
+                deposit_amount,
+                auto_fund_gas_reserve,
+            )
+            .await
+            .map_err(|e| format!("Auto-fund failed: {e}"))?;
+        }
+
+        (wallet_ctx, privacy_key)
+    } else {
+        tracing::info!("[mcp] Initializing wallet from private key...");
+        let wallet_private_key = cfg
+            .wallet_private_key
+            .as_deref()
+            .ok_or_else(|| {
+                "WALLET_PRIVATE_KEY must be set unless START_WITH_NEW_WALLET=true".to_string()
+            })?;
+        let wallet_ctx: McpWalletContext = WalletContext::from_private_key_hex(wallet_private_key)?;
+        let wallet_address = wallet_ctx.get_address();
+        tracing::info!("[mcp] Wallet address: {}", wallet_address);
+
+        tracing::info!("[mcp] Initializing privacy key from PRIVPOOL_SPEND_KEY");
+        let privpool_spend_key = cfg
+            .privpool_spend_key
+            .as_deref()
+            .ok_or_else(|| {
+                "PRIVPOOL_SPEND_KEY must be set unless START_WITH_NEW_WALLET=true".to_string()
+            })?;
+        let privacy_key = if privpool_spend_key.starts_with("privpool1") {
+            PrivacyKey::from_address(privpool_spend_key)
+        } else {
+            PrivacyKey::from_hex(privpool_spend_key)
+        }
+        .map_err(|e| {
+            format!(
+                "Failed to initialize privacy key from PRIVPOOL_SPEND_KEY: {}. \
+                Please provide a valid 32-byte hex string (with or without 0x prefix) \
+                or a bech32m privacy address (privpool1...)",
+                e
+            )
+        })?;
+
+        tracing::info!("[mcp] Privacy key initialized successfully");
+        tracing::info!(
+            "[mcp] Privacy address: {}",
+            privacy_key.privacy_address(&DOMAIN)
+        );
+        tracing::info!(
+            "[mcp] All deposits will be made to this privacy address: {}",
+            privacy_key.privacy_address(&DOMAIN)
+        );
+
+        (wallet_ctx, privacy_key)
+    };
+
+    let wallet_ctx = Arc::new(RwLock::new(wallet_ctx));
+    let privacy_key = Arc::new(RwLock::new(privacy_key));
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -220,8 +304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
-    // Track whether a wallet has been loaded (including from environment variables)
-    // Starts as true since the initial wallet is loaded from environment variables
+    // Track whether a wallet has been loaded (including from environment variables or startup generation)
+    // Starts as true since the initial wallet is loaded before serving requests
     let wallet_explicitly_loaded = Arc::new(RwLock::new(true));
     let wallet_explicitly_loaded_for_service = wallet_explicitly_loaded.clone();
 
