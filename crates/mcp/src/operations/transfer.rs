@@ -604,9 +604,7 @@ pub async fn transfer(
             (Some(vec![att_0]), Some(vec![enc_0]))
         }
     } else {
-        tracing::debug!(
-            "No viewer FVK configured: transfer will not include viewer attestation"
-        );
+        tracing::debug!("No viewer FVK configured: transfer will not include viewer attestation");
         (None, None)
     };
 
@@ -1007,9 +1005,9 @@ pub async fn transfer(
     }
 
     // Viewer section arguments (Level B) if viewer FVK is configured.
-    let viewer_fvk_commitment_arg_idx: Option<usize> =
-        if let (Some(ref bundle), Some(ref atts)) = (viewer_fvk_bundle.as_ref(), &view_attestations)
-        {
+    let viewer_fvk_commitment_arg_idx: Option<usize> = if let (Some(ref bundle), Some(ref atts)) =
+        (viewer_fvk_bundle.as_ref(), &view_attestations)
+    {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -1026,7 +1024,12 @@ pub async fn transfer(
             &mut proof_args,
         );
         // fvk (private)
-        push(arg32(&bundle.fvk), true, &mut private_indices, &mut proof_args);
+        push(
+            arg32(&bundle.fvk),
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
             push(
@@ -1085,7 +1088,9 @@ pub async fn transfer(
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("Failed to serialize Ligero args to JSON values for package")?;
 
-    if let (Some(idx), Some(ref bundle)) = (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref()) {
+    if let (Some(idx), Some(ref bundle)) =
+        (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref())
+    {
         let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
             anyhow::anyhow!(
                 "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"

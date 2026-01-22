@@ -1,6 +1,6 @@
 use anyhow::Result;
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::OnConflict;
@@ -124,7 +124,9 @@ async fn list_all_tables(
             "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE()"
         }
     };
-    let rows = idx_db.query_all(Statement::from_string(backend, sql)).await?;
+    let rows = idx_db
+        .query_all(Statement::from_string(backend, sql))
+        .await?;
     let mut tables = Vec::new();
     for row in rows {
         if let Ok(name) = row.try_get::<String>("", "name") {
@@ -362,8 +364,8 @@ pub async fn insert_midnight_transfer(
 /// it extracts the keys and computes the recipient hash, then encodes it as bech32m.
 /// Otherwise returns the address as-is.
 fn normalize_address_for_query(address: &str) -> String {
-    use midnight_privacy::PrivacyAddress;
     use crate::viewer::hex_to_bech32m_address;
+    use midnight_privacy::PrivacyAddress;
 
     // Domain constant used for privacy operations (matches the rest of the codebase)
     const DOMAIN: [u8; 32] = [1u8; 32];
@@ -423,7 +425,10 @@ pub async fn list_wallet_txs(
     let mut transfer_matches = 0u64;
 
     // Deposits by sender OR recipient
-    debug!("Fetching midnight_deposit records for sender or recipient={}", normalized_address);
+    debug!(
+        "Fetching midnight_deposit records for sender or recipient={}",
+        normalized_address
+    );
     let deposit_filter = if should_scan_privacy {
         Condition::any()
             .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
@@ -450,10 +455,7 @@ pub async fn list_wallet_txs(
             trace!("Deposit event id {} not found in idx::Entity", md.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            md.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, md.encrypted_notes.as_ref());
         let privacy_recipient = md
             .recipient
             .clone()
@@ -485,7 +487,8 @@ pub async fn list_wallet_txs(
             if t != "deposit" {
                 trace!(
                     "Deposit {} filtered out by type (expected deposit, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -549,10 +552,7 @@ pub async fn list_wallet_txs(
             trace!("Withdraw event id {} not found in idx::Entity", mw.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            mw.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, mw.encrypted_notes.as_ref());
         let privacy_sender = mw
             .privacy_sender
             .clone()
@@ -583,7 +583,8 @@ pub async fn list_wallet_txs(
             if t != "withdraw" {
                 trace!(
                     "Withdraw {} filtered out by type (expected withdraw, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -648,10 +649,7 @@ pub async fn list_wallet_txs(
             trace!("Transfer event id {} not found in idx::Entity", mt.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            mt.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, mt.encrypted_notes.as_ref());
         let privacy_sender = mt
             .privacy_sender
             .clone()
@@ -660,9 +658,8 @@ pub async fn list_wallet_txs(
             .recipient
             .clone()
             .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
-        let matches_recipient =
-            privacy_recipient.as_deref() == Some(normalized_address.as_str())
-                || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
+        let matches_recipient = privacy_recipient.as_deref() == Some(normalized_address.as_str())
+            || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
         let matches_sender = privacy_sender.as_deref() == Some(normalized_address.as_str());
         let matches = if address_is_privacy {
             matches_recipient || matches_sender
@@ -695,7 +692,8 @@ pub async fn list_wallet_txs(
             if t != "transfer" {
                 trace!(
                     "Transfer {} filtered out by type (expected transfer, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -866,10 +864,7 @@ pub async fn list_txs(
     })
 }
 
-pub async fn get_tx(
-    db: &DatabaseConnection,
-    tx_hash: &str,
-) -> Result<Option<InvolvementItem>> {
+pub async fn get_tx(db: &DatabaseConnection, tx_hash: &str) -> Result<Option<InvolvementItem>> {
     // Look up by tx_hash in events then related tables.
     let ev = idx::Entity::find()
         .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
@@ -968,10 +963,7 @@ fn resolve_decrypted_notes(
     viewer::try_decrypt_notes_json(vfk, encrypted)
 }
 
-fn decrypted_notes_match_recipient(
-    decrypted_notes: Option<&JsonValue>,
-    recipient: &str,
-) -> bool {
+fn decrypted_notes_match_recipient(decrypted_notes: Option<&JsonValue>, recipient: &str) -> bool {
     let Some(decrypted_notes) = decrypted_notes else {
         return false;
     };

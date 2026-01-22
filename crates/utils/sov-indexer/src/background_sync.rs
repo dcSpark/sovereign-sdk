@@ -145,8 +145,7 @@ pub async fn backfill_index(
                 .await?;
                 let decrypted_notes =
                     viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
-                let privacy_sender =
-                    extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
+                let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
                     idx,
                     event_id,
@@ -297,10 +296,8 @@ async fn backfill_deposits(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };
@@ -363,10 +360,8 @@ async fn backfill_transfers(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };
@@ -435,10 +430,8 @@ async fn backfill_withdraws(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };

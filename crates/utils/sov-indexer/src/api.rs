@@ -168,11 +168,7 @@ async fn wallet_balance(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (
-                status,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
+            (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
         }
     }
 }
@@ -223,7 +219,11 @@ fn is_balance_client_error(err: &anyhow::Error) -> bool {
     {
         return true;
     }
-    if err.root_cause().downcast_ref::<hex::FromHexError>().is_some() {
+    if err
+        .root_cause()
+        .downcast_ref::<hex::FromHexError>()
+        .is_some()
+    {
         return true;
     }
 

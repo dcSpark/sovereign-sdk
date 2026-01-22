@@ -72,10 +72,7 @@ async fn check_services_available(
         let proof_url = proof_service_url.trim_end_matches('/');
         let proof_check = reqwest::get(format!("{}/health", proof_url)).await;
         if proof_check.is_err() {
-            eprintln!(
-                "⚠️  Proof service not available at {}",
-                proof_service_url
-            );
+            eprintln!("⚠️  Proof service not available at {}", proof_service_url);
             return false;
         }
     }
@@ -195,9 +192,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Step 6: Initialize Ligero proof client for transfer
     tracing::info!("Step 6: Initializing Ligero proof client");
     let Some(ligero) = create_test_ligero() else {
-        eprintln!(
-            "⚠️  Skipping integration test: Ligero proof service not configured"
-        );
+        eprintln!("⚠️  Skipping integration test: Ligero proof service not configured");
         return Ok(());
     };
     tracing::info!("✓ Ligero proof client initialized");
@@ -450,9 +445,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
 
     // Initialize Ligero proof client
     let Some(ligero) = create_test_ligero() else {
-        eprintln!(
-            "⚠️  Skipping integration test: Ligero proof service not configured"
-        );
+        eprintln!("⚠️  Skipping integration test: Ligero proof service not configured");
         return Ok(());
     };
 

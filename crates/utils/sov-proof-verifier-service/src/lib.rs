@@ -153,9 +153,8 @@ impl AppState {
             let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
                 anyhow::anyhow!("{env_name} must be a 32-byte ed25519 public key (got {len} bytes)")
             })?;
-            Ed25519VerifyingKey::from_bytes(&bytes).with_context(|| {
-                format!("{env_name} must be a valid ed25519 public key")
-            })
+            Ed25519VerifyingKey::from_bytes(&bytes)
+                .with_context(|| format!("{env_name} must be a valid ed25519 public key"))
         }
 
         // Allow skipping cryptographic verification via env var.
@@ -327,11 +326,9 @@ fn ligero_skip_verify_enabled() -> bool {
 }
 
 fn parse_ligero_i64_arg(v: &serde_json::Value, label: &str) -> Result<i64, ServiceError> {
-    v.get("i64")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            ServiceError::ParseError(format!("Expected Ligero i64 argument for {label}"))
-        })
+    v.get("i64").and_then(|v| v.as_i64()).ok_or_else(|| {
+        ServiceError::ParseError(format!("Expected Ligero i64 argument for {label}"))
+    })
 }
 
 fn decode_hex_bytes(label: &str, s: &str) -> Result<Vec<u8>, ServiceError> {
@@ -340,10 +337,13 @@ fn decode_hex_bytes(label: &str, s: &str) -> Result<Vec<u8>, ServiceError> {
     hex::decode(s).map_err(|e| ServiceError::ParseError(format!("Invalid hex for {label}: {e}")))
 }
 
-fn decode_ligero_hash32_arg(v: &serde_json::Value, label: &str) -> Result<MidnightHash32, ServiceError> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| ServiceError::ParseError(format!("Expected Ligero arg object for {label}")))?;
+fn decode_ligero_hash32_arg(
+    v: &serde_json::Value,
+    label: &str,
+) -> Result<MidnightHash32, ServiceError> {
+    let obj = v.as_object().ok_or_else(|| {
+        ServiceError::ParseError(format!("Expected Ligero arg object for {label}"))
+    })?;
 
     if let Some(b64) = obj.get("bytes_b64").and_then(|v| v.as_str()) {
         let bytes = BASE64_STANDARD.decode(b64).map_err(|e| {
@@ -374,9 +374,9 @@ fn decode_pool_signature_from_ligero_arg(
     v: &serde_json::Value,
     label: &str,
 ) -> Result<[u8; 64], ServiceError> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| ServiceError::ParseError(format!("Expected Ligero arg object for {label}")))?;
+    let obj = v.as_object().ok_or_else(|| {
+        ServiceError::ParseError(format!("Expected Ligero arg object for {label}"))
+    })?;
 
     // Accept a few common spellings to match upstream payloads.
     let sig_hex = obj
@@ -403,7 +403,9 @@ fn decode_pool_signature_from_ligero_arg(
 /// Locate the Level-B viewer section and return the index of the first viewer `fvk_commitment` arg.
 ///
 /// This follows the fixed ABI described in `crates/adapters/ligero/reference_circuits/note_spend_guest_v2.rs`.
-fn locate_viewer_fvk_commitment_index(args: &[serde_json::Value]) -> Result<Option<usize>, ServiceError> {
+fn locate_viewer_fvk_commitment_index(
+    args: &[serde_json::Value],
+) -> Result<Option<usize>, ServiceError> {
     // Header indices (0-based):
     // 0 domain, 1 spend_sk, 2 pk_ivk_owner, 3 depth, 4 anchor, 5 n_in
     if args.len() < 6 {
@@ -435,13 +437,17 @@ fn locate_viewer_fvk_commitment_index(args: &[serde_json::Value]) -> Result<Opti
     let mut idx: usize = 6;
     for _ in 0..n_in {
         // value_in, rho_in, sender_id_in, pos
-        idx = idx.checked_add(4).ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
+        idx = idx
+            .checked_add(4)
+            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
         // siblings[depth]
         idx = idx
             .checked_add(depth)
             .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
         // nullifier (public)
-        idx = idx.checked_add(1).ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
+        idx = idx
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
     }
 
     if idx + 3 > args.len() {
@@ -547,8 +553,11 @@ fn enforce_pool_signed_viewer_commitment_in_args(
     pool_pk: &Ed25519VerifyingKey,
     args: &[serde_json::Value],
 ) -> Result<MidnightHash32, ServiceError> {
-    let idx = locate_viewer_fvk_commitment_index(&args)?
-        .ok_or_else(|| ServiceError::SignatureError("Missing viewer section in proof args (POOL_FVK_PK is set)".to_string()))?;
+    let idx = locate_viewer_fvk_commitment_index(&args)?.ok_or_else(|| {
+        ServiceError::SignatureError(
+            "Missing viewer section in proof args (POOL_FVK_PK is set)".to_string(),
+        )
+    })?;
 
     let fvk_commitment = decode_ligero_hash32_arg(&args[idx], "viewer.fvk_commitment")?;
     let signature = decode_pool_signature_from_ligero_arg(&args[idx], "viewer.fvk_commitment")?;
@@ -570,7 +579,9 @@ pub struct ViewCiphertextsMeta {
     notes: Vec<ViewCiphertextMeta>,
 }
 
-fn view_ciphertexts_meta(view_ciphertexts: Option<&Vec<EncryptedNote>>) -> Option<ViewCiphertextsMeta> {
+fn view_ciphertexts_meta(
+    view_ciphertexts: Option<&Vec<EncryptedNote>>,
+) -> Option<ViewCiphertextsMeta> {
     let notes = view_ciphertexts?;
     let notes = notes
         .iter()
@@ -588,12 +599,15 @@ fn enforce_pool_signed_viewer_commitment(
     pool_pk: &Ed25519VerifyingKey,
     proof: &[u8],
 ) -> Result<MidnightHash32, ServiceError> {
-    let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(proof).map_err(|e| {
-        ServiceError::ParseError(format!("Proof payload is not a LigeroProofPackage ({e})"))
-    })?;
+    let package: sov_ligero_adapter::LigeroProofPackage =
+        bincode::deserialize(proof).map_err(|e| {
+            ServiceError::ParseError(format!("Proof payload is not a LigeroProofPackage ({e})"))
+        })?;
 
     let args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json).map_err(|e| {
-        ServiceError::ParseError(format!("LigeroProofPackage.args_json is not valid JSON: {e}"))
+        ServiceError::ParseError(format!(
+            "LigeroProofPackage.args_json is not valid JSON: {e}"
+        ))
     })?;
 
     enforce_pool_signed_viewer_commitment_in_args(pool_pk, &args)
@@ -671,7 +685,10 @@ async fn verify_with_prover_service(
         )));
     }
 
-    debug!("✓ Prover service verification succeeded for circuit {}", circuit);
+    debug!(
+        "✓ Prover service verification succeeded for circuit {}",
+        circuit
+    );
     Ok(())
 }
 
@@ -1400,21 +1417,21 @@ async fn verify_and_record_midnight_handler(
             anchor_root,
             nullifier,
             view_ciphertexts,
-	        } => {
-	            // Transfers have proofs but zero withdraw amount; outputs contain new commitments
-	            debug!(
-	                "Parsed midnight transfer: nullifier=0x{}, anchor_root=0x{}, proof_size={} bytes",
+        } => {
+            // Transfers have proofs but zero withdraw amount; outputs contain new commitments
+            debug!(
+                "Parsed midnight transfer: nullifier=0x{}, anchor_root=0x{}, proof_size={} bytes",
                 hex::encode(nullifier),
                 hex::encode(anchor_root),
                 proof.len()
-	            );
+            );
 
-	            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
-	            let proof_start = std::time::Instant::now();
-	            // For transfers, expected withdraw_amount is 0
-	            let proof_public = verify_midnight_withdraw_proof(
-	                state.config.midnight_method_id.as_ref(),
-	                proof,
+            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
+            let proof_start = std::time::Instant::now();
+            // For transfers, expected withdraw_amount is 0
+            let proof_public = verify_midnight_withdraw_proof(
+                state.config.midnight_method_id.as_ref(),
+                proof,
                 state.config.max_concurrent_verifications,
                 anchor_root,
                 nullifier,
@@ -1806,8 +1823,8 @@ async fn verify_ligero_proof(
     let proof = proof.to_vec();
 
     // Decode package first (needed for both paths)
-    let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof)
-        .map_err(|err| {
+    let package: sov_ligero_adapter::LigeroProofPackage =
+        bincode::deserialize(&proof).map_err(|err| {
             ServiceError::ProofError(format!(
                 "Proof payload is not a LigeroProofPackage ({}). \
                      Regenerate the proof with the updated tooling.",
@@ -1825,7 +1842,10 @@ async fn verify_ligero_proof(
         // Skip verification, just decode public output
     } else if let Some(url) = prover_url {
         // Use remote prover service
-        debug!("Using remote prover service at {} for value-setter verification", url);
+        debug!(
+            "Using remote prover service at {} for value-setter verification",
+            url
+        );
         verify_with_prover_service(&http_client, &url, "value_validator_rust", &package).await?;
     } else {
         // Fall back to local daemon pool
@@ -1839,9 +1859,8 @@ async fn verify_ligero_proof(
     }
 
     // Decode and verify public output
-    let public: ValueProofPublic = bincode::deserialize(&package.public_output).map_err(|e| {
-        ServiceError::ProofError(format!("Failed to decode public output: {e}"))
-    })?;
+    let public: ValueProofPublic = bincode::deserialize(&package.public_output)
+        .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?;
 
     // Check that the public output matches the claimed value
     if public.value != value {
@@ -2232,7 +2251,10 @@ pub async fn verify_midnight_withdraw_proof(
         // Skip verification
     } else if let (Some(url), Some(client)) = (prover_service_url, http_client) {
         // Use remote prover service
-        debug!("Using remote prover service at {} for midnight verification", url);
+        debug!(
+            "Using remote prover service at {} for midnight verification",
+            url
+        );
         verify_with_prover_service(client, url, "note_spend_guest", &package).await?;
     } else {
         // Fall back to local daemon pool
@@ -2246,9 +2268,8 @@ pub async fn verify_midnight_withdraw_proof(
     }
 
     // Decode and verify public output
-    let public: SpendPublic = bincode::deserialize(&package.public_output).map_err(|e| {
-        ServiceError::ProofError(format!("Failed to decode public output: {e}"))
-    })?;
+    let public: SpendPublic = bincode::deserialize(&package.public_output)
+        .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?;
 
     // Verify public output against expected values
     if public.anchor_root != expected_anchor_root {

@@ -113,7 +113,11 @@ fn pool_admin_management_and_freeze_unfreeze() {
         &mut ws,
     )
     .unwrap();
-    let frozen = mp.frozen_addresses.get(&mut ws).unwrap().unwrap_or_default();
+    let frozen = mp
+        .frozen_addresses
+        .get(&mut ws)
+        .unwrap()
+        .unwrap_or_default();
     assert_eq!(frozen, vec![addr]);
     assert_ne!(
         mp.blacklist_root.get(&mut ws).unwrap().unwrap(),
@@ -125,7 +129,11 @@ fn pool_admin_management_and_freeze_unfreeze() {
         &mut ws,
     )
     .unwrap();
-    let frozen = mp.frozen_addresses.get(&mut ws).unwrap().unwrap_or_default();
+    let frozen = mp
+        .frozen_addresses
+        .get(&mut ws)
+        .unwrap()
+        .unwrap_or_default();
     assert!(frozen.is_empty());
     assert_eq!(
         mp.blacklist_root.get(&mut ws).unwrap().unwrap(),

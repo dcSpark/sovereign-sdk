@@ -1323,17 +1323,22 @@ impl CryptoServer {
             .transpose()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
 
-        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
-            let http = reqwest::Client::new();
-            Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
-                ErrorData::internal_error(
+        let viewer_fvk_bundle =
+            if let Some(pool_pk) = pool_fvk_pk {
+                let http = reqwest::Client::new();
+                Some(
+                    fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                        .await
+                        .map_err(|e| {
+                            ErrorData::internal_error(
                     format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
                     None,
                 )
-            })?)
-        } else {
-            None
-        };
+                        })?,
+                )
+            } else {
+                None
+            };
 
         // Create new privacy key
         let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
@@ -1459,7 +1464,8 @@ impl CryptoServer {
                     let mut sig_arr = [0u8; 64];
                     sig_arr.copy_from_slice(&sig_bytes);
 
-                    let commitment = midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
+                    let commitment =
+                        midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
                     let pool_vk = VerifyingKey::from_bytes(&pool_pk).map_err(|e| {
                         ErrorData::invalid_params(
                             format!("Invalid POOL_FVK_PK verifying key: {e}"),
@@ -1486,14 +1492,18 @@ impl CryptoServer {
                 }
                 (None, None) => {
                     let http = reqwest::Client::new();
-                    Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
-                        ErrorData::internal_error(
-                            format!(
+                    Some(
+                        fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                            .await
+                            .map_err(|e| {
+                                ErrorData::internal_error(
+                                    format!(
                                 "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
                             ),
-                            None,
-                        )
-                    })?)
+                                    None,
+                                )
+                            })?,
+                    )
                 }
                 _ => {
                     return Err(ErrorData::invalid_params(

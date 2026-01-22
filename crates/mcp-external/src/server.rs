@@ -17,10 +17,10 @@ use rmcp::{
     ServerHandler,
 };
 use sov_address::MultiAddressEvm;
+use sov_bank::config_gas_token_id;
 use sov_ligero_adapter::Ligero;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
-use sov_bank::config_gas_token_id;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
@@ -132,18 +132,19 @@ async fn run_auto_fund_sequence(
                 return;
             }
 
-            let dest_wallet_address_parsed: <McpSpec as Spec>::Address =
-                match dest_wallet_address.parse() {
-                    Ok(address) => address,
-                    Err(e) => {
-                        tracing::warn!(
+            let dest_wallet_address_parsed: <McpSpec as Spec>::Address = match dest_wallet_address
+                .parse()
+            {
+                Ok(address) => address,
+                Err(e) => {
+                    tracing::warn!(
                             "[auto-fund/createWallet] Invalid L2 wallet address '{}': {}. Skipping Step 2.",
                             dest_wallet_address,
                             e
                         );
-                        return;
-                    }
-                };
+                    return;
+                }
+            };
 
             let max_wait = std::time::Duration::from_secs(30);
             let poll_interval = std::time::Duration::from_secs(2);
@@ -1225,7 +1226,9 @@ impl CryptoServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let record = details_to_record(tx_details);
 
-        let result = GetTransactionStatusResult { transaction: record };
+        let result = GetTransactionStatusResult {
+            transaction: record,
+        };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
@@ -1259,9 +1262,10 @@ impl CryptoServer {
         let ctx = wallet_ctx.read().await;
         let privacy_key_guard = self.privacy_key.read().await;
 
-        let transactions = crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let transactions =
+            crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let transaction_records: Vec<TransactionRecord> = transactions
             .into_iter()
@@ -1399,17 +1403,22 @@ impl CryptoServer {
             .transpose()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
 
-        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
-            let http = reqwest::Client::new();
-            Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
-                ErrorData::internal_error(
+        let viewer_fvk_bundle =
+            if let Some(pool_pk) = pool_fvk_pk {
+                let http = reqwest::Client::new();
+                Some(
+                    fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                        .await
+                        .map_err(|e| {
+                            ErrorData::internal_error(
                     format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
                     None,
                 )
-            })?)
-        } else {
-            None
-        };
+                        })?,
+                )
+            } else {
+                None
+            };
 
         // Replace the wallet context and privacy keys
         if let Some(ref wallet_ctx) = self.wallet_context {
@@ -1571,7 +1580,8 @@ impl CryptoServer {
                     let mut sig_arr = [0u8; 64];
                     sig_arr.copy_from_slice(&sig_bytes);
 
-                    let commitment = midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
+                    let commitment =
+                        midnight_privacy::fvk_commitment(&midnight_privacy::FullViewingKey(fvk));
                     let pool_vk = VerifyingKey::from_bytes(&pool_pk).map_err(|e| {
                         ErrorData::invalid_params(
                             format!("Invalid POOL_FVK_PK verifying key: {e}"),
@@ -1598,14 +1608,18 @@ impl CryptoServer {
                 }
                 (None, None) => {
                     let http = reqwest::Client::new();
-                    Some(fetch_viewer_fvk_bundle(&http, Some(pool_pk)).await.map_err(|e| {
-                        ErrorData::internal_error(
-                            format!(
+                    Some(
+                        fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                            .await
+                            .map_err(|e| {
+                                ErrorData::internal_error(
+                                    format!(
                                 "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
                             ),
-                            None,
-                        )
-                    })?)
+                                    None,
+                                )
+                            })?,
+                    )
                 }
                 _ => {
                     return Err(ErrorData::invalid_params(
@@ -1691,7 +1705,8 @@ impl CryptoServer {
 
         let result = RemoveWalletResult {
             success: true,
-            message: "Wallet removed successfully. You can now use createWallet or restoreWallet.".to_string(),
+            message: "Wallet removed successfully. You can now use createWallet or restoreWallet."
+                .to_string(),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());

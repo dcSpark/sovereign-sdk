@@ -191,7 +191,10 @@ impl FvkStore {
         Ok(())
     }
 
-    pub async fn get_fvk_by_commitment(&self, fvk_commitment: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+    pub async fn get_fvk_by_commitment(
+        &self,
+        fvk_commitment: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>> {
         let row: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
             SELECT fvk

@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use sov_api_spec::types;
 use sov_bank::TokenId;
 use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
-use serde::Deserialize;
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -195,8 +195,6 @@ impl Provider {
 
         Ok(chain_data)
     }
-
-    
 
     /// Get the nonce for a public key
     pub async fn get_nonce<S: Spec>(
@@ -608,12 +606,10 @@ impl Provider {
             );
         }
 
-        let balance_response: BalanceResponse = response.json().await.with_context(|| {
-            format!(
-                "Failed to parse balance JSON from indexer at {}",
-                url
-            )
-        })?;
+        let balance_response: BalanceResponse = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse balance JSON from indexer at {}", url))?;
 
         tracing::debug!(
             "Fetched balance for address {}: {}",
@@ -623,5 +619,4 @@ impl Provider {
 
         Ok(balance_response)
     }
-
 }

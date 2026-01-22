@@ -116,8 +116,7 @@ pub async fn get_wallet_balance(
             continue;
         };
         if let (Some(amount), Some(rho_hex)) = (row.amount.as_ref(), row.rho.as_ref()) {
-            if let (Ok(value), Ok(rho)) =
-                (amount.parse::<u128>(), parse_hash32_hex(rho_hex, "rho"))
+            if let (Ok(value), Ok(rho)) = (amount.parse::<u128>(), parse_hash32_hex(rho_hex, "rho"))
             {
                 add_note(
                     &mut notes,
@@ -136,13 +135,9 @@ pub async fn get_wallet_balance(
 
         let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         for note in decrypted_notes {
-            if let Some(record) = note_from_decrypted(
-                &note,
-                &user_recipient,
-                tx_hash,
-                *timestamp_ms,
-                "deposit",
-            ) {
+            if let Some(record) =
+                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "deposit")
+            {
                 add_note(&mut notes, &mut seen_rhos, record);
             }
         }
@@ -157,13 +152,9 @@ pub async fn get_wallet_balance(
             decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         }
         for note in decrypted_notes {
-            if let Some(record) = note_from_decrypted(
-                &note,
-                &user_recipient,
-                tx_hash,
-                *timestamp_ms,
-                "transfer",
-            ) {
+            if let Some(record) =
+                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "transfer")
+            {
                 add_note(&mut notes, &mut seen_rhos, record);
             }
         }
@@ -175,13 +166,9 @@ pub async fn get_wallet_balance(
         };
         let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
         for note in decrypted_notes {
-            if let Some(record) = note_from_decrypted(
-                &note,
-                &user_recipient,
-                tx_hash,
-                *timestamp_ms,
-                "withdraw",
-            ) {
+            if let Some(record) =
+                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "withdraw")
+            {
                 add_note(&mut notes, &mut seen_rhos, record);
             }
         }
@@ -367,16 +354,22 @@ async fn fetch_spent_nullifiers(
 }
 
 fn normalize_nullifier(value: &str) -> String {
-    value.trim().strip_prefix("0x").unwrap_or(value).to_lowercase()
+    value
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(value)
+        .to_lowercase()
 }
 
 fn parse_hash32_hex(value: &str, field: &str) -> Result<Hash32> {
     let trimmed = value.trim();
     let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes =
-        hex::decode(trimmed).with_context(|| format!("Invalid hex for {field}"))?;
+    let bytes = hex::decode(trimmed).with_context(|| format!("Invalid hex for {field}"))?;
     if bytes.len() != 32 {
-        anyhow::bail!("Expected 32-byte hex for {field}, got {} bytes", bytes.len());
+        anyhow::bail!(
+            "Expected 32-byte hex for {field}, got {} bytes",
+            bytes.len()
+        );
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);

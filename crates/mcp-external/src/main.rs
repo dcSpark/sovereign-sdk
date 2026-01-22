@@ -89,10 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Ligero proof client (HTTP service)
     tracing::info!("[mcp] Initializing Ligero proof service client");
-    tracing::info!(
-        "[mcp] Proof service URL: {}",
-        cfg.ligero_proof_service_url
-    );
+    tracing::info!("[mcp] Proof service URL: {}", cfg.ligero_proof_service_url);
     tracing::info!("[mcp] Circuit: {}", cfg.ligero_program_path);
 
     let ligero = Arc::new(Ligero::new(
@@ -184,11 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<u128>().map_err(|e| {
-                tracing::warn!(
-                    "[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}",
-                    s,
-                    e
-                );
+                tracing::warn!("[auto-fund] Invalid AUTO_FUND_GAS_RESERVE '{}': {}", s, e);
                 e
             })
         })

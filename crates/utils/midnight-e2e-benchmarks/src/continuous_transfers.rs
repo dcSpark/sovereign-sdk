@@ -40,12 +40,12 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use toml::Value as TomlValue;
 
+use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
+use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 use crate::{
     find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
     ChildGuard, LigeroEnv,
 };
-use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
-use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -103,7 +103,6 @@ struct ProverServiceResponse {
     proof: Option<String>,
     error: Option<String>,
 }
-
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
@@ -637,7 +636,10 @@ pub async fn run() -> Result<()> {
         config.managed_mode
     );
     if let Some(ref url) = config.prover_service_url {
-        eprintln!("[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)", url);
+        eprintln!(
+            "[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)",
+            url
+        );
     } else {
         eprintln!("[config] Prover: local daemon pool (PROVER_SERVICE_URL=\"\")");
     }
@@ -2295,7 +2297,6 @@ async fn perform_transfer_cycle(
                 let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
                     Some(fvk) => {
                         let mut ciphertexts = Vec::new();
-                        
                         // Pay note ciphertext
                         let cm_pay = note_commitment(
                             &DOMAIN,

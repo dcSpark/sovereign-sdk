@@ -189,7 +189,12 @@ pub async fn issue_fvk(
     State(state): State<AppState>,
     Json(req): Json<IssueFvkRequest>,
 ) -> Result<Json<IssueFvkResponse>, ApiError> {
-    if req.seed.as_deref().map(str::trim).filter(|v| !v.is_empty()).is_some()
+    if req
+        .seed
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some()
         || req
             .seed_hex
             .as_deref()
@@ -359,7 +364,10 @@ mod tests {
 
         let issued = issuer.issue().unwrap();
         verifying_key
-            .verify_strict(&issued.fvk_commitment, &Signature::from_bytes(&issued.signature))
+            .verify_strict(
+                &issued.fvk_commitment,
+                &Signature::from_bytes(&issued.signature),
+            )
             .expect("signature should verify");
     }
 }

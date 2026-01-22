@@ -217,7 +217,7 @@ where
                         Some(stf_info) => stf_info,
                     };
                     tracing::trace!(
-                        slot_number = %stf_info.slot_number,
+                        slot_number = stf_info.slot_number.get(),
                         block_header = %stf_info.da_block_header().display(),
                         "Received STF info");
 
