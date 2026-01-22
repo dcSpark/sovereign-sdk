@@ -162,4 +162,3 @@ pub async fn remove_pool_admin(
 
     Ok(AdminTxResult { tx_hash })
 }
-

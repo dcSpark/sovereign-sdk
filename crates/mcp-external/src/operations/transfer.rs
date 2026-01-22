@@ -22,8 +22,8 @@ use sov_modules_api::Amount;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
-use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::fvk_service::ViewerFvkBundle;
+use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::viewer;
@@ -760,7 +760,12 @@ pub async fn transfer(
 
     // Header:
     push(arg32(&DOMAIN), false, &mut private_indices, &mut proof_args); // 1 domain
-    push(arg32(&spend_sk), true, &mut private_indices, &mut proof_args); // 2 spend_sk
+    push(
+        arg32(&spend_sk),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 2 spend_sk
     push(
         arg32(&pk_ivk_owner),
         true,
@@ -775,7 +780,12 @@ pub async fn transfer(
         &mut private_indices,
         &mut proof_args,
     ); // 4 depth
-    push(arg32(&anchor_root), false, &mut private_indices, &mut proof_args); // 5 anchor
+    push(
+        arg32(&anchor_root),
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 5 anchor
     push(
         LigeroProgramArguments::I64 {
             i64: u64_to_i64(n_in as u64, "n_in")?,
@@ -895,12 +905,7 @@ pub async fn transfer(
             &mut private_indices,
             &mut proof_args,
         );
-        push(
-            arg32(&rho1),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&rho1), true, &mut private_indices, &mut proof_args);
         push(
             arg32(&pk_spend_owner),
             true,
@@ -913,12 +918,7 @@ pub async fn transfer(
             &mut private_indices,
             &mut proof_args,
         );
-        push(
-            arg32(&cm1),
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&cm1), false, &mut private_indices, &mut proof_args);
     }
 
     // inv_enforce (private).
@@ -974,14 +974,25 @@ pub async fn transfer(
         Ok(inv.to_bytes_be())
     }
 
-    push(arg32(&blacklist_root), false, &mut private_indices, &mut proof_args);
+    push(
+        arg32(&blacklist_root),
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Opening 0: sender_id (spender identity)
     for e in sender_opening.bucket_entries.iter() {
         push(arg32(e), true, &mut private_indices, &mut proof_args);
     }
-    let sender_inv = bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
-    push(arg32(&sender_inv), true, &mut private_indices, &mut proof_args);
+    let sender_inv =
+        bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
+    push(
+        arg32(&sender_inv),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
     for sib in sender_opening.siblings.iter().take(bl_depth) {
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
@@ -991,15 +1002,20 @@ pub async fn transfer(
         push(arg32(e), true, &mut private_indices, &mut proof_args);
     }
     let dest_inv = bl_bucket_inv_for_id(&dest_opening.recipient, &dest_opening.bucket_entries)?;
-    push(arg32(&dest_inv), true, &mut private_indices, &mut proof_args);
+    push(
+        arg32(&dest_inv),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
     for sib in dest_opening.siblings.iter().take(bl_depth) {
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
 
     // Viewer section arguments (Level B) if viewer FVK is configured.
-    let viewer_fvk_commitment_arg_idx: Option<usize> =
-        if let (Some(ref bundle), Some(ref atts)) = (viewer_fvk_bundle.as_ref(), &view_attestations)
-        {
+    let viewer_fvk_commitment_arg_idx: Option<usize> = if let (Some(ref bundle), Some(ref atts)) =
+        (viewer_fvk_bundle.as_ref(), &view_attestations)
+    {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -1016,11 +1032,26 @@ pub async fn transfer(
             &mut proof_args,
         );
         // fvk (private)
-        push(arg32(&bundle.fvk), true, &mut private_indices, &mut proof_args);
+        push(
+            arg32(&bundle.fvk),
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
-            push(arg32(&att.ct_hash), false, &mut private_indices, &mut proof_args);
-            push(arg32(&att.mac), false, &mut private_indices, &mut proof_args);
+            push(
+                arg32(&att.ct_hash),
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
+            push(
+                arg32(&att.mac),
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
         }
         Some(fvk_commitment_arg_idx)
     } else {
@@ -1065,7 +1096,9 @@ pub async fn transfer(
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("Failed to serialize Ligero args to JSON values for package")?;
 
-    if let (Some(idx), Some(ref bundle)) = (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref()) {
+    if let (Some(idx), Some(ref bundle)) =
+        (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref())
+    {
         let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
             anyhow::anyhow!(
                 "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"
