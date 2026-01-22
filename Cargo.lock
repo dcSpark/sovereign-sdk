@@ -13750,6 +13750,7 @@ dependencies = [
  "sov-test-utils",
  "sov-universal-wallet",
  "sov-zkvm-utils",
+ "sysinfo 0.32.1",
  "tempfile",
  "tiny_http 0.12.0",
  "tokio",
@@ -15354,6 +15355,20 @@ dependencies = [
  "once_cell",
  "rayon",
  "windows 0.52.0",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c33cd241af0f2e9e3b5c32163b873b29956890b5342e6745b917ce9d490f4af"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+ "memchr",
+ "ntapi",
+ "rayon",
+ "windows 0.57.0",
 ]
 
 [[package]]

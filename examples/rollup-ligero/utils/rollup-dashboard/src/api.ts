@@ -18,6 +18,7 @@ import type {
   MedianTransactionSizeHistoricResponse,
   TokenValueSpentHistoricResponse,
   TokenVelocityHistoricResponse,
+  SystemStats,
 } from './types';
 
 const API_BASE = '/controller';
@@ -29,6 +30,22 @@ export async function fetchHealth(): Promise<HealthResponse> {
     throw new Error(`Health check failed: ${response.statusText}`);
   }
   return response.json();
+}
+
+export async function fetchSystemStats(): Promise<SystemStats | null> {
+  try {
+    const response = await fetch(`${API_BASE}/stats`);
+    if (!response.ok) {
+      return null;
+    }
+    const contentType = response.headers.get('content-type');
+    if (!contentType || !contentType.includes('application/json')) {
+      return null;
+    }
+    return response.json();
+  } catch {
+    return null;
+  }
 }
 
 export async function performAction(action: ActionType): Promise<ActionResult> {

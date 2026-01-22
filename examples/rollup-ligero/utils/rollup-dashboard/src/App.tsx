@@ -2,7 +2,34 @@ import { useState, useEffect, useCallback } from 'react';
 import type { HealthResponse, ActionType, ActionResult, MetricsData } from './types';
 import { fetchHealth, performAction, fetchMetrics } from './api';
 import { MetricsCharts } from './MetricsCharts';
+import { SystemStatsPanel } from './SystemStats';
+import { Terminal } from './Terminal';
 import './styles.css';
+
+interface RowProps {
+  title: string;
+  children: React.ReactNode;
+  defaultExpanded?: boolean;
+  badge?: string;
+  badgeColor?: 'healthy' | 'unhealthy' | 'warning' | 'neutral';
+}
+
+function DashboardRow({ title, children, defaultExpanded = true, badge, badgeColor = 'neutral' }: RowProps) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  
+  return (
+    <div className={`dashboard-row ${expanded ? 'expanded' : 'collapsed'}`}>
+      <button className="row-header" onClick={() => setExpanded(!expanded)}>
+        <span className="row-chevron">{expanded ? '▼' : '▶'}</span>
+        <span className="row-title">{title}</span>
+        {badge && (
+          <span className={`row-badge badge-${badgeColor}`}>{badge}</span>
+        )}
+      </button>
+      {expanded && <div className="row-content">{children}</div>}
+    </div>
+  );
+}
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -12,6 +39,7 @@ function App() {
   const [actionLoading, setActionLoading] = useState<ActionType | null>(null);
   const [actionResult, setActionResult] = useState<ActionResult | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [refreshInterval, setRefreshInterval] = useState(5000);
 
   const loadHealth = useCallback(async () => {
     try {
@@ -37,10 +65,10 @@ function App() {
       const interval = setInterval(() => {
         loadHealth();
         loadMetrics();
-      }, 5000);
+      }, refreshInterval);
       return () => clearInterval(interval);
     }
-  }, [loadHealth, loadMetrics, autoRefresh]);
+  }, [loadHealth, loadMetrics, autoRefresh, refreshInterval]);
 
   const handleAction = async (action: ActionType) => {
     setActionLoading(action);
@@ -67,10 +95,6 @@ function App() {
     return `${ms.toFixed(0)}ms`;
   };
 
-  const formatServiceNumber = (index: number) => {
-    return String(index + 1).padStart(2, '0');
-  };
-
   const formatNumber = (value: number | undefined | null, decimals: number = 2): string => {
     if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     if (Math.abs(value) >= 1_000_000) {
@@ -94,7 +118,6 @@ function App() {
 
   const formatTokenAmount = (value: number | undefined | null): string => {
     if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
-    // Values from API are already in human-readable format (not raw)
     if (Math.abs(value) >= 1_000_000) {
       return `${(value / 1_000_000).toFixed(2)}M`;
     }
@@ -107,267 +130,307 @@ function App() {
     return value.toFixed(4);
   };
 
+  const healthyCount = health?.services.filter(s => s.status === 'healthy').length ?? 0;
+  const totalCount = health?.services.length ?? 0;
+  const servicesStatusText = `${healthyCount}/${totalCount} healthy`;
+  const servicesStatusColor = healthyCount === totalCount ? 'healthy' : healthyCount === 0 ? 'unhealthy' : 'warning';
+
   return (
-    <div className="app">
-      <header className="header">
-        <h1>Midnight L2 Service Dashboard</h1>
-        <div className="header-controls">
-          <label className="auto-refresh">
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(e) => setAutoRefresh(e.target.checked)}
-            />
-            Auto-refresh
-          </label>
-          <button className="refresh-btn" onClick={loadHealth} disabled={loading}>
-            {loading ? 'Loading...' : 'Refresh'}
-          </button>
+    <div className="app grafana-style">
+      {/* Top Navigation Bar */}
+      <header className="dashboard-navbar">
+        <div className="navbar-left">
+          <div className="dashboard-logo">
+            <span className="logo-icon">◈</span>
+            <span className="logo-text">Midnight L2</span>
+          </div>
+          <div className="navbar-divider" />
+          <h1 className="dashboard-title">Service Dashboard</h1>
+        </div>
+        <div className="navbar-center">
+          {health && (
+            <div className={`system-status-pill ${getStatusColor(health.status)}`}>
+              <span className="status-dot-small" />
+              <span>System {health.status}</span>
+            </div>
+          )}
+        </div>
+        <div className="navbar-right">
+          <div className="refresh-controls">
+            <select 
+              className="refresh-interval-select"
+              value={refreshInterval}
+              onChange={(e) => setRefreshInterval(Number(e.target.value))}
+            >
+              <option value={5000}>5s</option>
+              <option value={10000}>10s</option>
+              <option value={30000}>30s</option>
+              <option value={60000}>1m</option>
+            </select>
+            <label className="auto-refresh-toggle">
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+              />
+              <span className="toggle-slider" />
+            </label>
+            <button className="icon-btn refresh" onClick={() => { loadHealth(); loadMetrics(); }} disabled={loading}>
+              <span className={loading ? 'spinning' : ''}>↻</span>
+            </button>
+          </div>
+          {health && (
+            <span className="last-updated">
+              {new Date(health.checkedAt).toLocaleTimeString()}
+            </span>
+          )}
         </div>
       </header>
 
-      <main className="main">
-        {/* Action Controls */}
-        <section className="controls-section">
-          <h2>Service Controls</h2>
-          <div className="controls">
-            <button
-              className="control-btn start"
-              onClick={() => handleAction('start')}
-              disabled={actionLoading !== null}
-            >
-              {actionLoading === 'start' ? 'Starting...' : 'Start'}
-            </button>
-            <button
-              className="control-btn stop"
-              onClick={() => handleAction('stop')}
-              disabled={actionLoading !== null}
-            >
-              {actionLoading === 'stop' ? 'Stopping...' : 'Stop'}
-            </button>
-            <button
-              className="control-btn restart"
-              onClick={() => handleAction('restart')}
-              disabled={actionLoading !== null}
-            >
-              {actionLoading === 'restart' ? 'Restarting...' : 'Restart'}
-            </button>
-            <button
-              className="control-btn clean"
-              onClick={() => handleAction('clean')}
-              disabled={actionLoading !== null}
-            >
-              {actionLoading === 'clean' ? 'Cleaning...' : 'Clean'}
-            </button>
-          </div>
-          {actionResult && (
-            <div className={`action-result ${actionResult.success ? 'success' : 'error'}`}>
-              {actionResult.message}
-            </div>
-          )}
-        </section>
-
-        {/* Overall Status */}
+      <main className="dashboard-main">
         {error ? (
-          <div className="error-banner">
-            <strong>Connection Error</strong>
-            <p className="error-hint">
-              Service controller unreachable at <code>http://127.0.0.1:9090</code>
-            </p>
+          <div className="error-panel">
+            <div className="error-icon">⚠</div>
+            <div className="error-content">
+              <strong>Connection Error</strong>
+              <p>Service controller unreachable at <code>http://127.0.0.1:9090</code></p>
+            </div>
+          </div>
+        ) : loading && !health ? (
+          <div className="loading-panel">
+            <div className="loading-spinner" />
+            <span>Loading dashboard...</span>
           </div>
         ) : health ? (
           <>
-            <section className="status-section">
-              <div className={`overall-status ${getStatusColor(health.status)}`}>
-                <span className="status-indicator"></span>
-                <span className="status-text">
-                  System {health.status}
-                </span>
-                <span className="checked-at">
-                  {new Date(health.checkedAt).toLocaleTimeString()}
-                </span>
-              </div>
-            </section>
-
-            {/* Services Grid */}
-            <section className="services-section">
-              <h2>Services</h2>
-              <div className="services-grid">
-                {health.services.map((service, index) => (
-                  <div
-                    key={service.name}
-                    className={`service-card ${getStatusColor(service.status)}`}
+            {/* Row: Service Controls */}
+            <DashboardRow title="Service Controls" defaultExpanded={true}>
+              <div className="controls-panel">
+                <div className="controls-grid">
+                  <button
+                    className="control-btn start"
+                    onClick={() => handleAction('start')}
+                    disabled={actionLoading !== null}
                   >
-                    <div className="service-header">
-                      <span className="service-number">{formatServiceNumber(index)}</span>
-                      <span className="status-dot"></span>
-                      <h3>{service.name}</h3>
-                    </div>
-                    <div className="service-details">
-                      <div className="detail-row">
-                        <span className="label">Endpoint</span>
-                        <span className="value url">{service.url}</span>
-                      </div>
-                      <div className="detail-row">
-                        <span className="label">Status</span>
-                        <span className={`value ${service.status}`}>
-                          {service.status}
-                        </span>
-                      </div>
-                      <div className="detail-row">
-                        <span className="label">Latency</span>
-                        <span className="value">
-                          {formatResponseTime(service.response_time_ms)}
-                        </span>
-                      </div>
-                      {service.error && (
-                        <div className="detail-row error">
-                          <span className="label">Error</span>
-                          <span className="value">{service.error}</span>
-                        </div>
-                      )}
-                    </div>
+                    <span className="btn-icon">▶</span>
+                    {actionLoading === 'start' ? 'Starting...' : 'Start'}
+                  </button>
+                  <button
+                    className="control-btn stop"
+                    onClick={() => handleAction('stop')}
+                    disabled={actionLoading !== null}
+                  >
+                    <span className="btn-icon">■</span>
+                    {actionLoading === 'stop' ? 'Stopping...' : 'Stop'}
+                  </button>
+                  <button
+                    className="control-btn restart"
+                    onClick={() => handleAction('restart')}
+                    disabled={actionLoading !== null}
+                  >
+                    <span className="btn-icon">↻</span>
+                    {actionLoading === 'restart' ? 'Restarting...' : 'Restart'}
+                  </button>
+                  <button
+                    className="control-btn clean"
+                    onClick={() => handleAction('clean')}
+                    disabled={actionLoading !== null}
+                  >
+                    <span className="btn-icon">🗑</span>
+                    {actionLoading === 'clean' ? 'Cleaning...' : 'Clean Data'}
+                  </button>
+                </div>
+                {actionResult && (
+                  <div className={`action-toast ${actionResult.success ? 'success' : 'error'}`}>
+                    {actionResult.success ? '✓' : '✗'} {actionResult.message}
                   </div>
-                ))}
+                )}
               </div>
-            </section>
+            </DashboardRow>
 
-            {/* Metrics Section */}
-            <section className="metrics-section">
-              <h2>Network Metrics</h2>
-              {metrics?.error ? (
-                <div className="metrics-error">
-                  <span>Metrics unavailable: {metrics.error}</span>
+            {/* Row: Quick Stats Overview */}
+            <DashboardRow title="Overview" defaultExpanded={true}>
+              <div className="overview-panels">
+                {/* Key Metrics Stats */}
+                <div className="stat-panel highlight">
+                  <div className="stat-panel-label">TPS</div>
+                  <div className="stat-panel-value">{formatTps(metrics?.tps?.tps)}</div>
+                  <div className="stat-panel-subtext">transactions/sec</div>
                 </div>
-              ) : (
-                <div className="metrics-grid">
-                  {/* TPS Card */}
-                  <div className="metric-card highlight">
-                    <div className="metric-header">
-                      <span className="metric-icon">⚡</span>
-                      <h3>TPS</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatTps(metrics?.tps?.tps)}
-                    </div>
-                    <div className="metric-subtitle">transactions per second</div>
-                    {metrics?.tps && (
-                      <div className="metric-details">
-                        <div className="metric-detail">
-                          <span className="label">Delta</span>
-                          <span className="value">{formatNumber(metrics.tps.delta_transactions, 0)} tx</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Total Transactions Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">📊</span>
-                      <h3>Total Transactions</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatNumber(metrics?.totalTransactions?.total_transactions, 0)}
-                    </div>
-                    <div className="metric-subtitle">cumulative</div>
-                  </div>
-
-                  {/* Failed Transactions Rate Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">⚠️</span>
-                      <h3>Failed Rate</h3>
-                    </div>
-                    <div className={`metric-value-large ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
-                      {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
-                    </div>
-                    <div className="metric-subtitle">failure rate</div>
-                    {metrics?.failedTransactionsRate && (
-                      <div className="metric-details">
-                        <div className="metric-detail">
-                          <span className="label">Failed</span>
-                          <span className="value">{formatNumber(metrics.failedTransactionsRate.failed_transactions, 0)}</span>
-                        </div>
-                        <div className="metric-detail">
-                          <span className="label">Total</span>
-                          <span className="value">{formatNumber(metrics.failedTransactionsRate.total_transactions, 0)}</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Average Transaction Size Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">📏</span>
-                      <h3>Avg Tx Size</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}
-                    </div>
-                    <div className="metric-subtitle">tokens (24h avg)</div>
-                  </div>
-
-                  {/* Median Transaction Size Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">📐</span>
-                      <h3>Median Tx Size</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatTokenAmount(metrics?.medianTransactionSize?.median_amount)}
-                    </div>
-                    <div className="metric-subtitle">tokens (24h median)</div>
-                  </div>
-
-                  {/* Token Value Spent Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">💰</span>
-                      <h3>Value Spent</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}
-                    </div>
-                    <div className="metric-subtitle">tokens (24h)</div>
-                  </div>
-
-                  {/* Token Velocity Card */}
-                  <div className="metric-card">
-                    <div className="metric-header">
-                      <span className="metric-icon">🔄</span>
-                      <h3>Token Velocity</h3>
-                    </div>
-                    <div className="metric-value-large">
-                      {formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}
-                    </div>
-                    <div className="metric-subtitle">turnover rate (24h)</div>
-                    {metrics?.tokenVelocity && (
-                      <div className="metric-details">
-                        <div className="metric-detail">
-                          <span className="label">Supply</span>
-                          <span className="value">{formatTokenAmount(metrics.tokenVelocity.total_tokens)}</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Total Transactions</div>
+                  <div className="stat-panel-value">{formatNumber(metrics?.totalTransactions?.total_transactions, 0)}</div>
+                  <div className="stat-panel-subtext">cumulative</div>
                 </div>
-              )}
-            </section>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Failed Rate</div>
+                  <div className={`stat-panel-value ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
+                    {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
+                  </div>
+                  <div className="stat-panel-subtext">failure rate</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Value Spent (24h)</div>
+                  <div className="stat-panel-value">{formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}</div>
+                  <div className="stat-panel-subtext">tokens</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Avg Tx Size</div>
+                  <div className="stat-panel-value">{formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}</div>
+                  <div className="stat-panel-subtext">tokens (24h)</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Token Velocity</div>
+                  <div className="stat-panel-value">{formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}</div>
+                  <div className="stat-panel-subtext">turnover rate</div>
+                </div>
+              </div>
+            </DashboardRow>
 
-            {/* Historic Metrics Charts */}
-            <MetricsCharts autoRefresh={autoRefresh} />
+            {/* Row: System Resources */}
+            <DashboardRow title="System Resources" defaultExpanded={true}>
+              <SystemStatsPanel autoRefresh={autoRefresh} />
+            </DashboardRow>
+
+            {/* Row: Services */}
+            <DashboardRow 
+              title="Services" 
+              defaultExpanded={true}
+              badge={servicesStatusText}
+              badgeColor={servicesStatusColor}
+            >
+              <div className="services-panel">
+                <div className="services-table">
+                  <div className="table-header">
+                    <div className="col-status">Status</div>
+                    <div className="col-name">Service</div>
+                    <div className="col-endpoint">Endpoint</div>
+                    <div className="col-latency">Latency</div>
+                    <div className="col-error">Error</div>
+                  </div>
+                  {health.services.map((service) => (
+                    <div key={service.name} className={`table-row ${getStatusColor(service.status)}`}>
+                      <div className="col-status">
+                        <span className="status-indicator-dot" />
+                      </div>
+                      <div className="col-name">{service.name}</div>
+                      <div className="col-endpoint">
+                        <code>{service.url}</code>
+                      </div>
+                      <div className="col-latency">{formatResponseTime(service.response_time_ms)}</div>
+                      <div className="col-error">{service.error || '-'}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </DashboardRow>
+
+            {/* Row: Network Metrics Details */}
+            <DashboardRow title="Network Metrics" defaultExpanded={false}>
+              <div className="metrics-detail-panel">
+                {metrics?.error ? (
+                  <div className="panel-error">Metrics unavailable: {metrics.error}</div>
+                ) : (
+                  <div className="metrics-detail-grid">
+                    {/* TPS Details */}
+                    <div className="metric-detail-card">
+                      <div className="metric-card-header">
+                        <span className="metric-icon">⚡</span>
+                        <h3>Transactions Per Second</h3>
+                      </div>
+                      <div className="metric-big-value">{formatTps(metrics?.tps?.tps)}</div>
+                      <div className="metric-card-stats">
+                        <div className="stat-row">
+                          <span className="stat-label">Delta Transactions</span>
+                          <span className="stat-value">{formatNumber(metrics?.tps?.delta_transactions, 0)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Transaction Size */}
+                    <div className="metric-detail-card">
+                      <div className="metric-card-header">
+                        <span className="metric-icon">📏</span>
+                        <h3>Transaction Sizes</h3>
+                      </div>
+                      <div className="metric-card-stats">
+                        <div className="stat-row">
+                          <span className="stat-label">Average (24h)</span>
+                          <span className="stat-value">{formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}</span>
+                        </div>
+                        <div className="stat-row">
+                          <span className="stat-label">Median (24h)</span>
+                          <span className="stat-value">{formatTokenAmount(metrics?.medianTransactionSize?.median_amount)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Token Economics */}
+                    <div className="metric-detail-card">
+                      <div className="metric-card-header">
+                        <span className="metric-icon">💰</span>
+                        <h3>Token Economics</h3>
+                      </div>
+                      <div className="metric-card-stats">
+                        <div className="stat-row">
+                          <span className="stat-label">Value Spent (24h)</span>
+                          <span className="stat-value">{formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}</span>
+                        </div>
+                        <div className="stat-row">
+                          <span className="stat-label">Token Velocity</span>
+                          <span className="stat-value">{formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}</span>
+                        </div>
+                        <div className="stat-row">
+                          <span className="stat-label">Total Supply</span>
+                          <span className="stat-value">{formatTokenAmount(metrics?.tokenVelocity?.total_tokens)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Failed Transactions */}
+                    <div className="metric-detail-card">
+                      <div className="metric-card-header">
+                        <span className="metric-icon">⚠️</span>
+                        <h3>Transaction Health</h3>
+                      </div>
+                      <div className="metric-card-stats">
+                        <div className="stat-row">
+                          <span className="stat-label">Failure Rate</span>
+                          <span className={`stat-value ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
+                            {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
+                          </span>
+                        </div>
+                        <div className="stat-row">
+                          <span className="stat-label">Failed Txs</span>
+                          <span className="stat-value">{formatNumber(metrics?.failedTransactionsRate?.failed_transactions, 0)}</span>
+                        </div>
+                        <div className="stat-row">
+                          <span className="stat-label">Total Txs</span>
+                          <span className="stat-value">{formatNumber(metrics?.failedTransactionsRate?.total_transactions, 0)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </DashboardRow>
+
+            {/* Row: Historic Charts */}
+            <DashboardRow title="Historic Data" defaultExpanded={true}>
+              <MetricsCharts autoRefresh={autoRefresh} />
+            </DashboardRow>
+
+            {/* Row: Service Logs */}
+            <DashboardRow title="Service Logs" defaultExpanded={false}>
+              <Terminal />
+            </DashboardRow>
           </>
-        ) : (
-          <div className="loading">Loading services...</div>
-        )}
+        ) : null}
       </main>
 
-      <footer className="footer">
-        <p>
-          Service Controller <code>http://127.0.0.1:9090</code>
-        </p>
+      <footer className="dashboard-footer">
+        <span>Midnight L2 Service Controller</span>
+        <code>http://127.0.0.1:9090</code>
       </footer>
     </div>
   );

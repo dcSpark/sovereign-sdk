@@ -188,3 +188,43 @@ export interface ChartDataPoint {
   timestamp: number;
   value: number;
 }
+
+// System stats types
+export interface CpuStats {
+  usage_percent: number;
+  core_count: number;
+  per_core_usage: number[];
+}
+
+export interface MemoryStats {
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  available_bytes: number;
+  usage_percent: number;
+  swap_total_bytes: number;
+  swap_used_bytes: number;
+}
+
+export interface DiskStats {
+  name: string;
+  mount_point: string;
+  total_bytes: number;
+  available_bytes: number;
+  used_bytes: number;
+  usage_percent: number;
+}
+
+export interface LoadAverage {
+  one: number;
+  five: number;
+  fifteen: number;
+}
+
+export interface SystemStats {
+  cpu: CpuStats;
+  memory: MemoryStats;
+  disks: DiskStats[];
+  uptime_seconds: number;
+  load_average: LoadAverage;
+}
