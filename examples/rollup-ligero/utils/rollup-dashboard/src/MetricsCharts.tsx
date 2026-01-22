@@ -315,7 +315,7 @@ export function MetricsCharts({ autoRefresh }: MetricsChartsProps) {
   const velocityData = transformVelocityData(historicData?.tokenVelocity ?? null);
 
   return (
-    <section className="charts-section">
+    <div className="charts-section">
       <div className="charts-header">
         <h2>Historic Metrics</h2>
         <div className="time-range-selector">
@@ -340,54 +340,54 @@ export function MetricsCharts({ autoRefresh }: MetricsChartsProps) {
           <ChartCard
             title="TPS"
             data={tpsData}
-            color="#ff3333"
+            color="#ff5d5d"
             metric="tps"
             loading={loading}
           />
           <ChartCard
             title="Total Transactions"
             data={totalTxData}
-            color="#00ff88"
+            color="#73bf69"
             metric="totalTx"
             loading={loading}
           />
           <ChartCard
             title="Failed Rate (%)"
             data={failedRateData}
-            color="#ffaa00"
+            color="#f2495c"
             metric="failedRate"
             loading={loading}
           />
           <ChartCard
             title="Avg Transaction Size"
             data={avgSizeData}
-            color="#8855ff"
+            color="#b877d9"
             metric="avgSize"
             loading={loading}
           />
           <ChartCard
             title="Median Transaction Size"
             data={medianSizeData}
-            color="#00aaff"
+            color="#5794f2"
             metric="medianSize"
             loading={loading}
           />
           <ChartCard
             title="Token Value Spent"
             data={valueSpentData}
-            color="#ff55aa"
+            color="#ff9830"
             metric="tokenValue"
             loading={loading}
           />
           <ChartCard
             title="Token Velocity"
             data={velocityData}
-            color="#55ffaa"
+            color="#73bf69"
             metric="velocity"
             loading={loading}
           />
         </div>
       )}
-    </section>
+    </div>
   );
 }
