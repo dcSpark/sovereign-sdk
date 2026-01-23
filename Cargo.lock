@@ -7243,6 +7243,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-external-stress"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11034,6 +11047,7 @@ dependencies = [
  "pastey 0.2.1",
  "pin-project-lite",
  "rand 0.9.2",
+ "reqwest 0.12.28",
  "rmcp-macros",
  "schemars 1.2.0",
  "serde",
