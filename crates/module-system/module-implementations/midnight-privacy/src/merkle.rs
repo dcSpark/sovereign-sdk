@@ -78,6 +78,43 @@ impl MerkleTree {
         }
     }
 
+    /// Create a tree from a prefix of filled leaves, rebuilding all internal nodes bottom-up.
+    ///
+    /// Semantics:
+    /// - The tree has exactly `2^depth` leaves.
+    /// - Leaves in `0..filled_leaves.len()` are set to `filled_leaves`.
+    /// - Remaining leaves are zero (the default leaf value).
+    ///
+    /// This is substantially faster than calling `set_leaf()` in a loop because it hashes
+    /// each internal node exactly once (O(2^depth) hashes), instead of O(filled_leaves * depth)
+    /// hashes.
+    ///
+    /// # Panics
+    /// Panics if `filled_leaves.len() > 2^depth`.
+    pub fn from_filled_leaves(depth: u8, filled_leaves: &[Hash32]) -> Self {
+        let capacity = 1usize << (depth as usize);
+        assert!(
+            filled_leaves.len() <= capacity,
+            "MerkleTree::from_filled_leaves: filled_leaves {} exceeds capacity {} for depth {}",
+            filled_leaves.len(),
+            capacity,
+            depth
+        );
+
+        let mut tree = MerkleTree::new(depth);
+        tree.levels[0][..filled_leaves.len()].copy_from_slice(filled_leaves);
+
+        for lvl in 0..depth as usize {
+            for parent in 0..tree.levels[lvl + 1].len() {
+                let left = tree.levels[lvl][parent * 2];
+                let right = tree.levels[lvl][parent * 2 + 1];
+                tree.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
+            }
+        }
+
+        tree
+    }
+
     /// Return the tree depth (number of levels from leaves to root).
     #[inline]
     pub fn depth(&self) -> u8 {
@@ -240,5 +277,38 @@ impl MerkleTree {
 
         assert_eq!(path.len(), self.depth as usize);
         path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MerkleTree;
+    use crate::hash::Hash32;
+
+    #[test]
+    fn from_filled_leaves_matches_set_leaf() {
+        let depth: u8 = 8;
+        let capacity = 1usize << (depth as usize);
+        let filled = 200usize;
+        assert!(filled <= capacity);
+
+        let mut leaves: Vec<Hash32> = Vec::with_capacity(filled);
+        for i in 0..filled {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            leaves.push(h);
+        }
+
+        let mut via_set_leaf = MerkleTree::new(depth);
+        for (i, leaf) in leaves.iter().enumerate() {
+            via_set_leaf.set_leaf(i, *leaf);
+        }
+
+        let via_bulk = MerkleTree::from_filled_leaves(depth, &leaves);
+        assert_eq!(via_set_leaf.root(), via_bulk.root());
+
+        for idx in [0usize, 1, 2, filled - 1, capacity - 1] {
+            assert_eq!(via_set_leaf.open(idx), via_bulk.open(idx));
+        }
     }
 }

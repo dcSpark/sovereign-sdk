@@ -88,6 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
 
+    // Keep the commitment tree cache warm in the background so transfers across many wallets
+    // don't all pay the sync cost on-demand.
+    crate::commitment_tree::start_background_tree_sync(provider.clone());
+
     // Initialize Ligero proof client (HTTP service)
     tracing::info!("[mcp] Initializing Ligero proof service client");
     tracing::info!("[mcp] Proof service URL: {}", cfg.ligero_proof_service_url);

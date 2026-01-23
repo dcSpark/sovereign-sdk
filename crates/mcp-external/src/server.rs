@@ -279,6 +279,8 @@ pub struct SendFundsResult {
     pub id: String,
     /// Current transaction state (always "initiated").
     pub state: String,
+    /// Post-submit confirmation status.
+    pub confirmation: String,
     /// Recipient wallet address.
     #[serde(rename = "toAddress")]
     pub to_address: String,
@@ -993,6 +995,7 @@ impl CryptoServer {
         let result = SendFundsResult {
             id: transfer_result.tx_hash,
             state: "initiated".to_string(),
+            confirmation: transfer_result.confirmation.as_str().to_string(),
             to_address: output_privacy_addr.to_string(),
             amount: send_amount.to_string(),
             created_at,

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -12,11 +14,57 @@ use crate::provider::Provider;
 pub const DEFAULT_TREE_DEPTH: u8 = 16;
 
 const NOTES_PAGE_LIMIT: usize = 1000;
+const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 5;
+const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
 const SYNC_MAX_RETRIES: usize = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 200;
 
 const POSITION_LOOKUP_MAX_RETRIES: usize = 10;
 const POSITION_LOOKUP_RETRY_DELAY_MS: u64 = 200;
+
+const BACKGROUND_SYNC_INTERVAL_SECS: u64 = 1;
+const BACKGROUND_SYNC_ERROR_BACKOFF_SECS: u64 = 3;
+
+static GLOBAL_TREE_SYNCER: OnceLock<CommitmentTreeSyncer> = OnceLock::new();
+static BACKGROUND_SYNC_STARTED: OnceLock<()> = OnceLock::new();
+
+/// Return the process-wide commitment tree syncer (shared across all wallets/sessions).
+pub fn global_tree_syncer() -> &'static CommitmentTreeSyncer {
+    GLOBAL_TREE_SYNCER.get_or_init(|| CommitmentTreeSyncer::new(DEFAULT_TREE_DEPTH))
+}
+
+/// Start a single background task which keeps the global tree cache warm.
+///
+/// Safe to call multiple times: only the first call will spawn the task.
+pub fn start_background_tree_sync(provider: Arc<Provider>) {
+    BACKGROUND_SYNC_STARTED.get_or_init(|| {
+        let syncer = global_tree_syncer();
+
+        tokio::spawn(async move {
+            // Don't spin on persistent errors (network, node restart, etc.).
+            let mut last_error_at: Option<tokio::time::Instant> = None;
+
+            loop {
+                if let Err(e) = syncer.sync_to_latest(provider.as_ref()).await {
+                    let now = tokio::time::Instant::now();
+                    let should_log = last_error_at
+                        .map(|t| now.duration_since(t) >= Duration::from_secs(10))
+                        .unwrap_or(true);
+                    if should_log {
+                        tracing::warn!(error = %e, "Background commitment-tree sync failed");
+                        last_error_at = Some(now);
+                    }
+                    tokio::time::sleep(Duration::from_secs(BACKGROUND_SYNC_ERROR_BACKOFF_SECS))
+                        .await;
+                    continue;
+                }
+
+                last_error_at = None;
+                tokio::time::sleep(Duration::from_secs(BACKGROUND_SYNC_INTERVAL_SECS)).await;
+            }
+        });
+    });
+}
 
 struct RootHex<'a>(&'a Hash32);
 
@@ -120,8 +168,6 @@ impl CommitmentTreeSyncer {
     /// This is safe to call concurrently: only one task will perform network fetches and
     /// tree updates at a time.
     pub async fn sync_to_latest(&self, provider: &Provider) -> Result<()> {
-        let _guard = self.sync_lock.lock().await;
-
         for attempt in 0..SYNC_MAX_RETRIES {
             let started = Instant::now();
             let state_started = Instant::now();
@@ -149,8 +195,35 @@ impl CommitmentTreeSyncer {
             let mut expected_root = [0u8; 32];
             expected_root.copy_from_slice(&state.root);
             let expected_next = state.next_position;
+            let capacity = 1u64
+                .checked_shl(self.depth as u32)
+                .ok_or_else(|| anyhow::anyhow!("Invalid commitment tree depth: {}", self.depth))?;
+            anyhow::ensure!(
+                expected_next <= capacity,
+                "Commitment tree next_position {} exceeds capacity {} for depth {}",
+                expected_next,
+                capacity,
+                self.depth
+            );
 
-            // Quick no-op check before doing any paging.
+            // Quick no-op check before acquiring the sync lock.
+            {
+                let st = self.state.read().await;
+                if st.next_position == expected_next && st.tree.root() == expected_root {
+                    tracing::debug!(
+                        state_ms,
+                        next_position = expected_next,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Commitment tree cache already up-to-date"
+                    );
+                    return Ok(());
+                }
+            }
+
+            // Only one task should perform the expensive sync at a time.
+            let _guard = self.sync_lock.lock().await;
+
+            // Another task may have synced while we waited for the lock.
             {
                 let st = self.state.read().await;
                 if st.next_position == expected_next && st.tree.root() == expected_root {
@@ -176,41 +249,65 @@ impl CommitmentTreeSyncer {
                 *st = CachedTree::new(self.depth);
             }
 
-            // Try incremental sync first; on mismatch, fall back to a full rebuild.
-            let incremental = self
-                .try_incremental_sync(provider, expected_next, expected_root)
-                .await?;
-            if let Some(stats) = incremental {
-                if stats.root_match {
-                    let elapsed_ms = started.elapsed().as_millis();
-                    tracing::info!(
-                        elapsed_ms,
-                        state_ms,
-                        fetch_ms = stats.fetch_ms,
-                        apply_ms = stats.apply_ms,
-                        fetched_notes = stats.fetched_notes,
-                        start_offset = stats.start_offset,
-                        target_next_position = stats.target_next_position,
-                        "Commitment tree synced (incremental)"
-                    );
-                    return Ok(());
-                }
+            // Heuristic: On a cold cache, prefer a full rebuild. Also prefer a full rebuild if
+            // the delta is so large that per-leaf `set_leaf()` updates would likely dominate.
+            let cached_next = { self.state.read().await.next_position };
+            let delta = expected_next.saturating_sub(cached_next);
+            let depth_for_threshold = u64::from(self.depth).max(1);
+            let full_rebuild_threshold = capacity / depth_for_threshold;
+            let should_skip_incremental = delta > 0 && delta >= full_rebuild_threshold;
 
-                let elapsed_ms = started.elapsed().as_millis();
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_attempts = SYNC_MAX_RETRIES,
-                        elapsed_ms,
-                        state_ms,
-                        start_offset = stats.start_offset,
-                        target_next_position = stats.target_next_position,
-                        fetched_notes = stats.fetched_notes,
-                        fetch_ms = stats.fetch_ms,
-                        apply_ms = stats.apply_ms,
-                        rebuilt_root = %RootHex(&stats.rebuilt_root),
-                        expected_root = %RootHex(&expected_root),
-                        "Commitment tree incremental sync root mismatch; falling back to full rebuild"
-                    );
+            // Try incremental sync first; on mismatch/error, fall back to a full rebuild.
+            if !should_skip_incremental {
+                match self
+                    .try_incremental_sync(provider, expected_next, expected_root)
+                    .await
+                {
+                    Ok(Some(stats)) if stats.root_match => {
+                        let elapsed_ms = started.elapsed().as_millis();
+                        tracing::info!(
+                            elapsed_ms,
+                            state_ms,
+                            fetch_ms = stats.fetch_ms,
+                            apply_ms = stats.apply_ms,
+                            fetched_notes = stats.fetched_notes,
+                            start_offset = stats.start_offset,
+                            target_next_position = stats.target_next_position,
+                            "Commitment tree synced (incremental)"
+                        );
+                        return Ok(());
+                    }
+                    Ok(Some(stats)) => {
+                        let elapsed_ms = started.elapsed().as_millis();
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts = SYNC_MAX_RETRIES,
+                            elapsed_ms,
+                            state_ms,
+                            start_offset = stats.start_offset,
+                            target_next_position = stats.target_next_position,
+                            fetched_notes = stats.fetched_notes,
+                            fetch_ms = stats.fetch_ms,
+                            apply_ms = stats.apply_ms,
+                            rebuilt_root = %RootHex(&stats.rebuilt_root),
+                            expected_root = %RootHex(&expected_root),
+                            "Commitment tree incremental sync root mismatch; falling back to full rebuild"
+                        );
+
+                        // Avoid serving an inconsistent tree while rebuilding.
+                        let mut st = self.state.write().await;
+                        *st = CachedTree::new(self.depth);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts = SYNC_MAX_RETRIES,
+                            error = %e,
+                            "Commitment tree incremental sync failed; falling back to full rebuild"
+                        );
+                    }
+                }
             }
 
             match self
@@ -270,42 +367,58 @@ impl CommitmentTreeSyncer {
         anyhow::ensure!(!cms.is_empty(), "cms must not be empty");
 
         for attempt in 0..=POSITION_LOOKUP_MAX_RETRIES {
+            // Sync first (cheap no-op if already up-to-date), then resolve positions/openings.
             self.sync_to_latest(provider).await?;
-
-            let st = self.state.read().await;
-            let mut positions = Vec::with_capacity(cms.len());
-            let mut siblings = Vec::with_capacity(cms.len());
-
-            let mut missing = false;
-            for cm in cms {
-                match st.pos_by_cm.get(cm).copied() {
-                    Some(pos) => {
-                        positions.push(pos);
-                        siblings.push(st.tree.open(pos as usize));
-                    }
-                    None => {
-                        missing = true;
-                        break;
+            {
+                let st = self.state.read().await;
+                let mut positions = Vec::with_capacity(cms.len());
+                let mut missing = false;
+                for cm in cms {
+                    match st.pos_by_cm.get(cm).copied() {
+                        Some(pos) => positions.push(pos),
+                        None => {
+                            missing = true;
+                            break;
+                        }
                     }
                 }
-            }
 
-            if !missing {
-                return Ok((st.tree.root(), positions, siblings));
+                if !missing {
+                    let siblings = positions
+                        .iter()
+                        .map(|pos| st.tree.open(*pos as usize))
+                        .collect();
+                    return Ok((st.tree.root(), positions, siblings));
+                }
             }
 
             if attempt == POSITION_LOOKUP_MAX_RETRIES {
                 break;
             }
 
-            drop(st);
             tokio::time::sleep(std::time::Duration::from_millis(
                 POSITION_LOOKUP_RETRY_DELAY_MS,
             ))
             .await;
         }
 
-        anyhow::bail!("Failed to resolve some commitment positions in the local tree cache");
+        let st = self.state.read().await;
+        let missing: Vec<Hash32> = cms
+            .iter()
+            .copied()
+            .filter(|cm| !st.pos_by_cm.contains_key(cm))
+            .collect();
+        let sample: Vec<String> = missing
+            .iter()
+            .take(5)
+            .map(|cm| format!("{}", RootHex(cm)))
+            .collect();
+        anyhow::bail!(
+            "Failed to resolve commitment positions in local tree cache (missing {} of {}): {}",
+            missing.len(),
+            cms.len(),
+            sample.join(", ")
+        );
     }
 
     async fn try_incremental_sync(
@@ -367,30 +480,29 @@ impl CommitmentTreeSyncer {
         expected_next: u64,
         expected_root: Hash32,
     ) -> Result<FullRebuildStats> {
-        let tree_init_started = Instant::now();
-        let mut tree = MerkleTree::new(self.depth);
-        let tree_init_ms = tree_init_started.elapsed().as_millis();
-
         let mut pos_by_cm: HashMap<Hash32, u64> = HashMap::new();
 
         let mut fetched_notes = 0usize;
-        let mut apply_ms = 0u128;
         if expected_next > 0 {
-            tree.grow_to_fit(expected_next as usize);
             let fetch_started = Instant::now();
             let notes = fetch_notes(provider, 0, expected_next as usize).await?;
             let fetch_ms = fetch_started.elapsed().as_millis();
 
             fetched_notes = notes.len();
             let apply_started = Instant::now();
+            let mut leaves: Vec<Hash32> = vec![[0u8; 32]; expected_next as usize];
             for (pos, cm) in notes {
-                if pos as usize >= tree.len() {
-                    tree.grow_to_fit(pos as usize + 1);
+                if pos >= expected_next {
+                    continue;
                 }
-                tree.set_leaf(pos as usize, cm);
+                leaves[pos as usize] = cm;
                 pos_by_cm.insert(cm, pos);
             }
-            apply_ms = apply_started.elapsed().as_millis();
+            let apply_ms = apply_started.elapsed().as_millis();
+
+            let tree_init_started = Instant::now();
+            let tree = MerkleTree::from_filled_leaves(self.depth, &leaves);
+            let tree_init_ms = tree_init_started.elapsed().as_millis();
 
             let rebuilt_root = tree.root();
             anyhow::ensure!(
@@ -415,12 +527,17 @@ impl CommitmentTreeSyncer {
         }
 
         let fetch_ms = 0u128;
+        let tree_init_started = Instant::now();
+        let tree = MerkleTree::new(self.depth);
+        let tree_init_ms = tree_init_started.elapsed().as_millis();
+
+        let apply_ms = 0u128;
         let rebuilt_root = tree.root();
         anyhow::ensure!(
             rebuilt_root == expected_root,
             "Rebuilt tree root mismatch: rebuilt={} expected={}",
-            hex::encode(rebuilt_root),
-            hex::encode(expected_root)
+                hex::encode(rebuilt_root),
+                hex::encode(expected_root)
         );
 
         let mut st = self.state.write().await;
@@ -443,7 +560,8 @@ async fn fetch_notes(
     start_offset: usize,
     target_leaves: usize,
 ) -> Result<Vec<(u64, Hash32)>> {
-    let mut out: Vec<(u64, Hash32)> = Vec::new();
+    let expected_count = target_leaves.saturating_sub(start_offset);
+    let mut out: Vec<(u64, Hash32)> = Vec::with_capacity(expected_count);
     let mut offset = start_offset;
 
     while offset < target_leaves {
@@ -451,14 +569,32 @@ async fn fetch_notes(
             "/modules/midnight-privacy/notes?limit={}&offset={}",
             NOTES_PAGE_LIMIT, offset
         );
-        let resp: NotesResp = provider
-            .query_rest_endpoint(&endpoint)
-            .await
-            .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
+        let mut empty_retries = 0usize;
+        let resp: NotesResp = loop {
+            let resp: NotesResp = provider
+                .query_rest_endpoint(&endpoint)
+                .await
+                .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
 
-        if resp.notes.is_empty() {
-            break;
-        }
+            if !resp.notes.is_empty() {
+                break resp;
+            }
+
+            if empty_retries >= NOTES_EMPTY_PAGE_MAX_RETRIES {
+                anyhow::bail!(
+                    "Notes endpoint returned empty batch at offset {} after {} retries (target_leaves={})",
+                    offset,
+                    NOTES_EMPTY_PAGE_MAX_RETRIES,
+                    target_leaves
+                );
+            }
+
+            empty_retries += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                NOTES_EMPTY_PAGE_RETRY_DELAY_MS,
+            ))
+            .await;
+        };
 
         let batch_len = resp.notes.len();
         for n in resp.notes {
@@ -466,7 +602,11 @@ async fn fetch_notes(
                 continue;
             }
             if n.commitment.len() != 32 {
-                continue;
+                anyhow::bail!(
+                    "Note commitment has unexpected length {} at position {}",
+                    n.commitment.len(),
+                    n.position
+                );
             }
             let mut cm = [0u8; 32];
             cm.copy_from_slice(&n.commitment);
@@ -476,5 +616,13 @@ async fn fetch_notes(
         offset += batch_len;
     }
 
+    anyhow::ensure!(
+        out.len() == expected_count,
+        "Fetched {} notes but expected {} (start_offset={}, target_leaves={})",
+        out.len(),
+        expected_count,
+        start_offset,
+        target_leaves
+    );
     Ok(out)
 }

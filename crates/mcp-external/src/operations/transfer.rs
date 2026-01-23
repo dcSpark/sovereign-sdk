@@ -18,11 +18,10 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
-use crate::commitment_tree::CommitmentTreeSyncer;
+use crate::commitment_tree::global_tree_syncer;
 use crate::fvk_service::ViewerFvkBundle;
 use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::operations::DEFAULT_MAX_FEE;
@@ -33,18 +32,36 @@ use crate::wallet::WalletContext;
 pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
-const TREE_DEPTH: u8 = crate::commitment_tree::DEFAULT_TREE_DEPTH;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const SEQUENCER_CONFIRM_POLL_INTERVAL_MS: u64 = 100;
 const SEQUENCER_CONFIRM_TIMEOUT_SECS: u64 = 10;
 const SEQUENCER_CONFIRM_LOG_INTERVAL_SECS: u64 = 2;
 
-static TREE_SYNCER: OnceLock<CommitmentTreeSyncer> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferConfirmation {
+    /// No confirmation wait was performed.
+    Skipped,
+    /// The sequencer returned a successful receipt.
+    SequencerConfirmed,
+    /// The sequencer did not confirm within the configured timeout.
+    PendingTimeout,
+}
+
+impl TransferConfirmation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::SequencerConfirmed => "sequencer_confirmed",
+            Self::PendingTimeout => "pending_timeout",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TransferResult {
     pub tx_hash: String,
     pub created_at: i64,
+    pub confirmation: TransferConfirmation,
     /// Amount sent to destination
     #[allow(dead_code)]
     pub amount_sent: u128,
@@ -73,11 +90,6 @@ pub struct TransferInputNote {
     pub sender_id: Hash32,
 }
 
-/// Initialize the process-wide commitment tree syncer.
-fn tree_syncer() -> &'static CommitmentTreeSyncer {
-    TREE_SYNCER.get_or_init(|| CommitmentTreeSyncer::new(TREE_DEPTH))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferWaitMode {
     None,
@@ -104,7 +116,7 @@ impl TransferWaitMode {
 }
 
 /// Poll the sequencer for a soft confirmation.
-async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> Result<()> {
+async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> Result<bool> {
     let start = TokioInstant::now();
     let deadline = start + Duration::from_secs(SEQUENCER_CONFIRM_TIMEOUT_SECS);
     let mut last_log = start;
@@ -113,10 +125,13 @@ async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> 
     loop {
         attempts += 1;
         if TokioInstant::now() > deadline {
-            anyhow::bail!(
-                "Timeout waiting for transaction {} to be confirmed by the sequencer",
-                tx_hash
+            tracing::warn!(
+                tx_hash,
+                attempts,
+                waited_ms = start.elapsed().as_millis(),
+                "Timed out waiting for sequencer confirmation; returning tx hash as pending"
             );
+            return Ok(false);
         }
 
         match provider.get_sequencer_tx(tx_hash).await {
@@ -128,7 +143,7 @@ async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> 
                         waited_ms = start.elapsed().as_millis(),
                         "Transaction confirmed by sequencer"
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
                 api_types::TxReceiptResult::Reverted | api_types::TxReceiptResult::Skipped => {
                     anyhow::bail!(
@@ -332,7 +347,7 @@ pub async fn transfer(
     }
 
     let tree_start = StdInstant::now();
-    let (anchor_root, positions, siblings_by_input) = tree_syncer()
+    let (anchor_root, positions, siblings_by_input) = global_tree_syncer()
         .resolve_positions_and_openings(provider, &input_cms)
         .await
         .context("Failed to resolve Merkle positions/openings from cached commitment tree")?;
@@ -987,15 +1002,21 @@ pub async fn transfer(
     );
 
     // Step 8: Optional post-submit wait
-    match TransferWaitMode::from_env() {
+    let confirmation = match TransferWaitMode::from_env() {
         TransferWaitMode::None => {
             tracing::info!("Skipping post-submit wait (MCP_TRANSFER_WAIT_MODE=none)");
+            TransferConfirmation::Skipped
         }
         TransferWaitMode::Sequencer => {
             tracing::info!("Waiting for sequencer confirmation...");
-            wait_for_sequencer_confirmation(provider, &tx_hash).await?;
+            let confirmed = wait_for_sequencer_confirmation(provider, &tx_hash).await?;
+            if confirmed {
+                TransferConfirmation::SequencerConfirmed
+            } else {
+                TransferConfirmation::PendingTimeout
+            }
         }
-    }
+    };
     tracing::info!(
         elapsed_ms = overall_start.elapsed().as_millis(),
         tx_hash,
@@ -1005,6 +1026,7 @@ pub async fn transfer(
     Ok(TransferResult {
         tx_hash,
         created_at: submit_result.created_at,
+        confirmation,
         amount_sent: send_amount,
         output_rho: out_rho_0,
         output_recipient: out_recipient_0,
