@@ -12,9 +12,9 @@ mod get_privacy_notes;
 mod get_transaction_status;
 mod get_transactions;
 mod get_wallet_config;
+mod pool_admin;
 mod send_funds;
 mod transfer;
-mod pool_admin;
 pub mod wallet_status;
 
 #[allow(unused_imports)]
@@ -27,16 +27,15 @@ pub use get_privacy_balance::{get_privacy_balance, PrivacyBalanceResult, Unspent
 pub use get_privacy_notes::{
     get_privacy_notes, select_largest_notes, select_largest_notes_covering_amount, SpendableNote,
 };
+#[allow(unused_imports)]
+pub use get_transaction_status::{get_transaction_status, TransactionDetails};
 pub use get_transactions::get_transactions;
 #[allow(unused_imports)]
 pub use get_transactions::Transaction;
 #[allow(unused_imports)]
 pub use get_wallet_config::get_wallet_config;
-pub use transfer::transfer;
-pub use transfer::TransferInputNote;
-#[allow(unused_imports)]
-pub use get_transaction_status::TransactionDetails;
 pub use pool_admin::{
     add_pool_admin, freeze_address, list_frozen_addresses, remove_pool_admin, unfreeze_address,
 };
 pub use send_funds::send_funds;
+pub use transfer::{transfer, TransferInputNote};

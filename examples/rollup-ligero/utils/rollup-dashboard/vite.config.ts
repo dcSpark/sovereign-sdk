@@ -17,6 +17,7 @@ export default defineConfig(({ mode }) => {
           target: apiTarget,
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/controller/, ''),
+          ws: true, // Enable WebSocket proxying for /controller/logs
         },
         '/metrics': {
           target: metricsTarget,

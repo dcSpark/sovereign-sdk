@@ -66,7 +66,10 @@ fn verify_commitment_signature(
         .map_err(|e| anyhow!("Invalid pool signature over fvk_commitment: {e}"))
 }
 
-pub async fn fetch_viewer_fvk_bundle(http: &HttpClient, pool_fvk_pk: Option<[u8; 32]>) -> Result<ViewerFvkBundle> {
+pub async fn fetch_viewer_fvk_bundle(
+    http: &HttpClient,
+    pool_fvk_pk: Option<[u8; 32]>,
+) -> Result<ViewerFvkBundle> {
     let base_url = fvk_service_base_url_from_env();
     let endpoint = format!("{}/v1/fvk", base_url);
 
@@ -100,8 +103,8 @@ pub async fn fetch_viewer_fvk_bundle(http: &HttpClient, pool_fvk_pk: Option<[u8;
         "midnight-fvk-service returned fvk_commitment that does not match fvk"
     );
 
-    let signer_vk =
-        VerifyingKey::from_bytes(&signer_pk).map_err(|e| anyhow!("Invalid signer_public_key: {e}"))?;
+    let signer_vk = VerifyingKey::from_bytes(&signer_pk)
+        .map_err(|e| anyhow!("Invalid signer_public_key: {e}"))?;
     verify_commitment_signature(&signer_vk, &fvk_commitment_resp, &signature)?;
 
     if let Some(pool_pk) = pool_fvk_pk {
@@ -121,4 +124,3 @@ pub async fn fetch_viewer_fvk_bundle(http: &HttpClient, pool_fvk_pk: Option<[u8;
         signer_public_key: signer_pk,
     })
 }
-

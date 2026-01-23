@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
-use midnight_privacy::{CallMessage as MidnightCallMessage, FrozenAddressesResponse, PrivacyAddress};
+use midnight_privacy::{
+    CallMessage as MidnightCallMessage, FrozenAddressesResponse, PrivacyAddress,
+};
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;

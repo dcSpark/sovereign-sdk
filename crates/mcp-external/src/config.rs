@@ -143,19 +143,6 @@ impl Config {
             anyhow::bail!("Configuration validation failed");
         }
 
-        if !cfg.start_with_new_wallet {
-            if cfg.wallet_private_key.is_none() {
-                anyhow::bail!(
-                    "WALLET_PRIVATE_KEY must be set unless START_WITH_NEW_WALLET=true"
-                );
-            }
-            if cfg.privpool_spend_key.is_none() {
-                anyhow::bail!(
-                    "PRIVPOOL_SPEND_KEY must be set unless START_WITH_NEW_WALLET=true"
-                );
-            }
-        }
-
         Ok(cfg)
     }
 }

@@ -71,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(api::AppState {
         store,
         retention_secs: tsink_retention_secs,
+        tps_peak_cache: api::TpsPeakCache::new(),
+        da_db: db.clone(),
     });
 
     info!("sov-metrics-api listening on {}", bind_addr);

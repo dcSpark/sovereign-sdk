@@ -103,9 +103,7 @@ impl Ligero {
             .context("Failed to deserialize Ligero proof service response")?;
 
         if !payload.success || payload.exit_code != 0 {
-            let error = payload
-                .error
-                .unwrap_or_else(|| "unknown error".to_string());
+            let error = payload.error.unwrap_or_else(|| "unknown error".to_string());
             anyhow::bail!(
                 "Ligero proof service failed (exitCode={}): {}",
                 payload.exit_code,

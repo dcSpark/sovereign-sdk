@@ -5,10 +5,9 @@ use base64::{engine::general_purpose, Engine as _};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
-    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
+    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
     PrivacyAddress, SpendPublic,
 };
-use serde::Deserialize;
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
 use sov_ligero_adapter::{Ligero as LigeroAdapter, LigeroProofPackage};
@@ -19,12 +18,13 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
-use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
-use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::commitment_tree::CommitmentTreeSyncer;
 use crate::fvk_service::ViewerFvkBundle;
+use crate::ligero::{Ligero, LigeroProgramArguments};
 use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::viewer;
@@ -33,12 +33,13 @@ use crate::wallet::WalletContext;
 pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
-const TREE_DEPTH: u8 = 16;
+const TREE_DEPTH: u8 = crate::commitment_tree::DEFAULT_TREE_DEPTH;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const INCLUSION_POLL_INTERVAL_MS: u64 = 100;
-const INCLUSION_TIMEOUT_SECS: u64 = 60;
-const INCLUSION_LOG_INTERVAL_SECS: u64 = 5;
-const MERKLE_FETCH_LOG_EVERY: usize = 10;
+const SEQUENCER_CONFIRM_POLL_INTERVAL_MS: u64 = 100;
+const SEQUENCER_CONFIRM_TIMEOUT_SECS: u64 = 10;
+const SEQUENCER_CONFIRM_LOG_INTERVAL_SECS: u64 = 2;
+
+static TREE_SYNCER: OnceLock<CommitmentTreeSyncer> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct TransferResult {
@@ -72,182 +73,100 @@ pub struct TransferInputNote {
     pub sender_id: Hash32,
 }
 
-#[derive(Deserialize, Clone)]
-struct TreeState {
-    root: Vec<u8>,
-    next_position: u64,
+/// Initialize the process-wide commitment tree syncer.
+fn tree_syncer() -> &'static CommitmentTreeSyncer {
+    TREE_SYNCER.get_or_init(|| CommitmentTreeSyncer::new(TREE_DEPTH))
 }
 
-/// Note information from the rollup API
-#[derive(Deserialize, Clone)]
-struct NoteInfo {
-    position: u64,
-    commitment: Vec<u8>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferWaitMode {
+    None,
+    Sequencer,
 }
 
-/// Notes response from the rollup API
-#[derive(Deserialize)]
-struct NotesResp {
-    notes: Vec<NoteInfo>,
-}
-
-/// Fetch and rebuild the Merkle tree from the rollup state
-async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32, HashMap<Hash32, u64>)> {
-    let start = StdInstant::now();
-    tracing::info!("Fetching tree state for Merkle rebuild");
-    let state: TreeState = provider
-        .query_rest_endpoint("/modules/midnight-privacy/tree/state")
-        .await
-        .context("Failed to query tree state")?;
-
-    anyhow::ensure!(
-        state.root.len() == 32,
-        "Tree state root has unexpected length: {}",
-        state.root.len()
-    );
-
-    let mut tree = MerkleTree::new(TREE_DEPTH);
-    let mut pos_by_cm: HashMap<Hash32, u64> = HashMap::new();
-    let target_leaves = state.next_position as usize;
-
-    tracing::info!(
-        "Fetched tree state with next_position={} ({} leaves to fetch)",
-        state.next_position,
-        target_leaves
-    );
-
-    if target_leaves > 0 {
-        tree.grow_to_fit(target_leaves);
-
-        // Fetch all notes
-        let batch_size = 1000;
-        let mut offset = 0;
-        let mut batches = 0usize;
-        let mut notes_seen = 0usize;
-
-        while offset < target_leaves {
-            let endpoint = format!(
-                "/modules/midnight-privacy/notes?limit={}&offset={}",
-                batch_size, offset
-            );
-            let batch_resp: NotesResp = provider
-                .query_rest_endpoint(&endpoint)
-                .await
-                .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
-
-            batches += 1;
-            if batch_resp.notes.is_empty() {
-                break;
-            }
-
-            for n in batch_resp.notes.iter() {
-                if n.commitment.len() == 32 {
-                    let mut cm = [0u8; 32];
-                    cm.copy_from_slice(&n.commitment);
-                    if n.position as usize >= tree.len() {
-                        tree.grow_to_fit(n.position as usize + 1);
-                    }
-                    tree.set_leaf(n.position as usize, cm);
-                    pos_by_cm.insert(cm, n.position);
-                }
-            }
-
-            notes_seen += batch_resp.notes.len();
-            if batches == 1 || batches % MERKLE_FETCH_LOG_EVERY == 0 || notes_seen >= target_leaves
-            {
-                tracing::info!(
-                    batch = batches,
-                    seen = notes_seen,
-                    target = target_leaves,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "Fetched note commitments while rebuilding Merkle tree"
+impl TransferWaitMode {
+    fn from_env() -> Self {
+        let raw = std::env::var("MCP_TRANSFER_WAIT_MODE")
+            .unwrap_or_else(|_| "sequencer".to_string());
+        let v = raw.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "" | "sequencer" | "seq" => Self::Sequencer,
+            "none" | "off" | "false" | "0" => Self::None,
+            other => {
+                tracing::warn!(
+                    "Unknown MCP_TRANSFER_WAIT_MODE '{}'; falling back to 'sequencer'",
+                    other
                 );
-            } else {
-                tracing::debug!(
-                    batch = batches,
-                    seen = notes_seen,
-                    target = target_leaves,
-                    "Fetched note commitments batch while rebuilding Merkle tree"
-                );
+                Self::Sequencer
             }
-
-            offset += batch_resp.notes.len();
         }
     }
-
-    let mut root = [0u8; 32];
-    root.copy_from_slice(&state.root);
-
-    tracing::debug!(
-        "Rebuilt Merkle tree: {} leaves, root={}",
-        tree.len(),
-        hex::encode(&root)
-    );
-    tracing::info!(
-        elapsed_ms = start.elapsed().as_millis(),
-        leaves = tree.len(),
-        "Finished rebuilding Merkle tree"
-    );
-
-    Ok((tree, root, pos_by_cm))
 }
 
-/// Poll the ledger for transaction inclusion
-async fn wait_for_inclusion(provider: &Provider, tx_hash: &str) -> Result<()> {
+/// Poll the sequencer for a soft confirmation.
+async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> Result<()> {
     let start = TokioInstant::now();
-    let deadline = start + Duration::from_secs(INCLUSION_TIMEOUT_SECS);
+    let deadline = start + Duration::from_secs(SEQUENCER_CONFIRM_TIMEOUT_SECS);
     let mut last_log = start;
     let mut attempts: u64 = 0;
 
     loop {
         attempts += 1;
         if TokioInstant::now() > deadline {
-            anyhow::bail!("Timeout waiting for transaction {} to be included", tx_hash);
+            anyhow::bail!(
+                "Timeout waiting for transaction {} to be confirmed by the sequencer",
+                tx_hash
+            );
         }
 
-        match provider
-            .query_rest_endpoint::<api_types::LedgerTx>(&format!(
-                "/ledger/txs/{}?children=1",
-                tx_hash
-            ))
-            .await
-        {
-            Ok(ltx) => {
-                if ltx.receipt.result != api_types::TxReceiptResult::Successful {
-                    anyhow::bail!(
-                        "Transaction {} included but not successful: {:?}",
-                        tx_hash,
-                        ltx.receipt
-                    );
-                }
-                tracing::info!(
-                    tx_hash,
-                    block = ltx.batch_number,
-                    attempts,
-                    waited_ms = start.elapsed().as_millis(),
-                    "Transaction included successfully"
-                );
-                return Ok(());
-            }
-            Err(err) => {
-                if last_log.elapsed() >= Duration::from_secs(INCLUSION_LOG_INTERVAL_SECS) {
-                    let remaining_secs = deadline
-                        .checked_duration_since(TokioInstant::now())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+        match provider.get_sequencer_tx(tx_hash).await {
+            Ok(Some(tx)) => match tx.receipt.result {
+                api_types::TxReceiptResult::Successful => {
                     tracing::info!(
                         tx_hash,
                         attempts,
                         waited_ms = start.elapsed().as_millis(),
-                        remaining_secs,
-                        "Waiting for transaction inclusion"
+                        "Transaction confirmed by sequencer"
                     );
-                    tracing::debug!(tx_hash, attempts, error = %err, "Latest inclusion check failed");
-                    last_log = TokioInstant::now();
+                    return Ok(());
                 }
-                sleep(Duration::from_millis(INCLUSION_POLL_INTERVAL_MS)).await;
+                api_types::TxReceiptResult::Reverted | api_types::TxReceiptResult::Skipped => {
+                    anyhow::bail!(
+                        "Transaction {} confirmed by sequencer but not successful: {:?}",
+                        tx_hash,
+                        tx.receipt
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                if last_log.elapsed() >= Duration::from_secs(SEQUENCER_CONFIRM_LOG_INTERVAL_SECS) {
+                    tracing::debug!(
+                        tx_hash,
+                        attempts,
+                        error = %err,
+                        "Latest sequencer confirmation check failed"
+                    );
+                }
             }
         }
+
+        if last_log.elapsed() >= Duration::from_secs(SEQUENCER_CONFIRM_LOG_INTERVAL_SECS) {
+            let remaining_secs = deadline
+                .checked_duration_since(TokioInstant::now())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            tracing::info!(
+                tx_hash,
+                attempts,
+                waited_ms = start.elapsed().as_millis(),
+                remaining_secs,
+                "Waiting for sequencer confirmation"
+            );
+            last_log = TokioInstant::now();
+        }
+
+        sleep(Duration::from_millis(SEQUENCER_CONFIRM_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -399,40 +318,29 @@ pub async fn transfer(
     let sender_id_out = input_recipient;
     let pk_spend_owner = pk_from_sk(&spend_sk);
 
-    // Step 1: Fetch Merkle tree and build commitment -> position map.
-    let tree_start = StdInstant::now();
-    let (tree, anchor_root, pos_by_cm) = fetch_merkle_tree(provider).await?;
-    tracing::info!(
-        elapsed_ms = tree_start.elapsed().as_millis(),
-        anchor_root = %hex::encode(anchor_root),
-        "Merkle tree fetch and rebuild completed"
-    );
-
-    // Resolve positions + auth paths for each input.
+    // Step 1: Compute input commitments and resolve positions + auth paths using a shared,
+    // incrementally-synced Merkle tree cache.
     let mut input_cms: Vec<Hash32> = Vec::with_capacity(inputs.len());
-    let mut positions: Vec<u64> = Vec::with_capacity(inputs.len());
-    let mut siblings_by_input: Vec<Vec<Hash32>> = Vec::with_capacity(inputs.len());
-
     for i in 0..inputs.len() {
-        let cm_i = note_commitment(
+        input_cms.push(note_commitment(
             &DOMAIN,
             in_values_u64[i],
             &in_rhos[i],
             &input_recipient,
             &in_sender_ids[i],
-        );
-        let pos_i = *pos_by_cm.get(&cm_i).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Input note not found in tree. Searched for commitment: {}",
-                hex::encode(cm_i)
-            )
-        })?;
-        let siblings_i = tree.open(pos_i as usize);
-
-        input_cms.push(cm_i);
-        positions.push(pos_i);
-        siblings_by_input.push(siblings_i);
+        ));
     }
+
+    let tree_start = StdInstant::now();
+    let (anchor_root, positions, siblings_by_input) = tree_syncer()
+        .resolve_positions_and_openings(provider, &input_cms)
+        .await
+        .context("Failed to resolve Merkle positions/openings from cached commitment tree")?;
+    tracing::info!(
+        elapsed_ms = tree_start.elapsed().as_millis(),
+        anchor_root = %hex::encode(anchor_root),
+        "Merkle tree sync completed"
+    );
 
     let depth = siblings_by_input
         .first()
@@ -663,7 +571,12 @@ pub async fn transfer(
 
     // Header:
     push(arg32(&DOMAIN), false, &mut private_indices, &mut proof_args); // 1 domain
-    push(arg32(&spend_sk), true, &mut private_indices, &mut proof_args); // 2 spend_sk
+    push(
+        arg32(&spend_sk),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 2 spend_sk
     push(
         arg32(&pk_ivk_owner),
         true,
@@ -678,7 +591,12 @@ pub async fn transfer(
         &mut private_indices,
         &mut proof_args,
     ); // 4 depth
-    push(arg32(&anchor_root), false, &mut private_indices, &mut proof_args); // 5 anchor
+    push(
+        arg32(&anchor_root),
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    ); // 5 anchor
     push(
         LigeroProgramArguments::I64 {
             i64: u64_to_i64(n_in as u64, "n_in")?,
@@ -805,12 +723,7 @@ pub async fn transfer(
             &mut private_indices,
             &mut proof_args,
         );
-        push(
-            arg32(&rho1),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&rho1), true, &mut private_indices, &mut proof_args);
         push(
             arg32(&pk_spend_owner),
             true,
@@ -823,12 +736,7 @@ pub async fn transfer(
             &mut private_indices,
             &mut proof_args,
         );
-        push(
-            arg32(&cm1),
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
+        push(arg32(&cm1), false, &mut private_indices, &mut proof_args);
     }
 
     // inv_enforce (private).
@@ -884,14 +792,25 @@ pub async fn transfer(
         Ok(inv.to_bytes_be())
     }
 
-    push(arg32(&blacklist_root), false, &mut private_indices, &mut proof_args);
+    push(
+        arg32(&blacklist_root),
+        false,
+        &mut private_indices,
+        &mut proof_args,
+    );
 
     // Opening 0: sender_id (spender identity)
     for e in sender_opening.bucket_entries.iter() {
         push(arg32(e), true, &mut private_indices, &mut proof_args);
     }
-    let sender_inv = bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
-    push(arg32(&sender_inv), true, &mut private_indices, &mut proof_args);
+    let sender_inv =
+        bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
+    push(
+        arg32(&sender_inv),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
     for sib in sender_opening.siblings.iter().take(bl_depth) {
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
@@ -901,15 +820,20 @@ pub async fn transfer(
         push(arg32(e), true, &mut private_indices, &mut proof_args);
     }
     let dest_inv = bl_bucket_inv_for_id(&dest_opening.recipient, &dest_opening.bucket_entries)?;
-    push(arg32(&dest_inv), true, &mut private_indices, &mut proof_args);
+    push(
+        arg32(&dest_inv),
+        true,
+        &mut private_indices,
+        &mut proof_args,
+    );
     for sib in dest_opening.siblings.iter().take(bl_depth) {
         push(arg32(sib), true, &mut private_indices, &mut proof_args);
     }
 
     // Viewer section arguments (Level B) if viewer FVK is configured.
-    let viewer_fvk_commitment_arg_idx: Option<usize> =
-        if let (Some(ref bundle), Some(ref atts)) = (viewer_fvk_bundle.as_ref(), &view_attestations)
-        {
+    let viewer_fvk_commitment_arg_idx: Option<usize> = if let (Some(ref bundle), Some(ref atts)) =
+        (viewer_fvk_bundle.as_ref(), &view_attestations)
+    {
         // n_viewers
         push(
             LigeroProgramArguments::I64 { i64: 1 },
@@ -926,11 +850,26 @@ pub async fn transfer(
             &mut proof_args,
         );
         // fvk (private)
-        push(arg32(&bundle.fvk), true, &mut private_indices, &mut proof_args);
+        push(
+            arg32(&bundle.fvk),
+            true,
+            &mut private_indices,
+            &mut proof_args,
+        );
         // For each output, ct_hash + mac (public)
         for att in atts.iter().take(n_out) {
-            push(arg32(&att.ct_hash), false, &mut private_indices, &mut proof_args);
-            push(arg32(&att.mac), false, &mut private_indices, &mut proof_args);
+            push(
+                arg32(&att.ct_hash),
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
+            push(
+                arg32(&att.mac),
+                false,
+                &mut private_indices,
+                &mut proof_args,
+            );
         }
         Some(fvk_commitment_arg_idx)
     } else {
@@ -975,7 +914,9 @@ pub async fn transfer(
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("Failed to serialize Ligero args to JSON values for package")?;
 
-    if let (Some(idx), Some(ref bundle)) = (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref()) {
+    if let (Some(idx), Some(ref bundle)) =
+        (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref())
+    {
         let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
             anyhow::anyhow!(
                 "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"
@@ -1045,9 +986,16 @@ pub async fn transfer(
         "Transfer transaction submitted via verifier service"
     );
 
-    // Step 8: Poll for inclusion
-    tracing::info!("Waiting for transaction inclusion...");
-    wait_for_inclusion(provider, &tx_hash).await?;
+    // Step 8: Optional post-submit wait
+    match TransferWaitMode::from_env() {
+        TransferWaitMode::None => {
+            tracing::info!("Skipping post-submit wait (MCP_TRANSFER_WAIT_MODE=none)");
+        }
+        TransferWaitMode::Sequencer => {
+            tracing::info!("Waiting for sequencer confirmation...");
+            wait_for_sequencer_confirmation(provider, &tx_hash).await?;
+        }
+    }
     tracing::info!(
         elapsed_ms = overall_start.elapsed().as_millis(),
         tx_hash,
