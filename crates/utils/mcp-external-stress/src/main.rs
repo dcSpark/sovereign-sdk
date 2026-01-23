@@ -59,6 +59,14 @@ struct Args {
     /// Confirmation wait timeout per tx when `--confirm` is enabled.
     #[arg(long, env = "MCP_STRESS_CONFIRM_TIMEOUT_SECS", default_value_t = 120)]
     confirm_timeout_secs: u64,
+
+    /// How often to print the periodic progress line (set to 0 to disable).
+    #[arg(long, env = "MCP_STRESS_REPORT_INTERVAL_SECS", default_value_t = 0)]
+    report_interval_secs: u64,
+
+    /// Print the periodic progress line even if nothing changed since the previous print.
+    #[arg(long, env = "MCP_STRESS_REPORT_UNCHANGED", default_value_t = false)]
+    report_unchanged: bool,
 }
 
 struct Counters {
@@ -271,11 +279,8 @@ async fn wallet_worker(
     .with_context(|| format!("wallet[{idx}] waiting for initial balance"))?;
 
     counters.wallets_ready.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(
-        "wallet[{idx}] ready: wallet_address={} privacy_address={}",
-        wallet_address,
-        privacy_address
-    );
+    tracing::debug!("wallet[{idx}] wallet_address={wallet_address}");
+    tracing::info!("wallet[{idx}] ready: privacy_address={privacy_address}");
 
     let per_wallet_delay = Duration::from_millis(args.per_wallet_delay_ms);
     let confirm_poll = Duration::from_millis(args.confirm_poll_ms);
@@ -310,7 +315,10 @@ async fn wallet_worker(
         match send_res {
             Ok(tx_id) => {
                 counters.sends_ok.fetch_add(1, Ordering::Relaxed);
-                tracing::info!("wallet[{idx}] sent tx_id={tx_id}");
+                tracing::info!(
+                    "wallet[{idx}] sent tx_id={tx_id} elapsed_ms={}",
+                    send_elapsed.as_millis()
+                );
                 if args.confirm {
                     let confirm_started = Instant::now();
                     let confirm_res = wait_for_tx_confirmed(
@@ -334,18 +342,27 @@ async fn wallet_worker(
                     match confirm_res {
                         Ok(()) => {
                             counters.confirms_ok.fetch_add(1, Ordering::Relaxed);
-                            tracing::info!("wallet[{idx}] confirmed tx_id={tx_id}");
+                            tracing::info!(
+                                "wallet[{idx}] confirmed tx_id={tx_id} elapsed_ms={}",
+                                confirm_elapsed.as_millis()
+                            );
                         }
                         Err(e) => {
                             counters.confirms_err.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!("wallet[{idx}] confirm failed: {e:#}");
+                            tracing::warn!(
+                                "wallet[{idx}] confirm failed elapsed_ms={} error={e:#}",
+                                confirm_elapsed.as_millis()
+                            );
                         }
                     }
                 }
             }
             Err(e) => {
                 counters.sends_err.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("wallet[{idx}] send failed: {e:#}");
+                tracing::warn!(
+                    "wallet[{idx}] send failed elapsed_ms={} error={e:#}",
+                    send_elapsed.as_millis()
+                );
             }
         }
 
@@ -441,50 +458,84 @@ async fn main() -> Result<()> {
 
     let reporter_counters = counters.clone();
     let mut reporter_stop_rx = stop_rx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let report_interval_secs = args.report_interval_secs;
+    let report_unchanged = args.report_unchanged;
+    if report_interval_secs > 0 {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(report_interval_secs.max(1)));
 
-        let mut last_sends_ok = 0u64;
-        let mut last_sends_err = 0u64;
+            let mut last_ready = u64::MAX;
+            let mut last_sends_ok = u64::MAX;
+            let mut last_sends_err = u64::MAX;
+            let mut last_confirms_ok = u64::MAX;
+            let mut last_confirms_err = u64::MAX;
 
-        loop {
-            tokio::select! {
-                _ = reporter_stop_rx.changed() => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    let ready = reporter_counters.wallets_ready.load(Ordering::Relaxed);
-                    let sends_ok = reporter_counters.sends_ok.load(Ordering::Relaxed);
-                    let sends_err = reporter_counters.sends_err.load(Ordering::Relaxed);
-                    let confirms_ok = reporter_counters.confirms_ok.load(Ordering::Relaxed);
-                    let confirms_err = reporter_counters.confirms_err.load(Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    _ = reporter_stop_rx.changed() => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let ready = reporter_counters.wallets_ready.load(Ordering::Relaxed);
+                        let sends_ok = reporter_counters.sends_ok.load(Ordering::Relaxed);
+                        let sends_err = reporter_counters.sends_err.load(Ordering::Relaxed);
+                        let confirms_ok = reporter_counters.confirms_ok.load(Ordering::Relaxed);
+                        let confirms_err = reporter_counters.confirms_err.load(Ordering::Relaxed);
 
-                    let send_us_total = reporter_counters.send_latency_us_total.load(Ordering::Relaxed);
-                    let send_us_max = reporter_counters.send_latency_us_max.load(Ordering::Relaxed);
-                    let send_avg_us = avg_us(send_us_total, sends_ok + sends_err);
+                        let changed = ready != last_ready
+                            || sends_ok != last_sends_ok
+                            || sends_err != last_sends_err
+                            || confirms_ok != last_confirms_ok
+                            || confirms_err != last_confirms_err;
 
-                    let confirm_us_total = reporter_counters.confirm_latency_us_total.load(Ordering::Relaxed);
-                    let confirm_us_max = reporter_counters.confirm_latency_us_max.load(Ordering::Relaxed);
-                    let confirm_count = confirms_ok + confirms_err;
-                    let confirm_avg_us = avg_us(confirm_us_total, confirm_count);
+                        if !changed && !report_unchanged {
+                            continue;
+                        }
 
-                    let delta_ok = sends_ok.saturating_sub(last_sends_ok);
-                    let delta_err = sends_err.saturating_sub(last_sends_err);
-                    last_sends_ok = sends_ok;
-                    last_sends_err = sends_err;
+                        let send_us_total =
+                            reporter_counters.send_latency_us_total.load(Ordering::Relaxed);
+                        let send_us_max = reporter_counters.send_latency_us_max.load(Ordering::Relaxed);
+                        let send_avg_us = avg_us(send_us_total, sends_ok + sends_err);
 
-                    eprintln!(
-                        "ready={ready}/{wallets} sends_ok={sends_ok} (+{delta_ok}/s) sends_err={sends_err} (+{delta_err}/s) send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
-                        wallets = wallets_total,
-                        send_avg_ms = send_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
-                        send_max_ms = send_us_max as f64 / 1000.0,
-                        confirm_avg_ms = confirm_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
-                        confirm_max_ms = confirm_us_max as f64 / 1000.0,
-                    );
+                        let confirm_us_total =
+                            reporter_counters.confirm_latency_us_total.load(Ordering::Relaxed);
+                        let confirm_us_max =
+                            reporter_counters.confirm_latency_us_max.load(Ordering::Relaxed);
+                        let confirm_count = confirms_ok + confirms_err;
+                        let confirm_avg_us = avg_us(confirm_us_total, confirm_count);
+
+                        let delta_ok = if last_sends_ok == u64::MAX {
+                            0
+                        } else {
+                            sends_ok.saturating_sub(last_sends_ok)
+                        };
+                        let delta_err = if last_sends_err == u64::MAX {
+                            0
+                        } else {
+                            sends_err.saturating_sub(last_sends_err)
+                        };
+
+                        last_ready = ready;
+                        last_sends_ok = sends_ok;
+                        last_sends_err = sends_err;
+                        last_confirms_ok = confirms_ok;
+                        last_confirms_err = confirms_err;
+
+                        eprintln!(
+                            "ready={ready}/{wallets} sends_ok={sends_ok} (+{delta_ok}/{interval}s) sends_err={sends_err} (+{delta_err}/{interval}s) send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
+                            wallets = wallets_total,
+                            interval = report_interval_secs.max(1),
+                            send_avg_ms = send_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
+                            send_max_ms = send_us_max as f64 / 1000.0,
+                            confirm_avg_ms = confirm_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
+                            confirm_max_ms = confirm_us_max as f64 / 1000.0,
+                        );
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     let mut join_set = tokio::task::JoinSet::new();
     for idx in 0..args.wallets {
