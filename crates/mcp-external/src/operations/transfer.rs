@@ -34,9 +34,9 @@ pub type McpRuntime = Runtime<McpSpec>;
 
 const TREE_DEPTH: u8 = 16;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const INCLUSION_POLL_INTERVAL_MS: u64 = 100;
-const INCLUSION_TIMEOUT_SECS: u64 = 60;
-const INCLUSION_LOG_INTERVAL_SECS: u64 = 5;
+const SEQUENCER_CONFIRM_POLL_INTERVAL_MS: u64 = 100;
+const SEQUENCER_CONFIRM_TIMEOUT_SECS: u64 = 10;
+const SEQUENCER_CONFIRM_LOG_INTERVAL_SECS: u64 = 2;
 const MERKLE_FETCH_LOG_EVERY: usize = 10;
 const NOTE_SEARCH_LOG_EVERY: usize = 10;
 
@@ -307,62 +307,95 @@ async fn get_anchor_root(provider: &Provider) -> Result<Hash32> {
     Ok(anchor)
 }
 
-/// Poll the ledger for transaction inclusion
-async fn wait_for_inclusion(provider: &Provider, tx_hash: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferWaitMode {
+    None,
+    Sequencer,
+}
+
+impl TransferWaitMode {
+    fn from_env() -> Self {
+        let raw = std::env::var("MCP_TRANSFER_WAIT_MODE")
+            .unwrap_or_else(|_| "sequencer".to_string());
+        let v = raw.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "" | "sequencer" | "seq" => Self::Sequencer,
+            "none" | "off" | "false" | "0" => Self::None,
+            other => {
+                tracing::warn!(
+                    "Unknown MCP_TRANSFER_WAIT_MODE '{}'; falling back to 'sequencer'",
+                    other
+                );
+                Self::Sequencer
+            }
+        }
+    }
+}
+
+/// Poll the sequencer for a soft confirmation.
+async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> Result<()> {
     let start = TokioInstant::now();
-    let deadline = start + Duration::from_secs(INCLUSION_TIMEOUT_SECS);
+    let deadline = start + Duration::from_secs(SEQUENCER_CONFIRM_TIMEOUT_SECS);
     let mut last_log = start;
     let mut attempts: u64 = 0;
 
     loop {
         attempts += 1;
         if TokioInstant::now() > deadline {
-            anyhow::bail!("Timeout waiting for transaction {} to be included", tx_hash);
+            anyhow::bail!(
+                "Timeout waiting for transaction {} to be confirmed by the sequencer",
+                tx_hash
+            );
         }
 
-        match provider
-            .query_rest_endpoint::<api_types::LedgerTx>(&format!(
-                "/ledger/txs/{}?children=1",
-                tx_hash
-            ))
-            .await
-        {
-            Ok(ltx) => {
-                if ltx.receipt.result != api_types::TxReceiptResult::Successful {
-                    anyhow::bail!(
-                        "Transaction {} included but not successful: {:?}",
-                        tx_hash,
-                        ltx.receipt
-                    );
-                }
-                tracing::info!(
-                    tx_hash,
-                    block = ltx.batch_number,
-                    attempts,
-                    waited_ms = start.elapsed().as_millis(),
-                    "Transaction included successfully"
-                );
-                return Ok(());
-            }
-            Err(err) => {
-                if last_log.elapsed() >= Duration::from_secs(INCLUSION_LOG_INTERVAL_SECS) {
-                    let remaining_secs = deadline
-                        .checked_duration_since(TokioInstant::now())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+        match provider.get_sequencer_tx(tx_hash).await {
+            Ok(Some(tx)) => match tx.receipt.result {
+                api_types::TxReceiptResult::Successful => {
                     tracing::info!(
                         tx_hash,
                         attempts,
                         waited_ms = start.elapsed().as_millis(),
-                        remaining_secs,
-                        "Waiting for transaction inclusion"
+                        "Transaction confirmed by sequencer"
                     );
-                    tracing::debug!(tx_hash, attempts, error = %err, "Latest inclusion check failed");
-                    last_log = TokioInstant::now();
+                    return Ok(());
                 }
-                sleep(Duration::from_millis(INCLUSION_POLL_INTERVAL_MS)).await;
+                api_types::TxReceiptResult::Reverted | api_types::TxReceiptResult::Skipped => {
+                    anyhow::bail!(
+                        "Transaction {} confirmed by sequencer but not successful: {:?}",
+                        tx_hash,
+                        tx.receipt
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                if last_log.elapsed() >= Duration::from_secs(SEQUENCER_CONFIRM_LOG_INTERVAL_SECS) {
+                    tracing::debug!(
+                        tx_hash,
+                        attempts,
+                        error = %err,
+                        "Latest sequencer confirmation check failed"
+                    );
+                }
             }
         }
+
+        if last_log.elapsed() >= Duration::from_secs(SEQUENCER_CONFIRM_LOG_INTERVAL_SECS) {
+            let remaining_secs = deadline
+                .checked_duration_since(TokioInstant::now())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            tracing::info!(
+                tx_hash,
+                attempts,
+                waited_ms = start.elapsed().as_millis(),
+                remaining_secs,
+                "Waiting for sequencer confirmation"
+            );
+            last_log = TokioInstant::now();
+        }
+
+        sleep(Duration::from_millis(SEQUENCER_CONFIRM_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -1168,9 +1201,16 @@ pub async fn transfer(
         "Transfer transaction submitted via verifier service"
     );
 
-    // Step 8: Poll for inclusion
-    tracing::info!("Waiting for transaction inclusion...");
-    wait_for_inclusion(provider, &tx_hash).await?;
+    // Step 8: Optional post-submit wait
+    match TransferWaitMode::from_env() {
+        TransferWaitMode::None => {
+            tracing::info!("Skipping post-submit wait (MCP_TRANSFER_WAIT_MODE=none)");
+        }
+        TransferWaitMode::Sequencer => {
+            tracing::info!("Waiting for sequencer confirmation...");
+            wait_for_sequencer_confirmation(provider, &tx_hash).await?;
+        }
+    }
     tracing::info!(
         elapsed_ms = overall_start.elapsed().as_millis(),
         tx_hash,

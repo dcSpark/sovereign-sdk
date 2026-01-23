@@ -40,6 +40,7 @@ Configure the following environment variables:
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
 - `AUTO_FUND_GAS_RESERVE` - Optional gas reserve (in dust) added to the L2 funding transfer for auto-funding (default: 1000000000000). Values below the default are clamped to ensure the deposit can reserve gas.
+- `MCP_TRANSFER_WAIT_MODE` - Optional post-submit wait mode for `send`: `sequencer` (default) or `none`.
 
 ### Start the Server
 

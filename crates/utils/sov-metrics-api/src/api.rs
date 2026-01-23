@@ -6,7 +6,10 @@ use axum::{
     Json, Router,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use sea_orm::DatabaseConnection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -19,15 +22,51 @@ use crate::metrics::collectors::total_tokens_economy::TotalTokensEconomyPayload;
 use crate::metrics::collectors::total_transactions::TotalTransactionsPayload;
 use crate::metrics::{MetricSample, MetricSeriesSnapshot, MetricsStore};
 
+/// Cached peak TPS value with its computation boundary.
+#[derive(Clone, Debug)]
+struct TpsPeakCacheEntry {
+    /// The maximum TPS value found in the window.
+    peak_tps: f64,
+    /// Timestamp (ms) when the peak occurred.
+    peak_at_ms: i64,
+    /// The end of the window used for this computation (ms).
+    computed_up_to_ms: i64,
+    /// When this cache entry was computed (ms).
+    computed_at_ms: i64,
+}
+
+/// Thread-safe cache for peak TPS calculations.
+#[derive(Clone, Default)]
+pub struct TpsPeakCache {
+    inner: Arc<RwLock<Option<TpsPeakCacheEntry>>>,
+}
+
+impl TpsPeakCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: MetricsStore,
     pub retention_secs: u64,
+    pub tps_peak_cache: TpsPeakCache,
+    pub da_db: DatabaseConnection,
 }
 
 #[derive(Debug, Deserialize)]
 struct WindowQuery {
     window_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TpsPeakQuery {
+    window_seconds: Option<u64>,
+    /// Set to true to bypass cache and force fresh calculation.
+    no_cache: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         .route("/total-transactions/historic", get(total_transactions_historic))
         .route("/tps", get(tps))
         .route("/tps/historic", get(tps_historic))
+        .route("/tps/peak", get(tps_peak))
         .merge(swagger_ui)
         .with_state(state)
 }
@@ -266,6 +306,195 @@ async fn tps_historic(
         latest,
         samples,
     })
+}
+
+/// Cache is valid if computed within this threshold (30 seconds).
+const TPS_PEAK_CACHE_THRESHOLD_MS: i64 = 30 * 1000;
+
+#[utoipa::path(
+    get,
+    path = "/tps/peak",
+    params(
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds to search for peak TPS. Defaults to 300 (5 minutes)."),
+        ("no_cache" = Option<bool>, Query, description = "Set to true to bypass cache and force fresh calculation.")
+    ),
+    responses(
+        (status = 200, description = "Peak TPS in the specified window", body = TpsPeakResponse)
+    ),
+    tag = "metrics"
+)]
+async fn tps_peak(
+    State(state): State<AppState>,
+    Query(params): Query<TpsPeakQuery>,
+) -> Json<TpsPeakResponse> {
+    let window_secs = params.window_seconds.unwrap_or(300); // 5 minutes default
+    let window_ms = (window_secs as i64) * 1000;
+    let no_cache = params.no_cache.unwrap_or(false);
+
+    let now = chrono::Utc::now();
+    let now_ms = now.timestamp_millis();
+    let window_start_ms = now_ms - window_ms;
+
+    // Check cache first (unless no_cache is set)
+    if !no_cache {
+        let cache = state.tps_peak_cache.inner.read().await;
+        if let Some(ref entry) = *cache {
+            // Cache is valid if:
+            // 1. It was computed recently (within threshold)
+            // 2. The cached window covers our current request window
+            let cache_age_ms = now_ms - entry.computed_at_ms;
+            if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
+                && entry.computed_up_to_ms >= window_start_ms
+            {
+                return Json(TpsPeakResponse {
+                    peak_tps: Some(entry.peak_tps),
+                    peak_at_ms: Some(entry.peak_at_ms),
+                    window_ms,
+                    from_cache: true,
+                });
+            }
+        }
+    }
+
+    // Cache miss or stale - query database directly for actual transaction timestamps
+    let window_start = chrono::DateTime::from_timestamp_millis(window_start_ms)
+        .unwrap_or(now - chrono::Duration::seconds(window_secs as i64));
+
+    let result = compute_peak_tps_from_db(&state.da_db, window_start, now).await;
+
+    let (peak_tps, peak_at_ms) = match result {
+        Ok((tps, at_ms)) => (Some(tps), Some(at_ms)),
+        Err(e) => {
+            warn!("Failed to compute peak TPS from database: {}", e);
+            (None, None)
+        }
+    };
+
+    // Update cache
+    if let (Some(tps), Some(at_ms)) = (peak_tps, peak_at_ms) {
+        let mut cache = state.tps_peak_cache.inner.write().await;
+        *cache = Some(TpsPeakCacheEntry {
+            peak_tps: tps,
+            peak_at_ms: at_ms,
+            computed_up_to_ms: now_ms,
+            computed_at_ms: now_ms,
+        });
+    }
+
+    Json(TpsPeakResponse {
+        peak_tps,
+        peak_at_ms,
+        window_ms,
+        from_cache: false,
+    })
+}
+
+/// Query the database to find the peak TPS by counting transactions per second.
+async fn compute_peak_tps_from_db(
+    db: &DatabaseConnection,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Result<(f64, i64), sea_orm::DbErr> {
+    use sea_orm::{ActiveEnum, ConnectionTrait, FromQueryResult, Statement};
+    use sov_midnight_da::storable::worker_verified_transactions::TransactionState;
+    use tracing::debug;
+
+    #[derive(Debug, FromQueryResult)]
+    struct SecondBucket {
+        second_ts: i64,
+        tx_count: i64,
+    }
+
+    let backend = db.get_database_backend();
+    let accepted = TransactionState::Accepted.to_value();
+    let rejected = TransactionState::Rejected.to_value();
+    
+    // Format timestamps as ISO strings for reliable parsing
+    let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
+    let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
+    
+    debug!(
+        "Computing peak TPS from {} to {} (states: {}, {})",
+        from_str, to_str, accepted, rejected
+    );
+
+    let sql = match backend {
+        sea_orm::DatabaseBackend::Postgres => {
+            format!(
+                r#"
+                SELECT 
+                    EXTRACT(EPOCH FROM DATE_TRUNC('second', created_at))::BIGINT as second_ts,
+                    COUNT(*) as tx_count
+                FROM worker_verified_transactions
+                WHERE created_at >= '{}'::timestamp 
+                  AND created_at <= '{}'::timestamp
+                  AND transaction_state IN ('{}', '{}')
+                GROUP BY DATE_TRUNC('second', created_at)
+                ORDER BY tx_count DESC
+                LIMIT 1
+                "#,
+                from_str, to_str, accepted, rejected
+            )
+        }
+        sea_orm::DatabaseBackend::Sqlite => {
+            // SQLite stores DateTimeUtc as ISO8601 strings like "2026-01-22T17:49:31.309922+00:00"
+            // Use substr to compare just the date/time portion, ignoring microseconds and timezone
+            let from_iso = from.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let to_iso = to.format("%Y-%m-%dT%H:%M:%S").to_string();
+            format!(
+                r#"
+                SELECT 
+                    CAST(strftime('%s', substr(created_at, 1, 19)) AS INTEGER) as second_ts,
+                    COUNT(*) as tx_count
+                FROM worker_verified_transactions
+                WHERE substr(created_at, 1, 19) >= '{}'
+                  AND substr(created_at, 1, 19) <= '{}'
+                  AND transaction_state IN ('{}', '{}')
+                GROUP BY strftime('%s', substr(created_at, 1, 19))
+                ORDER BY tx_count DESC
+                LIMIT 1
+                "#,
+                from_iso, to_iso, accepted, rejected
+            )
+        }
+        _ => {
+            format!(
+                r#"
+                SELECT 
+                    UNIX_TIMESTAMP(DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')) as second_ts,
+                    COUNT(*) as tx_count
+                FROM worker_verified_transactions
+                WHERE created_at >= '{}'
+                  AND created_at <= '{}'
+                  AND transaction_state IN ('{}', '{}')
+                GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
+                ORDER BY tx_count DESC
+                LIMIT 1
+                "#,
+                from_str, to_str, accepted, rejected
+            )
+        }
+    };
+
+    debug!("Peak TPS SQL: {}", sql);
+
+    let stmt = Statement::from_string(backend, sql);
+    let result = SecondBucket::find_by_statement(stmt).one(db).await?;
+
+    debug!("Peak TPS query result: {:?}", result);
+
+    match result {
+        Some(bucket) => {
+            let tps = bucket.tx_count as f64;
+            let peak_at_ms = bucket.second_ts * 1000;
+            debug!("Found peak TPS: {} at {}", tps, peak_at_ms);
+            Ok((tps, peak_at_ms))
+        }
+        None => {
+            debug!("No transactions found in window");
+            Ok((0.0, chrono::Utc::now().timestamp_millis()))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1527,6 +1756,18 @@ struct TpsResponse {
 }
 
 #[derive(Serialize, ToSchema)]
+struct TpsPeakResponse {
+    /// The maximum TPS observed in the window.
+    peak_tps: Option<f64>,
+    /// Timestamp (ms) when the peak TPS occurred.
+    peak_at_ms: Option<i64>,
+    /// The window size used for the search (ms).
+    window_ms: i64,
+    /// Whether this result was served from cache.
+    from_cache: bool,
+}
+
+#[derive(Serialize, ToSchema)]
 struct TpsSeriesSnapshot {
     name: String,
     interval_secs: u64,
@@ -1699,6 +1940,7 @@ struct TokenVelocityHistoricSample {
         total_transactions_historic,
         tps,
         tps_historic,
+        tps_peak,
         failed_transactions_rate,
         failed_transactions_rate_historic,
         average_transaction_size,
@@ -1718,6 +1960,7 @@ struct TokenVelocityHistoricSample {
         TpsResponse,
         TpsSeriesSnapshot,
         TpsSample,
+        TpsPeakResponse,
         FailedTransactionsResponse,
         FailedTransactionsRateSeriesSnapshot,
         FailedTransactionsRateSample,
