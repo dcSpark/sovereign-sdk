@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/pool_fvk_env.sh"
 resolve_pool_fvk_pk
 print_pool_fvk_pk_status
 
-export RUST_LOG="${RUST_LOG:-debug}"
+export RUST_LOG="${RUST_LOG:-info}"
 export MCP_SERVER_BIND_ADDRESS="${MCP_SERVER_BIND_ADDRESS_2:-0.0.0.0:3001}"
 export ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://localhost:12346}"
 export VERIFIER_URL="${VERIFIER_URL:-http://localhost:8080}"
