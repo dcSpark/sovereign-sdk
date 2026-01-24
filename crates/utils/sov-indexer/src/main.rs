@@ -77,13 +77,25 @@ async fn main() -> anyhow::Result<()> {
     let vfk_registry_clone = vfk_registry.clone();
     let fvk_service_clone = fvk_service.clone();
     tokio::spawn(async move {
-        println!("Starting VFK backfill");
+        println!("Starting encrypted-note backfills");
         if let Err(e) =
             background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone, fvk_service_clone.as_ref()).await
         {
             warn!(error = %e, "VFK backfill failed");
         }
-        println!("Finished VFK backfill");
+        if let Err(e) = background_sync::backfill_notes_nullifiers(
+            &idx_clone,
+            &vfk_registry_clone,
+            fvk_service_clone.as_ref(),
+        )
+        .await
+        {
+            warn!(error = %e, "notes_nullifiers backfill failed");
+        }
+        if let Err(e) = background_sync::backfill_spent_nullifiers(&idx_clone).await {
+            warn!(error = %e, "spent_nullifiers backfill failed");
+        }
+        println!("Finished encrypted-note backfills");
     });
     println!("Initializing background sync loop");
     background_sync::spawn_sync_loop(

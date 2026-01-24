@@ -1521,6 +1521,16 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
                 // Build viewer attestation if pool viewer is configured.
                 let (view_attestations, viewer_data) = if let Some(fvk) = viewer_fvk {
+                    let cm_in = note_commitment(
+                        &domain,
+                        out_value_u64,
+                        &rho,
+                        &in_recipient,
+                        &in_sender_id,
+                    );
+                    let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                        [[0u8; 32]; crate::viewer::MAX_INS];
+                    cm_ins[0] = cm_in;
                     let (att, _enc) = make_viewer_bundle(
                         &fvk,
                         &domain,
@@ -1528,6 +1538,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         &out_rho,
                         &out_recipient,
                         &sender_id_out,
+                        &cm_ins,
                         &cm_out,
                     )?;
                     (Some(vec![att.clone()]), Some((fvk, att)))
@@ -1539,7 +1550,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 let public = midnight_privacy::SpendPublic {
                     anchor_root: anchor,
                     blacklist_root,
-                    nullifier: nf,
+                    nullifiers: vec![nf],
                     withdraw_amount: 0,
                     output_commitments: vec![cm_out], // ONE output
                     view_attestations,
@@ -1812,9 +1823,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
                     let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
-                    let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                    let expected_nfs = [nf_exp];
                     if public.anchor_root != shared_anchor
-                        || public.nullifier != nf_exp
+                        || public.nullifiers.as_slice() != expected_nfs
                         || public.withdraw_amount != 0
                     {
                         eprintln!(
@@ -1822,7 +1834,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                             idx,
                             account_idx,
                             public.anchor_root == shared_anchor,
-                            public.nullifier == nf_exp,
+                            public.nullifiers.as_slice() == expected_nfs,
                             public.withdraw_amount == 0
                         );
                         eprintln!(
@@ -1833,7 +1845,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                         eprintln!(
                             "         proof anchor={} nullifier={} withdraw={}",
                             hex::encode(public.anchor_root),
-                            hex::encode(public.nullifier),
+                            public
+                                .nullifiers
+                                .first()
+                                .map(|n| hex::encode(n))
+                                .unwrap_or_else(|| "<empty>".to_string()),
                             public.withdraw_amount
                         );
                     }
@@ -1913,6 +1929,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         // sender_id = spender's address
         let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
             Some(fvk) => {
+                let in_recipient = recipient_from_sk_v2(&domain, &input.spend_sk, &pk_ivk_owner);
+                let in_sender_id = in_recipient; // deposit convention: sender_id == recipient
+                let cm_in =
+                    note_commitment(&domain, out_value_u64, &input.rho, &in_recipient, &in_sender_id);
+                let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                    [[0u8; 32]; crate::viewer::MAX_INS];
+                cm_ins[0] = cm_in;
                 let (_att, enc) = make_viewer_bundle(
                     &fvk,
                     &domain,
@@ -1920,6 +1943,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     &out_rho,
                     &out_recipient,
                     &sender_id,
+                    &cm_ins,
                     &cm_out,
                 )?;
                 Some(vec![enc])
@@ -1932,7 +1956,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Proof too large for SafeVec"))?,
             anchor_root: shared_anchor,
-            nullifier: nf,
+            nullifiers: vec![nf],
             view_ciphertexts,
             gas: None,
         });

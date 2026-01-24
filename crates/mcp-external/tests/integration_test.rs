@@ -10,7 +10,7 @@
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
 use mcp_external::ligero::Ligero;
-use mcp_external::operations::{deposit, transfer};
+use mcp_external::operations::{deposit, transfer, TransferInputNote};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::wallet::WalletContext;
@@ -201,6 +201,12 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tracing::info!("Step 7: Performing transfer using deposit outputs");
     let note_value = deposit_amount; // Note value from deposit
     let send_amount = deposit_amount; // Transfer the full amount
+    let inputs = vec![TransferInputNote {
+        value: note_value,
+        rho: deposit_result.rho,
+        // Deposit convention: sender_id == recipient (required by NOTE_V2 commitment).
+        sender_id: deposit_result.recipient,
+    }];
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -209,10 +215,8 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
             .spend_sk()
             .expect("transfer requires spend_sk (privacy key must not be address-only)"),
         *privacy_key.pk(),
-        note_value,
         send_amount,
-        deposit_result.rho,
-        deposit_result.recipient, // deposit convention: sender_id == recipient
+        inputs,
         *privacy_key.pk(),
         *privacy_key.pk(),
         None,
@@ -463,6 +467,12 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     const DOMAIN: [u8; 32] = [1u8; 32];
     let input_recipient = new_privacy_key.recipient(&DOMAIN);
 
+    let inputs = vec![TransferInputNote {
+        value: note.value,
+        rho: input_rho,
+        // Deposit convention: sender_id == recipient (required by NOTE_V2 commitment).
+        sender_id: input_recipient,
+    }];
     let transfer_result = transfer(
         &ligero,
         &provider,
@@ -471,10 +481,8 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
             .spend_sk()
             .expect("transfer requires spend_sk (privacy key must not be address-only)"),
         *new_privacy_key.pk(),
-        note.value,
         send_amount,
-        input_rho,
-        input_recipient, // deposit convention: sender_id == recipient
+        inputs,
         *new_privacy_key.pk(),
         *new_privacy_key.pk(),
         None,

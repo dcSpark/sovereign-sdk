@@ -8,8 +8,16 @@ use midnight_privacy::{
     EncryptedNote, FullViewingKey, Hash32, ViewAttestation,
 };
 
-/// Length of note plaintext: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
-pub const NOTE_PLAIN_LEN: usize = 144;
+/// Legacy spend/output note plaintext length (no `cm_ins`).
+pub const NOTE_PLAIN_LEN_SPEND_V1: usize = 144;
+
+pub const MAX_INS: usize = 4;
+
+/// Current spend/output note plaintext length (includes `cm_ins[4]`).
+pub const NOTE_PLAIN_LEN_SPEND_V2: usize = NOTE_PLAIN_LEN_SPEND_V1 + 32 * MAX_INS;
+
+// Backward-compatible alias (historically 144, now reflects current spend/output plaintext size).
+pub const NOTE_PLAIN_LEN: usize = NOTE_PLAIN_LEN_SPEND_V2;
 
 /// Produce the i-th 32-byte stream block for key k using Poseidon2.
 fn stream_block(k: &Hash32) -> impl Fn(u32) -> Hash32 + '_ {
@@ -36,15 +44,16 @@ fn stream_xor_encrypt(k: &Hash32, pt: &[u8], ct_out: &mut [u8]) {
     }
 }
 
-/// Serialize note plaintext for encryption (144 bytes with sender_id).
+/// Serialize spend/output note plaintext for encryption (includes `cm_ins`).
 pub fn encode_note_plain(
     domain: &Hash32,
     value: u64,
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-) -> [u8; NOTE_PLAIN_LEN] {
-    let mut out = [0u8; NOTE_PLAIN_LEN];
+    cm_ins: &[Hash32; MAX_INS],
+) -> [u8; NOTE_PLAIN_LEN_SPEND_V2] {
+    let mut out = [0u8; NOTE_PLAIN_LEN_SPEND_V2];
     out[0..32].copy_from_slice(domain);
     // Encode as 16-byte LE, zero-extended from u64.
     out[32..40].copy_from_slice(&value.to_le_bytes());
@@ -52,6 +61,11 @@ pub fn encode_note_plain(
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
     out
 }
 
@@ -77,6 +91,7 @@ pub fn make_viewer_bundle(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
+    cm_ins: &[Hash32; MAX_INS],
     cm: &Hash32,
 ) -> anyhow::Result<(ViewAttestation, EncryptedNote)> {
     let value_u64: u64 = value.try_into().map_err(|_| {
@@ -84,9 +99,9 @@ pub fn make_viewer_bundle(
     })?;
     let fvk_obj = FullViewingKey(*fvk);
     let fvk_c = fvk_commitment(&fvk_obj);
-    let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id);
+    let pt = encode_note_plain(domain, value_u64, rho, recipient, sender_id, cm_ins);
     let k = view_kdf(&fvk_obj, cm);
-    let mut ct = [0u8; NOTE_PLAIN_LEN];
+    let mut ct = [0u8; NOTE_PLAIN_LEN_SPEND_V2];
     stream_xor_encrypt(&k, &pt, &mut ct);
     let ct_h = ct_hash(&ct);
     let mac = view_mac(&k, cm, &ct_h);

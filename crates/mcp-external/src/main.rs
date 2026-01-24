@@ -6,6 +6,7 @@ use rmcp::transport::streamable_http_server::StreamableHttpService;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
+mod commitment_tree;
 mod config;
 mod fvk_service;
 mod ligero;
@@ -86,6 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
+
+    // Keep the commitment tree cache warm in the background so transfers across many wallets
+    // don't all pay the sync cost on-demand.
+    crate::commitment_tree::start_background_tree_sync(provider.clone());
 
     // Initialize Ligero proof client (HTTP service)
     tracing::info!("[mcp] Initializing Ligero proof service client");

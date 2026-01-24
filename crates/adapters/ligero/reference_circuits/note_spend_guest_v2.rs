@@ -1,15 +1,4 @@
 /*
- * REFERENCE ONLY — NOT USED BY THIS REPO'S BUILD.
- *
- * This is a copied snapshot of the Ligero/Ligetron `note_spend_guest` v2 guest program source
- * (TRANSFER/WITHDRAW verifier). The source of truth for the executable guest remains the Ligero
- * repo artifact `note_spend_guest.wasm`.
- *
- * Kept here so the Sovereign-side adapter/tests can track the expected argument layout and
- * hashing/tag conventions.
- */
-
-/*
  * Rust Guest Program: Note Spend Verifier for Midnight Privacy Pool (outputs + balance)
  *
  * NOTE: DEPOSIT is implemented as a separate, cheaper guest program:
@@ -156,6 +145,12 @@
  *     For each output j in [0..n_out):
  *       ct_hash_v_j     — 32 bytes (PUBLIC)  = H("CT_HASH_V1" || ct_v_j)
  *       mac_v_j         — 32 bytes (PUBLIC)  = H("VIEW_MAC_V1" || k_v_j || cm_out_j || ct_hash_v_j)
+ *       where plaintext includes the spent input commitments for traceability:
+ *         pt_v_j = [ domain | value | rho | recipient | sender_id | cm_in_0 | ... | cm_in_{MAX_INS-1} ]
+ *       (`cm_in_i` are padded with 0x00..00 for i >= n_in)
+ *
+ * Expected argc (with viewers) =
+ *   expected_base + 1(n_viewers) + n_viewers * (1 + 1 + 2*n_out)
  *
  * Notes:
  *   - The verifier MUST NOT require the real `fvk_v`. Only `fvk_commit_v` is public.
@@ -169,8 +164,8 @@
  *
  * Hashing uses Ligetron's Poseidon2 via bn254fr host functions (Ligero-compatible).
  *
- * Viewer plaintexts (Level B) are extended to include an attested sender_id:
- *   [ domain | value | rho | recipient | sender_id ]
+ * Viewer plaintexts (Level B):
+ *   [ domain | value | rho | recipient | sender_id | cm_in_0 | ... | cm_in_{MAX_INS-1} ]
  *
  */
 
@@ -405,9 +400,9 @@ fn hash32_to_fr_bytes_constrained(h: &Hash32) -> [Bn254Fr; 32] {
     out
 }
 
-/// Convert a 144-byte array into field-byte elements (byte value only).
+/// Convert a NOTE_PLAIN_LEN-byte array into field-byte elements (byte value only).
 #[inline(always)]
-fn bytes144_to_fr_bytes(bytes: &[u8; NOTE_PLAIN_LEN]) -> [Bn254Fr; NOTE_PLAIN_LEN] {
+fn bytes_note_plain_to_fr_bytes(bytes: &[u8; NOTE_PLAIN_LEN]) -> [Bn254Fr; NOTE_PLAIN_LEN] {
     let mut out: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
     for i in 0..NOTE_PLAIN_LEN {
         out[i].set_bytes_big(&bytes[i..i + 1]);
@@ -562,7 +557,7 @@ const NFKEY_BUF_LEN: usize = 8 + 32 + 32; // "NFKEY_V1" + domain + spend_sk = 72
 const FVK_COMMIT_BUF_LEN: usize = 13 + 32; // "FVK_COMMIT_V1" + fvk = 45
 const VIEW_KDF_BUF_LEN: usize = 11 + 32 + 32; // "VIEW_KDF_V1" + fvk + cm = 75
 const VIEW_STREAM_BUF_LEN: usize = 14 + 32 + 4; // "VIEW_STREAM_V1" + k + ctr = 50
-const CT_HASH_BUF_LEN: usize = 10 + 144; // "CT_HASH_V1" + ct = 154
+const CT_HASH_BUF_LEN: usize = 10 + NOTE_PLAIN_LEN; // "CT_HASH_V1" + ct = 10 + NOTE_PLAIN_LEN
 const VIEW_MAC_BUF_LEN: usize = 11 + 32 + 32 + 32; // "VIEW_MAC_V1" + k + cm + ct_hash = 107
 
 /// Merkle tree node hash: H("MT_NODE_V1" || lvl || left || right)
@@ -742,48 +737,29 @@ fn stream_block(h: &Poseidon2Core, k: &[Bn254Fr; 32], ctr: u32) -> [Bn254Fr; 32]
     h.hash_padded_bytes_frs(&buf)
 }
 
-/// Stream XOR encrypt for exactly 144 bytes (NOTE_PLAIN_LEN).
-/// Optimized: 5 hash calls for 144 bytes (4 full blocks + 16-byte remainder).
-fn stream_xor_encrypt_144(
+/// Stream XOR encrypt for `NOTE_PLAIN_LEN` bytes.
+/// Optimized: 9 hash calls for NOTE_PLAIN_LEN=272 (8 full blocks + 16-byte remainder).
+fn stream_xor_encrypt_note_plain(
     h: &Poseidon2Core,
     k: &[Bn254Fr; 32],
-    pt: &[Bn254Fr; 144],
-    ct_out: &mut [Bn254Fr; 144],
+    pt: &[Bn254Fr; NOTE_PLAIN_LEN],
+    ct_out: &mut [Bn254Fr; NOTE_PLAIN_LEN],
 ) {
-    // Block 0: bytes 0-31
-    let ks0 = stream_block(h, k, 0);
-    for i in 0..32 {
-        ct_out[i] = xor_byte_fr(&pt[i], &ks0[i]);
-    }
-
-    // Block 1: bytes 32-63
-    let ks1 = stream_block(h, k, 1);
-    for i in 0..32 {
-        ct_out[32 + i] = xor_byte_fr(&pt[32 + i], &ks1[i]);
-    }
-
-    // Block 2: bytes 64-95
-    let ks2 = stream_block(h, k, 2);
-    for i in 0..32 {
-        ct_out[64 + i] = xor_byte_fr(&pt[64 + i], &ks2[i]);
-    }
-
-    // Block 3: bytes 96-127
-    let ks3 = stream_block(h, k, 3);
-    for i in 0..32 {
-        ct_out[96 + i] = xor_byte_fr(&pt[96 + i], &ks3[i]);
-    }
-
-    // Block 4: bytes 128-143 (16-byte remainder)
-    let ks4 = stream_block(h, k, 4);
-    for i in 0..16 {
-        ct_out[128 + i] = xor_byte_fr(&pt[128 + i], &ks4[i]);
+    let mut ctr = 0u32;
+    while (ctr as usize) * 32 < NOTE_PLAIN_LEN {
+        let ks = stream_block(h, k, ctr);
+        let off = (ctr as usize) * 32;
+        let take = core::cmp::min(32, NOTE_PLAIN_LEN - off);
+        for i in 0..take {
+            ct_out[off + i] = xor_byte_fr(&pt[off + i], &ks[i]);
+        }
+        ctr += 1;
     }
 }
 
 /// Ciphertext hash: H("CT_HASH_V1" || ct)
-/// Fixed 154-byte preimage for 144-byte ciphertext.
-fn ct_hash_fr(h: &Poseidon2Core, ct: &[Bn254Fr; 144]) -> Bn254Fr {
+/// Fixed (10 + NOTE_PLAIN_LEN)-byte preimage for NOTE_PLAIN_LEN-byte ciphertext.
+fn ct_hash_fr(h: &Poseidon2Core, ct: &[Bn254Fr; NOTE_PLAIN_LEN]) -> Bn254Fr {
     let mut buf: Vec<Bn254Fr> = Vec::with_capacity(CT_HASH_BUF_LEN);
     for b in b"CT_HASH_V1" {
         buf.push(Bn254Fr::from_u32(*b as u32));
@@ -811,7 +787,7 @@ fn view_mac_fr(
 }
 
 /// Encode note plaintext for viewer encryption.
-/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
+/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) | cm_in[0..MAX_INS) ] => NOTE_PLAIN_LEN bytes
 /// Value is u64 zero-extended to 16 bytes.
 
 fn encode_note_plain(
@@ -820,7 +796,8 @@ fn encode_note_plain(
     rho: &Hash32,
     recipient: &Hash32,
     sender_id: &Hash32,
-    out: &mut [u8; 144],
+    cm_ins: &[Hash32; MAX_INS],
+    out: &mut [u8; NOTE_PLAIN_LEN],
 ) {
     out[0..32].copy_from_slice(domain);
     // Encode value as 16-byte LE (u64 zero-extended to 16 bytes)
@@ -831,6 +808,11 @@ fn encode_note_plain(
     out[48..80].copy_from_slice(rho);
     out[80..112].copy_from_slice(recipient);
     out[112..144].copy_from_slice(sender_id);
+    let mut off = 144usize;
+    for cm in cm_ins {
+        out[off..off + 32].copy_from_slice(cm);
+        off += 32;
+    }
 }
 
 /// Maximum Merkle tree depth supported by the circuit.
@@ -844,7 +826,7 @@ const BL_BUCKET_BUF_LEN: usize = BL_BUCKET_TAG_LEN + 32 * BL_BUCKET_SIZE;
 const MAX_INS: usize = 4;
 const MAX_OUTS: usize = 2;
 const MAX_VIEWERS: usize = 8;
-const NOTE_PLAIN_LEN: usize = 144; // 32 + 16 + 32 + 32 + 32 (domain + value + rho + recipient + sender_id)
+const NOTE_PLAIN_LEN: usize = 144 + 32 * MAX_INS; // domain + value + rho + recipient + sender_id + MAX_INS commitments
 
 #[inline(always)]
 fn bl_bucket_pos_from_id(id: &Hash32) -> u64 {
@@ -956,6 +938,12 @@ fn main() {
     let mut nullifier_args: Vec<Hash32> = Vec::with_capacity(n_in);
     let mut enforce_prod = Bn254Fr::from_u32(1);
     let mut in_rhos_fr: Vec<Bn254Fr> = Vec::with_capacity(n_in);
+    struct InPlain {
+        v: u64,
+        rho: Hash32,
+        sender_id_in: Hash32,
+    }
+    let mut in_plains: Vec<InPlain> = Vec::with_capacity(n_in);
 
     for _i in 0..n_in {
         // value_in_i [PRIVATE]
@@ -973,6 +961,11 @@ fn main() {
         // sender_id_in_i [PRIVATE] (NOTE_V2 leaf binding)
         let sender_id_in_i = read_hash32(&args, arg_idx);
         arg_idx += 1;
+        in_plains.push(InPlain {
+            v: v_i,
+            rho: rho_i,
+            sender_id_in: sender_id_in_i,
+        });
 
         // pos_i [PRIVATE]
         let pos_i = read_u64(&args, arg_idx, 77);
@@ -1225,11 +1218,6 @@ fn main() {
         return;
     }
 
-    // Disallow viewers when n_out == 0.
-    if n_out == 0 {
-        hard_fail(91);
-    }
-
     let n_viewers: usize = {
         let v = read_u32(&args, base_after_outs, 91) as usize;
         if v > MAX_VIEWERS {
@@ -1244,6 +1232,20 @@ fn main() {
         hard_fail(92);
     }
 
+    let mut cm_ins: [Hash32; MAX_INS] = [[0u8; 32]; MAX_INS];
+    for i in 0..n_in {
+        let inp = &in_plains[i];
+        let cm_fr = note_commitment_fr(
+            &h,
+            &domain,
+            inp.v,
+            &inp.rho,
+            &recipient_owner,
+            &inp.sender_id_in,
+        );
+        cm_ins[i] = bn254fr_to_hash32(&cm_fr);
+    }
+
     let mut out_pts: [[u8; NOTE_PLAIN_LEN]; MAX_OUTS] = [[0u8; NOTE_PLAIN_LEN]; MAX_OUTS];
     for j in 0..n_out {
         encode_note_plain(
@@ -1252,6 +1254,7 @@ fn main() {
             &outs[j].rho,
             &outs[j].rcp,
             &sender_id,
+            &cm_ins,
             &mut out_pts[j],
         );
     }
@@ -1279,9 +1282,9 @@ fn main() {
         for j in 0..n_out {
             let cm_fr = &out_cm_fr[j];
             let k = view_kdf(&h, &fvk_priv_fr, cm_fr);
-            let pt_fr = bytes144_to_fr_bytes(&out_pts[j]);
+            let pt_fr = bytes_note_plain_to_fr_bytes(&out_pts[j]);
             let mut ct_fr: [Bn254Fr; NOTE_PLAIN_LEN] = std::array::from_fn(|_| Bn254Fr::new());
-            stream_xor_encrypt_144(&h, &k, &pt_fr, &mut ct_fr);
+            stream_xor_encrypt_note_plain(&h, &k, &pt_fr, &mut ct_fr);
 
             let ct_h_fr = ct_hash_fr(&h, &ct_fr);
             let ct_hash_arg = read_hash32(&args, v_idx);

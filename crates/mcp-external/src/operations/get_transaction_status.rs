@@ -2,8 +2,9 @@
 //!
 //! This module provides functionality for retrieving the current status and details of a specific transaction.
 
-use crate::provider::{InvolvementItem, Provider};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use crate::provider::Provider;
+use crate::provider::InvolvementItem;
 
 /// Transaction status and details from the indexer
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,4 +67,16 @@ impl From<InvolvementItem> for TransactionDetails {
             payload: item.payload,
         }
     }
+}
+
+/// Fetch transaction status/details from the indexer by tx hash.
+///
+/// Returns an error if the transaction is not found.
+pub async fn get_transaction_status(provider: &Provider, tx_hash: &str) -> Result<TransactionDetails> {
+    let tx = provider
+        .get_transaction(tx_hash)
+        .await
+        .with_context(|| format!("Failed to fetch transaction {} from indexer", tx_hash))?
+        .ok_or_else(|| anyhow::anyhow!("Transaction not found: {}", tx_hash))?;
+    Ok(TransactionDetails::from(tx))
 }

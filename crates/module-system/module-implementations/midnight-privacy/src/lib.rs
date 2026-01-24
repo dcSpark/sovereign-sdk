@@ -288,13 +288,13 @@ impl<S: Spec> Module for ValueMidnightPrivacy<S> {
             CallMessage::Transfer {
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 view_ciphertexts,
                 gas,
             } => Ok(self.transfer(
                 proof,
                 anchor_root,
-                nullifier,
+                nullifiers,
                 view_ciphertexts,
                 gas,
                 context,

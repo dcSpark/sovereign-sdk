@@ -8,6 +8,7 @@ pub mod decrypt_transaction;
 mod deposit;
 mod get_default_address;
 mod get_privacy_balance;
+mod get_privacy_notes;
 mod get_transaction_status;
 mod get_transactions;
 mod get_wallet_config;
@@ -20,9 +21,16 @@ pub mod wallet_status;
 pub use decrypt_transaction::decrypt_transaction;
 pub use deposit::deposit;
 pub use get_default_address::get_default_address;
+#[allow(unused_imports)]
 pub use get_privacy_balance::{get_privacy_balance, PrivacyBalanceResult, UnspentNote};
-pub use get_transaction_status::TransactionDetails;
+#[allow(unused_imports)]
+pub use get_privacy_notes::{
+    get_privacy_notes, select_largest_notes, select_largest_notes_covering_amount, SpendableNote,
+};
+#[allow(unused_imports)]
+pub use get_transaction_status::{get_transaction_status, TransactionDetails};
 pub use get_transactions::get_transactions;
+#[allow(unused_imports)]
 pub use get_transactions::Transaction;
 #[allow(unused_imports)]
 pub use get_wallet_config::get_wallet_config;
@@ -30,4 +38,4 @@ pub use pool_admin::{
     add_pool_admin, freeze_address, list_frozen_addresses, remove_pool_admin, unfreeze_address,
 };
 pub use send_funds::send_funds;
-pub use transfer::transfer;
+pub use transfer::{transfer, TransferInputNote};

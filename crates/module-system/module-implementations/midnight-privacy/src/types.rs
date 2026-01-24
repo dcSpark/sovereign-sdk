@@ -245,8 +245,8 @@ pub struct SpendPublic {
     /// Sparse Merkle deny-map root used to enforce sender/recipient freezing.
     #[serde(default = "crate::hash::default_blacklist_root")]
     pub blacklist_root: Hash32,
-    /// Nullifier of the consumed note (PRF-based; no position).
-    pub nullifier: Hash32,
+    /// Nullifiers of all consumed inputs (1..=4).
+    pub nullifiers: Vec<Hash32>,
     /// For a single native token, the transparent withdrawal amount authorized by the circuit.
     pub withdraw_amount: u128,
     /// Commitments of new shielded outputs (0..=2), in order.

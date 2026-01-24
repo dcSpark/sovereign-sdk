@@ -65,7 +65,7 @@ pub enum CallMessage<S: Spec> {
     /// - Proper nullifier derivation
     /// - Value conservation: input_value = sum(output_values)
     ///
-    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// SECURITY: anchor_root and nullifiers are passed as explicit transaction fields
     /// (NOT extracted from public_output) and are validated by the guest.
     /// This prevents public-output tampering attacks.
     ///
@@ -80,8 +80,8 @@ pub enum CallMessage<S: Spec> {
         proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
-        /// Nullifier that the proof derives (must be fresh)
-        nullifier: Hash32,
+        /// Nullifiers that the proof derives (1..=4; all must be fresh)
+        nullifiers: Vec<Hash32>,
         /// Optional viewer ciphertexts (created off-chain by the prover).
         /// Each EncryptedNote must have `enc.cm` equal to one of the produced output commitments.
         view_ciphertexts: Option<Vec<EncryptedNote>>,
@@ -163,6 +163,7 @@ pub enum CallMessage<S: Spec> {
         /// Address to revoke pool-admin rights.
         admin: S::Address,
     },
+
 }
 
 /// Errors that can occur in the MidnightPrivacy module.
@@ -460,14 +461,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     ///
     /// All value stays shielded. For transparent withdrawals, use `withdraw()`.
     ///
-    /// SECURITY: anchor_root and nullifier are passed as explicit transaction fields
+    /// SECURITY: anchor_root and nullifiers are passed as explicit transaction fields
     /// and validated against the proof to prevent tampering.
     pub(crate) fn transfer(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
         proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
-        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
+        #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifiers: Vec<Hash32>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
             Vec<EncryptedNote>,
         >,
@@ -488,8 +489,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
             use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
+            anyhow::ensure!(
+                !nullifiers.is_empty(),
+                "Transfer requires at least 1 nullifier"
+            );
+            const MAX_NULLIFIERS: usize = 4;
+            anyhow::ensure!(
+                nullifiers.len() <= MAX_NULLIFIERS,
+                "Transfer supports at most {} nullifiers",
+                MAX_NULLIFIERS
+            );
+
             let credential_check_start = std::time::Instant::now();
-            let cached_public = crate::get_pre_verified_spend(&nullifier);
+            let cached_public = crate::get_pre_verified_spend(&nullifiers[0]);
             let credential_check_duration = credential_check_start.elapsed();
             debug!(
                 credential_check_ms = ?(credential_check_duration.as_secs_f64() * 1000.0),
@@ -519,7 +531,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
-            if public.anchor_root != anchor_root || public.nullifier != nullifier {
+            if public.anchor_root != anchor_root || public.nullifiers != nullifiers {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
             }
 
@@ -561,20 +573,28 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 );
             }
 
-            // 2) Consume nullifier
-            let nk = NullifierKey(public.nullifier);
-            if self.nullifier_set.get(&nk, st)?.is_some() {
-                return Err(
-                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
-                );
+            let spent_nullifiers = public.nullifiers.clone();
+
+            // 2) Consume all nullifiers (fail atomically if any are already spent)
+            for nf in &spent_nullifiers {
+                let nk = NullifierKey(*nf);
+                if self.nullifier_set.get(&nk, st)?.is_some() {
+                    return Err(MidnightPrivacyError::<S>::NullifierAlreadySpent(*nf).into());
+                }
             }
-            self.nullifier_set.set(&nk, &true, st)?;
+            for nf in &spent_nullifiers {
+                let nk = NullifierKey(*nf);
+                self.nullifier_set.set(&nk, &true, st)?;
+            }
             // Stats: bump spent nullifier count
             let n_spent = self.spent_nullifier_count.get(st)?.unwrap_or(0);
-            self.spent_nullifier_count.set(&(n_spent + 1), st)?;
+            self.spent_nullifier_count
+                .set(&(n_spent + spent_nullifiers.len() as u64), st)?;
 
-            // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            self.append_nullifier(public.nullifier, st)?;
+            // Record nullifiers in the nullifier tree (Aztec-style dual-tree design)
+            for nf in &spent_nullifiers {
+                self.append_nullifier(*nf, st)?;
+            }
 
             // 3) Queue all output commitments for end-of-block processing
             let outputs: Vec<Hash32> = public.output_commitments.clone();
@@ -582,14 +602,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 self.add_commitment(*cm, st)?;
             }
 
-            // Emit spent event
-            self.emit_event(
-                st,
-                Event::NoteSpent {
-                    nullifier: public.nullifier,
-                    anchor_root: public.anchor_root,
-                },
-            );
+            // Emit spent events (one per nullifier)
+            for nf in &spent_nullifiers {
+                self.emit_event(
+                    st,
+                    Event::NoteSpent {
+                        nullifier: *nf,
+                        anchor_root: public.anchor_root,
+                    },
+                );
+            }
 
             // Level B: Viewer attestation verification
             if let Some(vcs) = view_ciphertexts {
@@ -673,7 +695,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.emit_event(
                 st,
                 Event::PoolTransfer {
-                    nullifier: public.nullifier,
+                    nullifiers: spent_nullifiers,
                     anchor_root: public.anchor_root,
                     outputs,
                     viewer_bindings,
@@ -752,11 +774,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
             // SECURITY: Bind transaction fields to proof-committed values
             if public.anchor_root != anchor_root
-                || public.nullifier != nullifier
+                || public.nullifiers.len() != 1
+                || public.nullifiers[0] != nullifier
                 || public.withdraw_amount != withdraw_amount
             {
                 return Err(MidnightPrivacyError::<S>::PublicOutputMismatch.into());
             }
+
+            let spent_nullifier = public.nullifiers[0];
 
             // Enforce deny-map root binding (freeze/blacklist primitive).
             let expected_bl_root = self
@@ -797,10 +822,10 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             }
 
             // 2) Consume nullifier
-            let nk = NullifierKey(public.nullifier);
+            let nk = NullifierKey(spent_nullifier);
             if self.nullifier_set.get(&nk, st)?.is_some() {
                 return Err(
-                    MidnightPrivacyError::<S>::NullifierAlreadySpent(public.nullifier).into(),
+                    MidnightPrivacyError::<S>::NullifierAlreadySpent(spent_nullifier).into(),
                 );
             }
             self.nullifier_set.set(&nk, &true, st)?;
@@ -809,7 +834,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.spent_nullifier_count.set(&(n_spent + 1), st)?;
 
             // Record nullifier in the nullifier tree (Aztec-style dual-tree design)
-            self.append_nullifier(public.nullifier, st)?;
+            self.append_nullifier(spent_nullifier, st)?;
 
             // 3) Queue change outputs for end-of-block processing
             let change_outputs: Vec<Hash32> = public.output_commitments.clone();
@@ -839,7 +864,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.emit_event(
                 st,
                 Event::NoteSpent {
-                    nullifier: public.nullifier,
+                    nullifier: spent_nullifier,
                     anchor_root: public.anchor_root,
                 },
             );
@@ -935,7 +960,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 st,
                 Event::PoolWithdraw {
                     amount: public.withdraw_amount,
-                    nullifier: public.nullifier,
+                    nullifier: spent_nullifier,
                     anchor_root: public.anchor_root,
                     change: change_outputs,
                     viewer_bindings,

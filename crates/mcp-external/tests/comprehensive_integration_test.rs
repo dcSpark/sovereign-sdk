@@ -157,7 +157,7 @@ async fn test_get_privacy_balance() -> Result<()> {
     let viewing_key = FullViewingKey(fvk_bytes);
 
     // Get initial balance (should be 0)
-    let initial_balance = get_privacy_balance(&provider, &privacy_key, &viewing_key).await?;
+    let initial_balance = get_privacy_balance(&provider, &privacy_key, Some(&viewing_key)).await?;
 
     let initial_privacy_balance = initial_balance.balance;
     tracing::info!("Initial privacy balance: {}", initial_privacy_balance);
@@ -172,7 +172,7 @@ async fn test_get_privacy_balance() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // Get balance after deposit
-    let final_balance = get_privacy_balance(&provider, &privacy_key, &viewing_key).await?;
+    let final_balance = get_privacy_balance(&provider, &privacy_key, Some(&viewing_key)).await?;
 
     let final_privacy_balance = final_balance.balance;
     tracing::info!("Final privacy balance: {}", final_privacy_balance);
