@@ -89,10 +89,37 @@ resource "aws_subnet" "private" {
 }
 
 # -----------------------------------------------------------------------------
-# Route Table (Default for all subnets)
+# NAT Gateway
 # -----------------------------------------------------------------------------
 
-resource "aws_route_table" "main" {
+# Elastic IP for NAT Gateway
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.project_name}-nat-eip"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# NAT Gateway in the first public subnet
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "${var.project_name}-nat-gateway"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# -----------------------------------------------------------------------------
+# Public Route Table
+# -----------------------------------------------------------------------------
+
+resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
   # Local route is automatically added by AWS for VPC CIDR
@@ -103,7 +130,7 @@ resource "aws_route_table" "main" {
   }
 
   tags = {
-    Name = "${var.project_name}-route-table"
+    Name = "${var.project_name}-public-route-table"
   }
 }
 
@@ -112,7 +139,25 @@ resource "aws_route_table_association" "public" {
   count = length(aws_subnet.public)
 
   subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.main.id
+  route_table_id = aws_route_table.public.id
+}
+
+# -----------------------------------------------------------------------------
+# Private Route Table
+# -----------------------------------------------------------------------------
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  # Route outbound traffic through NAT Gateway
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.project_name}-private-route-table"
+  }
 }
 
 # Associate route table with private subnets
@@ -120,5 +165,5 @@ resource "aws_route_table_association" "private" {
   count = length(aws_subnet.private)
 
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.main.id
+  route_table_id = aws_route_table.private.id
 }
