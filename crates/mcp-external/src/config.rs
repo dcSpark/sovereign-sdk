@@ -77,6 +77,20 @@ pub struct Config {
     /// This is added to the deposit amount to cover future transaction fees.
     #[serde(default)]
     pub auto_fund_gas_reserve: Option<String>,
+
+    /// Optional bearer token for the `/authority` HTTP endpoints (env: AUTHORITY_API_TOKEN, optional).
+    ///
+    /// If set, POST endpoints such as `/authority/freeze` and `/authority/thaw` require
+    /// `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub authority_api_token: Option<String>,
+
+    /// Optional base URL for `sov-metrics-api` (env: METRICS_API_URL, optional).
+    ///
+    /// When set, `/authority/tps` is backed by `GET <METRICS_API_URL>/tps?window_seconds=...`.
+    #[serde(default)]
+    #[validate(custom(function = "validate_http_url"))]
+    pub metrics_api_url: Option<Url>,
 }
 
 fn default_server_bind_address() -> String {
@@ -122,6 +136,12 @@ impl Config {
             .map(|s| s.to_string());
         cfg.privpool_spend_key = cfg
             .privpool_spend_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.authority_api_token = cfg
+            .authority_api_token
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())

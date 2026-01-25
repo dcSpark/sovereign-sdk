@@ -86,12 +86,13 @@ impl MerkleTree {
     /// - Remaining leaves are zero (the default leaf value).
     ///
     /// This is substantially faster than calling `set_leaf()` in a loop because it hashes
-    /// each internal node exactly once (O(2^depth) hashes), instead of O(filled_leaves * depth)
-    /// hashes.
+    /// only the internal nodes that depend on the filled prefix (roughly O(filled_leaves.len())
+    /// hashes for sparse prefixes, and O(2^depth) hashes in the worst case).
     ///
     /// # Panics
     /// Panics if `filled_leaves.len() > 2^depth`.
     pub fn from_filled_leaves(depth: u8, filled_leaves: &[Hash32]) -> Self {
+        // NOTE: `filled_leaves` is a *prefix*; all leaves beyond it are defined to be zero.
         let capacity = 1usize << (depth as usize);
         assert!(
             filled_leaves.len() <= capacity,
@@ -101,11 +102,26 @@ impl MerkleTree {
             depth
         );
 
+        if filled_leaves.is_empty() {
+            return MerkleTree::new(depth);
+        }
+
         let mut tree = MerkleTree::new(depth);
         tree.levels[0][..filled_leaves.len()].copy_from_slice(filled_leaves);
 
+        // Optimization: only recompute nodes whose covered leaf-range intersects the filled prefix.
+        //
+        // For a prefix [0, filled), the number of nodes at level `lvl` (0=leaves) that can differ
+        // from the all-default value is ceil(filled / 2^lvl), i.e. the first N nodes.
+        // We reuse the fact that `MerkleTree::new()` pre-filled all nodes with correct defaults.
+        let mut affected = filled_leaves.len(); // potentially-non-default nodes at this level
         for lvl in 0..depth as usize {
-            for parent in 0..tree.levels[lvl + 1].len() {
+            // Parents at next level that cover any part of the prefix.
+            affected = (affected + 1) >> 1; // ceil(prev / 2)
+            debug_assert!(affected >= 1);
+            debug_assert!(affected <= tree.levels[lvl + 1].len());
+
+            for parent in 0..affected {
                 let left = tree.levels[lvl][parent * 2];
                 let right = tree.levels[lvl][parent * 2 + 1];
                 tree.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
@@ -227,15 +243,10 @@ impl MerkleTree {
         // Update all ancestors up to the root
         let mut idx = index;
         for lvl in 0..self.depth as usize {
-            let parent = idx / 2;
-
-            // Get both children at current level
+            let parent = idx >> 1;
+            // For this tree implementation, all levels are power-of-two width, so both children exist.
             let left = self.levels[lvl][parent * 2];
-            let right = if parent * 2 + 1 < self.levels[lvl].len() {
-                self.levels[lvl][parent * 2 + 1]
-            } else {
-                [0u8; 32] // right child doesn't exist (shouldn't happen for power-of-2 trees)
-            };
+            let right = self.levels[lvl][parent * 2 + 1];
 
             // Update parent at next level
             self.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
@@ -264,15 +275,9 @@ impl MerkleTree {
         let mut path = Vec::with_capacity(self.depth as usize);
 
         for lvl in 0..self.depth as usize {
-            // Get sibling at current level
-            let sib_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-            let sib = if sib_idx < self.levels[lvl].len() {
-                self.levels[lvl][sib_idx]
-            } else {
-                [0u8; 32] // implicit zero sibling if tree width is odd
-            };
-            path.push(sib);
-            idx /= 2;
+            // All levels are power-of-two width; sibling index is always in-bounds.
+            path.push(self.levels[lvl][idx ^ 1]);
+            idx >>= 1;
         }
 
         assert_eq!(path.len(), self.depth as usize);
@@ -284,6 +289,17 @@ impl MerkleTree {
 mod tests {
     use super::MerkleTree;
     use crate::hash::Hash32;
+
+    #[test]
+    fn from_filled_leaves_empty_matches_new() {
+        let depth: u8 = 8;
+        let via_new = MerkleTree::new(depth);
+        let via_bulk = MerkleTree::from_filled_leaves(depth, &[]);
+        assert_eq!(via_new.root(), via_bulk.root());
+        for idx in [0usize, 1, 2, (1usize << depth) - 1] {
+            assert_eq!(via_new.open(idx), via_bulk.open(idx));
+        }
+    }
 
     #[test]
     fn from_filled_leaves_matches_set_leaf() {
