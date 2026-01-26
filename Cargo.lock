@@ -13467,6 +13467,7 @@ dependencies = [
  "hex",
  "ligero-runner",
  "midnight-privacy",
+ "num_cpus",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

@@ -1,6 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use sea_orm::{ConnectOptions, Database};
@@ -27,15 +28,37 @@ async fn main() -> anyhow::Result<()> {
     let index_db_url = env::var("INDEX_DB")
         .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
-    let mut connection_options = ConnectOptions::new(da_conn.clone());
-    connection_options.sqlx_logging(false);
-    let da_db = Database::connect(connection_options)
+    // Configure DA database pool with tuned settings for concurrent access
+    let mut da_connection_options = ConnectOptions::new(da_conn.clone());
+    da_connection_options
+        .max_connections(50)
+        .min_connections(5)
+        .connect_timeout(Duration::from_secs(30))
+        .acquire_timeout(Duration::from_secs(30))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
+        .sqlx_logging(false);
+    info!(
+        "Connecting to DA database with tuned pool settings (max_connections=50, min_connections=5)"
+    );
+    let da_db = Database::connect(da_connection_options)
         .await
         .with_context(|| format!("Failed to connect DB {}", da_conn))?;
 
-    let mut connection_options = ConnectOptions::new(index_db_url.clone());
-    connection_options.sqlx_logging(false);
-    let idx_db = Database::connect(connection_options)
+    // Configure index database pool with tuned settings for concurrent access
+    let mut idx_connection_options = ConnectOptions::new(index_db_url.clone());
+    idx_connection_options
+        .max_connections(50)
+        .min_connections(5)
+        .connect_timeout(Duration::from_secs(30))
+        .acquire_timeout(Duration::from_secs(30))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
+        .sqlx_logging(false);
+    info!(
+        "Connecting to index database with tuned pool settings (max_connections=50, min_connections=5)"
+    );
+    let idx_db = Database::connect(idx_connection_options)
         .await
         .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
 
