@@ -12,12 +12,25 @@ project_name = "midnight-rollup"
 
 # VPC Configuration
 vpc_cidr           = "172.32.0.0/16"
-availability_zones = ["us-east-1a", "us-east-1b"]
+vpc_secondary_cidr = "172.33.0.0/16"  # Additional CIDR for us-east-1c and 1d
+availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d"]
 
-# Subnet CIDRs (/16 divided equally into 4 /18 subnets)
+# Subnet CIDRs
+# - Original subnets (1a, 1b) use primary CIDR 172.32.x.x - DO NOT CHANGE
+# - New subnets (1c, 1d) use secondary CIDR 172.33.x.x
 # Each /18 subnet provides 16,382 usable IP addresses
-public_subnet_cidrs  = ["172.32.0.0/18", "172.32.64.0/18"]
-private_subnet_cidrs = ["172.32.128.0/18", "172.32.192.0/18"]
+public_subnet_cidrs = [
+  "172.32.0.0/18",   # us-east-1a (existing)
+  "172.32.64.0/18",  # us-east-1b (existing)
+  "172.33.0.0/18",   # us-east-1c (new)
+  "172.33.64.0/18"   # us-east-1d (new)
+]
+private_subnet_cidrs = [
+  "172.32.128.0/18", # us-east-1a (existing)
+  "172.32.192.0/18", # us-east-1b (existing)
+  "172.33.128.0/18", # us-east-1c (new)
+  "172.33.192.0/18"  # us-east-1d (new)
+]
 
 # EC2 Configuration
 # NOTE: c7g instances are ARM (Graviton3) - must use ARM64 AMI
