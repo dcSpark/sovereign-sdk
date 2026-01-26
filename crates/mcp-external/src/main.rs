@@ -1,10 +1,13 @@
-use axum::http::StatusCode;
+use axum::extract::State;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 mod commitment_tree;
 mod config;
@@ -27,7 +30,7 @@ use tracing_subscriber::prelude::*;
 use crate::config::Config;
 use crate::ligero::Ligero;
 use crate::provider::Provider;
-use crate::server::CryptoServer;
+use crate::server::{CryptoServer, McpWalletContext};
 use crate::wallet::WalletContext;
 
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
@@ -191,9 +194,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Default::default(),
     );
 
-    let router = axum::Router::new()
+    let app_state = AppState {
+        http_client: reqwest::Client::new(),
+        provider: provider.clone(),
+        admin_wallet_ctx: admin_wallet_ctx.clone(),
+        authority_api_token: cfg.authority_api_token.clone(),
+        metrics_api_url: cfg.metrics_api_url.clone(),
+    };
+
+    let router = Router::new()
         .nest_service("/mcp", service)
-        .route("/health", axum::routing::get(health_handler));
+        .route("/health", get(health_handler))
+        .route("/authority", get(authority_index_handler))
+        .route("/authority/info", get(authority_info_handler))
+        .route("/authority/accounts", get(authority_accounts_handler))
+        .route("/authority/freeze", post(authority_freeze_handler))
+        .route("/authority/thaw", post(authority_thaw_handler))
+        .route("/authority/tps", get(authority_tps_handler))
+        .route("/authority/observe", post(authority_observe_handler))
+        .with_state(app_state);
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
 
     tracing::info!(
@@ -206,6 +225,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!(
         "[mcp] Health endpoint: http://{}/health",
+        cfg.mcp_server_bind_address
+    );
+    tracing::info!(
+        "[mcp] Authority endpoints: http://{}/authority/*",
         cfg.mcp_server_bind_address
     );
 
@@ -236,4 +259,304 @@ async fn health_handler() -> impl IntoResponse {
         checked_at: chrono::Utc::now().to_rfc3339(),
     };
     (StatusCode::OK, Json(response))
+}
+
+#[derive(Clone)]
+struct AppState {
+    http_client: reqwest::Client,
+    provider: Arc<Provider>,
+    admin_wallet_ctx: Option<Arc<McpWalletContext>>,
+    authority_api_token: Option<String>,
+    metrics_api_url: Option<Url>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorityIndexResponse {
+    service: String,
+    endpoints: AuthorityEndpoints,
+    write_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorityEndpoints {
+    info: String,
+    accounts: String,
+    freeze: String,
+    thaw: String,
+    tps: String,
+    observe: String,
+}
+
+async fn authority_index_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let response = AuthorityIndexResponse {
+        service: "mcp-external".to_string(),
+        endpoints: AuthorityEndpoints {
+            info: "/authority/info".to_string(),
+            accounts: "/authority/accounts".to_string(),
+            freeze: "/authority/freeze".to_string(),
+            thaw: "/authority/thaw".to_string(),
+            tps: "/authority/tps".to_string(),
+            observe: "/authority/observe".to_string(),
+        },
+        write_enabled: state.authority_api_token.is_some() && state.admin_wallet_ctx.is_some(),
+    };
+    (StatusCode::OK, Json(response))
+}
+
+async fn authority_observe_handler() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            error: "`/authority/observe` is only implemented in `midnight-sim/mockmcp`."
+                .to_string(),
+        }),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorityAccountsResponse {
+    addresses: Vec<String>,
+    count: u64,
+}
+
+async fn authority_info_handler(State(state): State<AppState>) -> impl IntoResponse {
+    authority_accounts_inner(state).await
+}
+
+async fn authority_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
+    authority_accounts_inner(state).await
+}
+
+async fn authority_accounts_inner(state: AppState) -> impl IntoResponse {
+    match crate::operations::list_frozen_addresses(&state.provider).await {
+        Ok(res) => {
+            let response = AuthorityAccountsResponse {
+                addresses: res.addresses.into_iter().map(|a| a.to_string()).collect(),
+                count: res.count,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("Failed to fetch frozen addresses: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_some_and(|provided| provided == token)
+}
+
+fn extract_privacy_address(body: &serde_json::Value) -> Option<String> {
+    match body {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => arr.get(0).and_then(|v| v.as_str()).map(|s| s.to_string()),
+        serde_json::Value::Object(map) => map
+            .get("privacyAddress")
+            .or_else(|| map.get("privacy_address"))
+            .or_else(|| map.get("address"))
+            .or_else(|| map.get("walletAddress"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TxHashResponse {
+    tx_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricsTpsResponse {
+    tps: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorityTpsResponse {
+    #[serde(rename = "lastTick")]
+    last_tick: String,
+    m1: Option<f64>,
+    m5: Option<f64>,
+    m15: Option<f64>,
+}
+
+async fn authority_tps_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(base_url) = state.metrics_api_url.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Metrics API not configured. Set METRICS_API_URL (sov-metrics-api base URL) to enable `/authority/tps`."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let fetch = |window_seconds: u64| fetch_metrics_tps(&state.http_client, base_url, window_seconds);
+    let (m1, m5, m15) = tokio::join!(fetch(60), fetch(300), fetch(900));
+
+    let (m1, m5, m15) = match (m1, m5, m15) {
+        (Ok(m1), Ok(m5), Ok(m15)) => (m1, m5, m15),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("Failed to fetch TPS from metrics API: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(AuthorityTpsResponse {
+            last_tick: chrono::Utc::now().to_rfc3339(),
+            m1,
+            m5,
+            m15,
+        }),
+    )
+        .into_response()
+}
+
+async fn fetch_metrics_tps(
+    http: &reqwest::Client,
+    base_url: &Url,
+    window_seconds: u64,
+) -> Result<Option<f64>, String> {
+    let mut url = base_url
+        .join("/tps")
+        .map_err(|e| format!("Invalid METRICS_API_URL: {e}"))?;
+    url.set_query(Some(&format!("window_seconds={window_seconds}")));
+
+    let resp = http
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status} from {url}: {body}"));
+    }
+
+    let parsed: MetricsTpsResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    Ok(parsed.tps)
+}
+
+async fn authority_freeze_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    authority_set_frozen(state, headers, body, true).await
+}
+
+async fn authority_thaw_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    authority_set_frozen(state, headers, body, false).await
+}
+
+async fn authority_set_frozen(
+    state: AppState,
+    headers: HeaderMap,
+    body: serde_json::Value,
+    freeze: bool,
+) -> axum::response::Response {
+    let Some(ref token) = state.authority_api_token else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Authority write endpoints are disabled. Set AUTHORITY_API_TOKEN."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if !is_authorized(&headers, token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Unauthorized".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let Some(admin_wallet_ctx) = state.admin_wallet_ctx.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Authority write endpoints require ADMIN_WALLET_PRIVATE_KEY.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let addr_str = match extract_privacy_address(&body) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Missing privacy address in request body.".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let addr: midnight_privacy::PrivacyAddress = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid privacy address: {e}"),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let res = if freeze {
+        crate::operations::freeze_address(&state.provider, admin_wallet_ctx.as_ref(), addr).await
+    } else {
+        crate::operations::unfreeze_address(&state.provider, admin_wallet_ctx.as_ref(), addr).await
+    };
+
+    match res {
+        Ok(res) => (StatusCode::OK, Json(TxHashResponse { tx_hash: res.tx_hash }))
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("Failed to submit transaction: {e}"),
+            }),
+        )
+            .into_response(),
+    }
 }

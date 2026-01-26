@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
@@ -30,7 +31,7 @@ use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
@@ -763,6 +764,41 @@ pub struct GetWalletStatusResult {
     pub is_fully_synced: bool,
 }
 
+const DEFAULT_PENDING_SPENT_NOTE_TTL_SECS: u64 = 120;
+const DEFAULT_WAIT_FOR_FRESH_NOTES_SECS: u64 = 5;
+
+fn pending_spent_note_ttl() -> std::time::Duration {
+    let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PENDING_SPENT_NOTE_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn wait_for_fresh_notes_secs() -> u64 {
+    std::env::var("MCP_WAIT_FOR_FRESH_NOTES_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WAIT_FOR_FRESH_NOTES_SECS)
+}
+
+#[derive(Debug, Default)]
+struct PendingSpentNotes {
+    by_rho: HashMap<String, std::time::Instant>,
+}
+
+impl PendingSpentNotes {
+    fn purge_expired(&mut self) {
+        let ttl = pending_spent_note_ttl();
+        self.by_rho.retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalNotes {
+    by_rho: HashMap<String, crate::operations::SpendableNote>,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
@@ -778,6 +814,12 @@ pub struct CryptoServer {
     /// Tracks whether a wallet has been explicitly loaded via createWallet or restoreWallet.
     /// When true, createWallet and restoreWallet will fail until removeWallet is called.
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
+    /// Best-effort local cache of recently-spent note identifiers (rho hex), used to avoid
+    /// double-spending when the indexer lags behind the sequencer.
+    pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
+    /// Best-effort local cache of newly-created change notes (owned by this wallet),
+    /// so consecutive sends don't have to wait for indexer lag.
+    local_notes: Arc<Mutex<LocalNotes>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -807,6 +849,8 @@ impl CryptoServer {
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
             wallet_explicitly_loaded,
+            pending_spent_notes: Arc::new(Mutex::new(PendingSpentNotes::default())),
+            local_notes: Arc::new(Mutex::new(LocalNotes::default())),
         }
     }
 
@@ -880,15 +924,93 @@ impl CryptoServer {
             ));
         }
 
-        let notes = crate::operations::get_privacy_notes(
-            provider,
-            privacy_key,
-            Some(&viewing_key),
-        )
-        .await
-        .map_err(|e| {
-            ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
-        })?;
+        let from_privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
+        let send_span = tracing::info_span!(
+            "send",
+            from = %from_privacy_address,
+            to = %output_privacy_addr,
+            amount = send_amount
+        );
+        let _send_guard = send_span.enter();
+        let send_started = std::time::Instant::now();
+
+        let notes_wait_started = std::time::Instant::now();
+        let notes_wait_limit = std::time::Duration::from_secs(wait_for_fresh_notes_secs());
+        let mut notes_fetch_attempts: u64 = 0;
+        let mut notes_fetch_ms_total: u128 = 0;
+        let mut notes_filtered_pending_total: u64 = 0;
+        let mut notes_added_local_total: u64 = 0;
+        let mut notes_returned_by_indexer_last: usize;
+
+        let notes = loop {
+            notes_fetch_attempts += 1;
+            let fetch_started = std::time::Instant::now();
+            let mut notes = crate::operations::get_privacy_notes(
+                provider,
+                privacy_key,
+                Some(&viewing_key),
+            )
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
+            })?;
+            notes_fetch_ms_total += fetch_started.elapsed().as_millis();
+            notes_returned_by_indexer_last = notes.len();
+
+            let local_notes: Vec<crate::operations::SpendableNote> = {
+                let local = self.local_notes.lock().await;
+                local.by_rho.values().cloned().collect()
+            };
+
+            let filtered = {
+                let mut pending = self.pending_spent_notes.lock().await;
+                pending.purge_expired();
+                let before = notes.len();
+                notes.retain(|n| !pending.by_rho.contains_key(&n.rho));
+                before.saturating_sub(notes.len())
+            };
+            if filtered > 0 {
+                notes_filtered_pending_total += filtered as u64;
+                tracing::info!(
+                    "[send] Filtered {} locally-pending spent note(s) from indexer results",
+                    filtered
+                );
+            }
+
+            if !local_notes.is_empty() {
+                let mut seen: std::collections::HashSet<String> =
+                    notes.iter().map(|n| n.rho.clone()).collect();
+                let mut added = 0usize;
+                for note in local_notes {
+                    if seen.insert(note.rho.clone()) {
+                        notes.push(note);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    notes_added_local_total += added as u64;
+                    tracing::info!("[send] Added {} local change note(s) to candidates", added);
+                }
+            }
+
+            if !notes.is_empty() || notes_wait_started.elapsed() >= notes_wait_limit {
+                break notes;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+
+        let notes_wait_ms = notes_wait_started.elapsed().as_millis();
+        tracing::info!(
+            notes_wait_ms,
+            notes_fetch_attempts,
+            notes_fetch_ms_total,
+            notes_returned_by_indexer_last,
+            notes_filtered_pending_total,
+            notes_added_local_total,
+            notes_candidates = notes.len(),
+            "Unspent notes ready"
+        );
 
         if notes.is_empty() {
             return Err(ErrorData::invalid_params(
@@ -897,6 +1019,7 @@ impl CryptoServer {
             ));
         }
 
+        let selection_started = std::time::Instant::now();
         let selected = crate::operations::select_largest_notes_covering_amount(
             notes,
             send_amount,
@@ -905,6 +1028,14 @@ impl CryptoServer {
         .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
 
         let total_in: u128 = selected.iter().map(|n| n.value).sum();
+        let selection_ms = selection_started.elapsed().as_millis();
+        tracing::info!(
+            elapsed_ms = selection_ms,
+            selected_inputs = selected.len(),
+            total_in,
+            "Selected input notes"
+        );
+
         tracing::info!(
             "[send] Selected {} input notes (total_in={}, send_amount={})",
             selected.len(),
@@ -912,6 +1043,7 @@ impl CryptoServer {
             send_amount
         );
 
+        let inputs_started = std::time::Instant::now();
         let mut inputs: Vec<crate::operations::TransferInputNote> =
             Vec::with_capacity(selected.len());
         for (idx, n) in selected.iter().enumerate() {
@@ -943,6 +1075,11 @@ impl CryptoServer {
                 sender_id,
             });
         }
+        let inputs_ms = inputs_started.elapsed().as_millis();
+        tracing::info!(
+            elapsed_ms = inputs_ms,
+            "Prepared transfer inputs"
+        );
         let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
         tracing::info!(
@@ -973,6 +1110,7 @@ impl CryptoServer {
                 None,
             )
         })?;
+        let transfer_started = std::time::Instant::now();
         let transfer_result = crate::operations::transfer(
             ligero_ref,
             provider,
@@ -989,8 +1127,53 @@ impl CryptoServer {
         .map_err(|e| {
             ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
         })?;
+        let transfer_ms = transfer_started.elapsed().as_millis();
+        tracing::info!(
+            elapsed_ms = transfer_ms,
+            tx_hash = %transfer_result.tx_hash,
+            "Transfer call completed"
+        );
+
+        {
+            let mut pending = self.pending_spent_notes.lock().await;
+            let mut local = self.local_notes.lock().await;
+            pending.purge_expired();
+            let now = std::time::Instant::now();
+            for note in &selected {
+                pending.by_rho.insert(note.rho.clone(), now);
+                local.by_rho.remove(&note.rho);
+            }
+
+            if let (Some(change_amount), Some(change_rho)) =
+                (transfer_result.change_amount, transfer_result.change_rho)
+            {
+                let rho_hex = hex::encode(change_rho);
+                let sender_id_hex = hex::encode(privacy_key.recipient(&DOMAIN));
+                local.by_rho.insert(
+                    rho_hex.clone(),
+                    crate::operations::SpendableNote {
+                        value: change_amount,
+                        rho: rho_hex,
+                        sender_id: sender_id_hex,
+                        tx_hash: transfer_result.tx_hash.clone(),
+                        timestamp_ms: transfer_result.created_at,
+                        kind: "transfer".to_string(),
+                    },
+                );
+            }
+        }
 
         let created_at = transfer_result.created_at;
+        let total_ms = send_started.elapsed().as_millis();
+        tracing::info!(
+            total_ms,
+            notes_wait_ms,
+            selection_ms,
+            inputs_ms,
+            transfer_ms,
+            tx_hash = %transfer_result.tx_hash,
+            "Send completed"
+        );
 
         let result = SendFundsResult {
             id: transfer_result.tx_hash,
@@ -1444,6 +1627,15 @@ impl CryptoServer {
         // Mark the wallet as explicitly loaded
         let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
         *loaded_guard = true;
+        {
+            // Reset any cached pending spends from a previous wallet within this session.
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
+        }
 
         tracing::info!("[createWallet] New wallet created successfully");
         tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
@@ -1640,6 +1832,15 @@ impl CryptoServer {
         // Mark the wallet as explicitly loaded
         let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
         *loaded_guard = true;
+        {
+            // Reset any cached pending spends from a previous wallet within this session.
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
+        }
 
         tracing::info!("[restoreWallet] Wallet restored successfully");
         tracing::info!("[restoreWallet] Wallet address: {}", wallet_address);
@@ -1678,6 +1879,14 @@ impl CryptoServer {
         *viewer_fvk_guard = None;
         *privacy_key_guard = None;
         *loaded_guard = false;
+        {
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
+        }
 
         if was_loaded {
             tracing::info!(

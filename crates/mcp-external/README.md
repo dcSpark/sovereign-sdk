@@ -41,6 +41,8 @@ Configure the following environment variables:
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
 - `AUTO_FUND_GAS_RESERVE` - Optional gas reserve (in dust) added to the L2 funding transfer for auto-funding (default: 1000000000000). Values below the default are clamped to ensure the deposit can reserve gas.
 - `MCP_TRANSFER_WAIT_MODE` - Optional post-submit wait mode for `send`: `sequencer` (default) or `none`.
+- `AUTHORITY_API_TOKEN` - Optional bearer token for `/authority` HTTP endpoints. If set, POST endpoints require `Authorization: Bearer <token>`.
+- `METRICS_API_URL` - Optional `sov-metrics-api` base URL used by `GET /authority/tps` (e.g. `http://127.0.0.1:13200`).
 
 ### Start the Server
 
@@ -64,6 +66,18 @@ The server exposes the following MCP tools:
 - `removeWallet` - Clear loaded wallet (enables create/restore again)
 
 If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool. When `START_WITH_NEW_WALLET=true`, the same auto-fund flow runs during startup.
+
+### Authority (HTTP)
+
+For compatibility with the `midnight-sim/mockmcp` API shape, `mcp-external` also exposes a small set of non-MCP HTTP endpoints:
+
+- `GET /authority` - Discover available authority endpoints
+- `GET /authority/info` - List frozen (blacklisted) privacy addresses
+- `GET /authority/accounts` - Alias for `/authority/info`
+- `POST /authority/freeze` - Freeze a privacy address (requires `AUTHORITY_API_TOKEN` + `ADMIN_WALLET_PRIVATE_KEY`)
+- `POST /authority/thaw` - Unfreeze a privacy address (requires `AUTHORITY_API_TOKEN` + `ADMIN_WALLET_PRIVATE_KEY`)
+- `GET /authority/tps` - TPS over 1m/5m/15m windows (requires `METRICS_API_URL`)
+- `POST /authority/observe` - Not implemented (mock-only)
 
 ### Transactions
 

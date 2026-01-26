@@ -19,14 +19,53 @@ const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
 const SYNC_MAX_RETRIES: usize = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 200;
 
-const POSITION_LOOKUP_MAX_RETRIES: usize = 10;
-const POSITION_LOOKUP_RETRY_DELAY_MS: u64 = 200;
+const DEFAULT_POSITION_LOOKUP_MAX_RETRIES: usize = 50;
+const DEFAULT_POSITION_LOOKUP_RETRY_DELAY_MS: u64 = 200;
 
 const BACKGROUND_SYNC_INTERVAL_SECS: u64 = 1;
 const BACKGROUND_SYNC_ERROR_BACKOFF_SECS: u64 = 3;
 
 static GLOBAL_TREE_SYNCER: OnceLock<CommitmentTreeSyncer> = OnceLock::new();
 static BACKGROUND_SYNC_STARTED: OnceLock<()> = OnceLock::new();
+static POSITION_LOOKUP_CONFIG: OnceLock<PositionLookupConfig> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct PositionLookupConfig {
+    max_retries: usize,
+    retry_delay: Duration,
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn position_lookup_config() -> PositionLookupConfig {
+    *POSITION_LOOKUP_CONFIG.get_or_init(|| {
+        let max_retries = env_usize(
+            "MCP_COMMITMENT_TREE_POSITION_LOOKUP_MAX_RETRIES",
+            DEFAULT_POSITION_LOOKUP_MAX_RETRIES,
+        );
+        let retry_delay_ms = env_u64(
+            "MCP_COMMITMENT_TREE_POSITION_LOOKUP_RETRY_DELAY_MS",
+            DEFAULT_POSITION_LOOKUP_RETRY_DELAY_MS,
+        );
+
+        PositionLookupConfig {
+            max_retries,
+            retry_delay: Duration::from_millis(retry_delay_ms),
+        }
+    })
+}
 
 /// Return the process-wide commitment tree syncer (shared across all wallets/sessions).
 pub fn global_tree_syncer() -> &'static CommitmentTreeSyncer {
@@ -366,7 +405,10 @@ impl CommitmentTreeSyncer {
     ) -> Result<(Hash32, Vec<u64>, Vec<Vec<Hash32>>)> {
         anyhow::ensure!(!cms.is_empty(), "cms must not be empty");
 
-        for attempt in 0..=POSITION_LOOKUP_MAX_RETRIES {
+        let lookup = position_lookup_config();
+        let started = Instant::now();
+
+        for attempt in 0..=lookup.max_retries {
             // Sync first (cheap no-op if already up-to-date), then resolve positions/openings.
             self.sync_to_latest(provider).await?;
             {
@@ -388,18 +430,23 @@ impl CommitmentTreeSyncer {
                         .iter()
                         .map(|pos| st.tree.open(*pos as usize))
                         .collect();
+                    if attempt > 0 {
+                        tracing::info!(
+                            attempt,
+                            waited_ms = started.elapsed().as_millis(),
+                            cms = cms.len(),
+                            "Resolved commitment positions after waiting for tree cache to catch up"
+                        );
+                    }
                     return Ok((st.tree.root(), positions, siblings));
                 }
             }
 
-            if attempt == POSITION_LOOKUP_MAX_RETRIES {
+            if attempt == lookup.max_retries {
                 break;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(
-                POSITION_LOOKUP_RETRY_DELAY_MS,
-            ))
-            .await;
+            tokio::time::sleep(lookup.retry_delay).await;
         }
 
         let st = self.state.read().await;
