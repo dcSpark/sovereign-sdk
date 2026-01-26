@@ -22,6 +22,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIND_ADDR="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
 THREADS="${PROVER_THREADS:-}"
+# Number of prover daemon workers (default: CPU count)
+PROVER_WORKERS="${PROVER_WORKERS:-}"
+# Number of verifier daemon workers (default: CPU count)
+VERIFIER_WORKERS="${VERIFIER_WORKERS:-}"
 PROOF_OUTPUTS="${PROVER_PROOF_OUTPUTS:-$SCRIPT_DIR/proof_outputs}"
 KEEP_PROOF_DIRS="${PROVER_KEEP_PROOF_DIRS:-}"
 export RUST_LOG="${RUST_LOG:-info}"
@@ -90,7 +94,17 @@ echo "Proof outputs:   $PROOF_OUTPUTS"
 echo "Log level:       ${RUST_LOG}"
 echo "Runner dir:      $RUNNER_DIR"
 if [[ -n "$THREADS" ]]; then
-    echo "Worker threads:  $THREADS"
+    echo "HTTP threads:    $THREADS"
+fi
+if [[ -n "$PROVER_WORKERS" ]]; then
+    echo "Prover workers:  $PROVER_WORKERS"
+else
+    echo "Prover workers:  (default: CPU count)"
+fi
+if [[ -n "$VERIFIER_WORKERS" ]]; then
+    echo "Verifier workers: $VERIFIER_WORKERS"
+else
+    echo "Verifier workers: (default: CPU count)"
 fi
 echo ""
 
@@ -113,6 +127,12 @@ fi
 ARGS=("-b" "$BIND_ADDR" "--proof-outputs" "$PROOF_OUTPUTS")
 if [[ -n "$THREADS" ]]; then
     ARGS+=("-t" "$THREADS")
+fi
+if [[ -n "$PROVER_WORKERS" ]]; then
+    ARGS+=("--prover-workers" "$PROVER_WORKERS")
+fi
+if [[ -n "$VERIFIER_WORKERS" ]]; then
+    ARGS+=("--verifier-workers" "$VERIFIER_WORKERS")
 fi
 if [[ -n "$KEEP_PROOF_DIRS" ]]; then
     ARGS+=("--keep-proof-dir")
