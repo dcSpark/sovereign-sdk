@@ -16,6 +16,12 @@ resource "aws_vpc" "main" {
   }
 }
 
+# Secondary CIDR block for additional availability zones (us-east-1c, us-east-1d)
+resource "aws_vpc_ipv4_cidr_block_association" "secondary" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = var.vpc_secondary_cidr
+}
+
 # Disable VPC Block Public Access to allow inbound internet traffic
 resource "aws_vpc_block_public_access_exclusion" "main" {
   vpc_id                 = aws_vpc.main.id
@@ -68,6 +74,9 @@ resource "aws_subnet" "public" {
     Name = "${var.project_name}-public-subnet-${var.availability_zones[count.index]}"
     Type = "public"
   }
+
+  # New subnets (index >= 2) use the secondary CIDR and must wait for it
+  depends_on = [aws_vpc_ipv4_cidr_block_association.secondary]
 }
 
 # -----------------------------------------------------------------------------
@@ -86,6 +95,9 @@ resource "aws_subnet" "private" {
     Name = "${var.project_name}-private-subnet-${var.availability_zones[count.index]}"
     Type = "private"
   }
+
+  # New subnets (index >= 2) use the secondary CIDR and must wait for it
+  depends_on = [aws_vpc_ipv4_cidr_block_association.secondary]
 }
 
 # -----------------------------------------------------------------------------

@@ -82,6 +82,9 @@ demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }
 # CLI args
 clap = { workspace = true, features = ["derive"] }
 
+# CPU detection for default concurrency
+num_cpus = "1.16"
+
 # Futures utilities
 futures = { workspace = true }
 

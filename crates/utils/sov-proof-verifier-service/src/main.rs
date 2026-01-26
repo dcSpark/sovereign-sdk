@@ -52,9 +52,9 @@ struct Args {
     #[arg(long, default_value = "4321")]
     chain_id: u64,
 
-    /// Maximum number of concurrent proof verifications
-    #[arg(long, default_value = "5")]
-    max_concurrent: usize,
+    /// Maximum number of concurrent proof verifications (defaults to number of CPUs)
+    #[arg(long)]
+    max_concurrent: Option<usize>,
 
     /// Connection string for the worker_txs database (used to store worker_verified_transactions).
     /// If not provided, the service will try to read it from --rollup-config-path's [da] section.
@@ -140,10 +140,13 @@ async fn main() -> Result<()> {
         IncomingWorkerTxSaver::disabled()
     };
 
+    // Default to number of CPUs for max concurrent verifications
+    let max_concurrent = args.max_concurrent.unwrap_or_else(num_cpus::get);
+
     info!("Starting proof verifier service");
     info!("Bind address: {}", args.bind);
     info!("Node RPC URL: {}", args.node_rpc_url);
-    info!("Max concurrent verifications: {}", args.max_concurrent);
+    info!("Max concurrent verifications: {}", max_concurrent);
     info!("Worker transactions DB: {}", da_connection_string);
     info!("Defer submission: {}", args.defer_submission);
 
@@ -174,7 +177,7 @@ async fn main() -> Result<()> {
         value_setter_method_id, // Will be auto-computed from value_validator_rust.wasm if None
         midnight_method_id,     // Will be auto-computed from note_spend_guest.wasm if None
         chain_id: args.chain_id,
-        max_concurrent_verifications: args.max_concurrent,
+        max_concurrent_verifications: max_concurrent,
         da_connection_string,
         defer_sequencer_submission: args.defer_submission,
         prover_service_url: args.prover_service_url,

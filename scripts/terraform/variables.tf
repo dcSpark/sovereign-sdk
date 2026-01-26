@@ -39,20 +39,38 @@ variable "vpc_cidr" {
 variable "availability_zones" {
   description = "Availability zones to use"
   type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
+  default     = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d"]
 }
 
-# Subnet CIDRs - /16 divided equally into 4 /18 subnets
+# Secondary CIDR block for additional subnets (us-east-1c, us-east-1d)
+variable "vpc_secondary_cidr" {
+  description = "Secondary CIDR block for the VPC to accommodate additional AZs"
+  type        = string
+  default     = "172.33.0.0/16"
+}
+
+# Subnet CIDRs - Original /18 subnets preserved, new AZs use secondary CIDR
+# IMPORTANT: Do NOT change existing subnet CIDRs or you will destroy running resources!
 variable "public_subnet_cidrs" {
   description = "CIDR blocks for public subnets"
   type        = list(string)
-  default     = ["172.32.0.0/18", "172.32.64.0/18"]
+  default     = [
+    "172.32.0.0/18",   # us-east-1a (existing - DO NOT CHANGE)
+    "172.32.64.0/18",  # us-east-1b (existing - DO NOT CHANGE)
+    "172.33.0.0/18",   # us-east-1c (new - from secondary CIDR)
+    "172.33.64.0/18"   # us-east-1d (new - from secondary CIDR)
+  ]
 }
 
 variable "private_subnet_cidrs" {
   description = "CIDR blocks for private subnets"
   type        = list(string)
-  default     = ["172.32.128.0/18", "172.32.192.0/18"]
+  default     = [
+    "172.32.128.0/18", # us-east-1a (existing - DO NOT CHANGE)
+    "172.32.192.0/18", # us-east-1b (existing - DO NOT CHANGE)
+    "172.33.128.0/18", # us-east-1c (new - from secondary CIDR)
+    "172.33.192.0/18"  # us-east-1d (new - from secondary CIDR)
+  ]
 }
 
 # -----------------------------------------------------------------------------
