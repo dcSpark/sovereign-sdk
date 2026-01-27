@@ -114,7 +114,8 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             buffer_raw_txs: true,
         };
 
-        let mut endpoints = NodeEndpoints {
+        // let mut endpoints = NodeEndpoints {
+        let endpoints = NodeEndpoints {
             jsonrpsee_module: sov_ethereum::get_ethereum_rpc(
                 eth_rpc_config,
                 Arc::clone(&sequencer),

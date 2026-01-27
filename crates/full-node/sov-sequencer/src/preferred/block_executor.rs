@@ -407,7 +407,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         self.checkpoint.apply_tx_changes(&tx_changes);
         let apply_changes_time = apply_changes_start.elapsed();
 
-        tracing::info!(
+        tracing::debug!(
             clone_ms = format!("{:.2}", clone_time.as_secs_f64() * 1000.0),
             try_send_ms = format!("{:.2}", send_time.as_secs_f64() * 1000.0),
             recv_ms = format!("{:.2}", recv_time.as_secs_f64() * 1000.0),
@@ -797,7 +797,7 @@ impl<S: Spec, Rt: Runtime<S>> RollupBlockExecutor<S, Rt> {
         let cache_time = cache_start.elapsed();
 
         let total_time = fn_start.elapsed();
-        tracing::info!(
+        tracing::debug!(
             total_ms = format!("{:.2}", total_time.as_secs_f64() * 1000.0),
             apply_changes_ms = format!("{:.2}", apply_changes_time.as_secs_f64() * 1000.0),
             process_receipt_ms = format!("{:.2}", process_receipt_time.as_secs_f64() * 1000.0),

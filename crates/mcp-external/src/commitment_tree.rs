@@ -304,7 +304,7 @@ impl CommitmentTreeSyncer {
                 {
                     Ok(Some(stats)) if stats.root_match => {
                         let elapsed_ms = started.elapsed().as_millis();
-                        tracing::info!(
+                        tracing::debug!(
                             elapsed_ms,
                             state_ms,
                             fetch_ms = stats.fetch_ms,
@@ -361,7 +361,7 @@ impl CommitmentTreeSyncer {
                 }) {
                 Ok(stats) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    tracing::info!(
+                    tracing::debug!(
                         elapsed_ms,
                         state_ms,
                         target_next_position = stats.target_next_position,
@@ -407,10 +407,14 @@ impl CommitmentTreeSyncer {
 
         let lookup = position_lookup_config();
         let started = Instant::now();
+        let mut sync_time_ms: u128 = 0;
+        let open_time_ms: u128;
 
         for attempt in 0..=lookup.max_retries {
             // Sync first (cheap no-op if already up-to-date), then resolve positions/openings.
+            let sync_start = Instant::now();
             self.sync_to_latest(provider).await?;
+            sync_time_ms += sync_start.elapsed().as_millis();
             {
                 let st = self.state.read().await;
                 let mut positions = Vec::with_capacity(cms.len());
@@ -426,18 +430,22 @@ impl CommitmentTreeSyncer {
                 }
 
                 if !missing {
+                    let open_start = Instant::now();
                     let siblings = positions
                         .iter()
                         .map(|pos| st.tree.open(*pos as usize))
                         .collect();
-                    if attempt > 0 {
-                        tracing::info!(
-                            attempt,
-                            waited_ms = started.elapsed().as_millis(),
-                            cms = cms.len(),
-                            "Resolved commitment positions after waiting for tree cache to catch up"
-                        );
-                    }
+                    open_time_ms = open_start.elapsed().as_millis();
+
+                    tracing::info!(
+                        attempt,
+                        total_ms = started.elapsed().as_millis(),
+                        sync_ms = sync_time_ms,
+                        open_ms = open_time_ms,
+                        cms = cms.len(),
+                        tree_size = st.next_position,
+                        "[TREE_TIMING] Resolved commitment positions"
+                    );
                     return Ok((st.tree.root(), positions, siblings));
                 }
             }

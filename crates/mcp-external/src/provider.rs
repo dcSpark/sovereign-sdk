@@ -299,7 +299,7 @@ impl Provider {
         let base_url = self.verifier_url.trim_end_matches('/');
         let endpoint = format!("{}/midnight-privacy", base_url);
 
-        tracing::info!("Submitting transaction to verifier service at {}", endpoint);
+        tracing::debug!("Submitting transaction to verifier service at {}", endpoint);
         tracing::debug!(
             "Transaction size: {} bytes, base64 size: {} bytes",
             raw_tx.len(),
@@ -364,7 +364,7 @@ impl Provider {
         let created_at = parse_rfc3339_to_millis(&verifier_resp.metrics.created_at)
             .ok_or_else(|| anyhow::anyhow!("Verifier response missing metrics.createdAt"))?;
 
-        tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
+        tracing::debug!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
 
         Ok(VerifierSubmitResult {
             tx_hash: tx_hash.to_string(),

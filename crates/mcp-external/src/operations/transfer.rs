@@ -137,7 +137,7 @@ async fn wait_for_sequencer_confirmation(provider: &Provider, tx_hash: &str) -> 
         match provider.get_sequencer_tx(tx_hash).await {
             Ok(Some(tx)) => match tx.receipt.result {
                 api_types::TxReceiptResult::Successful => {
-                    tracing::info!(
+                    tracing::debug!(
                         tx_hash,
                         attempts,
                         waited_ms = start.elapsed().as_millis(),
@@ -318,7 +318,7 @@ pub async fn transfer(
         .try_into()
         .context("change_amount does not fit into u64 (required by note_spend_guest v2)")?;
 
-    tracing::info!(
+    tracing::debug!(
         "Starting transfer: n_in={}, sum_in={}, send_amount={}, change_amount={}",
         inputs.len(),
         sum_in_u64,
@@ -326,6 +326,14 @@ pub async fn transfer(
         change_amount
     );
     let overall_start = StdInstant::now();
+
+    // Timing breakdown for instrumentation
+    let timing_tree_ms: u128;
+    let timing_proof_ms: u128;
+    let timing_tx_build_ms: u128;
+    let timing_sign_ms: u128;
+    let timing_submit_ms: u128;
+    let timing_confirm_ms: u128;
 
     // Derive the spender's privacy recipient (owner address) from (spend_sk, pk_ivk_owner).
     // This matches note_spend_guest v2, where the input recipient is derived in-circuit.
@@ -351,8 +359,9 @@ pub async fn transfer(
         .resolve_positions_and_openings(provider, &input_cms)
         .await
         .context("Failed to resolve Merkle positions/openings from cached commitment tree")?;
-    tracing::info!(
-        elapsed_ms = tree_start.elapsed().as_millis(),
+    timing_tree_ms = tree_start.elapsed().as_millis();
+    tracing::debug!(
+        elapsed_ms = timing_tree_ms,
         anchor_root = %hex::encode(anchor_root),
         "Merkle tree sync completed"
     );
@@ -402,7 +411,7 @@ pub async fn transfer(
     // Step 4b: Create viewer bundles if a viewer FVK bundle is provided
     let (view_attestations, view_ciphertexts) = if let Some(ref bundle) = viewer_fvk_bundle {
         let fvk = bundle.fvk;
-        tracing::info!(
+        tracing::debug!(
             "Viewer FVK configured: generating viewer attestations for {} output(s)",
             num_outputs
         );
@@ -498,7 +507,7 @@ pub async fn transfer(
     // with the public output (SpendPublic) for verifier compatibility.
 
     // Step 5: Generate ZK proof
-    tracing::info!("Generating ZK proof with {} output(s)...", num_outputs);
+    tracing::debug!("Generating ZK proof with {} output(s)...", num_outputs);
 
     use ligetron::bn254fr_native::submod_checked;
     use ligetron::Bn254Fr;
@@ -902,9 +911,10 @@ pub async fn transfer(
         .await
         .inspect_err(|e| tracing::error!("Failed to generate Ligero proof for transfer: {:?}", e))
         .context("Failed to generate Ligero proof for transfer")?;
+    timing_proof_ms = proof_start.elapsed().as_millis();
 
-    tracing::info!(
-        elapsed_ms = proof_start.elapsed().as_millis(),
+    tracing::debug!(
+        elapsed_ms = timing_proof_ms,
         proof_bytes_len = proof_bytes_raw.len(),
         "Generated proof bytes"
     );
@@ -971,8 +981,9 @@ pub async fn transfer(
         view_ciphertexts,
     )
     .await?;
-    tracing::info!(
-        elapsed_ms = unsigned_tx_start.elapsed().as_millis(),
+    timing_tx_build_ms = unsigned_tx_start.elapsed().as_millis();
+    tracing::debug!(
+        elapsed_ms = timing_tx_build_ms,
         "Unsigned transfer transaction created"
     );
 
@@ -980,9 +991,10 @@ pub async fn transfer(
     let raw_tx = wallet
         .sign_transaction::<McpRuntime>(unsigned_tx)
         .context("Failed to sign transaction")?;
+    timing_sign_ms = sign_start.elapsed().as_millis();
 
-    tracing::info!(
-        elapsed_ms = sign_start.elapsed().as_millis(),
+    tracing::debug!(
+        elapsed_ms = timing_sign_ms,
         tx_bytes_len = raw_tx.len(),
         "Transaction signed"
     );
@@ -994,21 +1006,23 @@ pub async fn transfer(
         .await
         .context("Failed to submit transaction to verifier service")?;
     let tx_hash = submit_result.tx_hash;
+    timing_submit_ms = submit_start.elapsed().as_millis();
 
-    tracing::info!(
-        elapsed_ms = submit_start.elapsed().as_millis(),
+    tracing::debug!(
+        elapsed_ms = timing_submit_ms,
         tx_hash,
         "Transfer transaction submitted via verifier service"
     );
 
     // Step 8: Optional post-submit wait
+    let confirm_start = StdInstant::now();
     let confirmation = match TransferWaitMode::from_env() {
         TransferWaitMode::None => {
-            tracing::info!("Skipping post-submit wait (MCP_TRANSFER_WAIT_MODE=none)");
+            tracing::debug!("Skipping post-submit wait (MCP_TRANSFER_WAIT_MODE=none)");
             TransferConfirmation::Skipped
         }
         TransferWaitMode::Sequencer => {
-            tracing::info!("Waiting for sequencer confirmation...");
+            tracing::debug!("Waiting for sequencer confirmation...");
             let confirmed = wait_for_sequencer_confirmation(provider, &tx_hash).await?;
             if confirmed {
                 TransferConfirmation::SequencerConfirmed
@@ -1017,10 +1031,20 @@ pub async fn transfer(
             }
         }
     };
+    timing_confirm_ms = confirm_start.elapsed().as_millis();
+
+    let total_ms = overall_start.elapsed().as_millis();
     tracing::info!(
-        elapsed_ms = overall_start.elapsed().as_millis(),
         tx_hash,
-        "Transfer operation completed"
+        total_ms,
+        tree_ms = timing_tree_ms,
+        proof_ms = timing_proof_ms,
+        tx_build_ms = timing_tx_build_ms,
+        sign_ms = timing_sign_ms,
+        submit_ms = timing_submit_ms,
+        confirm_ms = timing_confirm_ms,
+        confirmation = confirmation.as_str(),
+        "[TRANSFER_TIMING] Transfer completed"
     );
 
     Ok(TransferResult {

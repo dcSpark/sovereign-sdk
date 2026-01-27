@@ -729,7 +729,7 @@ where
     if execution_context == ExecutionContext::Node {
         // Log batch summary
         if batch_verification_stats.total_txs > 0 {
-            tracing::info!(
+            tracing::debug!(
                 blob_idx,
                 total = batch_verification_stats.total_txs,
                 cache_hits = batch_verification_stats.cache_hits_used,

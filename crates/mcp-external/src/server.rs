@@ -971,7 +971,7 @@ impl CryptoServer {
             };
             if filtered > 0 {
                 notes_filtered_pending_total += filtered as u64;
-                tracing::info!(
+                tracing::debug!(
                     "[send] Filtered {} locally-pending spent note(s) from indexer results",
                     filtered
                 );
@@ -989,7 +989,7 @@ impl CryptoServer {
                 }
                 if added > 0 {
                     notes_added_local_total += added as u64;
-                    tracing::info!("[send] Added {} local change note(s) to candidates", added);
+                    tracing::debug!("[send] Added {} local change note(s) to candidates", added);
                 }
             }
 
@@ -1036,7 +1036,7 @@ impl CryptoServer {
             "Selected input notes"
         );
 
-        tracing::info!(
+        tracing::debug!(
             "[send] Selected {} input notes (total_in={}, send_amount={})",
             selected.len(),
             total_in,
@@ -1060,7 +1060,7 @@ impl CryptoServer {
                 )
             })?;
 
-            tracing::info!(
+            tracing::debug!(
                 "[send] Input[{}] value={} rho={} sender_id={} created_tx={}",
                 idx,
                 n.value,
@@ -1076,25 +1076,25 @@ impl CryptoServer {
             });
         }
         let inputs_ms = inputs_started.elapsed().as_millis();
-        tracing::info!(
+        tracing::debug!(
             elapsed_ms = inputs_ms,
             "Prepared transfer inputs"
         );
         let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
-        tracing::info!(
+        tracing::debug!(
             "[send] Output recipient (destination): {}",
             hex::encode(&output_recipient)
         );
 
         if total_in > send_amount {
             let change_amt = total_in - send_amount;
-            tracing::info!(
+            tracing::debug!(
                 "[send] Transfer includes change output - amount: {}",
                 change_amt
             );
         } else {
-            tracing::info!("[send] No change needed - sending full note value");
+            tracing::debug!("[send] No change needed - sending full note value");
         }
 
         let spend_sk = privacy_key.spend_sk().copied().ok_or_else(|| {

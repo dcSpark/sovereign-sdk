@@ -2112,7 +2112,7 @@ where
             tx_changes_for_cache,
         } = parallel_response;
 
-        tracing::info!(
+        tracing::debug!(
             %tx_hash,
             "[STAGE 3] Committing parallel execution result to main executor (FAST PATH)"
         );
@@ -2272,7 +2272,7 @@ where
             });
         });
 
-        tracing::info!(
+        tracing::debug!(
             %tx_hash,
             total_ms = format!("{:.2}", total_time.as_secs_f64() * 1000.0),
             commit_ms = format!("{:.2}", commit_time.as_secs_f64() * 1000.0),
