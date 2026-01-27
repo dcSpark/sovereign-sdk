@@ -216,25 +216,32 @@ where
             let snap = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(async { midnight_bridge.snapshot().await })
-            })?;
+            });
 
-            let index = snap.rollup.next_cross_domain_message_index - 1;
-            l1_bridge.last_processed_queue_index =
-                U256::from(snap.l2_messenger.last_processed_l1_index);
-            l1_bridge.message_queue_hash = snap
-                .rollup
-                .message_rolling_hashes
-                .get(&index)
-                .expect("No message rolling hashes available")
-                .clone();
-            l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
-            l1_bridge.withdraw_root = snap
-                .rollup
-                .withdraw_roots
-                .values()
-                .next_back()
-                .expect("no withdraw roots available")
-                .clone();
+            match snap {
+                Err(e) => {
+                    tracing::error!(error = ?e, "Failed to get midnight bridge snapshot, L1 bridge data will be mocked values.");
+                }
+                Ok(snap) => {
+                    let index = snap.rollup.next_cross_domain_message_index - 1;
+                    l1_bridge.last_processed_queue_index =
+                        U256::from(snap.l2_messenger.last_processed_l1_index);
+                    l1_bridge.message_queue_hash = snap
+                        .rollup
+                        .message_rolling_hashes
+                        .get(&index)
+                        .expect("No message rolling hashes available")
+                        .clone();
+                    l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
+                    l1_bridge.withdraw_root = snap
+                        .rollup
+                        .withdraw_roots
+                        .values()
+                        .next_back()
+                        .expect("no withdraw roots available")
+                        .clone();
+                }
+            }
         } else {
             tracing::warn!("No midnight bridge provided, L1 bridge data will be mocked values.");
         }
