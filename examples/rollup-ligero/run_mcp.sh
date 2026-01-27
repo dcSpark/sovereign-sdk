@@ -20,6 +20,11 @@ export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-75fbf8d98746c2692e5
 export WALLET_PRIVATE_KEY="${WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export PRIVPOOL_SPEND_KEY="${PRIVPOOL_SPEND_KEY:-0xb23e0dc9d1f8869c8bc87ab4eaacd58cbe024a825bdc13fefa4d4c5eaa0b855f}"
 
+# Authority API configuration for /authority/* HTTP endpoints
+# Uses MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for protected endpoints (freeze/thaw). If not set, write endpoints are disabled.
+# METRICS_API_URL: Base URL for sov-metrics-api, enables /authority/tps endpoint.
+export METRICS_API_URL="${METRICS_API_URL:-http://127.0.0.1:13200}"
+
 # Provide the ZK guest program via:
 # - LIGERO_PROGRAM_PATH (circuit name like `note_spend_guest` OR full path to a `.wasm` file)
 export LIGERO_PROGRAM_PATH="${LIGERO_PROGRAM_PATH:-note_spend_guest}"

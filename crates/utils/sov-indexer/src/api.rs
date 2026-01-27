@@ -1,4 +1,5 @@
 use crate::balance;
+use crate::db;
 use crate::db::{
     get_tx_god, list_transactions, list_transactions_god, list_wallet_transactions,
     list_wallet_transactions_god, list_wallet_txs as list_wallet_txs_db, CursorInner,
@@ -110,6 +111,10 @@ pub fn router(state: AppState) -> Router {
         // FVK registry management endpoints
         .route("/fvks", get(list_fvks).post(add_fvk))
         .route("/fvks/:fvk_commitment", delete(delete_fvk))
+        // Frozen accounts management endpoints
+        .route("/frozen", get(list_frozen).post(record_freeze))
+        .route("/frozen/:privacy_address", get(get_frozen_status))
+        .route("/frozen/:privacy_address/history", get(get_freeze_history))
         .merge(swagger_ui)
         .with_state(state)
 }
@@ -506,9 +511,12 @@ pub struct AddFvkRequest {
     /// Optional: expected fvk_commitment (hex) - if provided, we verify it matches
     #[serde(default)]
     pub fvk_commitment: Option<String>,
-    /// The shielded address associated with this FVK (optional)
+    /// The shielded address associated with this FVK (optional, bech32m privpool1...)
     #[serde(default)]
     pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (optional, sov1...)
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 /// Response for FVK operations
@@ -518,6 +526,8 @@ pub struct FvkResponse {
     pub fvk: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shielded_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
 }
 
 /// List all FVKs in the registry
@@ -534,10 +544,11 @@ async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
         .vfk_registry
         .entries()
         .into_iter()
-        .map(|(commitment, fvk, addr)| FvkResponse {
+        .map(|(commitment, fvk, shielded_addr, wallet_addr)| FvkResponse {
             fvk_commitment: commitment,
             fvk: hex::encode(fvk),
-            shielded_address: addr,
+            shielded_address: shielded_addr,
+            wallet_address: wallet_addr,
         })
         .collect();
 
@@ -619,7 +630,9 @@ async fn add_fvk(
     }
 
     // Add to registry (DashMap - no lock needed)
-    state.vfk_registry.add(fvk, req.shielded_address.clone());
+    state
+        .vfk_registry
+        .add(fvk, req.shielded_address.clone(), req.wallet_address.clone());
 
     // Persist to database
     if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {
@@ -703,6 +716,293 @@ async fn delete_fvk(
         .into_response()
 }
 
+// ============================================================================
+// Frozen Accounts Endpoints
+// ============================================================================
+
+/// Request body for recording a freeze/unfreeze event
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RecordFreezeRequest {
+    /// Privacy address (bech32m privpool1...)
+    pub privacy_address: String,
+    /// Public wallet address (sov1...) if known
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    /// Reason for freeze/unfreeze
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Whether this is a freeze (true) or unfreeze (false) event
+    pub is_frozen: bool,
+    /// Transaction hash that performed this action
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    /// Who initiated this action (admin address)
+    #[serde(default)]
+    pub initiated_by: Option<String>,
+}
+
+/// Response for recording a freeze event
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecordFreezeResponse {
+    pub success: bool,
+    pub id: i64,
+    pub message: String,
+}
+
+/// Frozen account status for API responses
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ApiFrozenAccountStatus {
+    pub privacy_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    pub is_frozen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiated_by: Option<String>,
+    pub updated_at: String,
+}
+
+impl From<db::FrozenAccountStatus> for ApiFrozenAccountStatus {
+    fn from(s: db::FrozenAccountStatus) -> Self {
+        Self {
+            privacy_address: s.privacy_address,
+            wallet_address: s.wallet_address,
+            is_frozen: s.is_frozen,
+            reason: s.reason,
+            tx_hash: s.tx_hash,
+            initiated_by: s.initiated_by,
+            updated_at: s.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Freeze event for API responses
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ApiFreezeEvent {
+    pub id: i64,
+    pub privacy_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub is_frozen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiated_by: Option<String>,
+    pub created_at: String,
+}
+
+impl From<db::FreezeEvent> for ApiFreezeEvent {
+    fn from(e: db::FreezeEvent) -> Self {
+        Self {
+            id: e.id,
+            privacy_address: e.privacy_address,
+            wallet_address: e.wallet_address,
+            reason: e.reason,
+            is_frozen: e.is_frozen,
+            tx_hash: e.tx_hash,
+            initiated_by: e.initiated_by,
+            created_at: e.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Response for listing frozen accounts
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FrozenListResponse {
+    pub count: usize,
+    pub frozen_accounts: Vec<ApiFrozenAccountStatus>,
+}
+
+/// Response for freeze history
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FreezeHistoryResponse {
+    pub privacy_address: String,
+    pub events: Vec<ApiFreezeEvent>,
+}
+
+/// List all currently frozen accounts
+#[utoipa::path(
+    get,
+    path = "/frozen",
+    responses(
+        (status = 200, description = "List frozen accounts", body = FrozenListResponse)
+    ),
+    tag = "frozen"
+)]
+async fn list_frozen(State(state): State<AppState>) -> impl IntoResponse {
+    match db::list_frozen_accounts(&state.db, Some(1000)).await {
+        Ok(accounts) => {
+            let api_accounts: Vec<ApiFrozenAccountStatus> =
+                accounts.into_iter().map(|a| a.into()).collect();
+            (
+                StatusCode::OK,
+                Json(FrozenListResponse {
+                    count: api_accounts.len(),
+                    frozen_accounts: api_accounts,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list frozen accounts: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Record a freeze or unfreeze event
+#[utoipa::path(
+    post,
+    path = "/frozen",
+    request_body = RecordFreezeRequest,
+    responses(
+        (status = 201, description = "Freeze event recorded", body = RecordFreezeResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "frozen"
+)]
+async fn record_freeze(
+    State(state): State<AppState>,
+    Json(req): Json<RecordFreezeRequest>,
+) -> impl IntoResponse {
+    // Validate privacy address format
+    if !req.privacy_address.starts_with("privpool1") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid privacy_address format. Expected bech32m privpool1...".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match db::record_freeze_event(
+        &state.db,
+        &req.privacy_address,
+        req.wallet_address.as_deref(),
+        req.reason.as_deref(),
+        req.is_frozen,
+        req.tx_hash.as_deref(),
+        req.initiated_by.as_deref(),
+    )
+    .await
+    {
+        Ok(id) => {
+            let action = if req.is_frozen { "frozen" } else { "unfrozen" };
+            tracing::info!(
+                "Recorded {} event for {} (id={})",
+                action,
+                &req.privacy_address[..20.min(req.privacy_address.len())],
+                id
+            );
+            (
+                StatusCode::CREATED,
+                Json(RecordFreezeResponse {
+                    success: true,
+                    id,
+                    message: format!("Account {} successfully", action),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to record freeze event: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Get current frozen status for a privacy address
+#[utoipa::path(
+    get,
+    path = "/frozen/{privacy_address}",
+    params(
+        ("privacy_address" = String, Path, description = "Privacy address (bech32m)")
+    ),
+    responses(
+        (status = 200, description = "Frozen status", body = ApiFrozenAccountStatus),
+        (status = 404, description = "No freeze records found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "frozen"
+)]
+async fn get_frozen_status(
+    State(state): State<AppState>,
+    Path(privacy_address): Path<String>,
+) -> impl IntoResponse {
+    match db::get_frozen_status(&state.db, &privacy_address).await {
+        Ok(Some(status)) => {
+            let api_status: ApiFrozenAccountStatus = status.into();
+            (StatusCode::OK, Json(api_status)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "No freeze records found for this address".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get frozen status: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Get freeze/unfreeze history for a privacy address
+#[utoipa::path(
+    get,
+    path = "/frozen/{privacy_address}/history",
+    params(
+        ("privacy_address" = String, Path, description = "Privacy address (bech32m)")
+    ),
+    responses(
+        (status = 200, description = "Freeze history", body = FreezeHistoryResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "frozen"
+)]
+async fn get_freeze_history(
+    State(state): State<AppState>,
+    Path(privacy_address): Path<String>,
+) -> impl IntoResponse {
+    match db::get_freeze_history(&state.db, &privacy_address).await {
+        Ok(events) => {
+            let api_events: Vec<ApiFreezeEvent> = events.into_iter().map(|e| e.into()).collect();
+            (
+                StatusCode::OK,
+                Json(FreezeHistoryResponse {
+                    privacy_address,
+                    events: api_events,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get freeze history: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -722,7 +1022,11 @@ async fn delete_fvk(
         health,
         list_fvks,
         add_fvk,
-        delete_fvk
+        delete_fvk,
+        list_frozen,
+        record_freeze,
+        get_frozen_status,
+        get_freeze_history
     ),
     components(schemas(
         ListQuery,
@@ -739,12 +1043,19 @@ async fn delete_fvk(
         AddFvkResponse,
         SuccessResponse,
         ErrorResponse,
-        HealthResponse
+        HealthResponse,
+        RecordFreezeRequest,
+        RecordFreezeResponse,
+        FrozenListResponse,
+        FreezeHistoryResponse,
+        ApiFrozenAccountStatus,
+        ApiFreezeEvent
     )),
     tags(
         (name = "wallets", description = "Wallet-related endpoints"),
         (name = "transactions", description = "Transaction endpoints with privacy modes"),
         (name = "fvks", description = "FVK registry management"),
+        (name = "frozen", description = "Frozen accounts management"),
         (name = "health", description = "Service health checks")
     )
 )]

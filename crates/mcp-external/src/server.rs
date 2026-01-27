@@ -1574,14 +1574,21 @@ impl CryptoServer {
             if let Some(pool_pk) = pool_fvk_pk {
                 let http = reqwest::Client::new();
                 Some(
-                    fetch_viewer_fvk_bundle(&http, Some(pool_pk))
-                        .await
-                        .map_err(|e| {
-                            ErrorData::internal_error(
-                    format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
-                    None,
-                )
-                        })?,
+                    fetch_viewer_fvk_bundle(
+                        &http,
+                        Some(pool_pk),
+                        Some(&privacy_address),
+                        Some(&wallet_address_str),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!(
+                                "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
+                            ),
+                            None,
+                        )
+                    })?,
                 )
             } else {
                 None
@@ -1776,12 +1783,17 @@ impl CryptoServer {
                         fvk_commitment: commitment,
                         pool_sig_hex: sig_hex_trimmed.to_string(),
                         signer_public_key: pool_pk,
+                        // User-provided FVK doesn't have addresses yet
+                        shielded_address: None,
+                        wallet_address: None,
                     })
                 }
                 (None, None) => {
                     let http = reqwest::Client::new();
+                    // Note: privacy_address is not known yet at this point in restoreWallet
+                    // The FVK service can be updated later via /v1/fvk/:commitment/address
                     Some(
-                        fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                        fetch_viewer_fvk_bundle(&http, Some(pool_pk), None, None)
                             .await
                             .map_err(|e| {
                                 ErrorData::internal_error(

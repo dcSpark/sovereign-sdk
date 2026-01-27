@@ -41,7 +41,10 @@ pub struct MetricsStore {
 impl MetricsStore {
     pub fn new(data_path: PathBuf, retention_secs: u64) -> Result<Self> {
         fs::create_dir_all(&data_path).with_context(|| {
-            format!("Failed to create tsink data path at {}", data_path.display())
+            format!(
+                "Failed to create tsink data path at {}",
+                data_path.display()
+            )
         })?;
 
         let storage = StorageBuilder::new()
@@ -170,12 +173,7 @@ impl MetricsStore {
         end_ms: i64,
     ) -> Option<MetricSeriesSnapshot> {
         if start_ms >= end_ms || start_ms < 0 || end_ms < 0 {
-            warn!(
-                metric = name,
-                start_ms,
-                end_ms,
-                "Invalid snapshot range"
-            );
+            warn!(metric = name, start_ms, end_ms, "Invalid snapshot range");
             return None;
         }
 
@@ -390,10 +388,12 @@ fn value_from_point(point: &DataPoint, kind: FieldKind) -> Option<Value> {
             let value = f64_to_u64(point.value)?;
             Some(Value::Number(Number::from(value)))
         }
-        FieldKind::F64 => Number::from_f64(point.value).map(Value::Number).or_else(|| {
-            warn!(value = point.value, "Failed to encode f64 data point");
-            None
-        }),
+        FieldKind::F64 => Number::from_f64(point.value)
+            .map(Value::Number)
+            .or_else(|| {
+                warn!(value = point.value, "Failed to encode f64 data point");
+                None
+            }),
         FieldKind::String => Some(Value::String(format!("{:.0}", point.value))),
     }
 }

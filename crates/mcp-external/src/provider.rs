@@ -658,3 +658,69 @@ fn parse_rfc3339_to_millis(value: &str) -> Option<i64> {
         .ok()
         .map(|dt| dt.timestamp_millis())
 }
+
+/// FVK entry from the indexer's FVK registry
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct FvkEntry {
+    /// FVK commitment (unique identifier)
+    pub fvk_commitment: String,
+    /// Full Viewing Key (hex encoded)
+    pub fvk: String,
+    /// Associated shielded address (optional, bech32m privpool1...)
+    #[serde(default)]
+    pub shielded_address: Option<String>,
+    /// Associated public wallet address (optional, sov1...)
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+}
+
+/// Response from the indexer's FVK list endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct FvkListResponse {
+    pub count: usize,
+    pub fvks: Vec<FvkEntry>,
+}
+
+impl Provider {
+    /// Get all registered FVKs from the indexer
+    ///
+    /// This queries the indexer's `/fvks` endpoint to retrieve all registered
+    /// Full Viewing Keys and their associated shielded addresses.
+    pub async fn get_fvk_registry(&self) -> Result<FvkListResponse> {
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/fvks", base_url);
+
+        tracing::debug!("Fetching FVK registry from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch FVK registry from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer FVK registry API error at {}: HTTP {} - {}",
+                url,
+                status,
+                if body.is_empty() {
+                    "No error details provided"
+                } else {
+                    &body
+                }
+            );
+        }
+
+        let fvk_list: FvkListResponse = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse FVK registry JSON from indexer at {}", url))?;
+
+        tracing::debug!("Fetched {} FVKs from indexer", fvk_list.count);
+
+        Ok(fvk_list)
+    }
+}

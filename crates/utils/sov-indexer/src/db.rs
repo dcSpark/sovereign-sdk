@@ -80,6 +80,15 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     );
     idx_db.execute(stmt).await?;
 
+    // Frozen accounts tracking table (freeze/unfreeze history with reasons)
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::frozen_accounts::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
+
     // === Indexes ===
     //
     // These are additive (no migrations). We create them with IF NOT EXISTS so existing DBs
@@ -179,6 +188,23 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
         .table(idx::notes_nullifiers::Entity)
         .col(idx::notes_nullifiers::Column::Recipient)
         .col(idx::notes_nullifiers::Column::SpentTxHash)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    // Frozen accounts: quick lookup by privacy address
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_frozen_accounts_privacy_address")
+        .table(idx::frozen_accounts::Entity)
+        .col(idx::frozen_accounts::Column::PrivacyAddress)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+    // Frozen accounts: quick lookup by wallet address
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_frozen_accounts_wallet_address")
+        .table(idx::frozen_accounts::Entity)
+        .col(idx::frozen_accounts::Column::WalletAddress)
         .if_not_exists()
         .to_owned();
     idx_db.execute(builder.build(&idx_stmt)).await?;
@@ -1765,4 +1791,165 @@ fn decrypted_notes_match_recipient(
         }
     }
     false
+}
+
+// ============================================================================
+// Frozen Accounts
+// ============================================================================
+
+/// Record a freeze or unfreeze event for a privacy address
+pub async fn record_freeze_event(
+    db: &DatabaseConnection,
+    privacy_address: &str,
+    wallet_address: Option<&str>,
+    reason: Option<&str>,
+    is_frozen: bool,
+    tx_hash: Option<&str>,
+    initiated_by: Option<&str>,
+) -> Result<i64> {
+    let model = idx::frozen_accounts::ActiveModel {
+        id: sea_orm::ActiveValue::NotSet,
+        privacy_address: Set(privacy_address.to_string()),
+        wallet_address: Set(wallet_address.map(|s| s.to_string())),
+        reason: Set(reason.map(|s| s.to_string())),
+        is_frozen: Set(is_frozen),
+        tx_hash: Set(tx_hash.map(|s| s.to_string())),
+        initiated_by: Set(initiated_by.map(|s| s.to_string())),
+        created_at: Set(Utc::now()),
+    };
+
+    let result = idx::frozen_accounts::Entity::insert(model)
+        .exec(db)
+        .await?;
+
+    Ok(result.last_insert_id)
+}
+
+/// Get the current frozen status for a privacy address (most recent event)
+pub async fn get_frozen_status(
+    db: &DatabaseConnection,
+    privacy_address: &str,
+) -> Result<Option<FrozenAccountStatus>> {
+    let row = idx::frozen_accounts::Entity::find()
+        .filter(idx::frozen_accounts::Column::PrivacyAddress.eq(privacy_address))
+        .order_by_desc(idx::frozen_accounts::Column::CreatedAt)
+        .one(db)
+        .await?;
+
+    Ok(row.map(|r| FrozenAccountStatus {
+        privacy_address: r.privacy_address,
+        wallet_address: r.wallet_address,
+        is_frozen: r.is_frozen,
+        reason: r.reason,
+        tx_hash: r.tx_hash,
+        initiated_by: r.initiated_by,
+        updated_at: r.created_at,
+    }))
+}
+
+/// List all currently frozen accounts (latest status = frozen)
+pub async fn list_frozen_accounts(
+    db: &DatabaseConnection,
+    limit: Option<u64>,
+) -> Result<Vec<FrozenAccountStatus>> {
+    // Get distinct privacy addresses with their most recent freeze event
+    // This is a subquery approach: for each address, get the most recent event
+
+    // Get all addresses that have at least one event
+    let all_events = idx::frozen_accounts::Entity::find()
+        .order_by_desc(idx::frozen_accounts::Column::CreatedAt)
+        .all(db)
+        .await?;
+
+    // Group by privacy_address and take only the most recent event per address
+    let mut latest_by_address: std::collections::HashMap<String, idx::frozen_accounts::Model> =
+        std::collections::HashMap::new();
+    for event in all_events {
+        latest_by_address
+            .entry(event.privacy_address.clone())
+            .or_insert(event);
+    }
+
+    // Filter to only currently frozen accounts
+    let mut frozen: Vec<FrozenAccountStatus> = latest_by_address
+        .into_values()
+        .filter(|e| e.is_frozen)
+        .map(|r| FrozenAccountStatus {
+            privacy_address: r.privacy_address,
+            wallet_address: r.wallet_address,
+            is_frozen: r.is_frozen,
+            reason: r.reason,
+            tx_hash: r.tx_hash,
+            initiated_by: r.initiated_by,
+            updated_at: r.created_at,
+        })
+        .collect();
+
+    // Sort by most recently frozen
+    frozen.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    if let Some(limit) = limit {
+        frozen.truncate(limit as usize);
+    }
+
+    Ok(frozen)
+}
+
+/// Get freeze/unfreeze history for a privacy address
+pub async fn get_freeze_history(
+    db: &DatabaseConnection,
+    privacy_address: &str,
+) -> Result<Vec<FreezeEvent>> {
+    let rows = idx::frozen_accounts::Entity::find()
+        .filter(idx::frozen_accounts::Column::PrivacyAddress.eq(privacy_address))
+        .order_by_desc(idx::frozen_accounts::Column::CreatedAt)
+        .all(db)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| FreezeEvent {
+            id: r.id,
+            privacy_address: r.privacy_address,
+            wallet_address: r.wallet_address,
+            reason: r.reason,
+            is_frozen: r.is_frozen,
+            tx_hash: r.tx_hash,
+            initiated_by: r.initiated_by,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Current frozen status for an account
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenAccountStatus {
+    pub privacy_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    pub is_frozen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiated_by: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A single freeze/unfreeze event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreezeEvent {
+    pub id: i64,
+    pub privacy_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub is_frozen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiated_by: Option<String>,
+    pub created_at: DateTime<Utc>,
 }

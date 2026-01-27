@@ -34,6 +34,12 @@ pub mod midnight_transfer {
         pub event_id: i32,
         #[sea_orm(nullable)]
         pub amount: Option<String>,
+        #[sea_orm(nullable)]
+        pub privacy_sender: Option<String>,
+        #[sea_orm(nullable)]
+        pub recipient: Option<String>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub view_attestations: Option<JsonValue>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -70,6 +76,62 @@ pub mod midnight_deposit {
         )]
         Events,
     }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod midnight_withdraw {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "midnight_withdraw")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false, column_type = "Integer")]
+        pub event_id: i32,
+        #[sea_orm(nullable)]
+        pub amount: Option<String>,
+        #[sea_orm(nullable)]
+        pub privacy_sender: Option<String>,
+        #[sea_orm(nullable, column_type = "Json")]
+        pub view_attestations: Option<JsonValue>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::Entity",
+            from = "Column::EventId",
+            to = "super::Column::Id"
+        )]
+        Events,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Registry of known FVKs for decryption (accounts).
+pub mod fvk_registry {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "fvk_registry")]
+    pub struct Model {
+        #[sea_orm(
+            primary_key,
+            auto_increment = false,
+            column_type = "String(StringLen::N(64))"
+        )]
+        pub fvk_commitment: String,
+        #[sea_orm(column_type = "String(StringLen::N(64))")]
+        pub fvk: String,
+        #[sea_orm(column_type = "Text", nullable)]
+        pub shielded_address: Option<String>,
+        #[sea_orm(column_type = "TimestampWithTimeZone")]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
 }
