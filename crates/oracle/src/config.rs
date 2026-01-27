@@ -16,7 +16,7 @@ pub struct Config {
 }
 
 fn default_server_bind_address() -> String {
-    "127.0.0.1:8080".to_owned()
+    "127.0.0.1:8090".to_owned()
 }
 
 fn default_policies_dir() -> String {

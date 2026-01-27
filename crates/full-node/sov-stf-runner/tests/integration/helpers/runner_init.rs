@@ -282,7 +282,7 @@ pub async fn initialize_runner(
             genesis_state_root,
             stf_info_receiver,
             shutdown_receiver.clone(),
-            "http://127.0.0.1:8080".to_owned(),
+            "http://127.0.0.1:8090".to_owned(),
             Some(MidnightIndexerClient::new(
                 reqwest::Client::new(),
                 "https://indexer.preview.midnight.network/api/v3/graphql".to_owned(),

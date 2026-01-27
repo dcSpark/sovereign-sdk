@@ -216,7 +216,7 @@ mod tests {
             [sequencer.extension]
             max_log_limit = 1000
             [sequencer.extension.tee_configuration]
-            tee_attestation_oracle_url = "http://127.0.0.1:8080"
+            tee_attestation_oracle_url = "http://127.0.0.1:8090"
             [sequencer.standard]
         "#;
 
