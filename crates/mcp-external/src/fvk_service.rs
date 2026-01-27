@@ -12,10 +12,25 @@ pub struct ViewerFvkBundle {
     pub fvk_commitment: Hash32,
     pub pool_sig_hex: String,
     pub signer_public_key: Hash32,
+    /// The shielded address associated with this FVK (if provided at issuance).
+    /// This is stored in midnight-fvk-service for the indexer to use.
+    #[allow(dead_code)]
+    pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (if provided at issuance).
+    /// This is stored in midnight-fvk-service for the indexer to use.
+    #[allow(dead_code)]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct IssueFvkRequest {}
+struct IssueFvkRequest {
+    /// Optional shielded address to associate with this FVK
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shielded_address: Option<String>,
+    /// Optional public wallet address to associate with this FVK
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_address: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct IssueFvkResponse {
@@ -24,6 +39,10 @@ struct IssueFvkResponse {
     signature: String,
     signer_public_key: String,
     signature_scheme: String,
+    #[serde(default)]
+    shielded_address: Option<String>,
+    #[serde(default)]
+    wallet_address: Option<String>,
 }
 
 pub fn fvk_service_base_url_from_env() -> String {
@@ -66,16 +85,22 @@ fn verify_commitment_signature(
         .map_err(|e| anyhow!("Invalid pool signature over fvk_commitment: {e}"))
 }
 
+/// Fetch a new FVK bundle from midnight-fvk-service, optionally associating addresses
 pub async fn fetch_viewer_fvk_bundle(
     http: &HttpClient,
     pool_fvk_pk: Option<[u8; 32]>,
+    shielded_address: Option<&str>,
+    wallet_address: Option<&str>,
 ) -> Result<ViewerFvkBundle> {
     let base_url = fvk_service_base_url_from_env();
     let endpoint = format!("{}/v1/fvk", base_url);
 
     let resp: IssueFvkResponse = http
         .post(&endpoint)
-        .json(&IssueFvkRequest {})
+        .json(&IssueFvkRequest {
+            shielded_address: shielded_address.map(|s| s.to_string()),
+            wallet_address: wallet_address.map(|s| s.to_string()),
+        })
         .send()
         .await
         .with_context(|| format!("POST {endpoint}"))?
@@ -122,5 +147,7 @@ pub async fn fetch_viewer_fvk_bundle(
         fvk_commitment: fvk_commitment_resp,
         pool_sig_hex: resp.signature,
         signer_public_key: signer_pk,
+        shielded_address: resp.shielded_address,
+        wallet_address: resp.wallet_address,
     })
 }

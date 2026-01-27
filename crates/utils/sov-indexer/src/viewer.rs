@@ -62,6 +62,9 @@ pub struct FvkEntry {
     /// The shielded address associated with this FVK (optional)
     #[serde(default)]
     pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (optional)
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 /// Config file structure for FVK registry
@@ -75,8 +78,8 @@ pub struct FvkConfig {
 /// Uses DashMap for lock-free concurrent access during indexing.
 #[derive(Debug)]
 pub struct FvkRegistry {
-    /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address)
-    by_commitment: DashMap<String, (Hash32, Option<String>)>,
+    /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address, wallet_address)
+    by_commitment: DashMap<String, (Hash32, Option<String>, Option<String>)>,
 }
 
 #[derive(Clone)]
@@ -90,6 +93,10 @@ pub struct FvkServiceClient {
 struct FvkLookupResponse {
     fvk: String,
     fvk_commitment: String,
+    #[serde(default)]
+    shielded_address: Option<String>,
+    #[serde(default)]
+    wallet_address: Option<String>,
 }
 
 impl FvkServiceClient {
@@ -115,10 +122,11 @@ impl FvkServiceClient {
         }))
     }
 
+    /// Fetch an FVK by commitment, returning (fvk, shielded_address, wallet_address) if found
     pub async fn fetch_fvk_by_commitment(
         &self,
         expected_fvk_commitment: &Hash32,
-    ) -> Result<Option<Hash32>> {
+    ) -> Result<Option<(Hash32, Option<String>, Option<String>)>> {
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/v1/fvk/{}", hex::encode(expected_fvk_commitment));
 
@@ -159,7 +167,7 @@ impl FvkServiceClient {
             anyhow::bail!("FVK service returned fvk that does not match requested commitment");
         }
 
-        Ok(Some(fvk))
+        Ok(Some((fvk, body.shielded_address, body.wallet_address)))
     }
 }
 
@@ -182,12 +190,17 @@ impl FvkRegistry {
     }
 
     /// Add a FVK to the registry (thread-safe, no &mut needed)
-    pub fn add(&self, fvk: Hash32, shielded_address: Option<String>) {
+    pub fn add(
+        &self,
+        fvk: Hash32,
+        shielded_address: Option<String>,
+        wallet_address: Option<String>,
+    ) {
         let fvk_obj = FullViewingKey(fvk);
         let commitment = fvk_commitment(&fvk_obj);
         let commitment_hex = hex::encode(commitment);
         self.by_commitment
-            .insert(commitment_hex, (fvk, shielded_address));
+            .insert(commitment_hex, (fvk, shielded_address, wallet_address));
     }
 
     /// Remove a FVK by its commitment (thread-safe)
@@ -207,12 +220,12 @@ impl FvkRegistry {
     }
 
     /// Get all entries as a collected Vec (for iteration/serialization)
-    pub fn entries(&self) -> Vec<(String, Hash32, Option<String>)> {
+    pub fn entries(&self) -> Vec<(String, Hash32, Option<String>, Option<String>)> {
         self.by_commitment
             .iter()
             .map(|r| {
-                let (k, (fvk, addr)) = r.pair();
-                (k.clone(), *fvk, addr.clone())
+                let (k, (fvk, shielded_addr, wallet_addr)) = r.pair();
+                (k.clone(), *fvk, shielded_addr.clone(), wallet_addr.clone())
             })
             .collect()
     }
@@ -229,7 +242,7 @@ impl FvkRegistry {
 
         for entry in config.fvks {
             let fvk = parse_fvk_hex(&entry.fvk)?;
-            registry.add(fvk, entry.shielded_address);
+            registry.add(fvk, entry.shielded_address, entry.wallet_address);
         }
 
         info!("Loaded {} FVKs from config file {:?}", registry.len(), path);
@@ -241,11 +254,12 @@ impl FvkRegistry {
         use sea_orm::sea_query::OnConflict;
 
         for entry in self.by_commitment.iter() {
-            let (commitment_hex, (fvk, shielded_address)) = entry.pair();
+            let (commitment_hex, (fvk, shielded_address, wallet_address)) = entry.pair();
             let model = idx::fvk_registry::ActiveModel {
                 fvk_commitment: Set(commitment_hex.clone()),
                 fvk: Set(hex::encode(fvk)),
                 shielded_address: Set(shielded_address.clone()),
+                wallet_address: Set(wallet_address.clone()),
                 created_at: Set(Utc::now()),
             };
 
@@ -255,6 +269,7 @@ impl FvkRegistry {
                         .update_columns([
                             idx::fvk_registry::Column::Fvk,
                             idx::fvk_registry::Column::ShieldedAddress,
+                            idx::fvk_registry::Column::WalletAddress,
                         ])
                         .to_owned(),
                 )
@@ -270,6 +285,7 @@ impl FvkRegistry {
         db: &DatabaseConnection,
         fvk: Hash32,
         shielded_address: Option<String>,
+        wallet_address: Option<String>,
     ) -> Result<()> {
         use sea_orm::sea_query::OnConflict;
 
@@ -281,6 +297,7 @@ impl FvkRegistry {
             fvk_commitment: Set(commitment_hex),
             fvk: Set(hex::encode(fvk)),
             shielded_address: Set(shielded_address),
+            wallet_address: Set(wallet_address),
             created_at: Set(Utc::now()),
         };
 
@@ -290,6 +307,7 @@ impl FvkRegistry {
                     .update_columns([
                         idx::fvk_registry::Column::Fvk,
                         idx::fvk_registry::Column::ShieldedAddress,
+                        idx::fvk_registry::Column::WalletAddress,
                     ])
                     .to_owned(),
             )
@@ -308,7 +326,7 @@ impl FvkRegistry {
         for row in rows {
             let fvk = parse_fvk_hex(&row.fvk)?;
             // We already have the commitment stored, but we re-add to populate our DashMap
-            registry.add(fvk, row.shielded_address);
+            registry.add(fvk, row.shielded_address, row.wallet_address);
         }
 
         if !registry.is_empty() {
@@ -373,9 +391,12 @@ pub async fn maybe_fetch_missing_fvks_for_encrypted_notes(
 
     for commitment in missing {
         match client.fetch_fvk_by_commitment(&commitment).await {
-            Ok(Some(fvk)) => {
-                registry.add(fvk, None);
-                if let Err(e) = FvkRegistry::save_single_to_db(idx_db, fvk, None).await {
+            Ok(Some((fvk, shielded_address, wallet_address))) => {
+                registry.add(fvk, shielded_address.clone(), wallet_address.clone());
+                if let Err(e) =
+                    FvkRegistry::save_single_to_db(idx_db, fvk, shielded_address, wallet_address)
+                        .await
+                {
                     warn!("Failed to persist fetched FVK to index DB: {}", e);
                 }
             }

@@ -81,6 +81,12 @@ pub struct IssueFvkRequest {
     pub seed: Option<String>,
     #[serde(default)]
     pub seed_hex: Option<String>,
+    /// Optional shielded address (bech32m privpool1...) to associate with this FVK
+    #[serde(default)]
+    pub shielded_address: Option<String>,
+    /// Optional public wallet address (sov1...) to associate with this FVK
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +97,12 @@ pub struct IssueFvkResponse {
     pub signer_public_key: String,
     pub signature_scheme: &'static str,
     pub fvk_commitment_scheme: &'static str,
+    /// The shielded address associated with this FVK (if provided at issuance)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (if provided at issuance)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,11 +123,44 @@ pub struct HealthResponse {
 pub struct LookupFvkResponse {
     pub fvk: String,
     pub fvk_commitment: String,
+    /// The shielded address associated with this FVK (if stored)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (if stored)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Request body for updating the addresses of an existing FVK
+#[derive(Debug, Deserialize)]
+pub struct UpdateAddressesRequest {
+    #[serde(default)]
+    pub shielded_address: Option<String>,
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+}
+
+/// Response for listing all FVKs
+#[derive(Debug, Serialize)]
+pub struct ListFvksResponse {
+    pub count: usize,
+    pub fvks: Vec<FvkListItem>,
+}
+
+/// Individual FVK entry in the list response
+#[derive(Debug, Serialize)]
+pub struct FvkListItem {
+    pub fvk: String,
+    pub fvk_commitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shielded_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Debug)]
@@ -151,8 +196,12 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/info", get(info))
-        .route("/v1/fvk", post(issue_fvk))
+        .route("/v1/fvk", post(issue_fvk).get(list_fvks))
         .route("/v1/fvk/:fvk_commitment", get(lookup_fvk))
+        .route(
+            "/v1/fvk/:fvk_commitment/address",
+            post(update_shielded_address),
+        )
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -200,6 +249,18 @@ pub async fn issue_fvk(
         ));
     }
 
+    let shielded_address = req
+        .shielded_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let wallet_address = req
+        .wallet_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
     let issued_at_ms = now_ms().map_err(ApiError::internal)?;
     let index_value = state
         .store
@@ -223,6 +284,8 @@ pub async fn issue_fvk(
             issued_at_ms,
             index_value,
             &issued.signature,
+            shielded_address,
+            wallet_address,
         )
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -234,6 +297,8 @@ pub async fn issue_fvk(
         signer_public_key: issued.signer_public_key_hex,
         signature_scheme: "ed25519",
         fvk_commitment_scheme: r#"Poseidon2 H("FVK_COMMIT_V1" || fvk)"#,
+        shielded_address: shielded_address.map(|s| s.to_string()),
+        wallet_address: wallet_address.map(|s| s.to_string()),
     }))
 }
 
@@ -252,7 +317,7 @@ pub async fn lookup_fvk(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let Some(fvk) = maybe_fvk else {
+    let Some((fvk, shielded_address, wallet_address)) = maybe_fvk else {
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             message: "fvk_commitment not found".to_string(),
@@ -262,6 +327,105 @@ pub async fn lookup_fvk(
     Ok(Json(LookupFvkResponse {
         fvk: hex::encode(fvk),
         fvk_commitment: hex::encode(fvk_commitment),
+        shielded_address,
+        wallet_address,
+    }))
+}
+
+/// List all issued FVKs (requires admin token)
+pub async fn list_fvks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ListFvksResponse>, ApiError> {
+    require_admin_token(&state, &headers)?;
+
+    let all_fvks = state
+        .store
+        .list_all()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let fvks: Vec<FvkListItem> = all_fvks
+        .into_iter()
+        .map(|(commitment, fvk, shielded_address, wallet_address)| FvkListItem {
+            fvk: hex::encode(fvk),
+            fvk_commitment: hex::encode(commitment),
+            shielded_address,
+            wallet_address,
+        })
+        .collect();
+
+    Ok(Json(ListFvksResponse {
+        count: fvks.len(),
+        fvks,
+    }))
+}
+
+/// Update the addresses for an existing FVK (requires admin token)
+pub async fn update_shielded_address(
+    State(state): State<AppState>,
+    Path(fvk_commitment_hex): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateAddressesRequest>,
+) -> Result<Json<LookupFvkResponse>, ApiError> {
+    require_admin_token(&state, &headers)?;
+
+    let fvk_commitment = parse_hex_32("fvk_commitment", &fvk_commitment_hex)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let shielded_address = req
+        .shielded_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let wallet_address = req
+        .wallet_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if shielded_address.is_none() && wallet_address.is_none() {
+        return Err(ApiError::bad_request(
+            "At least one of shielded_address or wallet_address must be provided",
+        ));
+    }
+
+    // Verify the FVK exists
+    let maybe_fvk = state
+        .store
+        .get_fvk_by_commitment(&fvk_commitment)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let Some((fvk, existing_shielded, existing_wallet)) = maybe_fvk else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "fvk_commitment not found".to_string(),
+        });
+    };
+
+    // Update the addresses
+    state
+        .store
+        .update_addresses(&fvk_commitment, shielded_address, wallet_address)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    info!(
+        "Updated addresses for FVK commitment {}",
+        &fvk_commitment_hex[..16.min(fvk_commitment_hex.len())]
+    );
+
+    Ok(Json(LookupFvkResponse {
+        fvk: hex::encode(fvk),
+        fvk_commitment: hex::encode(fvk_commitment),
+        shielded_address: shielded_address
+            .map(|s| s.to_string())
+            .or(existing_shielded),
+        wallet_address: wallet_address
+            .map(|s| s.to_string())
+            .or(existing_wallet),
     }))
 }
 
@@ -318,9 +482,17 @@ pub fn log_startup(bind: SocketAddr) {
     info!("midnight-fvk-service listening on {}", bind);
     info!("GET  {}/health", bind);
     info!("GET  {}/v1/info", bind);
-    info!("POST {}/v1/fvk", bind);
+    info!("POST {}/v1/fvk (shielded_address optional)", bind);
+    info!(
+        "GET  {}/v1/fvk (list all, requires MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN)",
+        bind
+    );
     info!(
         "GET  {}/v1/fvk/<fvk_commitment> (requires MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN)",
+        bind
+    );
+    info!(
+        "POST {}/v1/fvk/<fvk_commitment>/address (update shielded_address, requires MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN)",
         bind
     );
 }

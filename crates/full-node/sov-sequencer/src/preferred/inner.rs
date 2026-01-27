@@ -1937,7 +1937,7 @@ where
 
         // Sequential processing (either not a midnight privacy tx, or parallel processing failed/timed out)
         let stage1_elapsed = stage1_start.elapsed();
-        info!(
+        debug!(
             %tx_hash,
             stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
             path = "sequential",

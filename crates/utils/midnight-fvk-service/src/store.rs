@@ -50,13 +50,25 @@ impl FvkStore {
                 seed BLOB NOT NULL,
                 issued_at_ms INTEGER NOT NULL,
                 index_value INTEGER,
-                signature BLOB NOT NULL
+                signature BLOB NOT NULL,
+                shielded_address TEXT,
+                wallet_address TEXT
             )
             "#,
         )
         .execute(&pool)
         .await
         .context("create issued_fvks")?;
+
+        // Migration: add shielded_address column if it doesn't exist (for existing DBs)
+        let _ = sqlx::query("ALTER TABLE issued_fvks ADD COLUMN shielded_address TEXT")
+            .execute(&pool)
+            .await;
+
+        // Migration: add wallet_address column if it doesn't exist (for existing DBs)
+        let _ = sqlx::query("ALTER TABLE issued_fvks ADD COLUMN wallet_address TEXT")
+            .execute(&pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -165,6 +177,8 @@ impl FvkStore {
         issued_at_ms: i64,
         index_value: Option<u64>,
         signature: &[u8; 64],
+        shielded_address: Option<&str>,
+        wallet_address: Option<&str>,
     ) -> Result<()> {
         let index_value: Option<i64> = match index_value {
             Some(v) => Some(
@@ -177,8 +191,8 @@ impl FvkStore {
         sqlx::query(
             r#"
             INSERT OR IGNORE INTO issued_fvks (
-                fvk_commitment, fvk, seed, issued_at_ms, index_value, signature
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                fvk_commitment, fvk, seed, issued_at_ms, index_value, signature, shielded_address, wallet_address
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
         )
         .bind(fvk_commitment.as_slice())
@@ -187,6 +201,8 @@ impl FvkStore {
         .bind(issued_at_ms)
         .bind(index_value)
         .bind(signature.as_slice())
+        .bind(shielded_address)
+        .bind(wallet_address)
         .execute(&self.pool)
         .await
         .context("insert issued_fvks")?;
@@ -194,10 +210,13 @@ impl FvkStore {
         Ok(())
     }
 
-    pub async fn get_fvk_by_commitment(&self, fvk_commitment: &[u8; 32]) -> Result<Option<[u8; 32]>> {
-        let row: Option<Vec<u8>> = sqlx::query_scalar(
+    pub async fn get_fvk_by_commitment(
+        &self,
+        fvk_commitment: &[u8; 32],
+    ) -> Result<Option<([u8; 32], Option<String>, Option<String>)>> {
+        let row: Option<(Vec<u8>, Option<String>, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT fvk
+            SELECT fvk, shielded_address, wallet_address
             FROM issued_fvks
             WHERE fvk_commitment = ?1
             "#,
@@ -207,14 +226,65 @@ impl FvkStore {
         .await
         .context("select fvk by commitment")?;
 
-        let Some(bytes) = row else {
+        let Some((bytes, shielded_address, wallet_address)) = row else {
             return Ok(None);
         };
         let len = bytes.len();
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| anyhow!("fvk must be 32 bytes (got {len})"))?;
-        Ok(Some(bytes))
+        Ok(Some((bytes, shielded_address, wallet_address)))
+    }
+
+    /// Update the addresses for an existing FVK entry
+    pub async fn update_addresses(
+        &self,
+        fvk_commitment: &[u8; 32],
+        shielded_address: Option<&str>,
+        wallet_address: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE issued_fvks
+            SET shielded_address = COALESCE(?2, shielded_address),
+                wallet_address = COALESCE(?3, wallet_address)
+            WHERE fvk_commitment = ?1
+            "#,
+        )
+        .bind(fvk_commitment.as_slice())
+        .bind(shielded_address)
+        .bind(wallet_address)
+        .execute(&self.pool)
+        .await
+        .context("update addresses")?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List all issued FVKs with their addresses
+    pub async fn list_all(&self) -> Result<Vec<([u8; 32], [u8; 32], Option<String>, Option<String>)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT fvk_commitment, fvk, shielded_address, wallet_address
+            FROM issued_fvks
+            ORDER BY issued_at_ms DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list all fvks")?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for (commitment_bytes, fvk_bytes, shielded_address, wallet_address) in rows {
+            let commitment: [u8; 32] = commitment_bytes
+                .try_into()
+                .map_err(|_| anyhow!("fvk_commitment must be 32 bytes"))?;
+            let fvk: [u8; 32] = fvk_bytes
+                .try_into()
+                .map_err(|_| anyhow!("fvk must be 32 bytes"))?;
+            result.push((commitment, fvk, shielded_address, wallet_address));
+        }
+        Ok(result)
     }
 }
 

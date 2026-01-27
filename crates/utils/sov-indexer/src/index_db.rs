@@ -178,7 +178,7 @@ pub mod midnight_spent_nullifiers {
 }
 
 /// Registry of known FVKs for decryption.
-/// Maps fvk_commitment -> (fvk, shielded_address) for looking up which key to use.
+/// Maps fvk_commitment -> (fvk, shielded_address, wallet_address) for looking up which key to use.
 pub mod fvk_registry {
     use super::*;
     #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -194,13 +194,53 @@ pub mod fvk_registry {
         /// The actual FVK (32 bytes hex-encoded)
         #[sea_orm(column_type = "String(StringLen::N(64))")]
         pub fvk: String,
-        /// The shielded address associated with this FVK (bech32 or hex, optional)
+        /// The shielded address associated with this FVK (bech32 privpool1..., optional)
         #[sea_orm(column_type = "Text", nullable)]
         pub shielded_address: Option<String>,
+        /// The public wallet address associated with this FVK (sov1..., optional)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub wallet_address: Option<String>,
         /// When this entry was added
         #[sea_orm(column_type = "TimestampWithTimeZone")]
         pub created_at: chrono::DateTime<chrono::Utc>,
     }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Tracks frozen accounts with their freeze/unfreeze history and reasons.
+pub mod frozen_accounts {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "frozen_accounts")]
+    pub struct Model {
+        /// Unique ID for this freeze event
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i64,
+        /// Privacy address (bech32m privpool1...)
+        #[sea_orm(column_type = "Text")]
+        pub privacy_address: String,
+        /// Public wallet address (sov1...) if known
+        #[sea_orm(column_type = "Text", nullable)]
+        pub wallet_address: Option<String>,
+        /// Reason for freeze/unfreeze action
+        #[sea_orm(column_type = "Text", nullable)]
+        pub reason: Option<String>,
+        /// Whether this is a freeze (true) or unfreeze (false) event
+        pub is_frozen: bool,
+        /// Transaction hash that performed this action
+        #[sea_orm(column_type = "String(StringLen::N(64))", nullable)]
+        pub tx_hash: Option<String>,
+        /// Who initiated this action (admin address)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub initiated_by: Option<String>,
+        /// When this action occurred
+        #[sea_orm(column_type = "TimestampWithTimeZone")]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
     impl ActiveModelBehavior for ActiveModel {}

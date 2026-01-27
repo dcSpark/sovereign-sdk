@@ -42,27 +42,40 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     manager
-        .register(metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
+        .register(
+            metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
+                indexer_db.clone(),
+            ),
+        )
+        .await;
+    manager
+        .register(
+            metrics::collectors::total_tokens_economy::TotalTokensEconomyCollector::new(
+                indexer_db.clone(),
+            ),
+        )
+        .await;
+    manager
+        .register(
+            metrics::collectors::transaction_size::TransactionSizeCollector::new(
+                indexer_db.clone(),
+            ),
+        )
+        .await;
+    manager
+        .register(
+            metrics::collectors::failed_transactions::FailedTransactionsCollector::new(db.clone()),
+        )
+        .await;
+    manager
+        .register(
+            metrics::collectors::total_transactions::TotalTransactionsCollector::new(db.clone()),
+        )
+        .await;
+    // Accounts collector for EMA metrics endpoints
+    manager
+        .register(metrics::collectors::accounts::AccountsCollector::new(
             indexer_db.clone(),
-        ))
-        .await;
-    manager
-        .register(metrics::collectors::total_tokens_economy::TotalTokensEconomyCollector::new(
-            indexer_db.clone(),
-        ))
-        .await;
-    manager
-        .register(metrics::collectors::transaction_size::TransactionSizeCollector::new(
-            indexer_db.clone(),
-        ))
-        .await;
-    manager
-        .register(metrics::collectors::failed_transactions::FailedTransactionsCollector::new(
-            db.clone(),
-        ))
-        .await;
-    manager
-        .register(metrics::collectors::total_transactions::TotalTransactionsCollector::new(
             db.clone(),
         ))
         .await;

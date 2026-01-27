@@ -5,22 +5,26 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use sea_orm::DatabaseConnection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::metrics::collectors::accounts::AccountsPayload;
 use crate::metrics::collectors::average_transaction_size::AverageTransactionSizePayload;
 use crate::metrics::collectors::failed_transactions::FailedTransactionsPayload;
-use crate::metrics::collectors::transaction_size::TransactionSizePayload;
 use crate::metrics::collectors::token_value_spent::TokenValueSpentPayload;
 use crate::metrics::collectors::total_tokens_economy::TotalTokensEconomyPayload;
 use crate::metrics::collectors::total_transactions::TotalTransactionsPayload;
-use crate::metrics::{MetricSample, MetricSeriesSnapshot, MetricsStore};
+use crate::metrics::collectors::transaction_size::TransactionSizePayload;
+use crate::metrics::{
+    compute_tokens_per_second_ema, compute_tps_ema, EmaWindow, MetricSample, MetricSeriesSnapshot,
+    MetricsStore,
+};
 
 /// Cached peak TPS value with its computation boundary.
 #[derive(Clone, Debug)]
@@ -90,10 +94,9 @@ struct HistoricWindowQuery {
 }
 
 pub fn router(state: AppState) -> Router {
-    let swagger_ui = Router::from(
-        SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()),
-    )
-    .layer(middleware::from_fn(swagger_ui_redirect));
+    let swagger_ui =
+        Router::from(SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()))
+            .layer(middleware::from_fn(swagger_ui_redirect));
 
     Router::new()
         .route("/health", get(health))
@@ -112,12 +115,23 @@ pub fn router(state: AppState) -> Router {
             "/median-transaction-size/historic",
             get(median_transaction_size_historic),
         )
+        // EMA metrics endpoints (MockMCP-compatible) - exposed via proxy at /metrics/*
+        .route("/s5", get(metrics_s5))
+        .route("/m1", get(metrics_m1))
+        .route("/m5", get(metrics_m5))
+        .route("/m15", get(metrics_m15))
         .route("/token-value-spent", get(token_value_spent))
-        .route("/token-value-spent/historic", get(token_value_spent_historic))
+        .route(
+            "/token-value-spent/historic",
+            get(token_value_spent_historic),
+        )
         .route("/token-velocity", get(token_velocity))
         .route("/token-velocity/historic", get(token_velocity_historic))
         .route("/total-transactions", get(total_transactions))
-        .route("/total-transactions/historic", get(total_transactions_historic))
+        .route(
+            "/total-transactions/historic",
+            get(total_transactions_historic),
+        )
         .route("/tps", get(tps))
         .route("/tps/historic", get(tps_historic))
         .route("/tps/peak", get(tps_peak))
@@ -163,10 +177,15 @@ async fn total_transactions(State(state): State<AppState>) -> Json<TotalTransact
         .and_then(|series| series.latest.or_else(|| series.samples.last().cloned()));
 
     let (total_transactions, as_of_ms) = match latest {
-        Some(sample) => match decode_payload::<TotalTransactionsPayload>(&sample, "total-transactions") {
-            Some(payload) => (Some(payload.total_transactions), Some(sample.recorded_at_ms)),
-            None => (None, None),
-        },
+        Some(sample) => {
+            match decode_payload::<TotalTransactionsPayload>(&sample, "total-transactions") {
+                Some(payload) => (
+                    Some(payload.total_transactions),
+                    Some(sample.recorded_at_ms),
+                ),
+                None => (None, None),
+            }
+        }
         None => (None, None),
     };
 
@@ -203,8 +222,7 @@ async fn total_transactions_historic(
             samples: Vec::new(),
         });
 
-    series.samples =
-        filter_samples_by_range(series.samples, range, |sample| sample.recorded_at_ms);
+    series.samples = filter_samples_by_range(series.samples, range, |sample| sample.recorded_at_ms);
     series.latest = series.samples.last().cloned();
 
     Json(series)
@@ -389,6 +407,151 @@ async fn tps_peak(
     })
 }
 
+// =============================================================================
+// EMA Metrics Endpoints (MockMCP-compatible /metrics/{s5|m1|m5|m15})
+// =============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/s5",
+    responses(
+        (status = 200, description = "5-second EMA metrics", body = EmaMetricsResponse)
+    ),
+    tag = "ema-metrics"
+)]
+async fn metrics_s5(State(state): State<AppState>) -> Json<EmaMetricsResponse> {
+    Json(compute_ema_metrics(&state, EmaWindow::S5).await)
+}
+
+#[utoipa::path(
+    get,
+    path = "/m1",
+    responses(
+        (status = 200, description = "1-minute EMA metrics", body = EmaMetricsResponse)
+    ),
+    tag = "ema-metrics"
+)]
+async fn metrics_m1(State(state): State<AppState>) -> Json<EmaMetricsResponse> {
+    Json(compute_ema_metrics(&state, EmaWindow::M1).await)
+}
+
+#[utoipa::path(
+    get,
+    path = "/m5",
+    responses(
+        (status = 200, description = "5-minute EMA metrics", body = EmaMetricsResponse)
+    ),
+    tag = "ema-metrics"
+)]
+async fn metrics_m5(State(state): State<AppState>) -> Json<EmaMetricsResponse> {
+    Json(compute_ema_metrics(&state, EmaWindow::M5).await)
+}
+
+#[utoipa::path(
+    get,
+    path = "/m15",
+    responses(
+        (status = 200, description = "15-minute EMA metrics", body = EmaMetricsResponse)
+    ),
+    tag = "ema-metrics"
+)]
+async fn metrics_m15(State(state): State<AppState>) -> Json<EmaMetricsResponse> {
+    Json(compute_ema_metrics(&state, EmaWindow::M15).await)
+}
+
+/// Computes EMA metrics for a given window.
+///
+/// This aggregates data from multiple metric series to produce the MockMCP-compatible
+/// response format.
+async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsResponse {
+    // Get accounts data (latest snapshot)
+    let accounts_data = state
+        .store
+        .snapshot("accounts")
+        .await
+        .and_then(|s| s.latest)
+        .and_then(|sample| decode_payload::<AccountsPayload>(&sample, "accounts"));
+
+    // Get total transactions data for TPS calculation
+    let total_tx_series = state
+        .store
+        .snapshot("total-transactions")
+        .await
+        .map(map_total_transactions_series);
+
+    // Get token value spent data for TokensPerSecond calculation
+    let token_value_series = state.store.snapshot("token-value-spent").await;
+
+    // Get total tokens economy for TotalTokensInWallets
+    let total_tokens_data = state
+        .store
+        .snapshot("total-tokens-economy")
+        .await
+        .and_then(|s| s.latest)
+        .and_then(|sample| {
+            decode_payload::<TotalTokensEconomyPayload>(&sample, "total-tokens-economy")
+        });
+
+    // Calculate TPS using EMA
+    let tps = total_tx_series.as_ref().and_then(|series| {
+        let samples: Vec<(i64, u64)> = series
+            .samples
+            .iter()
+            .map(|s| (s.recorded_at_ms, s.payload.total_transactions))
+            .collect();
+        compute_tps_ema(samples, window)
+    });
+
+    // Calculate TokensPerSecond using EMA
+    let tokens_per_second = token_value_series.as_ref().and_then(|series| {
+        let samples: Vec<(i64, u128)> = series
+            .samples
+            .iter()
+            .filter_map(|s| {
+                let payload: TokenValueSpentPayload = decode_payload(s, "token-value-spent")?;
+                let amount = payload.total_amount.parse::<u128>().ok()?;
+                Some((s.recorded_at_ms, amount))
+            })
+            .collect();
+        compute_tokens_per_second_ema(samples, window)
+    });
+
+    // Get cumulative totals
+    let total_transactions = total_tx_series
+        .as_ref()
+        .and_then(|s| s.latest.as_ref())
+        .map(|s| s.payload.total_transactions)
+        .unwrap_or(0);
+
+    let total_tokens_in_wallets = total_tokens_data
+        .as_ref()
+        .and_then(|p| p.total_amount.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let accounts = accounts_data
+        .as_ref()
+        .map(|p| p.total_accounts)
+        .unwrap_or(0);
+    let sending_accounts = accounts_data
+        .as_ref()
+        .map(|p| p.sending_accounts)
+        .unwrap_or(0);
+    let total_disclosure_events = accounts_data
+        .as_ref()
+        .map(|p| p.total_disclosure_events)
+        .unwrap_or(0);
+
+    EmaMetricsResponse {
+        accounts,
+        sending_accounts,
+        tps: tps.unwrap_or(0.0),
+        tokens_per_second: tokens_per_second.unwrap_or(0.0),
+        total_disclosure_events,
+        total_tokens_in_wallets,
+        total_transactions,
+    }
+}
+
 /// Query the database to find the peak TPS by counting transactions per second.
 async fn compute_peak_tps_from_db(
     db: &DatabaseConnection,
@@ -408,11 +571,11 @@ async fn compute_peak_tps_from_db(
     let backend = db.get_database_backend();
     let accepted = TransactionState::Accepted.to_value();
     let rejected = TransactionState::Rejected.to_value();
-    
+
     // Format timestamps as ISO strings for reliable parsing
     let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
     let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
-    
+
     debug!(
         "Computing peak TPS from {} to {} (states: {}, {})",
         from_str, to_str, accepted, rejected
@@ -521,9 +684,9 @@ async fn failed_transactions_rate(
     let window_ms = window_ms(params.window_seconds);
     let (rate_percent, failed_transactions, total_transactions, delta_ms) =
         match series_snapshot.as_ref() {
-        Some(series) => compute_failed_rate(series, window_ms),
-        None => (None, None, None, None),
-    };
+            Some(series) => compute_failed_rate(series, window_ms),
+            None => (None, None, None, None),
+        };
 
     Json(FailedTransactionsResponse {
         rate_percent,
@@ -633,9 +796,9 @@ async fn average_transaction_size(
     };
     let (average_amount, delta_amount, delta_transactions, delta_ms) =
         match series_snapshot.as_ref() {
-        Some(series) => compute_average_transaction_size(series, window_ms),
-        None => (None, None, None, None),
-    };
+            Some(series) => compute_average_transaction_size(series, window_ms),
+            None => (None, None, None, None),
+        };
 
     Json(AverageTransactionSizeResponse {
         average_amount,
@@ -752,7 +915,9 @@ async fn median_transaction_size(
 
     values.retain(|value| value.is_finite());
     if values.is_empty() {
-        return Json(MedianTransactionSizeResponse { median_amount: None });
+        return Json(MedianTransactionSizeResponse {
+            median_amount: None,
+        });
     }
 
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -868,9 +1033,7 @@ async fn token_value_spent(
         .as_ref()
         .and_then(|series| compute_token_value_spent(series, window_ms));
 
-    Json(TokenValueSpentResponse {
-        value_spent,
-    })
+    Json(TokenValueSpentResponse { value_spent })
 }
 
 #[utoipa::path(
@@ -954,7 +1117,10 @@ async fn token_velocity(
                 warn!(from_ms, to_ms, "Invalid token velocity range");
                 None
             } else if from_ms < 0 || to_ms < 0 {
-                warn!(from_ms, to_ms, "Negative token velocity range not supported");
+                warn!(
+                    from_ms,
+                    to_ms, "Negative token velocity range not supported"
+                );
                 None
             } else {
                 Some((from_ms, to_ms))
@@ -963,20 +1129,21 @@ async fn token_velocity(
         _ => None,
     };
 
-    let value_spent = state
-        .store
-        .snapshot("token-value-spent")
-        .await
-        .and_then(|series| match range {
-            Some((from_ms, to_ms)) => compute_token_value_spent_range(&series, from_ms, to_ms),
-            None => {
-                let window_ms = match params.window_seconds {
-                    Some(window_seconds) => window_ms(Some(window_seconds)),
-                    None => window_ms(Some(86_400)),
-                };
-                compute_token_value_spent(&series, window_ms)
-            }
-        });
+    let value_spent =
+        state
+            .store
+            .snapshot("token-value-spent")
+            .await
+            .and_then(|series| match range {
+                Some((from_ms, to_ms)) => compute_token_value_spent_range(&series, from_ms, to_ms),
+                None => {
+                    let window_ms = match params.window_seconds {
+                        Some(window_seconds) => window_ms(Some(window_seconds)),
+                        None => window_ms(Some(86_400)),
+                    };
+                    compute_token_value_spent(&series, window_ms)
+                }
+            });
 
     let total_tokens = state
         .store
@@ -1055,11 +1222,8 @@ async fn token_velocity_historic(
             samples: Vec::new(),
         });
 
-    let mut samples = derive_token_velocity_series(
-        &value_series.samples,
-        &total_series.samples,
-        window_ms,
-    );
+    let mut samples =
+        derive_token_velocity_series(&value_series.samples, &total_series.samples, window_ms);
 
     samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
     let latest = samples.last().cloned();
@@ -1141,11 +1305,7 @@ async fn load_series(
     }
 }
 
-fn filter_samples_by_range<T, F>(
-    samples: Vec<T>,
-    range: Option<(i64, i64)>,
-    timestamp: F,
-) -> Vec<T>
+fn filter_samples_by_range<T, F>(samples: Vec<T>, range: Option<(i64, i64)>, timestamp: F) -> Vec<T>
 where
     F: Fn(&T) -> i64,
 {
@@ -1196,8 +1356,7 @@ where
                 if delta_ms <= 0 {
                     continue;
                 }
-                if let Some(sample) = derive(&samples[start_idx], &samples[latest_idx], delta_ms)
-                {
+                if let Some(sample) = derive(&samples[start_idx], &samples[latest_idx], delta_ms) {
                     derived.push(sample);
                 }
             }
@@ -1295,12 +1454,7 @@ fn compute_tps(
         .saturating_sub(window.start.payload.total_transactions);
     let delta_ms = window.delta_ms;
     if delta_ms <= 0 {
-        return (
-            None,
-            Some(delta_transactions),
-            Some(delta_ms),
-            latest_total,
-        );
+        return (None, Some(delta_transactions), Some(delta_ms), latest_total);
     }
 
     let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
@@ -1401,8 +1555,7 @@ fn compute_token_value_spent(
 ) -> Option<String> {
     let window = select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms)?;
 
-    let prev_payload: TokenValueSpentPayload =
-        decode_payload(window.start, "token-value-spent")?;
+    let prev_payload: TokenValueSpentPayload = decode_payload(window.start, "token-value-spent")?;
     let latest_payload: TokenValueSpentPayload =
         decode_payload(window.latest, "token-value-spent")?;
     let prev_total = parse_amount(&prev_payload.total_amount)?;
@@ -1413,10 +1566,8 @@ fn compute_token_value_spent(
 }
 
 fn token_value_spent_from_samples(start: &MetricSample, latest: &MetricSample) -> Option<String> {
-    let prev_payload: TokenValueSpentPayload =
-        decode_payload(start, "token-value-spent")?;
-    let latest_payload: TokenValueSpentPayload =
-        decode_payload(latest, "token-value-spent")?;
+    let prev_payload: TokenValueSpentPayload = decode_payload(start, "token-value-spent")?;
+    let latest_payload: TokenValueSpentPayload = decode_payload(latest, "token-value-spent")?;
     let prev_total = parse_amount(&prev_payload.total_amount)?;
     let latest_total = parse_amount(&latest_payload.total_amount)?;
     let delta_amount = latest_total.saturating_sub(prev_total);
@@ -1433,7 +1584,6 @@ fn parse_amount(value: &str) -> Option<u128> {
         }
     }
 }
-
 
 fn select_range<'a, T>(
     samples: &'a [T],
@@ -1483,9 +1633,10 @@ fn compute_token_value_spent_range(
     from_ms: i64,
     to_ms: i64,
 ) -> Option<String> {
-    let window = select_range(&series.samples, from_ms, to_ms, |sample| sample.recorded_at_ms)?;
-    let prev_payload: TokenValueSpentPayload =
-        decode_payload(window.start, "token-value-spent")?;
+    let window = select_range(&series.samples, from_ms, to_ms, |sample| {
+        sample.recorded_at_ms
+    })?;
+    let prev_payload: TokenValueSpentPayload = decode_payload(window.start, "token-value-spent")?;
     let latest_payload: TokenValueSpentPayload =
         decode_payload(window.latest, "token-value-spent")?;
     let prev_total = parse_amount(&prev_payload.total_amount)?;
@@ -1508,7 +1659,9 @@ fn compute_total_tokens_average_range(
     from_ms: i64,
     to_ms: i64,
 ) -> Option<String> {
-    let window = select_range(&series.samples, from_ms, to_ms, |sample| sample.recorded_at_ms)?;
+    let window = select_range(&series.samples, from_ms, to_ms, |sample| {
+        sample.recorded_at_ms
+    })?;
     total_tokens_average_from_samples(window.start, window.latest)
 }
 
@@ -1517,8 +1670,7 @@ fn total_tokens_average_from_samples(
     latest: &MetricSample,
 ) -> Option<String> {
     let start_payload: TotalTokensEconomyPayload = decode_payload(start, "total-tokens-economy")?;
-    let latest_payload: TotalTokensEconomyPayload =
-        decode_payload(latest, "total-tokens-economy")?;
+    let latest_payload: TotalTokensEconomyPayload = decode_payload(latest, "total-tokens-economy")?;
     let start_total = parse_amount(&start_payload.total_amount)?;
     let latest_total = parse_amount(&latest_payload.total_amount)?;
     let sum = match start_total.checked_add(latest_total) {
@@ -1655,7 +1807,9 @@ fn map_total_transactions_series(series: MetricSeriesSnapshot) -> TotalTransacti
     }
 }
 
-fn map_failed_transactions_series(series: MetricSeriesSnapshot) -> FailedTransactionsSeriesSnapshot {
+fn map_failed_transactions_series(
+    series: MetricSeriesSnapshot,
+) -> FailedTransactionsSeriesSnapshot {
     let samples: Vec<FailedTransactionsSample> = series
         .samples
         .into_iter()
@@ -1689,7 +1843,6 @@ fn map_average_transaction_size_series(
     }
 }
 
-
 fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactionsSample> {
     let payload: TotalTransactionsPayload = decode_payload(&sample, "total-transactions")?;
 
@@ -1700,8 +1853,7 @@ fn map_total_transactions_sample(sample: MetricSample) -> Option<TotalTransactio
 }
 
 fn map_failed_transactions_sample(sample: MetricSample) -> Option<FailedTransactionsSample> {
-    let payload: FailedTransactionsPayload =
-        decode_payload(&sample, "failed-transactions-rate")?;
+    let payload: FailedTransactionsPayload = decode_payload(&sample, "failed-transactions-rate")?;
 
     Some(FailedTransactionsSample {
         recorded_at_ms: sample.recorded_at_ms,
@@ -1721,6 +1873,33 @@ fn map_average_transaction_size_sample(
     })
 }
 
+/// Response for EMA metrics endpoints (/metrics/{s5|m1|m5|m15}).
+///
+/// This matches the MockMCP Authority API specification for metrics endpoints.
+/// The EMA window affects how quickly the metrics respond to recent activity:
+/// - `s5`: 5-second window - fastest response, best for quick demos
+/// - `m1`: 1-minute window - good for short-term monitoring
+/// - `m5`: 5-minute window - balanced view for medium-term simulations
+/// - `m15`: 15-minute window - smoothest view for long-term trends
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+struct EmaMetricsResponse {
+    /// Total number of created accounts.
+    accounts: u64,
+    /// EMA of accounts that recently sent funds.
+    sending_accounts: u64,
+    /// Transactions per second using the specified EMA window.
+    #[serde(rename = "TPS")]
+    tps: f64,
+    /// EMA tokens sent per second.
+    tokens_per_second: f64,
+    /// Total disclosure events fired.
+    total_disclosure_events: u64,
+    /// Sum of all wallet balances.
+    total_tokens_in_wallets: u64,
+    /// Total transactions ever processed.
+    total_transactions: u64,
+}
 
 #[derive(Serialize, ToSchema)]
 struct HealthResponse {
@@ -1947,6 +2126,10 @@ struct TokenVelocityHistoricSample {
         average_transaction_size_historic,
         median_transaction_size,
         median_transaction_size_historic,
+        metrics_s5,
+        metrics_m1,
+        metrics_m5,
+        metrics_m15,
         token_value_spent,
         token_value_spent_historic,
         token_velocity,
@@ -1954,6 +2137,7 @@ struct TokenVelocityHistoricSample {
     ),
     components(schemas(
         HealthResponse,
+        EmaMetricsResponse,
         TotalTransactionsResponse,
         TotalTransactionsSeriesSnapshot,
         TotalTransactionsSample,
@@ -1979,7 +2163,8 @@ struct TokenVelocityHistoricSample {
     )),
     tags(
         (name = "health", description = "Service health checks"),
-        (name = "metrics", description = "Metrics endpoints")
+        (name = "metrics", description = "Metrics endpoints"),
+        (name = "ema-metrics", description = "EMA metrics endpoints (MockMCP-compatible)")
     )
 )]
 struct ApiDoc;

@@ -36,8 +36,8 @@ impl Config {
             ));
         }
 
-        let bind_addr = env::var("METRICS_API_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:13200".to_string());
+        let bind_addr =
+            env::var("METRICS_API_BIND").unwrap_or_else(|_| "0.0.0.0:13200".to_string());
         if bind_addr.trim().is_empty() {
             return Err(anyhow!("METRICS_API_BIND env var is empty"));
         }
@@ -57,9 +57,9 @@ impl Config {
                 if trimmed.is_empty() {
                     return Err(anyhow!("TSINK_RETENTION_SECONDS env var is empty"));
                 }
-                let parsed = trimmed.parse::<u64>().map_err(|_| {
-                    anyhow!("TSINK_RETENTION_SECONDS must be a positive integer")
-                })?;
+                let parsed = trimmed
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("TSINK_RETENTION_SECONDS must be a positive integer"))?;
                 if parsed == 0 {
                     return Err(anyhow!("TSINK_RETENTION_SECONDS must be > 0"));
                 }

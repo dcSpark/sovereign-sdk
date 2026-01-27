@@ -218,6 +218,12 @@ if [[ -n "${POOL_FVK_PK:-}" && -z "${MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN:-}" ]]; th
   echo "Generated MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for midnight-fvk-service private lookups."
 fi
 
+# Authority API configuration for mcp-external /authority/* endpoints
+# Uses MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for /authority/freeze and /authority/thaw endpoints
+# Set METRICS_API_URL to point to the metrics service (enables /authority/tps)
+METRICS_HOST_NORMALIZED="$(normalize_host "$METRICS_HOST")"
+export METRICS_API_URL="${METRICS_API_URL:-http://${METRICS_HOST_NORMALIZED}:${METRICS_PORT}}"
+
 PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
 PROVER_HOST="${PROVER_BIND%:*}"
 PROVER_PORT="${PROVER_BIND##*:}"

@@ -78,12 +78,12 @@ pub struct Config {
     #[serde(default)]
     pub auto_fund_gas_reserve: Option<String>,
 
-    /// Optional bearer token for the `/authority` HTTP endpoints (env: AUTHORITY_API_TOKEN, optional).
+    /// Bearer token for the `/authority` HTTP endpoints (env: MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN).
     ///
-    /// If set, POST endpoints such as `/authority/freeze` and `/authority/thaw` require
-    /// `Authorization: Bearer <token>`.
+    /// Uses the same token as the FVK service admin. If set, POST endpoints such as
+    /// `/authority/freeze` and `/authority/thaw` require `Authorization: Bearer <token>`.
     #[serde(default)]
-    pub authority_api_token: Option<String>,
+    pub midnight_fvk_service_admin_token: Option<String>,
 
     /// Optional base URL for `sov-metrics-api` (env: METRICS_API_URL, optional).
     ///
@@ -140,8 +140,8 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
-        cfg.authority_api_token = cfg
-            .authority_api_token
+        cfg.midnight_fvk_service_admin_token = cfg
+            .midnight_fvk_service_admin_token
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())

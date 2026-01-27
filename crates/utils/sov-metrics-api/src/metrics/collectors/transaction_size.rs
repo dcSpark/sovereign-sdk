@@ -50,7 +50,10 @@ impl MetricCollector for TransactionSizeCollector {
             let rows = midnight_transfer::Entity::find()
                 .filter(midnight_transfer::Column::EventId.gt(last_seen))
                 .filter(midnight_transfer::Column::Amount.is_not_null())
-                .join(JoinType::InnerJoin, midnight_transfer::Relation::Events.def())
+                .join(
+                    JoinType::InnerJoin,
+                    midnight_transfer::Relation::Events.def(),
+                )
                 .order_by_asc(midnight_transfer::Column::EventId)
                 .select_also(indexer_db::Entity)
                 .all(&self.db)
@@ -77,7 +80,10 @@ impl MetricCollector for TransactionSizeCollector {
                     None => continue,
                 };
                 if amount.parse::<u128>().is_err() {
-                    warn!(event_id = transfer.event_id, amount, "Invalid transfer amount");
+                    warn!(
+                        event_id = transfer.event_id,
+                        amount, "Invalid transfer amount"
+                    );
                     continue;
                 }
 

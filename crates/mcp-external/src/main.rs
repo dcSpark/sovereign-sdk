@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client: reqwest::Client::new(),
         provider: provider.clone(),
         admin_wallet_ctx: admin_wallet_ctx.clone(),
-        authority_api_token: cfg.authority_api_token.clone(),
+        authority_api_token: cfg.midnight_fvk_service_admin_token.clone(),
         metrics_api_url: cfg.metrics_api_url.clone(),
     };
 
@@ -211,7 +211,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/authority/freeze", post(authority_freeze_handler))
         .route("/authority/thaw", post(authority_thaw_handler))
         .route("/authority/tps", get(authority_tps_handler))
-        .route("/authority/observe", post(authority_observe_handler))
         .with_state(app_state);
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.mcp_server_bind_address).await?;
 
@@ -289,7 +288,6 @@ struct AuthorityEndpoints {
     freeze: String,
     thaw: String,
     tps: String,
-    observe: String,
 }
 
 async fn authority_index_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -301,45 +299,48 @@ async fn authority_index_handler(State(state): State<AppState>) -> impl IntoResp
             freeze: "/authority/freeze".to_string(),
             thaw: "/authority/thaw".to_string(),
             tps: "/authority/tps".to_string(),
-            observe: "/authority/observe".to_string(),
         },
         write_enabled: state.authority_api_token.is_some() && state.admin_wallet_ctx.is_some(),
     };
     (StatusCode::OK, Json(response))
 }
 
-async fn authority_observe_handler() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "`/authority/observe` is only implemented in `midnight-sim/mockmcp`."
-                .to_string(),
-        }),
-    )
+
+/// Wallet data matching MockMCP's /authority/accounts response format
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityWalletData {
+    /// Authority verification key (FVK hex)
+    authority_vfk: String,
+    /// Current balance as string
+    balance: String,
+    /// Frozen status: null if not frozen, or string with freeze reason
+    frozen: Option<String>,
+    /// Timestamp of last send transaction (ISO 8601)
+    last_send: String,
+    /// Pending balance as string
+    pending_balance: String,
+    /// Privacy address (bech32 format)
+    privacy_address: String,
+    /// Privacy spend key - always null for security (we don't expose private keys)
+    privacy_spend_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct AuthorityAccountsResponse {
-    addresses: Vec<String>,
-    count: u64,
-}
+/// Response type for /authority/accounts - array of [wallet_id, wallet_data] tuples
+/// Matches MockMCP's response format
+type AuthorityAccountsResponse = Vec<(String, AuthorityWalletData)>;
+
+/// Response type for /authority/info - array of frozen wallet addresses
+/// Matches MockMCP's response format
+type AuthorityInfoResponse = Vec<String>;
 
 async fn authority_info_handler(State(state): State<AppState>) -> impl IntoResponse {
-    authority_accounts_inner(state).await
-}
-
-async fn authority_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
-    authority_accounts_inner(state).await
-}
-
-async fn authority_accounts_inner(state: AppState) -> impl IntoResponse {
+    // /authority/info returns just the list of frozen addresses (matches MockMCP spec)
     match crate::operations::list_frozen_addresses(&state.provider).await {
         Ok(res) => {
-            let response = AuthorityAccountsResponse {
-                addresses: res.addresses.into_iter().map(|a| a.to_string()).collect(),
-                count: res.count,
-            };
-            (StatusCode::OK, Json(response)).into_response()
+            let frozen_addresses: AuthorityInfoResponse =
+                res.addresses.into_iter().map(|a| a.to_string()).collect();
+            (StatusCode::OK, Json(frozen_addresses)).into_response()
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -349,6 +350,103 @@ async fn authority_accounts_inner(state: AppState) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+async fn authority_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // /authority/accounts returns all accounts with wallet data (matches MockMCP spec)
+    authority_accounts_full(state).await
+}
+
+async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
+    // Step 1: Get all registered FVKs from the indexer
+    let fvk_registry = match state.provider.get_fvk_registry().await {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::warn!("Failed to fetch FVK registry: {}", e);
+            // Return empty array if indexer is unavailable
+            return (StatusCode::OK, Json(Vec::<(String, AuthorityWalletData)>::new())).into_response();
+        }
+    };
+
+    // Step 2: Get frozen addresses to check freeze status
+    let frozen_addresses: std::collections::HashSet<String> =
+        match crate::operations::list_frozen_addresses(&state.provider).await {
+            Ok(res) => res.addresses.into_iter().map(|a| a.to_string()).collect(),
+            Err(e) => {
+                tracing::warn!("Failed to fetch frozen addresses: {}", e);
+                std::collections::HashSet::new()
+            }
+        };
+
+    // Step 3: Build account list with balances
+    let mut accounts: AuthorityAccountsResponse = Vec::new();
+
+    for fvk_entry in fvk_registry.fvks {
+        let Some(ref privacy_address) = fvk_entry.shielded_address else {
+            // Skip FVKs without associated addresses
+            continue;
+        };
+
+        // Try to get balance for this address
+        let (balance, last_send) = match state
+            .provider
+            .get_wallet_balance(privacy_address, None, Some(&fvk_entry.fvk), Some(&fvk_entry.fvk))
+            .await
+        {
+            Ok(balance_resp) => {
+                // Find the most recent transfer (for lastSend timestamp)
+                let last_send_ts = balance_resp
+                    .unspent_notes
+                    .iter()
+                    .filter(|n| n.kind == "transfer")
+                    .map(|n| n.timestamp_ms)
+                    .max();
+
+                let last_send = match last_send_ts {
+                    Some(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| "0000-01-01T00:00:00Z".to_string()),
+                    None => "0000-01-01T00:00:00Z".to_string(),
+                };
+
+                (balance_resp.balance, last_send)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch balance for {}: {}",
+                    &privacy_address[..20.min(privacy_address.len())],
+                    e
+                );
+                ("0".to_string(), "0000-01-01T00:00:00Z".to_string())
+            }
+        };
+
+        // Check if address is frozen
+        let frozen = if frozen_addresses.contains(privacy_address) {
+            Some("Frozen by authority".to_string())
+        } else {
+            None
+        };
+
+        let wallet_data = AuthorityWalletData {
+            authority_vfk: fvk_entry.fvk,
+            balance,
+            frozen,
+            last_send,
+            pending_balance: "0".to_string(), // Not tracked in our system
+            privacy_address: privacy_address.clone(),
+            privacy_spend_key: None, // Never expose private keys
+        };
+
+        // Use wallet_address (sov1...) as the identifier if available, otherwise fall back to privacy_address
+        let wallet_id = fvk_entry
+            .wallet_address
+            .clone()
+            .unwrap_or_else(|| privacy_address.clone());
+        accounts.push((wallet_id, wallet_data));
+    }
+
+    (StatusCode::OK, Json(accounts)).into_response()
 }
 
 fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -489,7 +587,7 @@ async fn authority_set_frozen(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: "Authority write endpoints are disabled. Set AUTHORITY_API_TOKEN."
+                error: "Authority write endpoints are disabled. Set MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN."
                     .to_string(),
             }),
         )
@@ -529,6 +627,9 @@ async fn authority_set_frozen(
         }
     };
 
+    // Extract reason from body (second element of array, or "reason" field in object)
+    let reason = extract_freeze_reason(&body);
+
     let addr: midnight_privacy::PrivacyAddress = match addr_str.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -549,8 +650,27 @@ async fn authority_set_frozen(
     };
 
     match res {
-        Ok(res) => (StatusCode::OK, Json(TxHashResponse { tx_hash: res.tx_hash }))
-            .into_response(),
+        Ok(res) => {
+            // Record the freeze event in the indexer
+            let action = if freeze { "freeze" } else { "unfreeze" };
+            if let Err(e) = record_freeze_event_to_indexer(
+                &state.provider,
+                &addr_str,
+                reason.as_deref(),
+                freeze,
+                Some(&res.tx_hash),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to record {} event to indexer for {}: {}",
+                    action,
+                    &addr_str[..20.min(addr_str.len())],
+                    e
+                );
+            }
+            (StatusCode::OK, Json(TxHashResponse { tx_hash: res.tx_hash })).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse {
@@ -559,4 +679,52 @@ async fn authority_set_frozen(
         )
             .into_response(),
     }
+}
+
+fn extract_freeze_reason(body: &serde_json::Value) -> Option<String> {
+    match body {
+        serde_json::Value::Array(arr) => {
+            // Get second element as reason
+            arr.get(1).and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        serde_json::Value::Object(map) => map
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+async fn record_freeze_event_to_indexer(
+    provider: &crate::provider::Provider,
+    privacy_address: &str,
+    reason: Option<&str>,
+    is_frozen: bool,
+    tx_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    let indexer_url = provider.indexer_url();
+    let endpoint = format!("{}/frozen", indexer_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "privacy_address": privacy_address,
+        "reason": reason,
+        "is_frozen": is_frozen,
+        "tx_hash": tx_hash,
+    });
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to call indexer: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Indexer returned {}: {}", status, body);
+    }
+
+    Ok(())
 }
