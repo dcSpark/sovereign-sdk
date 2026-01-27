@@ -1001,7 +1001,7 @@ impl CryptoServer {
         };
 
         let notes_wait_ms = notes_wait_started.elapsed().as_millis();
-        tracing::info!(
+        tracing::debug!(
             notes_wait_ms,
             notes_fetch_attempts,
             notes_fetch_ms_total,
@@ -1128,7 +1128,7 @@ impl CryptoServer {
             ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
         })?;
         let transfer_ms = transfer_started.elapsed().as_millis();
-        tracing::info!(
+        tracing::debug!(
             elapsed_ms = transfer_ms,
             tx_hash = %transfer_result.tx_hash,
             "Transfer call completed"

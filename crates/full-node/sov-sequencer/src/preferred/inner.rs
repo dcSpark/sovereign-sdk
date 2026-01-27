@@ -1914,7 +1914,7 @@ where
                 message_sender,
             ) {
                 let stage1_elapsed = stage1_start.elapsed();
-                info!(
+                debug!(
                     %tx_hash,
                     stage1_ms = stage1_elapsed.as_secs_f64() * 1000.0,
                     path = "parallel",

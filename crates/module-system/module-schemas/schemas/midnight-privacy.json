@@ -73,7 +73,7 @@
       "additionalProperties": false
     },
     {
-      "description": "Transfer: Move money WITHIN the privacy pool (Shielded → Shielded).\n\nThis is the pure privacy-preserving transaction that atomically: 1. Verifies a ZK proof 2. Consumes the input note's nullifier (prevents double-spending) 3. Creates output note commitments from the proof\n\nThe proof demonstrates: - Knowledge of a note in the tree (via Merkle path) - Proper nullifier derivation - Value conservation: input_value = sum(output_values)\n\nSECURITY: anchor_root and nullifier are passed as explicit transaction fields (NOT extracted from public_output) and are validated by the guest. This prevents public-output tampering attacks.\n\n# Examples\n\n- Split 1000 → 600 + 400 (two outputs) - Consolidate multiple notes into one - Send shielded payment to another recipient",
+      "description": "Transfer: Move money WITHIN the privacy pool (Shielded → Shielded).\n\nThis is the pure privacy-preserving transaction that atomically: 1. Verifies a ZK proof 2. Consumes the input note's nullifier (prevents double-spending) 3. Creates output note commitments from the proof\n\nThe proof demonstrates: - Knowledge of a note in the tree (via Merkle path) - Proper nullifier derivation - Value conservation: input_value = sum(output_values)\n\nSECURITY: anchor_root and nullifiers are passed as explicit transaction fields (NOT extracted from public_output) and are validated by the guest. This prevents public-output tampering attacks.\n\n# Examples\n\n- Split 1000 → 600 + 400 (two outputs) - Consolidate multiple notes into one - Send shielded payment to another recipient",
       "type": "object",
       "required": [
         "transfer"
@@ -83,7 +83,7 @@
           "type": "object",
           "required": [
             "anchor_root",
-            "nullifier",
+            "nullifiers",
             "proof"
           ],
           "properties": {
@@ -109,16 +109,19 @@
                 }
               ]
             },
-            "nullifier": {
-              "description": "Nullifier that the proof derives (must be fresh)",
+            "nullifiers": {
+              "description": "Nullifiers that the proof derives (1..=4; all must be fresh)",
               "type": "array",
               "items": {
-                "type": "integer",
-                "format": "uint8",
-                "minimum": 0.0
-              },
-              "maxItems": 32,
-              "minItems": 32
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0.0
+                },
+                "maxItems": 32,
+                "minItems": 32
+              }
             },
             "proof": {
               "description": "Serialized Ligero proof package (bincode-encoded) Note: Ligero proofs are currently ~8MB in size",
