@@ -177,14 +177,6 @@ if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
   MCP_PORT="3000"
 fi
 
-MCP_2_BIND="${MCP_SERVER_BIND_ADDRESS_2:-0.0.0.0:3001}"
-MCP_2_HOST="${MCP_2_BIND%:*}"
-MCP_2_PORT="${MCP_2_BIND##*:}"
-if [[ "$MCP_2_HOST" == "$MCP_2_PORT" ]]; then
-  MCP_2_HOST="$MCP_2_BIND"
-  MCP_2_PORT="3001"
-fi
-
 METRICS_BIND="${METRICS_API_BIND:-0.0.0.0:13200}"
 METRICS_HOST="${METRICS_BIND%:*}"
 METRICS_PORT="${METRICS_BIND##*:}"
@@ -264,10 +256,6 @@ wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "$LAST_PID"
 echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
 wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
-
-echo "Starting mcp-2..."
-start_service "mcp-2" bash "$SCRIPT_DIR/run_mcp_2.sh"
-wait_for_port "mcp-2" "$MCP_2_HOST" "$MCP_2_PORT" "$LAST_PID"
 
 echo "Starting prover..."
 start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"

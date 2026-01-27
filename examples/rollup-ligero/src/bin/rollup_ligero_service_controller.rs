@@ -762,13 +762,6 @@ async fn health_check(
             optional_env: None,
         },
         ServiceDefinition {
-            name: "mcp-2",
-            env_var: "MCP_SERVER_BIND_ADDRESS_2",
-            default_url: "http://127.0.0.1:3001",
-            health_path: "/health", // MCP may not have health, we'll do TCP check
-            optional_env: None,
-        },
-        ServiceDefinition {
             name: "ligero-proving-system",
             env_var: "PROVER_BIND_ADDR",
             default_url: "http://127.0.0.1:1313",
