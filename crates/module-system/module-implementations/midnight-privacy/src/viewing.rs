@@ -101,14 +101,18 @@ fn encode_note_bytes(note: &Note) -> Result<Vec<u8>> {
     Ok(pt)
 }
 
-/// Deterministic serialization of a Note plaintext with sender_id (transfer format):
-/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) ] => 144 bytes
-fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Result<Vec<u8>> {
+/// Deterministic serialization of a Note plaintext with sender_id and input commitments:
+/// [ domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) | cm_ins[4](128) ] => 272 bytes
+fn encode_note_bytes_with_sender_and_ins(
+    note: &Note,
+    sender_id: &Hash32,
+    cm_ins: &[Hash32; 4],
+) -> Result<Vec<u8>> {
     let value_u64: u64 = note
         .value
         .try_into()
         .map_err(|_| anyhow!("note value does not fit into u64 (required by NOTE_V2 encoding)"))?;
-    let mut pt = Vec::with_capacity(144);
+    let mut pt = Vec::with_capacity(144 + 32 * cm_ins.len());
     pt.extend_from_slice(&note.domain);
     // Encode as 16-byte LE, zero-extended from u64.
     pt.extend_from_slice(&value_u64.to_le_bytes());
@@ -116,6 +120,9 @@ fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Result<Vec<
     pt.extend_from_slice(&note.rho);
     pt.extend_from_slice(&note.recipient);
     pt.extend_from_slice(sender_id);
+    for cm in cm_ins {
+        pt.extend_from_slice(cm);
+    }
     Ok(pt)
 }
 
@@ -123,13 +130,14 @@ fn encode_note_bytes_with_sender(note: &Note, sender_id: &Hash32) -> Result<Vec<
 ///
 /// Supports two formats:
 /// - 112 bytes: Deposit notes [domain(32) | value(16) | rho(32) | recipient(32)]
-/// - 144 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
+/// - 144 bytes: Legacy spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32)]
+/// - 272 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32) | cm_ins[4](128)]
 ///
 /// For 144-byte format, sender_id is ignored when returning Note (use decode_note_with_sender for full data).
 fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
-    if pt.len() != 112 && pt.len() != 144 {
+    if pt.len() != 112 && pt.len() != 144 && pt.len() != 272 {
         return Err(anyhow!(
-            "invalid note plaintext length: {} (expected 112 or 144)",
+            "invalid note plaintext length: {} (expected 112, 144, or 272)",
             pt.len()
         ));
     }
@@ -152,17 +160,17 @@ fn decode_note_bytes(pt: &[u8]) -> Result<Note> {
 
 /// Deserialize Note from plaintext, including optional sender_id.
 ///
-/// Returns (Note, Option<sender_id>) where sender_id is present for 144-byte spend outputs.
+/// Returns (Note, Option<sender_id>) where sender_id is present for spend outputs.
 pub fn decode_note_with_sender(pt: &[u8]) -> Result<(Note, Option<Hash32>)> {
-    if pt.len() != 112 && pt.len() != 144 {
+    if pt.len() != 112 && pt.len() != 144 && pt.len() != 272 {
         return Err(anyhow!(
-            "invalid note plaintext length: {} (expected 112 or 144)",
+            "invalid note plaintext length: {} (expected 112, 144, or 272)",
             pt.len()
         ));
     }
     let note = decode_note_bytes(pt)?;
 
-    let sender_id = if pt.len() == 144 {
+    let sender_id = if pt.len() == 144 || pt.len() == 272 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(sender)
@@ -233,27 +241,29 @@ pub fn encrypt_note_for_fvk_level_b(
 /// Encrypt a `Note` with sender_id for a given `cm` using the FVK (Level B - transfer format).
 ///
 /// This is used for transfer/withdraw outputs where sender_id is required.
-/// The plaintext is 144 bytes: [domain | value | rho | recipient | sender_id]
+/// The plaintext is 272 bytes: [domain | value | rho | recipient | sender_id | cm_ins[4]]
 ///
 /// # Arguments
 /// * `fvk` - The Full Viewing Key
 /// * `note` - The note to encrypt
 /// * `sender_id` - The sender's address (spender's recipient address)
+/// * `cm_ins` - Commitments of notes spent to create this tx (padded)
 /// * `cm` - The note commitment
 ///
 /// # Returns
-/// EncryptedNote with 144-byte ciphertext containing sender_id
+/// EncryptedNote with 272-byte ciphertext containing sender_id and cm_ins
 pub fn encrypt_note_for_fvk_with_sender(
     fvk: &FullViewingKey,
     note: &Note,
     sender_id: &Hash32,
+    cm_ins: &[Hash32; 4],
     cm: &Hash32,
 ) -> Result<EncryptedNote> {
     let fvk_c = fvk_commitment(fvk);
     let k = view_kdf(fvk, cm);
 
-    // Serialize Note with sender_id (144 bytes)
-    let pt = encode_note_bytes_with_sender(note, sender_id)?;
+    // Serialize Note with sender_id and cm_ins (272 bytes)
+    let pt = encode_note_bytes_with_sender_and_ins(note, sender_id, cm_ins)?;
 
     // Encrypt with Poseidon2-stream XOR
     let ct_vec = stream_xor_encrypt(&k, &pt);

@@ -185,12 +185,12 @@ if [[ "$MCP_HOST" == "$MCP_PORT" ]]; then
   MCP_PORT="3000"
 fi
 
-MCP_2_BIND="${MCP_SERVER_BIND_ADDRESS_2:-0.0.0.0:3001}"
-MCP_2_HOST="${MCP_2_BIND%:*}"
-MCP_2_PORT="${MCP_2_BIND##*:}"
-if [[ "$MCP_2_HOST" == "$MCP_2_PORT" ]]; then
-  MCP_2_HOST="$MCP_2_BIND"
-  MCP_2_PORT="3001"
+METRICS_BIND="${METRICS_API_BIND:-0.0.0.0:13200}"
+METRICS_HOST="${METRICS_BIND%:*}"
+METRICS_PORT="${METRICS_BIND##*:}"
+if [[ "$METRICS_HOST" == "$METRICS_PORT" ]]; then
+  METRICS_HOST="$METRICS_BIND"
+  METRICS_PORT="13200"
 fi
 
 FVK_BIND="${MIDNIGHT_FVK_SERVICE_BIND:-}"
@@ -225,6 +225,12 @@ if [[ -n "${POOL_FVK_PK:-}" && -z "${MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN:-}" ]]; th
   fi
   echo "Generated MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for midnight-fvk-service private lookups."
 fi
+
+# Authority API configuration for mcp-external /authority/* endpoints
+# Uses MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for /authority/freeze and /authority/thaw endpoints
+# Set METRICS_API_URL to point to the metrics service (enables /authority/tps)
+METRICS_HOST_NORMALIZED="$(normalize_host "$METRICS_HOST")"
+export METRICS_API_URL="${METRICS_API_URL:-http://${METRICS_HOST_NORMALIZED}:${METRICS_PORT}}"
 
 PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
 PROVER_HOST="${PROVER_BIND%:*}"
@@ -269,13 +275,13 @@ echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
 wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
 
-echo "Starting mcp-2..."
-start_service "mcp-2" bash "$SCRIPT_DIR/run_mcp_2.sh"
-wait_for_port "mcp-2" "$MCP_2_HOST" "$MCP_2_PORT" "$LAST_PID"
-
 echo "Starting prover..."
 start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
-wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "${PIDS[4]}"
+wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "$LAST_PID"
+
+echo "Starting metrics..."
+start_service "metrics" bash "$SCRIPT_DIR/run_metrics.sh"
+wait_for_port "metrics" "$METRICS_HOST" "$METRICS_PORT" "$LAST_PID"
 
 echo ""
 echo "All services started. Press Ctrl+C to stop."

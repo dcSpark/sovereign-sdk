@@ -334,7 +334,7 @@ impl Provider {
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<InvolvementItem>> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/txs/{}", base_url, tx_hash);
+        let url = format!("{}/transactions/{}", base_url, tx_hash);
 
         tracing::debug!("Fetching transaction details from indexer: {}", url);
 
@@ -397,7 +397,6 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
-    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -407,7 +406,7 @@ impl Provider {
     /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
     /// let transactions = provider
-    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .get_wallet_transactions(address, None, None, None)
     ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
@@ -419,11 +418,10 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
-        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/wallets/{}", base_url, address);
+        let mut url = format!("{}/transactions/wallet/{}/god", base_url, address);
 
         // Build query parameters
         let mut query_params = Vec::new();
@@ -444,11 +442,9 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let mut request = self.http_client.post(&url);
-        if let Some(vfk) = vfk {
-            request = request.json(&serde_json::json!({ "vfk": vfk }));
-        }
-        let response = request
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
@@ -480,7 +476,7 @@ impl Provider {
     ///
     /// # Parameters
     /// * `limit` - Optional limit on number of transactions per page (default: 100)
-    /// * `offset` - Optional offset for pagination (default: 0)
+    /// * `cursor` - Optional pagination cursor (from `next` in the previous response)
     ///
     /// # Returns
     /// A list of all transactions from the indexer
@@ -488,7 +484,7 @@ impl Provider {
     /// # Example
     /// ```rust,no_run
     /// # async fn example(provider: &mcp::provider::Provider) -> anyhow::Result<()> {
-    /// let transactions = provider.get_all_transactions(Some(100), Some(0)).await?;
+    /// let transactions = provider.get_all_transactions(Some(100), None).await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
     /// # }
@@ -496,19 +492,19 @@ impl Provider {
     pub async fn get_all_transactions(
         &self,
         limit: Option<usize>,
-        offset: Option<usize>,
+        cursor: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/txs", base_url);
+        let mut url = format!("{}/transactions/god", base_url);
 
         // Build query parameters
         let mut query_params = Vec::new();
         if let Some(limit) = limit {
             query_params.push(format!("limit={}", limit));
         }
-        if let Some(offset) = offset {
-            query_params.push(format!("offset={}", offset));
+        if let Some(cursor) = cursor {
+            query_params.push(format!("cursor={}", cursor));
         }
 
         if !query_params.is_empty() {
@@ -537,9 +533,9 @@ impl Provider {
             .context("Failed to parse transactions list from indexer")?;
 
         tracing::debug!(
-            "Fetched {} transactions from indexer (offset: {:?}, limit: {:?})",
+            "Fetched {} transactions from indexer (cursor: {:?}, limit: {:?})",
             tx_list.items.len(),
-            offset,
+            cursor,
             limit
         );
 

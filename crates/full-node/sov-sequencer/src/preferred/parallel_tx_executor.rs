@@ -372,7 +372,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                             // Increment active workers counter to track concurrency
                             let active_count = ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst) + 1;
 
-                            tracing::info!(
+                            tracing::debug!(
                                 worker_id,
                                 tx_hash = %request.tx_hash,
                                 active_workers = active_count,
@@ -402,7 +402,7 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                         });
                                     });
 
-                                    tracing::info!(
+                                    tracing::debug!(
                                         worker_id,
                                         tx_hash = %request.tx_hash,
                                         elapsed_ms = format!("{:.2}", elapsed.as_secs_f64() * 1000.0),

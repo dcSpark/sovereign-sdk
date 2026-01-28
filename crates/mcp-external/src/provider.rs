@@ -25,6 +25,13 @@ pub struct ChainData {
     pub chain_name: String,
 }
 
+/// Result from the verifier submission endpoint.
+#[derive(Debug, Clone)]
+pub struct VerifierSubmitResult {
+    pub tx_hash: String,
+    pub created_at: i64,
+}
+
 /// Transaction involvement item from the indexer
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct InvolvementItem {
@@ -219,13 +226,6 @@ impl Provider {
             .context("Failed to get balance from rollup")
     }
 
-    pub async fn wait_for_tx_processing(&self, tx_hash: &types::TxHash) -> Result<()> {
-        self.client
-            .wait_for_tx_processing(tx_hash)
-            .await
-            .context("Failed to wait for transaction processing")
-    }
-
     pub async fn get_gas_token_id(&self) -> Result<TokenId> {
         #[derive(Deserialize)]
         struct TokenIdResponse {
@@ -238,6 +238,33 @@ impl Provider {
             .context("Failed to fetch gas token id from rollup")?;
 
         Ok(response.token_id)
+    }
+
+    /// Get transaction details from the sequencer by tx hash.
+    pub async fn get_sequencer_tx(&self, tx_hash: &str) -> Result<Option<types::ApiAcceptedTx>> {
+        let parsed: types::TxHash = tx_hash
+            .parse()
+            .with_context(|| format!("Failed to parse tx hash '{}'", tx_hash))?;
+
+        match self.client.client.sequencer_get_tx(&parsed).await {
+            Ok(tx_info) => Ok(Some(tx_info.into_inner())),
+            Err(sov_api_spec::Error::ErrorResponse(response)) => {
+                if response.status().as_u16() == 404 {
+                    Ok(None)
+                } else {
+                    let status = response.status();
+                    let error = response.into_inner();
+                    anyhow::bail!(
+                        "Sequencer returned error status {}: {}",
+                        status,
+                        error.message
+                    );
+                }
+            }
+            Err(err) => Err(anyhow::anyhow!(
+                "Failed to fetch tx details from sequencer: {err}"
+            )),
+        }
     }
 
     /// Submit a raw transaction to the rollup sequencer
@@ -262,8 +289,8 @@ impl Provider {
     ///
     /// This method submits a borsh-serialized transaction to the verifier service,
     /// which will verify the proof and then submit to the sequencer.
-    /// Returns the transaction hash from the verifier response.
-    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+    /// Returns the transaction hash (and optional createdAt) from the verifier response.
+    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<VerifierSubmitResult> {
         use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
         use base64::Engine as _;
 
@@ -272,7 +299,7 @@ impl Provider {
         let base_url = self.verifier_url.trim_end_matches('/');
         let endpoint = format!("{}/midnight-privacy", base_url);
 
-        tracing::info!("Submitting transaction to verifier service at {}", endpoint);
+        tracing::debug!("Submitting transaction to verifier service at {}", endpoint);
         tracing::debug!(
             "Transaction size: {} bytes, base64 size: {} bytes",
             raw_tx.len(),
@@ -308,10 +335,18 @@ impl Provider {
             .await
             .context("Failed to read verifier response")?;
 
-        #[derive(serde::Deserialize)]
+        #[derive(Deserialize)]
+        struct VerifierMetrics {
+            #[serde(rename = "createdAt")]
+            created_at: String,
+        }
+
+        #[derive(Deserialize)]
         struct VerifierResponse {
             success: bool,
+            #[serde(rename = "tx_hash", alias = "id")]
             tx_hash: Option<String>,
+            metrics: VerifierMetrics,
             error: Option<String>,
         }
 
@@ -319,21 +354,22 @@ impl Provider {
             serde_json::from_str(&body).context("Failed to parse verifier response")?;
 
         if !verifier_resp.success {
-            anyhow::bail!(
-                "Verifier service reported failure: {}",
-                verifier_resp
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string())
-            );
+            let error = verifier_resp.error.as_deref().unwrap_or("Unknown error");
+            anyhow::bail!("Verifier service reported failure: {}", error);
         }
 
         let tx_hash = verifier_resp
             .tx_hash
             .ok_or_else(|| anyhow::anyhow!("Verifier response missing tx_hash"))?;
+        let created_at = parse_rfc3339_to_millis(&verifier_resp.metrics.created_at)
+            .ok_or_else(|| anyhow::anyhow!("Verifier response missing metrics.createdAt"))?;
 
-        tracing::info!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
+        tracing::debug!("Transaction submitted via verifier, tx_hash: {}", tx_hash);
 
-        Ok(tx_hash)
+        Ok(VerifierSubmitResult {
+            tx_hash: tx_hash.to_string(),
+            created_at,
+        })
     }
 
     /// Get the RPC URL this provider is connected to
@@ -384,7 +420,7 @@ impl Provider {
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<InvolvementItem>> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let url = format!("{}/txs/{}", base_url, tx_hash);
+        let url = format!("{}/transactions/{}", base_url, tx_hash);
 
         tracing::debug!("Fetching transaction details from indexer: {}", url);
 
@@ -447,7 +483,6 @@ impl Provider {
     /// * `limit` - Optional limit on the number of transactions to return (default: 50, max: 200)
     /// * `cursor` - Optional cursor for pagination
     /// * `tx_type` - Optional transaction type filter (e.g., "deposit", "withdraw")
-    /// * `vfk` - Optional viewing key to return decrypted notes
     ///
     /// # Returns
     /// A list of transactions with their details
@@ -457,7 +492,7 @@ impl Provider {
     /// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
     /// let address = "0x1234...";
     /// let transactions = provider
-    ///     .get_wallet_transactions(address, None, None, None, None)
+    ///     .get_wallet_transactions(address, None, None, None)
     ///     .await?;
     /// println!("Found {} transactions", transactions.items.len());
     /// # Ok(())
@@ -469,11 +504,10 @@ impl Provider {
         limit: Option<usize>,
         cursor: Option<&str>,
         tx_type: Option<&str>,
-        vfk: Option<&str>,
     ) -> Result<ListTransactionsResponse> {
         // Trim trailing slash from indexer_url to avoid double slashes
         let base_url = self.indexer_url.trim_end_matches('/');
-        let mut url = format!("{}/wallets/{}", base_url, address);
+        let mut url = format!("{}/transactions/wallet/{}/god", base_url, address);
 
         // Build query parameters
         let mut query_params = Vec::new();
@@ -494,11 +528,9 @@ impl Provider {
 
         tracing::debug!("Fetching transactions from indexer: {}", url);
 
-        let mut request = self.http_client.post(&url);
-        if let Some(vfk) = vfk {
-            request = request.json(&serde_json::json!({ "vfk": vfk }));
-        }
-        let response = request
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| format!("Failed to fetch transactions from indexer at {}", url))?;
@@ -618,5 +650,76 @@ impl Provider {
         );
 
         Ok(balance_response)
+    }
+}
+
+fn parse_rfc3339_to_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// FVK entry from the indexer's FVK registry
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct FvkEntry {
+    /// FVK commitment (unique identifier)
+    pub fvk_commitment: String,
+    /// Full Viewing Key (hex encoded)
+    pub fvk: String,
+    /// Associated shielded address (optional, bech32m privpool1...)
+    #[serde(default)]
+    pub shielded_address: Option<String>,
+    /// Associated public wallet address (optional, sov1...)
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+}
+
+/// Response from the indexer's FVK list endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct FvkListResponse {
+    pub count: usize,
+    pub fvks: Vec<FvkEntry>,
+}
+
+impl Provider {
+    /// Get all registered FVKs from the indexer
+    ///
+    /// This queries the indexer's `/fvks` endpoint to retrieve all registered
+    /// Full Viewing Keys and their associated shielded addresses.
+    pub async fn get_fvk_registry(&self) -> Result<FvkListResponse> {
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/fvks", base_url);
+
+        tracing::debug!("Fetching FVK registry from indexer: {}", url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch FVK registry from indexer at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer FVK registry API error at {}: HTTP {} - {}",
+                url,
+                status,
+                if body.is_empty() {
+                    "No error details provided"
+                } else {
+                    &body
+                }
+            );
+        }
+
+        let fvk_list: FvkListResponse = response.json().await.with_context(|| {
+            format!("Failed to parse FVK registry JSON from indexer at {}", url)
+        })?;
+
+        tracing::debug!("Fetched {} FVKs from indexer", fvk_list.count);
+
+        Ok(fvk_list)
     }
 }

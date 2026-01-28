@@ -232,9 +232,14 @@ impl ContinuousConfig {
 struct WalletState {
     account: PrivateKeyAndAddress<DemoRollupSpec>,
     nonce: u64,
+    spend_sk: Hash32,
+    notes: Vec<NoteState>,
+}
+
+#[derive(Clone, Debug)]
+struct NoteState {
     value: u128,
     rho: Hash32,
-    spend_sk: Hash32,
     sender_id: Hash32,
 }
 
@@ -767,10 +772,8 @@ pub async fn run() -> Result<()> {
         wallets.push(WalletState {
             account,
             nonce,
-            value: 0,
-            rho: [0u8; 32],
             spend_sk: [0u8; 32],
-            sender_id: [0u8; 32],
+            notes: Vec::new(),
         });
     }
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
@@ -1183,12 +1186,13 @@ async fn perform_initial_deposits(
         }
 
         wallet.nonce += 1;
-        wallet.value = amount;
-        wallet.rho = rho;
         wallet.spend_sk = spend_sk;
         // Deposit convention: sender_id == recipient.
-        let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
-        wallet.sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
+        wallet.notes = vec![NoteState {
+            value: amount,
+            rho,
+            sender_id: recipient,
+        }];
 
         if per_tx_delay_ms > 0 {
             sleep(Duration::from_millis(per_tx_delay_ms)).await;
@@ -1218,22 +1222,17 @@ async fn perform_initial_deposits(
     const DEPOSIT_SYNC_TIMEOUT_SECS: u64 = 60;
     const DEPOSIT_SYNC_POLL_MS: u64 = 100;
 
-    let mut expected_commitments: Vec<[u8; 32]> = Vec::with_capacity(wallets.len());
+    let mut expected_commitments: Vec<[u8; 32]> = Vec::new();
     for wallet in wallets.iter() {
-        let value_u64: u64 = wallet
-            .value
-            .try_into()
-            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
         let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
-        let cm = note_commitment(
-            &DOMAIN,
-            value_u64,
-            &wallet.rho,
-            &recipient,
-            &wallet.sender_id,
-        );
-        expected_commitments.push(cm);
+        for note in wallet.notes.iter() {
+            let value_u64: u64 = note.value.try_into().context(
+                "wallet note value does not fit into u64 (required by note_spend_guest v2)",
+            )?;
+            let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
+            expected_commitments.push(cm);
+        }
     }
 
     if !expected_commitments.is_empty() {
@@ -1500,51 +1499,97 @@ async fn perform_transfer_cycle(
     let anchor_root: Hash32 = mt.root();
 
     #[derive(Clone)]
-    struct TransferInput {
-        wallet_idx: usize,
+    struct InputNotePlan {
         value: u128,
         rho: Hash32,
-        spend_sk: Hash32,
         sender_id: Hash32,
+        cm: Hash32,
         position: u64,
+        siblings: Vec<Hash32>,
     }
 
-    let mut inputs: Vec<TransferInput> = Vec::new();
+    #[derive(Clone)]
+    struct TransferPlan {
+        sender_idx: usize,
+        dest_idx: usize,
+        spend_sk: Hash32,
+        inputs: Vec<InputNotePlan>,
+    }
+
+    let transfer_amount = config.transfer_amount;
+    let mut plans: Vec<TransferPlan> = Vec::new();
     for (idx, wallet) in wallets.iter().enumerate() {
-        if wallet.value == 0 {
+        if wallet.notes.is_empty() {
             continue;
         }
-        let value_u64: u64 = wallet
-            .value
-            .try_into()
-            .context("wallet note value does not fit into u64 (required by note_spend_guest v2)")?;
+
+        // Select up to 4 notes, largest-first (UTXO consolidation), matching the tx-generator policy.
+        let mut selected: Vec<&NoteState> = wallet.notes.iter().collect();
+        selected.sort_by(|a, b| b.value.cmp(&a.value).then(b.rho.cmp(&a.rho)));
+        selected.truncate(crate::viewer::MAX_INS);
+
+        let total_in: u128 = selected.iter().map(|n| n.value).sum();
+        if total_in < transfer_amount {
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] wallet {}: insufficient funds within {} inputs (need {}, have {}); skipping",
+                    idx,
+                    crate::viewer::MAX_INS,
+                    transfer_amount,
+                    total_in
+                );
+            }
+            continue;
+        }
+
+        // Send to the next wallet (ring) to accumulate multiple notes per wallet over time.
+        let dest_idx = if wallets.len() > 1 {
+            (idx + 1) % wallets.len()
+        } else {
+            idx
+        };
+
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
         let recipient = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk);
-        let cm = note_commitment(
-            &DOMAIN,
-            value_u64,
-            &wallet.rho,
-            &recipient,
-            &wallet.sender_id,
-        );
-        let mut position = pos_by_cm.get(&cm).copied();
 
-        if position.is_none() {
+        // Resolve positions (and open Merkle paths) for all selected inputs.
+        let mut cms: Vec<Hash32> = Vec::with_capacity(selected.len());
+        for note in selected.iter() {
+            let value_u64: u64 = note.value.try_into().context(
+                "wallet note value does not fit into u64 (required by note_spend_guest v2)",
+            )?;
+            let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
+            cms.push(cm);
+        }
+
+        let mut positions: Vec<Option<u64>> =
+            cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+        if positions.iter().any(|p| p.is_none()) {
             // Retry with fresh note fetches and small waits; useful when the tree has just advanced.
             for _attempt in 0..MISSING_NOTE_RETRY_MAX {
                 sleep(Duration::from_millis(MISSING_NOTE_RETRY_DELAY_MS)).await;
                 pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
-                position = pos_by_cm.get(&cm).copied();
-                if position.is_some() {
+                positions = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+                if positions.iter().all(|p| p.is_some()) {
                     break;
                 }
             }
         }
 
-        if let Some(position) = position {
-            // Verify the tree actually has the expected commitment at this position
+        if positions.iter().any(|p| p.is_none()) {
+            eprintln!(
+                "[cycle] wallet {}: some input commitments not yet in tree; skipping this cycle",
+                idx
+            );
+            continue;
+        }
+
+        let mut inputs: Vec<InputNotePlan> = Vec::with_capacity(selected.len());
+        let mut tree_mismatch = false;
+        for ((note, cm), pos_opt) in selected.iter().zip(cms.iter()).zip(positions.into_iter()) {
+            let position = pos_opt.expect("checked above");
             let tree_leaf = mt.leaf(position as usize);
-            if tree_leaf != cm {
+            if tree_leaf != *cm {
                 eprintln!(
                     "[cycle] wallet {}: TREE MISMATCH! position={} expected_cm={} tree_leaf={}",
                     idx,
@@ -1552,33 +1597,32 @@ async fn perform_transfer_cycle(
                     hex::encode(&cm[..8]),
                     hex::encode(&tree_leaf[..8])
                 );
-                eprintln!(
-                    "        wallet values: value={} rho={} spend_sk={} sender_id={}",
-                    wallet.value,
-                    hex::encode(&wallet.rho[..8]),
-                    hex::encode(&wallet.spend_sk[..8]),
-                    hex::encode(&wallet.sender_id[..8])
-                );
-                // Skip this wallet - the tree state is inconsistent
-                continue;
+                tree_mismatch = true;
+                break;
             }
-            inputs.push(TransferInput {
-                wallet_idx: idx,
-                value: wallet.value,
-                rho: wallet.rho,
-                spend_sk: wallet.spend_sk,
-                sender_id: wallet.sender_id,
+            let siblings = mt.open(position as usize);
+            inputs.push(InputNotePlan {
+                value: note.value,
+                rho: note.rho,
+                sender_id: note.sender_id,
+                cm: *cm,
                 position,
+                siblings,
             });
-        } else {
-            eprintln!(
-                "[cycle] wallet {}: note commitment not yet in tree; skipping this cycle",
-                idx
-            );
         }
+        if tree_mismatch {
+            continue;
+        }
+
+        plans.push(TransferPlan {
+            sender_idx: idx,
+            dest_idx,
+            spend_sk: wallet.spend_sk,
+            inputs,
+        });
     }
 
-    if inputs.is_empty() {
+    if plans.is_empty() {
         *cached_tree = Some(mt);
         *cached_next_position = cached_next_pos;
         *cached_root = cached_root_val;
@@ -1602,7 +1646,7 @@ async fn perform_transfer_cycle(
 
     eprintln!(
         "[cycle] Building proofs for {} wallets (max_concurrent_proofs={})",
-        inputs.len(),
+        plans.len(),
         config.max_concurrent_proofs
     );
     let proof_generation_start = Instant::now();
@@ -1612,12 +1656,16 @@ async fn perform_transfer_cycle(
     /// Result from proof generation task containing note secrets for wallet update.
     #[derive(Clone)]
     struct ProofResult {
-        account_idx: usize,
+        sender_idx: usize,
+        dest_idx: usize,
         proof_data: Vec<u8>,
-        /// Pay note: fresh recipient address
+        nullifiers: Vec<Hash32>,
+        input_cms: Vec<Hash32>,
+        spent_rhos: Vec<Hash32>,
+        sender_id_out: Hash32,
+        /// Pay note: sent to `dest_idx`
         pay_value: u128,
         pay_rho: Hash32,
-        pay_spend_sk: Hash32,
         /// Change note (if any): same owner as input, fresh rho
         change_value: u128,
         change_rho: Option<Hash32>,
@@ -1625,19 +1673,17 @@ async fn perform_transfer_cycle(
 
     let depth_usize = TREE_DEPTH as usize;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_proofs));
-    let mut proof_tasks = Vec::with_capacity(inputs.len());
+    let mut proof_tasks = Vec::with_capacity(plans.len());
 
     let viewer_bundles = viewer_bundles.clone();
     let prover_service_url = config.prover_service_url.clone();
     let transfer_amount = config.transfer_amount;
-    for input in inputs.iter() {
-        let account_idx = input.wallet_idx;
-        let value = input.value;
-        let in_rho = input.rho;
-        let in_spend_sk = input.spend_sk;
-        let in_sender_id = input.sender_id;
-        let position = input.position;
-        let siblings = mt.open(position as usize);
+    for plan in plans.iter() {
+        let sender_idx = plan.sender_idx;
+        let dest_idx = plan.dest_idx;
+        let in_spend_sk = plan.spend_sk;
+        let input_notes = plan.inputs.clone();
+        let dest_spend_sk = wallets[dest_idx].spend_sk;
         let anchor = anchor_root;
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
@@ -1649,8 +1695,16 @@ async fn perform_transfer_cycle(
             let _permit = sem.acquire().await.expect("semaphore closed");
 
             // Calculate pay and change amounts
-            let pay_value = transfer_amount.min(value);
-            let change_value = value.saturating_sub(pay_value);
+            let total_in: u128 = input_notes.iter().map(|n| n.value).sum();
+            anyhow::ensure!(
+                total_in >= transfer_amount,
+                "wallet {}: insufficient funds (need {}, have {})",
+                sender_idx,
+                transfer_amount,
+                total_in
+            );
+            let pay_value = transfer_amount;
+            let change_value = total_in - pay_value;
             let has_change = change_value > 0;
 
             // Fetch deny-map openings (sender + pay recipient + change recipient if needed).
@@ -1663,11 +1717,10 @@ async fn perform_transfer_cycle(
             let pk_spend_owner = pk_from_sk(&in_spend_sk);
             let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
 
-            // Pay output note parameters (fresh recipient address)
+            // Pay output note parameters (destination wallet)
             let pay_rho: Hash32 = rand::thread_rng().gen();
-            let pay_spend_sk: Hash32 = rand::thread_rng().gen();
-            let pay_pk_spend = pk_from_sk(&pay_spend_sk);
-            let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &pay_spend_sk);
+            let pay_pk_spend = pk_from_sk(&dest_spend_sk);
+            let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &dest_spend_sk);
             let pay_addr = PrivacyAddress::from_keys(&pay_pk_spend, &pay_pk_ivk);
 
             // Change output note parameters (same owner as input, fresh rho)
@@ -1731,9 +1784,9 @@ async fn perform_transfer_cycle(
             tokio::task::spawn_blocking(
                 move || -> anyhow::Result<ProofResult> {
                     let (viewer_fvk, pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
-                        let b = bundles.get(account_idx).ok_or_else(|| {
+                        let b = bundles.get(sender_idx).ok_or_else(|| {
                             anyhow!(
-                                "missing viewer bundle for wallet {account_idx} (have {} bundles)",
+                                "missing viewer bundle for wallet {sender_idx} (have {} bundles)",
                                 bundles.len()
                             )
                         })?;
@@ -1741,64 +1794,123 @@ async fn perform_transfer_cycle(
                     } else {
                         (None, None)
                     };
+                    let n_in = input_notes.len();
+                    anyhow::ensure!(n_in > 0, "n_in must be > 0");
+                    anyhow::ensure!(
+                        n_in <= crate::viewer::MAX_INS,
+                        "n_in must be <= {}",
+                        crate::viewer::MAX_INS
+                    );
 
-                let value_u64: u64 = value
-                    .try_into()
-                    .context("note value does not fit into u64 (required by note_spend_guest v2)")?;
-                if value_u64 > i64::MAX as u64 {
-                    bail!("note value does not fit into i64 (required by note_spend_guest v2 ABI)");
-                }
-                let pay_value_u64: u64 = pay_value
-                    .try_into()
-                    .context("pay value does not fit into u64")?;
-                let change_value_u64: u64 = change_value
-                    .try_into()
-                    .context("change value does not fit into u64")?;
+                    let mut in_values_u64: Vec<u64> = Vec::with_capacity(n_in);
+                    let mut in_rhos: Vec<Hash32> = Vec::with_capacity(n_in);
+                    let mut in_sender_ids: Vec<Hash32> = Vec::with_capacity(n_in);
+                    let mut positions: Vec<u64> = Vec::with_capacity(n_in);
+                    let mut siblings_by_input: Vec<Vec<Hash32>> = Vec::with_capacity(n_in);
+                    let mut input_cms: Vec<Hash32> = Vec::with_capacity(n_in);
+                    let mut spent_rhos: Vec<Hash32> = Vec::with_capacity(n_in);
 
-                // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
-                let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
-                let sender_id_out = in_recipient;
-
-                // Pay output note (goes to fresh recipient)
-                let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
-                let cm_pay = note_commitment(&DOMAIN, pay_value_u64, &pay_rho, &pay_recipient, &sender_id_out);
-
-                // Change output note (goes back to owner)
-                let change_recipient = if has_change {
-                    recipient_from_pk_v2(&DOMAIN, &change_pk_spend, &change_pk_ivk)
-                } else {
-                    [0u8; 32] // unused
-                };
-                let cm_change = if has_change {
-                    note_commitment(&DOMAIN, change_value_u64, &change_rho, &change_recipient, &sender_id_out)
-                } else {
-                    [0u8; 32] // unused
-                };
-
-                // Nullifier is derived from spend_sk (nf_key is derived inside the circuit).
-                let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
-                let nf = nullifier(&DOMAIN, &nf_key, &in_rho);
-
-                // Build viewer attestations if pool viewer is configured.
-                // The circuit expects: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output.
-                // So view_attestations should include attestations for ALL outputs (pay + change if applicable).
-                let n_out: usize = if has_change { 2 } else { 1 };
-                let (view_attestations, viewer_data_list) = if let Some(fvk) = viewer_fvk {
-                    let (pay_att, _pay_enc) = make_viewer_bundle(
-                        &fvk, &DOMAIN, pay_value, &pay_rho, &pay_recipient, &sender_id_out, &cm_pay,
-                    )?;
-                    if has_change {
-                        let (change_att, _change_enc) = make_viewer_bundle(
-                            &fvk, &DOMAIN, change_value, &change_rho, &change_recipient, &sender_id_out, &cm_change,
+                    for n in input_notes.iter() {
+                        let v_u64: u64 = n.value.try_into().context(
+                            "note value does not fit into u64 (required by note_spend_guest v2)",
                         )?;
-                        // Include attestations for BOTH outputs
-                        (Some(vec![pay_att.clone(), change_att.clone()]), Some(vec![(fvk, pay_att), (fvk, change_att)]))
-                    } else {
-                        (Some(vec![pay_att.clone()]), Some(vec![(fvk, pay_att)]))
+                        if v_u64 > i64::MAX as u64 {
+                            bail!("note value does not fit into i64 (required by note_spend_guest v2 ABI)");
+                        }
+                        in_values_u64.push(v_u64);
+                        in_rhos.push(n.rho);
+                        in_sender_ids.push(n.sender_id);
+                        positions.push(n.position);
+                        siblings_by_input.push(n.siblings.clone());
+                        input_cms.push(n.cm);
+                        spent_rhos.push(n.rho);
                     }
-                } else {
-                    (None, None)
-                };
+
+                    anyhow::ensure!(
+                        siblings_by_input.iter().all(|s| s.len() == depth_usize),
+                        "Merkle path depth mismatch (expected {} siblings per input)",
+                        depth_usize
+                    );
+
+                    let pay_value_u64: u64 = pay_value.try_into().context("pay value does not fit into u64")?;
+                    let change_value_u64: u64 =
+                        change_value.try_into().context("change value does not fit into u64")?;
+
+                    // note_spend_guest v2 derives the owner recipient from (spend_sk, pk_ivk_owner).
+                    let in_recipient = recipient_from_sk_v2(&DOMAIN, &in_spend_sk, &pk_ivk_owner);
+                    let sender_id_out = in_recipient;
+
+                    // Pay output note (goes to destination wallet)
+                    let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
+                    let cm_pay =
+                        note_commitment(&DOMAIN, pay_value_u64, &pay_rho, &pay_recipient, &sender_id_out);
+
+                    // Change output note (goes back to owner)
+                    let change_recipient = if has_change {
+                        recipient_from_pk_v2(&DOMAIN, &change_pk_spend, &change_pk_ivk)
+                    } else {
+                        [0u8; 32] // unused
+                    };
+                    let cm_change = if has_change {
+                        note_commitment(
+                            &DOMAIN,
+                            change_value_u64,
+                            &change_rho,
+                            &change_recipient,
+                            &sender_id_out,
+                        )
+                    } else {
+                        [0u8; 32] // unused
+                    };
+
+                    // Nullifiers are derived from spend_sk (nf_key is derived inside the circuit).
+                    let nf_key = nf_key_from_sk(&DOMAIN, &in_spend_sk);
+                    let nullifiers: Vec<Hash32> =
+                        in_rhos.iter().map(|rho| nullifier(&DOMAIN, &nf_key, rho)).collect();
+
+                    // Build viewer attestations if pool viewer is configured.
+                    // The circuit expects: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output.
+                    // So view_attestations should include attestations for ALL outputs (pay + change if applicable).
+                    let n_out: usize = if has_change { 2 } else { 1 };
+                    let (view_attestations, viewer_data_list) = if let Some(fvk) = viewer_fvk {
+                        let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                            [[0u8; 32]; crate::viewer::MAX_INS];
+                        for (i, cm) in input_cms.iter().enumerate().take(crate::viewer::MAX_INS) {
+                            cm_ins[i] = *cm;
+                        }
+
+                        let (pay_att, _pay_enc) = make_viewer_bundle(
+                            &fvk,
+                            &DOMAIN,
+                            pay_value,
+                            &pay_rho,
+                            &pay_recipient,
+                            &sender_id_out,
+                            &cm_ins,
+                            &cm_pay,
+                        )?;
+                        if has_change {
+                            let (change_att, _change_enc) = make_viewer_bundle(
+                                &fvk,
+                                &DOMAIN,
+                                change_value,
+                                &change_rho,
+                                &change_recipient,
+                                &sender_id_out,
+                                &cm_ins,
+                                &cm_change,
+                            )?;
+                            // Include attestations for BOTH outputs
+                            (
+                                Some(vec![pay_att.clone(), change_att.clone()]),
+                                Some(vec![(fvk, pay_att), (fvk, change_att)]),
+                            )
+                        } else {
+                            (Some(vec![pay_att.clone()]), Some(vec![(fvk, pay_att)]))
+                        }
+                    } else {
+                        (None, None)
+                    };
 
                 let output_commitments = if has_change {
                     vec![cm_pay, cm_change]
@@ -1809,7 +1921,7 @@ async fn perform_transfer_cycle(
                 let public = SpendPublic {
                     anchor_root: anchor,
                     blacklist_root,
-                    nullifier: nf,
+                    nullifiers: nullifiers.clone(),
                     withdraw_amount: 0,
                     output_commitments,
                     view_attestations,
@@ -1819,16 +1931,23 @@ async fn perform_transfer_cycle(
                 let mut private_indices: Vec<usize> = Vec::new();
                 private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
 
-                let n_in: usize = 1;
                 let per_in = 5usize + depth_usize;
                 let withdraw_idx = 7usize + n_in * per_in;
                 let outs_base = withdraw_idx + 3;
 
-                // Input 0 private args.
-                private_indices.extend_from_slice(&[7, 8, 9, 10]); // value_in, rho_in, sender_id_in, pos
-                // siblings [11..11+depth)
-                for j in 0..depth_usize {
-                    private_indices.push(11 + j);
+                // Input private args (per input: value, rho, sender_id, pos, siblings[depth])
+                for in_idx in 0..n_in {
+                    let base = 7usize + in_idx * per_in;
+                    private_indices.extend_from_slice(&[
+                        base,         // value_in
+                        base + 1,     // rho_in
+                        base + 2,     // sender_id_in
+                        base + 3,     // pos
+                    ]);
+                    // siblings start at base+4
+                    for j in 0..depth_usize {
+                        private_indices.push(base + 4 + j);
+                    }
                 }
 
                 // Output private args (5 args per output: value, rho, pk_spend, pk_ivk, commitment)
@@ -1882,18 +2001,19 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3: pk_ivk_owner (PRIVATE)
                 host.add_u64_arg(TREE_DEPTH as u64); // 4: depth (PUBLIC)
                 host.add_hex_arg(hex::encode(anchor)); // 5: anchor (PUBLIC)
-                host.add_u64_arg(1); // 6: n_in (PUBLIC)
+                host.add_u64_arg(n_in as u64); // 6: n_in (PUBLIC)
 
-                host.add_u64_arg(value_u64); // 7: value_in (PRIVATE)
-                host.add_hex_arg(hex::encode(in_rho)); // 8: rho_in (PRIVATE)
-                host.add_hex_arg(hex::encode(in_sender_id)); // 9: sender_id_in (PRIVATE)
-                host.add_u64_arg(position as u64); // 10: pos (PRIVATE)
-                // 11..11+depth: siblings
-                for s in &siblings {
-                    host.add_hex_arg(hex::encode(s));
+                for i in 0..n_in {
+                    host.add_u64_arg(in_values_u64[i]); // value_in_i (PRIVATE)
+                    host.add_hex_arg(hex::encode(in_rhos[i])); // rho_in_i (PRIVATE)
+                    host.add_hex_arg(hex::encode(in_sender_ids[i])); // sender_id_in_i (PRIVATE)
+                    host.add_u64_arg(positions[i] as u64); // pos_i (PRIVATE)
+                    for s in siblings_by_input[i].iter() {
+                        host.add_hex_arg(hex::encode(s));
+                    }
+                    host.add_hex_arg(hex::encode(nullifiers[i])); // nullifier_i (PUBLIC)
                 }
 
-                host.add_hex_arg(hex::encode(nf)); // nullifier (PUBLIC)
                 host.add_u64_arg(0); // withdraw_amount (PUBLIC)
                 host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
                 host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
@@ -1922,8 +2042,8 @@ async fn perform_transfer_cycle(
                     (vec![pay_value_u64], vec![pay_rho])
                 };
                 let inv_enforce = inv_enforce_v2(
-                    &[value_u64],   // in_values
-                    &[in_rho],      // in_rhos
+                    &in_values_u64, // in_values
+                    &in_rhos,       // in_rhos
                     &out_values,    // out_values
                     &out_rhos,      // out_rhos
                 );
@@ -2186,11 +2306,15 @@ async fn perform_transfer_cycle(
                     proof_data
                 };
                 Ok(ProofResult {
-                    account_idx,
+                    sender_idx,
+                    dest_idx,
                     proof_data,
+                    nullifiers,
+                    input_cms,
+                    spent_rhos,
+                    sender_id_out,
                     pay_value,
                     pay_rho,
-                    pay_spend_sk,
                     change_value,
                     change_rho: if has_change { Some(change_rho) } else { None },
                 })
@@ -2201,7 +2325,7 @@ async fn perform_transfer_cycle(
         }));
     }
 
-    let mut proofs: Vec<ProofResult> = Vec::with_capacity(inputs.len());
+    let mut proofs: Vec<ProofResult> = Vec::with_capacity(plans.len());
     for t in proof_tasks {
         proofs.push(t.await??);
     }
@@ -2234,38 +2358,40 @@ async fn perform_transfer_cycle(
     #[derive(Debug)]
     struct BuiltTransfer {
         idx: usize,
-        wallet_idx: usize,
+        sender_idx: usize,
+        dest_idx: usize,
         tx_hash: String,
         tx_b64: String,
         new_nonce: u64,
-        /// The note secrets for the wallet's next spendable note.
-        /// For full transfers: this is the pay note (recipient)
-        /// For partial transfers with change: this is the change note (back to owner)
-        new_value: u128,
-        new_rho: Hash32,
-        new_spend_sk: Hash32,
-        new_sender_id: Hash32,
+        spent_rhos: Vec<Hash32>,
+        pay_note: NoteState,
+        change_note: Option<NoteState>,
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
     for (i, proof_result) in proofs.into_iter().enumerate() {
-        let wallet_idx = proof_result.account_idx;
+        let sender_idx = proof_result.sender_idx;
+        let dest_idx = proof_result.dest_idx;
         let proof_bytes = proof_result.proof_data;
+        let nullifiers = proof_result.nullifiers;
+        let input_cms = proof_result.input_cms;
+        let spent_rhos = proof_result.spent_rhos;
+        let sender_id_out = proof_result.sender_id_out;
         let pay_value = proof_result.pay_value;
         let pay_rho = proof_result.pay_rho;
-        let pay_spend_sk = proof_result.pay_spend_sk;
         let change_value = proof_result.change_value;
         let change_rho = proof_result.change_rho;
         let has_change = change_rho.is_some();
 
-        let wallet = wallets[wallet_idx].clone();
+        let sender_wallet = wallets[sender_idx].clone();
+        let dest_spend_sk = wallets[dest_idx].spend_sk;
         let chain_hash = *chain_hash;
         let anchor_root = anchor_root;
         let detailed_logs = config.detailed_wallet_logs;
         let viewer_fvk = if let Some(ref bundles) = viewer_bundles {
-            let b = bundles.get(wallet_idx).ok_or_else(|| {
+            let b = bundles.get(sender_idx).ok_or_else(|| {
                 anyhow!(
-                    "missing viewer bundle for wallet {wallet_idx} (have {} bundles)",
+                    "missing viewer bundle for wallet {sender_idx} (have {} bundles)",
                     bundles.len()
                 )
             })?;
@@ -2275,35 +2401,36 @@ async fn perform_transfer_cycle(
         };
         build_tasks.push(tokio::task::spawn_blocking(
             move || -> anyhow::Result<BuiltTransfer> {
-                let nf_key = nf_key_from_sk(&DOMAIN, &wallet.spend_sk);
-                let nf = nullifier(&DOMAIN, &nf_key, &wallet.rho);
-
                 let pay_value_u64: u64 = pay_value.try_into().context(
                     "pay value does not fit into u64 (required by note_spend_guest v2)",
                 )?;
 
-                // Pay output goes to fresh recipient
-                let pay_pk_spend = pk_from_sk(&pay_spend_sk);
-                let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &pay_spend_sk);
+                // Pay output goes to destination wallet
+                let pay_pk_spend = pk_from_sk(&dest_spend_sk);
+                let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &dest_spend_sk);
                 let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
 
-                // Owner keys for sender_id calculation
-                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &wallet.spend_sk);
-
-                let sender_id = recipient_from_sk_v2(&DOMAIN, &wallet.spend_sk, &pk_ivk_owner);
+                let pk_ivk_owner = pk_ivk_from_sk(&DOMAIN, &sender_wallet.spend_sk);
+                let pk_spend_owner = pk_from_sk(&sender_wallet.spend_sk);
 
                 // Build encrypted notes for pool viewer if configured.
                 // Encrypt both pay output and change output (if applicable).
                 let view_ciphertexts: Option<Vec<EncryptedNote>> = match viewer_fvk {
                     Some(fvk) => {
+                        let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
+                            [[0u8; 32]; crate::viewer::MAX_INS];
+                        for (i, cm) in input_cms.iter().enumerate().take(crate::viewer::MAX_INS) {
+                            cm_ins[i] = *cm;
+                        }
                         let mut ciphertexts = Vec::new();
+
                         // Pay note ciphertext
                         let cm_pay = note_commitment(
                             &DOMAIN,
                             pay_value_u64,
                             &pay_rho,
                             &pay_recipient,
-                            &sender_id,
+                            &sender_id_out,
                         );
                         let (_att, enc) = make_viewer_bundle(
                             &fvk,
@@ -2311,7 +2438,8 @@ async fn perform_transfer_cycle(
                             pay_value,
                             &pay_rho,
                             &pay_recipient,
-                            &sender_id,
+                            &sender_id_out,
+                            &cm_ins,
                             &cm_pay,
                         )?;
                         ciphertexts.push(enc);
@@ -2321,14 +2449,14 @@ async fn perform_transfer_cycle(
                             let change_value_u64: u64 = change_value.try_into().context(
                                 "change value does not fit into u64",
                             )?;
-                            let pk_spend_owner = pk_from_sk(&wallet.spend_sk);
-                            let change_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
+                            let change_recipient =
+                                recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
                             let cm_change = note_commitment(
                                 &DOMAIN,
                                 change_value_u64,
                                 &change_rho_val,
                                 &change_recipient,
-                                &sender_id,
+                                &sender_id_out,
                             );
                             let (_att, enc) = make_viewer_bundle(
                                 &fvk,
@@ -2336,7 +2464,8 @@ async fn perform_transfer_cycle(
                                 change_value,
                                 &change_rho_val,
                                 &change_recipient,
-                                &sender_id,
+                                &sender_id_out,
+                                &cm_ins,
                                 &cm_change,
                             )?;
                             ciphertexts.push(enc);
@@ -2353,16 +2482,16 @@ async fn perform_transfer_cycle(
                             .try_into()
                             .map_err(|_| anyhow!("Proof too large for SafeVec"))?,
                         anchor_root,
-                        nullifier: nf,
+                        nullifiers: nullifiers.clone(),
                         view_ciphertexts,
                         gas: None,
                     });
 
                 let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
                     default_test_signed_transaction(
-                        &wallet.account.private_key,
+                        &sender_wallet.account.private_key,
                         &call,
-                        wallet.nonce,
+                        sender_wallet.nonce,
                         &chain_hash,
                     );
 
@@ -2378,49 +2507,51 @@ async fn perform_transfer_cycle(
                 if detailed_logs {
                     if has_change {
                         eprintln!(
-                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={} pay={} change={}",
-                            wallet_idx,
+                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} n_in={} nullifier0={} pay={} change={}",
+                            sender_idx,
                             i + 1,
-                            wallet.nonce,
+                            sender_wallet.nonce,
                             tx_hash,
-                            hex::encode(&nf[..8]),
+                            nullifiers.len(),
+                            hex::encode(&nullifiers[0][..8]),
                             pay_value,
                             change_value
                         );
                     } else {
                         eprintln!(
-                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} nullifier={} value={}",
-                            wallet_idx,
+                            "  [transfer] wallet={} idx_in_cycle={} nonce={} tx={} n_in={} nullifier0={} value={}",
+                            sender_idx,
                             i + 1,
-                            wallet.nonce,
+                            sender_wallet.nonce,
                             tx_hash,
-                            hex::encode(&nf[..8]),
+                            nullifiers.len(),
+                            hex::encode(&nullifiers[0][..8]),
                             pay_value
                         );
                     }
                 }
 
-                // Determine which note the wallet should track for the next cycle:
-                // - If there's change: track the change note (wallet keeps same keys, new rho)
-                // - If no change (full transfer): track the pay note (wallet adopts new keys)
-                let (new_value, new_rho, new_spend_sk) = if let Some(change_rho_val) = change_rho {
-                    // Partial transfer: wallet keeps the change note
-                    (change_value, change_rho_val, wallet.spend_sk)
-                } else {
-                    // Full transfer: wallet adopts the pay note (new identity)
-                    (pay_value, pay_rho, pay_spend_sk)
+                let pay_note = NoteState {
+                    value: pay_value,
+                    rho: pay_rho,
+                    sender_id: sender_id_out,
                 };
+                let change_note = change_rho.map(|rho| NoteState {
+                    value: change_value,
+                    rho,
+                    sender_id: sender_id_out,
+                });
 
                 Ok(BuiltTransfer {
                     idx: i,
-                    wallet_idx,
+                    sender_idx,
+                    dest_idx,
                     tx_hash,
                     tx_b64,
-                    new_nonce: wallet.nonce + 1,
-                    new_value,
-                    new_rho,
-                    new_spend_sk,
-                    new_sender_id: sender_id,
+                    new_nonce: sender_wallet.nonce + 1,
+                    spent_rhos,
+                    pay_note,
+                    change_note,
                 })
             },
         ));
@@ -2432,19 +2563,70 @@ async fn perform_transfer_cycle(
     }
     built.sort_by_key(|b| b.idx);
 
+    let mut expected_output_commitments: Vec<Hash32> = Vec::new();
     for b in built {
         transfer_hashes.push(b.tx_hash);
-        transfer_txs_b64.push((b.wallet_idx, b.tx_b64));
-        let w = &mut wallets[b.wallet_idx];
-        w.nonce = b.new_nonce;
-        w.value = b.new_value;
-        w.rho = b.new_rho;
-        w.spend_sk = b.new_spend_sk;
-        eprintln!(
-            "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
-            transfer_txs_ms,
-            transfer_txs_ms / transfer_txs_b64.len() as f64
+        transfer_txs_b64.push((b.sender_idx, b.tx_b64));
+
+        // Track expected output commitments so the next cycle can find them in the tree.
+        let pay_value_u64: u64 = b
+            .pay_note
+            .value
+            .try_into()
+            .context("pay note value does not fit into u64")?;
+        let dest_spend_sk = wallets[b.dest_idx].spend_sk;
+        let pay_pk_spend = pk_from_sk(&dest_spend_sk);
+        let pay_pk_ivk = pk_ivk_from_sk(&DOMAIN, &dest_spend_sk);
+        let pay_recipient = recipient_from_pk_v2(&DOMAIN, &pay_pk_spend, &pay_pk_ivk);
+        let cm_pay = note_commitment(
+            &DOMAIN,
+            pay_value_u64,
+            &b.pay_note.rho,
+            &pay_recipient,
+            &b.pay_note.sender_id,
         );
+        expected_output_commitments.push(cm_pay);
+
+        if let Some(ref change) = b.change_note {
+            let change_value_u64: u64 = change
+                .value
+                .try_into()
+                .context("change note value does not fit into u64")?;
+            let sender_spend_sk = wallets[b.sender_idx].spend_sk;
+            let change_pk_spend = pk_from_sk(&sender_spend_sk);
+            let change_pk_ivk = pk_ivk_from_sk(&DOMAIN, &sender_spend_sk);
+            let change_recipient = recipient_from_pk_v2(&DOMAIN, &change_pk_spend, &change_pk_ivk);
+            let cm_change = note_commitment(
+                &DOMAIN,
+                change_value_u64,
+                &change.rho,
+                &change_recipient,
+                &change.sender_id,
+            );
+            expected_output_commitments.push(cm_change);
+        }
+
+        // Update sender wallet: consume inputs and add change (if any).
+        {
+            let w = &mut wallets[b.sender_idx];
+            w.nonce = b.new_nonce;
+            let spent: HashSet<Hash32> = b.spent_rhos.iter().copied().collect();
+            w.notes.retain(|n| !spent.contains(&n.rho));
+            if let Some(change) = b.change_note {
+                w.notes.push(change);
+            }
+        }
+
+        // Update destination wallet: add the pay note.
+        wallets[b.dest_idx].notes.push(b.pay_note);
+    }
+    let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[cycle] Built and signed {} transfers txs in {:.2} ms (avg {:.2} ms per tx)",
+        transfer_txs_b64.len(),
+        transfer_txs_ms,
+        transfer_txs_ms / transfer_txs_b64.len() as f64
+    );
 
         eprintln!(
             "[cycle] Submitting {} transfers to verifier...",
@@ -2862,25 +3044,12 @@ async fn perform_transfer_cycle(
         const NOTE_SYNC_TIMEOUT_SECS: u64 = 30;
         const NOTE_SYNC_POLL_MS: u64 = 100;
 
-        // Collect expected output commitments for wallets that participated in this cycle
-        let mut expected_commitments: Vec<([u8; 32], usize)> = Vec::new();
-        for input in &inputs {
-            // The wallet state has already been updated with the new note secrets.
-            let w = &wallets[input.wallet_idx];
-            let value_u64: u64 = w.value.try_into().context(
-                "wallet note value does not fit into u64 (required by note_spend_guest v2)",
-            )?;
-            let pk_ivk = pk_ivk_from_sk(&DOMAIN, &w.spend_sk);
-            let recipient = recipient_from_sk_v2(&DOMAIN, &w.spend_sk, &pk_ivk);
-            let expected_cm = note_commitment(&DOMAIN, value_u64, &w.rho, &recipient, &w.sender_id);
-            expected_commitments.push((expected_cm, input.wallet_idx));
-        }
-
-        if !expected_commitments.is_empty() {
-            let sync_start = Instant::now();
-            let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
-            let mut pending: HashSet<[u8; 32]> =
-                expected_commitments.iter().map(|(cm, _)| *cm).collect();
+    // Wait for all new output notes to be indexed before ending the cycle.
+    // This ensures the next cycle can find the note commitments.
+    if !expected_output_commitments.is_empty() {
+        let sync_start = Instant::now();
+        let sync_deadline = sync_start + Duration::from_secs(NOTE_SYNC_TIMEOUT_SECS);
+        let mut pending: HashSet<Hash32> = expected_output_commitments.iter().copied().collect();
 
             while !pending.is_empty() && Instant::now() < sync_deadline {
                 let fresh_positions = fetch_note_positions(client, false).await?;
@@ -2891,26 +3060,26 @@ async fn perform_transfer_cycle(
                 }
             }
 
-            let sync_elapsed = sync_start.elapsed();
-            if pending.is_empty() {
-                if config.detailed_wallet_logs {
-                    eprintln!(
-                        "[cycle] All {} new output notes indexed in {:.2} ms",
-                        expected_commitments.len(),
-                        sync_elapsed.as_secs_f64() * 1000.0
-                    );
-                }
-                // Update the cached position map with fresh data
-                pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
-            } else {
+        let sync_elapsed = sync_start.elapsed();
+        if pending.is_empty() {
+            if config.detailed_wallet_logs {
                 eprintln!(
-                    "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
-                    pending.len(),
-                    expected_commitments.len(),
-                    sync_elapsed.as_secs_f64()
+                    "[cycle] All {} new output notes indexed in {:.2} ms",
+                    expected_output_commitments.len(),
+                    sync_elapsed.as_secs_f64() * 1000.0
                 );
             }
+            // Update the cached position map with fresh data
+            pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
+        } else {
+            eprintln!(
+                "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
+                pending.len(),
+                expected_output_commitments.len(),
+                sync_elapsed.as_secs_f64()
+            );
         }
+    }
 
         // Persist rebuilt tree and note index for the next cycle.
         *cached_tree = Some(mt);

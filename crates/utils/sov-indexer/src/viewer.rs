@@ -26,18 +26,32 @@ pub const PRIVACY_ADDRESS_HRP: &str = "privpool";
 /// Length of note plaintext for deposits: 32(domain) + 16(value) + 32(rho) + 32(recipient)
 pub const NOTE_PLAIN_LEN_DEPOSIT: usize = 112;
 
-/// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
-pub const NOTE_PLAIN_LEN_TRANSFER: usize = 144;
+/// Legacy spend/output note plaintext length (no `cm_ins`):
+/// 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
+pub const NOTE_PLAIN_LEN_SPEND_V1: usize = 144;
+
+/// Current spend/output note plaintext length (includes `cm_ins[4]`):
+/// 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id) + 4*32(cm_ins)
+pub const NOTE_PLAIN_LEN_SPEND_V2: usize = 272;
+
+pub const MAX_INS: usize = 4;
 
 /// Decrypted note data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptedNote {
+    /// Output note commitment (cm) this plaintext corresponds to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm: Option<String>,
     pub domain: String,
     pub value: String,
     pub rho: String,
     pub recipient: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
+    /// Commitments of notes spent to produce this tx (padded with zeros).
+    /// Present for spend/output plaintexts using the v2 layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm_ins: Option<Vec<String>>,
 }
 
 /// A single FVK entry from the config file
@@ -48,6 +62,9 @@ pub struct FvkEntry {
     /// The shielded address associated with this FVK (optional)
     #[serde(default)]
     pub shielded_address: Option<String>,
+    /// The public wallet address associated with this FVK (optional)
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 /// Config file structure for FVK registry
@@ -61,8 +78,8 @@ pub struct FvkConfig {
 /// Uses DashMap for lock-free concurrent access during indexing.
 #[derive(Debug)]
 pub struct FvkRegistry {
-    /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address)
-    by_commitment: DashMap<String, (Hash32, Option<String>)>,
+    /// Map from fvk_commitment (hex) -> (fvk bytes, shielded_address, wallet_address)
+    by_commitment: DashMap<String, (Hash32, Option<String>, Option<String>)>,
 }
 
 #[derive(Clone)]
@@ -76,6 +93,10 @@ pub struct FvkServiceClient {
 struct FvkLookupResponse {
     fvk: String,
     fvk_commitment: String,
+    #[serde(default)]
+    shielded_address: Option<String>,
+    #[serde(default)]
+    wallet_address: Option<String>,
 }
 
 impl FvkServiceClient {
@@ -101,10 +122,11 @@ impl FvkServiceClient {
         }))
     }
 
+    /// Fetch an FVK by commitment, returning (fvk, shielded_address, wallet_address) if found
     pub async fn fetch_fvk_by_commitment(
         &self,
         expected_fvk_commitment: &Hash32,
-    ) -> Result<Option<Hash32>> {
+    ) -> Result<Option<(Hash32, Option<String>, Option<String>)>> {
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/v1/fvk/{}", hex::encode(expected_fvk_commitment));
 
@@ -145,7 +167,7 @@ impl FvkServiceClient {
             anyhow::bail!("FVK service returned fvk that does not match requested commitment");
         }
 
-        Ok(Some(fvk))
+        Ok(Some((fvk, body.shielded_address, body.wallet_address)))
     }
 }
 
@@ -168,12 +190,17 @@ impl FvkRegistry {
     }
 
     /// Add a FVK to the registry (thread-safe, no &mut needed)
-    pub fn add(&self, fvk: Hash32, shielded_address: Option<String>) {
+    pub fn add(
+        &self,
+        fvk: Hash32,
+        shielded_address: Option<String>,
+        wallet_address: Option<String>,
+    ) {
         let fvk_obj = FullViewingKey(fvk);
         let commitment = fvk_commitment(&fvk_obj);
         let commitment_hex = hex::encode(commitment);
         self.by_commitment
-            .insert(commitment_hex, (fvk, shielded_address));
+            .insert(commitment_hex, (fvk, shielded_address, wallet_address));
     }
 
     /// Remove a FVK by its commitment (thread-safe)
@@ -193,12 +220,12 @@ impl FvkRegistry {
     }
 
     /// Get all entries as a collected Vec (for iteration/serialization)
-    pub fn entries(&self) -> Vec<(String, Hash32, Option<String>)> {
+    pub fn entries(&self) -> Vec<(String, Hash32, Option<String>, Option<String>)> {
         self.by_commitment
             .iter()
             .map(|r| {
-                let (k, (fvk, addr)) = r.pair();
-                (k.clone(), *fvk, addr.clone())
+                let (k, (fvk, shielded_addr, wallet_addr)) = r.pair();
+                (k.clone(), *fvk, shielded_addr.clone(), wallet_addr.clone())
             })
             .collect()
     }
@@ -215,7 +242,7 @@ impl FvkRegistry {
 
         for entry in config.fvks {
             let fvk = parse_fvk_hex(&entry.fvk)?;
-            registry.add(fvk, entry.shielded_address);
+            registry.add(fvk, entry.shielded_address, entry.wallet_address);
         }
 
         info!("Loaded {} FVKs from config file {:?}", registry.len(), path);
@@ -227,11 +254,12 @@ impl FvkRegistry {
         use sea_orm::sea_query::OnConflict;
 
         for entry in self.by_commitment.iter() {
-            let (commitment_hex, (fvk, shielded_address)) = entry.pair();
+            let (commitment_hex, (fvk, shielded_address, wallet_address)) = entry.pair();
             let model = idx::fvk_registry::ActiveModel {
                 fvk_commitment: Set(commitment_hex.clone()),
                 fvk: Set(hex::encode(fvk)),
                 shielded_address: Set(shielded_address.clone()),
+                wallet_address: Set(wallet_address.clone()),
                 created_at: Set(Utc::now()),
             };
 
@@ -241,6 +269,7 @@ impl FvkRegistry {
                         .update_columns([
                             idx::fvk_registry::Column::Fvk,
                             idx::fvk_registry::Column::ShieldedAddress,
+                            idx::fvk_registry::Column::WalletAddress,
                         ])
                         .to_owned(),
                 )
@@ -256,6 +285,7 @@ impl FvkRegistry {
         db: &DatabaseConnection,
         fvk: Hash32,
         shielded_address: Option<String>,
+        wallet_address: Option<String>,
     ) -> Result<()> {
         use sea_orm::sea_query::OnConflict;
 
@@ -267,6 +297,7 @@ impl FvkRegistry {
             fvk_commitment: Set(commitment_hex),
             fvk: Set(hex::encode(fvk)),
             shielded_address: Set(shielded_address),
+            wallet_address: Set(wallet_address),
             created_at: Set(Utc::now()),
         };
 
@@ -276,6 +307,7 @@ impl FvkRegistry {
                     .update_columns([
                         idx::fvk_registry::Column::Fvk,
                         idx::fvk_registry::Column::ShieldedAddress,
+                        idx::fvk_registry::Column::WalletAddress,
                     ])
                     .to_owned(),
             )
@@ -294,7 +326,7 @@ impl FvkRegistry {
         for row in rows {
             let fvk = parse_fvk_hex(&row.fvk)?;
             // We already have the commitment stored, but we re-add to populate our DashMap
-            registry.add(fvk, row.shielded_address);
+            registry.add(fvk, row.shielded_address, row.wallet_address);
         }
 
         if !registry.is_empty() {
@@ -359,9 +391,12 @@ pub async fn maybe_fetch_missing_fvks_for_encrypted_notes(
 
     for commitment in missing {
         match client.fetch_fvk_by_commitment(&commitment).await {
-            Ok(Some(fvk)) => {
-                registry.add(fvk, None);
-                if let Err(e) = FvkRegistry::save_single_to_db(idx_db, fvk, None).await {
+            Ok(Some((fvk, shielded_address, wallet_address))) => {
+                registry.add(fvk, shielded_address.clone(), wallet_address.clone());
+                if let Err(e) =
+                    FvkRegistry::save_single_to_db(idx_db, fvk, shielded_address, wallet_address)
+                        .await
+                {
                     warn!("Failed to persist fetched FVK to index DB: {}", e);
                 }
             }
@@ -438,13 +473,20 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
         anyhow::bail!("MAC verification failed: ciphertext may be corrupted");
     }
 
-    // Decrypt ciphertext - support both 112-byte (deposit) and 144-byte (transfer) formats
+    // Decrypt ciphertext - support:
+    // - 112-byte deposit plaintext
+    // - 144-byte legacy spend/output plaintext
+    // - 272-byte spend/output plaintext with cm_ins[4]
     let ct_bytes = encrypted_note.ct.as_ref();
-    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT && ct_bytes.len() != NOTE_PLAIN_LEN_TRANSFER {
+    if ct_bytes.len() != NOTE_PLAIN_LEN_DEPOSIT
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V1
+        && ct_bytes.len() != NOTE_PLAIN_LEN_SPEND_V2
+    {
         anyhow::bail!(
-            "Invalid ciphertext length: expected {} (deposit) or {} (transfer), got {}",
+            "Invalid ciphertext length: expected {} (deposit), {} (spend_v1), or {} (spend_v2), got {}",
             NOTE_PLAIN_LEN_DEPOSIT,
-            NOTE_PLAIN_LEN_TRANSFER,
+            NOTE_PLAIN_LEN_SPEND_V1,
+            NOTE_PLAIN_LEN_SPEND_V2,
             ct_bytes.len()
         );
     }
@@ -467,8 +509,8 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
     let mut recipient = [0u8; 32];
     recipient.copy_from_slice(&pt[80..112]);
 
-    // Parse sender_id if present (144-byte transfer format)
-    let sender_id = if pt.len() == NOTE_PLAIN_LEN_TRANSFER {
+    // Parse sender_id if present (spend/output formats)
+    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(hex::encode(sender))
@@ -476,12 +518,29 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
         None
     };
 
+    // Parse cm_ins if present (spend/output v2 plaintext)
+    let cm_ins = if pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
+        let mut out = Vec::with_capacity(MAX_INS);
+        let mut off = 144usize;
+        for _ in 0..MAX_INS {
+            let mut cm = [0u8; 32];
+            cm.copy_from_slice(&pt[off..off + 32]);
+            out.push(hex::encode(cm));
+            off += 32;
+        }
+        Some(out)
+    } else {
+        None
+    };
+
     Ok(DecryptedNote {
+        cm: Some(hex::encode(encrypted_note.cm)),
         domain: hex::encode(domain),
         value: value.to_string(),
         rho: hex::encode(rho),
         recipient: hex::encode(recipient),
         sender_id,
+        cm_ins,
     })
 }
 
@@ -625,4 +684,48 @@ pub fn extract_sender_from_decrypted_notes(
     }
 
     None
+}
+
+/// Extract the transferred amount from decrypted notes.
+///
+/// Only sums notes where recipient != sender_id (excludes change notes).
+/// For transfers: if sender sends 100 but only 20 goes to recipient (80 is change),
+/// this returns 20 (the actual transferred amount).
+pub fn extract_amount_from_decrypted_notes(
+    decrypted_notes: Option<&serde_json::Value>,
+) -> Option<String> {
+    let notes = decrypted_notes?;
+    let arr = notes.as_array()?;
+
+    let mut total: u128 = 0;
+    for note in arr {
+        // Get the value - skip this note if missing
+        let Some(value_str) = note.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(value) = value_str.parse::<u128>() else {
+            continue;
+        };
+
+        let recipient = note.get("recipient").and_then(|v| v.as_str());
+        let sender_id = note.get("sender_id").and_then(|v| v.as_str());
+
+        // Only count notes that are NOT change (recipient != sender)
+        // If sender_id is None (deposit notes), count all notes
+        // If sender_id == recipient, it's a change note - skip it
+        let is_change_note = match (sender_id, recipient) {
+            (Some(sender), Some(recip)) => sender == recip,
+            _ => false,
+        };
+
+        if !is_change_note {
+            total = total.saturating_add(value);
+        }
+    }
+
+    if total > 0 {
+        Some(total.to_string())
+    } else {
+        None
+    }
 }

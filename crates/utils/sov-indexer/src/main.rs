@@ -1,9 +1,10 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use sea_orm::{ConnectOptions, Database};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use tracing::{info, warn};
 mod api;
 mod background_sync;
@@ -27,17 +28,8 @@ async fn main() -> anyhow::Result<()> {
     let index_db_url = env::var("INDEX_DB")
         .unwrap_or_else(|_| "sqlite://wallet_index.sqlite?mode=rwc".to_string());
     let bind_addr = env::var("INDEXER_BIND").unwrap_or_else(|_| "0.0.0.0:13100".to_string());
-    let mut connection_options = ConnectOptions::new(da_conn.clone());
-    connection_options.sqlx_logging(false);
-    let da_db = Database::connect(connection_options)
-        .await
-        .with_context(|| format!("Failed to connect DB {}", da_conn))?;
-
-    let mut connection_options = ConnectOptions::new(index_db_url.clone());
-    connection_options.sqlx_logging(false);
-    let idx_db = Database::connect(connection_options)
-        .await
-        .with_context(|| format!("Failed to connect index DB {}", index_db_url))?;
+    let da_db = connect_db(&da_conn, "DA").await?;
+    let idx_db = connect_db(&index_db_url, "index").await?;
 
     println!("Initializing index database");
 
@@ -74,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let vfk_registry_clone = vfk_registry.clone();
     let fvk_service_clone = fvk_service.clone();
     tokio::spawn(async move {
-        println!("Starting VFK backfill");
+        println!("Starting encrypted-note backfills");
         if let Err(e) = background_sync::backfill_privacy_fields(
             &idx_clone,
             &vfk_registry_clone,
@@ -84,7 +76,19 @@ async fn main() -> anyhow::Result<()> {
         {
             warn!(error = %e, "VFK backfill failed");
         }
-        println!("Finished VFK backfill");
+        if let Err(e) = background_sync::backfill_notes_nullifiers(
+            &idx_clone,
+            &vfk_registry_clone,
+            fvk_service_clone.as_ref(),
+        )
+        .await
+        {
+            warn!(error = %e, "notes_nullifiers backfill failed");
+        }
+        if let Err(e) = background_sync::backfill_spent_nullifiers(&idx_clone).await {
+            warn!(error = %e, "spent_nullifiers backfill failed");
+        }
+        println!("Finished encrypted-note backfills");
     });
     println!("Initializing background sync loop");
     background_sync::spawn_sync_loop(
@@ -106,6 +110,62 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<DatabaseConnection> {
+    if connection_string.starts_with("sqlite:") {
+        use sea_orm::sqlx::sqlite::{
+            SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+        };
+        use std::str::FromStr;
+
+        let sqlite_opts = SqliteConnectOptions::from_str(connection_string)
+            .with_context(|| format!("Failed to parse {} SQLite connection string", label))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_millis(30_000));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Some(Duration::from_secs(300)))
+            .max_lifetime(Some(Duration::from_secs(1800)))
+            .connect_with(sqlite_opts)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to connect {} SQLite DB {}",
+                    label, connection_string
+                )
+            })?;
+
+        info!(
+            "Connecting to {} SQLite DB with tuned pool settings (max_connections=10, WAL, synchronous=NORMAL)",
+            label
+        );
+
+        Ok(DatabaseConnection::SqlxSqlitePoolConnection(pool.into()))
+    } else {
+        let mut connect_opts = ConnectOptions::new(connection_string.to_string());
+        connect_opts
+            .max_connections(50)
+            .min_connections(5)
+            .connect_timeout(Duration::from_secs(30))
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800))
+            .sqlx_logging(false);
+
+        info!(
+            "Connecting to {} database with tuned pool settings (max_connections=50, min_connections=5)",
+            label
+        );
+
+        Database::connect(connect_opts)
+            .await
+            .with_context(|| format!("Failed to connect {} DB {}", label, connection_string))
+    }
 }
 
 fn should_reset_index_db() -> bool {

@@ -63,6 +63,8 @@ impl Ligero {
         private_indices: Vec<u32>,
         args: Vec<LigeroProgramArguments>,
     ) -> Result<Vec<u8>> {
+        use std::time::Instant;
+
         let circuit = self.circuit.trim();
         anyhow::ensure!(
             !circuit.is_empty(),
@@ -80,6 +82,8 @@ impl Ligero {
         } else {
             format!("{}/prove", base_url)
         };
+
+        let num_args = args.len();
         let request = ProveRequest {
             circuit: circuit.to_string(),
             args,
@@ -87,6 +91,7 @@ impl Ligero {
             private_indices,
         };
 
+        let request_start = Instant::now();
         let response = self
             .http
             .post(&endpoint)
@@ -96,11 +101,14 @@ impl Ligero {
             .with_context(|| format!("POST {endpoint}"))?
             .error_for_status()
             .with_context(|| format!("POST {endpoint} returned error status"))?;
+        let http_ms = request_start.elapsed().as_millis();
 
+        let parse_start = Instant::now();
         let payload: ProveResponse = response
             .json()
             .await
             .context("Failed to deserialize Ligero proof service response")?;
+        let parse_ms = parse_start.elapsed().as_millis();
 
         if !payload.success || payload.exit_code != 0 {
             let error = payload.error.unwrap_or_else(|| "unknown error".to_string());
@@ -115,9 +123,21 @@ impl Ligero {
             .proof
             .context("Ligero proof service response missing proof payload")?;
         let proof_b64 = proof_b64.trim();
+        let decode_start = Instant::now();
         let proof_bytes = general_purpose::STANDARD
             .decode(proof_b64)
             .context("Failed to decode base64 proof payload")?;
+        let decode_ms = decode_start.elapsed().as_millis();
+
+        tracing::info!(
+            endpoint,
+            num_args,
+            http_ms,
+            parse_ms,
+            decode_ms,
+            proof_bytes_len = proof_bytes.len(),
+            "[LIGERO_TIMING] Proof service call completed"
+        );
 
         Ok(proof_bytes)
     }

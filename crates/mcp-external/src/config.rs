@@ -19,10 +19,15 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub mcp_server_bind_address: String,
 
-    /// Wallet private key as hex string (env: WALLET_PRIVATE_KEY, required)
+    /// Start with a new randomly generated wallet and privacy key (env: START_WITH_NEW_WALLET, optional)
+    /// When true, WALLET_PRIVATE_KEY and PRIVPOOL_SPEND_KEY are ignored.
+    #[serde(default)]
+    pub start_with_new_wallet: bool,
+
+    /// Wallet private key as hex string (env: WALLET_PRIVATE_KEY, required unless START_WITH_NEW_WALLET=true)
     /// No files needed! Just provide the private key hex string.
-    #[validate(length(min = 1))]
-    pub wallet_private_key: String,
+    #[serde(default)]
+    pub wallet_private_key: Option<String>,
 
     /// Admin wallet private key used for auto-funding newly created wallets (env: ADMIN_WALLET_PRIVATE_KEY, optional)
     /// This key remains immutable and is not affected by restoreWallet.
@@ -57,11 +62,11 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub ligero_proof_service_url: Url,
 
-    /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
+    /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required unless START_WITH_NEW_WALLET=true)
     /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
-    /// This is REQUIRED to start the MCP server - deposits can only be made to your own privacy address
-    #[validate(length(min = 1))]
-    pub privpool_spend_key: String,
+    /// Required to start the MCP server unless START_WITH_NEW_WALLET=true.
+    #[serde(default)]
+    pub privpool_spend_key: Option<String>,
 
     /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
     /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
@@ -72,6 +77,20 @@ pub struct Config {
     /// This is added to the deposit amount to cover future transaction fees.
     #[serde(default)]
     pub auto_fund_gas_reserve: Option<String>,
+
+    /// Bearer token for the `/authority` HTTP endpoints (env: MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN).
+    ///
+    /// Uses the same token as the FVK service admin. If set, POST endpoints such as
+    /// `/authority/freeze` and `/authority/thaw` require `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub midnight_fvk_service_admin_token: Option<String>,
+
+    /// Optional base URL for `sov-metrics-api` (env: METRICS_API_URL, optional).
+    ///
+    /// When set, `/authority/tps` is backed by `GET <METRICS_API_URL>/tps?window_seconds=...`.
+    #[serde(default)]
+    #[validate(custom(function = "validate_http_url"))]
+    pub metrics_api_url: Option<Url>,
 }
 
 fn default_server_bind_address() -> String {
@@ -106,8 +125,27 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
-        let cfg: Self =
+        let mut cfg: Self =
             envy::from_env().context("Failed to load configuration from environment variables")?;
+
+        cfg.wallet_private_key = cfg
+            .wallet_private_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.privpool_spend_key = cfg
+            .privpool_spend_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.midnight_fvk_service_admin_token = cfg
+            .midnight_fvk_service_admin_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         // Validate all fields using the validator derive macro
         if let Err(errors) = cfg.validate() {

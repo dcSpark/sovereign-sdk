@@ -8,7 +8,7 @@ use std::str::FromStr;
 use const_rollup_config::{ROLLUP_BATCH_NAMESPACE_RAW, ROLLUP_PROOF_NAMESPACE_RAW};
 use sov_celestia_adapter::types::Namespace;
 
-mod midnight_bridge;
+// mod midnight_bridge; // Disabled: Midnight bridge not compiled into this rollup.
 mod mock_rollup;
 
 pub use mock_rollup::*;

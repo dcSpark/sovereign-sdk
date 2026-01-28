@@ -329,24 +329,12 @@ async fn fetch_spent_nullifiers(
 
     for chunk in values.chunks(NULLIFIER_CHUNK_SIZE) {
         let chunk_vec: Vec<String> = chunk.to_vec();
-        let transfer_rows = idx::midnight_transfer::Entity::find()
-            .filter(idx::midnight_transfer::Column::Nullifier.is_in(chunk_vec.clone()))
+        let rows = idx::midnight_spent_nullifiers::Entity::find()
+            .filter(idx::midnight_spent_nullifiers::Column::Nullifier.is_in(chunk_vec))
             .all(db)
             .await?;
-        for row in transfer_rows {
-            if let Some(nullifier) = row.nullifier {
-                spent.insert(normalize_nullifier(&nullifier));
-            }
-        }
-
-        let withdraw_rows = idx::midnight_withdraw::Entity::find()
-            .filter(idx::midnight_withdraw::Column::Nullifier.is_in(chunk_vec))
-            .all(db)
-            .await?;
-        for row in withdraw_rows {
-            if let Some(nullifier) = row.nullifier {
-                spent.insert(normalize_nullifier(&nullifier));
-            }
+        for row in rows {
+            spent.insert(normalize_nullifier(&row.nullifier));
         }
     }
 

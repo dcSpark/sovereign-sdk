@@ -49,6 +49,7 @@ CHAIN_ID="${CHAIN_ID:-4321}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
 ROLLUP_CONFIG_PATH="${ROLLUP_CONFIG_PATH:-$SCRIPT_DIR/rollup_config.toml}"
+LIGERO_PROOF_SERVICE_URL="${LIGERO_PROOF_SERVICE_URL:-http://127.0.0.1:1313}"
 
 # Optional: Skip verification for testing
 if [ -n "$SKIP_VERIFICATION" ]; then
@@ -104,4 +105,5 @@ exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
     --log-level "$LOG_LEVEL" \
     --max-concurrent "$MAX_CONCURRENT" \
     --rollup-config-path "$ROLLUP_CONFIG_PATH" \
+    --prover-service-url "$LIGERO_PROOF_SERVICE_URL" \
     $DEFER_FLAG

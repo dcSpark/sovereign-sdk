@@ -136,7 +136,7 @@ where
 
     // Query the indexer for transactions from the privacy pool address only
     let privacy_response = provider
-        .get_wallet_transactions(&privacy_address, None, None, None, None)
+        .get_wallet_transactions(&privacy_address, None, None, None)
         .await?;
 
     tracing::info!(

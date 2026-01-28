@@ -778,7 +778,7 @@ fn x25519_dh_roundtrip_requires_real_pk_ivk() -> Result<()> {
     let public_output = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -1038,7 +1038,7 @@ fn test_simple_note_spend() -> Result<()> {
     let public_output = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -1118,7 +1118,7 @@ fn test_simple_note_spend() -> Result<()> {
 
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
-    assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.nullifiers, vec![nf], "Nullifier mismatch!");
     assert_eq!(verified_output.withdraw_amount, withdraw_amount as u128);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
@@ -1129,7 +1129,7 @@ fn test_simple_note_spend() -> Result<()> {
     );
     println!(
         "  - Nullifier: {}",
-        hex::encode(&verified_output.nullifier[..8])
+        hex::encode(&verified_output.nullifiers[0][..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
     println!(

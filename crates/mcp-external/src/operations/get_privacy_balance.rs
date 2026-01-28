@@ -46,7 +46,7 @@ pub async fn get_privacy_balance(
 ) -> Result<PrivacyBalanceResult> {
     let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
-    tracing::info!(
+    tracing::debug!(
         "Fetching privacy pool balance for address {}",
         privacy_address
     );
@@ -89,7 +89,7 @@ pub async fn get_privacy_balance(
         })
         .collect();
 
-    tracing::info!(
+    tracing::debug!(
         "Privacy pool balance: {}, unspent notes: {}",
         balance,
         unspent_notes.len()

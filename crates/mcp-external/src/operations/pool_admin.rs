@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
-use midnight_privacy::{CallMessage as MidnightCallMessage, PrivacyAddress};
+use midnight_privacy::{
+    CallMessage as MidnightCallMessage, FrozenAddressesResponse, PrivacyAddress,
+};
 use sov_address::MultiAddressEvm;
 use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
@@ -89,11 +91,12 @@ pub async fn freeze_address(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -111,11 +114,12 @@ pub async fn unfreeze_address(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -133,11 +137,12 @@ pub async fn add_pool_admin(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
 }
@@ -155,11 +160,19 @@ pub async fn remove_pool_admin(
         .inspect_err(|e| tracing::error!("Failed to sign transaction: {:?}", e))
         .context("Failed to sign transaction")?;
 
-    let tx_hash = provider
+    let submit_result = provider
         .submit_to_verifier(raw_tx)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
+    let tx_hash = submit_result.tx_hash;
 
     Ok(AdminTxResult { tx_hash })
+}
+
+pub async fn list_frozen_addresses(provider: &Provider) -> Result<FrozenAddressesResponse> {
+    provider
+        .query_rest_endpoint("/modules/midnight-privacy/blacklist/frozen")
+        .await
+        .context("Failed to fetch frozen addresses from rollup")
 }

@@ -48,7 +48,10 @@ struct ServeArgs {
     )]
     bind: SocketAddr,
 
-    /// SQLite connection string for persisted state (issued FVKs + monotonic counter)
+    /// Database connection string for persisted state (issued FVKs + monotonic counter).
+    /// Supports both SQLite and PostgreSQL:
+    ///   SQLite:     sqlite://path/to/db.sqlite?mode=rwc
+    ///   PostgreSQL: postgresql://user:pass@host:port/dbname
     #[arg(
         long,
         env = "MIDNIGHT_FVK_SERVICE_DB",

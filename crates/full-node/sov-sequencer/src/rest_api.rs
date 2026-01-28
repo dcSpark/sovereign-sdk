@@ -433,7 +433,8 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            if proof_outputs.nullifier != nullifier_array {
+            if proof_outputs.nullifiers.len() != 1 || proof_outputs.nullifiers[0] != nullifier_array
+            {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
                     "nullifier does not match",
@@ -462,17 +463,40 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                 .try_into()
                 .map_err(|_| errors::bad_request_400("Invalid anchor_root length", ""))?;
 
-            let nullifier_hex = transfer
-                .get("nullifier")
-                .and_then(|v| v.as_str())
+            let nullifiers = transfer
+                .get("nullifiers")
+                .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    errors::bad_request_400("Invalid transaction data", "Missing nullifier")
+                    errors::bad_request_400("Invalid transaction data", "Missing nullifiers")
                 })?;
-            let nullifier_vec = Vec::from_hex(nullifier_hex.trim_start_matches("0x"))
-                .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
-            let nullifier_array: [u8; 32] = nullifier_vec
-                .try_into()
-                .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+            if nullifiers.is_empty() {
+                return Err(errors::bad_request_400(
+                    "Invalid transaction data",
+                    "nullifiers must be non-empty",
+                ));
+            }
+            if nullifiers.len() > 4 {
+                return Err(errors::bad_request_400(
+                    "Invalid transaction data",
+                    "nullifiers supports at most 4 entries",
+                ));
+            }
+
+            let mut nullifier_arrays: Vec<[u8; 32]> = Vec::with_capacity(nullifiers.len());
+            for (idx, n) in nullifiers.iter().enumerate() {
+                let hex = n.as_str().ok_or_else(|| {
+                    errors::bad_request_400(
+                        "Invalid transaction data",
+                        format!("nullifiers[{idx}] must be a hex string"),
+                    )
+                })?;
+                let v = Vec::from_hex(hex.trim_start_matches("0x"))
+                    .map_err(|err| errors::bad_request_400("Invalid nullifier hex", err))?;
+                let a: [u8; 32] = v
+                    .try_into()
+                    .map_err(|_| errors::bad_request_400("Invalid nullifier length", ""))?;
+                nullifier_arrays.push(a);
+            }
 
             let proof_outputs_str = model.proof_outputs.trim();
             if proof_outputs_str.is_empty() || proof_outputs_str == "{}" {
@@ -491,10 +515,10 @@ impl<Seq: Sequencer> SequencerApis<Seq> {
                     "anchor_root does not match",
                 ));
             }
-            if proof_outputs.nullifier != nullifier_array {
+            if proof_outputs.nullifiers != nullifier_arrays {
                 return Err(errors::bad_request_400(
                     "Proof outputs mismatch",
-                    "nullifier does not match",
+                    "nullifiers do not match",
                 ));
             }
             // For transfers, withdraw_amount must be 0

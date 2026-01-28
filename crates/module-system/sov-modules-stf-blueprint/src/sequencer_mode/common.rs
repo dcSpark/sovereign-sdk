@@ -121,7 +121,7 @@ fn attempt_tx<S: Spec, RT: Runtime<S>, I: StateProvider<S>>(
     runtime.post_dispatch_tx_hook(tx, ctx, state)?;
     let post_dispatch_time = post_dispatch_start.elapsed();
 
-    info!(
+    debug!(
         pre_dispatch_ms = format!("{:.2}", pre_dispatch_time.as_secs_f64() * 1000.0),
         dispatch_ms = format!("{:.2}", dispatch_time.as_secs_f64() * 1000.0),
         post_dispatch_ms = format!("{:.2}", post_dispatch_time.as_secs_f64() * 1000.0),

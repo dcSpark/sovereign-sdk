@@ -1,5 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
+use crate::ligero::Ligero as LigeroProver;
+use crate::privacy_key::PrivacyKey;
+use crate::provider::Provider;
+use crate::wallet::WalletContext;
 use demo_stf::runtime::Runtime;
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use rmcp::{
@@ -17,6 +23,7 @@ use rmcp::{
     ServerHandler,
 };
 use sov_address::MultiAddressEvm;
+use sov_api_spec::types::TxReceiptResult;
 use sov_bank::config_gas_token_id;
 use sov_ligero_adapter::Ligero;
 use sov_mock_da::MockDaSpec;
@@ -24,15 +31,7 @@ use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
-use tokio::sync::RwLock;
-use url::Url;
-use uuid::Uuid;
-
-use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use crate::ligero::Ligero as LigeroProver;
-use crate::privacy_key::PrivacyKey;
-use crate::provider::Provider;
-use crate::wallet::WalletContext;
+use tokio::sync::{Mutex, RwLock};
 
 pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
@@ -40,7 +39,7 @@ pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-async fn run_auto_fund_sequence(
+pub(crate) async fn run_auto_fund_sequence(
     provider: Arc<Provider>,
     admin_ctx: Arc<McpWalletContext>,
     dest_wallet_address: String,
@@ -48,7 +47,7 @@ async fn run_auto_fund_sequence(
     new_wallet_for_deposit: Arc<McpWalletContext>,
     deposit_amount: u128,
     auto_fund_gas_reserve: u128,
-) {
+) -> anyhow::Result<()> {
     // Total L2 funding: deposit amount + extra for gas fees
     let min_gas_reserve = crate::operations::DEFAULT_MAX_FEE;
     let gas_reserve = if auto_fund_gas_reserve < min_gas_reserve {
@@ -109,27 +108,65 @@ async fn run_auto_fund_sequence(
     .await
     {
         Ok(res) => {
+            let tx_hash = res.tx_hash.trim().to_string();
             tracing::info!(
                 "[auto-fund/createWallet] Step 1 complete: L2 funding tx {}",
-                res.tx_hash
+                tx_hash
             );
-            let tx_hash = match res.tx_hash.parse() {
-                Ok(hash) => hash,
-                Err(e) => {
-                    tracing::warn!(
-                        "[auto-fund/createWallet] Failed to parse L2 funding tx hash {}: {}. Skipping Step 2.",
-                        res.tx_hash,
-                        e
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = provider.wait_for_tx_processing(&tx_hash).await {
+            if tx_hash.is_empty() {
                 tracing::warn!(
-                    "[auto-fund/createWallet] Failed waiting for L2 funding tx processing: {}. Skipping Step 2.",
-                    e
+                    "[auto-fund/createWallet] L2 funding tx hash is empty; skipping Step 2."
                 );
-                return;
+                anyhow::bail!("L2 funding tx hash is empty");
+            }
+
+            let tx_max_wait = std::time::Duration::from_secs(300);
+            let tx_poll_interval = std::time::Duration::from_secs(2);
+            let tx_started = std::time::Instant::now();
+
+            loop {
+                match provider.get_sequencer_tx(&tx_hash).await {
+                    Ok(Some(tx)) => match &tx.receipt.result {
+                        TxReceiptResult::Successful => {
+                            tracing::info!(
+                                "[auto-fund/createWallet] L2 funding tx accepted by sequencer: receipt={:?}",
+                                tx.receipt.result
+                            );
+                            break;
+                        }
+                        TxReceiptResult::Reverted | TxReceiptResult::Skipped => {
+                            tracing::warn!(
+                                    "[auto-fund/createWallet] L2 funding tx failed in sequencer: receipt={:?}. Skipping Step 2.",
+                                    tx.receipt.result
+                                );
+                            anyhow::bail!(
+                                "L2 funding tx failed in sequencer: receipt={:?}",
+                                tx.receipt.result
+                            );
+                        }
+                    },
+                    Ok(None) => {
+                        tracing::info!(
+                            "[auto-fund/createWallet] Waiting for L2 funding tx {} to appear in sequencer",
+                            tx_hash
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[auto-fund/createWallet] Failed to query sequencer for L2 funding tx receipt: {}",
+                            e
+                        );
+                    }
+                }
+
+                if tx_started.elapsed() >= tx_max_wait {
+                    tracing::warn!(
+                        "[auto-fund/createWallet] Timed out waiting for L2 funding tx in sequencer; skipping Step 2."
+                    );
+                    anyhow::bail!("Timed out waiting for L2 funding tx in sequencer");
+                }
+
+                tokio::time::sleep(tx_poll_interval).await;
             }
 
             let dest_wallet_address_parsed: <McpSpec as Spec>::Address = match dest_wallet_address
@@ -142,7 +179,7 @@ async fn run_auto_fund_sequence(
                             dest_wallet_address,
                             e
                         );
-                    return;
+                    anyhow::bail!("Invalid L2 wallet address '{}': {}", dest_wallet_address, e);
                 }
             };
 
@@ -181,7 +218,7 @@ async fn run_auto_fund_sequence(
                     tracing::warn!(
                         "[auto-fund/createWallet] Timed out waiting for L2 funding; skipping privacy deposit"
                     );
-                    return;
+                    anyhow::bail!("Timed out waiting for L2 funding balance");
                 }
 
                 tokio::time::sleep(poll_interval).await;
@@ -201,15 +238,22 @@ async fn run_auto_fund_sequence(
             )
             .await
             {
-                Ok(res) => tracing::info!(
-                    "[auto-fund/createWallet] Step 2 complete: Privacy pool deposit tx {}",
-                    res.tx_hash
-                ),
+                Ok(res) => {
+                    tracing::info!(
+                        "[auto-fund/createWallet] Step 2 complete: Privacy pool deposit tx {}",
+                        res.tx_hash
+                    );
+                    Ok(())
+                }
                 Err(e) => {
                     tracing::warn!(
                         "[auto-fund/createWallet] Step 2 failed (privacy pool deposit): {}",
                         e
-                    )
+                    );
+                    Err(anyhow::anyhow!(
+                        "Step 2 failed (privacy pool deposit): {}",
+                        e
+                    ))
                 }
             }
         }
@@ -217,7 +261,8 @@ async fn run_auto_fund_sequence(
             tracing::warn!(
                 "[auto-fund/createWallet] Step 1 failed (L2 funding): {}. Skipping Step 2.",
                 e
-            )
+            );
+            Err(anyhow::anyhow!("Step 1 failed (L2 funding): {}", e))
         }
     }
 }
@@ -231,23 +276,20 @@ pub struct SendFundsRequest {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct SendFundsResult {
-    /// Transaction hash from the rollup (available once submitted)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_hash: Option<String>,
-    /// Privacy transfer hash if we spent an unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note_tx_hash: Option<String>,
-    /// Deterministic UUID derived from the privacy tx hash
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "noteTxIdentifier")]
-    pub note_tx_identifier: Option<String>,
-    /// Amount sent from the unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note_amount: Option<String>,
-    /// Error if we couldn't send an unspent note
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "noteError")]
-    pub note_error: Option<String>,
+    /// Transaction hash from the rollup.
+    pub id: String,
+    /// Current transaction state (always "initiated").
+    pub state: String,
+    /// Post-submit confirmation status.
+    pub confirmation: String,
+    /// Recipient wallet address.
+    #[serde(rename = "toAddress")]
+    pub to_address: String,
+    /// Amount sent.
+    pub amount: String,
+    /// Timestamp (ms since epoch) when the transaction was created.
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -269,111 +311,119 @@ pub struct GetWalletBalanceResult {
     /// Coins that are pending and not yet available for spending
     #[serde(rename = "pendingBalance")]
     pub pending_balance: String,
-    /// Available unspent notes that back the balance
-    pub unspent_notes: Vec<UnspentNoteInfo>,
 }
 
-// Types for GetTransaction
+// Types for VerifyTransaction
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetTransactionRequest {
-    /// Transaction hash ID (with or without 0x prefix)
-    pub tx_hash: String,
+pub struct VerifyTransactionRequest {
+    /// Transaction hash identifier
+    pub identifier: String,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionResult {
+pub struct VerifyTransactionLag {
+    #[serde(rename = "applyGap")]
+    pub apply_gap: String,
+    #[serde(rename = "sourceGap")]
+    pub source_gap: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct VerifyTransactionSyncStatus {
+    #[serde(rename = "syncedIndices")]
+    pub synced_indices: String,
+    pub lag: VerifyTransactionLag,
+    #[serde(rename = "isFullySynced")]
+    pub is_fully_synced: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct VerifyTransactionResult {
+    /// Whether the transaction exists in the wallet
+    pub exists: bool,
+    #[serde(rename = "syncStatus")]
+    pub sync_status: VerifyTransactionSyncStatus,
+    /// Amount of the transaction (if known)
+    #[serde(rename = "transactionAmount")]
+    pub transaction_amount: String,
+}
+
+// Types for GetTransactionStatus
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusRequest {
+    /// Transaction hash identifier
+    #[serde(rename = "transactionId")]
+    pub transaction_id: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusRecord {
     /// Transaction hash
-    pub tx_hash: String,
-    /// Transaction status (e.g., "Success", "Failed", or "pending" if not yet indexed)
-    pub status: String,
-    /// Timestamp in milliseconds (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<i64>,
-    /// Transaction kind (e.g., "deposit", "withdraw", "transfer")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// Sender address (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    /// Recipient address (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
-    /// Transaction amount (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<String>,
-    /// Anchor root for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anchor_root: Option<String>,
-    /// Nullifier for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nullifier: Option<String>,
-    /// View Full Viewing Keys (FVKs) for note decryption
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub view_fvks: Option<serde_json::Value>,
-    /// View attestations for privacy proofs
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub view_attestations: Option<serde_json::Value>,
-    /// Transaction events from the rollup
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub events: Option<serde_json::Value>,
-    /// Encrypted notes for privacy transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encrypted_notes: Option<serde_json::Value>,
-    /// Full transaction payload
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
+    pub id: String,
+    /// Current transaction state
+    pub state: String,
+    /// Sender address
+    #[serde(rename = "fromAddress")]
+    pub from_address: String,
+    /// Recipient address
+    #[serde(rename = "toAddress")]
+    pub to_address: String,
+    /// Amount in dust format
+    pub amount: String,
+    /// Transaction identifier (when available)
+    #[serde(rename = "txIdentifier", skip_serializing_if = "Option::is_none")]
+    pub tx_identifier: Option<String>,
+    /// Timestamp of creation
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    /// Timestamp of last update
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+    /// Error message if transaction failed
+    #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusLag {
+    #[serde(rename = "applyGap")]
+    pub apply_gap: String,
+    #[serde(rename = "sourceGap")]
+    pub source_gap: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusSyncStatus {
+    #[serde(rename = "syncedIndices")]
+    pub synced_indices: String,
+    pub lag: GetTransactionStatusLag,
+    #[serde(rename = "isFullySynced")]
+    pub is_fully_synced: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusBlockchainStatus {
+    pub exists: bool,
+    #[serde(rename = "syncStatus")]
+    pub sync_status: GetTransactionStatusSyncStatus,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct GetTransactionStatusResult {
+    pub transaction: GetTransactionStatusRecord,
+    #[serde(rename = "blockchainStatus", skip_serializing_if = "Option::is_none")]
+    pub blockchain_status: Option<GetTransactionStatusBlockchainStatus>,
 }
 
 // Types for GetTransactions
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetTransactionsRequest {}
 
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct TransactionRecord {
-    /// Transaction hash
-    pub id: String,
-    /// Current state ("initiated", "sent", "completed", or "failed")
-    pub state: String,
-    /// Sender address (or "encrypted" if unavailable)
-    #[serde(rename = "fromAddress")]
-    pub from_address: String,
-    /// Recipient address (or "encrypted" if unavailable)
-    #[serde(rename = "toAddress")]
-    pub to_address: String,
-    /// Amount in dust format (or "encrypted" if unavailable)
-    pub amount: String,
-    /// Transaction identifier (once available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "txIdentifier")]
-    pub tx_identifier: Option<String>,
-    /// Timestamp of creation (milliseconds)
-    #[serde(rename = "createdAt")]
-    pub created_at: i64,
-    /// Timestamp of last update (milliseconds)
-    #[serde(rename = "updatedAt")]
-    pub updated_at: i64,
-    /// Error message if transaction failed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "errorMessage")]
-    pub error_message: Option<String>,
-}
+type GetTransactionsRecord = GetTransactionStatusRecord;
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionsResult {
-    /// Array of transaction records
-    pub transactions: Vec<TransactionRecord>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusRequest {
-    /// Transaction hash (with or without 0x prefix)
-    pub id: String,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct GetTransactionStatusResult {
-    pub transaction: TransactionRecord,
-}
+#[serde(transparent)]
+pub struct GetTransactionsResult(pub Vec<GetTransactionsRecord>);
 
 // Types for GetWalletConfig
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -486,6 +536,17 @@ pub struct UnfreezeAddressRequest {
 pub struct UnfreezeAddressResult {
     /// Transaction hash from the rollup
     pub tx_hash: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ListFrozenAddressesRequest {}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct ListFrozenAddressesResult {
+    /// Frozen privacy pool addresses (bech32m format: privpool1...)
+    pub addresses: Vec<String>,
+    /// Total count.
+    pub count: u64,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -641,50 +702,6 @@ pub struct RemoveWalletResult {
     pub message: String,
 }
 
-// Types for VerifyTransaction
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct VerifyTransactionRequest {
-    /// The transaction hash (tx_hash) to verify. This is the rollup transaction hash returned from send/deposit operations.
-    /// Can be provided with or without the '0x' prefix.
-    pub identifier: String,
-}
-
-/// Sync status information for transaction verification
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifySyncStatus {
-    /// Indices that have been synced
-    #[serde(rename = "syncedIndices")]
-    pub synced_indices: String,
-    /// Lag information
-    pub lag: VerifyLagInfo,
-    /// Whether the wallet is fully synced
-    #[serde(rename = "isFullySynced")]
-    pub is_fully_synced: bool,
-}
-
-/// Lag information for transaction verification
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifyLagInfo {
-    /// Apply gap value
-    #[serde(rename = "applyGap")]
-    pub apply_gap: String,
-    /// Source gap value
-    #[serde(rename = "sourceGap")]
-    pub source_gap: String,
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub struct VerifyTransactionResult {
-    /// Whether the transaction exists in the wallet
-    pub exists: bool,
-    /// Current sync status information
-    #[serde(rename = "syncStatus")]
-    pub sync_status: VerifySyncStatus,
-    /// The amount of the transaction (in dust format), or "encrypted" if cannot decrypt
-    #[serde(rename = "transactionAmount")]
-    pub transaction_amount: String,
-}
-
 // Types for WalletStatus
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct GetWalletStatusRequest {}
@@ -747,21 +764,63 @@ pub struct GetWalletStatusResult {
     pub is_fully_synced: bool,
 }
 
+const DEFAULT_PENDING_SPENT_NOTE_TTL_SECS: u64 = 120;
+const DEFAULT_WAIT_FOR_FRESH_NOTES_SECS: u64 = 5;
+
+fn pending_spent_note_ttl() -> std::time::Duration {
+    let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PENDING_SPENT_NOTE_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn wait_for_fresh_notes_secs() -> u64 {
+    std::env::var("MCP_WAIT_FOR_FRESH_NOTES_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WAIT_FOR_FRESH_NOTES_SECS)
+}
+
+#[derive(Debug, Default)]
+struct PendingSpentNotes {
+    by_rho: HashMap<String, std::time::Instant>,
+}
+
+impl PendingSpentNotes {
+    fn purge_expired(&mut self) {
+        let ttl = pending_spent_note_ttl();
+        self.by_rho
+            .retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalNotes {
+    by_rho: HashMap<String, crate::operations::SpendableNote>,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
-    wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
+    wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
     admin_wallet_context: Option<Arc<McpWalletContext>>,
     ligero_prover: Option<Arc<LigeroProver>>,
     viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
-    privacy_key: Arc<RwLock<PrivacyKey>>,
+    privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
     auto_fund_gas_reserve: u128,
     /// Tracks whether a wallet has been explicitly loaded via createWallet or restoreWallet.
     /// When true, createWallet and restoreWallet will fail until removeWallet is called.
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
+    /// Best-effort local cache of recently-spent note identifiers (rho hex), used to avoid
+    /// double-spending when the indexer lags behind the sequencer.
+    pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
+    /// Best-effort local cache of newly-created change notes (owned by this wallet),
+    /// so consecutive sends don't have to wait for indexer lag.
+    local_notes: Arc<Mutex<LocalNotes>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
@@ -769,11 +828,11 @@ pub struct CryptoServer {
 impl CryptoServer {
     pub fn new(
         provider: Arc<Provider>,
-        wallet_context: Arc<RwLock<McpWalletContext>>,
+        wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
         admin_wallet_context: Option<Arc<McpWalletContext>>,
         ligero_prover: Arc<LigeroProver>,
         viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
-        privacy_key: Arc<RwLock<PrivacyKey>>,
+        privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
         auto_fund_gas_reserve: u128,
@@ -782,7 +841,7 @@ impl CryptoServer {
         Self {
             tool_router: Self::tool_router(),
             provider: Some(provider),
-            wallet_context: Some(wallet_context),
+            wallet_context,
             admin_wallet_context,
             ligero_prover: Some(ligero_prover),
             viewer_fvk_bundle,
@@ -791,13 +850,15 @@ impl CryptoServer {
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
             wallet_explicitly_loaded,
+            pending_spent_notes: Arc::new(Mutex::new(PendingSpentNotes::default())),
+            local_notes: Arc::new(Mutex::new(LocalNotes::default())),
         }
     }
 
-    /// Send funds from the privacy pool using the first available unspent note.
+    /// Send funds from the privacy pool using up to 4 unspent notes (largest-first).
     #[tool(
         name = "send",
-        description = "Send funds from the privacy pool to a destination privacy address. Uses the first unspent note and submits a privacy transfer."
+        description = "Send funds from the privacy pool to a destination privacy address. Selects up to 4 unspent notes (largest-first) and submits a privacy transfer."
     )]
     async fn send_funds(
         &self,
@@ -813,9 +874,10 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
@@ -832,6 +894,12 @@ impl CryptoServer {
             })?;
 
         let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse().map_err(|e| {
             ErrorData::invalid_params(
                 format!(
@@ -857,164 +925,198 @@ impl CryptoServer {
             ));
         }
 
-        let ctx_guard = wallet_ctx.read().await;
+        let from_privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
+        let send_span = tracing::info_span!(
+            "send",
+            from = %from_privacy_address,
+            to = %output_privacy_addr,
+            amount = send_amount
+        );
+        let _send_guard = send_span.enter();
+        let send_started = std::time::Instant::now();
 
-        let privacy_result = crate::operations::get_privacy_balance(
-            provider,
-            &*privacy_key_guard,
-            Some(&viewing_key),
-        )
-        .await
-        .map_err(|e| {
-            ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
-        })?;
+        let notes_wait_started = std::time::Instant::now();
+        let notes_wait_limit = std::time::Duration::from_secs(wait_for_fresh_notes_secs());
+        let mut notes_fetch_attempts: u64 = 0;
+        let mut notes_fetch_ms_total: u128 = 0;
+        let mut notes_filtered_pending_total: u64 = 0;
+        let mut notes_added_local_total: u64 = 0;
+        let mut notes_returned_by_indexer_last: usize;
 
-        if privacy_result.unspent_notes.is_empty() {
+        let notes = loop {
+            notes_fetch_attempts += 1;
+            let fetch_started = std::time::Instant::now();
+            let mut notes =
+                crate::operations::get_privacy_notes(provider, privacy_key, Some(&viewing_key))
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!("Failed to fetch unspent notes: {}", e),
+                            None,
+                        )
+                    })?;
+            notes_fetch_ms_total += fetch_started.elapsed().as_millis();
+            notes_returned_by_indexer_last = notes.len();
+
+            let local_notes: Vec<crate::operations::SpendableNote> = {
+                let local = self.local_notes.lock().await;
+                local.by_rho.values().cloned().collect()
+            };
+
+            let filtered = {
+                let mut pending = self.pending_spent_notes.lock().await;
+                pending.purge_expired();
+                let before = notes.len();
+                notes.retain(|n| !pending.by_rho.contains_key(&n.rho));
+                before.saturating_sub(notes.len())
+            };
+            if filtered > 0 {
+                notes_filtered_pending_total += filtered as u64;
+                tracing::debug!(
+                    "[send] Filtered {} locally-pending spent note(s) from indexer results",
+                    filtered
+                );
+            }
+
+            if !local_notes.is_empty() {
+                let mut seen: std::collections::HashSet<String> =
+                    notes.iter().map(|n| n.rho.clone()).collect();
+                let mut added = 0usize;
+                for note in local_notes {
+                    if seen.insert(note.rho.clone()) {
+                        notes.push(note);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    notes_added_local_total += added as u64;
+                    tracing::debug!("[send] Added {} local change note(s) to candidates", added);
+                }
+            }
+
+            if !notes.is_empty() || notes_wait_started.elapsed() >= notes_wait_limit {
+                break notes;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+
+        let notes_wait_ms = notes_wait_started.elapsed().as_millis();
+        tracing::debug!(
+            notes_wait_ms,
+            notes_fetch_attempts,
+            notes_fetch_ms_total,
+            notes_returned_by_indexer_last,
+            notes_filtered_pending_total,
+            notes_added_local_total,
+            notes_candidates = notes.len(),
+            "Unspent notes ready"
+        );
+
+        if notes.is_empty() {
             return Err(ErrorData::invalid_params(
                 "No unspent notes available to send.".to_string(),
                 None,
             ));
         }
 
-        // Smart note selection: choose the best note based on the amount
-        // Strategy:
-        // 1. Look for exact match (no change needed)
-        // 2. If no exact match, find smallest note >= send_amount (minimize change)
-        // 3. If no note is large enough, fail with insufficient funds error
-        let note = {
-            let mut exact_match = None;
-            let mut smallest_sufficient = None;
-            let mut smallest_sufficient_value = u128::MAX;
+        let selection_started = std::time::Instant::now();
+        let selected = crate::operations::select_largest_notes_covering_amount(
+            notes,
+            send_amount,
+            crate::viewer::MAX_INS,
+        )
+        .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
 
-            for n in &privacy_result.unspent_notes {
-                if n.value == send_amount {
-                    // Perfect match found
-                    exact_match = Some(n);
-                    break;
-                } else if n.value > send_amount && n.value < smallest_sufficient_value {
-                    // Track smallest note that's larger than needed
-                    smallest_sufficient = Some(n);
-                    smallest_sufficient_value = n.value;
-                }
-            }
-
-            match exact_match.or(smallest_sufficient) {
-                Some(n) => n,
-                None => {
-                    let total_balance: u128 =
-                        privacy_result.unspent_notes.iter().map(|n| n.value).sum();
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "Insufficient funds: trying to send {} but no single note is large enough. Total balance: {}, available notes: {}",
-                            send_amount,
-                            total_balance,
-                            privacy_result.unspent_notes.len()
-                        ),
-                        None,
-                    ));
-                }
-            }
-        };
-
+        let total_in: u128 = selected.iter().map(|n| n.value).sum();
+        let selection_ms = selection_started.elapsed().as_millis();
         tracing::info!(
-            "[send] Selected note - value: {}, tx_hash: {}, strategy: {}",
-            note.value,
-            note.tx_hash,
-            if note.value == send_amount {
-                "exact match"
-            } else {
-                "smallest sufficient"
-            }
+            elapsed_ms = selection_ms,
+            selected_inputs = selected.len(),
+            total_in,
+            "Selected input notes"
         );
 
-        let rho_bytes = match hex::decode(note.rho.trim_start_matches("0x")) {
-            Ok(bytes) if bytes.len() == 32 => bytes,
-            Ok(bytes) => {
-                return Err(ErrorData::internal_error(
-                    format!("Invalid rho length ({} bytes)", bytes.len()),
-                    None,
-                ));
-            }
-            Err(e) => {
-                return Err(ErrorData::internal_error(
-                    format!("Failed to decode rho: {}", e),
-                    None,
-                ));
-            }
-        };
+        tracing::debug!(
+            "[send] Selected {} input notes (total_in={}, send_amount={})",
+            selected.len(),
+            total_in,
+            send_amount
+        );
 
-        let mut input_rho = [0u8; 32];
-        input_rho.copy_from_slice(&rho_bytes);
-        let input_recipient = privacy_key_guard.recipient(&DOMAIN);
-        let input_sender_id: [u8; 32] = if let Some(sender_id_hex) = note.sender_id.as_deref() {
-            let bytes = hex::decode(sender_id_hex.trim_start_matches("0x")).map_err(|e| {
+        let inputs_started = std::time::Instant::now();
+        let mut inputs: Vec<crate::operations::TransferInputNote> =
+            Vec::with_capacity(selected.len());
+        for (idx, n) in selected.iter().enumerate() {
+            let rho = parse_hex_32("rho", &n.rho).map_err(|e| {
                 ErrorData::internal_error(
-                    format!("Invalid sender_id in note (hex decode failed): {}", e),
+                    format!("Failed to decode rho for input {}: {}", idx, e),
                     None,
                 )
             })?;
-            if bytes.len() != 32 {
-                return Err(ErrorData::internal_error(
-                    format!(
-                        "Invalid sender_id length in note (expected 32 bytes, got {})",
-                        bytes.len()
-                    ),
+            let sender_id = parse_hex_32("sender_id", &n.sender_id).map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Failed to decode sender_id for input {}: {}", idx, e),
                     None,
-                ));
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            out
-        } else {
-            // Deposit-style note: sender_id is derived deterministically as recipient.
-            input_recipient
-        };
+                )
+            })?;
+
+            tracing::debug!(
+                "[send] Input[{}] value={} rho={} sender_id={} created_tx={}",
+                idx,
+                n.value,
+                &n.rho,
+                &n.sender_id,
+                n.tx_hash
+            );
+
+            inputs.push(crate::operations::TransferInputNote {
+                value: n.value,
+                rho,
+                sender_id,
+            });
+        }
+        let inputs_ms = inputs_started.elapsed().as_millis();
+        tracing::debug!(elapsed_ms = inputs_ms, "Prepared transfer inputs");
         let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
-        tracing::info!(
-            "[send] Input note - value: {}, rho: {}, recipient: {}",
-            note.value,
-            hex::encode(&input_rho),
-            hex::encode(&input_recipient)
-        );
-        tracing::info!(
+        tracing::debug!(
             "[send] Output recipient (destination): {}",
             hex::encode(&output_recipient)
         );
 
-        if send_amount < note.value {
-            let change_amt = note.value - send_amount;
-            tracing::info!(
+        if total_in > send_amount {
+            let change_amt = total_in - send_amount;
+            tracing::debug!(
                 "[send] Transfer includes change output - amount: {}",
                 change_amt
             );
         } else {
-            tracing::info!("[send] No change needed - sending full note value");
+            tracing::debug!("[send] No change needed - sending full note value");
         }
 
-        let spend_sk = privacy_key_guard.spend_sk().copied().ok_or_else(|| {
+        let spend_sk = privacy_key.spend_sk().copied().ok_or_else(|| {
             ErrorData::internal_error(
                 "privacy key missing spend_sk; cannot spend note".to_string(),
                 None,
             )
         })?;
-        let pk_ivk_owner = privacy_key_guard.pk_ivk(&DOMAIN);
+        let pk_ivk_owner = privacy_key.pk_ivk(&DOMAIN);
         let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Ligero proof service not configured; set LIGERO_PROOF_SERVICE_URL.".to_string(),
                 None,
             )
         })?;
+        let transfer_started = std::time::Instant::now();
         let transfer_result = crate::operations::transfer(
             ligero_ref,
             provider,
-            &*ctx_guard,
+            ctx,
             spend_sk,
             pk_ivk_owner,
-            note.value,
             send_amount,
-            input_rho,
-            input_sender_id,
+            inputs,
             output_pk,
             output_pk_ivk,
             viewer_fvk_bundle_for_transfer,
@@ -1023,13 +1125,61 @@ impl CryptoServer {
         .map_err(|e| {
             ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
         })?;
+        let transfer_ms = transfer_started.elapsed().as_millis();
+        tracing::debug!(
+            elapsed_ms = transfer_ms,
+            tx_hash = %transfer_result.tx_hash,
+            "Transfer call completed"
+        );
+
+        {
+            let mut pending = self.pending_spent_notes.lock().await;
+            let mut local = self.local_notes.lock().await;
+            pending.purge_expired();
+            let now = std::time::Instant::now();
+            for note in &selected {
+                pending.by_rho.insert(note.rho.clone(), now);
+                local.by_rho.remove(&note.rho);
+            }
+
+            if let (Some(change_amount), Some(change_rho)) =
+                (transfer_result.change_amount, transfer_result.change_rho)
+            {
+                let rho_hex = hex::encode(change_rho);
+                let sender_id_hex = hex::encode(privacy_key.recipient(&DOMAIN));
+                local.by_rho.insert(
+                    rho_hex.clone(),
+                    crate::operations::SpendableNote {
+                        value: change_amount,
+                        rho: rho_hex,
+                        sender_id: sender_id_hex,
+                        tx_hash: transfer_result.tx_hash.clone(),
+                        timestamp_ms: transfer_result.created_at,
+                        kind: "transfer".to_string(),
+                    },
+                );
+            }
+        }
+
+        let created_at = transfer_result.created_at;
+        let total_ms = send_started.elapsed().as_millis();
+        tracing::info!(
+            total_ms,
+            notes_wait_ms,
+            selection_ms,
+            inputs_ms,
+            transfer_ms,
+            tx_hash = %transfer_result.tx_hash,
+            "Send completed"
+        );
 
         let result = SendFundsResult {
-            tx_hash: Some(transfer_result.tx_hash),
-            note_tx_hash: None,
-            note_tx_identifier: None,
-            note_amount: None,
-            note_error: None,
+            id: transfer_result.tx_hash,
+            state: "initiated".to_string(),
+            confirmation: transfer_result.confirmation.as_str().to_string(),
+            to_address: output_privacy_addr.to_string(),
+            amount: send_amount.to_string(),
+            created_at,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1054,46 +1204,29 @@ impl CryptoServer {
             )
         })?;
 
-        let _wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                None,
-            )
-        })?;
-
         let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
         let viewing_key = viewer_fvk_guard
             .as_ref()
             .map(|bundle| midnight_privacy::FullViewingKey(bundle.fvk));
 
         let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
 
-        let privacy_result = crate::operations::get_privacy_balance(
-            provider,
-            &*privacy_key_guard,
-            viewing_key.as_ref(),
-        )
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let privacy_result =
+            crate::operations::get_privacy_balance(provider, privacy_key, viewing_key.as_ref())
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let balance = privacy_result.balance;
-        let unspent_notes = privacy_result
-            .unspent_notes
-            .into_iter()
-            .map(|note| UnspentNoteInfo {
-                value: note.value.to_string(),
-                rho: note.rho,
-                sender_id: note.sender_id,
-                tx_hash: note.tx_hash,
-                timestamp_ms: note.timestamp_ms,
-                kind: note.kind,
-            })
-            .collect();
 
         let result = GetWalletBalanceResult {
             balance: balance.to_string(),
             pending_balance: "0".to_string(),
-            unspent_notes,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1111,7 +1244,13 @@ impl CryptoServer {
         Parameters(_params): Parameters<GetWalletAddressRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let privacy_key_guard = self.privacy_key.read().await;
-        let privacy_address = privacy_key_guard.privacy_address(&DOMAIN).to_string();
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
+        let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
         let result = GetWalletAddressResult {
             address: privacy_address,
@@ -1122,15 +1261,14 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get full details of a transaction by its ID.
-    /// Retrieves complete transaction information from the indexer including status, kind, amounts, and privacy fields.
+    /// Verify if a transaction has been received.
     #[tool(
-        name = "getTransaction",
-        description = "Get transaction details by its ID. Retrieves complete transaction information including status, kind, amounts, and privacy-related fields."
+        name = "verifyTransaction",
+        description = "Verify if a transaction has been received. Checks whether the transaction hash exists in the wallet."
     )]
-    async fn get_transaction(
+    async fn verify_transaction(
         &self,
-        Parameters(params): Parameters<GetTransactionRequest>,
+        Parameters(params): Parameters<VerifyTransactionRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
@@ -1139,65 +1277,51 @@ impl CryptoServer {
             )
         })?;
 
-        // Allow lookup by either tx_hash or a UUIDv5 derived from the tx hash (legacy helper)
-        let tx_hash = if Uuid::parse_str(&params.tx_hash).is_ok() {
-            let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "Wallet context not configured. Please set WALLET_PATH environment variable.",
-                    None,
-                )
-            })?;
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
+        let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
 
-            let ctx = wallet_ctx.read().await;
-            let privacy_key_guard = self.privacy_key.read().await;
-            let target_uuid = Uuid::parse_str(&params.tx_hash).map_err(|e| {
-                ErrorData::invalid_params(format!("Invalid transaction ID format: {}", e), None)
-            })?;
-
-            let transactions =
-                crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-            transactions
-                .into_iter()
-                .find_map(|tx| {
-                    let candidate = Uuid::new_v5(&Uuid::NAMESPACE_OID, tx.tx_hash.as_bytes());
-                    if candidate == target_uuid {
-                        Some(tx.tx_hash)
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| {
-                    ErrorData::invalid_params(
-                        "Transaction ID not found for this wallet. Try querying by tx hash.",
-                        None,
-                    )
-                })?
-        } else {
-            params.tx_hash.clone()
-        };
-
-        let tx_details = crate::operations::get_transaction_status(provider, &tx_hash)
+        let transactions = crate::operations::get_transactions(provider, ctx, privacy_key)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let result = GetTransactionResult {
-            tx_hash: tx_details.tx_hash,
-            status: tx_details.status,
-            timestamp_ms: tx_details.timestamp_ms,
-            kind: tx_details.kind,
-            sender: tx_details.sender,
-            recipient: tx_details.recipient,
-            amount: tx_details.amount,
-            anchor_root: tx_details.anchor_root,
-            nullifier: tx_details.nullifier,
-            view_fvks: tx_details.view_fvks,
-            view_attestations: tx_details.view_attestations,
-            events: tx_details.events,
-            encrypted_notes: tx_details.encrypted_notes,
-            payload: tx_details.payload,
+        let normalize = |value: &str| value.trim().trim_start_matches("0x").to_ascii_lowercase();
+        let target = normalize(&params.identifier);
+
+        let mut exists = false;
+        let mut transaction_amount = "0".to_string();
+        if let Some(tx) = transactions
+            .into_iter()
+            .find(|tx| normalize(&tx.tx_hash) == target)
+        {
+            exists = true;
+            if let Some(amount) = tx.amount {
+                transaction_amount = amount;
+            }
+        }
+
+        let result = VerifyTransactionResult {
+            exists,
+            sync_status: VerifyTransactionSyncStatus {
+                synced_indices: "".to_string(),
+                lag: VerifyTransactionLag {
+                    apply_gap: "".to_string(),
+                    source_gap: "".to_string(),
+                },
+                is_fully_synced: true,
+            },
+            transaction_amount,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1205,10 +1329,10 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Get the status of a transaction by its transaction hash.
+    /// Get the status of a transaction by its ID.
     #[tool(
         name = "getTransactionStatus",
-        description = "Get the status of a transaction by its hash. Returns the latest indexed state and txIdentifier."
+        description = "Get the status of a transaction by its ID. Retrieves the current status of a specific transaction."
     )]
     async fn get_transaction_status(
         &self,
@@ -1216,18 +1340,49 @@ impl CryptoServer {
     ) -> Result<CallToolResult, ErrorData> {
         let provider = self.provider.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
             )
         })?;
 
-        let tx_details = crate::operations::get_transaction_status(provider, &params.id)
+        let tx = crate::operations::get_transaction_status(provider, &params.transaction_id)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let record = details_to_record(tx_details);
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.to_ascii_lowercase().contains("not found") {
+                    ErrorData::invalid_params(
+                        "Transaction not found for this wallet.".to_string(),
+                        None,
+                    )
+                } else {
+                    ErrorData::internal_error(msg, None)
+                }
+            })?;
+
+        let transaction = build_transaction_record(
+            tx.tx_hash.clone(),
+            Some(tx.status.clone()),
+            tx.privacy_sender.clone(),
+            tx.sender.clone(),
+            tx.privacy_recipient.clone(),
+            tx.recipient.clone(),
+            tx.amount.clone(),
+            tx.timestamp_ms.unwrap_or(0),
+        );
 
         let result = GetTransactionStatusResult {
-            transaction: record,
+            transaction,
+            blockchain_status: Some(GetTransactionStatusBlockchainStatus {
+                exists: true,
+                sync_status: GetTransactionStatusSyncStatus {
+                    synced_indices: "".to_string(),
+                    lag: GetTransactionStatusLag {
+                        apply_gap: "".to_string(),
+                        source_gap: "".to_string(),
+                    },
+                    is_fully_synced: true,
+                },
+            }),
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1252,31 +1407,44 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
+                None,
+            )
+        })?;
+        let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
 
-        let ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
+        let transactions = crate::operations::get_transactions(provider, ctx, privacy_key)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let transactions =
-            crate::operations::get_transactions(provider, &*ctx, &*privacy_key_guard)
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let transaction_records: Vec<TransactionRecord> = transactions
+        let transaction_records: Vec<GetTransactionsRecord> = transactions
             .into_iter()
-            .map(transaction_to_record)
+            .map(|tx| {
+                build_transaction_record(
+                    tx.tx_hash,
+                    tx.status,
+                    tx.privacy_sender,
+                    tx.sender,
+                    tx.privacy_recipient,
+                    tx.recipient,
+                    tx.amount,
+                    tx.timestamp_ms,
+                )
+            })
             .collect();
 
-        let result = GetTransactionsResult {
-            transactions: transaction_records,
-        };
+        let result = GetTransactionsResult(transaction_records);
 
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "[]".to_string());
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -1326,7 +1494,7 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    // deposit tool removed; funding is attempted on startup when configured via env
+    // deposit tool removed; funding is attempted by createWallet when configured via env
 
     /// Create a new wallet with new keys.
     /// Generates new wallet private key, viewer FVK (via midnight-fvk-service when POOL_FVK_PK is set),
@@ -1388,7 +1556,7 @@ impl CryptoServer {
         let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
 
         // Ensure provider is configured before we swap wallet context.
-        let _ = self.provider.as_ref().ok_or_else(|| {
+        let provider = self.provider.clone().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
                 None,
@@ -1403,71 +1571,80 @@ impl CryptoServer {
             .transpose()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
 
-        let viewer_fvk_bundle =
-            if let Some(pool_pk) = pool_fvk_pk {
-                let http = reqwest::Client::new();
-                Some(
-                    fetch_viewer_fvk_bundle(&http, Some(pool_pk))
-                        .await
-                        .map_err(|e| {
-                            ErrorData::internal_error(
-                    format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let http = reqwest::Client::new();
+            Some(
+                fetch_viewer_fvk_bundle(
+                    &http,
+                    Some(pool_pk),
+                    Some(&privacy_address),
+                    Some(&wallet_address_str),
+                )
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
+                        None,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+
+        // Auto-fund when configured via AUTO_FUND_DEPOSIT_AMOUNT
+        // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool
+        if let Some(deposit_amount) = self.auto_fund_deposit_amount {
+            let admin_ctx = self.admin_wallet_context.clone().ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set.",
                     None,
                 )
-                        })?,
-                )
-            } else {
-                None
-            };
+            })?;
+            let dest_privacy_key = new_privacy_key_for_deposit.clone();
+            let dest_wallet_address = wallet_address_str.clone();
+            let new_wallet_for_deposit = new_wallet_for_deposit.clone();
+            let auto_fund_gas_reserve = self.auto_fund_gas_reserve;
+
+            run_auto_fund_sequence(
+                provider,
+                admin_ctx,
+                dest_wallet_address,
+                dest_privacy_key,
+                new_wallet_for_deposit,
+                deposit_amount,
+                auto_fund_gas_reserve,
+            )
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Auto-fund failed: {e}"), None))?;
+        }
 
         // Replace the wallet context and privacy keys
-        if let Some(ref wallet_ctx) = self.wallet_context {
-            let mut ctx_guard = wallet_ctx.write().await;
-            *ctx_guard = new_wallet_ctx;
-        }
+        let mut ctx_guard = self.wallet_context.write().await;
+        *ctx_guard = Some(new_wallet_ctx);
 
         let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
         *viewer_fvk_guard = viewer_fvk_bundle.clone();
 
         let mut privacy_key_guard = self.privacy_key.write().await;
-        *privacy_key_guard = new_privacy_key;
+        *privacy_key_guard = Some(new_privacy_key);
 
         // Mark the wallet as explicitly loaded
         let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
         *loaded_guard = true;
+        {
+            // Reset any cached pending spends from a previous wallet within this session.
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
+        }
 
         tracing::info!("[createWallet] New wallet created successfully");
         tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
         tracing::info!("[createWallet] Privacy address: {}", privacy_address);
-
-        // Best-effort funding when configured via AUTO_FUND_DEPOSIT_AMOUNT
-        // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool
-        if let Some(deposit_amount) = self.auto_fund_deposit_amount {
-            let admin_wallet_ctx = self.admin_wallet_context.clone();
-            if let (Some(provider), Some(admin_ctx)) = (self.provider.clone(), admin_wallet_ctx) {
-                let dest_privacy_key = new_privacy_key_for_deposit.clone();
-                let dest_wallet_address = wallet_address_str.clone();
-                let new_wallet_for_deposit = new_wallet_for_deposit.clone();
-                let auto_fund_gas_reserve = self.auto_fund_gas_reserve;
-
-                tokio::spawn(async move {
-                    run_auto_fund_sequence(
-                        provider,
-                        admin_ctx,
-                        dest_wallet_address,
-                        dest_privacy_key,
-                        new_wallet_for_deposit,
-                        deposit_amount,
-                        auto_fund_gas_reserve,
-                    )
-                    .await;
-                });
-            } else {
-                tracing::warn!(
-                    "[auto-fund/createWallet] Auto-fund configured but ADMIN_WALLET_PRIVATE_KEY is not set; skipping"
-                );
-            }
-        }
 
         let result = CreateWalletResult {
             wallet_private_key: wallet_private_key_hex,
@@ -1604,12 +1781,17 @@ impl CryptoServer {
                         fvk_commitment: commitment,
                         pool_sig_hex: sig_hex_trimmed.to_string(),
                         signer_public_key: pool_pk,
+                        // User-provided FVK doesn't have addresses yet
+                        shielded_address: None,
+                        wallet_address: None,
                     })
                 }
                 (None, None) => {
                     let http = reqwest::Client::new();
+                    // Note: privacy_address is not known yet at this point in restoreWallet
+                    // The FVK service can be updated later via /v1/fvk/:commitment/address
                     Some(
-                        fetch_viewer_fvk_bundle(&http, Some(pool_pk))
+                        fetch_viewer_fvk_bundle(&http, Some(pool_pk), None, None)
                             .await
                             .map_err(|e| {
                                 ErrorData::internal_error(
@@ -1648,20 +1830,27 @@ impl CryptoServer {
         })?;
 
         // Replace the existing keys with the restored ones (including wallet context)
-        if let Some(ref wallet_ctx) = self.wallet_context {
-            let mut ctx_guard = wallet_ctx.write().await;
-            *ctx_guard = new_wallet_ctx;
-        }
+        let mut ctx_guard = self.wallet_context.write().await;
+        *ctx_guard = Some(new_wallet_ctx);
 
         let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
         *viewer_fvk_guard = viewer_fvk_bundle;
 
         let mut privacy_key_guard = self.privacy_key.write().await;
-        *privacy_key_guard = new_privacy_key;
+        *privacy_key_guard = Some(new_privacy_key);
 
         // Mark the wallet as explicitly loaded
         let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
         *loaded_guard = true;
+        {
+            // Reset any cached pending spends from a previous wallet within this session.
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
+        }
 
         tracing::info!("[restoreWallet] Wallet restored successfully");
         tracing::info!("[restoreWallet] Wallet address: {}", wallet_address);
@@ -1677,36 +1866,56 @@ impl CryptoServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Remove the currently loaded wallet.
-    /// Clears the wallet state so that createWallet or restoreWallet can be called again.
-    /// This prevents accidental overwrites of a loaded wallet.
+    /// Remove the currently loaded wallet for this MCP session.
+    /// After calling this, createWallet or restoreWallet can be called again.
     #[tool(
         name = "removeWallet",
-        description = "Remove the currently loaded wallet. This clears the wallet state so that createWallet or restoreWallet can be called again. Use this to safely switch wallets without accidentally overwriting an existing one."
+        description = "Remove the currently loaded wallet for this MCP session. After calling this, createWallet or restoreWallet can be called again."
     )]
     async fn remove_wallet(
         &self,
         Parameters(_params): Parameters<RemoveWalletRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Check if a wallet is currently loaded
-        let is_loaded = *self.wallet_explicitly_loaded.read().await;
-        if !is_loaded {
-            return Err(ErrorData::invalid_params(
-                "No wallet is currently loaded. Use createWallet or restoreWallet first.",
-                None,
-            ));
+        // This tool is intentionally idempotent: it resets the per-session wallet state and
+        // allows createWallet/restoreWallet to be called again.
+        let mut wallet_ctx_guard = self.wallet_context.write().await;
+        let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+        let mut privacy_key_guard = self.privacy_key.write().await;
+        let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
+
+        let was_loaded = *loaded_guard;
+
+        *wallet_ctx_guard = None;
+        *viewer_fvk_guard = None;
+        *privacy_key_guard = None;
+        *loaded_guard = false;
+        {
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.by_rho.clear();
+        }
+        {
+            let mut local = self.local_notes.lock().await;
+            local.by_rho.clear();
         }
 
-        // Clear the wallet_explicitly_loaded flag
-        let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
-        *loaded_guard = false;
-
-        tracing::info!("[removeWallet] Wallet removed successfully. createWallet and restoreWallet are now available.");
+        if was_loaded {
+            tracing::info!(
+                "[removeWallet] Wallet removed successfully. createWallet and restoreWallet are now available."
+            );
+        } else {
+            tracing::info!(
+                "[removeWallet] No wallet to remove. createWallet and restoreWallet are available."
+            );
+        }
 
         let result = RemoveWalletResult {
             success: true,
-            message: "Wallet removed successfully. You can now use createWallet or restoreWallet."
-                .to_string(),
+            message: if was_loaded {
+                "Wallet removed successfully. You can now use createWallet or restoreWallet."
+                    .to_string()
+            } else {
+                "No wallet to remove. You can now use createWallet or restoreWallet.".to_string()
+            },
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1731,15 +1940,13 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let privacy_key_guard = self.privacy_key.read().await;
+        let privacy_key = privacy_key_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
-
-        let _ctx = wallet_ctx.read().await;
-        let privacy_key_guard = self.privacy_key.read().await;
 
         // Get the current privacy balance to include in status
         let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
@@ -1749,7 +1956,7 @@ impl CryptoServer {
 
         let privacy_balance = match crate::operations::get_privacy_balance(
             provider,
-            &*privacy_key_guard,
+            privacy_key,
             viewing_key.as_ref(),
         )
         .await
@@ -1774,7 +1981,7 @@ impl CryptoServer {
             ready: true,
             syncing: false,
             sync_progress,
-            address: privacy_key_guard.privacy_address(&DOMAIN).to_string(),
+            address: privacy_key.privacy_address(&DOMAIN).to_string(),
             balances: BalancesInfo {
                 balance: privacy_balance.to_string(),
                 pending_balance: "0".to_string(),
@@ -1783,54 +1990,6 @@ impl CryptoServer {
             recovery_attempts: 0,
             max_recovery_attempts: 0,
             is_fully_synced: true,
-        };
-
-        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
-    /// Verify if a transaction has been received.
-    /// Verifies the status of a transaction and attempts to decrypt it to extract the amount.
-    #[tool(
-        name = "verifyTransaction",
-        description = "Verify if a transaction has been received. Takes a transaction hash (tx_hash) and checks if it exists in the indexer. Attempts to decrypt the transaction to extract the amount if encrypted notes are present. Use this to confirm if a payment has been received."
-    )]
-    async fn verify_transaction(
-        &self,
-        Parameters(params): Parameters<VerifyTransactionRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let provider = self.provider.as_ref().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
-                None,
-            )
-        })?;
-
-        // Get FVK if available for decryption
-        let viewer_fvk_guard = self.viewer_fvk_bundle.read().await;
-        let fvk_hex = if let Some(ref bundle) = *viewer_fvk_guard {
-            Some(hex::encode(bundle.fvk))
-        } else {
-            None
-        };
-
-        let verify_result =
-            crate::operations::verify_transaction(provider, &params.identifier, fvk_hex.as_deref())
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let result = VerifyTransactionResult {
-            exists: verify_result.exists,
-            sync_status: VerifySyncStatus {
-                synced_indices: "all".to_string(),
-                lag: VerifyLagInfo {
-                    apply_gap: "0".to_string(),
-                    source_gap: "0".to_string(),
-                },
-                is_fully_synced: true,
-            },
-            transaction_amount: verify_result.transaction_amount,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
@@ -1856,20 +2015,19 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
-
-        let ctx = wallet_ctx.read().await;
 
         let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
             ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
         })?;
 
-        let res = crate::operations::freeze_address(provider, &*ctx, addr)
+        let res = crate::operations::freeze_address(provider, ctx, addr)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -1898,20 +2056,19 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
-
-        let ctx = wallet_ctx.read().await;
 
         let addr: PrivacyAddress = params.privacy_address.parse().map_err(|e| {
             ErrorData::invalid_params(format!("Invalid privacy address: {e}"), None)
         })?;
 
-        let res = crate::operations::unfreeze_address(provider, &*ctx, addr)
+        let res = crate::operations::unfreeze_address(provider, ctx, addr)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -1919,6 +2076,39 @@ impl CryptoServer {
             tx_hash: res.tx_hash,
         })
         .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List frozen (blacklisted) privacy addresses.
+    #[tool(
+        name = "listFrozenAddresses",
+        description = "List frozen (blacklisted) privacy pool addresses."
+    )]
+    async fn list_frozen_addresses(
+        &self,
+        Parameters(_params): Parameters<ListFrozenAddressesRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Provider not configured. Please set ROLLUP_RPC_URL environment variable.",
+                None,
+            )
+        })?;
+
+        let res = crate::operations::list_frozen_addresses(provider)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let result = ListFrozenAddressesResult {
+            addresses: res
+                .addresses
+                .into_iter()
+                .map(|addr| addr.to_string())
+                .collect(),
+            count: res.count,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -1938,21 +2128,20 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
-
-        let ctx = wallet_ctx.read().await;
 
         let admin: <McpSpec as Spec>::Address = params
             .admin_address
             .parse()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid admin address: {e}"), None))?;
 
-        let res = crate::operations::add_pool_admin(provider, &*ctx, admin)
+        let res = crate::operations::add_pool_admin(provider, ctx, admin)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -1979,21 +2168,20 @@ impl CryptoServer {
             )
         })?;
 
-        let wallet_ctx = self.wallet_context.as_ref().ok_or_else(|| {
+        let ctx_guard = self.wallet_context.read().await;
+        let ctx = ctx_guard.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Wallet context not configured. Please set WALLET_PATH environment variable.",
+                "No wallet loaded. Call createWallet or restoreWallet first.",
                 None,
             )
         })?;
-
-        let ctx = wallet_ctx.read().await;
 
         let admin: <McpSpec as Spec>::Address = params
             .admin_address
             .parse()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid admin address: {e}"), None))?;
 
-        let res = crate::operations::remove_pool_admin(provider, &*ctx, admin)
+        let res = crate::operations::remove_pool_admin(provider, ctx, admin)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -2018,100 +2206,52 @@ impl ServerHandler for CryptoServer {
     }
 }
 
-fn map_state_and_error(status: Option<String>) -> (String, Option<String>) {
-    match status {
-        Some(raw) => {
-            let normalized = raw.to_ascii_lowercase();
-            if normalized.contains("fail") || normalized.contains("error") {
-                ("failed".to_string(), Some(raw))
-            } else if normalized.contains("success") || normalized.contains("complete") {
-                ("completed".to_string(), None)
-            } else if normalized.contains("pending")
-                || normalized.contains("sent")
-                || normalized.contains("submit")
-                || normalized.contains("queue")
-            {
-                ("sent".to_string(), None)
-            } else {
-                ("sent".to_string(), None)
-            }
-        }
-        None => ("initiated".to_string(), None),
+fn map_state_from_status(status: &str) -> &'static str {
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized.contains("success")
+        || normalized.contains("processed")
+        || normalized.contains("finalized")
+    {
+        "completed"
+    } else if normalized.contains("fail") {
+        "failed"
+    } else if normalized.contains("pending") || normalized.contains("submitted") {
+        "sent"
+    } else {
+        "initiated"
     }
 }
 
-fn reveal_or_encrypted(value: Option<String>) -> String {
-    match value {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => "encrypted".to_string(),
-    }
-}
-
-fn record_from_indexer(
+fn build_transaction_record(
     tx_hash: String,
     status: Option<String>,
-    timestamp_ms: i64,
-    sender: Option<String>,
-    recipient: Option<String>,
     privacy_sender: Option<String>,
+    sender: Option<String>,
     privacy_recipient: Option<String>,
+    recipient: Option<String>,
     amount: Option<String>,
-) -> TransactionRecord {
-    let (state, error_message) = map_state_and_error(status.clone());
-    let from_address = privacy_sender.or(sender);
-    let to_address = privacy_recipient.or(recipient);
+    timestamp_ms: i64,
+) -> GetTransactionStatusRecord {
+    let status = status.unwrap_or_else(|| "Unknown".to_string());
+    let state = map_state_from_status(&status).to_string();
+    let from_address = privacy_sender.or(sender).unwrap_or_default();
+    let to_address = privacy_recipient.or(recipient).unwrap_or_default();
+    let amount = amount.unwrap_or_else(|| "0".to_string());
+    let error_message = if state == "failed" {
+        Some(status.clone())
+    } else {
+        None
+    };
 
-    TransactionRecord {
+    GetTransactionStatusRecord {
         id: tx_hash.clone(),
         state,
-        from_address: reveal_or_encrypted(from_address),
-        to_address: reveal_or_encrypted(to_address),
-        amount: reveal_or_encrypted(amount),
+        from_address,
+        to_address,
+        amount,
         tx_identifier: Some(tx_hash),
         created_at: timestamp_ms,
         updated_at: timestamp_ms,
         error_message,
     }
-}
-
-fn transaction_to_record(tx: crate::operations::Transaction) -> TransactionRecord {
-    record_from_indexer(
-        tx.tx_hash,
-        tx.status,
-        tx.timestamp_ms,
-        tx.sender,
-        tx.recipient,
-        tx.privacy_sender,
-        tx.privacy_recipient,
-        tx.amount,
-    )
-}
-
-fn details_to_record(details: crate::operations::TransactionDetails) -> TransactionRecord {
-    record_from_indexer(
-        details.tx_hash,
-        Some(details.status),
-        details.timestamp_ms.unwrap_or_default(),
-        details.sender,
-        details.recipient,
-        details.privacy_sender,
-        details.privacy_recipient,
-        details.amount,
-    )
-}
-
-#[allow(dead_code)]
-fn to_ws_url(http_url: &str) -> String {
-    Url::parse(http_url)
-        .map(|mut url| {
-            let scheme = url.scheme().to_string();
-            let new_scheme = match scheme.as_str() {
-                "https" => "wss",
-                "http" => "ws",
-                other => other,
-            };
-            let _ = url.set_scheme(new_scheme);
-            url.to_string()
-        })
-        .unwrap_or_else(|_| http_url.to_string())
 }

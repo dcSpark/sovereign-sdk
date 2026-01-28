@@ -9,7 +9,32 @@ WorkingDirectory=/home/replace_for_linux_user/sovereign-sdk/examples/rollup-lige
 ExecStart=/usr/bin/env cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release
 Restart=on-failure
 Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Service Controller bind address
 #Environment="SERVICE_CONTROLLER_BIND=127.0.0.1:9090"
+
+# Service endpoint URLs (used for health checks)
+Environment="ROLLUP_RPC_URL=http://127.0.0.1:12346"
+Environment="BIND_ADDR=http://127.0.0.1:8080"
+Environment="MIDNIGHT_FVK_SERVICE_URL=http://127.0.0.1:8088"
+Environment="INDEXER_BIND=http://127.0.0.1:13100"
+Environment="MCP_SERVER_BIND_ADDRESS=http://127.0.0.1:3000"
+Environment="MCP_SERVER_BIND_ADDRESS_2=http://127.0.0.1:3001"
+Environment="PROVER_BIND_ADDR=http://127.0.0.1:1313"
+Environment="METRICS_API_BIND=http://127.0.0.1:13200"
+
+# FVK service signing keys
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX=SECRET_KEY"
+Environment="MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX=PUBLIC_KEY"
+Environment="POOL_FVK_PK=PUBLIC_KEY"
+Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=ADMIN_TOKEN"
+
+# Auto-funding configuration
+Environment="AUTO_FUND_DEPOSIT_AMOUNT=100"
+Environment="AUTO_FUND_GAS_RESERVE=1000000"
+
+# Defer sequencer submission
+#Environment="DEFER_SUBMISSION=1"
 
 [Install]
 WantedBy=multi-user.target

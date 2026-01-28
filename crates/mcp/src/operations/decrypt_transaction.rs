@@ -23,6 +23,9 @@ pub struct DecryptedNote {
     /// - For deposit notes (112 bytes): None
     /// - For transfer notes (144 bytes): Some(sender_id)
     pub sender_id: Option<String>,
+    /// Input note commitments (cm_ins[4]) if present (272-byte spend/output format).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm_ins: Option<Vec<String>>,
 }
 
 /// Result of decrypting a transaction
@@ -110,7 +113,7 @@ pub async fn decrypt_transaction(
     let mut decrypted_notes = Vec::new();
     for (idx, encrypted_note) in encrypted_notes.iter().enumerate() {
         match viewer::decrypt_note(&fvk, encrypted_note) {
-            Ok((domain, value, rho, recipient, sender_id)) => {
+            Ok((domain, value, rho, recipient, sender_id, cm_ins)) => {
                 let note_type = if sender_id.is_some() {
                     "transfer"
                 } else {
@@ -128,6 +131,7 @@ pub async fn decrypt_transaction(
                     rho: hex::encode(rho),
                     recipient: hex::encode(recipient),
                     sender_id: sender_id.map(|s| hex::encode(s)),
+                    cm_ins: cm_ins.map(|ins| ins.into_iter().map(hex::encode).collect()),
                 });
             }
             Err(e) => {

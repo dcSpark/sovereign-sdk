@@ -2,8 +2,9 @@
 //!
 //! This module provides functionality for retrieving the current status and details of a specific transaction.
 
-use crate::provider::{InvolvementItem, Provider};
-use anyhow::{anyhow, Context, Result};
+use crate::provider::InvolvementItem;
+use crate::provider::Provider;
+use anyhow::{Context, Result};
 
 /// Transaction status and details from the indexer
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,54 +69,17 @@ impl From<InvolvementItem> for TransactionDetails {
     }
 }
 
-/// Get the status and details of a transaction by its ID
+/// Fetch transaction status/details from the indexer by tx hash.
 ///
-/// Retrieves full transaction details from the indexer including status, kind,
-/// amounts, and all privacy-related fields.
-///
-/// # Parameters
-/// * `provider` - The RPC provider with indexer access
-/// * `tx_hash` - The transaction hash ID (with or without 0x prefix)
-///
-/// # Returns
-/// Transaction details including status and all available metadata
-///
-/// # Example
-/// ```rust,no_run
-/// # async fn example(provider: &mcp_external::provider::Provider) -> anyhow::Result<()> {
-/// use mcp_external::operations::get_transaction_status;
-///
-/// let details = get_transaction_status(provider, "0x1234...").await?;
-/// println!("Transaction {} status: {}", details.tx_hash, details.status);
-/// # Ok(())
-/// # }
-/// ```
+/// Returns an error if the transaction is not found.
 pub async fn get_transaction_status(
     provider: &Provider,
     tx_hash: &str,
 ) -> Result<TransactionDetails> {
-    tracing::info!("Getting transaction details from indexer: {}", tx_hash);
-
-    let tx_option = provider
+    let tx = provider
         .get_transaction(tx_hash)
         .await
-        .with_context(|| format!("Failed to get transaction details for {}", tx_hash))?;
-
-    let tx = tx_option.ok_or_else(|| {
-        anyhow!(
-            "Transaction {} not found in indexer (may not be indexed yet)",
-            tx_hash
-        )
-    })?;
-
-    let details = TransactionDetails::from(tx);
-
-    tracing::info!(
-        "Transaction {} status: {}, kind: {:?}",
-        details.tx_hash,
-        details.status,
-        details.kind
-    );
-
-    Ok(details)
+        .with_context(|| format!("Failed to fetch transaction {} from indexer", tx_hash))?
+        .ok_or_else(|| anyhow::anyhow!("Transaction not found: {}", tx_hash))?;
+    Ok(TransactionDetails::from(tx))
 }

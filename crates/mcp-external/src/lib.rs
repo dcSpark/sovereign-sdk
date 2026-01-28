@@ -1,3 +1,4 @@
+pub mod commitment_tree;
 pub mod config;
 pub mod fvk_service;
 pub mod ligero;
