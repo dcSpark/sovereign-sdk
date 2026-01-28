@@ -59,26 +59,6 @@ pub(crate) fn compute_batch_hash_v1(
     h
 }
 
-pub(crate) fn hash_to_bytes32<H: AsRef<[u8]>>(h: &H) -> anyhow::Result<[u8; 32]> {
-    let b = h.as_ref();
-    anyhow::ensure!(
-        b.len() == 32,
-        "hash_to_bytes32: expected 32 bytes, got {}",
-        b.len()
-    );
-    Ok(b.try_into().unwrap())
-}
-
-pub(crate) fn state_root_to_bytes32<R: AsRef<[u8]>>(root: &R) -> anyhow::Result<[u8; 64]> {
-    let b = root.as_ref();
-    anyhow::ensure!(
-        b.len() == 64,
-        "state_root_to_bytes32: expected 64 bytes, got {}",
-        b.len()
-    );
-    Ok(b.try_into().unwrap())
-}
-
 /// Manages the lifecycle of the `AggregatedProof`.
 #[allow(clippy::type_complexity)]
 #[allow(dead_code)]

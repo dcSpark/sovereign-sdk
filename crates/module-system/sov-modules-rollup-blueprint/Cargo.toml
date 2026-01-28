@@ -83,3 +83,4 @@ native = [
     "opentelemetry-semantic-conventions",
     "tracing-opentelemetry",
 ]
+tee = ["sov-stf-runner/tee"]

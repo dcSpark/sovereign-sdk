@@ -2,9 +2,14 @@
 mod op_manager;
 mod prover_service;
 mod stf_info_manager;
-mod tee_manager;
 mod zk_manager;
 use std::num::NonZero;
+
+#[cfg(feature = "tee")]
+mod tee_manager;
+
+#[cfg(feature = "tee")]
+pub use tee_manager::*;
 
 use op_manager::attestations::AttestationsManager;
 pub use prover_service::*;
@@ -13,11 +18,11 @@ use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::optimistic::BondingProofService;
 use sov_rollup_interface::stf::ProofSender;
 pub use stf_info_manager::*;
-pub use tee_manager::*;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 pub use zk_manager::*;
 
+#[cfg(feature = "tee")]
 /// Starts a process that generates aggregated proofs in the background.
 pub async fn start_tee_workflow_in_background<Ps>(
     prover_service: Ps,
@@ -110,4 +115,24 @@ pub async fn start_operator_workflow_in_background(
     tokio::spawn(async move {
         let _ = shutdown_receiver.changed().await;
     })
+}
+
+pub(crate) fn hash_to_bytes32<H: AsRef<[u8]>>(h: &H) -> anyhow::Result<[u8; 32]> {
+    let b = h.as_ref();
+    anyhow::ensure!(
+        b.len() == 32,
+        "hash_to_bytes32: expected 32 bytes, got {}",
+        b.len()
+    );
+    Ok(b.try_into().unwrap())
+}
+
+pub(crate) fn state_root_to_bytes32<R: AsRef<[u8]>>(root: &R) -> anyhow::Result<[u8; 64]> {
+    let b = root.as_ref();
+    anyhow::ensure!(
+        b.len() == 64,
+        "state_root_to_bytes32: expected 64 bytes, got {}",
+        b.len()
+    );
+    Ok(b.try_into().unwrap())
 }

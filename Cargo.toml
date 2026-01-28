@@ -347,7 +347,7 @@ quick_cache = "0.6.16"
 # End of EVM dependencies
 
 # TEE dependencies
-tee = { path = "crates/adapters/tee", default-features = false, features = ["maa"] }
+tee = { path = "crates/adapters/tee", default-features = false }
 
 # Profile for profiling with samply/perf - release performance with debug symbols
 [profile.profiling]

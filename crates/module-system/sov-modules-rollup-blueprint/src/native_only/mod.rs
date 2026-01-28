@@ -36,8 +36,7 @@ use sov_state::storage::NativeStorage;
 use sov_state::Storage;
 use sov_stf_runner::make_da_sync_state;
 use sov_stf_runner::processes::{
-    start_op_workflow_in_background, start_operator_workflow_in_background,
-    start_tee_workflow_in_background, start_zk_workflow_in_background, ProverService,
+    start_op_workflow_in_background, start_operator_workflow_in_background, start_zk_workflow_in_background, ProverService,
     RollupProverConfig, RollupProverConfigDiscriminants,
 };
 use sov_stf_runner::{
@@ -53,6 +52,9 @@ pub use wallet::*;
 /// Commit hash of this rollup
 pub const GIT_COMMIT_HASH: &str = env!("GIT_COMMIT_HASH");
 use crate::RollupBlueprint;
+
+#[cfg(feature = "tee")]
+use sov_stf_runner::processes::{start_tee_workflow_in_background};
 
 /// This trait defines how to create all the necessary dependencies required by a rollup.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -501,57 +503,63 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                     .await?
                 }
                 OperatingMode::TEE => {
-                    let ext = rollup_config.sequencer.extension.as_ref();
+                    #[cfg(feature = "tee")]
+                    {
+                        let ext = rollup_config.sequencer.extension.as_ref();
+                        let oracle_url = ext
+                            .and_then(|e| e.tee_configuration.as_ref())
+                            .map(|t| t.tee_attestation_oracle_url.clone())
+                            .unwrap_or_else(|| "http://127.0.0.1:8090".to_owned());
 
-                    let oracle_url = ext
-                        .and_then(|e| e.tee_configuration.as_ref())
-                        .map(|t| t.tee_attestation_oracle_url.clone())
-                        .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned());
+                        let bridge = ext.and_then(|e| e.midnight_bridge.as_ref());
 
-                    let bridge = ext.and_then(|e| e.midnight_bridge.as_ref());
+                        let indexer: Option<MidnightIndexerClient> = match bridge {
+                            None => None,
 
-                    let indexer: Option<MidnightIndexerClient> = match bridge {
-                        None => None,
+                            Some(cfg) => {
+                                if cfg.mock_events_path.is_some() {
+                                    tracing::warn!(
+                                        "Mock mode is enabled on L1 Bridge. Mock values will be used in the TEE Manager."
+                                    );
+                                    None
+                                } else {
+                                    match (cfg.indexer_http.as_ref(), cfg.contract_address.as_ref()) {
+                                        (Some(indexer_http), Some(contract_address)) => {
+                                            let timeout =
+                                                Duration::from_millis(cfg.indexer_timeout_ms.max(1));
+                                            let client =
+                                                Client::builder().timeout(timeout).build().context(
+                                                    "Failed to build Midnight indexer HTTP client",
+                                                )?;
 
-                        Some(cfg) => {
-                            if cfg.mock_events_path.is_some() {
-                                tracing::warn!(
-                                    "Mock mode is enabled on L1 Bridge. Mock values will be used in the TEE Manager."
-                                );
-                                None
-                            } else {
-                                match (cfg.indexer_http.as_ref(), cfg.contract_address.as_ref()) {
-                                    (Some(indexer_http), Some(contract_address)) => {
-                                        let timeout =
-                                            Duration::from_millis(cfg.indexer_timeout_ms.max(1));
-                                        let client =
-                                            Client::builder().timeout(timeout).build().context(
-                                                "Failed to build Midnight indexer HTTP client",
-                                            )?;
-
-                                        Some(MidnightIndexerClient::new(
-                                            client,
-                                            indexer_http.clone(),
-                                            contract_address.clone(),
-                                        ))
+                                            Some(MidnightIndexerClient::new(
+                                                client,
+                                                indexer_http.clone(),
+                                                contract_address.clone(),
+                                            ))
+                                        }
+                                        _ => None,
                                     }
-                                    _ => None,
                                 }
                             }
-                        }
-                    };
+                        };
 
-                    start_tee_workflow_in_background(
-                        prover_service,
-                        rollup_config.proof_manager.aggregated_proof_block_jump,
-                        proof_sender,
-                        genesis_state_root,
-                        stf_info_receiver,
-                        secondary_shutdown_receiver,
-                        oracle_url,
-                        indexer,
-                    )
-                    .await?
+                        start_tee_workflow_in_background(
+                            prover_service,
+                            rollup_config.proof_manager.aggregated_proof_block_jump,
+                            proof_sender,
+                            genesis_state_root,
+                            stf_info_receiver,
+                            secondary_shutdown_receiver,
+                            oracle_url,
+                            indexer,
+                        )
+                        .await?
+                    }
+                    #[cfg(not(feature = "tee"))]
+                    {
+                        panic!("You need to activate the `tee` feature to use TEE operating mode");
+                    }
                 }
                 OperatingMode::Operator => {
                     start_operator_workflow_in_background(secondary_shutdown_receiver).await
