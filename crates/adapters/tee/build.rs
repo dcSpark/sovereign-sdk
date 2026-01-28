@@ -1,7 +1,7 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
-    #[cfg(feature = "tee")]
+    #[cfg(feature = "maa")]
     {
         // Re-run if anything in the attestation_verifier directory changes.
         println!("cargo:rerun-if-changed=attestation_verifier");
