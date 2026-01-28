@@ -136,11 +136,11 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
 
         loop {
             let status = prover_service
-                .create_aggregated_proof(agg_proof_hashes.as_slice(), genesis_state_root)
+                .create_aggregated_proof(agg_proof_hashes.as_slice(), &None, genesis_state_root)
                 .await;
 
             match status {
-                Ok(ProofAggregationStatus::Success(agg_proof)) => {
+                Ok(ProofAggregationStatus::Success(agg_proof, public_data)) => {
                     return Ok(agg_proof);
                 }
                 // TODO(https://github.com/Sovereign-Labs/sovereign-sdk/issues/1185): Add timeout handling.

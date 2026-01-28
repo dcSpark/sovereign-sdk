@@ -7,6 +7,7 @@ use borsh::BorshSerialize;
 use prover::Prover;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
@@ -143,11 +144,13 @@ where
     async fn create_aggregated_proof(
         &self,
         block_header_hashes: &[<<Self::DaService as DaService>::Spec as DaSpec>::SlotHash],
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &Self::StateRoot,
     ) -> anyhow::Result<ProofAggregationStatus> {
         self.prover_state.create_aggregated_proof(
             self.outer_vm.clone(),
             block_header_hashes,
+            midnight_bridge,
             genesis_state_root,
         )
     }

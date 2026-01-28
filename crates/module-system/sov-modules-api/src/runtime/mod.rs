@@ -24,6 +24,8 @@ pub enum OperatingMode {
     Optimistic,
     /// The rollup is currently executing in zk mode.
     Zk,
+    /// The rollup is currently executing in TEE mode.
+    TEE,
     /// The rollup is currently executing in operator mode.
     Operator,
 }

@@ -1,9 +1,11 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
+use alloy_primitives::U256;
 use borsh::BorshSerialize;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::{BlockHeaderTrait, DaSpec, DaVerifier};
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::{
@@ -13,15 +15,24 @@ use sov_rollup_interface::zk::{
     StateTransitionPublicData, StateTransitionWitness, StateTransitionWitnessWithAddress, Zkvm,
     ZkvmHost,
 };
+use tokio::runtime::Runtime;
 use tracing::{error, info, trace};
 
 use super::state::{ProverState, ProverStatus};
 use super::{ProverServiceError, Verifier};
 use crate::processes::prover_service::block_proof::BlockProof;
 use crate::processes::{
-    ProofAggregationStatus, ProofProcessingStatus, RollupProverConfigDiscriminants,
-    StateTransitionInfo,
+    hash_to_bytes32, state_root_to_bytes32, ProofAggregationStatus, ProofProcessingStatus,
+    PublicDataTee, RollupProverConfigDiscriminants, StateTransitionInfo,
 };
+
+#[derive(Clone, Default)]
+pub(crate) struct L1BridgeData {
+    pub withdraw_root: [u8; 32],
+    pub message_queue_hash: [u8; 32],
+    pub last_processed_queue_index: U256,
+    pub layer2_chain_id: u64,
+}
 
 // A prover that generates proofs in parallel using a thread pool. If the pool is saturated,
 // the prover will reject new jobs.
@@ -165,6 +176,7 @@ where
         &self,
         mut outer_vm: OuterVm,
         block_header_hashes: &[<Da::Spec as DaSpec>::SlotHash],
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &StateRoot,
     ) -> anyhow::Result<ProofAggregationStatus> {
         assert!(!block_header_hashes.is_empty());
@@ -197,6 +209,43 @@ where
             rewarded_addresses.push(bp.st.prover_address.clone());
         }
 
+        // Mainly here to avoid to init the midnight bridge if not needed.
+        let mut l1_bridge = L1BridgeData::default();
+
+        if let Some(midnight_bridge) = midnight_bridge {
+            let snap = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { midnight_bridge.snapshot().await })
+            });
+
+            match snap {
+                Err(e) => {
+                    tracing::error!(error = ?e, "Failed to get midnight bridge snapshot, L1 bridge data will be mocked values.");
+                }
+                Ok(snap) => {
+                    let index = snap.rollup.next_cross_domain_message_index - 1;
+                    l1_bridge.last_processed_queue_index =
+                        U256::from(snap.l2_messenger.last_processed_l1_index);
+                    l1_bridge.message_queue_hash = snap
+                        .rollup
+                        .message_rolling_hashes
+                        .get(&index)
+                        .expect("No message rolling hashes available")
+                        .clone();
+                    l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
+                    l1_bridge.withdraw_root = snap
+                        .rollup
+                        .withdraw_roots
+                        .values()
+                        .next_back()
+                        .expect("no withdraw roots available")
+                        .clone();
+                }
+            }
+        } else {
+            tracing::warn!("No midnight bridge provided, L1 bridge data will be mocked values.");
+        }
+
         let public_data = AggregatedProofPublicData::<Address, Da::Spec, StateRoot> {
             rewarded_addresses,
             initial_slot_number: initial_block_proof.slot_number,
@@ -207,6 +256,18 @@ where
             initial_slot_hash: initial_block_proof.st.slot_hash.clone(),
             final_slot_hash: final_block_proof.st.slot_hash.clone(),
             code_commitment: self.code_commitment.clone(),
+            withdraw_root: l1_bridge.withdraw_root,
+            message_queue_hash: l1_bridge.message_queue_hash,
+        };
+
+        let public_tee: PublicDataTee = PublicDataTee {
+            initial_state_root: state_root_to_bytes32(&public_data.initial_state_root)?,
+            final_state_root: state_root_to_bytes32(&public_data.final_state_root)?,
+            final_slot_hash: hash_to_bytes32(&public_data.final_slot_hash)?,
+            withdraw_root: public_data.withdraw_root,
+            message_queue_hash: public_data.message_queue_hash,
+            last_processed_queue_index: l1_bridge.last_processed_queue_index,
+            layer2_chain_id: l1_bridge.layer2_chain_id,
         };
 
         trace!(%public_data, "generating aggregate proof");
@@ -220,7 +281,10 @@ where
         for slot_hash in block_header_hashes {
             prover_state.remove(slot_hash);
         }
-        Ok(ProofAggregationStatus::Success(serialized_aggregated_proof))
+        Ok(ProofAggregationStatus::Success(
+            serialized_aggregated_proof,
+            public_tee,
+        ))
     }
 }
 

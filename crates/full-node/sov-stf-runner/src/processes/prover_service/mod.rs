@@ -5,11 +5,13 @@ mod block_proof;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use alloy_primitives::U256;
 use async_trait::async_trait;
 use borsh::BorshSerialize;
 pub use parallel::ParallelProverService;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::DaSpec;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -105,11 +107,31 @@ pub enum WitnessSubmissionStatus {
     WitnessExist,
 }
 
+/// Extracted public data from the aggregated proof for submission to the DA, for the TEE attestation.
+/// Preserialized for convenience, as this is what will be sent to the DA. This data is expected to be deserialized for determistic verification in the TEE.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PublicDataTee {
+    /// The initial state root before the batch execution.
+    pub initial_state_root: [u8; 64],
+    /// The final state root after the batch execution.
+    pub final_state_root: [u8; 64],
+    /// The final slot hash after the batch execution.
+    pub final_slot_hash: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub withdraw_root: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub message_queue_hash: [u8; 32],
+    /// Undocumented, needs to be fetched from the Hyperlane.
+    pub last_processed_queue_index: U256,
+    /// Layer 2 Chain ID.
+    pub layer2_chain_id: u64,
+}
+
 /// Represents the status of a DA proof submission.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ProofAggregationStatus {
     /// Indicates successful proof generation.
-    Success(SerializedAggregatedProof),
+    Success(SerializedAggregatedProof, PublicDataTee),
     /// Indicates that proof generation is currently in progress.
     ProofGenerationInProgress,
 }
@@ -180,6 +202,7 @@ pub trait ProverService: Send + Sync + 'static {
     async fn create_aggregated_proof(
         &self,
         block_header_hashes: &[<<Self::DaService as DaService>::Spec as DaSpec>::SlotHash],
+        midnight_bridge: &Option<MidnightIndexerClient>,
         genesis_state_root: &Self::StateRoot,
     ) -> anyhow::Result<ProofAggregationStatus>;
 }

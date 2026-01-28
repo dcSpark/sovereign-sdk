@@ -213,6 +213,10 @@ mod tests {
             max_allowed_node_distance_behind = 5
             num_cache_warmup_workers = 5
             rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+            [sequencer.extension]
+            max_log_limit = 1000
+            [sequencer.extension.tee_configuration]
+            tee_attestation_oracle_url = "http://127.0.0.1:8090"
             [sequencer.standard]
         "#;
 

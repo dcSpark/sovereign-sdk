@@ -9,6 +9,7 @@
 pub mod aggregated_proof;
 use core::fmt::Debug;
 
+use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use digest::typenum::U32;
 use digest::Digest;

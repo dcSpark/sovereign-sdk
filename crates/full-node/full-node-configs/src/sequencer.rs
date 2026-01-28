@@ -20,6 +20,13 @@ impl Default for SequencerKindConfig {
     }
 }
 
+/// TEE configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct TEEConfiguration {
+    /// URL of the TEE attestation oracle.
+    pub tee_attestation_oracle_url: String,
+}
+
 /// Configuration data used by sequencer extensions, such as EVM endpoints.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SeqConfigExtension {
@@ -27,6 +34,8 @@ pub struct SeqConfigExtension {
     /// Optional Midnight bridge configuration that allows custom background services to run alongside the sequencer.
     #[serde(default)]
     pub midnight_bridge: Option<MidnightBridgeSettings>,
+    /// TEE Extension
+    pub tee_configuration: Option<TEEConfiguration>,
 }
 
 /// Rollup-specific Midnight bridge settings parsed from `[sequencer.extension.midnight_bridge]`.

@@ -853,6 +853,17 @@
               "type": "null"
             }
           ]
+        },
+        "tee_configuration": {
+          "description": "TEE Extension",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TEEConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -980,6 +991,19 @@
           ],
           "format": "uint",
           "minimum": 1.0
+        }
+      }
+    },
+    "TEEConfiguration": {
+      "description": "TEE configuration.",
+      "type": "object",
+      "required": [
+        "tee_attestation_oracle_url"
+      ],
+      "properties": {
+        "tee_attestation_oracle_url": {
+          "description": "URL of the TEE attestation oracle.",
+          "type": "string"
         }
       }
     },

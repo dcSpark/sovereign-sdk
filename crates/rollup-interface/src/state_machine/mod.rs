@@ -16,6 +16,7 @@ use crate::common::{HexHash, SlotNumber};
 
 pub mod optimistic;
 pub mod storage;
+pub mod tee;
 
 /// A rollup transaction hash.
 pub type TxHash = HexHash;

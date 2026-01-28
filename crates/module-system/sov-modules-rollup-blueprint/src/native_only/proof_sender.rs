@@ -7,7 +7,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use sov_modules_api::capabilities::config_chain_id;
 use sov_modules_api::proof_metadata::{ProofType, SerializeProofWithDetails};
 use sov_modules_api::transaction::{PriorityFeeBips, TxDetails};
-use sov_modules_api::{Amount, ProofSender, Spec};
+use sov_modules_api::{Amount, ProofSender, SerializedTEEAttestation, Spec};
 use sov_rollup_interface::common::SlotNumber;
 use sov_rollup_interface::optimistic::{SerializedAttestation, SerializedChallenge};
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -57,6 +57,18 @@ impl<S: Spec> ProofSender for SovApiProofSender<S> {
         Ok(())
     }
 
+    async fn publish_tee_attestation_blob_with_metadata(
+        &self,
+        serialized_attestation: SerializedTEEAttestation,
+    ) -> anyhow::Result<()> {
+        let proof_data = serialize_tee_attestation_blob_with_metadata::<S>(serialized_attestation)?;
+        self.inner
+            .produce_and_publish_proof_blob(proof_data)
+            .await?;
+
+        Ok(())
+    }
+
     async fn publish_challenge_blob_with_metadata(
         &self,
         serialized_challenge: SerializedChallenge,
@@ -70,6 +82,18 @@ impl<S: Spec> ProofSender for SovApiProofSender<S> {
 
         Ok(())
     }
+}
+
+/// See [`ProofSender::publish_attestation_blob_with_metadata`].
+pub fn serialize_tee_attestation_blob_with_metadata<S: Spec>(
+    serialized_attestation: SerializedTEEAttestation,
+) -> anyhow::Result<Arc<[u8]>> {
+    let proof_with_details = SerializeProofWithDetails::<S> {
+        proof: ProofType::TEEProofAttestation(serialized_attestation),
+        details: make_details(MAX_FEE),
+    };
+
+    Ok(borsh::to_vec(&proof_with_details)?.into())
 }
 
 /// See [`ProofSender::publish_attestation_blob_with_metadata`].

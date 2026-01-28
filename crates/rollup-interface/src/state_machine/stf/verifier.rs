@@ -1,5 +1,8 @@
 use std::marker::PhantomData;
 
+use alloy_primitives::U256;
+
+use crate::da::DaSpec;
 use crate::da::{BlockHeaderTrait, DaVerifier};
 use crate::stf::{ExecutionContext, StateTransitionFunction};
 use crate::zk::{StateTransitionPublicData, StateTransitionWitnessWithAddress, Zkvm, ZkvmGuest};

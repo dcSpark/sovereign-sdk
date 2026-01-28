@@ -111,3 +111,6 @@ max_log_limit = 20000
 # indexer_timeout_ms = 30000
 # poll_interval_ms = 1000
 # max_fee = 1000000
+
+[sequencer.extension.tee_configuration]
+tee_attestation_oracle_url = "http://127.0.0.1:8090"

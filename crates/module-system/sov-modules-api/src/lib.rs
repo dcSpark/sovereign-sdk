@@ -117,6 +117,7 @@ pub use sov_rollup_interface::stf::{
     ProofOutcome, ProofReceipt, ProofReceiptContents, ProofSender, StateTransitionFunction,
     StoredEvent,
 };
+pub use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation, TEEAttestationType};
 pub use sov_rollup_interface::zk::aggregated_proof::{
     AggregatedProofPublicData, CodeCommitment, SerializedAggregatedProof,
 };

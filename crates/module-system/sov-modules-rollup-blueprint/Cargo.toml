@@ -19,6 +19,7 @@ derivative = { workspace = true, optional = true }
 sov-rollup-interface = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true, optional = true }
 sov-state = { workspace = true }
+sov-midnight-adapter = { workspace = true }
 sov-modules-api = { workspace = true, features = ["native"] }
 sov-cli = { workspace = true, optional = true }
 sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
@@ -27,6 +28,7 @@ sov-sequencer = { workspace = true, optional = true }
 sov-ledger-apis = { workspace = true, optional = true }
 sov-rollup-apis = { workspace = true, optional = true }
 sov-api-spec = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["json"] }
 
 anyhow = { workspace = true }
 futures = { workspace = true, optional = true }
