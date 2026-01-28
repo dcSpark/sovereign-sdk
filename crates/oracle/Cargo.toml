@@ -26,7 +26,7 @@ validator = { version = "0.18", features = ["derive"] }
 sov-modules-api = { workspace = true, features = ["native"] }
 sov-midnight-da = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
-tee = { workspace = true }
+tee = { workspace = true, features = ["maa"] }
 
 [lints]
 workspace = true
