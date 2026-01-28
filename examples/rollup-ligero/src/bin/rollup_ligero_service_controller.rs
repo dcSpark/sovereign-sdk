@@ -781,6 +781,13 @@ async fn health_check(State(_app): State<Arc<AppState>>) -> Result<Json<HealthRe
             health_path: "/health",
             optional_env: None,
         },
+        ServiceDefinition {
+            name: "oracle",
+            env_var: "ORACLE_SERVER_BIND_ADDRESS",
+            default_url: "http://127.0.0.1:8090",
+            health_path: "/", // Oracle uses root endpoint for health check
+            optional_env: None,
+        },
     ];
 
     let client = reqwest::Client::builder()
