@@ -65,6 +65,8 @@ To enforce “pool-signed viewer commitments” in the proof verifier, set `POOL
 
 ## State & Restarts
 
-- Issued FVKs are persisted in SQLite (see `MIDNIGHT_FVK_SERVICE_DB` in `crates/utils/midnight-fvk-service/.env.example`).
+- Issued FVKs are persisted in a database. Both **SQLite** and **PostgreSQL** are supported:
+  - SQLite: `MIDNIGHT_FVK_SERVICE_DB=sqlite://path/to/db.sqlite?mode=rwc`
+  - PostgreSQL: `MIDNIGHT_FVK_SERVICE_DB=postgresql://user:pass@host:port/dbname`
 - The service keeps a monotonic `index` counter for operational introspection and persists it so restarts continue from the previous value.
 - You can force the counter forward on startup with `MIDNIGHT_FVK_SERVICE_LAST_ISSUED_INDEX`; the larger value wins between the DB and ENV.
