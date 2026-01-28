@@ -438,12 +438,8 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
             privacy_spend_key: None, // Never expose private keys
         };
 
-        // Use wallet_address (sov1...) as the identifier if available, otherwise fall back to privacy_address
-        let wallet_id = fvk_entry
-            .wallet_address
-            .clone()
-            .unwrap_or_else(|| privacy_address.clone());
-        accounts.push((wallet_id, wallet_data));
+        // Use privacy_address (bech32m privpool1...) as the wallet identifier
+        accounts.push((privacy_address.clone(), wallet_data));
     }
 
     (StatusCode::OK, Json(accounts)).into_response()
