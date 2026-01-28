@@ -41,7 +41,11 @@ enum Command {
 #[derive(Debug, Parser)]
 struct ServeArgs {
     /// Address to bind the HTTP server to
-    #[arg(long, env = "MIDNIGHT_FVK_SERVICE_BIND", default_value = "127.0.0.1:8088")]
+    #[arg(
+        long,
+        env = "MIDNIGHT_FVK_SERVICE_BIND",
+        default_value = "127.0.0.1:8088"
+    )]
     bind: SocketAddr,
 
     /// Database connection string for persisted state (issued FVKs + monotonic counter).
@@ -88,14 +92,8 @@ async fn main() -> Result<()> {
             let signing_key = SigningKey::from_bytes(&sk_bytes);
             let pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
 
-            println!(
-                "MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX={}",
-                sk_hex
-            );
-            println!(
-                "MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX={}",
-                pk_hex
-            );
+            println!("MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX={}", sk_hex);
+            println!("MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX={}", pk_hex);
             Ok(())
         }
         Command::Serve(serve_args) => serve(serve_args).await,

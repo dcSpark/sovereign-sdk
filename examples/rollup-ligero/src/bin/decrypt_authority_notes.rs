@@ -218,7 +218,17 @@ fn stream_xor_decrypt(k: &Hash32, ct: &[u8]) -> Vec<u8> {
 /// - 272 bytes: Spend outputs [domain(32) | value(16) | rho(32) | recipient(32) | sender_id(32) | cm_ins[4](128)]
 fn parse_note_plaintext(
     pt: &[u8],
-) -> Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>, Option<Vec<Hash32>>), String> {
+) -> Result<
+    (
+        Hash32,
+        u128,
+        Hash32,
+        Hash32,
+        Option<Hash32>,
+        Option<Vec<Hash32>>,
+    ),
+    String,
+> {
     if pt.len() != 112 && pt.len() != 144 && pt.len() != 272 {
         return Err(format!(
             "Expected 112, 144, or 272 bytes plaintext, got {}",
@@ -441,10 +451,7 @@ fn main() {
                     r.recipient_hex,
                     r.sender_bech32.as_deref().unwrap_or(""),
                     r.sender_id.as_deref().unwrap_or(""),
-                    r.cm_ins
-                        .as_ref()
-                        .map(|v| v.join("|"))
-                        .unwrap_or_default(),
+                    r.cm_ins.as_ref().map(|v| v.join("|")).unwrap_or_default(),
                     r.fvk_match,
                     r.mac_valid
                         .map(|v| v.to_string())
@@ -580,10 +587,7 @@ mod tests {
         );
 
         // Verify cm_ins are present
-        assert!(
-            decrypted.cm_ins.is_some(),
-            "Spend notes should have cm_ins"
-        );
+        assert!(decrypted.cm_ins.is_some(), "Spend notes should have cm_ins");
         let cm_ins = decrypted.cm_ins.unwrap();
         assert_eq!(cm_ins.len(), 4, "Should have 4 cm_ins");
         assert_eq!(

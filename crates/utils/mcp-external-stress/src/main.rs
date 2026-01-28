@@ -45,7 +45,11 @@ struct Args {
     max_txs: Option<u64>,
 
     /// Initial wait timeout for a newly created wallet to have >0 privacy balance.
-    #[arg(long, env = "MCP_STRESS_WALLET_READY_TIMEOUT_SECS", default_value_t = 600)]
+    #[arg(
+        long,
+        env = "MCP_STRESS_WALLET_READY_TIMEOUT_SECS",
+        default_value_t = 600
+    )]
     wallet_ready_timeout_secs: u64,
 
     /// Poll interval while waiting for wallet to have balance.
@@ -321,13 +325,8 @@ async fn wallet_worker(
                 );
                 if args.confirm {
                     let confirm_started = Instant::now();
-                    let confirm_res = wait_for_tx_confirmed(
-                        &client,
-                        &tx_id,
-                        confirm_poll,
-                        confirm_timeout,
-                    )
-                    .await;
+                    let confirm_res =
+                        wait_for_tx_confirmed(&client, &tx_id, confirm_poll, confirm_timeout).await;
                     let confirm_elapsed = confirm_started.elapsed();
 
                     let confirm_elapsed_us =
@@ -418,7 +417,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let mcp_endpoint = normalize_mcp_endpoint(&args.mcp_endpoint)?;
-    let args = Arc::new(Args { mcp_endpoint, ..args });
+    let args = Arc::new(Args {
+        mcp_endpoint,
+        ..args
+    });
 
     if args.probe {
         probe_once(&args.mcp_endpoint).await?;

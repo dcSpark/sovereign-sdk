@@ -40,12 +40,12 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use toml::Value as TomlValue;
 
+use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
+use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 use crate::{
     find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
     ChildGuard, LigeroEnv,
 };
-use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
-use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
@@ -103,7 +103,6 @@ struct ProverServiceResponse {
     proof: Option<String>,
     error: Option<String>,
 }
-
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
@@ -531,7 +530,6 @@ struct VerifierResponse {
     metrics: VerifierMetrics,
 }
 
-
 #[derive(Clone, Debug)]
 struct CycleSummary {
     num_transfers: usize,
@@ -643,7 +641,10 @@ pub async fn run() -> Result<()> {
         config.managed_mode
     );
     if let Some(ref url) = config.prover_service_url {
-        eprintln!("[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)", url);
+        eprintln!(
+            "[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)",
+            url
+        );
     } else {
         eprintln!("[config] Prover: local daemon pool (PROVER_SERVICE_URL=\"\")");
     }
@@ -1229,13 +1230,7 @@ async fn perform_initial_deposits(
             let value_u64: u64 = note.value.try_into().context(
                 "wallet note value does not fit into u64 (required by note_spend_guest v2)",
             )?;
-            let cm = note_commitment(
-                &DOMAIN,
-                value_u64,
-                &note.rho,
-                &recipient,
-                &note.sender_id,
-            );
+            let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
             expected_commitments.push(cm);
         }
     }
@@ -1563,17 +1558,12 @@ async fn perform_transfer_cycle(
             let value_u64: u64 = note.value.try_into().context(
                 "wallet note value does not fit into u64 (required by note_spend_guest v2)",
             )?;
-            let cm = note_commitment(
-                &DOMAIN,
-                value_u64,
-                &note.rho,
-                &recipient,
-                &note.sender_id,
-            );
+            let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
             cms.push(cm);
         }
 
-        let mut positions: Vec<Option<u64>> = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+        let mut positions: Vec<Option<u64>> =
+            cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
         if positions.iter().any(|p| p.is_none()) {
             // Retry with fresh note fetches and small waits; useful when the tree has just advanced.
             for _attempt in 0..MISSING_NOTE_RETRY_MAX {
@@ -2433,7 +2423,7 @@ async fn perform_transfer_cycle(
                             cm_ins[i] = *cm;
                         }
                         let mut ciphertexts = Vec::new();
-                        
+
                         // Pay note ciphertext
                         let cm_pay = note_commitment(
                             &DOMAIN,

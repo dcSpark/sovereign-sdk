@@ -187,7 +187,9 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(ErrorResponse { error: self.message });
+        let body = Json(ErrorResponse {
+            error: self.message,
+        });
         (self.status, body).into_response()
     }
 }
@@ -236,7 +238,12 @@ pub async fn issue_fvk(
     State(state): State<AppState>,
     Json(req): Json<IssueFvkRequest>,
 ) -> Result<Json<IssueFvkResponse>, ApiError> {
-    if req.seed.as_deref().map(str::trim).filter(|v| !v.is_empty()).is_some()
+    if req
+        .seed
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some()
         || req
             .seed_hex
             .as_deref()
@@ -347,12 +354,14 @@ pub async fn list_fvks(
 
     let fvks: Vec<FvkListItem> = all_fvks
         .into_iter()
-        .map(|(commitment, fvk, shielded_address, wallet_address)| FvkListItem {
-            fvk: hex::encode(fvk),
-            fvk_commitment: hex::encode(commitment),
-            shielded_address,
-            wallet_address,
-        })
+        .map(
+            |(commitment, fvk, shielded_address, wallet_address)| FvkListItem {
+                fvk: hex::encode(fvk),
+                fvk_commitment: hex::encode(commitment),
+                shielded_address,
+                wallet_address,
+            },
+        )
         .collect();
 
     Ok(Json(ListFvksResponse {
@@ -423,9 +432,7 @@ pub async fn update_shielded_address(
         shielded_address: shielded_address
             .map(|s| s.to_string())
             .or(existing_shielded),
-        wallet_address: wallet_address
-            .map(|s| s.to_string())
-            .or(existing_wallet),
+        wallet_address: wallet_address.map(|s| s.to_string()).or(existing_wallet),
     }))
 }
 
@@ -529,7 +536,10 @@ mod tests {
 
         let issued = issuer.issue().unwrap();
         verifying_key
-            .verify_strict(&issued.fvk_commitment, &Signature::from_bytes(&issued.signature))
+            .verify_strict(
+                &issued.fvk_commitment,
+                &Signature::from_bytes(&issued.signature),
+            )
             .expect("signature should verify");
     }
 }

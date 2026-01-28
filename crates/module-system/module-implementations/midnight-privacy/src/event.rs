@@ -118,7 +118,6 @@ pub enum Event<S: Spec> {
     //
     // IMPORTANT: These variants are intentionally appended at the end of the enum to preserve
     // the discriminant indices of previously-emitted events under Borsh serialization.
-
     /// Deny-map root (blacklist) was updated by a pool admin.
     BlacklistRootUpdated {
         /// Previous root.

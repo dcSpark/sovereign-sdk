@@ -138,7 +138,14 @@ pub fn make_viewer_bundle(
 pub fn decrypt_note(
     fvk: &Hash32,
     encrypted_note: &EncryptedNote,
-) -> anyhow::Result<(Hash32, u128, Hash32, Hash32, Option<Hash32>, Option<[Hash32; MAX_INS]>)> {
+) -> anyhow::Result<(
+    Hash32,
+    u128,
+    Hash32,
+    Hash32,
+    Option<Hash32>,
+    Option<[Hash32; MAX_INS]>,
+)> {
     let fvk_obj = FullViewingKey(*fvk);
     let expected_fvk_c = fvk_commitment(&fvk_obj);
 
@@ -191,8 +198,7 @@ pub fn decrypt_note(
     recipient.copy_from_slice(&pt[80..112]);
 
     // Parse sender_id if present (spend/output formats)
-    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2
-    {
+    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(sender)

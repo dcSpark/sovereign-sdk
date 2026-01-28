@@ -1,6 +1,6 @@
 use anyhow::Result;
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Index, IndexCreateStatement, OnConflict};
@@ -272,7 +272,9 @@ async fn list_all_tables(
             "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE()"
         }
     };
-    let rows = idx_db.query_all(Statement::from_string(backend, sql)).await?;
+    let rows = idx_db
+        .query_all(Statement::from_string(backend, sql))
+        .await?;
     let mut tables = Vec::new();
     for row in rows {
         if let Ok(name) = row.try_get::<String>("", "name") {
@@ -722,8 +724,8 @@ pub async fn upsert_spent_nullifier(
 /// it extracts the keys and computes the recipient hash, then encodes it as bech32m.
 /// Otherwise returns the address as-is.
 fn normalize_address_for_query(address: &str) -> String {
-    use midnight_privacy::PrivacyAddress;
     use crate::viewer::hex_to_bech32m_address;
+    use midnight_privacy::PrivacyAddress;
 
     // Domain constant used for privacy operations (matches the rest of the codebase)
     const DOMAIN: [u8; 32] = [1u8; 32];
@@ -783,7 +785,10 @@ pub async fn list_wallet_txs(
     let mut transfer_matches = 0u64;
 
     // Deposits by sender OR recipient
-    debug!("Fetching midnight_deposit records for sender or recipient={}", normalized_address);
+    debug!(
+        "Fetching midnight_deposit records for sender or recipient={}",
+        normalized_address
+    );
     let deposit_filter = if should_scan_privacy {
         Condition::any()
             .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
@@ -810,10 +815,7 @@ pub async fn list_wallet_txs(
             trace!("Deposit event id {} not found in idx::Entity", md.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            md.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, md.encrypted_notes.as_ref());
         let privacy_recipient = md
             .recipient
             .clone()
@@ -845,7 +847,8 @@ pub async fn list_wallet_txs(
             if t != "deposit" {
                 trace!(
                     "Deposit {} filtered out by type (expected deposit, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -909,10 +912,7 @@ pub async fn list_wallet_txs(
             trace!("Withdraw event id {} not found in idx::Entity", mw.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            mw.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, mw.encrypted_notes.as_ref());
         let privacy_sender = mw
             .privacy_sender
             .clone()
@@ -943,7 +943,8 @@ pub async fn list_wallet_txs(
             if t != "withdraw" {
                 trace!(
                     "Withdraw {} filtered out by type (expected withdraw, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -1008,10 +1009,7 @@ pub async fn list_wallet_txs(
             trace!("Transfer event id {} not found in idx::Entity", mt.event_id);
             continue;
         };
-        let decrypted_notes = resolve_decrypted_notes(
-            vfk,
-            mt.encrypted_notes.as_ref(),
-        );
+        let decrypted_notes = resolve_decrypted_notes(vfk, mt.encrypted_notes.as_ref());
         let privacy_sender = mt
             .privacy_sender
             .clone()
@@ -1020,9 +1018,8 @@ pub async fn list_wallet_txs(
             .recipient
             .clone()
             .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
-        let matches_recipient =
-            privacy_recipient.as_deref() == Some(normalized_address.as_str())
-                || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
+        let matches_recipient = privacy_recipient.as_deref() == Some(normalized_address.as_str())
+            || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
         let matches_sender = privacy_sender.as_deref() == Some(normalized_address.as_str());
         let matches = if address_is_privacy {
             matches_recipient || matches_sender
@@ -1055,7 +1052,8 @@ pub async fn list_wallet_txs(
             if t != "transfer" {
                 trace!(
                     "Transfer {} filtered out by type (expected transfer, got {})",
-                    ev.tx_hash, t
+                    ev.tx_hash,
+                    t
                 );
                 continue;
             }
@@ -1227,10 +1225,7 @@ pub async fn list_txs(
     })
 }
 
-pub async fn get_tx(
-    db: &DatabaseConnection,
-    tx_hash: &str,
-) -> Result<Option<InvolvementItem>> {
+pub async fn get_tx(db: &DatabaseConnection, tx_hash: &str) -> Result<Option<InvolvementItem>> {
     // Look up by tx_hash in events then related tables.
     let ev = idx::Entity::find()
         .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
@@ -1320,10 +1315,7 @@ pub async fn get_tx(
     }))
 }
 
-pub async fn get_tx_god(
-    db: &DatabaseConnection,
-    tx_hash: &str,
-) -> Result<Option<InvolvementItem>> {
+pub async fn get_tx_god(db: &DatabaseConnection, tx_hash: &str) -> Result<Option<InvolvementItem>> {
     let ev = idx::Entity::find()
         .filter(idx::Column::TxHash.eq(tx_hash.to_string()))
         .one(db)
@@ -1385,8 +1377,8 @@ async fn list_transactions_internal(
 
     // Apply cursor filter for efficient pagination
     if let Some(ref cur) = cursor {
-        let cursor_ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms)
-            .unwrap_or_else(|| Utc::now());
+        let cursor_ts =
+            DateTime::<Utc>::from_timestamp_millis(cur.ts_ms).unwrap_or_else(|| Utc::now());
         // Fetch records where (created_at < cursor_ts) OR (created_at == cursor_ts AND tx_hash < cursor_tx_hash)
         query = query.filter(
             Condition::any()
@@ -1494,8 +1486,7 @@ async fn list_wallet_transactions_internal(
             Condition::any()
                 .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
         } else {
-            Condition::any()
-                .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+            Condition::any().add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
         };
 
         let deps = idx::midnight_deposit::Entity::find()
@@ -1543,8 +1534,9 @@ async fn list_wallet_transactions_internal(
     if type_filter.is_none() || type_filter.as_deref() == Some("withdraw") {
         let wds = idx::midnight_withdraw::Entity::find()
             .filter(if address_is_privacy {
-                Condition::any()
-                    .add(idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()))
+                Condition::any().add(
+                    idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()),
+                )
             } else {
                 Condition::any()
                     .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
@@ -1572,7 +1564,11 @@ async fn list_wallet_transactions_internal(
                 kind: ev.kind.clone(),
                 sender: mw.sender.clone(),
                 recipient: mw.to_addr.clone(),
-                privacy_sender: if god_mode { mw.privacy_sender.clone() } else { None },
+                privacy_sender: if god_mode {
+                    mw.privacy_sender.clone()
+                } else {
+                    None
+                },
                 privacy_recipient: None,
                 amount: mw.amount.clone(),
                 anchor_root: mw.anchor_root.clone(),
@@ -1594,10 +1590,12 @@ async fn list_wallet_transactions_internal(
             .filter(if address_is_privacy {
                 Condition::any()
                     .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
-                    .add(idx::midnight_transfer::Column::PrivacySender.eq(normalized_address.clone()))
+                    .add(
+                        idx::midnight_transfer::Column::PrivacySender
+                            .eq(normalized_address.clone()),
+                    )
             } else {
-                Condition::any()
-                    .add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+                Condition::any().add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
             })
             .all(db)
             .await?;
@@ -1621,7 +1619,11 @@ async fn list_wallet_transactions_internal(
                 kind: ev.kind.clone(),
                 sender: mt.sender.clone(),
                 recipient: if god_mode { mt.recipient.clone() } else { None },
-                privacy_sender: if god_mode { mt.privacy_sender.clone() } else { None },
+                privacy_sender: if god_mode {
+                    mt.privacy_sender.clone()
+                } else {
+                    None
+                },
                 privacy_recipient: if god_mode { mt.recipient.clone() } else { None },
                 amount: if god_mode { mt.amount.clone() } else { None },
                 anchor_root: mt.anchor_root.clone(),
@@ -1631,7 +1633,11 @@ async fn list_wallet_transactions_internal(
                 events: ev.events.clone(),
                 status: ev.status.clone(),
                 encrypted_notes: mt.encrypted_notes.clone(),
-                decrypted_notes: if god_mode { mt.decrypted_notes.clone() } else { None },
+                decrypted_notes: if god_mode {
+                    mt.decrypted_notes.clone()
+                } else {
+                    None
+                },
                 payload: serde_json::from_str(&ev.payload).ok(),
             });
         }
@@ -1774,10 +1780,7 @@ async fn build_transaction_item(
     })
 }
 
-fn decrypted_notes_match_recipient(
-    decrypted_notes: Option<&JsonValue>,
-    recipient: &str,
-) -> bool {
+fn decrypted_notes_match_recipient(decrypted_notes: Option<&JsonValue>, recipient: &str) -> bool {
     let Some(decrypted_notes) = decrypted_notes else {
         return false;
     };
@@ -1818,9 +1821,7 @@ pub async fn record_freeze_event(
         created_at: Set(Utc::now()),
     };
 
-    let result = idx::frozen_accounts::Entity::insert(model)
-        .exec(db)
-        .await?;
+    let result = idx::frozen_accounts::Entity::insert(model).exec(db).await?;
 
     Ok(result.last_insert_id)
 }

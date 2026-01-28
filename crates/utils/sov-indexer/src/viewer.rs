@@ -510,8 +510,7 @@ pub fn decrypt_note(fvk: &Hash32, encrypted_note: &EncryptedNote) -> Result<Decr
     recipient.copy_from_slice(&pt[80..112]);
 
     // Parse sender_id if present (spend/output formats)
-    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2
-    {
+    let sender_id = if pt.len() == NOTE_PLAIN_LEN_SPEND_V1 || pt.len() == NOTE_PLAIN_LEN_SPEND_V2 {
         let mut sender = [0u8; 32];
         sender.copy_from_slice(&pt[112..144]);
         Some(hex::encode(sender))

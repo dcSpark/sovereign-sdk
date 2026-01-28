@@ -714,10 +714,9 @@ impl Provider {
             );
         }
 
-        let fvk_list: FvkListResponse = response
-            .json()
-            .await
-            .with_context(|| format!("Failed to parse FVK registry JSON from indexer at {}", url))?;
+        let fvk_list: FvkListResponse = response.json().await.with_context(|| {
+            format!("Failed to parse FVK registry JSON from indexer at {}", url)
+        })?;
 
         tracing::debug!("Fetched {} FVKs from indexer", fvk_list.count);
 

@@ -82,7 +82,11 @@ pub async fn get_privacy_notes(
         .collect();
 
     // Largest-first to maximize value coverage within the input cap (<= 4).
-    notes.sort_by(|a, b| b.value.cmp(&a.value).then(b.timestamp_ms.cmp(&a.timestamp_ms)));
+    notes.sort_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then(b.timestamp_ms.cmp(&a.timestamp_ms))
+    });
 
     Ok(notes)
 }
@@ -91,8 +95,15 @@ pub async fn get_privacy_notes(
 ///
 /// This matches the tx-generator policy: always use as many notes as possible
 /// (up to 4), in descending value order.
-pub fn select_largest_notes(mut notes: Vec<SpendableNote>, max_inputs: usize) -> Vec<SpendableNote> {
-    notes.sort_by(|a, b| b.value.cmp(&a.value).then(b.timestamp_ms.cmp(&a.timestamp_ms)));
+pub fn select_largest_notes(
+    mut notes: Vec<SpendableNote>,
+    max_inputs: usize,
+) -> Vec<SpendableNote> {
+    notes.sort_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then(b.timestamp_ms.cmp(&a.timestamp_ms))
+    });
     notes.truncate(max_inputs);
     notes
 }
@@ -115,4 +126,3 @@ pub fn select_largest_notes_covering_amount(
     );
     Ok(selected)
 }
-

@@ -7,14 +7,19 @@ use midnight_privacy::{
 };
 use sov_modules_api::capabilities::mocks::MockKernel;
 use sov_modules_api::transaction::AuthenticatedTransactionData;
-use sov_modules_api::{Context, Gas, Genesis, Module, Spec, StateCheckpoint, StateProvider, WorkingSet};
+use sov_modules_api::{
+    Context, Gas, Genesis, Module, Spec, StateCheckpoint, StateProvider, WorkingSet,
+};
 use sov_test_utils::storage::{ForklessStorageManager, SimpleStorageManager};
 use sov_test_utils::{
     default_test_tx_details, new_test_gas_meter, validate_and_materialize, TestSpec,
     TestStorageSpec,
 };
 
-fn setup_mp() -> (ValueMidnightPrivacy<TestSpec>, SimpleStorageManager<TestStorageSpec>) {
+fn setup_mp() -> (
+    ValueMidnightPrivacy<TestSpec>,
+    SimpleStorageManager<TestStorageSpec>,
+) {
     let mut sm = SimpleStorageManager::<TestStorageSpec>::new();
     sm.genesis();
 
@@ -103,28 +108,32 @@ fn pool_admin_management_and_freeze_unfreeze() {
     let pk: Hash32 = [0x11u8; 32];
     let addr = PrivacyAddress::from_pk(&pk);
     mp.call(
-        CallMessage::FreezeAddress {
-            address: addr,
-        },
+        CallMessage::FreezeAddress { address: addr },
         &ctx(new_pool_admin.clone()),
         &mut ws,
     )
     .unwrap();
-    let frozen = mp.frozen_addresses.get(&mut ws).unwrap().unwrap_or_default();
+    let frozen = mp
+        .frozen_addresses
+        .get(&mut ws)
+        .unwrap()
+        .unwrap_or_default();
     assert_eq!(frozen, vec![addr]);
     assert_ne!(
         mp.blacklist_root.get(&mut ws).unwrap().unwrap(),
         default_blacklist_root()
     );
     mp.call(
-        CallMessage::UnfreezeAddress {
-            address: addr,
-        },
+        CallMessage::UnfreezeAddress { address: addr },
         &ctx(new_pool_admin.clone()),
         &mut ws,
     )
     .unwrap();
-    let frozen = mp.frozen_addresses.get(&mut ws).unwrap().unwrap_or_default();
+    let frozen = mp
+        .frozen_addresses
+        .get(&mut ws)
+        .unwrap()
+        .unwrap_or_default();
     assert!(frozen.is_empty());
     assert_eq!(
         mp.blacklist_root.get(&mut ws).unwrap().unwrap(),

@@ -305,7 +305,6 @@ async fn authority_index_handler(State(state): State<AppState>) -> impl IntoResp
     (StatusCode::OK, Json(response))
 }
 
-
 /// Wallet data matching MockMCP's /authority/accounts response format
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,7 +363,11 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
         Err(e) => {
             tracing::warn!("Failed to fetch FVK registry: {}", e);
             // Return empty array if indexer is unavailable
-            return (StatusCode::OK, Json(Vec::<(String, AuthorityWalletData)>::new())).into_response();
+            return (
+                StatusCode::OK,
+                Json(Vec::<(String, AuthorityWalletData)>::new()),
+            )
+                .into_response();
         }
     };
 
@@ -390,7 +393,12 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
         // Try to get balance for this address
         let (balance, last_send) = match state
             .provider
-            .get_wallet_balance(privacy_address, None, Some(&fvk_entry.fvk), Some(&fvk_entry.fvk))
+            .get_wallet_balance(
+                privacy_address,
+                None,
+                Some(&fvk_entry.fvk),
+                Some(&fvk_entry.fvk),
+            )
             .await
         {
             Ok(balance_resp) => {
@@ -499,7 +507,8 @@ async fn authority_tps_handler(State(state): State<AppState>) -> impl IntoRespon
             .into_response();
     };
 
-    let fetch = |window_seconds: u64| fetch_metrics_tps(&state.http_client, base_url, window_seconds);
+    let fetch =
+        |window_seconds: u64| fetch_metrics_tps(&state.http_client, base_url, window_seconds);
     let (m1, m5, m15) = tokio::join!(fetch(60), fetch(300), fetch(900));
 
     let (m1, m5, m15) = match (m1, m5, m15) {
@@ -583,8 +592,9 @@ async fn authority_set_frozen(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: "Authority write endpoints are disabled. Set MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN."
-                    .to_string(),
+                error:
+                    "Authority write endpoints are disabled. Set MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN."
+                        .to_string(),
             }),
         )
             .into_response();
@@ -665,7 +675,13 @@ async fn authority_set_frozen(
                     e
                 );
             }
-            (StatusCode::OK, Json(TxHashResponse { tx_hash: res.tx_hash })).into_response()
+            (
+                StatusCode::OK,
+                Json(TxHashResponse {
+                    tx_hash: res.tx_hash,
+                }),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,

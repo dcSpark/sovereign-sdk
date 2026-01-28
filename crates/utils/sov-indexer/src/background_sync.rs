@@ -19,7 +19,11 @@ const PRIVACY_DOMAIN: Hash32 = [1u8; 32];
 const PRIVACY_DOMAIN_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
 fn is_zero_hash32(hex_str: &str) -> bool {
-    let trimmed = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str).to_lowercase();
+    let trimmed = hex_str
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(hex_str)
+        .to_lowercase();
     trimmed == "0".repeat(64)
 }
 
@@ -280,8 +284,10 @@ pub async fn backfill_index(
     let mut cur = last;
     for row in rows.iter() {
         cur = row.id;
-        let (kind, amount, anchor_root, nullifiers) = parse_kind_amount_roots(&row.transaction_data)
-            .unwrap_or(("other".to_string(), None, None, None));
+        let (kind, amount, anchor_root, nullifiers) = parse_kind_amount_roots(
+            &row.transaction_data,
+        )
+        .unwrap_or(("other".to_string(), None, None, None));
         let first_nullifier = nullifiers.as_ref().and_then(|v| v.first().cloned());
         let payload = row.transaction_data.clone();
         if kind == "deposit" {
@@ -343,7 +349,11 @@ pub async fn backfill_index(
                 .or(recip_from_payload);
 
             let deposit_cm = deposit_cm_from_events.or_else(|| {
-                compute_deposit_commitment_fallback(amount.as_deref(), rho.as_deref(), recipient.as_deref())
+                compute_deposit_commitment_fallback(
+                    amount.as_deref(),
+                    rho.as_deref(),
+                    recipient.as_deref(),
+                )
             });
 
             // Deposits may not include any viewer ciphertexts; still index the created output commitment
@@ -449,7 +459,8 @@ pub async fn backfill_index(
                 let decrypted_notes =
                     viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
                 let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-                index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+                index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec)
+                    .await?;
                 index_spent_inputs(
                     idx,
                     &row.tx_hash,
@@ -461,18 +472,11 @@ pub async fn backfill_index(
                 .await?;
                 if let Some(nfs) = nullifiers.as_ref() {
                     for nf in nfs {
-                        db::upsert_spent_nullifier(
-                            idx,
-                            nf,
-                            &row.tx_hash,
-                            row.created_at,
-                            &kind,
-                        )
-                        .await?;
+                        db::upsert_spent_nullifier(idx, nf, &row.tx_hash, row.created_at, &kind)
+                            .await?;
                     }
                 }
-                let privacy_sender =
-                    extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
+                let privacy_sender = extract_sender_from_decrypted_notes(decrypted_notes.as_ref());
                 db::insert_midnight_withdraw(
                     idx,
                     event_id,
@@ -731,14 +735,13 @@ async fn backfill_notes_nullifiers_deposits(
                 continue;
             };
 
-            let deposit_cm =
-                extract_deposit_commitment(ev_json.as_ref()).or_else(|| {
-                    compute_deposit_commitment_fallback(
-                        row.amount.as_deref(),
-                        row.rho.as_deref(),
-                        row.recipient.as_deref(),
-                    )
-                });
+            let deposit_cm = extract_deposit_commitment(ev_json.as_ref()).or_else(|| {
+                compute_deposit_commitment_fallback(
+                    row.amount.as_deref(),
+                    row.rho.as_deref(),
+                    row.recipient.as_deref(),
+                )
+            });
             if let Some(cm) = deposit_cm.as_deref() {
                 db::upsert_note_created_metadata(idx_db, cm, tx_hash, *created_at, "deposit")
                     .await?;
@@ -1004,10 +1007,8 @@ async fn backfill_deposits(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };
@@ -1071,10 +1072,8 @@ async fn backfill_transfers(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };
@@ -1151,10 +1150,8 @@ async fn backfill_withdraws(
                 fvk_service,
             )
             .await?;
-            let decrypted_notes = viewer::try_decrypt_notes_with_registry(
-                vfk_registry,
-                row.encrypted_notes.as_ref(),
-            );
+            let decrypted_notes =
+                viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
                 continue;
             };

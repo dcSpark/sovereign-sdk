@@ -261,8 +261,8 @@ async fn test_store_deposit_transaction_without_proof() {
         &tx_hash,
         "{}".to_string(), // No proof outputs for deposits
         None,             // No view_attestations_json
-        true, // signature_valid
-        None, // proof_verified: NULL (transaction doesn't have a proof)
+        true,             // signature_valid
+        None,             // proof_verified: NULL (transaction doesn't have a proof)
         &transaction_data,
         &full_blob,
         None, // No pre-auth data in test

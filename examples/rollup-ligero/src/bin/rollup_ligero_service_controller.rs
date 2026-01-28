@@ -577,7 +577,11 @@ async fn handle_logs_socket(socket: WebSocket, app: Arc<AppState>) {
     {
         let buffer = app.log_buffer.lock().await;
         for log_line in buffer.get_all() {
-            if sender.send(Message::Text(log_line.to_json())).await.is_err() {
+            if sender
+                .send(Message::Text(log_line.to_json()))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -589,7 +593,11 @@ async fn handle_logs_socket(socket: WebSocket, app: Arc<AppState>) {
     // Spawn a task to send new logs
     let send_task = tokio::spawn(async move {
         while let Ok(log_line) = log_rx.recv().await {
-            if sender.send(Message::Text(log_line.to_json())).await.is_err() {
+            if sender
+                .send(Message::Text(log_line.to_json()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -721,9 +729,7 @@ async fn system_stats(State(app): State<Arc<AppState>>) -> Json<SystemStats> {
 }
 
 /// Health check endpoint that checks the status of all services
-async fn health_check(
-    State(_app): State<Arc<AppState>>,
-) -> Result<Json<HealthResponse>, ApiError> {
+async fn health_check(State(_app): State<Arc<AppState>>) -> Result<Json<HealthResponse>, ApiError> {
     // Define all services to check
     let services = vec![
         ServiceDefinition {

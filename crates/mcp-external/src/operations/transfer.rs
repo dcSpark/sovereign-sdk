@@ -98,8 +98,8 @@ enum TransferWaitMode {
 
 impl TransferWaitMode {
     fn from_env() -> Self {
-        let raw = std::env::var("MCP_TRANSFER_WAIT_MODE")
-            .unwrap_or_else(|_| "sequencer".to_string());
+        let raw =
+            std::env::var("MCP_TRANSFER_WAIT_MODE").unwrap_or_else(|_| "sequencer".to_string());
         let v = raw.trim().to_ascii_lowercase();
         match v.as_str() {
             "" | "sequencer" | "seq" => Self::Sequencer,
@@ -366,10 +366,7 @@ pub async fn transfer(
         "Merkle tree sync completed"
     );
 
-    let depth = siblings_by_input
-        .first()
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let depth = siblings_by_input.first().map(|s| s.len()).unwrap_or(0);
     anyhow::ensure!(depth > 0, "Merkle tree depth is zero");
     anyhow::ensure!(
         siblings_by_input.iter().all(|s| s.len() == depth),

@@ -384,14 +384,16 @@ impl CommitmentTreeSyncer {
                     let mut st = self.state.write().await;
                     *st = CachedTree::new(self.depth);
                     drop(st);
-                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
                     continue;
                 }
             }
         }
 
-        anyhow::bail!("Failed to sync commitment tree after {} attempts", SYNC_MAX_RETRIES);
+        anyhow::bail!(
+            "Failed to sync commitment tree after {} attempts",
+            SYNC_MAX_RETRIES
+        );
     }
 
     /// Resolve positions and Merkle openings for all `cms`, using the cached tree.
@@ -591,8 +593,8 @@ impl CommitmentTreeSyncer {
         anyhow::ensure!(
             rebuilt_root == expected_root,
             "Rebuilt tree root mismatch: rebuilt={} expected={}",
-                hex::encode(rebuilt_root),
-                hex::encode(expected_root)
+            hex::encode(rebuilt_root),
+            hex::encode(expected_root)
         );
 
         let mut st = self.state.write().await;

@@ -92,10 +92,9 @@ pub struct SuccessResponse {
 }
 
 pub fn router(state: AppState) -> Router {
-    let swagger_ui = Router::from(
-        SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()),
-    )
-    .layer(middleware::from_fn(swagger_ui_redirect));
+    let swagger_ui =
+        Router::from(SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()))
+            .layer(middleware::from_fn(swagger_ui_redirect));
 
     Router::new()
         .route("/wallets/:address", post(list_wallet_txs))
@@ -106,7 +105,10 @@ pub fn router(state: AppState) -> Router {
         .route("/transactions", get(get_transactions))
         .route("/transactions/god", get(get_transactions_god))
         .route("/transactions/wallet/:wallet", get(get_wallet_transactions))
-        .route("/transactions/wallet/:wallet/god", get(get_wallet_transactions_god))
+        .route(
+            "/transactions/wallet/:wallet/god",
+            get(get_wallet_transactions_god),
+        )
         .route("/health", get(health))
         // FVK registry management endpoints
         .route("/fvks", get(list_fvks).post(add_fvk))
@@ -201,11 +203,7 @@ async fn wallet_balance(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (
-                status,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
+            (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
         }
     }
 }
@@ -256,7 +254,11 @@ fn is_balance_client_error(err: &anyhow::Error) -> bool {
     {
         return true;
     }
-    if err.root_cause().downcast_ref::<hex::FromHexError>().is_some() {
+    if err
+        .root_cause()
+        .downcast_ref::<hex::FromHexError>()
+        .is_some()
+    {
         return true;
     }
 
@@ -544,12 +546,14 @@ async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
         .vfk_registry
         .entries()
         .into_iter()
-        .map(|(commitment, fvk, shielded_addr, wallet_addr)| FvkResponse {
-            fvk_commitment: commitment,
-            fvk: hex::encode(fvk),
-            shielded_address: shielded_addr,
-            wallet_address: wallet_addr,
-        })
+        .map(
+            |(commitment, fvk, shielded_addr, wallet_addr)| FvkResponse {
+                fvk_commitment: commitment,
+                fvk: hex::encode(fvk),
+                shielded_address: shielded_addr,
+                wallet_address: wallet_addr,
+            },
+        )
         .collect();
 
     (
@@ -630,9 +634,11 @@ async fn add_fvk(
     }
 
     // Add to registry (DashMap - no lock needed)
-    state
-        .vfk_registry
-        .add(fvk, req.shielded_address.clone(), req.wallet_address.clone());
+    state.vfk_registry.add(
+        fvk,
+        req.shielded_address.clone(),
+        req.wallet_address.clone(),
+    );
 
     // Persist to database
     if let Err(e) = state.vfk_registry.save_to_db(&state.db).await {

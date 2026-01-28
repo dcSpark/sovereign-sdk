@@ -34,7 +34,10 @@ pub fn load_pool_fvk_pk_from_env() -> Result<Option<[u8; 32]>> {
     if pk.is_empty() {
         return Ok(None);
     }
-    Ok(Some(parse_hex_32("MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX", pk)?))
+    Ok(Some(parse_hex_32(
+        "MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX",
+        pk,
+    )?))
 }
 
 /// If `POOL_FVK_PK` is not explicitly set but `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is, export it
@@ -102,7 +105,9 @@ pub fn inject_pool_sig_hex_into_proof_bytes(
         .get_mut(idx)
         .ok_or_else(|| anyhow!("Ligero args too short (missing arg #{fvk_commitment_arg_pos})"))?;
     let obj = arg.as_object_mut().ok_or_else(|| {
-        anyhow!("Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})")
+        anyhow!(
+            "Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})"
+        )
     })?;
     obj.insert(
         "pool_sig_hex".to_string(),
@@ -112,4 +117,3 @@ pub fn inject_pool_sig_hex_into_proof_bytes(
     package.args_json = serde_json::to_vec(&args).context("Failed to reserialize args_json")?;
     bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
 }
-

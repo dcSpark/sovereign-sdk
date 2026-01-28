@@ -29,13 +29,13 @@ use sov_node_client::NodeClient;
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
-use crate::{
-    find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
-    ChildGuard,
-};
 use crate::fvk_service::fetch_viewer_fvk_bundle;
 use crate::pool_fvk::{
     decode_ligero_hash32_arg, ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes,
+};
+use crate::{
+    find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
+    ChildGuard,
 };
 use sov_rollup_ligero::MockDemoRollup;
 
@@ -344,8 +344,9 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let viewer_fvk: Option<Hash32> = viewer_bundle.as_ref().map(|b| b.fvk);
     let expected_viewer_fvk_commitment: Option<Hash32> =
         viewer_bundle.as_ref().map(|b| b.fvk_commitment);
-    let pool_sig_hex: Option<Arc<String>> =
-        viewer_bundle.as_ref().map(|b| Arc::new(b.pool_sig_hex.clone()));
+    let pool_sig_hex: Option<Arc<String>> = viewer_bundle
+        .as_ref()
+        .map(|b| Arc::new(b.pool_sig_hex.clone()));
 
     if let Some(b) = viewer_bundle.as_ref() {
         eprintln!(
@@ -1284,8 +1285,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     // Check cache and generate proofs in parallel (with concurrency limit)
     use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
     let depth_usize = TREE_DEPTH as usize;
-    let viewer_fvk_commitment_arg_pos: Option<usize> = if expected_viewer_fvk_commitment.is_some()
-    {
+    let viewer_fvk_commitment_arg_pos: Option<usize> = if expected_viewer_fvk_commitment.is_some() {
         // note_spend_guest v2 fixed layout:
         // fvk_commitment lives at (n_viewers_idx + 1), where n_viewers_idx follows the deny-map args.
         let n_in: usize = 1;
@@ -1344,10 +1344,12 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                                         "cached proof payload is not a LigeroProofPackage",
                                     )?;
                                 let args: Vec<JsonValue> =
-                                    serde_json::from_slice(&package.args_json).context(
-                                        "cached proof args_json is not valid JSON",
-                                    )?;
-                                anyhow::ensure!(args.len() >= arg_pos, "cached proof args too short");
+                                    serde_json::from_slice(&package.args_json)
+                                        .context("cached proof args_json is not valid JSON")?;
+                                anyhow::ensure!(
+                                    args.len() >= arg_pos,
+                                    "cached proof args too short"
+                                );
                                 decode_ligero_hash32_arg(
                                     &args[arg_pos - 1],
                                     "viewer.fvk_commitment",
@@ -1823,7 +1825,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
                     let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
-                let nf_exp = nullifier(&domain, &nf_key, &input.rho);
+                    let nf_exp = nullifier(&domain, &nf_key, &input.rho);
                     let expected_nfs = [nf_exp];
                     if public.anchor_root != shared_anchor
                         || public.nullifiers.as_slice() != expected_nfs
@@ -1931,8 +1933,13 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             Some(fvk) => {
                 let in_recipient = recipient_from_sk_v2(&domain, &input.spend_sk, &pk_ivk_owner);
                 let in_sender_id = in_recipient; // deposit convention: sender_id == recipient
-                let cm_in =
-                    note_commitment(&domain, out_value_u64, &input.rho, &in_recipient, &in_sender_id);
+                let cm_in = note_commitment(
+                    &domain,
+                    out_value_u64,
+                    &input.rho,
+                    &in_recipient,
+                    &in_sender_id,
+                );
                 let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
                     [[0u8; 32]; crate::viewer::MAX_INS];
                 cm_ins[0] = cm_in;

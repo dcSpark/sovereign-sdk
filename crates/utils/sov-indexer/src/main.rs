@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use tracing::{info, warn};
 mod api;
@@ -48,20 +48,17 @@ async fn main() -> anyhow::Result<()> {
     let fvk_service = viewer::FvkServiceClient::from_env()?;
     if vfk_registry.is_empty() {
         if fvk_service.is_some() {
-            info!("FVK registry is empty; auto-fetch enabled (MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN set)");
+            info!(
+                "FVK registry is empty; auto-fetch enabled (MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN set)"
+            );
         } else {
             info!("FVK registry is empty; encrypted notes will not be decrypted (no FVKs + no auto-fetch)");
         }
     }
 
     // Try a one-shot backfill; if DA tables are not ready, log and continue.
-    if let Err(e) = background_sync::backfill_index(
-        &da_db,
-        &idx_db,
-        &vfk_registry,
-        fvk_service.as_ref(),
-    )
-    .await
+    if let Err(e) =
+        background_sync::backfill_index(&da_db, &idx_db, &vfk_registry, fvk_service.as_ref()).await
     {
         warn!(error = %e, "Initial backfill failed; will retry in background loop");
     }
@@ -70,8 +67,12 @@ async fn main() -> anyhow::Result<()> {
     let fvk_service_clone = fvk_service.clone();
     tokio::spawn(async move {
         println!("Starting encrypted-note backfills");
-        if let Err(e) =
-            background_sync::backfill_privacy_fields(&idx_clone, &vfk_registry_clone, fvk_service_clone.as_ref()).await
+        if let Err(e) = background_sync::backfill_privacy_fields(
+            &idx_clone,
+            &vfk_registry_clone,
+            fvk_service_clone.as_ref(),
+        )
+        .await
         {
             warn!(error = %e, "VFK backfill failed");
         }
@@ -99,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Indexer running in SYNC mode; serving from index DB");
 
-    let app = api::router(api::AppState { db: idx_db, vfk_registry });
+    let app = api::router(api::AppState {
+        db: idx_db,
+        vfk_registry,
+    });
 
     let addr: SocketAddr = bind_addr.parse()?;
     info!("sov-indexer listening on {}", addr);
@@ -116,9 +120,7 @@ async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<Data
         use std::str::FromStr;
 
         let sqlite_opts = SqliteConnectOptions::from_str(connection_string)
-            .with_context(|| {
-                format!("Failed to parse {} SQLite connection string", label)
-            })?
+            .with_context(|| format!("Failed to parse {} SQLite connection string", label))?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_millis(30_000));
@@ -132,7 +134,10 @@ async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<Data
             .connect_with(sqlite_opts)
             .await
             .with_context(|| {
-                format!("Failed to connect {} SQLite DB {}", label, connection_string)
+                format!(
+                    "Failed to connect {} SQLite DB {}",
+                    label, connection_string
+                )
             })?;
 
         info!(

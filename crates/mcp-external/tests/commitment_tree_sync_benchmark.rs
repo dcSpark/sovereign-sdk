@@ -89,7 +89,10 @@ fn bench_commitment_tree_rebuild_like_server() {
     let notes = generate_notes(filled);
 
     eprintln!("--- commitment tree rebuild benchmark (server-like, offline) ---");
-    eprintln!("depth={} capacity={} filled_leaves={}", depth, capacity, filled);
+    eprintln!(
+        "depth={} capacity={} filled_leaves={}",
+        depth, capacity, filled
+    );
     eprintln!(
         "openings_per_iter={} min_secs={}",
         openings,

@@ -790,7 +790,8 @@ struct PendingSpentNotes {
 impl PendingSpentNotes {
     fn purge_expired(&mut self) {
         let ttl = pending_spent_note_ttl();
-        self.by_rho.retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+        self.by_rho
+            .retain(|_, inserted_at| inserted_at.elapsed() < ttl);
     }
 }
 
@@ -945,15 +946,15 @@ impl CryptoServer {
         let notes = loop {
             notes_fetch_attempts += 1;
             let fetch_started = std::time::Instant::now();
-            let mut notes = crate::operations::get_privacy_notes(
-                provider,
-                privacy_key,
-                Some(&viewing_key),
-            )
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(format!("Failed to fetch unspent notes: {}", e), None)
-            })?;
+            let mut notes =
+                crate::operations::get_privacy_notes(provider, privacy_key, Some(&viewing_key))
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!("Failed to fetch unspent notes: {}", e),
+                            None,
+                        )
+                    })?;
             notes_fetch_ms_total += fetch_started.elapsed().as_millis();
             notes_returned_by_indexer_last = notes.len();
 
@@ -1076,10 +1077,7 @@ impl CryptoServer {
             });
         }
         let inputs_ms = inputs_started.elapsed().as_millis();
-        tracing::debug!(
-            elapsed_ms = inputs_ms,
-            "Prepared transfer inputs"
-        );
+        tracing::debug!(elapsed_ms = inputs_ms, "Prepared transfer inputs");
         let output_recipient = recipient_from_pk_v2(&DOMAIN, &output_pk, &output_pk_ivk);
 
         tracing::debug!(
@@ -1352,7 +1350,10 @@ impl CryptoServer {
             .map_err(|e| {
                 let msg = e.to_string();
                 if msg.to_ascii_lowercase().contains("not found") {
-                    ErrorData::invalid_params("Transaction not found for this wallet.".to_string(), None)
+                    ErrorData::invalid_params(
+                        "Transaction not found for this wallet.".to_string(),
+                        None,
+                    )
                 } else {
                     ErrorData::internal_error(msg, None)
                 }
@@ -1570,29 +1571,26 @@ impl CryptoServer {
             .transpose()
             .map_err(|e| ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None))?;
 
-        let viewer_fvk_bundle =
-            if let Some(pool_pk) = pool_fvk_pk {
-                let http = reqwest::Client::new();
-                Some(
-                    fetch_viewer_fvk_bundle(
-                        &http,
-                        Some(pool_pk),
-                        Some(&privacy_address),
-                        Some(&wallet_address_str),
-                    )
-                    .await
-                    .map_err(|e| {
-                        ErrorData::internal_error(
-                            format!(
-                                "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
-                            ),
-                            None,
-                        )
-                    })?,
+        let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+            let http = reqwest::Client::new();
+            Some(
+                fetch_viewer_fvk_bundle(
+                    &http,
+                    Some(pool_pk),
+                    Some(&privacy_address),
+                    Some(&wallet_address_str),
                 )
-            } else {
-                None
-            };
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"),
+                        None,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
 
         // Auto-fund when configured via AUTO_FUND_DEPOSIT_AMOUNT
         // Flow: Admin sends L2 tokens to new wallet, then new wallet deposits to privacy pool

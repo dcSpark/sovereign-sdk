@@ -16,8 +16,7 @@ impl FvkStore {
 
         let is_postgres = db_url.starts_with("postgres://") || db_url.starts_with("postgresql://");
 
-        let options = AnyConnectOptions::from_str(db_url)
-            .context("parse database URL")?;
+        let options = AnyConnectOptions::from_str(db_url).context("parse database URL")?;
 
         let pool = AnyPoolOptions::new()
             .max_connections(8)
@@ -145,9 +144,10 @@ impl FvkStore {
         .context("create issued_fvks")?;
 
         // Migration: add shielded_address column if it doesn't exist (for existing DBs)
-        let _ = sqlx::query("ALTER TABLE issued_fvks ADD COLUMN IF NOT EXISTS shielded_address TEXT")
-            .execute(&self.pool)
-            .await;
+        let _ =
+            sqlx::query("ALTER TABLE issued_fvks ADD COLUMN IF NOT EXISTS shielded_address TEXT")
+                .execute(&self.pool)
+                .await;
 
         // Migration: add wallet_address column if it doesn't exist (for existing DBs)
         let _ = sqlx::query("ALTER TABLE issued_fvks ADD COLUMN IF NOT EXISTS wallet_address TEXT")
@@ -310,10 +310,7 @@ impl FvkStore {
         wallet_address: Option<&str>,
     ) -> Result<()> {
         let index_value: Option<i64> = match index_value {
-            Some(v) => Some(
-                v.try_into()
-                    .map_err(|_| anyhow!("index_value too large"))?,
-            ),
+            Some(v) => Some(v.try_into().map_err(|_| anyhow!("index_value too large"))?),
             None => None,
         };
 
@@ -449,7 +446,9 @@ impl FvkStore {
     }
 
     /// List all issued FVKs with their addresses
-    pub async fn list_all(&self) -> Result<Vec<([u8; 32], [u8; 32], Option<String>, Option<String>)>> {
+    pub async fn list_all(
+        &self,
+    ) -> Result<Vec<([u8; 32], [u8; 32], Option<String>, Option<String>)>> {
         let rows = sqlx::query(
             r#"
             SELECT fvk_commitment, fvk, shielded_address, wallet_address
