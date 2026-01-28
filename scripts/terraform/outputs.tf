@@ -109,3 +109,43 @@ output "ssh_connection_command" {
   description = "SSH command to connect to the instance"
   value       = "ssh -i <path-to-private-key> ubuntu@${aws_instance.main.public_ip}"
 }
+
+# -----------------------------------------------------------------------------
+# RDS Outputs
+# -----------------------------------------------------------------------------
+
+output "rds_endpoint" {
+  description = "RDS instance endpoint (hostname:port)"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "rds_address" {
+  description = "RDS instance hostname"
+  value       = aws_db_instance.main.address
+}
+
+output "rds_port" {
+  description = "RDS instance port"
+  value       = aws_db_instance.main.port
+}
+
+output "rds_database_name" {
+  description = "Name of the default database"
+  value       = aws_db_instance.main.db_name
+}
+
+output "rds_username" {
+  description = "Master username for the RDS instance"
+  value       = aws_db_instance.main.username
+  sensitive   = true
+}
+
+output "rds_security_group_id" {
+  description = "ID of the RDS security group"
+  value       = aws_security_group.rds_postgres.id
+}
+
+output "rds_connection_string" {
+  description = "PostgreSQL connection string (password not included)"
+  value       = "postgresql://${aws_db_instance.main.username}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${aws_db_instance.main.db_name}"
+}

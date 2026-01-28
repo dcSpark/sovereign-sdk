@@ -54,18 +54,18 @@ variable "vpc_secondary_cidr" {
 variable "public_subnet_cidrs" {
   description = "CIDR blocks for public subnets"
   type        = list(string)
-  default     = [
-    "172.32.0.0/18",   # us-east-1a (existing - DO NOT CHANGE)
-    "172.32.64.0/18",  # us-east-1b (existing - DO NOT CHANGE)
-    "172.33.0.0/18",   # us-east-1c (new - from secondary CIDR)
-    "172.33.64.0/18"   # us-east-1d (new - from secondary CIDR)
+  default = [
+    "172.32.0.0/18",  # us-east-1a (existing - DO NOT CHANGE)
+    "172.32.64.0/18", # us-east-1b (existing - DO NOT CHANGE)
+    "172.33.0.0/18",  # us-east-1c (new - from secondary CIDR)
+    "172.33.64.0/18"  # us-east-1d (new - from secondary CIDR)
   ]
 }
 
 variable "private_subnet_cidrs" {
   description = "CIDR blocks for private subnets"
   type        = list(string)
-  default     = [
+  default = [
     "172.32.128.0/18", # us-east-1a (existing - DO NOT CHANGE)
     "172.32.192.0/18", # us-east-1b (existing - DO NOT CHANGE)
     "172.33.128.0/18", # us-east-1c (new - from secondary CIDR)
@@ -118,4 +118,62 @@ variable "root_volume_throughput" {
   description = "Throughput for GP3 volume in MB/s (125-1000)"
   type        = number
   default     = 125
+}
+
+# -----------------------------------------------------------------------------
+# RDS Configuration
+# -----------------------------------------------------------------------------
+
+variable "rds_engine_version" {
+  description = "PostgreSQL engine version for RDS"
+  type        = string
+  default     = "16.6" # Adjust to your preferred version (e.g., 16.1, 16.4, etc.)
+}
+
+variable "rds_instance_class" {
+  description = "RDS instance class"
+  type        = string
+  default     = "db.m8g.large"
+}
+
+variable "rds_allocated_storage" {
+  description = "Initial allocated storage in GB"
+  type        = number
+  default     = 100
+}
+
+variable "rds_max_allocated_storage" {
+  description = "Maximum storage in GB for autoscaling (set higher than allocated_storage to enable)"
+  type        = number
+  default     = 500
+}
+
+variable "rds_database_name" {
+  description = "Name of the default database to create"
+  type        = string
+  default     = "midnight"
+}
+
+variable "rds_master_username" {
+  description = "Master username for the RDS instance"
+  type        = string
+  default     = "postgres"
+}
+
+variable "rds_master_password" {
+  description = "Master password for the RDS instance"
+  type        = string
+  sensitive   = true
+}
+
+variable "rds_skip_final_snapshot" {
+  description = "Skip final snapshot when destroying the database (set to false for production)"
+  type        = bool
+  default     = true
+}
+
+variable "rds_deletion_protection" {
+  description = "Enable deletion protection (set to true for production)"
+  type        = bool
+  default     = false
 }

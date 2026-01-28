@@ -24,7 +24,7 @@ resource "aws_vpc_ipv4_cidr_block_association" "secondary" {
 
 # Disable VPC Block Public Access to allow inbound internet traffic
 resource "aws_vpc_block_public_access_exclusion" "main" {
-  vpc_id                 = aws_vpc.main.id
+  vpc_id                          = aws_vpc.main.id
   internet_gateway_exclusion_mode = "allow-bidirectional"
 }
 
