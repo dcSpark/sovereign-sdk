@@ -1,9 +1,13 @@
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use rmcp::transport::common::http_header::HEADER_SESSION_ID;
+use rmcp::transport::common::server_side_http::SessionId;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::SessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -34,6 +38,133 @@ use crate::server::{CryptoServer, McpWalletContext};
 use crate::wallet::WalletContext;
 
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
+
+struct McpSessions {
+    service: StreamableHttpService<CryptoServer, LocalSessionManager>,
+    session_manager: Arc<LocalSessionManager>,
+    alias_to_internal: RwLock<std::collections::HashMap<String, SessionId>>,
+}
+
+impl McpSessions {
+    fn new(
+        service: StreamableHttpService<CryptoServer, LocalSessionManager>,
+        session_manager: Arc<LocalSessionManager>,
+    ) -> Self {
+        Self {
+            service,
+            session_manager,
+            alias_to_internal: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn handle(&self, request: Request<Body>) -> axum::response::Response {
+        let (mut parts, body) = request.into_parts();
+
+        let body_bytes = match to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read request body: {err}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let original_session_id = parts
+            .headers
+            .get(HEADER_SESSION_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let mut pending_alias: Option<String> = None;
+
+        if let Some(session_id) = original_session_id {
+            // 1) If the session id is an alias we created, rewrite to the internal session id.
+            let mapped_internal = {
+                let guard = self.alias_to_internal.read().await;
+                guard.get(&session_id).cloned()
+            };
+
+            if let Some(internal) = mapped_internal {
+                match self.session_manager.has_session(&internal).await {
+                    Ok(true) => {
+                        if let Ok(value) = HeaderValue::from_str(internal.as_ref()) {
+                            parts.headers.insert(HEADER_SESSION_ID, value);
+                        } else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "Invalid resolved session id header value",
+                            )
+                                .into_response();
+                        }
+                    }
+                    Ok(false) | Err(_) => {
+                        // Stale mapping; drop it and treat as a new alias below.
+                        let mut guard = self.alias_to_internal.write().await;
+                        guard.remove(&session_id);
+                        pending_alias = Some(session_id);
+                    }
+                }
+            } else {
+                // 2) Otherwise, treat it as a real/internal session id if the RMCP session exists.
+                let as_session_id: SessionId = session_id.clone().into();
+                let exists = self
+                    .session_manager
+                    .has_session(&as_session_id)
+                    .await
+                    .unwrap_or(false);
+                if !exists {
+                    pending_alias = Some(session_id);
+                }
+            }
+        }
+
+        // If the client supplied a session id that doesn't exist, allow it to *create* a new
+        // session by sending an MCP `initialize` request with that session id. We do this by
+        // letting RMCP create a fresh internal session id, then mapping the client-provided id
+        // to it and returning the client-provided id back in the response header.
+        if pending_alias.is_some() {
+            let is_initialize = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+                .is_some_and(|m| m == "initialize");
+
+            if parts.method == Method::POST && is_initialize {
+                parts.headers.remove(HEADER_SESSION_ID);
+            } else {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
+                )
+                    .into_response();
+            }
+        }
+
+        let request = Request::from_parts(parts, Body::from(body_bytes));
+        let mut response = self.service.handle(request).await.into_response();
+
+        if let Some(alias) = pending_alias {
+            if let Some(internal_id) = response
+                .headers()
+                .get(HEADER_SESSION_ID)
+                .and_then(|v| v.to_str().ok())
+            {
+                let internal: SessionId = internal_id.to_string().into();
+                let mut guard = self.alias_to_internal.write().await;
+                guard.insert(alias.clone(), internal);
+
+                if let Ok(alias_value) = HeaderValue::from_str(&alias) {
+                    response
+                        .headers_mut()
+                        .insert(HEADER_SESSION_ID, alias_value);
+                }
+            }
+        }
+
+        response
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -165,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
 
+    let session_manager = Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
         move || {
             // Each MCP session starts with no wallet loaded and gets isolated state (no cross-talk
@@ -190,9 +322,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_explicitly_loaded,
             ))
         },
-        LocalSessionManager::default().into(),
+        session_manager.clone(),
         Default::default(),
     );
+
+    let mcp_sessions = Arc::new(McpSessions::new(service, session_manager));
 
     let app_state = AppState {
         http_client: reqwest::Client::new(),
@@ -200,10 +334,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_wallet_ctx: admin_wallet_ctx.clone(),
         authority_api_token: cfg.midnight_fvk_service_admin_token.clone(),
         metrics_api_url: cfg.metrics_api_url.clone(),
+        mcp_sessions,
     };
 
+    let mcp_router = Router::new().route("/", any(mcp_handler));
+
     let router = Router::new()
-        .nest_service("/mcp", service)
+        .nest("/mcp", mcp_router)
         .route("/health", get(health_handler))
         .route("/authority", get(authority_index_handler))
         .route("/authority/info", get(authority_info_handler))
@@ -241,6 +378,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn mcp_handler(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> axum::response::Response {
+    state.mcp_sessions.handle(req).await
+}
+
 /// Health check response
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -267,6 +411,7 @@ struct AppState {
     admin_wallet_ctx: Option<Arc<McpWalletContext>>,
     authority_api_token: Option<String>,
     metrics_api_url: Option<Url>,
+    mcp_sessions: Arc<McpSessions>,
 }
 
 #[derive(Debug, Serialize)]
