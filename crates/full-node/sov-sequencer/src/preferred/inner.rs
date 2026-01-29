@@ -202,7 +202,12 @@ where
         &mut self,
         sequence_number: SequenceNumber,
     ) {
-        info!(%sequence_number, "Overwriting next sequence number");
+        // For replicas, this happens on every new block synced - use debug level to reduce noise.
+        if self.is_replica() {
+            debug!(%sequence_number, "Replica: updating sequence number to match chain");
+        } else {
+            info!(%sequence_number, "Overwriting next sequence number");
+        }
         self.sequence_number_of_next_blob = sequence_number;
         track_sequence_number(self.sequence_number_of_next_blob);
     }
@@ -1639,7 +1644,13 @@ where
         ) {
             (true, _, _, true, _) => PreferredSeqOperation::Unreachable,
             (true, _, false, false, _) => {
-                warn!("The node has a higher sequence number than the sequencer, but we're very close to the chain tip, i.e. we don't expect to be simply syncing. This could mean there is another preferred sequencer running (which is not supported and will likely lead to issues), or you very recently restarted the node and there's still some in-flight blobs. Resyncing to the chain tip.");
+                // In replica mode, this is expected behavior - the replica is always "behind" the primary.
+                // Only warn in non-replica mode where this could indicate a competing sequencer.
+                if inner.is_replica() {
+                    debug!("Replica detected chain advancement. Resyncing to chain tip.");
+                } else {
+                    warn!("The node has a higher sequence number than the sequencer, but we're very close to the chain tip, i.e. we don't expect to be simply syncing. This could mean there is another preferred sequencer running (which is not supported and will likely lead to issues), or you very recently restarted the node and there's still some in-flight blobs. Resyncing to the chain tip.");
+                }
                 inner.is_ready = Err(SequencerNotReadyDetails::Syncing {
                     target_da_height: sync_status.target_da_height(),
                     synced_da_height: sync_status.synced_da_height(),
