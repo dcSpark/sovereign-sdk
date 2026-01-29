@@ -9,9 +9,15 @@ connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
 finalization = 40
 
-# Skip database schema setup (CREATE TABLE, CREATE INDEX) for read-only users.
-# Tables must already exist in the database (created by a primary node with write access).
-skip_schema_setup = true
+# Enable read-only replica mode:
+# - Skips database schema setup (CREATE TABLE, CREATE INDEX)
+# - Spawns background poller to detect new blocks from the shared database
+# Tables must already exist (created by the primary node with write access).
+readonly_mode = true
+
+# Polling interval (ms) for detecting new blocks from the shared database.
+# Lower values = faster sync but more database queries. Default is 1000ms.
+readonly_poll_interval_ms = 500
 
 # Disable worker tx persistence for replica (read-only, no need to save)
 save_incoming_worker_txs = "none"

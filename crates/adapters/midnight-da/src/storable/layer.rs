@@ -49,17 +49,17 @@ impl StorableMidnightDaLayer {
         Self::new_from_connection_with_options(connection_string, blocks_to_finality, false).await
     }
 
-    /// Creates new [`StorableMidnightDaLayer`] with options for skipping schema setup.
+    /// Creates new [`StorableMidnightDaLayer`] with options for read-only mode.
     ///
     /// # Arguments
     /// * `connection_string` - Database connection string
     /// * `blocks_to_finality` - Number of blocks before finalization
-    /// * `skip_schema_setup` - If true, skips table/index creation. Use this when connecting
+    /// * `readonly_mode` - If true, skips table/index creation. Use this when connecting
     ///   with a read-only database user where tables already exist.
     pub async fn new_from_connection_with_options(
         connection_string: &str,
         blocks_to_finality: u32,
-        skip_schema_setup: bool,
+        readonly_mode: bool,
     ) -> anyhow::Result<Self> {
         // For SQLite, we need to build SqliteConnectOptions with per-connection PRAGMAs
         // For other databases, use standard ConnectOptions
@@ -70,7 +70,7 @@ impl StorableMidnightDaLayer {
             // Parse connection string and enable detailed logging
             // Chain all methods together since they consume self
             let sqlite_opts = SqliteConnectOptions::from_str(connection_string)?
-                .create_if_missing(!skip_schema_setup)
+                .create_if_missing(!readonly_mode)
                 .log_statements(tracing::log::LevelFilter::Debug)
                 .log_slow_statements(
                     tracing::log::LevelFilter::Warn,
@@ -115,8 +115,8 @@ impl StorableMidnightDaLayer {
             Database::connect(opts).await?
         };
 
-        if skip_schema_setup {
-            tracing::info!("Skipping database schema setup (skip_schema_setup=true). Ensure tables already exist.");
+        if readonly_mode {
+            tracing::info!("Read-only mode enabled (readonly_mode=true). Skipping database schema setup.");
         } else {
             entity::setup_db(&conn).await?;
         }
@@ -152,6 +152,46 @@ impl StorableMidnightDaLayer {
     /// Creates in-memory SQLite instance.
     pub async fn new_in_memory(blocks_to_finality: u32) -> anyhow::Result<Self> {
         Self::new_from_connection(&MidnightDaConfig::sqlite_in_memory(), blocks_to_finality).await
+    }
+
+    /// Polls the database for new blocks added by another node (e.g., primary sequencer).
+    /// This is used by read-only replicas to detect new blocks without producing them.
+    ///
+    /// Returns the number of new blocks detected.
+    pub async fn poll_for_new_blocks(&mut self) -> anyhow::Result<u32> {
+        let latest_block = entity::query_last_saved_block(&self.conn).await?;
+        let latest_height = latest_block.height as u32;
+
+        // Check if there are new blocks
+        if latest_height >= self.next_height {
+            let old_next_height = self.next_height;
+            self.next_height = latest_height.checked_add(1).expect("next_height overflow");
+
+            // Update the head header sender so waiters get notified
+            let _ = self.head_header_sender.send_replace(latest_block.clone());
+
+            // Update finalized height if needed
+            let new_finalized_height = entity::query_last_finalized_height(&self.conn).await?;
+            if new_finalized_height > self.last_finalized_height {
+                self.last_finalized_height = new_finalized_height;
+
+                // Notify finalized header subscribers
+                if let Ok(finalized_header) = self.get_header_at(new_finalized_height).await {
+                    let _ = self.finalized_header_sender.send(finalized_header);
+                }
+            }
+
+            let new_blocks = self.next_height.saturating_sub(old_next_height);
+            tracing::debug!(
+                old_height = old_next_height.saturating_sub(1),
+                new_height = latest_height,
+                new_blocks,
+                "Detected new blocks from database"
+            );
+            return Ok(new_blocks);
+        }
+
+        Ok(0)
     }
 
     /// Creates an SQLite instance at a given path.

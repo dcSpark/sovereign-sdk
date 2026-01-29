@@ -252,7 +252,7 @@ impl StorableMidnightDaService {
                 let mut da_layer = StorableMidnightDaLayer::new_from_connection_with_options(
                     &config.connection_string,
                     config.finalization_blocks,
-                    config.skip_schema_setup,
+                    config.readonly_mode,
                 )
                 .await
                 .expect("Failed to initialize StorableMidnightDaLayer");
@@ -267,9 +267,24 @@ impl StorableMidnightDaService {
             }
             Some(da_layer) => da_layer.clone(),
         };
-        let handle = config
-            .block_producing
-            .spawn_block_producing_if_needed(shutdown_receiver, da_layer.clone());
+
+        // For read-only replicas, spawn a background task to poll for new blocks
+        // added by the primary node to the shared database.
+        let handle = if config.readonly_mode {
+            let poll_interval = Duration::from_millis(
+                config.readonly_poll_interval_ms.unwrap_or(1000),
+            );
+            Some(Self::spawn_readonly_block_poller(
+                shutdown_receiver.clone(),
+                da_layer.clone(),
+                poll_interval,
+            ))
+        } else {
+            config
+                .block_producing
+                .spawn_block_producing_if_needed(shutdown_receiver, da_layer.clone())
+        };
+
         Self::construct(
             config.sender_address,
             da_layer,
@@ -277,6 +292,51 @@ impl StorableMidnightDaService {
             handle,
         )
         .await
+    }
+
+    /// Spawns a background task that polls the database for new blocks.
+    /// Used by read-only replicas to detect blocks produced by the primary node.
+    fn spawn_readonly_block_poller(
+        shutdown_receiver: watch::Receiver<()>,
+        da_layer: Arc<RwLock<StorableMidnightDaLayer>>,
+        poll_interval: Duration,
+    ) -> JoinHandle<()> {
+        let span = tracing::info_span!("readonly_block_poller");
+
+        tokio::spawn(
+            async move {
+                tracing::info!(?poll_interval, "Starting read-only block poller for replica mode");
+                let mut interval = interval(poll_interval);
+
+                loop {
+                    match future_or_shutdown(interval.tick(), &shutdown_receiver).await {
+                        FutureOrShutdownOutput::Shutdown => {
+                            tracing::debug!("Received shutdown signal, stopping block poller...");
+                            break;
+                        }
+                        FutureOrShutdownOutput::Output(_) => {
+                            let mut da_layer = da_layer.write().await;
+                            match da_layer.poll_for_new_blocks().await {
+                                Ok(new_blocks) if new_blocks > 0 => {
+                                    tracing::trace!(new_blocks, "Polled new blocks from database");
+                                }
+                                Ok(_) => {
+                                    // No new blocks, this is normal
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        ?error,
+                                        "Error polling for new blocks. Will retry."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::info!("Read-only block poller stopped");
+            }
+            .instrument(span),
+        )
     }
 
     async fn wait_for_height(&self, height: u32) -> anyhow::Result<()> {
