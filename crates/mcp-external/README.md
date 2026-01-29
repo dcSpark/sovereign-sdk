@@ -14,6 +14,16 @@ Sessions start with no wallet loaded. In a fresh session, call `createWallet` (o
 
 Reconnecting with the same `Mcp-Session-Id` continues using the same per-session wallet state while the server is running and the session remains open.
 
+#### User-defined `Mcp-Session-Id`
+
+Clients may either:
+- omit `Mcp-Session-Id` and let the server generate one (returned in the `Mcp-Session-Id` response header on `initialize`), or
+- provide their own `Mcp-Session-Id` on `initialize`.
+
+If the provided `Mcp-Session-Id` already exists, the server resumes that session. If it doesn't exist, the server creates a fresh session and binds it to that id for future requests (within the current server process).
+
+Note: the first request for a new session must be the MCP `initialize` request.
+
 ## Running the Server
 
 ### Prerequisites

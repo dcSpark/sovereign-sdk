@@ -1,7 +1,9 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
-    #[cfg(feature = "maa")]
+    // The MAA attestation client requires Azure-specific libraries (azguestattestation)
+    // that are only available on Linux Azure VMs. Skip building on non-Linux platforms.
+    #[cfg(all(feature = "maa", target_os = "linux"))]
     {
         // Re-run if anything in the attestation_verifier directory changes.
         println!("cargo:rerun-if-changed=attestation_verifier");
@@ -41,5 +43,11 @@ fn main() {
         }
 
         println!("cargo:rustc-env=ATTESTATION_CLIENT_PATH={}", dest.display());
+    }
+
+    // On non-Linux platforms with maa feature, warn that attestation won't work
+    #[cfg(all(feature = "maa", not(target_os = "linux")))]
+    {
+        println!("cargo:warning=MAA attestation client not built: requires Linux with Azure Guest Attestation library");
     }
 }

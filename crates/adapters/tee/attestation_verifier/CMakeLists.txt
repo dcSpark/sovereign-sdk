@@ -28,6 +28,14 @@ include_directories(
      /usr/include/azguestattestation1
 )
 
+# Fetch nlohmann-json (required by jwt-cpp and used directly)
+fetchcontent_declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+set(JSON_BuildTests OFF CACHE BOOL "disable building tests" FORCE)
+fetchcontent_makeavailable(nlohmann_json)
+
 fetchcontent_declare(jwt-cpp 
     GIT_REPOSITORY https://github.com/Thalhammer/jwt-cpp.git
     GIT_TAG 08bcf77a687fb06e34138e9e9fa12a4ecbe12332 # v0.7.0 release
@@ -46,6 +54,7 @@ add_executable(${CMAKE_PROJECT_TARGET} main.cpp
 
 target_link_libraries(${CMAKE_PROJECT_TARGET} azguestattestation -lz)
 target_link_libraries(${CMAKE_PROJECT_TARGET} curl)
+target_link_libraries(${CMAKE_PROJECT_TARGET} nlohmann_json::nlohmann_json)
 target_link_libraries(${CMAKE_PROJECT_TARGET} jwt-cpp::jwt-cpp)
 target_link_libraries(${CMAKE_PROJECT_TARGET} crypto)
 target_link_libraries(${CMAKE_PROJECT_TARGET} ssl )
