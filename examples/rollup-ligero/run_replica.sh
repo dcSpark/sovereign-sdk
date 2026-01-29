@@ -20,7 +20,8 @@ cargo build --release -p sov-rollup-ligero
 echo ""
 echo "Starting replica node (read-only mode)..."
 echo "  Config: rollup_config_replica.toml"
-echo "  Port: 12347"
+echo "  API Port: 12347"
+echo "  Prometheus Port: 13201 (primary uses 13200)"
 echo "  Storage: demo_data_replica/"
 echo ""
 
@@ -29,4 +30,8 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create replica data directory
 mkdir -p demo_data_replica
 
-exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" --rollup-config-path rollup_config_replica.toml "$@"
+# Use different Prometheus port than primary (13200) to allow running both on same machine
+exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" \
+    --rollup-config-path rollup_config_replica.toml \
+    --prometheus-exporter-bind "0.0.0.0:13201" \
+    "$@"

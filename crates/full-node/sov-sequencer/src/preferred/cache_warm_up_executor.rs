@@ -184,7 +184,12 @@ impl<S: Spec> CacheWarmUpExecutor<S> {
             let mut is_started = false;
             loop {
                 tokio::select! {
-                    _ = start_block_notification_receiver.changed() => {
+                    result = start_block_notification_receiver.changed() => {
+                        // Handle channel closed (sender dropped during shutdown)
+                        if result.is_err() {
+                            tracing::debug!("Cache warm-up worker notification channel closed, shutting down");
+                            return;
+                        }
 
                         let notify = start_block_notification_receiver.borrow().clone();
                         if let Some(notify) = notify {

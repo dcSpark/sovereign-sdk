@@ -153,14 +153,6 @@ if [[ "$ROLLUP_HOST" == "$ROLLUP_PORT" ]]; then
   ROLLUP_PORT="12346"
 fi
 
-ORACLE_BIND="${BIND_ADDR:-127.0.0.1:8090}"
-ORACLE_HOST="${ORACLE_BIND%:*}"
-ORACLE_PORT="${ORACLE_BIND##*:}"
-if [[ "$ORACLE_HOST" == "$ORACLE_PORT" ]]; then
-  ORACLE_HOST="$ORACLE_BIND"
-  ORACLE_PORT="8090"
-fi
-
 VERIFIER_BIND="${BIND_ADDR:-127.0.0.1:8080}"
 VERIFIER_HOST="${VERIFIER_BIND%:*}"
 VERIFIER_PORT="${VERIFIER_BIND##*:}"
@@ -252,10 +244,6 @@ fi
 echo "Starting rollup..."
 start_service "rollup" bash "$SCRIPT_DIR/run_rollup.sh" ${ROLLUP_ARGS[@]+"${ROLLUP_ARGS[@]}"}
 wait_for_port "rollup" "$ROLLUP_HOST" "$ROLLUP_PORT" "$LAST_PID"
-
-echo "Starting oracle..."
-start_service "oracle" bash "$SCRIPT_DIR/run_oracle.sh"
-wait_for_port "oracle" "$ORACLE_HOST" "$ORACLE_PORT" "$LAST_PID"
 
 echo "Starting verifier..."
 start_service "verifier" bash "$SCRIPT_DIR/run_verifier_service.sh"

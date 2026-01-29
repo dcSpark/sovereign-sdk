@@ -338,8 +338,14 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                 tokio::select! {
                     biased;
 
-                        _ = start_block_notification_receiver.changed() => {
-                        let notify = start_block_notification_receiver.borrow_and_update().clone();
+                        result = start_block_notification_receiver.changed() => {
+                            // Handle channel closed (sender dropped during shutdown)
+                            if result.is_err() {
+                                tracing::debug!(worker_id, txs_processed, "Parallel worker notification channel closed, shutting down");
+                                return;
+                            }
+
+                            let notify = start_block_notification_receiver.borrow_and_update().clone();
                             if let Some(notify) = notify {
                                 tracing::debug!(
                                     worker_id,
