@@ -413,6 +413,9 @@ pub struct GetTransactionStatusResult {
     pub transaction: GetTransactionStatusRecord,
     #[serde(rename = "blockchainStatus", skip_serializing_if = "Option::is_none")]
     pub blockchain_status: Option<GetTransactionStatusBlockchainStatus>,
+    /// Transaction events from the rollup (NoteCreated, NoteSpent, NoteEncrypted, PoolTransfer, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<serde_json::Value>,
 }
 
 // Types for GetTransactions
@@ -1383,6 +1386,7 @@ impl CryptoServer {
                     is_fully_synced: true,
                 },
             }),
+            events: tx.events,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
