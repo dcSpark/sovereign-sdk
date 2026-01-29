@@ -249,9 +249,10 @@ impl StorableMidnightDaService {
 
         let da_layer = match config.da_layer.as_ref() {
             None => {
-                let mut da_layer = StorableMidnightDaLayer::new_from_connection(
+                let mut da_layer = StorableMidnightDaLayer::new_from_connection_with_options(
                     &config.connection_string,
                     config.finalization_blocks,
+                    config.skip_schema_setup,
                 )
                 .await
                 .expect("Failed to initialize StorableMidnightDaLayer");

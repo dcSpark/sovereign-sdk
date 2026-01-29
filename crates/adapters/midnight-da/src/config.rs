@@ -194,6 +194,13 @@ pub struct MidnightDaConfig {
     /// If specified, [`StorableMidnightDaLayer`] will add randomization to non-finalized blocks.
     pub randomization: Option<RandomizationConfig>,
 
+    /// Skip database schema setup (table creation, index creation).
+    /// Set to true when using a read-only database user where tables already exist.
+    /// This is useful for replica nodes that connect to a shared database with a
+    /// read-only PostgreSQL user.
+    #[serde(default)]
+    pub skip_schema_setup: bool,
+
     /// Whether (and where) to persist full incoming worker transactions (the base64-encoded,
     /// borsh-serialized transaction bytes as received by the verifier service).
     ///
@@ -223,6 +230,7 @@ impl PartialEq for MidnightDaConfig {
             && self.finalization_blocks == other.finalization_blocks
             && self.block_producing == other.block_producing
             && self.randomization == other.randomization
+            && self.skip_schema_setup == other.skip_schema_setup
             && self.save_incoming_worker_txs == other.save_incoming_worker_txs
             && self.worker_tx_path == other.worker_tx_path
             && self.worker_tx_bucket == other.worker_tx_bucket;
@@ -253,6 +261,7 @@ impl MidnightDaConfig {
             block_producing: default_block_producing(),
             da_layer: None,
             randomization: None,
+            skip_schema_setup: false,
             save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
             worker_tx_path: None,
             worker_tx_bucket: None,
@@ -296,6 +305,7 @@ impl MidnightDaConfig {
                 // Just to spice things up a bit
                 behaviour: RandomizationBehaviour::OutOfOrderBlobs,
             }),
+            skip_schema_setup: false,
             save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
             worker_tx_path: None,
             worker_tx_bucket: None,
@@ -318,6 +328,7 @@ impl MidnightDaConfig {
                     adjust_head_height: -10..10,
                 },
             }),
+            skip_schema_setup: false,
             save_incoming_worker_txs: IncomingWorkerTxSaveMode::None,
             worker_tx_path: None,
             worker_tx_bucket: None,

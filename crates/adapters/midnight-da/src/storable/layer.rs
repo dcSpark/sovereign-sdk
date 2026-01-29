@@ -46,6 +46,21 @@ impl StorableMidnightDaLayer {
         connection_string: &str,
         blocks_to_finality: u32,
     ) -> anyhow::Result<Self> {
+        Self::new_from_connection_with_options(connection_string, blocks_to_finality, false).await
+    }
+
+    /// Creates new [`StorableMidnightDaLayer`] with options for skipping schema setup.
+    ///
+    /// # Arguments
+    /// * `connection_string` - Database connection string
+    /// * `blocks_to_finality` - Number of blocks before finalization
+    /// * `skip_schema_setup` - If true, skips table/index creation. Use this when connecting
+    ///   with a read-only database user where tables already exist.
+    pub async fn new_from_connection_with_options(
+        connection_string: &str,
+        blocks_to_finality: u32,
+        skip_schema_setup: bool,
+    ) -> anyhow::Result<Self> {
         // For SQLite, we need to build SqliteConnectOptions with per-connection PRAGMAs
         // For other databases, use standard ConnectOptions
         let conn: DatabaseConnection = if connection_string.starts_with("sqlite:") {
@@ -55,7 +70,7 @@ impl StorableMidnightDaLayer {
             // Parse connection string and enable detailed logging
             // Chain all methods together since they consume self
             let sqlite_opts = SqliteConnectOptions::from_str(connection_string)?
-                .create_if_missing(true)
+                .create_if_missing(!skip_schema_setup)
                 .log_statements(tracing::log::LevelFilter::Debug)
                 .log_slow_statements(
                     tracing::log::LevelFilter::Warn,
@@ -100,7 +115,12 @@ impl StorableMidnightDaLayer {
             Database::connect(opts).await?
         };
 
-        entity::setup_db(&conn).await?;
+        if skip_schema_setup {
+            tracing::info!("Skipping database schema setup (skip_schema_setup=true). Ensure tables already exist.");
+        } else {
+            entity::setup_db(&conn).await?;
+        }
+
         let last_seen_block = entity::query_last_saved_block(&conn).await?;
         let next_height = (last_seen_block.height as u32)
             .checked_add(1)

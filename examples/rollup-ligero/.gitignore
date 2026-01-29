@@ -22,3 +22,6 @@ proof_fraud_test
 
 # TSink data
 tsink-data
+
+# Replica data
+demo_data_replica/

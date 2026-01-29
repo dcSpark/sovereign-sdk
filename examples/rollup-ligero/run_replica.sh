@@ -29,4 +29,4 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 # Create replica data directory
 mkdir -p demo_data_replica
 
-exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" rollup_config_replica.toml "$@"
+exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" --rollup-config-path rollup_config_replica.toml "$@"
