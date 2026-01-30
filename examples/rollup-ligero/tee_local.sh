@@ -127,7 +127,7 @@ export SOV_TEE_MOCK_ATTESTATION="${SOV_TEE_MOCK_ATTESTATION:-1}"
 
 # Start a local oracle that signs attestations. In mock mode, we configure it to accept all.
 export START_ORACLE="${START_ORACLE:-1}"
-export ORACLE_DEV_ACCEPT_ALL="${ORACLE_DEV_ACCEPT_ALL:-1}"
+export ORACLE_DEV_ACCEPT_ALL="${ORACLE_DEV_ACCEPT_ALL:-true}"
 ensure_oracle_keypair
 export ORACLE_SIGNING_KEY_HEX="${ORACLE_SIGNING_KEY_HEX}"
 
