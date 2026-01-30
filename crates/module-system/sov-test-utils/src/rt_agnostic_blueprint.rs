@@ -124,6 +124,7 @@ where
             prover_config_disc,
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address.clone(),
+            Some(rollup_config.storage.path.clone()),
         )
     }
 

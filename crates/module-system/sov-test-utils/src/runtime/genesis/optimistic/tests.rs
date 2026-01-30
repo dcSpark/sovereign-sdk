@@ -170,6 +170,7 @@ fn create_test_rt_genesis_config<S: Spec>(
                 proving_penalty
             },
             initial_provers: vec![(prover_placeholder.address(), prover_placeholder.balance())],
+            tee_oracle_pubkeys: vec![],
         },
         bank: BankConfig {
             gas_token_config: Some(sov_bank::GasTokenConfig {

@@ -8662,7 +8662,9 @@ dependencies = [
  "axum 0.8.8",
  "borsh",
  "dotenvy",
+ "ed25519-dalek 2.2.0",
  "envy",
+ "hex",
  "midnight-privacy",
  "once_cell",
  "serde",
@@ -12810,6 +12812,8 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "ed25519-dalek 2.2.0",
+ "sha2 0.10.9",
  "sov-accounts",
  "sov-attester-incentives",
  "sov-bank",

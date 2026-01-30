@@ -272,6 +272,7 @@ pub async fn initialize_runner(
                 nb_of_prover_threads.unwrap(),
                 Default::default(),
                 MockAddress::new([0u8; 32]),
+                None,
             );
         let handle = start_tee_workflow_in_background::<_>(
             prover_service,

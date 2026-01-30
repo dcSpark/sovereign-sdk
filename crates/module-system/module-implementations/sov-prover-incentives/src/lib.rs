@@ -52,6 +52,14 @@ pub struct ProverIncentives<S: Spec> {
     #[state]
     pub proving_penalty: StateValue<S::Gas>,
 
+    /// The set of oracle public keys authorized to sign TEE attestation statements.
+    ///
+    /// These keys are consensus-critical in `OperatingMode::TEE` because they are used during
+    /// deterministic proof verification in the STF.
+    #[state]
+    #[rest_api(include)]
+    pub tee_oracle_pubkeys: StateValue<Vec<[u8; 32]>>,
+
     /// Reference to the Bank module.
     #[module]
     pub(crate) bank: sov_bank::Bank<S>,

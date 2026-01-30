@@ -1,6 +1,7 @@
 use std::{env, num::NonZero};
 
 use backon::{BackoffBuilder, ExponentialBuilder};
+use sha2::{Digest, Sha256};
 use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::da::BlockHeaderTrait;
 use sov_rollup_interface::node::da::DaService;
@@ -337,7 +338,7 @@ where
             };
 
             let mock_attestation = env_flag_enabled("SOV_TEE_MOCK_ATTESTATION");
-            let skip_oracle = mock_attestation || env_flag_enabled("SOV_TEE_SKIP_ORACLE");
+            let skip_oracle = env_flag_enabled("SOV_TEE_SKIP_ORACLE");
 
             let attestation_jwt = if mock_attestation {
                 tracing::warn!(
@@ -348,23 +349,68 @@ where
                 attest(&batch, "midnight-l2")? // Hardcoded for now, should be replaced.
             };
 
+            if skip_oracle {
+                anyhow::bail!(
+                    "SOV_TEE_SKIP_ORACLE is enabled, but TEE mode now requires an oracle-signed receipt. \
+                     Start the oracle service and (for local dev) set ORACLE_DEV_ACCEPT_ALL=1."
+                );
+            }
+
+            let statement = sov_modules_api::TeeOracleStatementV1 {
+                domain: sov_modules_api::TEE_ORACLE_STATEMENT_DOMAIN_V1,
+                attestation_type: sov_modules_api::TEEAttestationType::MAA,
+                batch_data: batch.clone(),
+                raw_aggregated_proof_sha256: Sha256::digest(&agg_proof.raw_aggregated_proof).into(),
+                attestation_jwt_sha256: Sha256::digest(attestation_jwt.as_bytes()).into(),
+            };
+
+            // Ask the oracle to (1) validate the TEE attestation and (2) sign the statement for deterministic on-chain verification.
+            let oracle_req = sov_modules_api::OracleAttestRequestV1 {
+                attestation_jwt: attestation_jwt.clone(),
+                statement: statement.clone(),
+            };
+            let oracle_req_bytes = borsh::to_vec(&oracle_req)?;
+
+            let oracle_res_http = self
+                .http_client
+                .post(format!("{}/attest", self.oracle_url))
+                .json(&tee::common::TEEPayload {
+                    data: tee::common::BASE64_ENGINE.encode(oracle_req_bytes),
+                })
+                .send()
+                .await?;
+
+            let status = oracle_res_http.status();
+            if !status.is_success() {
+                let body = oracle_res_http.text().await.unwrap_or_default();
+                anyhow::bail!("Oracle /attest failed: {} {}", status, body);
+            }
+
+            let oracle_payload: tee::common::TEEPayload = oracle_res_http.json().await?;
+            let oracle_res_bytes = tee::common::BASE64_ENGINE
+                .decode(oracle_payload.data.trim())
+                .map_err(|e| anyhow::anyhow!("Invalid oracle base64 response: {e}"))?;
+            let oracle_res: sov_modules_api::OracleAttestResponseV1 =
+                borsh::from_slice(&oracle_res_bytes)?;
+
+            let signed_attestation = sov_modules_api::TeeOracleSignedMAAAttestationV1 {
+                attestation_jwt,
+                statement,
+                oracle_pubkey: oracle_res.oracle_pubkey,
+                oracle_signature: oracle_res.oracle_signature,
+            };
+
             tracing::debug!(
                 bytes = agg_proof.raw_aggregated_proof.len(),
                 "Sending aggregated proof and attestation to DA (for now, to be replaced)"
             );
 
             let attestation = sov_modules_api::TEEAttestation {
-                attestation: borsh::to_vec(&attestation_jwt)?,
+                attestation: borsh::to_vec(&signed_attestation)?,
                 raw_aggregated_proof: agg_proof.raw_aggregated_proof,
                 batch_data: batch,
                 attestation_type: sov_modules_api::TEEAttestationType::MAA,
             };
-
-            println!(
-                "Posting TEE attestation for batch index {}",
-                self.batch_index
-            );
-            println!("TEE attestation: {:?}", attestation);
 
             let borshed_attestation = borsh::to_vec(&attestation)?;
 
@@ -372,11 +418,11 @@ where
                 tee_raw_attestation: borshed_attestation.clone(),
             };
 
-            println!(
-                "Serialized TEE attestation size: {}",
-                borshed_attestation.len()
+            tracing::info!(
+                batch_index = self.batch_index,
+                bytes = borshed_attestation.len(),
+                "Posting oracle-signed TEE attestation"
             );
-            println!("Sending aggregated proof and attestation to DA (for now, to be replaced)");
 
             self.proof_sender
                 .publish_tee_attestation_blob_with_metadata(attestation)
@@ -389,24 +435,6 @@ where
             self.batch_index += 1;
 
             self.prev_batch_hash = batch_hash;
-
-            if skip_oracle {
-                tracing::warn!("Skipping oracle validation for this batch");
-            } else {
-                // URL is hardcoded for now, to be replaced with a config value...
-                let res_http = self
-                    .http_client
-                    .post(format!("{}/validate", self.oracle_url))
-                    .json(&tee::common::TEEPayload {
-                        data: tee::common::BASE64_ENGINE.encode(borshed_attestation),
-                    })
-                    .send()
-                    .await?;
-
-                let status = res_http.status();
-                let body = res_http.text().await.unwrap_or_default();
-                println!("Oracle response: {} {}", status, body);
-            }
         }
         println!("Done");
         Ok(())

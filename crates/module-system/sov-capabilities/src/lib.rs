@@ -2,6 +2,8 @@ use std::convert::Infallible;
 
 #[cfg(feature = "native")]
 use sov_attester_incentives::BondingProofServiceImpl;
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
 use sov_bank::utils::TokenHolder;
 use sov_bank::{config_gas_token_id, Coins, IntoPayable, Payable};
 #[cfg(feature = "native")]
@@ -20,7 +22,10 @@ use sov_modules_api::{
     SovStateTransitionPublicData, Spec, StateAccessor, StateReader, StateWriter, Storage, TxState,
 };
 use sov_rollup_interface::common::SlotNumber;
-use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation};
+use sov_rollup_interface::tee::{
+    SerializedTEEAttestation, TeeOracleSignedMAAAttestationV1, TEEAttestation,
+    TEE_ORACLE_STATEMENT_DOMAIN_V1,
+};
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 #[cfg(feature = "native")]
 use sov_rollup_interface::StateUpdateInfo;
@@ -362,6 +367,15 @@ impl<S: Spec, T> ProofProcessor<S> for StandardProvenRollupCapabilities<'_, S, T
             ))
         })?;
 
+        let allowed_oracle_pubkeys = self
+            .prover_incentives
+            .tee_oracle_pubkeys
+            .get(state)
+            .map_err(|e| InvalidProofError::StateAccess(format!("{e:?}")))?
+            .unwrap_or_default();
+
+        verify_oracle_signed_maa_attestation_v1(&att, &allowed_oracle_pubkeys)?;
+
         // Reuse the existing aggregated-proof public data verification logic (range checks, state root checks, etc.)
         // but return a TEE receipt so the attestation becomes the first-class proof artifact in the STF.
         let agg_proof = SerializedAggregatedProof {
@@ -429,6 +443,161 @@ impl<S: Spec, T> ProofProcessor<S> for StandardProvenRollupCapabilities<'_, S, T
         )?;
 
         Ok(result)
+    }
+}
+
+fn verify_oracle_signed_maa_attestation_v1(
+    att: &TEEAttestation,
+    allowed_oracle_pubkeys: &[[u8; 32]],
+) -> Result<(), InvalidProofError> {
+    if allowed_oracle_pubkeys.is_empty() {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "No TEE oracle public keys configured in prover incentives genesis".to_owned(),
+        ));
+    }
+
+    if att.attestation_type != sov_modules_api::TEEAttestationType::MAA {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Unsupported TEE attestation type (expected MAA)".to_owned(),
+        ));
+    }
+
+    let signed: TeeOracleSignedMAAAttestationV1 = borsh::from_slice(&att.attestation).map_err(|e| {
+        InvalidProofError::PreconditionNotMet(format!(
+            "Invalid oracle-signed MAA attestation payload: {e}"
+        ))
+    })?;
+
+    if signed.statement.domain != TEE_ORACLE_STATEMENT_DOMAIN_V1 {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Invalid oracle statement domain".to_owned(),
+        ));
+    }
+
+    if signed.statement.attestation_type != att.attestation_type {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Oracle statement attestation_type does not match outer attestation_type".to_owned(),
+        ));
+    }
+
+    if signed.statement.batch_data != att.batch_data {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Oracle statement batch_data does not match outer batch_data".to_owned(),
+        ));
+    }
+
+    let expected_proof_hash: [u8; 32] = Sha256::digest(&att.raw_aggregated_proof).into();
+    if signed.statement.raw_aggregated_proof_sha256 != expected_proof_hash {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Oracle statement raw_aggregated_proof_sha256 mismatch".to_owned(),
+        ));
+    }
+
+    let expected_jwt_hash: [u8; 32] = Sha256::digest(signed.attestation_jwt.as_bytes()).into();
+    if signed.statement.attestation_jwt_sha256 != expected_jwt_hash {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Oracle statement attestation_jwt_sha256 mismatch".to_owned(),
+        ));
+    }
+
+    if !allowed_oracle_pubkeys.contains(&signed.oracle_pubkey) {
+        return Err(InvalidProofError::PreconditionNotMet(
+            "Oracle pubkey is not authorized by genesis".to_owned(),
+        ));
+    }
+
+    let message = borsh::to_vec(&signed.statement).map_err(|e| {
+        InvalidProofError::PreconditionNotMet(format!(
+            "Failed to serialize oracle statement for signature verification: {e}"
+        ))
+    })?;
+
+    let verifying_key = VerifyingKey::from_bytes(&signed.oracle_pubkey).map_err(|e| {
+        InvalidProofError::PreconditionNotMet(format!("Invalid oracle pubkey bytes: {e}"))
+    })?;
+
+    verifying_key
+        .verify_strict(&message, &Ed25519Signature::from_bytes(&signed.oracle_signature))
+        .map_err(|e| {
+            InvalidProofError::PreconditionNotMet(format!(
+                "Invalid oracle signature over TEE statement: {e}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::Signer;
+
+    fn make_attestation(
+        signing_key: &SigningKey,
+        raw_aggregated_proof: Vec<u8>,
+    ) -> (TEEAttestation, Vec<[u8; 32]>) {
+        let mut batch_data = sov_rollup_interface::tee::TEEAttestation::default().batch_data;
+        batch_data.layer2_chain_id = 1337;
+        batch_data.batch_index = 7;
+
+        let attestation_jwt = "mock-jwt".to_owned();
+        let statement = sov_rollup_interface::tee::TeeOracleStatementV1 {
+            domain: TEE_ORACLE_STATEMENT_DOMAIN_V1,
+            attestation_type: sov_modules_api::TEEAttestationType::MAA,
+            batch_data: batch_data.clone(),
+            raw_aggregated_proof_sha256: Sha256::digest(&raw_aggregated_proof).into(),
+            attestation_jwt_sha256: Sha256::digest(attestation_jwt.as_bytes()).into(),
+        };
+
+        let message = borsh::to_vec(&statement).unwrap();
+        let sig = signing_key.sign(&message).to_bytes();
+
+        let signed = TeeOracleSignedMAAAttestationV1 {
+            attestation_jwt,
+            statement,
+            oracle_pubkey: *signing_key.verifying_key().as_bytes(),
+            oracle_signature: sig,
+        };
+
+        let att = TEEAttestation {
+            attestation: borsh::to_vec(&signed).unwrap(),
+            raw_aggregated_proof,
+            batch_data,
+            attestation_type: sov_modules_api::TEEAttestationType::MAA,
+        };
+
+        (att, vec![*signing_key.verifying_key().as_bytes()])
+    }
+
+    #[test]
+    fn oracle_signed_maa_attestation_verifies() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (att, allowed) = make_attestation(&signing_key, vec![1, 2, 3, 4]);
+        verify_oracle_signed_maa_attestation_v1(&att, &allowed).unwrap();
+    }
+
+    #[test]
+    fn oracle_signed_maa_attestation_rejects_bad_signature() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (mut att, allowed) = make_attestation(&signing_key, vec![1, 2, 3, 4]);
+
+        let mut signed: TeeOracleSignedMAAAttestationV1 = borsh::from_slice(&att.attestation).unwrap();
+        signed.oracle_signature[0] ^= 0x01;
+        att.attestation = borsh::to_vec(&signed).unwrap();
+
+        assert!(verify_oracle_signed_maa_attestation_v1(&att, &allowed).is_err());
+    }
+
+    #[test]
+    fn oracle_signed_maa_attestation_rejects_unauthorized_pubkey() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (att, _) = make_attestation(&signing_key, vec![1, 2, 3, 4]);
+
+        let other_key = SigningKey::from_bytes(&[9u8; 32]);
+        let allowed = vec![*other_key.verifying_key().as_bytes()];
+
+        assert!(verify_oracle_signed_maa_attestation_v1(&att, &allowed).is_err());
     }
 }
 

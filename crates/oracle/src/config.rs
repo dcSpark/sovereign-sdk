@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::PathBuf;
 use validator::Validate;
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -13,6 +14,22 @@ pub struct Config {
     #[serde(default = "default_policies_dir")]
     #[validate(length(min = 1))]
     pub oracle_policies_dir: String,
+
+    /// Ed25519 signing key seed as hex (32 bytes, env: ORACLE_SIGNING_KEY_HEX).
+    ///
+    /// Either `oracle_signing_key_hex` or `oracle_signing_key_path` must be provided.
+    #[serde(default)]
+    pub oracle_signing_key_hex: Option<String>,
+
+    /// Path to a file containing `ORACLE_SIGNING_KEY_HEX` (env: ORACLE_SIGNING_KEY_PATH).
+    ///
+    /// Either `oracle_signing_key_hex` or `oracle_signing_key_path` must be provided.
+    #[serde(default)]
+    pub oracle_signing_key_path: Option<PathBuf>,
+
+    /// Development mode: skip policy validation and sign any request (env: ORACLE_DEV_ACCEPT_ALL, default: false).
+    #[serde(default)]
+    pub oracle_dev_accept_all: bool,
 }
 
 fn default_server_bind_address() -> String {
@@ -44,6 +61,12 @@ impl Config {
                 }
             }
             anyhow::bail!("Configuration validation failed");
+        }
+
+        if cfg.oracle_signing_key_hex.is_none() && cfg.oracle_signing_key_path.is_none() {
+            anyhow::bail!(
+                "Missing oracle signing key: set ORACLE_SIGNING_KEY_HEX or ORACLE_SIGNING_KEY_PATH"
+            );
         }
 
         Ok(cfg)

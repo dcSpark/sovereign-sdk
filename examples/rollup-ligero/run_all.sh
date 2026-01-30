@@ -185,6 +185,14 @@ if [[ "$METRICS_HOST" == "$METRICS_PORT" ]]; then
   METRICS_PORT="13200"
 fi
 
+ORACLE_BIND="${ORACLE_SERVER_BIND_ADDRESS:-127.0.0.1:8090}"
+ORACLE_HOST="${ORACLE_BIND%:*}"
+ORACLE_PORT="${ORACLE_BIND##*:}"
+if [[ "$ORACLE_HOST" == "$ORACLE_PORT" ]]; then
+  ORACLE_HOST="$ORACLE_BIND"
+  ORACLE_PORT="8090"
+fi
+
 FVK_BIND="${MIDNIGHT_FVK_SERVICE_BIND:-}"
 if [[ -n "$FVK_BIND" ]]; then
   FVK_HOST="${FVK_BIND%:*}"
@@ -239,6 +247,12 @@ fi
 if [[ -n "${DEFER_SEQUENCER_SUBMISSION:-}" ]]; then
   export DEFER_SEQUENCER_SUBMISSION
   echo "DEFER_SEQUENCER_SUBMISSION=$DEFER_SEQUENCER_SUBMISSION (verifier will defer sequencer submission)"
+fi
+
+if [[ -n "${START_ORACLE:-}" ]]; then
+  echo "Starting oracle..."
+  start_service "oracle" bash "$SCRIPT_DIR/run_oracle.sh"
+  wait_for_port "oracle" "$ORACLE_HOST" "$ORACLE_PORT" "$LAST_PID"
 fi
 
 echo "Starting rollup..."
