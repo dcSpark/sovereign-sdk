@@ -5,7 +5,7 @@ pub mod runner_init;
 #[derive(Clone, Debug)]
 pub struct RawGenesisStateRoot(pub Vec<u8>);
 
-const GENESIS_STATE_ROOT: [u8; 32] = [22; 32];
+const GENESIS_STATE_ROOT: [u8; 64] = [22; 64];
 
 pub fn genesis_state_root() -> RawGenesisStateRoot {
     RawGenesisStateRoot(GENESIS_STATE_ROOT.to_vec())

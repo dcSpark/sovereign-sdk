@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::num::NonZero;
+use std::{env, num::NonZero};
 
 use backon::{BackoffBuilder, ExponentialBuilder};
 use sov_midnight_adapter::MidnightIndexerClient;
@@ -17,13 +16,29 @@ use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
-use crate::processes::{ProverService, PublicDataTee, Receiver};
+use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
 
 mod types;
 
 const BACKOFF_POLICY_MIN_DELAY: u64 = 1;
 const BACKOFF_POLICY_MAX_DELAY: u64 = 60;
 const BACKOFF_POLICY_MAX_NUM_RETRIES: usize = 5;
+
+fn env_flag_enabled(var_name: &str) -> bool {
+    let Ok(raw) = env::var(var_name) else {
+        return false;
+    };
+
+    let v = raw.trim();
+    if v.is_empty() {
+        return true;
+    }
+
+    match v.to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => false,
+        _ => true,
+    }
+}
 
 pub(crate) fn compute_batch_hash_v1(
     batch_version: u8,
@@ -321,7 +336,17 @@ where
                 withdraw_root: public_data.withdraw_root,
             };
 
-            let attestation = attest(&batch, "midnight-l2")?; // Hardcoded for now, should be replaced.
+            let mock_attestation = env_flag_enabled("SOV_TEE_MOCK_ATTESTATION");
+            let skip_oracle = mock_attestation || env_flag_enabled("SOV_TEE_SKIP_ORACLE");
+
+            let attestation_jwt = if mock_attestation {
+                tracing::warn!(
+                    "SOV_TEE_MOCK_ATTESTATION is enabled: publishing a mock MAA attestation"
+                );
+                format!("mock-maa-jwt(batch_index={})", self.batch_index)
+            } else {
+                attest(&batch, "midnight-l2")? // Hardcoded for now, should be replaced.
+            };
 
             tracing::debug!(
                 bytes = agg_proof.raw_aggregated_proof.len(),
@@ -329,7 +354,7 @@ where
             );
 
             let attestation = sov_modules_api::TEEAttestation {
-                attestation: borsh::to_vec(&attestation)?,
+                attestation: borsh::to_vec(&attestation_jwt)?,
                 raw_aggregated_proof: agg_proof.raw_aggregated_proof,
                 batch_data: batch,
                 attestation_type: sov_modules_api::TEEAttestationType::MAA,
@@ -363,21 +388,25 @@ where
 
             self.batch_index += 1;
 
-            // URL is hardcoded for now, to be replaced with a config value...
-            let res_http = self
-                .http_client
-                .post(format!("{}/validate", self.oracle_url))
-                .json(&tee::common::TEEPayload {
-                    data: tee::common::BASE64_ENGINE.encode(borshed_attestation),
-                })
-                .send()
-                .await?;
-
-            let status = res_http.status();
-            let body = res_http.text().await.unwrap_or_default();
-            println!("Oracle response: {} {}", status, body);
-
             self.prev_batch_hash = batch_hash;
+
+            if skip_oracle {
+                tracing::warn!("Skipping oracle validation for this batch");
+            } else {
+                // URL is hardcoded for now, to be replaced with a config value...
+                let res_http = self
+                    .http_client
+                    .post(format!("{}/validate", self.oracle_url))
+                    .json(&tee::common::TEEPayload {
+                        data: tee::common::BASE64_ENGINE.encode(borshed_attestation),
+                    })
+                    .send()
+                    .await?;
+
+                let status = res_http.status();
+                let body = res_http.text().await.unwrap_or_default();
+                println!("Oracle response: {} {}", status, body);
+            }
         }
         println!("Done");
         Ok(())

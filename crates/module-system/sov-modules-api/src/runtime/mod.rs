@@ -25,6 +25,7 @@ pub enum OperatingMode {
     /// The rollup is currently executing in zk mode.
     Zk,
     /// The rollup is currently executing in TEE mode.
+    #[serde(rename = "tee", alias = "t_e_e")]
     TEE,
     /// The rollup is currently executing in operator mode.
     Operator,

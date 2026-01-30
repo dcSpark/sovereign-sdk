@@ -20,6 +20,7 @@ use sov_modules_api::{
     SovStateTransitionPublicData, Spec, StateAccessor, StateReader, StateWriter, Storage, TxState,
 };
 use sov_rollup_interface::common::SlotNumber;
+use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation};
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 #[cfg(feature = "native")]
 use sov_rollup_interface::StateUpdateInfo;
@@ -341,6 +342,63 @@ impl<S: Spec, T> ProofProcessor<S> for StandardProvenRollupCapabilities<'_, S, T
             .process_proof(&proof, prover_address, state)?;
 
         Ok((result, proof))
+    }
+
+    fn process_tee_attestation<ST: TxState<S> + GetGasPrice<Spec = S>>(
+        &mut self,
+        proof: SerializedTEEAttestation,
+        prover_address: &S::Address,
+        state: &mut ST,
+    ) -> Result<
+        (
+            AggregatedProofPublicData<S::Address, S::Da, <S::Storage as Storage>::Root>,
+            TEEAttestation,
+        ),
+        InvalidProofError,
+    > {
+        let att: TEEAttestation = borsh::from_slice(&proof.tee_raw_attestation).map_err(|e| {
+            InvalidProofError::PreconditionNotMet(format!(
+                "Invalid TEE attestation payload: {e}"
+            ))
+        })?;
+
+        // Reuse the existing aggregated-proof public data verification logic (range checks, state root checks, etc.)
+        // but return a TEE receipt so the attestation becomes the first-class proof artifact in the STF.
+        let agg_proof = SerializedAggregatedProof {
+            raw_aggregated_proof: att.raw_aggregated_proof.clone(),
+        };
+
+        let pub_data = self
+            .prover_incentives
+            .process_proof(&agg_proof, prover_address, state)?;
+
+        // Ensure attested batch public data matches the public data extracted from the aggregated-proof wrapper.
+        if pub_data.initial_state_root.as_ref() != att.batch_data.prev_state_root.as_ref() {
+            return Err(InvalidProofError::PreconditionNotMet(
+                "TEE batch data prev_state_root does not match aggregated public data initial_state_root"
+                    .to_owned(),
+            ));
+        }
+        if pub_data.final_state_root.as_ref() != att.batch_data.post_state_root.as_ref() {
+            return Err(InvalidProofError::PreconditionNotMet(
+                "TEE batch data post_state_root does not match aggregated public data final_state_root"
+                    .to_owned(),
+            ));
+        }
+        if pub_data.withdraw_root != att.batch_data.withdraw_root {
+            return Err(InvalidProofError::PreconditionNotMet(
+                "TEE batch data withdraw_root does not match aggregated public data withdraw_root"
+                    .to_owned(),
+            ));
+        }
+        if pub_data.message_queue_hash != att.batch_data.message_queue_hash {
+            return Err(InvalidProofError::PreconditionNotMet(
+                "TEE batch data message_queue_hash does not match aggregated public data message_queue_hash"
+                    .to_owned(),
+            ));
+        }
+
+        Ok((pub_data, att))
     }
 
     fn process_attestation<ST: TxState<S> + GetGasPrice<Spec = S>>(

@@ -103,6 +103,8 @@ pub(crate) fn build_proof(
         final_slot_hash: *end_transition.slot().slot_hash(),
         code_commitment: CodeCommitment(MOCK_CODE_COMMITMENT.0.to_vec()),
         rewarded_addresses: vec![prover_address],
+        withdraw_root: [0u8; 32],
+        message_queue_hash: [0u8; 32],
     })
 }
 
