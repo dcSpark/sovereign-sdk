@@ -189,13 +189,7 @@ fn test_cannot_prove_when_gas_price_is_too_high() {
             value: 1,
             gas: Some(gas_target.clone()),
         })
-        .with_max_fee(
-            prover
-                .user_info
-                .available_gas_balance
-                .checked_div(Amount::new(2))
-                .unwrap(),
-        )
+        .with_max_fee(prover.user_info.available_gas_balance)
         .to_serialized_authenticated_tx(&mut nonces);
 
     let register_signed = unbonded_user

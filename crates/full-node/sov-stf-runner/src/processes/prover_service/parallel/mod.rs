@@ -62,6 +62,7 @@ where
         num_threads: usize,
         code_commitment: CodeCommitment,
         prover_address: Address,
+        storage_path: Option<std::path::PathBuf>,
     ) -> Self {
         let verifier = Arc::new(Verifier { da_verifier });
 
@@ -69,7 +70,7 @@ where
             inner_vm,
             outer_vm,
             prover_config: config,
-            prover_state: Prover::new(prover_address, num_threads, code_commitment),
+            prover_state: Prover::new(prover_address, num_threads, code_commitment, storage_path),
             verifier,
         }
     }
@@ -83,6 +84,7 @@ where
         config: RollupProverConfigDiscriminants,
         code_commitment: CodeCommitment,
         prover_address: Address,
+        storage_path: Option<std::path::PathBuf>,
     ) -> Self {
         let num_cpus = num_cpus::get();
         assert!(num_cpus > 1, "Unable to create parallel prover service");
@@ -95,6 +97,7 @@ where
             num_cpus - 1,
             code_commitment,
             prover_address,
+            storage_path,
         )
     }
 }

@@ -2,6 +2,7 @@ use sov_rollup_interface::common::SlotNumber;
 #[cfg(feature = "native")]
 use sov_rollup_interface::optimistic::BondingProofService;
 use sov_rollup_interface::optimistic::{SerializedAttestation, SerializedChallenge};
+use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation};
 use sov_rollup_interface::stf::InvalidProofError;
 use sov_rollup_interface::zk::aggregated_proof::{
     AggregatedProofPublicData, SerializedAggregatedProof,
@@ -43,6 +44,23 @@ pub trait ProofProcessor<S: Spec> {
         (
             AggregatedProofPublicData<S::Address, S::Da, <S::Storage as Storage>::Root>,
             SerializedAggregatedProof,
+        ),
+        InvalidProofError,
+    >;
+
+    /// Called by the stf once the TEE attestation is received.
+    ///
+    /// Returns the public data extracted from the attestation, plus the decoded attestation payload.
+    #[allow(clippy::type_complexity)]
+    fn process_tee_attestation<ST: TxState<S> + GetGasPrice<Spec = S>>(
+        &mut self,
+        proof: SerializedTEEAttestation,
+        prover_address: &S::Address,
+        state: &mut ST,
+    ) -> Result<
+        (
+            AggregatedProofPublicData<S::Address, S::Da, <S::Storage as Storage>::Root>,
+            TEEAttestation,
         ),
         InvalidProofError,
     >;

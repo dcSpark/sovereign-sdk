@@ -178,6 +178,7 @@ impl<S: Spec> MinimalZkGenesisConfig<S> {
                         initial_prover.as_user().address().clone(),
                         initial_prover.bond,
                     )],
+                    tee_oracle_pubkeys: vec![],
                 },
 
                 bank: BasicGenesisConfig::bank(

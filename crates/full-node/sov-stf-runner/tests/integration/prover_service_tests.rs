@@ -327,6 +327,7 @@ fn make_new_prover() -> TestProver {
             num_threads,
             Default::default(),
             Default::default(),
+            None,
         ),
         inner_vm,
         num_worker_threads: num_threads,
@@ -337,10 +338,11 @@ fn make_transition_info(
     header_hash: MockHash,
     height: u64,
 ) -> StateTransitionInfo<StateRoot, Vec<u8>, MockDaSpec> {
+    let genesis_root = genesis_state_root().0;
     StateTransitionInfo::new(
         StateTransitionWitness {
-            initial_state_root: Vec::default(),
-            final_state_root: Vec::default(),
+            initial_state_root: genesis_root.clone(),
+            final_state_root: genesis_root,
             da_block_header: MockBlockHeader {
                 prev_hash: [0; 32].into(),
                 hash: header_hash,

@@ -160,6 +160,7 @@ impl FullNodeBlueprint<Native> for MockNomtDemoRollup<Native> {
             prover_config_discriminant,
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address,
+            Some(rollup_config.storage.path.clone()),
         )
     }
 

@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sov_bank::Amount;
 use sov_modules_api::registration_lib::StakeRegistration;
-use sov_modules_api::{GasArray, GenesisState, Module, Spec};
+use sov_modules_api::{GasArray, GenesisState, HexHash, Module, Spec};
 use sov_rollup_interface::common::SlotNumber;
 
 use crate::ProverIncentives;
@@ -25,6 +25,12 @@ pub struct ProverIncentivesConfig<S: Spec> {
     pub minimum_bond: S::Gas,
     /// A list of initial provers and their bonded amount.
     pub initial_provers: Vec<(S::Address, Amount)>,
+
+    /// The set of oracle public keys (Ed25519) authorized to sign TEE attestation statements.
+    ///
+    /// Human-readable JSON form is `0x`-prefixed 32-byte hex strings.
+    #[serde(default)]
+    pub tee_oracle_pubkeys: Vec<HexHash>,
 }
 
 impl<S: Spec> ProverIncentives<S> {
@@ -53,6 +59,14 @@ impl<S: Spec> ProverIncentives<S> {
             .set(&<S::Gas as GasArray>::ZEROED, state)?;
         self.proving_penalty.set(&config.proving_penalty, state)?;
         self.last_claimed_reward.set(&SlotNumber::GENESIS, state)?;
+        let oracle_keys: Vec<[u8; 32]> = config
+            .tee_oracle_pubkeys
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+        self.tee_oracle_pubkeys
+            .set::<Vec<[u8; 32]>, _>(&oracle_keys, state)?;
 
         for (prover, bond) in config.initial_provers.iter() {
             self.register_staker(prover, prover, *bond, state)?;

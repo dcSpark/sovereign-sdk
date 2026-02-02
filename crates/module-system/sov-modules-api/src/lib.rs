@@ -117,7 +117,11 @@ pub use sov_rollup_interface::stf::{
     ProofOutcome, ProofReceipt, ProofReceiptContents, ProofSender, StateTransitionFunction,
     StoredEvent,
 };
-pub use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation, TEEAttestationType};
+pub use sov_rollup_interface::tee::{
+    OracleAttestRequestV1, OracleAttestResponseV1, SerializedTEEAttestation,
+    TeeOracleSignedMAAAttestationV1, TeeOracleStatementV1, TEEAttestation, TEEAttestationType,
+    TEE_ORACLE_STATEMENT_DOMAIN_V1,
+};
 pub use sov_rollup_interface::zk::aggregated_proof::{
     AggregatedProofPublicData, CodeCommitment, SerializedAggregatedProof,
 };

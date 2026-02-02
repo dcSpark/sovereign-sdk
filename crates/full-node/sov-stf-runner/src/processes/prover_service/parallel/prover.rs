@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use alloy_primitives::U256;
-use borsh::BorshSerialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sov_midnight_adapter::MidnightIndexerClient;
@@ -15,7 +17,6 @@ use sov_rollup_interface::zk::{
     StateTransitionPublicData, StateTransitionWitness, StateTransitionWitnessWithAddress, Zkvm,
     ZkvmHost,
 };
-use tokio::runtime::Runtime;
 use tracing::{error, info, trace};
 
 use super::state::{ProverState, ProverStatus};
@@ -26,12 +27,33 @@ use crate::processes::{
     PublicDataTee, RollupProverConfigDiscriminants, StateTransitionInfo,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize)]
 pub(crate) struct L1BridgeData {
     pub withdraw_root: [u8; 32],
     pub message_queue_hash: [u8; 32],
     pub last_processed_queue_index: U256,
     pub layer2_chain_id: u64,
+}
+
+fn default_l1_bridge_cache_filename() -> &'static str {
+    "tee_l1_bridge_cache.borsh"
+}
+
+fn load_l1_bridge_cache(path: &Path) -> Option<L1BridgeData> {
+    let bytes = std::fs::read(path).ok()?;
+    borsh::from_slice(&bytes).ok()
+}
+
+fn store_l1_bridge_cache(path: &Path, value: &L1BridgeData) -> anyhow::Result<()> {
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("Invalid cache path (no parent directory): {}", path.display());
+    };
+    std::fs::create_dir_all(parent)?;
+
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, borsh::to_vec(value)?)?;
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
 }
 
 // A prover that generates proofs in parallel using a thread pool. If the pool is saturated,
@@ -49,6 +71,9 @@ pub(crate) struct Prover<Address, StateRoot, Witness, Da: DaService> {
     // """
     pool: rayon::ThreadPool,
     code_commitment: CodeCommitment,
+    l1_bridge_cache_path: Option<PathBuf>,
+    l1_bridge_cached: Arc<RwLock<L1BridgeData>>,
+    warned_no_midnight_bridge: AtomicBool,
     phantom: std::marker::PhantomData<(StateRoot, Witness, Da)>,
 }
 
@@ -64,7 +89,16 @@ where
         prover_address: Address,
         num_threads: usize,
         code_commitment: CodeCommitment,
+        storage_path: Option<PathBuf>,
     ) -> Self {
+        let l1_bridge_cache_path =
+            storage_path.as_ref().map(|p| p.join(default_l1_bridge_cache_filename()));
+
+        let cached = l1_bridge_cache_path
+            .as_deref()
+            .and_then(load_l1_bridge_cache)
+            .unwrap_or_default();
+
         Self {
             code_commitment,
             num_threads,
@@ -78,6 +112,9 @@ where
                 pending_tasks_count: Default::default(),
             })),
             prover_address,
+            l1_bridge_cache_path,
+            l1_bridge_cached: Arc::new(RwLock::new(cached)),
+            warned_no_midnight_bridge: AtomicBool::new(false),
             phantom: PhantomData,
         }
     }
@@ -210,7 +247,11 @@ where
         }
 
         // Mainly here to avoid to init the midnight bridge if not needed.
-        let mut l1_bridge = L1BridgeData::default();
+        let mut l1_bridge = self
+            .l1_bridge_cached
+            .read()
+            .expect("Lock was poisoned")
+            .clone();
 
         if let Some(midnight_bridge) = midnight_bridge {
             let snap = tokio::task::block_in_place(|| {
@@ -223,27 +264,59 @@ where
                     tracing::error!(error = ?e, "Failed to get midnight bridge snapshot, L1 bridge data will be mocked values.");
                 }
                 Ok(snap) => {
-                    let index = snap.rollup.next_cross_domain_message_index - 1;
-                    l1_bridge.last_processed_queue_index =
+                    let candidate_last_processed =
                         U256::from(snap.l2_messenger.last_processed_l1_index);
-                    l1_bridge.message_queue_hash = snap
-                        .rollup
-                        .message_rolling_hashes
-                        .get(&index)
-                        .expect("No message rolling hashes available")
-                        .clone();
+                    if candidate_last_processed < l1_bridge.last_processed_queue_index {
+                        tracing::warn!(
+                            previous = %l1_bridge.last_processed_queue_index,
+                            candidate = %candidate_last_processed,
+                            "Midnight bridge snapshot last_processed_l1_index regressed; keeping cached value"
+                        );
+                    } else {
+                        l1_bridge.last_processed_queue_index = candidate_last_processed;
+                    }
+
                     l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
-                    l1_bridge.withdraw_root = snap
-                        .rollup
-                        .withdraw_roots
-                        .values()
-                        .next_back()
-                        .expect("no withdraw roots available")
-                        .clone();
+
+                    let index = snap.rollup.next_cross_domain_message_index.saturating_sub(1);
+                    if let Some(h) = snap.rollup.message_rolling_hashes.get(&index) {
+                        l1_bridge.message_queue_hash = *h;
+                    } else {
+                        tracing::warn!(
+                            next_cross_domain_message_index = snap.rollup.next_cross_domain_message_index,
+                            "Missing message rolling hash for expected index; keeping cached value"
+                        );
+                    }
+
+                    if let Some(root) = snap.rollup.withdraw_roots.values().next_back() {
+                        l1_bridge.withdraw_root = *root;
+                    } else {
+                        tracing::warn!("No withdraw roots available in snapshot; keeping cached value");
+                    }
+
+                    // Persist best-effort so we don't reset to zeros on restart.
+                    if let Some(path) = &self.l1_bridge_cache_path {
+                        if let Err(err) = store_l1_bridge_cache(path, &l1_bridge) {
+                            tracing::warn!(
+                                error = ?err,
+                                path = %path.display(),
+                                "Failed to persist L1 bridge cache"
+                            );
+                        }
+                    }
+
+                    *self
+                        .l1_bridge_cached
+                        .write()
+                        .expect("Lock was poisoned") = l1_bridge.clone();
                 }
             }
         } else {
-            tracing::warn!("No midnight bridge provided, L1 bridge data will be mocked values.");
+            if !self.warned_no_midnight_bridge.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "No midnight bridge configured; using cached/mock L1 bridge values for TEE batch public data"
+                );
+            }
         }
 
         let public_data = AggregatedProofPublicData::<Address, Da::Spec, StateRoot> {

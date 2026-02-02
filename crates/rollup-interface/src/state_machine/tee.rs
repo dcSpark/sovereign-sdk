@@ -3,6 +3,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use tee::common::BatchPublicDataV1;
 
+/// 32-byte domain separator for oracle-signed TEE attestation statements (v1).
+///
+/// This value is included in the signed message to prevent cross-protocol signature reuse.
+pub const TEE_ORACLE_STATEMENT_DOMAIN_V1: [u8; 32] =
+    *b"SOV_TEE_ORACLE_STATEMENT_V1\0\0\0\0\0";
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize, Default, PartialEq, Eq)]
 /// Represents a TEE attestation along with its batch data.
 pub struct TEEAttestation {
@@ -26,6 +32,55 @@ pub enum TEEAttestationType {
     MAA,
     /// Raw AMD SEV-SNP Attestation
     RawSevSnp,
+}
+
+/// A deterministic, oracle-signed statement binding a TEE attestation to the batch public data (v1).
+///
+/// The rollup verifies this statement purely from DA-provided bytes plus on-chain configured
+/// oracle public keys (no HTTP calls, no external binaries).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct TeeOracleStatementV1 {
+    /// Domain separator; must equal [`TEE_ORACLE_STATEMENT_DOMAIN_V1`].
+    pub domain: [u8; 32],
+    /// Type of the TEE attestation that was verified by the oracle.
+    pub attestation_type: TEEAttestationType,
+    /// The batch public data this attestation commits to.
+    pub batch_data: BatchPublicDataV1,
+    /// SHA-256 hash of `TEEAttestation.raw_aggregated_proof`.
+    pub raw_aggregated_proof_sha256: [u8; 32],
+    /// SHA-256 hash of the attestation JWT bytes (UTF-8 string bytes).
+    pub attestation_jwt_sha256: [u8; 32],
+}
+
+/// Oracle request for signing a TEE attestation statement (v1).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct OracleAttestRequestV1 {
+    /// The attestation JWT (typically MAA).
+    pub attestation_jwt: String,
+    /// The statement to sign.
+    pub statement: TeeOracleStatementV1,
+}
+
+/// Oracle response containing a signature over the statement (v1).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct OracleAttestResponseV1 {
+    /// The oracle Ed25519 verifying key (32 bytes).
+    pub oracle_pubkey: [u8; 32],
+    /// Ed25519 signature over `borsh(statement)` (64 bytes).
+    pub oracle_signature: [u8; 64],
+}
+
+/// Oracle-signed attestation payload stored inside `TEEAttestation.attestation` (v1).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+pub struct TeeOracleSignedMAAAttestationV1 {
+    /// The attestation JWT (MAA).
+    pub attestation_jwt: String,
+    /// The signed statement (must match outer fields).
+    pub statement: TeeOracleStatementV1,
+    /// The oracle Ed25519 verifying key (32 bytes).
+    pub oracle_pubkey: [u8; 32],
+    /// Ed25519 signature over `borsh(statement)` (64 bytes).
+    pub oracle_signature: [u8; 64],
 }
 
 /// Represents a serialized TEE attestation.

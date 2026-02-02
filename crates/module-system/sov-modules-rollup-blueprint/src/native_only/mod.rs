@@ -302,6 +302,12 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
             panic!("The operating mode is set to `{operating_mode:?}` and prover config is set to `{prover_config:?}`. This is not supported");
         }
 
+        let mut prover_config = prover_config;
+        if operating_mode == OperatingMode::TEE && prover_config.is_none() {
+            tracing::info!("TEE mode enabled with no prover config; defaulting prover config to `skip`");
+            prover_config = Some(RollupProverConfig::Skip);
+        }
+
         let da_service = self
             .create_da_service(&rollup_config, secondary_shutdown_receiver.clone())
             .await;

@@ -85,6 +85,18 @@ if [ -n "$SKIP_VERIFICATION" ]; then
     echo ""
 fi
 
+# Optional: extra Cargo features for the rollup build (e.g. enabling TEE workflow).
+# Example:
+#   ROLLUP_CARGO_FEATURES="sov-modules-rollup-blueprint/tee"
+ROLLUP_CARGO_FEATURES="${ROLLUP_CARGO_FEATURES:-}"
+BUILD_FEATURE_ARGS=()
+if [[ -n "$ROLLUP_CARGO_FEATURES" ]]; then
+    BUILD_FEATURE_ARGS+=(--features "$ROLLUP_CARGO_FEATURES")
+    echo "✓ Rollup build configuration:"
+    echo "  ROLLUP_CARGO_FEATURES=$ROLLUP_CARGO_FEATURES"
+    echo ""
+fi
+
 # Build ligero rollup
 cd "$WORKSPACE_ROOT"
 
@@ -94,7 +106,7 @@ if [ "$MEMORY_PROFILE" -eq 1 ]; then
     CARGO_PROFILE_RELEASE_DEBUG=2 \
     CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
     RUSTFLAGS="-C force-frame-pointers=yes" \
-    cargo build --release -p sov-rollup-ligero
+    cargo build --release -p sov-rollup-ligero "${BUILD_FEATURE_ARGS[@]}"
     
     echo "Generating dSYM for Instruments symbolication..."
     # Generate dSYM bundle that Instruments uses for symbol resolution
@@ -102,7 +114,7 @@ if [ "$MEMORY_PROFILE" -eq 1 ]; then
     echo "   ✓ dSYM generated at target/release/sov-rollup-ligero.dSYM"
 else
     echo "Building ligero rollup..."
-    cargo build --release -p sov-rollup-ligero
+    cargo build --release -p sov-rollup-ligero "${BUILD_FEATURE_ARGS[@]}"
 fi
 
 echo ""
@@ -119,20 +131,22 @@ export RUST_LOG="${RUST_LOG:-info}"
 # Run the ligero rollup from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
-# Create demo_data directory if it doesn't exist (required for SQLite DB)
-mkdir -p demo_data
+ROLLUP_DATA_DIR="${ROLLUP_DATA_DIR:-demo_data}"
+
+# Create rollup data directory if it doesn't exist (required for SQLite DB)
+mkdir -p "$ROLLUP_DATA_DIR"
 
 # Seed Midnight bridge mock assets if they were wiped by `make clean`
 ASSETS_DIR="$SCRIPT_DIR/assets"
 if [ -d "$ASSETS_DIR" ]; then
-    if [ ! -f "demo_data/midnight_bridge_signer.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_signer.json" ]; then
-        cp "$ASSETS_DIR/midnight_bridge_signer.json" demo_data/
-        echo "  ↳ Restored demo_data/midnight_bridge_signer.json"
+    if [ ! -f "$ROLLUP_DATA_DIR/midnight_bridge_signer.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_signer.json" ]; then
+        cp "$ASSETS_DIR/midnight_bridge_signer.json" "$ROLLUP_DATA_DIR/"
+        echo "  ↳ Restored $ROLLUP_DATA_DIR/midnight_bridge_signer.json"
     fi
 
-    if [ ! -f "demo_data/midnight_bridge_events.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_events.json" ]; then
-        cp "$ASSETS_DIR/midnight_bridge_events.json" demo_data/
-        echo "  ↳ Restored demo_data/midnight_bridge_events.json"
+    if [ ! -f "$ROLLUP_DATA_DIR/midnight_bridge_events.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_events.json" ]; then
+        cp "$ASSETS_DIR/midnight_bridge_events.json" "$ROLLUP_DATA_DIR/"
+        echo "  ↳ Restored $ROLLUP_DATA_DIR/midnight_bridge_events.json"
     fi
 fi
 

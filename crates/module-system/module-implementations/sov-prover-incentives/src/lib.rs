@@ -52,6 +52,14 @@ pub struct ProverIncentives<S: Spec> {
     #[state]
     pub proving_penalty: StateValue<S::Gas>,
 
+    /// The set of oracle public keys authorized to sign TEE attestation statements.
+    ///
+    /// These keys are consensus-critical in `OperatingMode::TEE` because they are used during
+    /// deterministic proof verification in the STF.
+    #[state]
+    #[rest_api(include)]
+    pub tee_oracle_pubkeys: StateValue<Vec<[u8; 32]>>,
+
     /// Reference to the Bank module.
     #[module]
     pub(crate) bank: sov_bank::Bank<S>,
@@ -106,10 +114,12 @@ impl<S: Spec> sov_modules_api::Module for ProverIncentives<S> {
 impl<S: Spec> ProverIncentives<S> {
     /// Returns a bool indicating if the [`ProverIncentives`] module should be paid fees.
     pub fn should_reward_fees<Accessor: StateReader<User>>(&self, state: &mut Accessor) -> bool {
-        self.chain_state
-            .operating_mode(state)
-            .expect("Operating mode retrieval should be infallible")
-            == OperatingMode::Zk
+        matches!(
+            self.chain_state
+                .operating_mode(state)
+                .expect("Operating mode retrieval should be infallible"),
+            OperatingMode::Zk | OperatingMode::TEE
+        )
     }
 
     /// Returns the proving penalty as a [`u64`] value using the gas price contained in the state accessor.

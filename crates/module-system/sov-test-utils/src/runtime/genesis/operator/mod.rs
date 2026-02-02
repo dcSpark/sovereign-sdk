@@ -150,6 +150,7 @@ impl<S: Spec> MinimalOperatorGenesisConfig<S> {
                         user_stake
                     },
                     initial_provers: vec![(placeholder.address().clone(), placeholder.balance())],
+                    tee_oracle_pubkeys: vec![],
                 },
 
                 bank: BasicGenesisConfig::bank(
