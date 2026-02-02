@@ -11,6 +11,8 @@ use tokio::sync::RwLock;
 /// EMA window configurations matching MockMCP spec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmaWindow {
+    /// 2-second EMA - ultra-fast response for real-time monitoring
+    S2,
     /// 5-second EMA - fastest response, best for quick demos
     S5,
     /// 1-minute EMA - good for short-term monitoring
@@ -25,6 +27,7 @@ impl EmaWindow {
     /// Returns the window duration in seconds.
     pub fn seconds(&self) -> u64 {
         match self {
+            EmaWindow::S2 => 2,
             EmaWindow::S5 => 5,
             EmaWindow::M1 => 60,
             EmaWindow::M5 => 300,
@@ -43,6 +46,7 @@ impl EmaWindow {
     /// Returns the path suffix for this window.
     pub fn path_suffix(&self) -> &'static str {
         match self {
+            EmaWindow::S2 => "s2",
             EmaWindow::S5 => "s5",
             EmaWindow::M1 => "m1",
             EmaWindow::M5 => "m5",
@@ -217,6 +221,7 @@ pub struct EmaTracker {
 
 #[derive(Default)]
 struct EmaTrackerState {
+    s2: EmaState,
     s5: EmaState,
     m1: EmaState,
     m5: EmaState,
@@ -239,6 +244,7 @@ impl EmaTracker {
     /// Updates all EMA windows with a new value.
     pub async fn update(&self, value: f64, now_ms: i64) {
         let mut states = self.states.write().await;
+        states.s2.update(value, now_ms, EmaWindow::S2);
         states.s5.update(value, now_ms, EmaWindow::S5);
         states.m1.update(value, now_ms, EmaWindow::M1);
         states.m5.update(value, now_ms, EmaWindow::M5);
@@ -249,6 +255,7 @@ impl EmaTracker {
     pub async fn get(&self, window: EmaWindow) -> f64 {
         let states = self.states.read().await;
         match window {
+            EmaWindow::S2 => states.s2.value,
             EmaWindow::S5 => states.s5.value,
             EmaWindow::M1 => states.m1.value,
             EmaWindow::M5 => states.m5.value,
@@ -263,6 +270,7 @@ mod tests {
 
     #[test]
     fn test_ema_window_seconds() {
+        assert_eq!(EmaWindow::S2.seconds(), 2);
         assert_eq!(EmaWindow::S5.seconds(), 5);
         assert_eq!(EmaWindow::M1.seconds(), 60);
         assert_eq!(EmaWindow::M5.seconds(), 300);

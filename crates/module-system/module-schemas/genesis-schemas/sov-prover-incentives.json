@@ -41,6 +41,14 @@
           "$ref": "#/definitions/GasUnit(2)"
         }
       ]
+    },
+    "tee_oracle_pubkeys": {
+      "description": "The set of oracle public keys (Ed25519) authorized to sign TEE attestation statements.\n\nHuman-readable JSON form is `0x`-prefixed 32-byte hex strings.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/HexHash"
+      }
     }
   },
   "definitions": {
@@ -63,6 +71,11 @@
       },
       "maxItems": 2,
       "minItems": 2
+    },
+    "HexHash": {
+      "description": "32 bytes in hexadecimal format, with `0x` prefix.",
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{64}$"
     }
   }
 }

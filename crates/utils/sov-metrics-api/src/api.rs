@@ -116,6 +116,7 @@ pub fn router(state: AppState) -> Router {
             get(median_transaction_size_historic),
         )
         // EMA metrics endpoints (MockMCP-compatible) - exposed via proxy at /metrics/*
+        .route("/s2", get(metrics_s2))
         .route("/s5", get(metrics_s5))
         .route("/m1", get(metrics_m1))
         .route("/m5", get(metrics_m5))
@@ -408,8 +409,20 @@ async fn tps_peak(
 }
 
 // =============================================================================
-// EMA Metrics Endpoints (MockMCP-compatible /metrics/{s5|m1|m5|m15})
+// EMA Metrics Endpoints (MockMCP-compatible /metrics/{s2|s5|m1|m5|m15})
 // =============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/s2",
+    responses(
+        (status = 200, description = "2-second EMA metrics", body = EmaMetricsResponse)
+    ),
+    tag = "ema-metrics"
+)]
+async fn metrics_s2(State(state): State<AppState>) -> Json<EmaMetricsResponse> {
+    Json(compute_ema_metrics(&state, EmaWindow::S2).await)
+}
 
 #[utoipa::path(
     get,
@@ -541,10 +554,26 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
+    // Compute peak TPS for this EMA window
+    let now = chrono::Utc::now();
+    let window_secs = window.seconds() as i64;
+    let window_start = now - chrono::Duration::seconds(window_secs);
+
+    let (peak_tps, peak_tps_at_ms) =
+        match compute_peak_tps_from_db(&state.da_db, window_start, now).await {
+            Ok((tps, at_ms)) => (tps, Some(at_ms)),
+            Err(e) => {
+                tracing::warn!("Failed to compute peak TPS for EMA endpoint: {}", e);
+                (0.0, None)
+            }
+        };
+
     EmaMetricsResponse {
         accounts,
         sending_accounts,
         tps: tps.unwrap_or(0.0),
+        peak_tps,
+        peak_tps_at_ms,
         tokens_per_second: tokens_per_second.unwrap_or(0.0),
         total_disclosure_events,
         total_tokens_in_wallets,
@@ -1873,10 +1902,11 @@ fn map_average_transaction_size_sample(
     })
 }
 
-/// Response for EMA metrics endpoints (/metrics/{s5|m1|m5|m15}).
+/// Response for EMA metrics endpoints (/metrics/{s2|s5|m1|m5|m15}).
 ///
 /// This matches the MockMCP Authority API specification for metrics endpoints.
 /// The EMA window affects how quickly the metrics respond to recent activity:
+/// - `s2`: 2-second window - ultra-fast response for real-time monitoring
 /// - `s5`: 5-second window - fastest response, best for quick demos
 /// - `m1`: 1-minute window - good for short-term monitoring
 /// - `m5`: 5-minute window - balanced view for medium-term simulations
@@ -1891,6 +1921,12 @@ struct EmaMetricsResponse {
     /// Transactions per second using the specified EMA window.
     #[serde(rename = "TPS")]
     tps: f64,
+    /// Peak TPS observed within the EMA window.
+    #[serde(rename = "PeakTPS")]
+    peak_tps: f64,
+    /// Timestamp (ms) when peak TPS occurred within the window.
+    #[serde(rename = "PeakTPSAtMs")]
+    peak_tps_at_ms: Option<i64>,
     /// EMA tokens sent per second.
     tokens_per_second: f64,
     /// Total disclosure events fired.
@@ -2126,6 +2162,7 @@ struct TokenVelocityHistoricSample {
         average_transaction_size_historic,
         median_transaction_size,
         median_transaction_size_historic,
+        metrics_s2,
         metrics_s5,
         metrics_m1,
         metrics_m5,

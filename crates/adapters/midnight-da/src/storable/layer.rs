@@ -74,7 +74,7 @@ impl StorableMidnightDaLayer {
                 .log_statements(tracing::log::LevelFilter::Debug)
                 .log_slow_statements(
                     tracing::log::LevelFilter::Warn,
-                    std::time::Duration::from_millis(5),
+                    std::time::Duration::from_millis(250),
                 )
                 .busy_timeout(std::time::Duration::from_millis(30000));
 
@@ -89,7 +89,7 @@ impl StorableMidnightDaLayer {
                 .await?;
 
             tracing::info!(
-                "Initializing SQLite database connection pool: 4 max_connections, 5ms slow-query threshold"
+                "Initializing SQLite database connection pool: 4 max_connections, 250ms slow-query threshold"
             );
 
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
@@ -107,10 +107,10 @@ impl StorableMidnightDaLayer {
                 .sqlx_logging_level(tracing::log::LevelFilter::Debug)
                 .sqlx_slow_statements_logging_settings(
                     tracing::log::LevelFilter::Warn,
-                    std::time::Duration::from_millis(5),
+                    std::time::Duration::from_millis(250),
                 );
 
-            tracing::info!("Initializing PostgreSQL database connection pool: 50 max_connections, 5ms slow-query threshold");
+            tracing::info!("Initializing PostgreSQL database connection pool: 50 max_connections, 250ms slow-query threshold");
 
             Database::connect(opts).await?
         };

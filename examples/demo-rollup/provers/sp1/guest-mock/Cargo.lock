@@ -6160,6 +6160,9 @@ name = "sov-capabilities"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "borsh",
+ "ed25519-dalek",
+ "sha2 0.10.9",
  "sov-accounts",
  "sov-attester-incentives",
  "sov-bank",
