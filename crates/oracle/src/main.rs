@@ -129,14 +129,22 @@ fn validate_attestation_jwt(
 }
 
 async fn validate_batch(State(state): State<AppState>, Json(payload): Json<TEEPayload>) -> impl IntoResponse {
+    info!(payload_len = payload.data.len(), "POST /validate");
+
     let bytes = match decode_b64_payload(&payload) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err(e) => {
+            warn!("POST /validate - failed to decode payload");
+            return e;
+        }
     };
 
     let attestation_payload: sov_modules_api::TEEAttestation = match borsh::from_slice(&bytes) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid attestation payload"),
+        Err(_) => {
+            warn!("POST /validate - invalid attestation payload");
+            return (StatusCode::BAD_REQUEST, "invalid attestation payload");
+        }
     };
 
     match attestation_payload.attestation_type {
@@ -149,13 +157,22 @@ async fn validate_batch(State(state): State<AppState>, Json(payload): Json<TEEPa
                 Ok(signed) => signed.attestation_jwt,
                 Err(_) => match borsh::from_slice(&attestation_payload.attestation) {
                     Ok(jwt) => jwt,
-                    Err(_) => return (StatusCode::BAD_REQUEST, "invalid MAA attestation format"),
+                    Err(_) => {
+                        warn!("POST /validate - invalid MAA attestation format");
+                        return (StatusCode::BAD_REQUEST, "invalid MAA attestation format");
+                    }
                 },
             };
 
             match validate_attestation_jwt(&attestation_jwt, state.dev_accept_all) {
-                Ok(()) => (StatusCode::NO_CONTENT, ""),
-                Err(e) => e,
+                Ok(()) => {
+                    info!("POST /validate - attestation valid");
+                    (StatusCode::NO_CONTENT, "")
+                }
+                Err(e) => {
+                    warn!("POST /validate - attestation rejected");
+                    e
+                }
             }
         }
         sov_modules_api::TEEAttestationType::RawSevSnp => {
@@ -165,30 +182,53 @@ async fn validate_batch(State(state): State<AppState>, Json(payload): Json<TEEPa
 }
 
 async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayload>) -> Response {
+    info!(payload_len = payload.data.len(), "POST /attest");
+
     let bytes = match decode_b64_payload(&payload) {
         Ok(b) => b,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            warn!("POST /attest - failed to decode payload");
+            return e.into_response();
+        }
     };
 
     let req: sov_modules_api::OracleAttestRequestV1 = match borsh::from_slice(&bytes) {
         Ok(r) => r,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid attest request payload").into_response(),
+        Err(_) => {
+            warn!("POST /attest - invalid attest request payload");
+            return (StatusCode::BAD_REQUEST, "invalid attest request payload").into_response();
+        }
     };
 
+    let batch_index = req.statement.batch_data.batch_index;
+    let da_start = req.statement.batch_data.da_start_height;
+    let da_end = req.statement.batch_data.da_end_height;
+
+    info!(
+        batch_index = batch_index,
+        da_start_height = da_start,
+        da_end_height = da_end,
+        "POST /attest - processing batch"
+    );
+
     if req.statement.domain != sov_modules_api::TEE_ORACLE_STATEMENT_DOMAIN_V1 {
+        warn!(batch_index = batch_index, "POST /attest - invalid statement domain");
         return (StatusCode::BAD_REQUEST, "invalid statement domain").into_response();
     }
 
     let jwt_hash: [u8; 32] = Sha256::digest(req.attestation_jwt.as_bytes()).into();
     if req.statement.attestation_jwt_sha256 != jwt_hash {
+        warn!(batch_index = batch_index, "POST /attest - JWT hash mismatch");
         return (StatusCode::BAD_REQUEST, "statement JWT hash mismatch").into_response();
     }
 
     if req.statement.attestation_type != sov_modules_api::TEEAttestationType::MAA {
+        warn!(batch_index = batch_index, "POST /attest - unsupported attestation type");
         return (StatusCode::BAD_REQUEST, "unsupported attestation type").into_response();
     }
 
     if let Err(e) = validate_attestation_jwt(&req.attestation_jwt, state.dev_accept_all) {
+        warn!(batch_index = batch_index, "POST /attest - attestation validation failed");
         return e.into_response();
     }
 
@@ -271,9 +311,17 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
     let resp_bytes = match borsh::to_vec(&resp) {
         Ok(b) => b,
         Err(_) => {
+            error!("POST /attest - failed to encode response");
             return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode response").into_response()
         }
     };
+
+    info!(
+        batch_index = batch_index,
+        da_start_height = da_start,
+        da_end_height = da_end,
+        "POST /attest - attestation signed successfully"
+    );
 
     (
         StatusCode::OK,
@@ -285,11 +333,13 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
 }
 
 async fn pubkey(State(state): State<AppState>) -> impl IntoResponse {
+    info!("GET /pubkey");
     let pk_hex = hex::encode(state.signing_key.verifying_key().as_bytes());
     (StatusCode::OK, pk_hex)
 }
 
 async fn root() -> &'static str {
+    info!("GET /");
     "Midnight L2 Oracle Service is running."
 }
 
@@ -304,7 +354,12 @@ async fn list_attestations(
     State(state): State<AppState>,
     Query(params): Query<ListAttestationsParams>,
 ) -> Response {
+    let limit = params.limit.unwrap_or(20).min(100);
+    let offset = params.offset.unwrap_or(0);
+    info!(limit = limit, offset = offset, "GET /attestations");
+
     let Some(pool) = &state.db_pool else {
+        warn!("GET /attestations - database not configured");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -312,9 +367,6 @@ async fn list_attestations(
             }))
         ).into_response();
     };
-
-    let limit = params.limit.unwrap_or(20).min(100);
-    let offset = params.offset.unwrap_or(0);
 
     let query = if state.db_type == Some(DbType::Postgres) {
         r#"
@@ -369,6 +421,8 @@ async fn list_attestations(
         })
         .collect();
 
+    info!(count = attestations.len(), limit = limit, offset = offset, "GET /attestations - returning results");
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -385,7 +439,10 @@ async fn get_attestation_by_slot(
     State(state): State<AppState>,
     Path(slot_id): Path<i64>,
 ) -> Response {
+    info!(slot_id = slot_id, "GET /attestations/slot/{}", slot_id);
+
     let Some(pool) = &state.db_pool else {
+        warn!(slot_id = slot_id, "GET /attestations/slot - database not configured");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -438,6 +495,14 @@ async fn get_attestation_by_slot(
             let attestation: serde_json::Value = serde_json::from_str(&attestation_json)
                 .unwrap_or(serde_json::Value::Null);
 
+            info!(
+                slot_id = slot_id,
+                batch_index = batch_index,
+                da_start_height = da_start_height,
+                da_end_height = da_end_height,
+                "GET /attestations/slot - found attestation"
+            );
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -452,6 +517,7 @@ async fn get_attestation_by_slot(
             ).into_response()
         }
         None => {
+            info!(slot_id = slot_id, "GET /attestations/slot - not found");
             (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
