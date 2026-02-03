@@ -347,6 +347,33 @@ async fn pubkey(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, pk_hex)
 }
 
+/// GET /policies - List all loaded MAA policies
+async fn list_policies() -> impl IntoResponse {
+    info!("GET /policies");
+    let policies = read_policies();
+    
+    let policy_list: Vec<serde_json::Value> = policies
+        .iter()
+        .filter_map(|(id, policy_str)| {
+            let policy_json: serde_json::Value = serde_json::from_str(policy_str).ok()?;
+            Some(serde_json::json!({
+                "policy_id": hex::encode(id),
+                "policy": policy_json,
+            }))
+        })
+        .collect();
+
+    info!(count = policy_list.len(), "GET /policies - returning policies");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "policies": policy_list,
+            "count": policy_list.len(),
+        }))
+    )
+}
+
 async fn root() -> &'static str {
     info!("GET /");
     "Midnight L2 Oracle Service is running."
@@ -381,14 +408,14 @@ async fn list_attestations(
         r#"
         SELECT batch_index, da_start_height, da_end_height, attestation_json, created_at::text as created_at
         FROM tee_attestations
-        ORDER BY batch_index DESC
+        ORDER BY da_start_height DESC
         LIMIT $1 OFFSET $2
         "#
     } else {
         r#"
         SELECT batch_index, da_start_height, da_end_height, attestation_json, CAST(created_at AS TEXT) as created_at
         FROM tee_attestations
-        ORDER BY batch_index DESC
+        ORDER BY da_start_height DESC
         LIMIT ? OFFSET ?
         "#
     };
@@ -590,7 +617,7 @@ async fn setup_database(connection_string: &str) -> Result<(AnyPool, DbType)> {
     .execute(&pool)
     .await?;
 
-    // Create index for querying by DA height range
+    // Create index for querying by DA height range (used by /attestations/slot/:slotId and /attestations ordering)
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_tee_attestations_da_height 
@@ -647,6 +674,7 @@ async fn main() -> Result<()> {
         .route("/validate", post(validate_batch))
         .route("/attest", post(attest_batch))
         .route("/pubkey", get(pubkey))
+        .route("/policies", get(list_policies))
         .route("/attestations", get(list_attestations))
         .route("/attestations/slot/{slot_id}", get(get_attestation_by_slot))
         .with_state(state);
@@ -665,6 +693,7 @@ async fn main() -> Result<()> {
         &cfg.oracle_server_bind_address
     );
     tracing::info!("Pubkey endpoint: http://{}/pubkey", &cfg.oracle_server_bind_address);
+    tracing::info!("Policies endpoint: http://{}/policies", &cfg.oracle_server_bind_address);
     tracing::info!("Attestations endpoint: http://{}/attestations", &cfg.oracle_server_bind_address);
     tracing::info!("Attestation by slot endpoint: http://{}/attestations/slot/{{slot_id}}", &cfg.oracle_server_bind_address);
 
