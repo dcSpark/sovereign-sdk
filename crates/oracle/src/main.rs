@@ -249,6 +249,7 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
     if let Some(pool) = &state.db_pool {
         let batch_data = &req.statement.batch_data;
         let attestation_json = serde_json::json!({
+            // Batch public data
             "version": batch_data.version,
             "layer2_chain_id": batch_data.layer2_chain_id,
             "batch_index": batch_data.batch_index,
@@ -263,8 +264,16 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
             "message_queue_hash": hex::encode(batch_data.message_queue_hash),
             "withdraw_root": hex::encode(batch_data.withdraw_root),
             "attestation_type": format!("{:?}", req.statement.attestation_type),
+            // Oracle signature data
             "oracle_pubkey": hex::encode(resp.oracle_pubkey),
             "oracle_signature": hex::encode(resp.oracle_signature),
+            // Full signed message (borsh-encoded statement) - can be verified with oracle_pubkey + oracle_signature
+            "signed_message": hex::encode(&message),
+            // Statement hashes for verification
+            "raw_aggregated_proof_sha256": hex::encode(req.statement.raw_aggregated_proof_sha256),
+            "attestation_jwt_sha256": hex::encode(req.statement.attestation_jwt_sha256),
+            // Full attestation JWT payload
+            "attestation_jwt": &req.attestation_jwt,
         });
 
         let batch_idx = batch_data.batch_index as i64;
