@@ -1,6 +1,8 @@
 pub mod config;
 use anyhow::Result;
 use axum::{
+    extract::Path,
+    extract::Query,
     extract::State,
     extract::Json,
     http::StatusCode,
@@ -12,13 +14,16 @@ use axum::{
 use config::Config;
 use ed25519_dalek::{Signer, SigningKey};
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::{AnyPool, Row};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 use std::sync::RwLock;
 use tee::common::Engine;
 use tee::common::TEEPayload;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Default)]
 pub struct MAAPolicyState {
@@ -29,10 +34,18 @@ pub struct MAAPolicyState {
 pub static MAA_POLICY_STATE: Lazy<RwLock<MAAPolicyState>> =
     Lazy::new(|| RwLock::new(MAAPolicyState::default()));
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbType {
+    Postgres,
+    Sqlite,
+}
+
 #[derive(Clone)]
 struct AppState {
     signing_key: SigningKey,
     dev_accept_all: bool,
+    db_pool: Option<Arc<AnyPool>>,
+    db_type: Option<DbType>,
 }
 
 pub fn load_policies_from_dir(dir: &String) -> Result<usize> {
@@ -192,6 +205,69 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
         oracle_signature: sig,
     };
 
+    // Store attestation in database if configured
+    if let Some(pool) = &state.db_pool {
+        let batch_data = &req.statement.batch_data;
+        let attestation_json = serde_json::json!({
+            "version": batch_data.version,
+            "layer2_chain_id": batch_data.layer2_chain_id,
+            "batch_index": batch_data.batch_index,
+            "da_start_height": batch_data.da_start_height,
+            "da_end_height": batch_data.da_end_height,
+            "da_commitment": hex::encode(batch_data.da_commitment),
+            "prev_state_root": hex::encode(batch_data.prev_state_root),
+            "post_state_root": hex::encode(batch_data.post_state_root),
+            "prev_batch_hash": hex::encode(batch_data.prev_batch_hash),
+            "batch_hash": hex::encode(batch_data.batch_hash),
+            "last_processed_queue_index": batch_data.last_processed_queue_index.to_string(),
+            "message_queue_hash": hex::encode(batch_data.message_queue_hash),
+            "withdraw_root": hex::encode(batch_data.withdraw_root),
+            "attestation_type": format!("{:?}", req.statement.attestation_type),
+            "oracle_pubkey": hex::encode(resp.oracle_pubkey),
+            "oracle_signature": hex::encode(resp.oracle_signature),
+        });
+
+        let batch_idx = batch_data.batch_index as i64;
+        let da_start = batch_data.da_start_height as i64;
+        let da_end = batch_data.da_end_height as i64;
+        let json_str = attestation_json.to_string();
+
+        let query = if state.db_type == Some(DbType::Postgres) {
+            r#"
+            INSERT INTO tee_attestations (batch_index, da_start_height, da_end_height, attestation_json, created_at)
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (batch_index) DO UPDATE SET
+                da_start_height = EXCLUDED.da_start_height,
+                da_end_height = EXCLUDED.da_end_height,
+                attestation_json = EXCLUDED.attestation_json,
+                created_at = CURRENT_TIMESTAMP
+            "#
+        } else {
+            r#"
+            INSERT INTO tee_attestations (batch_index, da_start_height, da_end_height, attestation_json, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (batch_index) DO UPDATE SET
+                da_start_height = EXCLUDED.da_start_height,
+                da_end_height = EXCLUDED.da_end_height,
+                attestation_json = EXCLUDED.attestation_json,
+                created_at = CURRENT_TIMESTAMP
+            "#
+        };
+
+        if let Err(e) = sqlx::query(query)
+        .bind(batch_idx)
+        .bind(da_start)
+        .bind(da_end)
+        .bind(&json_str)
+        .execute(pool.as_ref())
+        .await
+        {
+            error!(error = ?e, "Failed to store TEE attestation in database");
+        } else {
+            info!(batch_index = batch_idx, da_start_height = da_start, da_end_height = da_end, "TEE attestation stored in database");
+        }
+    }
+
     let resp_bytes = match borsh::to_vec(&resp) {
         Ok(b) => b,
         Err(_) => {
@@ -217,6 +293,177 @@ async fn root() -> &'static str {
     "Midnight L2 Oracle Service is running."
 }
 
+#[derive(Debug, Deserialize)]
+struct ListAttestationsParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// GET /attestations - List all attestations with pagination
+async fn list_attestations(
+    State(state): State<AppState>,
+    Query(params): Query<ListAttestationsParams>,
+) -> Response {
+    let Some(pool) = &state.db_pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Database not configured"
+            }))
+        ).into_response();
+    };
+
+    let limit = params.limit.unwrap_or(20).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let query = if state.db_type == Some(DbType::Postgres) {
+        r#"
+        SELECT batch_index, da_start_height, da_end_height, attestation_json, created_at::text as created_at
+        FROM tee_attestations
+        ORDER BY batch_index DESC
+        LIMIT $1 OFFSET $2
+        "#
+    } else {
+        r#"
+        SELECT batch_index, da_start_height, da_end_height, attestation_json, CAST(created_at AS TEXT) as created_at
+        FROM tee_attestations
+        ORDER BY batch_index DESC
+        LIMIT ? OFFSET ?
+        "#
+    };
+
+    let rows = match sqlx::query(query)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = ?e, "Failed to query attestations");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Database query failed"
+                }))
+            ).into_response();
+        }
+    };
+
+    let attestations: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let batch_index: i64 = row.try_get("batch_index").ok()?;
+            let da_start_height: i64 = row.try_get("da_start_height").ok()?;
+            let da_end_height: i64 = row.try_get("da_end_height").ok()?;
+            let attestation_json: String = row.try_get("attestation_json").ok()?;
+            let created_at: String = row.try_get("created_at").unwrap_or_default();
+            let attestation: serde_json::Value = serde_json::from_str(&attestation_json).ok()?;
+            Some(serde_json::json!({
+                "batch_index": batch_index,
+                "da_start_height": da_start_height,
+                "da_end_height": da_end_height,
+                "created_at": created_at,
+                "attestation": attestation,
+            }))
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "attestations": attestations,
+            "count": attestations.len(),
+            "limit": limit,
+            "offset": offset,
+        }))
+    ).into_response()
+}
+
+/// GET /attestations/slot/:slot_id - Get attestation for a specific DA slot height
+async fn get_attestation_by_slot(
+    State(state): State<AppState>,
+    Path(slot_id): Path<i64>,
+) -> Response {
+    let Some(pool) = &state.db_pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Database not configured"
+            }))
+        ).into_response();
+    };
+
+    let query = if state.db_type == Some(DbType::Postgres) {
+        r#"
+        SELECT batch_index, da_start_height, da_end_height, attestation_json, created_at::text as created_at
+        FROM tee_attestations
+        WHERE da_start_height <= $1 AND da_end_height >= $2
+        LIMIT 1
+        "#
+    } else {
+        r#"
+        SELECT batch_index, da_start_height, da_end_height, attestation_json, CAST(created_at AS TEXT) as created_at
+        FROM tee_attestations
+        WHERE da_start_height <= ? AND da_end_height >= ?
+        LIMIT 1
+        "#
+    };
+
+    let row = match sqlx::query(query)
+    .bind(slot_id)
+    .bind(slot_id)
+    .fetch_optional(pool.as_ref())
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            error!(error = ?e, slot_id = slot_id, "Failed to query attestation by slot");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Database query failed"
+                }))
+            ).into_response();
+        }
+    };
+
+    match row {
+        Some(row) => {
+            let batch_index: i64 = row.try_get("batch_index").unwrap_or(0);
+            let da_start_height: i64 = row.try_get("da_start_height").unwrap_or(0);
+            let da_end_height: i64 = row.try_get("da_end_height").unwrap_or(0);
+            let attestation_json: String = row.try_get("attestation_json").unwrap_or_default();
+            let created_at: String = row.try_get("created_at").unwrap_or_default();
+            let attestation: serde_json::Value = serde_json::from_str(&attestation_json)
+                .unwrap_or(serde_json::Value::Null);
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "found": true,
+                    "slot_id": slot_id,
+                    "batch_index": batch_index,
+                    "da_start_height": da_start_height,
+                    "da_end_height": da_end_height,
+                    "created_at": created_at,
+                    "attestation": attestation,
+                }))
+            ).into_response()
+        }
+        None => {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "found": false,
+                    "slot_id": slot_id,
+                    "message": format!("No attestation found for DA height {}", slot_id),
+                }))
+            ).into_response()
+        }
+    }
+}
+
 fn parse_signing_key(cfg: &Config) -> Result<SigningKey> {
     let mut key_hex = cfg.oracle_signing_key_hex.clone();
     if key_hex.is_none() {
@@ -238,6 +485,50 @@ fn parse_signing_key(cfg: &Config) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
+fn detect_db_type(connection_string: &str) -> DbType {
+    if connection_string.starts_with("postgres") || connection_string.starts_with("postgresql") {
+        DbType::Postgres
+    } else {
+        DbType::Sqlite
+    }
+}
+
+async fn setup_database(connection_string: &str) -> Result<(AnyPool, DbType)> {
+    // Install the any driver for SQLite and PostgreSQL
+    sqlx::any::install_default_drivers();
+
+    let db_type = detect_db_type(connection_string);
+    let pool = sqlx::AnyPool::connect(connection_string).await?;
+
+    // Create the table if it doesn't exist (SQL syntax works for both SQLite and PostgreSQL)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tee_attestations (
+            batch_index BIGINT PRIMARY KEY,
+            da_start_height BIGINT NOT NULL,
+            da_end_height BIGINT NOT NULL,
+            attestation_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        "#
+    )
+    .execute(&pool)
+    .await?;
+
+    // Create index for querying by DA height range
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tee_attestations_da_height 
+        ON tee_attestations (da_start_height, da_end_height)
+        "#
+    )
+    .execute(&pool)
+    .await?;
+
+    info!("TEE attestations database initialized (type: {:?})", db_type);
+    Ok((pool, db_type))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -252,9 +543,28 @@ async fn main() -> Result<()> {
         cfg.oracle_policies_dir
     );
 
+    // Set up database connection if configured
+    let (db_pool, db_type) = if let Some(ref conn_str) = cfg.oracle_db_connection_string {
+        match setup_database(conn_str).await {
+            Ok((pool, db_type)) => {
+                info!("Database connected: {} (type: {:?})", conn_str, db_type);
+                (Some(Arc::new(pool)), Some(db_type))
+            }
+            Err(e) => {
+                warn!(error = ?e, "Failed to connect to database, attestations will not be persisted");
+                (None, None)
+            }
+        }
+    } else {
+        info!("No database configured (ORACLE_DB_CONNECTION_STRING not set), attestations will not be persisted");
+        (None, None)
+    };
+
     let state = AppState {
         signing_key,
         dev_accept_all: cfg.oracle_dev_accept_all,
+        db_pool,
+        db_type,
     };
 
     let app = Router::new()
@@ -262,6 +572,8 @@ async fn main() -> Result<()> {
         .route("/validate", post(validate_batch))
         .route("/attest", post(attest_batch))
         .route("/pubkey", get(pubkey))
+        .route("/attestations", get(list_attestations))
+        .route("/attestations/slot/{slot_id}", get(get_attestation_by_slot))
         .with_state(state);
     let tcp_listener = tokio::net::TcpListener::bind(&cfg.oracle_server_bind_address).await?;
 
@@ -278,6 +590,8 @@ async fn main() -> Result<()> {
         &cfg.oracle_server_bind_address
     );
     tracing::info!("Pubkey endpoint: http://{}/pubkey", &cfg.oracle_server_bind_address);
+    tracing::info!("Attestations endpoint: http://{}/attestations", &cfg.oracle_server_bind_address);
+    tracing::info!("Attestation by slot endpoint: http://{}/attestations/slot/{{slot_id}}", &cfg.oracle_server_bind_address);
 
     let _ = axum::serve(tcp_listener, app)
         .with_graceful_shutdown(async {

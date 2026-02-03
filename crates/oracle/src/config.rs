@@ -50,6 +50,12 @@ pub struct Config {
     /// Development mode: skip policy validation and sign any request (env: ORACLE_DEV_ACCEPT_ALL, default: false).
     #[serde(default, deserialize_with = "deserialize_env_bool")]
     pub oracle_dev_accept_all: bool,
+
+    /// Database connection string for storing attestations (env: ORACLE_DB_CONNECTION_STRING).
+    /// Supports SQLite (sqlite://) or PostgreSQL (postgresql://).
+    /// If not set, attestations will not be persisted.
+    #[serde(default)]
+    pub oracle_db_connection_string: Option<String>,
 }
 
 fn default_server_bind_address() -> String {
