@@ -247,12 +247,10 @@ where
             let slot_number = stf_info.slot_number.get();
             let da_height = stf_info.da_block_header().height();
 
-            println!(
-                "Adding block at slot number {} to proofs_to_create",
-                slot_number
+            tracing::debug!(
+                "Adding block at slot number {} (block hash {}) to proofs_to_create",
+                slot_number, block_hash
             );
-
-            println!("{}", block_hash);
 
             // Save the transition for later proving. This is temporarily redundant
             // since we always just try to prove blocks right away (because we don't have fee
@@ -277,7 +275,7 @@ where
 
         // If we've covered enough blocks for the aggregate proof, generate and submit it to DA
         if num_proofs_to_create >= self.aggregated_proof_block_jump.get() {
-            println!("Aggregating...");
+            tracing::debug!("Aggregating...");
             self.proofs_to_create.close_newest_proof();
             let metadata = self.proofs_to_create.take_oldest();
 
@@ -293,9 +291,9 @@ where
                 .collect();
 
             let da_commitment_root = merkle_root_from_leaves(da_leaves);
-            println!("DA commitment root: {:?}", da_commitment_root);
+            tracing::debug!("DA commitment root: {:?}", da_commitment_root);
 
-            println!(
+            tracing::info!(
                 "Creating aggregated proof for blocks covering DA heights {} to {}",
                 da_start_height, da_end_height
             );
@@ -436,7 +434,7 @@ where
 
             self.prev_batch_hash = batch_hash;
         }
-        println!("Done");
+        tracing::debug!("Finished processing STF info");
         Ok(())
     }
 }
