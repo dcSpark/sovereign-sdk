@@ -1,4 +1,4 @@
-2026-02-03T13:29:50.452539Z ERROR sov_stf_runner::processes::tee_manager: Failed to post aggregated proof to DA error=Oracle /attest failed: 403 Forbidden attestation rejected by policy{
+{
   "compliance-status": "azure-compliant-cvm",
   "attestation-type": "sevsnpvm",
   "secureboot": true,
