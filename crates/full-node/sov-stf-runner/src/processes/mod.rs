@@ -21,6 +21,14 @@ pub use stf_info_manager::*;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 pub use zk_manager::*;
+use borsh::{BorshDeserialize, BorshSerialize};
+use tracing::{info, warn};
+
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize)]
+pub(crate) struct TEEBatchData {
+    pub last_batch_index: u64,
+    pub last_prev_batch_hash: [u8; 32],
+}
 
 #[cfg(feature = "tee")]
 /// Starts a process that generates aggregated proofs in the background.
@@ -43,14 +51,35 @@ where
     if let Some(client) = midnight_bridge.as_ref() {
         let _ = client.snapshot().await;
     }
+    use hex::FromHex;
+
+    let mut batch_data = 0;
+    let mut prev_batch_hash = [0u8; 32];
+
+    // Restore from last known state, if available
+    if std::fs::metadata("tee_batch_data.borsh").is_ok() {
+        let data = std::fs::read("tee_batch_data.borsh");
+        match data {
+            Ok(d) => {
+                let tee_data: TEEBatchData = borsh::from_slice(&d).unwrap_or_default();
+                batch_data = tee_data.last_batch_index;
+                prev_batch_hash = tee_data.last_prev_batch_hash;
+                info!("Restored TEE batch data from file: batch_index={}, prev_batch_hash={:?}", batch_data, prev_batch_hash);
+            }
+            Err(e) => {
+                warn!("Failed to read tee_batch_data.borsh: {}", e);
+                warn!("Defaulting to initial batch data values.");
+            }
+        }
+    }
 
     Ok(TeeProofManager::new(
         prover_service,
         aggregated_proof_block_jump,
         proof_sender,
         genesis_state_root.clone(),
-        0,
-        [0u8; 32],
+        batch_data,
+        prev_batch_hash,
         stf_info_receiver,
         shutdown_receiver,
         reqwest::Client::new(),

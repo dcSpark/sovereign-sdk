@@ -13,11 +13,13 @@ use tee::maa::*;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
+use tracing::warn;
 
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
 use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
+use crate::processes::TEEBatchData;
 
 mod types;
 
@@ -433,6 +435,22 @@ where
             self.batch_index += 1;
 
             self.prev_batch_hash = batch_hash;
+
+            let tee_data = TEEBatchData {
+                last_batch_index: self.batch_index,
+                last_prev_batch_hash: self.prev_batch_hash,
+            };
+            let serialized_tee_data = borsh::to_vec(&tee_data);
+            match serialized_tee_data {
+                Ok(d) => {
+                    if let Err(e) = std::fs::write("tee_batch_data.borsh", d) {
+                        warn!("Failed to write tee_batch_data.borsh: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize TEE batch data for writing: {}", e);
+                }
+            }
         }
         tracing::debug!("Finished processing STF info");
         Ok(())
