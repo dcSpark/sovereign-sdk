@@ -48,8 +48,10 @@ Configure the following environment variables:
 - `PRIVPOOL_SPEND_KEY` - Deprecated/ignored (use `restoreWallet` per session)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
-- `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
+- `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort). If unset but `ADMIN_WALLET_PRIVATE_KEY` is provided, defaults to `1000`.
 - `AUTO_FUND_GAS_RESERVE` - Optional gas reserve (in dust) added to the L2 funding transfer for auto-funding (default: 1000000000000). Values below the default are clamped to ensure the deposit can reserve gas.
+- `AUTO_TOP_UP_THRESHOLD` - Low-balance threshold (in dust) for automatic top-ups (default: `AUTO_FUND_DEPOSIT_AMOUNT / 2`). Set to `0` to disable.
+- `AUTO_TOP_UP_COOLDOWN_SECS` - Minimum time between automatic top-up attempts per session (default: `300`).
 - `MCP_TRANSFER_WAIT_MODE` - Optional post-submit wait mode for `send`: `sequencer` (default) or `none`.
 - `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` - Admin token (shared with FVK service). If set, POST endpoints on `/authority` require `Authorization: Bearer <token>`.
 - `METRICS_API_URL` - Optional `sov-metrics-api` base URL used by `GET /authority/tps` (e.g. `http://127.0.0.1:13200`).
@@ -76,6 +78,8 @@ The server exposes the following MCP tools:
 - `removeWallet` - Clear loaded wallet (enables create/restore again)
 
 If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool. When `START_WITH_NEW_WALLET=true`, the same auto-fund flow runs during startup.
+
+If `AUTO_TOP_UP_THRESHOLD > 0` and auto-funding is configured (`AUTO_FUND_DEPOSIT_AMOUNT` + `ADMIN_WALLET_PRIVATE_KEY`), `send` and `walletBalance` may schedule a best-effort **background** top-up when the wallet balance drops below the threshold. The top-up targets the same amount used for wallet creation (`AUTO_FUND_DEPOSIT_AMOUNT`) and does not block the tool response.
 
 ### Authority (HTTP)
 

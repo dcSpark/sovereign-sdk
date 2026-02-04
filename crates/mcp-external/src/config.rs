@@ -12,6 +12,10 @@ fn default_ligero_proof_service_url() -> Url {
     Url::parse("http://127.0.0.1:1313").expect("default proof service URL is valid")
 }
 
+fn default_auto_top_up_cooldown_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct Config {
     /// Server bind address (env: MCP_SERVER_BIND_ADDRESS, default: "127.0.0.1:3000")
@@ -70,6 +74,8 @@ pub struct Config {
 
     /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
     /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
+    ///
+    /// If unset but ADMIN_WALLET_PRIVATE_KEY is provided, `mcp-external` defaults this to 1000.
     #[serde(default, alias = "AUTO_FUND_DEPOSIT_AMOUNT")]
     pub auto_fund_deposit_amount: Option<String>,
 
@@ -77,6 +83,18 @@ pub struct Config {
     /// This is added to the deposit amount to cover future transaction fees.
     #[serde(default)]
     pub auto_fund_gas_reserve: Option<String>,
+
+    /// Low-balance threshold (in dust) to trigger an automatic top-up (env: AUTO_TOP_UP_THRESHOLD).
+    ///
+    /// Set to "0" to disable automatic top-ups.
+    ///
+    /// If unset, `mcp-external` defaults this to half of the effective `AUTO_FUND_DEPOSIT_AMOUNT`.
+    #[serde(default)]
+    pub auto_top_up_threshold: Option<String>,
+
+    /// Minimum time between automatic top-up attempts per session (env: AUTO_TOP_UP_COOLDOWN_SECS, default: 300).
+    #[serde(default = "default_auto_top_up_cooldown_secs")]
+    pub auto_top_up_cooldown_secs: u64,
 
     /// Bearer token for the `/authority` HTTP endpoints (env: MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN).
     ///

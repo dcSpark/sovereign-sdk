@@ -38,6 +38,7 @@ use crate::server::{CryptoServer, McpWalletContext};
 use crate::wallet::WalletContext;
 
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
+const DEFAULT_AUTO_FUND_DEPOSIT_AMOUNT: u128 = 1_000u128;
 
 struct McpSessions {
     service: StreamableHttpService<CryptoServer, LocalSessionManager>,
@@ -236,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.ligero_program_path.clone(),
     ));
 
-    let auto_fund_deposit_amount = cfg
+    let auto_fund_deposit_amount_from_env = cfg
         .auto_fund_deposit_amount
         .as_deref()
         .map(str::trim)
@@ -253,16 +254,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .and_then(Result::ok);
 
-    if let Some(amount) = auto_fund_deposit_amount {
-        tracing::info!(
-            "[auto-fund] Configured auto-fund deposit amount: {}",
-            amount
-        );
-    } else {
-        tracing::info!(
-            "[auto-fund] No AUTO_FUND_DEPOSIT_AMOUNT configured; skipping auto-funding on wallet creation"
-        );
-    }
+    let auto_fund_deposit_amount = match (auto_fund_deposit_amount_from_env, admin_wallet_ctx.is_some())
+    {
+        (Some(amount), _) => {
+            tracing::info!(
+                "[auto-fund] Configured auto-fund deposit amount: {}",
+                amount
+            );
+            Some(amount)
+        }
+        (None, true) => {
+            tracing::info!(
+                "[auto-fund] No AUTO_FUND_DEPOSIT_AMOUNT configured; using default {}",
+                DEFAULT_AUTO_FUND_DEPOSIT_AMOUNT
+            );
+            Some(DEFAULT_AUTO_FUND_DEPOSIT_AMOUNT)
+        }
+        (None, false) => {
+            tracing::info!(
+                "[auto-fund] No AUTO_FUND_DEPOSIT_AMOUNT configured; skipping auto-funding on wallet creation"
+            );
+            None
+        }
+    };
 
     let auto_fund_gas_reserve = cfg
         .auto_fund_gas_reserve
@@ -285,6 +299,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let default_auto_top_up_threshold = auto_fund_deposit_amount.map(|a| a / 2).unwrap_or(0);
+
+    let auto_top_up_threshold_from_env = cfg
+        .auto_top_up_threshold
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u128>().map_err(|e| {
+                tracing::warn!(
+                    "[auto-top-up] Invalid AUTO_TOP_UP_THRESHOLD '{}': {}. Falling back to default {}",
+                    s,
+                    e,
+                    default_auto_top_up_threshold
+                );
+                e
+            })
+        })
+        .and_then(Result::ok);
+
+    let auto_top_up_threshold = auto_top_up_threshold_from_env.unwrap_or_else(|| {
+        if auto_fund_deposit_amount.is_some() {
+            tracing::info!(
+                "[auto-top-up] No AUTO_TOP_UP_THRESHOLD configured; defaulting to {} (half of target)",
+                default_auto_top_up_threshold
+            );
+        }
+        default_auto_top_up_threshold
+    });
+
+    if auto_top_up_threshold == 0 {
+        tracing::info!("[auto-top-up] AUTO_TOP_UP_THRESHOLD=0: auto top-up disabled");
+    } else {
+        tracing::info!(
+            "[auto-top-up] Configured auto top-up threshold: {}",
+            auto_top_up_threshold
+        );
+    }
+
+    let auto_top_up_cooldown = std::time::Duration::from_secs(cfg.auto_top_up_cooldown_secs);
+    tracing::info!(
+        "[auto-top-up] Configured auto top-up cooldown: {}s",
+        auto_top_up_cooldown.as_secs()
+    );
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -295,6 +354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
+    let auto_top_up_threshold_for_service = auto_top_up_threshold;
+    let auto_top_up_cooldown_for_service = auto_top_up_cooldown;
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
@@ -319,6 +380,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,
+                auto_top_up_threshold_for_service,
+                auto_top_up_cooldown_for_service,
                 wallet_explicitly_loaded,
             ))
         },

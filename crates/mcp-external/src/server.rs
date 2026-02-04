@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
@@ -265,6 +265,246 @@ pub(crate) async fn run_auto_fund_sequence(
             Err(anyhow::anyhow!("Step 1 failed (L2 funding): {}", e))
         }
     }
+}
+
+pub(crate) async fn run_auto_top_up_to_target(
+    provider: Arc<Provider>,
+    admin_ctx: Arc<McpWalletContext>,
+    dest_wallet_ctx: Arc<McpWalletContext>,
+    dest_privacy_key: PrivacyKey,
+    target_privacy_balance: u128,
+    threshold: u128,
+    desired_gas_reserve: u128,
+    current_privacy_balance: u128,
+) -> anyhow::Result<()> {
+    if threshold == 0 {
+        return Ok(());
+    }
+
+    if target_privacy_balance == 0 {
+        anyhow::bail!("target privacy balance is 0");
+    }
+
+    let effective_target = if target_privacy_balance < threshold {
+        tracing::warn!(
+            "[auto-top-up] AUTO_FUND_DEPOSIT_AMOUNT {} is below AUTO_TOP_UP_THRESHOLD {}. Using {} as effective target.",
+            target_privacy_balance,
+            threshold,
+            threshold
+        );
+        threshold
+    } else {
+        target_privacy_balance
+    };
+
+    let dest_wallet_address = dest_wallet_ctx.get_address().to_string();
+
+    if current_privacy_balance >= threshold {
+        tracing::debug!(
+            "[auto-top-up] Privacy balance {} >= threshold {}; no top-up needed",
+            current_privacy_balance,
+            threshold
+        );
+        return Ok(());
+    }
+
+    if current_privacy_balance >= effective_target {
+        tracing::debug!(
+            "[auto-top-up] Privacy balance {} already >= target {}; no top-up needed",
+            current_privacy_balance,
+            effective_target
+        );
+        return Ok(());
+    }
+
+    let deposit_amount = effective_target - current_privacy_balance;
+
+    // Gas token id (same as auto-fund).
+    let gas_token_id = match provider.get_gas_token_id().await {
+        Ok(token_id) => {
+            let configured_id = config_gas_token_id();
+            if token_id != configured_id {
+                tracing::warn!(
+                    "[auto-top-up] Gas token mismatch: chain {}, configured {}",
+                    token_id,
+                    configured_id
+                );
+            }
+            token_id
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[auto-top-up] Failed to fetch gas token id from rollup: {}. Falling back to configured gas token.",
+                e
+            );
+            config_gas_token_id()
+        }
+    };
+
+    let dest_wallet_address_parsed: <McpSpec as Spec>::Address =
+        dest_wallet_address.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid L2 wallet address '{}': {}",
+                dest_wallet_address,
+                e
+            )
+        })?;
+
+    let current_l2_balance_u128: u128 = match provider
+        .get_balance::<McpSpec>(&dest_wallet_address_parsed, &gas_token_id)
+        .await
+    {
+        Ok(balance) => balance.0,
+        Err(e) => {
+            tracing::warn!(
+                "[auto-top-up] Failed to query L2 balance (using 0): {}",
+                e
+            );
+            0
+        }
+    };
+
+    // Ensure enough L2 balance to deposit the delta and pay fees.
+    let min_gas_reserve = crate::operations::DEFAULT_MAX_FEE;
+    let gas_reserve = desired_gas_reserve.max(min_gas_reserve);
+    let required_l2_balance = deposit_amount.saturating_add(gas_reserve);
+    let l2_funding_amount = required_l2_balance.saturating_sub(current_l2_balance_u128);
+
+    tracing::info!(
+        "[auto-top-up] Wallet {} below threshold {} (balance {}). Topping up by {} to reach target {} (L2 top-up {} to reach required {} = deposit {} + gas_reserve {}).",
+        dest_wallet_address,
+        threshold,
+        current_privacy_balance,
+        deposit_amount,
+        effective_target,
+        l2_funding_amount,
+        required_l2_balance,
+        deposit_amount,
+        gas_reserve
+    );
+
+    if l2_funding_amount > 0 {
+        // Step 1: Admin sends L2 tokens to the wallet.
+        tracing::info!(
+            "[auto-top-up] Step 1: Admin sending {} L2 tokens to {}",
+            l2_funding_amount,
+            dest_wallet_address
+        );
+        let tx_hash = crate::operations::send_funds(
+            &provider,
+            &admin_ctx,
+            &dest_wallet_address,
+            &gas_token_id,
+            Amount::from(l2_funding_amount),
+        )
+        .await?
+        .tx_hash
+        .trim()
+        .to_string();
+
+        if tx_hash.is_empty() {
+            anyhow::bail!("L2 funding tx hash is empty");
+        }
+
+        let tx_max_wait = std::time::Duration::from_secs(300);
+        let tx_poll_interval = std::time::Duration::from_secs(2);
+        let tx_started = std::time::Instant::now();
+
+        loop {
+            match provider.get_sequencer_tx(&tx_hash).await {
+                Ok(Some(tx)) => match &tx.receipt.result {
+                    TxReceiptResult::Successful => {
+                        tracing::info!(
+                            "[auto-top-up] L2 funding tx accepted by sequencer: receipt={:?}",
+                            tx.receipt.result
+                        );
+                        break;
+                    }
+                    TxReceiptResult::Reverted | TxReceiptResult::Skipped => {
+                        anyhow::bail!(
+                            "L2 funding tx failed in sequencer: receipt={:?}",
+                            tx.receipt.result
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::info!(
+                        "[auto-top-up] Waiting for L2 funding tx {} to appear in sequencer",
+                        tx_hash
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[auto-top-up] Failed to query sequencer for L2 funding tx receipt: {}",
+                        e
+                    );
+                }
+            }
+
+            if tx_started.elapsed() >= tx_max_wait {
+                anyhow::bail!("Timed out waiting for L2 funding tx in sequencer");
+            }
+
+            tokio::time::sleep(tx_poll_interval).await;
+        }
+
+        // Wait for balance to reflect the transfer before depositing.
+        let expected_l2_balance = current_l2_balance_u128.saturating_add(l2_funding_amount);
+        let max_wait = std::time::Duration::from_secs(30);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+
+        loop {
+            match provider
+                .get_balance::<McpSpec>(&dest_wallet_address_parsed, &gas_token_id)
+                .await
+            {
+                Ok(balance) => {
+                    let balance_u128: u128 = balance.0;
+                    if balance_u128 >= expected_l2_balance {
+                        tracing::info!(
+                            "[auto-top-up] L2 funding confirmed: {}",
+                            balance_u128
+                        );
+                        break;
+                    }
+
+                    tracing::info!(
+                        "[auto-top-up] Waiting for L2 funding: {} / {}",
+                        balance_u128,
+                        expected_l2_balance
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "[auto-top-up] Failed to query L2 balance while waiting for funding: {}",
+                    e
+                ),
+            }
+
+            if started.elapsed() >= max_wait {
+                anyhow::bail!("Timed out waiting for L2 funding balance");
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    } else {
+        tracing::debug!(
+            "[auto-top-up] Wallet {} already has sufficient L2 balance ({} >= required {}); skipping admin transfer",
+            dest_wallet_address,
+            current_l2_balance_u128,
+            required_l2_balance
+        );
+    }
+
+    // Step 2: Wallet deposits the delta to privacy pool.
+    tracing::info!(
+        "[auto-top-up] Step 2: Wallet {} depositing {} to privacy pool",
+        dest_wallet_address,
+        deposit_amount
+    );
+    let _ = crate::operations::deposit(&provider, &dest_wallet_ctx, deposit_amount, &dest_privacy_key).await?;
+
+    Ok(())
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -803,6 +1043,12 @@ struct LocalNotes {
     by_rho: HashMap<String, crate::operations::SpendableNote>,
 }
 
+#[derive(Debug, Default)]
+struct AutoTopUpState {
+    in_flight: bool,
+    last_started_at: Option<std::time::Instant>,
+}
+
 #[derive(Clone)]
 pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
@@ -815,6 +1061,9 @@ pub struct CryptoServer {
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
     auto_fund_gas_reserve: u128,
+    auto_top_up_threshold: u128,
+    auto_top_up_cooldown: std::time::Duration,
+    auto_top_up_state: Arc<StdMutex<AutoTopUpState>>,
     /// Tracks whether a wallet has been explicitly loaded via createWallet or restoreWallet.
     /// When true, createWallet and restoreWallet will fail until removeWallet is called.
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
@@ -839,6 +1088,8 @@ impl CryptoServer {
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
         auto_fund_gas_reserve: u128,
+        auto_top_up_threshold: u128,
+        auto_top_up_cooldown: std::time::Duration,
         wallet_explicitly_loaded: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
@@ -852,6 +1103,9 @@ impl CryptoServer {
             log_path,
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
+            auto_top_up_threshold,
+            auto_top_up_cooldown,
+            auto_top_up_state: Arc::new(StdMutex::new(AutoTopUpState::default())),
             wallet_explicitly_loaded,
             pending_spent_notes: Arc::new(Mutex::new(PendingSpentNotes::default())),
             local_notes: Arc::new(Mutex::new(LocalNotes::default())),
@@ -884,6 +1138,7 @@ impl CryptoServer {
                 None,
             )
         })?;
+        let wallet_ctx_for_top_up = Arc::new(ctx.clone());
 
         let viewer_fvk_bundle_for_transfer = self.viewer_fvk_bundle.read().await.clone();
         let viewer_fvk_bytes = viewer_fvk_bundle_for_transfer
@@ -903,6 +1158,7 @@ impl CryptoServer {
                 None,
             )
         })?;
+        let privacy_key_for_top_up = privacy_key.clone();
         let output_privacy_addr: PrivacyAddress = params.destination_address.parse().map_err(|e| {
             ErrorData::invalid_params(
                 format!(
@@ -1022,6 +1278,7 @@ impl CryptoServer {
                 None,
             ));
         }
+        let estimated_privacy_balance_before_send: u128 = notes.iter().map(|n| n.value).sum();
 
         let selection_started = std::time::Instant::now();
         let selected = crate::operations::select_largest_notes_covering_amount(
@@ -1185,6 +1442,15 @@ impl CryptoServer {
             created_at,
         };
 
+        let estimated_privacy_balance_after_send =
+            estimated_privacy_balance_before_send.saturating_sub(send_amount);
+        self.maybe_spawn_auto_top_up_after_send(
+            provider.clone(),
+            wallet_ctx_for_top_up,
+            privacy_key_for_top_up,
+            estimated_privacy_balance_after_send,
+        );
+
         let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -1226,6 +1492,24 @@ impl CryptoServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let balance = privacy_result.balance;
+
+        // Best-effort: if balance is low, schedule an async top-up in the background.
+        // This must not block the `walletBalance` response.
+        let threshold = self.auto_top_up_threshold;
+        if threshold > 0 && balance < threshold {
+            let wallet_ctx_for_top_up = {
+                let guard = self.wallet_context.read().await;
+                guard.as_ref().cloned()
+            };
+            if let Some(wallet_ctx) = wallet_ctx_for_top_up {
+                self.maybe_spawn_auto_top_up_after_send(
+                    provider.clone(),
+                    Arc::new(wallet_ctx),
+                    privacy_key.clone(),
+                    balance,
+                );
+            }
+        }
 
         let result = GetWalletBalanceResult {
             balance: balance.to_string(),
@@ -2257,5 +2541,97 @@ fn build_transaction_record(
         created_at: timestamp_ms,
         updated_at: timestamp_ms,
         error_message,
+    }
+}
+
+impl CryptoServer {
+    fn maybe_spawn_auto_top_up_after_send(
+        &self,
+        provider: Arc<Provider>,
+        wallet_ctx: Arc<McpWalletContext>,
+        privacy_key: PrivacyKey,
+        privacy_balance_hint: u128,
+    ) {
+        let threshold = self.auto_top_up_threshold;
+        if threshold == 0 {
+            return;
+        }
+
+        // Don't even schedule a background check if our local estimate is comfortably above
+        // threshold. This keeps `send` fast.
+        if privacy_balance_hint >= threshold {
+            return;
+        }
+
+        let Some(target_privacy_balance) = self.auto_fund_deposit_amount else {
+            tracing::debug!(
+                "[auto-top-up] AUTO_FUND_DEPOSIT_AMOUNT not configured; skipping auto top-up"
+            );
+            return;
+        };
+        let Some(admin_ctx) = self.admin_wallet_context.clone() else {
+            tracing::debug!(
+                "[auto-top-up] ADMIN_WALLET_PRIVATE_KEY not configured; skipping auto top-up"
+            );
+            return;
+        };
+
+        let cooldown = self.auto_top_up_cooldown;
+        let desired_gas_reserve = self.auto_fund_gas_reserve;
+        let state = self.auto_top_up_state.clone();
+
+        let now = std::time::Instant::now();
+        {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if guard.in_flight {
+                return;
+            }
+
+            if let Some(last) = guard.last_started_at {
+                if now.duration_since(last) < cooldown {
+                    return;
+                }
+            }
+
+            guard.in_flight = true;
+            guard.last_started_at = Some(now);
+        }
+
+        let wallet_address = wallet_ctx.get_address().to_string();
+        tracing::info!(
+            "[auto-top-up] Scheduling background top-up for wallet {} (balance_hint={}, threshold={}, target={})",
+            wallet_address,
+            privacy_balance_hint,
+            threshold,
+            target_privacy_balance
+        );
+
+        tokio::spawn(async move {
+            let res = run_auto_top_up_to_target(
+                provider,
+                admin_ctx,
+                wallet_ctx,
+                privacy_key,
+                target_privacy_balance,
+                threshold,
+                desired_gas_reserve,
+                privacy_balance_hint,
+            )
+            .await;
+
+            if let Err(e) = res {
+                tracing::warn!("[auto-top-up] Top-up failed: {}", e);
+            }
+
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.in_flight = false;
+        });
     }
 }
