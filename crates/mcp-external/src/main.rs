@@ -1,14 +1,21 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::http::{
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    HeaderMap, Method, Request, StatusCode,
+};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use rmcp::model::{ClientJsonRpcMessage, ClientNotification, InitializedNotification};
 use rmcp::transport::common::http_header::HEADER_SESSION_ID;
-use rmcp::transport::common::server_side_http::SessionId;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::common::server_side_http::{session_id, SessionId};
+use rmcp::transport::streamable_http_server::session::local::{
+    create_local_session, LocalSessionManager, LocalSessionManagerError, LocalSessionWorker,
+};
 use rmcp::transport::streamable_http_server::SessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::WorkerTransport;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -21,40 +28,235 @@ mod operations;
 mod privacy_key;
 mod provider;
 mod server;
+mod session_store;
 mod viewer;
 mod wallet;
 
 #[cfg(test)]
 mod test_utils;
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
+use crate::fvk_service::ViewerFvkBundle;
 use crate::ligero::Ligero;
 use crate::provider::Provider;
+use crate::privacy_key::PrivacyKey;
 use crate::server::{CryptoServer, McpWalletContext};
+use crate::session_store::{SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
 
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
 
+struct SessionContext {
+    requested_id: Option<String>,
+    created_id: Option<String>,
+    restore_tx: Option<oneshot::Sender<()>>,
+}
+
+tokio::task_local! {
+    static SESSION_CONTEXT: RefCell<SessionContext>;
+}
+
+#[derive(Debug, Default)]
+struct PersistentSessionManager {
+    inner: LocalSessionManager,
+}
+
+impl SessionManager for PersistentSessionManager {
+    type Error = LocalSessionManagerError;
+    type Transport = WorkerTransport<LocalSessionWorker>;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let requested_id = SESSION_CONTEXT
+            .try_with(|ctx| ctx.borrow().requested_id.clone())
+            .ok()
+            .flatten();
+
+        let mut id: SessionId = requested_id.map(Into::into).unwrap_or_else(session_id);
+        if self.inner.sessions.read().await.contains_key(&id) {
+            tracing::warn!(session_id = %id, "requested MCP session id already exists; generating a new id");
+            id = session_id();
+        }
+
+        let (handle, worker) = create_local_session(id.clone(), self.inner.session_config.clone());
+        self.inner.sessions.write().await.insert(id.clone(), handle);
+
+        let _ = SESSION_CONTEXT.try_with(|ctx| {
+            ctx.borrow_mut().created_id = Some(id.to_string());
+        });
+
+        Ok((id, WorkerTransport::spawn(worker)))
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> Result<rmcp::model::ServerJsonRpcMessage, Self::Error> {
+        self.inner.initialize_session(id, message).await
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.inner.close_session(id).await
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.create_stream(id, message).await
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.create_standalone_stream(id).await
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.resume(id, last_event_id).await
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await
+    }
+}
+
 struct McpSessions {
-    service: StreamableHttpService<CryptoServer, LocalSessionManager>,
-    session_manager: Arc<LocalSessionManager>,
-    alias_to_internal: RwLock<std::collections::HashMap<String, SessionId>>,
+    service: StreamableHttpService<CryptoServer, PersistentSessionManager>,
+    session_manager: Arc<PersistentSessionManager>,
+    session_store: Option<Arc<SessionStore>>,
+    auto_initialize_sessions: bool,
 }
 
 impl McpSessions {
     fn new(
-        service: StreamableHttpService<CryptoServer, LocalSessionManager>,
-        session_manager: Arc<LocalSessionManager>,
+        service: StreamableHttpService<CryptoServer, PersistentSessionManager>,
+        session_manager: Arc<PersistentSessionManager>,
+        session_store: Option<Arc<SessionStore>>,
+        auto_initialize_sessions: bool,
     ) -> Self {
         Self {
             service,
             session_manager,
-            alias_to_internal: RwLock::new(std::collections::HashMap::new()),
+            session_store,
+            auto_initialize_sessions,
         }
+    }
+
+    fn build_initialize_request_body() -> Vec<u8> {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "clientInfo": { "name": "mcp-external-auto", "version": "0.0.0" },
+                "capabilities": {}
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    async fn send_initialized_notification(&self, session_id: &str) {
+        if !self.auto_initialize_sessions {
+            return;
+        }
+        let session_id: SessionId = session_id.to_string().into();
+        let notification = ClientJsonRpcMessage::notification(
+            ClientNotification::InitializedNotification(InitializedNotification::default()),
+        );
+        if let Err(err) = self
+            .session_manager
+            .accept_message(&session_id, notification)
+            .await
+        {
+            tracing::warn!("Failed to auto-send initialized notification for {session_id}: {err}");
+        }
+    }
+
+    async fn bootstrap_session(&self, requested_session_id: String) -> Result<String, axum::response::Response> {
+        let (restore_tx, restore_rx) = if self.session_store.is_some() {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let session_context = SessionContext {
+            requested_id: Some(requested_session_id),
+            created_id: None,
+            restore_tx,
+        };
+
+        let init_body = Self::build_initialize_request_body();
+        let init_request = match Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(init_body))
+        {
+            Ok(req) => req,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build initialize request: {err}"),
+                )
+                    .into_response());
+            }
+        };
+
+        let response = SESSION_CONTEXT
+            .scope(RefCell::new(session_context), async {
+                self.service.handle(init_request).await.into_response()
+            })
+            .await;
+
+        if let Some(rx) = restore_rx {
+            if let Err(err) = rx.await {
+                tracing::warn!("Session restore channel closed unexpectedly: {err}");
+            }
+        }
+
+        if !response.status().is_success() {
+            return Err(response);
+        }
+
+        let session_id = response
+            .headers()
+            .get(HEADER_SESSION_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Initialize response missing session id",
+                )
+                    .into_response()
+            })?;
+
+        Ok(session_id)
     }
 
     async fn handle(&self, request: Request<Body>) -> axum::response::Response {
@@ -77,93 +279,183 @@ impl McpSessions {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let mut pending_alias: Option<String> = None;
+        let is_initialize = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+            .is_some_and(|m| m == "initialize");
+
+        let mut requested_session_id: Option<String> = None;
+        let mut should_create_session = false;
 
         if let Some(session_id) = original_session_id {
-            // 1) If the session id is an alias we created, rewrite to the internal session id.
-            let mapped_internal = {
-                let guard = self.alias_to_internal.read().await;
-                guard.get(&session_id).cloned()
-            };
-
-            if let Some(internal) = mapped_internal {
-                match self.session_manager.has_session(&internal).await {
-                    Ok(true) => {
-                        if let Ok(value) = HeaderValue::from_str(internal.as_ref()) {
-                            parts.headers.insert(HEADER_SESSION_ID, value);
-                        } else {
+            let as_session_id: SessionId = session_id.clone().into();
+            let exists = self
+                .session_manager
+                .has_session(&as_session_id)
+                .await
+                .unwrap_or(false);
+            if !exists {
+                if parts.method == Method::POST && is_initialize {
+                    requested_session_id = Some(session_id);
+                    should_create_session = true;
+                    parts.headers.remove(HEADER_SESSION_ID);
+                } else if self.auto_initialize_sessions {
+                    let store = match self.session_store.as_ref() {
+                        Some(store) => store,
+                        None => {
                             return (
-                                StatusCode::BAD_REQUEST,
-                                "Invalid resolved session id header value",
+                                StatusCode::UNAUTHORIZED,
+                                "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
                             )
                                 .into_response();
                         }
+                    };
+
+                    let has_snapshot = match store.load_session(&session_id).await {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(err) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to load session snapshot: {err}"),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    if !has_snapshot {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
+                        )
+                            .into_response();
                     }
-                    Ok(false) | Err(_) => {
-                        // Stale mapping; drop it and treat as a new alias below.
-                        let mut guard = self.alias_to_internal.write().await;
-                        guard.remove(&session_id);
-                        pending_alias = Some(session_id);
-                    }
-                }
-            } else {
-                // 2) Otherwise, treat it as a real/internal session id if the RMCP session exists.
-                let as_session_id: SessionId = session_id.clone().into();
-                let exists = self
-                    .session_manager
-                    .has_session(&as_session_id)
-                    .await
-                    .unwrap_or(false);
-                if !exists {
-                    pending_alias = Some(session_id);
+
+                    let bootstrapped_session_id = match self.bootstrap_session(session_id).await {
+                        Ok(id) => id,
+                        Err(response) => return response,
+                    };
+                    self.send_initialized_notification(&bootstrapped_session_id).await;
+                } else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
+                    )
+                        .into_response();
                 }
             }
-        }
-
-        // If the client supplied a session id that doesn't exist, allow it to *create* a new
-        // session by sending an MCP `initialize` request with that session id. We do this by
-        // letting RMCP create a fresh internal session id, then mapping the client-provided id
-        // to it and returning the client-provided id back in the response header.
-        if pending_alias.is_some() {
-            let is_initialize = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                .ok()
-                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
-                .is_some_and(|m| m == "initialize");
-
-            if parts.method == Method::POST && is_initialize {
-                parts.headers.remove(HEADER_SESSION_ID);
-            } else {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
-                )
-                    .into_response();
-            }
+        } else if parts.method == Method::POST && is_initialize {
+            should_create_session = true;
         }
 
         let request = Request::from_parts(parts, Body::from(body_bytes));
-        let mut response = self.service.handle(request).await.into_response();
 
-        if let Some(alias) = pending_alias {
-            if let Some(internal_id) = response
-                .headers()
-                .get(HEADER_SESSION_ID)
-                .and_then(|v| v.to_str().ok())
-            {
-                let internal: SessionId = internal_id.to_string().into();
-                let mut guard = self.alias_to_internal.write().await;
-                guard.insert(alias.clone(), internal);
+        if should_create_session {
+            let (restore_tx, restore_rx) = if self.session_store.is_some() {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
 
-                if let Ok(alias_value) = HeaderValue::from_str(&alias) {
-                    response
-                        .headers_mut()
-                        .insert(HEADER_SESSION_ID, alias_value);
+            let session_context = SessionContext {
+                requested_id: requested_session_id,
+                created_id: None,
+                restore_tx,
+            };
+
+            let response = SESSION_CONTEXT
+                .scope(RefCell::new(session_context), async {
+                    self.service.handle(request).await.into_response()
+                })
+                .await;
+
+            if let Some(rx) = restore_rx {
+                if let Err(err) = rx.await {
+                    tracing::warn!("Session restore channel closed unexpectedly: {err}");
                 }
             }
+
+            if self.auto_initialize_sessions && response.status().is_success() {
+                if let Some(session_id) = response
+                    .headers()
+                    .get(HEADER_SESSION_ID)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    self.send_initialized_notification(session_id).await;
+                }
+            }
+
+            response
+        } else {
+            self.service.handle(request).await.into_response()
+        }
+    }
+}
+
+async fn restore_session_state(
+    session_store: Arc<SessionStore>,
+    session_id: String,
+    wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
+    privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
+    viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
+    wallet_explicitly_loaded: Arc<RwLock<bool>>,
+) -> anyhow::Result<()> {
+    let snapshot = match session_store.load_session(&session_id).await? {
+        Some(snapshot) => snapshot,
+        None => {
+            session_store
+                .save_session(&session_id, &SessionSnapshot::empty())
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let mut restored_wallet_ctx: Option<McpWalletContext> = None;
+    let mut restored_privacy_key: Option<PrivacyKey> = None;
+
+    if let (Some(wallet_hex), Some(privacy_hex)) = (
+        snapshot.wallet_private_key_hex.clone(),
+        snapshot.privacy_spend_key_hex.clone(),
+    ) {
+        match McpWalletContext::from_private_key_hex(wallet_hex) {
+            Ok(ctx) => restored_wallet_ctx = Some(ctx),
+            Err(err) => tracing::warn!("Failed to restore wallet context for session {session_id}: {err}"),
         }
 
-        response
+        match PrivacyKey::from_hex(privacy_hex) {
+            Ok(key) => restored_privacy_key = Some(key),
+            Err(err) => tracing::warn!("Failed to restore privacy key for session {session_id}: {err}"),
+        }
     }
+
+    let restored_viewer_fvk = match snapshot.viewer_fvk_bundle {
+        Some(bundle) => match bundle.try_into_bundle() {
+            Ok(bundle) => Some(bundle),
+            Err(err) => {
+                tracing::warn!("Failed to restore viewer FVK bundle for session {session_id}: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let loaded = snapshot.wallet_explicitly_loaded
+        && restored_wallet_ctx.is_some()
+        && restored_privacy_key.is_some();
+
+    if snapshot.wallet_explicitly_loaded && !loaded {
+        tracing::warn!(
+            "Session {session_id} was marked as loaded but keys could not be restored; leaving it unlocked"
+        );
+    }
+
+    *wallet_context.write().await = restored_wallet_ctx;
+    *privacy_key.write().await = restored_privacy_key;
+    *viewer_fvk_bundle.write().await = restored_viewer_fvk;
+    *wallet_explicitly_loaded.write().await = loaded;
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -285,6 +577,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let session_store = if let Some(db_url) = cfg.mcp_session_db_url.as_deref() {
+        if cfg.mcp_session_db_encryption_key.is_none() {
+            tracing::warn!(
+                "[mcp] MCP_SESSION_DB_ENCRYPTION_KEY not set; session data will be stored unencrypted"
+            );
+        }
+        let store = SessionStore::connect(db_url, cfg.mcp_session_db_encryption_key.as_deref())
+            .await?;
+        tracing::info!("[mcp] MCP session persistence enabled");
+        Some(Arc::new(store))
+    } else {
+        None
+    };
+    if cfg.mcp_auto_initialize_sessions {
+        tracing::info!("[mcp] MCP auto-initialize sessions enabled");
+    }
+
     tracing::info!(
         "[mcp] HTTP Streamable server binding to {}",
         cfg.mcp_server_bind_address
@@ -295,8 +604,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
+    let session_store_for_service = session_store.clone();
 
-    let session_manager = Arc::new(LocalSessionManager::default());
+    let session_manager = Arc::new(PersistentSessionManager::default());
     let service = StreamableHttpService::new(
         move || {
             // Each MCP session starts with no wallet loaded and gets isolated state (no cross-talk
@@ -309,6 +619,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Sessions start empty and remain "unlocked" by default.
             let wallet_explicitly_loaded = Arc::new(RwLock::new(false));
 
+            let session_id = SESSION_CONTEXT
+                .try_with(|ctx| {
+                    let ctx = ctx.borrow();
+                    ctx.created_id.clone().or_else(|| ctx.requested_id.clone())
+                })
+                .ok()
+                .flatten();
+
+            let restore_tx = SESSION_CONTEXT
+                .try_with(|ctx| ctx.borrow_mut().restore_tx.take())
+                .ok()
+                .flatten();
+
+            if let (Some(store), Some(id)) = (session_store_for_service.clone(), session_id.clone()) {
+                let wallet_ctx_restore = wallet_ctx.clone();
+                let privacy_key_restore = privacy_key.clone();
+                let viewer_fvk_restore = viewer_fvk_bundle.clone();
+                let wallet_loaded_restore = wallet_explicitly_loaded.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = restore_session_state(
+                        store,
+                        id.clone(),
+                        wallet_ctx_restore,
+                        privacy_key_restore,
+                        viewer_fvk_restore,
+                        wallet_loaded_restore,
+                    )
+                    .await
+                    {
+                        tracing::warn!("Failed to restore session {id}: {err}");
+                    }
+                    if let Some(tx) = restore_tx {
+                        let _ = tx.send(());
+                    }
+                });
+            } else if let Some(tx) = restore_tx {
+                let _ = tx.send(());
+            }
+
             Ok(CryptoServer::new(
                 provider_for_service.clone(),
                 wallet_ctx,
@@ -320,13 +669,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,
                 wallet_explicitly_loaded,
+                session_id,
+                session_store_for_service.clone(),
             ))
         },
         session_manager.clone(),
         Default::default(),
     );
 
-    let mcp_sessions = Arc::new(McpSessions::new(service, session_manager));
+    let mcp_sessions = Arc::new(McpSessions::new(
+        service,
+        session_manager,
+        session_store,
+        cfg.mcp_auto_initialize_sessions,
+    ));
 
     let app_state = AppState {
         http_client: reqwest::Client::new(),

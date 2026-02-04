@@ -25,6 +25,16 @@ const LOG_BUFFER_SIZE: usize = 1000;
 /// Broadcast channel capacity
 const BROADCAST_CAPACITY: usize = 256;
 
+fn env_flag(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct LogLine {
     pub timestamp: String,
@@ -262,6 +272,16 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Failed to bind to {bind_addr}"))?;
     println!("Service controller listening on http://{bind_addr}");
     println!("WebSocket logs available at ws://{bind_addr}/logs");
+
+    if env_flag("SERVICE_CONTROLLER_AUTO_START") {
+        match start(State(app_state.clone())).await {
+            Ok(message) => println!("{message}"),
+            Err(err) => eprintln!(
+                "Auto-start requested via SERVICE_CONTROLLER_AUTO_START, but failed: {}",
+                err.message
+            ),
+        }
+    }
 
     // Run the server with graceful shutdown on SIGTERM/SIGINT
     let shutdown_state = app_state.clone();

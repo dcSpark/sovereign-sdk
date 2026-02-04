@@ -5,6 +5,7 @@ use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle}
 use crate::ligero::Ligero as LigeroProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
+use crate::session_store::{SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
 use demo_stf::runtime::Runtime;
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
@@ -818,6 +819,8 @@ pub struct CryptoServer {
     /// Tracks whether a wallet has been explicitly loaded via createWallet or restoreWallet.
     /// When true, createWallet and restoreWallet will fail until removeWallet is called.
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
+    session_id: Option<String>,
+    session_store: Option<Arc<SessionStore>>,
     /// Best-effort local cache of recently-spent note identifiers (rho hex), used to avoid
     /// double-spending when the indexer lags behind the sequencer.
     pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
@@ -840,6 +843,8 @@ impl CryptoServer {
         auto_fund_deposit_amount: Option<u128>,
         auto_fund_gas_reserve: u128,
         wallet_explicitly_loaded: Arc<RwLock<bool>>,
+        session_id: Option<String>,
+        session_store: Option<Arc<SessionStore>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -853,8 +858,36 @@ impl CryptoServer {
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
             wallet_explicitly_loaded,
+            session_id,
+            session_store,
             pending_spent_notes: Arc::new(Mutex::new(PendingSpentNotes::default())),
             local_notes: Arc::new(Mutex::new(LocalNotes::default())),
+        }
+    }
+
+    async fn persist_session_snapshot(&self, snapshot: SessionSnapshot) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let Some(session_id) = self.session_id.as_deref() else {
+            tracing::warn!("[mcp] Session persistence enabled but session id is missing");
+            return;
+        };
+        if let Err(err) = store.save_session(session_id, &snapshot).await {
+            tracing::warn!("[mcp] Failed to persist session {session_id}: {err}");
+        }
+    }
+
+    async fn clear_session_snapshot(&self) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let Some(session_id) = self.session_id.as_deref() else {
+            tracing::warn!("[mcp] Session persistence enabled but session id is missing");
+            return;
+        };
+        if let Err(err) = store.delete_session(session_id).await {
+            tracing::warn!("[mcp] Failed to delete session {session_id}: {err}");
         }
     }
 
@@ -1645,6 +1678,12 @@ impl CryptoServer {
             let mut local = self.local_notes.lock().await;
             local.by_rho.clear();
         }
+        self.persist_session_snapshot(SessionSnapshot::from_keys(
+            wallet_private_key_hex.clone(),
+            privacy_spend_key_hex.clone(),
+            viewer_fvk_bundle.clone(),
+        ))
+        .await;
 
         tracing::info!("[createWallet] New wallet created successfully");
         tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
@@ -1833,6 +1872,8 @@ impl CryptoServer {
             )
         })?;
 
+        let viewer_fvk_bundle_for_persist = viewer_fvk_bundle.clone();
+
         // Replace the existing keys with the restored ones (including wallet context)
         let mut ctx_guard = self.wallet_context.write().await;
         *ctx_guard = Some(new_wallet_ctx);
@@ -1855,6 +1896,12 @@ impl CryptoServer {
             let mut local = self.local_notes.lock().await;
             local.by_rho.clear();
         }
+        self.persist_session_snapshot(SessionSnapshot::from_keys(
+            wallet_private_key_hex.to_string(),
+            privacy_spend_key_hex.to_string(),
+            viewer_fvk_bundle_for_persist,
+        ))
+        .await;
 
         tracing::info!("[restoreWallet] Wallet restored successfully");
         tracing::info!("[restoreWallet] Wallet address: {}", wallet_address);
@@ -1901,6 +1948,7 @@ impl CryptoServer {
             let mut local = self.local_notes.lock().await;
             local.by_rho.clear();
         }
+        self.clear_session_snapshot().await;
 
         if was_loaded {
             tracing::info!(

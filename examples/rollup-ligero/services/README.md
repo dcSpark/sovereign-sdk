@@ -76,7 +76,7 @@ load generator as background services on Linux.
   environment from `crates/mcp-external/.env` (or inline `Environment=` overrides)
   for MCP address, rollup/verifier/indexer endpoints, keys, and Ligero paths.
 - The service controller runs
-  `cargo run -p sov-rollup-ligero --bin rollup_ligero_service_controller --release`.
+  `cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release`.
   It provides HTTP endpoints for managing all other services:
   - `POST /start`: Start all services via `run_all.sh`
   - `POST /stop`: Stop all running services
@@ -85,5 +85,6 @@ load generator as background services on Linux.
   - `GET /health`: Check health of all services (rollup, verifier, indexer, mcp, prover, fvk)
   Configure via environment variables:
   - `SERVICE_CONTROLLER_BIND`: Bind address (default: `127.0.0.1:9090`)
+  - `SERVICE_CONTROLLER_AUTO_START`: Set to `1` to auto-start all services when the controller starts
 - Ensure that all services run under a user with permission to access the
   workspace and required key material.

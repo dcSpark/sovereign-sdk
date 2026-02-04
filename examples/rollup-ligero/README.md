@@ -126,6 +126,7 @@ curl -X POST http://127.0.0.1:9090/clean
 
 Notes:
 - Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
+- Auto-start services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
 - `/clean` removes `demo_data` and only runs when services are stopped
 
 ### Linux Services
