@@ -2,8 +2,8 @@ use sov_rollup_interface::common::SlotNumber;
 #[cfg(feature = "native")]
 use sov_rollup_interface::optimistic::BondingProofService;
 use sov_rollup_interface::optimistic::{SerializedAttestation, SerializedChallenge};
-use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation};
 use sov_rollup_interface::stf::InvalidProofError;
+use sov_rollup_interface::tee::{SerializedTEEAttestation, TEEAttestation};
 use sov_rollup_interface::zk::aggregated_proof::{
     AggregatedProofPublicData, SerializedAggregatedProof,
 };

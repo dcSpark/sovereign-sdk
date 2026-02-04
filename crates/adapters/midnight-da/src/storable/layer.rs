@@ -116,7 +116,9 @@ impl StorableMidnightDaLayer {
         };
 
         if readonly_mode {
-            tracing::info!("Read-only mode enabled (readonly_mode=true). Skipping database schema setup.");
+            tracing::info!(
+                "Read-only mode enabled (readonly_mode=true). Skipping database schema setup."
+            );
         } else {
             entity::setup_db(&conn).await?;
         }

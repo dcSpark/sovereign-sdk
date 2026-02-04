@@ -36,8 +36,9 @@ use sov_state::storage::NativeStorage;
 use sov_state::Storage;
 use sov_stf_runner::make_da_sync_state;
 use sov_stf_runner::processes::{
-    start_op_workflow_in_background, start_operator_workflow_in_background, start_zk_workflow_in_background, ProverService,
-    RollupProverConfig, RollupProverConfigDiscriminants,
+    start_op_workflow_in_background, start_operator_workflow_in_background,
+    start_zk_workflow_in_background, ProverService, RollupProverConfig,
+    RollupProverConfigDiscriminants,
 };
 use sov_stf_runner::{
     initialize_state, query_state_update_info, CorsConfiguration, RollupConfig,
@@ -54,7 +55,7 @@ pub const GIT_COMMIT_HASH: &str = env!("GIT_COMMIT_HASH");
 use crate::RollupBlueprint;
 
 #[cfg(feature = "tee")]
-use sov_stf_runner::processes::{start_tee_workflow_in_background};
+use sov_stf_runner::processes::start_tee_workflow_in_background;
 
 /// This trait defines how to create all the necessary dependencies required by a rollup.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -304,7 +305,9 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
 
         let mut prover_config = prover_config;
         if operating_mode == OperatingMode::TEE && prover_config.is_none() {
-            tracing::info!("TEE mode enabled with no prover config; defaulting prover config to `skip`");
+            tracing::info!(
+                "TEE mode enabled with no prover config; defaulting prover config to `skip`"
+            );
             prover_config = Some(RollupProverConfig::Skip);
         }
 
@@ -529,12 +532,16 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                                     );
                                     None
                                 } else {
-                                    match (cfg.indexer_http.as_ref(), cfg.contract_address.as_ref()) {
+                                    match (cfg.indexer_http.as_ref(), cfg.contract_address.as_ref())
+                                    {
                                         (Some(indexer_http), Some(contract_address)) => {
-                                            let timeout =
-                                                Duration::from_millis(cfg.indexer_timeout_ms.max(1));
-                                            let client =
-                                                Client::builder().timeout(timeout).build().context(
+                                            let timeout = Duration::from_millis(
+                                                cfg.indexer_timeout_ms.max(1),
+                                            );
+                                            let client = Client::builder()
+                                                .timeout(timeout)
+                                                .build()
+                                                .context(
                                                     "Failed to build Midnight indexer HTTP client",
                                                 )?;
 

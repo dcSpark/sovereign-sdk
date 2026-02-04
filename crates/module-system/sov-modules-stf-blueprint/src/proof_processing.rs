@@ -116,19 +116,17 @@ where
                         &mut working_set,
                     )
                     .map(ProofReceiptContents::BlockProof),
-                ProofType::TEEProofAttestation(proof) => {
-                    runtime
-                        .proof_processor()
-                        .process_tee_attestation(proof, sequencer_rollup_address, &mut working_set)
-                        .map(|(pub_data, att)| {
-                            ProofReceiptContents::TEEAttestation(
-                                pub_data,
-                                att.attestation,
-                                att.attestation_type,
-                                att.batch_data,
-                            )
-                        })
-                }
+                ProofType::TEEProofAttestation(proof) => runtime
+                    .proof_processor()
+                    .process_tee_attestation(proof, sequencer_rollup_address, &mut working_set)
+                    .map(|(pub_data, att)| {
+                        ProofReceiptContents::TEEAttestation(
+                            pub_data,
+                            att.attestation,
+                            att.attestation_type,
+                            att.batch_data,
+                        )
+                    }),
             };
 
             let (outcome, mut scratchpad, transaction_consumption) = match receipt_contents {

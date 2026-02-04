@@ -119,6 +119,21 @@ pub struct BalanceResponse {
     pub unspent_notes: Vec<UnspentNote>,
 }
 
+/// Response from the indexer's prefunded wallets import endpoint
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PrefundedWalletImportSummary {
+    pub processed: usize,
+    pub inserted: usize,
+    pub ignored: usize,
+}
+
+/// Claimed prefunded wallet metadata returned by the indexer
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ClaimedPrefundedWallet {
+    pub wallet_address: String,
+    pub privacy_address: String,
+}
+
 /// Provider for RPC communication with the Sovereign rollup
 ///
 /// Responsible for all network communication and chain state queries.
@@ -650,6 +665,99 @@ impl Provider {
         );
 
         Ok(balance_response)
+    }
+
+    pub async fn import_prefunded_wallets(
+        &self,
+        wallets: &[crate::prefunded_wallets::PrefundedWalletImportItem],
+    ) -> Result<PrefundedWalletImportSummary> {
+        #[derive(serde::Serialize)]
+        struct ImportRequest<'a> {
+            wallets: &'a [crate::prefunded_wallets::PrefundedWalletImportItem],
+        }
+
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/prefunded-wallets/import", base_url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&ImportRequest { wallets })
+            .send()
+            .await
+            .with_context(|| format!("Failed to import prefunded wallets at {}", url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer prefunded-wallets import error at {}: HTTP {} - {}",
+                url,
+                status,
+                if body.is_empty() {
+                    "No error details provided"
+                } else {
+                    &body
+                }
+            );
+        }
+
+        let summary: PrefundedWalletImportSummary = response.json().await.with_context(|| {
+            format!(
+                "Failed to parse prefunded-wallets import response JSON from indexer at {}",
+                url
+            )
+        })?;
+
+        Ok(summary)
+    }
+
+    pub async fn claim_prefunded_wallet(
+        &self,
+        claimed_by: Option<&str>,
+    ) -> Result<Option<ClaimedPrefundedWallet>> {
+        #[derive(serde::Serialize)]
+        struct ClaimRequest<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claimed_by: Option<&'a str>,
+        }
+
+        let base_url = self.indexer_url.trim_end_matches('/');
+        let url = format!("{}/prefunded-wallets/claim", base_url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&ClaimRequest { claimed_by })
+            .send()
+            .await
+            .with_context(|| format!("Failed to claim prefunded wallet at {}", url))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Indexer prefunded-wallets claim error at {}: HTTP {} - {}",
+                url,
+                status,
+                if body.is_empty() {
+                    "No error details provided"
+                } else {
+                    &body
+                }
+            );
+        }
+
+        let claimed: ClaimedPrefundedWallet = response.json().await.with_context(|| {
+            format!(
+                "Failed to parse prefunded-wallets claim response JSON from indexer at {}",
+                url
+            )
+        })?;
+        Ok(Some(claimed))
     }
 }
 

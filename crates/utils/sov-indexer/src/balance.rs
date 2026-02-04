@@ -14,6 +14,8 @@ use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, P
 
 const DOMAIN: Hash32 = [1u8; 32];
 const NULLIFIER_CHUNK_SIZE: usize = 500;
+// SQLite commonly defaults to 999 bind parameters; keep `IN (...)` batches below that.
+const EVENT_ID_CHUNK_SIZE: usize = 900;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BalanceRequest {
@@ -238,14 +240,18 @@ pub async fn get_wallet_balance(
             encrypted_notes: Option<JsonValue>,
         }
 
+        let withdraw_filter = Condition::any()
+            .add(idx::midnight_withdraw::Column::PrivacySender.eq(wallet_bech32m.clone()))
+            // Backward-compat: include untagged withdraws so we can decrypt and recover
+            // change notes even if `privacy_sender` hasn't been backfilled yet.
+            .add(idx::midnight_withdraw::Column::PrivacySender.is_null());
+
         idx::midnight_withdraw::Entity::find()
             .select_only()
             .column(idx::midnight_withdraw::Column::EventId)
             .column(idx::midnight_withdraw::Column::EncryptedNotes)
-            // Withdraws relevant to this wallet should have `privacy_sender` populated during
-            // indexing when viewer keys are available. Keep this query scoped to the wallet.
-            .filter(idx::midnight_withdraw::Column::PrivacySender.eq(wallet_bech32m.clone()))
             .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
+            .filter(withdraw_filter)
             .into_model::<WithdrawDbRow>()
             .all(db)
             .await?
@@ -401,19 +407,21 @@ async fn load_event_map(
 
     // Only fetch the event columns we need for balance computation. Avoid selecting
     // large `payload`/`events` JSON blobs to reduce DB CPU + network I/O.
-    let events: Vec<EventMetaRow> = idx::Entity::find()
-        .select_only()
-        .column(idx::Column::Id)
-        .column(idx::Column::TxHash)
-        .column(idx::Column::CreatedAt)
-        .filter(idx::Column::Id.is_in(event_ids))
-        .into_model::<EventMetaRow>()
-        .all(db)
-        .await?;
+    let mut map = HashMap::with_capacity(event_ids.len());
+    for chunk in event_ids.chunks(EVENT_ID_CHUNK_SIZE) {
+        let events: Vec<EventMetaRow> = idx::Entity::find()
+            .select_only()
+            .column(idx::Column::Id)
+            .column(idx::Column::TxHash)
+            .column(idx::Column::CreatedAt)
+            .filter(idx::Column::Id.is_in(chunk.to_vec()))
+            .into_model::<EventMetaRow>()
+            .all(db)
+            .await?;
 
-    let mut map = HashMap::new();
-    for ev in events {
-        map.insert(ev.id, (ev.tx_hash, ev.created_at.timestamp_millis()));
+        for ev in events {
+            map.insert(ev.id, (ev.tx_hash, ev.created_at.timestamp_millis()));
+        }
     }
     Ok(map)
 }

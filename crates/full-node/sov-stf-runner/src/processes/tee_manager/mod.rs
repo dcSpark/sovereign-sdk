@@ -12,14 +12,14 @@ use tee::common::{BatchPublicDataV1, Engine};
 use tee::maa::*;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
-use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 use tracing::warn;
+use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
-use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
 use crate::processes::TEEBatchData;
+use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
 
 mod types;
 
@@ -251,7 +251,8 @@ where
 
             tracing::debug!(
                 "Adding block at slot number {} (block hash {}) to proofs_to_create",
-                slot_number, block_hash
+                slot_number,
+                block_hash
             );
 
             // Save the transition for later proving. This is temporarily redundant
@@ -297,7 +298,8 @@ where
 
             tracing::info!(
                 "Creating aggregated proof for blocks covering DA heights {} to {}",
-                da_start_height, da_end_height
+                da_start_height,
+                da_end_height
             );
 
             let (agg_proof, public_data) = self

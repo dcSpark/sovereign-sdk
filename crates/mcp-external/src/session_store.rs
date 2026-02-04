@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
+use anyhow::{Context, Result};
 use base64::Engine;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use rand::RngCore;
 
 use crate::fvk_service::{parse_hex_32, ViewerFvkBundle};
 
@@ -67,7 +67,8 @@ impl ViewerFvkBundleStored {
     pub fn try_into_bundle(self) -> Result<ViewerFvkBundle> {
         let fvk = parse_hex_32("viewer_fvk", &self.fvk)?;
         let fvk_commitment = parse_hex_32("viewer_fvk_commitment", &self.fvk_commitment)?;
-        let signer_public_key = parse_hex_32("viewer_fvk_signer_public_key", &self.signer_public_key)?;
+        let signer_public_key =
+            parse_hex_32("viewer_fvk_signer_public_key", &self.signer_public_key)?;
         Ok(ViewerFvkBundle {
             fvk,
             fvk_commitment,
@@ -114,26 +115,27 @@ impl SessionStore {
     }
 
     pub async fn load_session(&self, session_id: &str) -> Result<Option<SessionSnapshot>> {
-        let row = sqlx::query(
-            "SELECT payload, encrypted FROM mcp_sessions WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to fetch MCP session payload")?;
+        let row = sqlx::query("SELECT payload, encrypted FROM mcp_sessions WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to fetch MCP session payload")?;
 
-        let Some(row) = row else { return Ok(None); };
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
         let payload: Vec<u8> = row.try_get("payload")?;
         let encrypted: bool = row.try_get("encrypted")?;
         let decoded = self.decode_payload(&payload, encrypted)?;
-        let snapshot: SessionSnapshot = serde_json::from_slice(&decoded)
-            .context("Failed to decode MCP session payload")?;
+        let snapshot: SessionSnapshot =
+            serde_json::from_slice(&decoded).context("Failed to decode MCP session payload")?;
         Ok(Some(snapshot))
     }
 
     pub async fn save_session(&self, session_id: &str, snapshot: &SessionSnapshot) -> Result<()> {
-        let encoded = serde_json::to_vec(snapshot).context("Failed to serialize session snapshot")?;
+        let encoded =
+            serde_json::to_vec(snapshot).context("Failed to serialize session snapshot")?;
         let (payload, encrypted) = self.encode_payload(&encoded)?;
         sqlx::query(
             "INSERT INTO mcp_sessions (session_id, payload, encrypted, updated_at)
@@ -168,10 +170,9 @@ impl SessionStore {
 
     fn decode_payload(&self, data: &[u8], encrypted: bool) -> Result<Vec<u8>> {
         if encrypted {
-            let encryptor = self
-                .encryptor
-                .as_ref()
-                .context("Session payload is encrypted but MCP_SESSION_DB_ENCRYPTION_KEY is not set")?;
+            let encryptor = self.encryptor.as_ref().context(
+                "Session payload is encrypted but MCP_SESSION_DB_ENCRYPTION_KEY is not set",
+            )?;
             encryptor.decrypt(data)
         } else {
             Ok(data.to_vec())
@@ -219,7 +220,8 @@ fn parse_encryption_key(raw: &str) -> Result<[u8; 32]> {
     let trimmed = raw.trim();
     let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        let bytes = hex::decode(trimmed).context("Invalid hex for MCP_SESSION_DB_ENCRYPTION_KEY")?;
+        let bytes =
+            hex::decode(trimmed).context("Invalid hex for MCP_SESSION_DB_ENCRYPTION_KEY")?;
         return bytes
             .as_slice()
             .try_into()

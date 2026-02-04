@@ -46,7 +46,10 @@ fn load_l1_bridge_cache(path: &Path) -> Option<L1BridgeData> {
 
 fn store_l1_bridge_cache(path: &Path, value: &L1BridgeData) -> anyhow::Result<()> {
     let Some(parent) = path.parent() else {
-        anyhow::bail!("Invalid cache path (no parent directory): {}", path.display());
+        anyhow::bail!(
+            "Invalid cache path (no parent directory): {}",
+            path.display()
+        );
     };
     std::fs::create_dir_all(parent)?;
 
@@ -91,8 +94,9 @@ where
         code_commitment: CodeCommitment,
         storage_path: Option<PathBuf>,
     ) -> Self {
-        let l1_bridge_cache_path =
-            storage_path.as_ref().map(|p| p.join(default_l1_bridge_cache_filename()));
+        let l1_bridge_cache_path = storage_path
+            .as_ref()
+            .map(|p| p.join(default_l1_bridge_cache_filename()));
 
         let cached = l1_bridge_cache_path
             .as_deref()
@@ -278,12 +282,16 @@ where
 
                     l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
 
-                    let index = snap.rollup.next_cross_domain_message_index.saturating_sub(1);
+                    let index = snap
+                        .rollup
+                        .next_cross_domain_message_index
+                        .saturating_sub(1);
                     if let Some(h) = snap.rollup.message_rolling_hashes.get(&index) {
                         l1_bridge.message_queue_hash = *h;
                     } else {
                         tracing::warn!(
-                            next_cross_domain_message_index = snap.rollup.next_cross_domain_message_index,
+                            next_cross_domain_message_index =
+                                snap.rollup.next_cross_domain_message_index,
                             "Missing message rolling hash for expected index; keeping cached value"
                         );
                     }
@@ -291,7 +299,9 @@ where
                     if let Some(root) = snap.rollup.withdraw_roots.values().next_back() {
                         l1_bridge.withdraw_root = *root;
                     } else {
-                        tracing::warn!("No withdraw roots available in snapshot; keeping cached value");
+                        tracing::warn!(
+                            "No withdraw roots available in snapshot; keeping cached value"
+                        );
                     }
 
                     // Persist best-effort so we don't reset to zeros on restart.
@@ -305,10 +315,7 @@ where
                         }
                     }
 
-                    *self
-                        .l1_bridge_cached
-                        .write()
-                        .expect("Lock was poisoned") = l1_bridge.clone();
+                    *self.l1_bridge_cached.write().expect("Lock was poisoned") = l1_bridge.clone();
                 }
             }
         } else {
