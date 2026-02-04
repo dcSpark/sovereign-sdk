@@ -13,6 +13,9 @@ Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bi
 # Service Controller bind address
 #Environment="SERVICE_CONTROLLER_BIND=127.0.0.1:9090"
 
+# Auto-start all services on controller start
+#Environment="SERVICE_CONTROLLER_AUTO_START=1"
+
 # Service endpoint URLs (used for health checks)
 Environment="ROLLUP_RPC_URL=http://127.0.0.1:12346"
 Environment="BIND_ADDR=http://127.0.0.1:8080"
