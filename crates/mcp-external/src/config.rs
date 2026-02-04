@@ -78,6 +78,19 @@ pub struct Config {
     #[serde(default)]
     pub auto_fund_gas_reserve: Option<String>,
 
+    /// Optional JSONL file with prefunded wallet credentials (env: PREFUNDED_WALLETS_FILE, optional).
+    ///
+    /// When set, `createWallet` will claim an unused prefunded wallet from the indexer instead of
+    /// generating and funding a wallet on-demand.
+    ///
+    /// The file is expected to contain one JSON object per line, including:
+    /// - wallet_private_key_hex (32-byte hex)
+    /// - privacy_spend_key_hex (32-byte hex)
+    /// - wallet_address (sov1...)
+    /// - privacy_address (privpool1...)
+    #[serde(default)]
+    pub prefunded_wallets_file: Option<String>,
+
     /// Bearer token for the `/authority` HTTP endpoints (env: MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN).
     ///
     /// Uses the same token as the FVK service admin. If set, POST endpoints such as
@@ -166,6 +179,12 @@ impl Config {
             .map(|s| s.to_string());
         cfg.mcp_session_db_encryption_key = cfg
             .mcp_session_db_encryption_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.prefunded_wallets_file = cfg
+            .prefunded_wallets_file
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())

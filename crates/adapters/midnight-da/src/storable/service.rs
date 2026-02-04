@@ -271,9 +271,8 @@ impl StorableMidnightDaService {
         // For read-only replicas, spawn a background task to poll for new blocks
         // added by the primary node to the shared database.
         let handle = if config.readonly_mode {
-            let poll_interval = Duration::from_millis(
-                config.readonly_poll_interval_ms.unwrap_or(1000),
-            );
+            let poll_interval =
+                Duration::from_millis(config.readonly_poll_interval_ms.unwrap_or(1000));
             Some(Self::spawn_readonly_block_poller(
                 shutdown_receiver.clone(),
                 da_layer.clone(),
@@ -305,7 +304,10 @@ impl StorableMidnightDaService {
 
         tokio::spawn(
             async move {
-                tracing::info!(?poll_interval, "Starting read-only block poller for replica mode");
+                tracing::info!(
+                    ?poll_interval,
+                    "Starting read-only block poller for replica mode"
+                );
                 let mut interval = interval(poll_interval);
 
                 loop {

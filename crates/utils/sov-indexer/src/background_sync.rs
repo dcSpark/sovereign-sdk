@@ -8,8 +8,8 @@ use crate::viewer::{
 use anyhow::Result;
 use midnight_privacy::{note_commitment, Hash32};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
@@ -720,8 +720,24 @@ async fn backfill_notes_nullifiers_deposits(
 
         // Batch-load event metadata for this page.
         let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
-        let events = idx::Entity::find()
+        #[derive(Debug, FromQueryResult)]
+        struct EventMeta {
+            id: i32,
+            tx_hash: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            events: Option<sea_orm::JsonValue>,
+        }
+
+        let events: Vec<EventMeta> = idx::Entity::find()
+            .select_only()
+            .columns([
+                idx::Column::Id,
+                idx::Column::TxHash,
+                idx::Column::CreatedAt,
+                idx::Column::Events,
+            ])
             .filter(idx::Column::Id.is_in(ids))
+            .into_model::<EventMeta>()
             .all(idx_db)
             .await?;
         let mut event_map = std::collections::HashMap::new();
@@ -827,8 +843,24 @@ async fn backfill_notes_nullifiers_transfers(
         }
 
         let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
-        let events = idx::Entity::find()
+        #[derive(Debug, FromQueryResult)]
+        struct EventMeta {
+            id: i32,
+            tx_hash: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            payload: String,
+        }
+
+        let events: Vec<EventMeta> = idx::Entity::find()
+            .select_only()
+            .columns([
+                idx::Column::Id,
+                idx::Column::TxHash,
+                idx::Column::CreatedAt,
+                idx::Column::Payload,
+            ])
             .filter(idx::Column::Id.is_in(ids))
+            .into_model::<EventMeta>()
             .all(idx_db)
             .await?;
         let mut event_map = std::collections::HashMap::new();
@@ -915,8 +947,24 @@ async fn backfill_notes_nullifiers_withdraws(
         }
 
         let ids: Vec<i32> = rows.iter().map(|r| r.event_id).collect();
-        let events = idx::Entity::find()
+        #[derive(Debug, FromQueryResult)]
+        struct EventMeta {
+            id: i32,
+            tx_hash: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            payload: String,
+        }
+
+        let events: Vec<EventMeta> = idx::Entity::find()
+            .select_only()
+            .columns([
+                idx::Column::Id,
+                idx::Column::TxHash,
+                idx::Column::CreatedAt,
+                idx::Column::Payload,
+            ])
             .filter(idx::Column::Id.is_in(ids))
+            .into_model::<EventMeta>()
             .all(idx_db)
             .await?;
         let mut event_map = std::collections::HashMap::new();

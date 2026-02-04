@@ -71,6 +71,15 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     );
     idx_db.execute(stmt).await?;
 
+    // Prefunded wallets table for external wallet assignment (e.g. MCP)
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::prefunded_wallets::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
+
     // UTXO-like note tracking table (auditor/indexer view)
     let stmt = builder.build(
         &schema
@@ -209,6 +218,16 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
         .to_owned();
     idx_db.execute(builder.build(&idx_stmt)).await?;
 
+    // Prefunded wallets: speed up claiming of available wallets
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_prefunded_wallets_used_created_at")
+        .table(idx::prefunded_wallets::Entity)
+        .col(idx::prefunded_wallets::Column::Used)
+        .col(idx::prefunded_wallets::Column::CreatedAt)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
     Ok(())
 }
 
@@ -217,7 +236,7 @@ pub async fn reset_index_db(idx_db: &DatabaseConnection) -> Result<()> {
     set_foreign_key_checks(idx_db, backend, false).await?;
     let tables = list_all_tables(idx_db, backend).await?;
     for table in tables {
-        if table == "fvk_registry" {
+        if table == "fvk_registry" || table == "prefunded_wallets" {
             continue;
         }
         let quoted = quote_table(&table, backend);
@@ -1467,6 +1486,17 @@ async fn list_wallet_transactions_internal(
 
     let normalized_address = normalize_address_for_query(address);
     let address_is_privacy = address.starts_with("privpool1");
+    let cursor_filter = cursor.as_ref().map(|cur| {
+        let cursor_ts = DateTime::<Utc>::from_timestamp_millis(cur.ts_ms).unwrap_or_else(Utc::now);
+        // Fetch records where (created_at < cursor_ts) OR (created_at == cursor_ts AND tx_hash < cursor_tx_hash)
+        Condition::any()
+            .add(idx::Column::CreatedAt.lt(cursor_ts))
+            .add(
+                Condition::all()
+                    .add(idx::Column::CreatedAt.eq(cursor_ts))
+                    .add(idx::Column::TxHash.lt(cur.tx_hash.clone())),
+            )
+    });
 
     debug!(
         "list_wallet_transactions: address={}, normalized={}, is_privacy={}, god_mode={}",
@@ -1479,6 +1509,7 @@ async fn list_wallet_transactions_internal(
     // 2. Merge, sort, and take the top `limit` items
 
     let mut collected: Vec<InvolvementItem> = Vec::new();
+    let per_kind_limit = (limit + 1) as u64;
 
     // Deposits
     if type_filter.is_none() || type_filter.as_deref() == Some("deposit") {
@@ -1489,24 +1520,23 @@ async fn list_wallet_transactions_internal(
             Condition::any().add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
         };
 
-        let deps = idx::midnight_deposit::Entity::find()
+        let mut deps_query = idx::midnight_deposit::Entity::find()
             .filter(deposit_filter)
-            .all(db)
-            .await?;
+            .find_also_related(idx::Entity)
+            .order_by_desc(idx::Column::CreatedAt)
+            .order_by_desc(idx::Column::TxHash)
+            .limit(per_kind_limit);
+        if let Some(ref cond) = cursor_filter {
+            deps_query = deps_query.filter(cond.clone());
+        }
+        let deps = deps_query.all(db).await?;
 
         trace!("Found {} deposit records for wallet", deps.len());
 
-        for md in deps {
-            let Some(ev) = idx::Entity::find_by_id(md.event_id).one(db).await? else {
+        for (md, ev) in deps {
+            let Some(ev) = ev else {
                 continue;
             };
-
-            // Apply cursor filter
-            if let Some(ref cur) = cursor {
-                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                    continue;
-                }
-            }
 
             collected.push(InvolvementItem {
                 tx_hash: ev.tx_hash.clone(),
@@ -1532,31 +1562,32 @@ async fn list_wallet_transactions_internal(
 
     // Withdrawals
     if type_filter.is_none() || type_filter.as_deref() == Some("withdraw") {
-        let wds = idx::midnight_withdraw::Entity::find()
-            .filter(if address_is_privacy {
-                Condition::any().add(
-                    idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()),
-                )
-            } else {
-                Condition::any()
-                    .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
-                    .add(idx::midnight_withdraw::Column::ToAddr.eq(address.to_string()))
-            })
-            .all(db)
-            .await?;
+        let withdraw_filter = if address_is_privacy {
+            Condition::any()
+                .add(idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()))
+        } else {
+            Condition::any()
+                .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
+                .add(idx::midnight_withdraw::Column::ToAddr.eq(address.to_string()))
+        };
+
+        let mut wds_query = idx::midnight_withdraw::Entity::find()
+            .filter(withdraw_filter)
+            .find_also_related(idx::Entity)
+            .order_by_desc(idx::Column::CreatedAt)
+            .order_by_desc(idx::Column::TxHash)
+            .limit(per_kind_limit);
+        if let Some(ref cond) = cursor_filter {
+            wds_query = wds_query.filter(cond.clone());
+        }
+        let wds = wds_query.all(db).await?;
 
         trace!("Found {} withdraw records for wallet", wds.len());
 
-        for mw in wds {
-            let Some(ev) = idx::Entity::find_by_id(mw.event_id).one(db).await? else {
+        for (mw, ev) in wds {
+            let Some(ev) = ev else {
                 continue;
             };
-
-            if let Some(ref cur) = cursor {
-                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                    continue;
-                }
-            }
 
             collected.push(InvolvementItem {
                 tx_hash: ev.tx_hash.clone(),
@@ -1586,32 +1617,31 @@ async fn list_wallet_transactions_internal(
 
     // Transfers
     if type_filter.is_none() || type_filter.as_deref() == Some("transfer") {
-        let tfs = idx::midnight_transfer::Entity::find()
-            .filter(if address_is_privacy {
-                Condition::any()
-                    .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
-                    .add(
-                        idx::midnight_transfer::Column::PrivacySender
-                            .eq(normalized_address.clone()),
-                    )
-            } else {
-                Condition::any().add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
-            })
-            .all(db)
-            .await?;
+        let transfer_filter = if address_is_privacy {
+            Condition::any()
+                .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
+                .add(idx::midnight_transfer::Column::PrivacySender.eq(normalized_address.clone()))
+        } else {
+            Condition::any().add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+        };
+
+        let mut tfs_query = idx::midnight_transfer::Entity::find()
+            .filter(transfer_filter)
+            .find_also_related(idx::Entity)
+            .order_by_desc(idx::Column::CreatedAt)
+            .order_by_desc(idx::Column::TxHash)
+            .limit(per_kind_limit);
+        if let Some(ref cond) = cursor_filter {
+            tfs_query = tfs_query.filter(cond.clone());
+        }
+        let tfs = tfs_query.all(db).await?;
 
         trace!("Found {} transfer records for wallet", tfs.len());
 
-        for mt in tfs {
-            let Some(ev) = idx::Entity::find_by_id(mt.event_id).one(db).await? else {
+        for (mt, ev) in tfs {
+            let Some(ev) = ev else {
                 continue;
             };
-
-            if let Some(ref cur) = cursor {
-                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                    continue;
-                }
-            }
 
             collected.push(InvolvementItem {
                 tx_hash: ev.tx_hash.clone(),

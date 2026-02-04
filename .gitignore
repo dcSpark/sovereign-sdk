@@ -73,6 +73,7 @@ examples/rollup-ligero/examples/rollup-ligero/output.log
 wallet_index.sqlite
 crates/utils/sov-indexer/fvk_config.json
 crates/mcp-external/logs/mcp-external.log
+prefunded_wallets*.jsonl
 
 crates/adapters/tee/attestation_verifier/cmake_install.cmake
 crates/adapters/tee/attestation_verifier/CMakeFiles

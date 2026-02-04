@@ -1,9 +1,9 @@
 use std::convert::Infallible;
 
-#[cfg(feature = "native")]
-use sov_attester_incentives::BondingProofServiceImpl;
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "native")]
+use sov_attester_incentives::BondingProofServiceImpl;
 use sov_bank::utils::TokenHolder;
 use sov_bank::{config_gas_token_id, Coins, IntoPayable, Payable};
 #[cfg(feature = "native")]
@@ -23,7 +23,7 @@ use sov_modules_api::{
 };
 use sov_rollup_interface::common::SlotNumber;
 use sov_rollup_interface::tee::{
-    SerializedTEEAttestation, TeeOracleSignedMAAAttestationV1, TEEAttestation,
+    SerializedTEEAttestation, TEEAttestation, TeeOracleSignedMAAAttestationV1,
     TEE_ORACLE_STATEMENT_DOMAIN_V1,
 };
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
@@ -362,9 +362,7 @@ impl<S: Spec, T> ProofProcessor<S> for StandardProvenRollupCapabilities<'_, S, T
         InvalidProofError,
     > {
         let att: TEEAttestation = borsh::from_slice(&proof.tee_raw_attestation).map_err(|e| {
-            InvalidProofError::PreconditionNotMet(format!(
-                "Invalid TEE attestation payload: {e}"
-            ))
+            InvalidProofError::PreconditionNotMet(format!("Invalid TEE attestation payload: {e}"))
         })?;
 
         let allowed_oracle_pubkeys = self
@@ -462,11 +460,12 @@ fn verify_oracle_signed_maa_attestation_v1(
         ));
     }
 
-    let signed: TeeOracleSignedMAAAttestationV1 = borsh::from_slice(&att.attestation).map_err(|e| {
-        InvalidProofError::PreconditionNotMet(format!(
-            "Invalid oracle-signed MAA attestation payload: {e}"
-        ))
-    })?;
+    let signed: TeeOracleSignedMAAAttestationV1 =
+        borsh::from_slice(&att.attestation).map_err(|e| {
+            InvalidProofError::PreconditionNotMet(format!(
+                "Invalid oracle-signed MAA attestation payload: {e}"
+            ))
+        })?;
 
     if signed.statement.domain != TEE_ORACLE_STATEMENT_DOMAIN_V1 {
         return Err(InvalidProofError::PreconditionNotMet(
@@ -517,7 +516,10 @@ fn verify_oracle_signed_maa_attestation_v1(
     })?;
 
     verifying_key
-        .verify_strict(&message, &Ed25519Signature::from_bytes(&signed.oracle_signature))
+        .verify_strict(
+            &message,
+            &Ed25519Signature::from_bytes(&signed.oracle_signature),
+        )
         .map_err(|e| {
             InvalidProofError::PreconditionNotMet(format!(
                 "Invalid oracle signature over TEE statement: {e}"
@@ -530,8 +532,8 @@ fn verify_oracle_signed_maa_attestation_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
     use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
 
     fn make_attestation(
         signing_key: &SigningKey,
@@ -582,7 +584,8 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let (mut att, allowed) = make_attestation(&signing_key, vec![1, 2, 3, 4]);
 
-        let mut signed: TeeOracleSignedMAAAttestationV1 = borsh::from_slice(&att.attestation).unwrap();
+        let mut signed: TeeOracleSignedMAAAttestationV1 =
+            borsh::from_slice(&att.attestation).unwrap();
         signed.oracle_signature[0] ^= 0x01;
         att.attestation = borsh::to_vec(&signed).unwrap();
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
+use crate::prefunded_wallets::PrefundedWalletStore;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::session_store::{SessionSnapshot, SessionStore};
@@ -813,6 +814,7 @@ pub struct CryptoServer {
     ligero_prover: Option<Arc<LigeroProver>>,
     viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
+    prefunded_wallets: Option<Arc<PrefundedWalletStore>>,
     log_path: String,
     auto_fund_deposit_amount: Option<u128>,
     auto_fund_gas_reserve: u128,
@@ -839,6 +841,7 @@ impl CryptoServer {
         ligero_prover: Arc<LigeroProver>,
         viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
         privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
+        prefunded_wallets: Option<Arc<PrefundedWalletStore>>,
         log_path: String,
         auto_fund_deposit_amount: Option<u128>,
         auto_fund_gas_reserve: u128,
@@ -854,6 +857,7 @@ impl CryptoServer {
             ligero_prover: Some(ligero_prover),
             viewer_fvk_bundle,
             privacy_key,
+            prefunded_wallets,
             log_path,
             auto_fund_deposit_amount,
             auto_fund_gas_reserve,
@@ -1554,6 +1558,175 @@ impl CryptoServer {
                 "A wallet is already loaded. Call removeWallet first before creating a new wallet.",
                 None,
             ));
+        }
+
+        // If prefunded wallets are configured, claim one from the indexer and load it into this
+        // session instead of generating/funding on-demand.
+        if let Some(prefunded) = self.prefunded_wallets.as_ref() {
+            // Ensure provider is configured.
+            let provider = self.provider.clone().ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "Provider not configured. Please set ROLLUP_RPC_URL and INDEXER_URL environment variables.",
+                    None,
+                )
+            })?;
+
+            let claimed = provider
+                .claim_prefunded_wallet(self.session_id.as_deref())
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to claim prefunded wallet from indexer: {e}"),
+                        None,
+                    )
+                })?;
+
+            let Some(claimed) = claimed else {
+                return Err(ErrorData::invalid_params(
+                    "No prefunded wallets available. Run the prefund script to generate more wallets.",
+                    None,
+                ));
+            };
+
+            let creds = prefunded.get(&claimed.wallet_address).ok_or_else(|| {
+                ErrorData::internal_error(
+                    format!(
+                        "Indexer returned prefunded wallet {} but it is missing from the configured PREFUNDED_WALLETS_FILE ({:?})",
+                        claimed.wallet_address,
+                        prefunded.source_path()
+                    ),
+                    None,
+                )
+            })?;
+
+            if creds.privacy_address != claimed.privacy_address {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Prefunded wallet privacy address mismatch for {}: indexer={}, file={}",
+                        claimed.wallet_address, claimed.privacy_address, creds.privacy_address
+                    ),
+                    None,
+                ));
+            }
+
+            let wallet_private_key_hex = creds.wallet_private_key_hex.clone();
+            let privacy_spend_key_hex = creds.privacy_spend_key_hex.clone();
+
+            let new_wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to create wallet context: {}", e),
+                        None,
+                    )
+                })?;
+            let wallet_address_str = new_wallet_ctx.get_address().to_string();
+            if wallet_address_str != claimed.wallet_address {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Prefunded wallet address mismatch: indexer={}, derived={}",
+                        claimed.wallet_address, wallet_address_str
+                    ),
+                    None,
+                ));
+            }
+
+            let new_privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex).map_err(|e| {
+                ErrorData::internal_error(format!("Failed to create privacy key: {}", e), None)
+            })?;
+            let privacy_address = new_privacy_key.privacy_address(&DOMAIN).to_string();
+            if privacy_address != claimed.privacy_address {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Prefunded wallet privacy address mismatch: indexer={}, derived={}",
+                        claimed.privacy_address, privacy_address
+                    ),
+                    None,
+                ));
+            }
+
+            let pool_fvk_pk = std::env::var("POOL_FVK_PK")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| parse_hex_32("POOL_FVK_PK", &s))
+                .transpose()
+                .map_err(|e| {
+                    ErrorData::invalid_params(format!("Invalid POOL_FVK_PK: {e}"), None)
+                })?;
+
+            let viewer_fvk_bundle = if let Some(pool_pk) = pool_fvk_pk {
+                let http = reqwest::Client::new();
+                Some(
+                    fetch_viewer_fvk_bundle(
+                        &http,
+                        Some(pool_pk),
+                        Some(&privacy_address),
+                        Some(&wallet_address_str),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!(
+                                "Failed to fetch viewer FVK bundle from midnight-fvk-service: {e}"
+                            ),
+                            None,
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+
+            // Replace the wallet context and privacy keys
+            let mut ctx_guard = self.wallet_context.write().await;
+            *ctx_guard = Some(new_wallet_ctx);
+
+            let mut viewer_fvk_guard = self.viewer_fvk_bundle.write().await;
+            *viewer_fvk_guard = viewer_fvk_bundle.clone();
+
+            let mut privacy_key_guard = self.privacy_key.write().await;
+            *privacy_key_guard = Some(new_privacy_key);
+
+            // Mark the wallet as explicitly loaded
+            let mut loaded_guard = self.wallet_explicitly_loaded.write().await;
+            *loaded_guard = true;
+            {
+                // Reset any cached pending spends from a previous wallet within this session.
+                let mut pending = self.pending_spent_notes.lock().await;
+                pending.by_rho.clear();
+            }
+            {
+                let mut local = self.local_notes.lock().await;
+                local.by_rho.clear();
+            }
+            self.persist_session_snapshot(SessionSnapshot::from_keys(
+                wallet_private_key_hex.clone(),
+                privacy_spend_key_hex.clone(),
+                viewer_fvk_bundle.clone(),
+            ))
+            .await;
+
+            tracing::info!("[createWallet] Prefunded wallet claimed successfully");
+            tracing::info!("[createWallet] Wallet address: {}", wallet_address_str);
+            tracing::info!("[createWallet] Privacy address: {}", privacy_address);
+
+            let result = CreateWalletResult {
+                wallet_private_key: wallet_private_key_hex,
+                wallet_address: wallet_address_str,
+                viewer_fvk: viewer_fvk_bundle.as_ref().map(|b| hex::encode(b.fvk)),
+                viewer_fvk_commitment: viewer_fvk_bundle
+                    .as_ref()
+                    .map(|b| hex::encode(b.fvk_commitment)),
+                viewer_fvk_pool_sig_hex: viewer_fvk_bundle.as_ref().map(|b| b.pool_sig_hex.clone()),
+                viewer_fvk_signer_public_key: viewer_fvk_bundle
+                    .as_ref()
+                    .map(|b| hex::encode(b.signer_public_key)),
+                privacy_spend_key: privacy_spend_key_hex,
+                privacy_address,
+            };
+
+            let json = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
         }
 
         // Generate all random bytes first (before any async operations)

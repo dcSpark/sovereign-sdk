@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde::de::Error as _;
+use serde::Deserialize;
 use std::path::PathBuf;
 use validator::Validate;
 
@@ -105,13 +105,19 @@ mod tests {
 
     fn minimal_env(dev_accept_all: &str) -> Vec<(String, String)> {
         vec![
-            ("ORACLE_SERVER_BIND_ADDRESS".to_owned(), "127.0.0.1:0".to_owned()),
+            (
+                "ORACLE_SERVER_BIND_ADDRESS".to_owned(),
+                "127.0.0.1:0".to_owned(),
+            ),
             ("ORACLE_POLICIES_DIR".to_owned(), "./policies".to_owned()),
             (
                 "ORACLE_SIGNING_KEY_HEX".to_owned(),
                 "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             ),
-            ("ORACLE_DEV_ACCEPT_ALL".to_owned(), dev_accept_all.to_owned()),
+            (
+                "ORACLE_DEV_ACCEPT_ALL".to_owned(),
+                dev_accept_all.to_owned(),
+            ),
         ]
     }
 

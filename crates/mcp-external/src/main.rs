@@ -25,6 +25,7 @@ mod config;
 mod fvk_service;
 mod ligero;
 mod operations;
+mod prefunded_wallets;
 mod privacy_key;
 mod provider;
 mod server;
@@ -37,15 +38,15 @@ mod test_utils;
 
 use std::cell::RefCell;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
 use crate::fvk_service::ViewerFvkBundle;
 use crate::ligero::Ligero;
-use crate::provider::Provider;
 use crate::privacy_key::PrivacyKey;
+use crate::provider::Provider;
 use crate::server::{CryptoServer, McpWalletContext};
 use crate::session_store::{SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
@@ -113,14 +114,24 @@ impl SessionManager for PersistentSessionManager {
         &self,
         id: &SessionId,
         message: rmcp::model::ClientJsonRpcMessage,
-    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+    ) -> Result<
+        impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage>
+            + Send
+            + 'static,
+        Self::Error,
+    > {
         self.inner.create_stream(id, message).await
     }
 
     async fn create_standalone_stream(
         &self,
         id: &SessionId,
-    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+    ) -> Result<
+        impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage>
+            + Send
+            + 'static,
+        Self::Error,
+    > {
         self.inner.create_standalone_stream(id).await
     }
 
@@ -128,7 +139,12 @@ impl SessionManager for PersistentSessionManager {
         &self,
         id: &SessionId,
         last_event_id: String,
-    ) -> Result<impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage> + Send + 'static, Self::Error> {
+    ) -> Result<
+        impl futures::Stream<Item = rmcp::transport::common::server_side_http::ServerSseMessage>
+            + Send
+            + 'static,
+        Self::Error,
+    > {
         self.inner.resume(id, last_event_id).await
     }
 
@@ -195,7 +211,10 @@ impl McpSessions {
         }
     }
 
-    async fn bootstrap_session(&self, requested_session_id: String) -> Result<String, axum::response::Response> {
+    async fn bootstrap_session(
+        &self,
+        requested_session_id: String,
+    ) -> Result<String, axum::response::Response> {
         let (restore_tx, restore_rx) = if self.session_store.is_some() {
             let (tx, rx) = oneshot::channel();
             (Some(tx), Some(rx))
@@ -335,7 +354,8 @@ impl McpSessions {
                         Ok(id) => id,
                         Err(response) => return response,
                     };
-                    self.send_initialized_notification(&bootstrapped_session_id).await;
+                    self.send_initialized_notification(&bootstrapped_session_id)
+                        .await;
                 } else {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -420,12 +440,16 @@ async fn restore_session_state(
     ) {
         match McpWalletContext::from_private_key_hex(wallet_hex) {
             Ok(ctx) => restored_wallet_ctx = Some(ctx),
-            Err(err) => tracing::warn!("Failed to restore wallet context for session {session_id}: {err}"),
+            Err(err) => {
+                tracing::warn!("Failed to restore wallet context for session {session_id}: {err}")
+            }
         }
 
         match PrivacyKey::from_hex(privacy_hex) {
             Ok(key) => restored_privacy_key = Some(key),
-            Err(err) => tracing::warn!("Failed to restore privacy key for session {session_id}: {err}"),
+            Err(err) => {
+                tracing::warn!("Failed to restore privacy key for session {session_id}: {err}")
+            }
         }
     }
 
@@ -433,7 +457,9 @@ async fn restore_session_state(
         Some(bundle) => match bundle.try_into_bundle() {
             Ok(bundle) => Some(bundle),
             Err(err) => {
-                tracing::warn!("Failed to restore viewer FVK bundle for session {session_id}: {err}");
+                tracing::warn!(
+                    "Failed to restore viewer FVK bundle for session {session_id}: {err}"
+                );
                 None
             }
         },
@@ -514,6 +540,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
 
+    let prefunded_wallets = if let Some(path) = cfg
+        .prefunded_wallets_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let store = crate::prefunded_wallets::PrefundedWalletStore::load_jsonl(path)?;
+        tracing::info!(
+            "[mcp] Loaded {} prefunded wallets from {:?}",
+            store.len(),
+            store.source_path()
+        );
+        if store.is_empty() {
+            tracing::warn!(
+                "[mcp] PREFUNDED_WALLETS_FILE is set but the file is empty; createWallet will fail when prefunded mode is enabled"
+            );
+        } else {
+            match provider.import_prefunded_wallets(store.import_items()).await {
+                Ok(summary) => tracing::info!(
+                    "[mcp] Prefunded wallets imported to indexer: processed={}, inserted={}, ignored={}",
+                    summary.processed,
+                    summary.inserted,
+                    summary.ignored
+                ),
+                Err(e) => tracing::warn!(
+                    "[mcp] Failed to import prefunded wallets to indexer (createWallet may fail): {}",
+                    e
+                ),
+            }
+        }
+        Some(Arc::new(store))
+    } else {
+        None
+    };
+
     // Keep the commitment tree cache warm in the background so transfers across many wallets
     // don't all pay the sync cost on-demand.
     crate::commitment_tree::start_background_tree_sync(provider.clone());
@@ -583,8 +644,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[mcp] MCP_SESSION_DB_ENCRYPTION_KEY not set; session data will be stored unencrypted"
             );
         }
-        let store = SessionStore::connect(db_url, cfg.mcp_session_db_encryption_key.as_deref())
-            .await?;
+        let store =
+            SessionStore::connect(db_url, cfg.mcp_session_db_encryption_key.as_deref()).await?;
         tracing::info!("[mcp] MCP session persistence enabled");
         Some(Arc::new(store))
     } else {
@@ -601,6 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_for_service = provider.clone();
     let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
     let ligero_for_service = ligero.clone();
+    let prefunded_wallets_for_service = prefunded_wallets.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
     let auto_fund_gas_reserve_for_service = auto_fund_gas_reserve;
@@ -632,7 +694,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .flatten();
 
-            if let (Some(store), Some(id)) = (session_store_for_service.clone(), session_id.clone()) {
+            if let (Some(store), Some(id)) = (session_store_for_service.clone(), session_id.clone())
+            {
                 let wallet_ctx_restore = wallet_ctx.clone();
                 let privacy_key_restore = privacy_key.clone();
                 let viewer_fvk_restore = viewer_fvk_bundle.clone();
@@ -665,6 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ligero_for_service.clone(),
                 viewer_fvk_bundle,
                 privacy_key,
+                prefunded_wallets_for_service.clone(),
                 log_path_string.clone(),
                 auto_fund_deposit_amount_for_service,
                 auto_fund_gas_reserve_for_service,

@@ -50,6 +50,11 @@ pub mod midnight_deposit {
         )]
         Events,
     }
+    impl Related<super::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Events.def()
+        }
+    }
     impl ActiveModelBehavior for ActiveModel {}
 }
 
@@ -83,6 +88,11 @@ pub mod midnight_withdraw {
             to = "super::Column::Id"
         )]
         Events,
+    }
+    impl Related<super::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Events.def()
+        }
     }
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -136,6 +146,11 @@ pub mod midnight_transfer {
             to = "super::Column::Id"
         )]
         Events,
+    }
+    impl Related<super::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Events.def()
+        }
     }
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -204,6 +219,44 @@ pub mod fvk_registry {
         #[sea_orm(column_type = "TimestampWithTimeZone")]
         pub created_at: chrono::DateTime<chrono::Utc>,
     }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Tracks prefunded wallets that can be claimed by external services (e.g. MCP).
+///
+/// This table intentionally stores only non-secret metadata (addresses + claim state).
+pub mod prefunded_wallets {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "prefunded_wallets")]
+    pub struct Model {
+        /// Public wallet address (sov1...) - primary key for lookups
+        #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+        pub wallet_address: String,
+
+        /// Privacy address (bech32m privpool1...) associated with this wallet
+        #[sea_orm(column_type = "Text")]
+        pub privacy_address: String,
+
+        /// Whether this wallet has been claimed/assigned
+        pub used: bool,
+
+        /// When this entry was added
+        #[sea_orm(column_type = "TimestampWithTimeZone")]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+
+        /// When this wallet was claimed (if used)
+        #[sea_orm(column_type = "TimestampWithTimeZone", nullable)]
+        pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+
+        /// Optional identifier for who claimed this wallet (e.g. MCP session id)
+        #[sea_orm(column_type = "Text", nullable)]
+        pub claimed_by: Option<String>,
+    }
+
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
     impl ActiveModelBehavior for ActiveModel {}

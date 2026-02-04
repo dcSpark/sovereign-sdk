@@ -1,10 +1,10 @@
 pub mod config;
 use anyhow::Result;
 use axum::{
+    extract::Json,
     extract::Path,
     extract::Query,
     extract::State,
-    extract::Json,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -128,7 +128,10 @@ fn validate_attestation_jwt(
     Err((StatusCode::FORBIDDEN, "attestation rejected by policy"))
 }
 
-async fn validate_batch(State(state): State<AppState>, Json(payload): Json<TEEPayload>) -> impl IntoResponse {
+async fn validate_batch(
+    State(state): State<AppState>,
+    Json(payload): Json<TEEPayload>,
+) -> impl IntoResponse {
     info!(payload_len = payload.data.len(), "POST /validate");
 
     let bytes = match decode_b64_payload(&payload) {
@@ -212,30 +215,46 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
     );
 
     if req.statement.domain != sov_modules_api::TEE_ORACLE_STATEMENT_DOMAIN_V1 {
-        warn!(batch_index = batch_index, "POST /attest - invalid statement domain");
+        warn!(
+            batch_index = batch_index,
+            "POST /attest - invalid statement domain"
+        );
         return (StatusCode::BAD_REQUEST, "invalid statement domain").into_response();
     }
 
     let jwt_hash: [u8; 32] = Sha256::digest(req.attestation_jwt.as_bytes()).into();
     if req.statement.attestation_jwt_sha256 != jwt_hash {
-        warn!(batch_index = batch_index, "POST /attest - JWT hash mismatch");
+        warn!(
+            batch_index = batch_index,
+            "POST /attest - JWT hash mismatch"
+        );
         return (StatusCode::BAD_REQUEST, "statement JWT hash mismatch").into_response();
     }
 
     if req.statement.attestation_type != sov_modules_api::TEEAttestationType::MAA {
-        warn!(batch_index = batch_index, "POST /attest - unsupported attestation type");
+        warn!(
+            batch_index = batch_index,
+            "POST /attest - unsupported attestation type"
+        );
         return (StatusCode::BAD_REQUEST, "unsupported attestation type").into_response();
     }
 
     if let Err(e) = validate_attestation_jwt(&req.attestation_jwt, state.dev_accept_all) {
-        warn!(batch_index = batch_index, "POST /attest - attestation validation failed");
+        warn!(
+            batch_index = batch_index,
+            "POST /attest - attestation validation failed"
+        );
         return e.into_response();
     }
 
     let message = match borsh::to_vec(&req.statement) {
         Ok(m) => m,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode statement").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode statement",
+            )
+                .into_response()
         }
     };
 
@@ -304,16 +323,21 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
         };
 
         if let Err(e) = sqlx::query(query)
-        .bind(batch_idx)
-        .bind(da_start)
-        .bind(da_end)
-        .bind(&json_str)
-        .execute(pool.as_ref())
-        .await
+            .bind(batch_idx)
+            .bind(da_start)
+            .bind(da_end)
+            .bind(&json_str)
+            .execute(pool.as_ref())
+            .await
         {
             error!(error = ?e, "Failed to store TEE attestation in database");
         } else {
-            info!(batch_index = batch_idx, da_start_height = da_start, da_end_height = da_end, "TEE attestation stored in database");
+            info!(
+                batch_index = batch_idx,
+                da_start_height = da_start,
+                da_end_height = da_end,
+                "TEE attestation stored in database"
+            );
         }
     }
 
@@ -321,7 +345,11 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
         Ok(b) => b,
         Err(_) => {
             error!("POST /attest - failed to encode response");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode response").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode response",
+            )
+                .into_response();
         }
     };
 
@@ -351,7 +379,7 @@ async fn pubkey(State(state): State<AppState>) -> impl IntoResponse {
 async fn list_policies() -> impl IntoResponse {
     info!("GET /policies");
     let policies = read_policies();
-    
+
     let policy_list: Vec<serde_json::Value> = policies
         .iter()
         .filter_map(|(id, policy_str)| {
@@ -363,14 +391,17 @@ async fn list_policies() -> impl IntoResponse {
         })
         .collect();
 
-    info!(count = policy_list.len(), "GET /policies - returning policies");
+    info!(
+        count = policy_list.len(),
+        "GET /policies - returning policies"
+    );
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "policies": policy_list,
             "count": policy_list.len(),
-        }))
+        })),
     )
 }
 
@@ -400,8 +431,9 @@ async fn list_attestations(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "Database not configured"
-            }))
-        ).into_response();
+            })),
+        )
+            .into_response();
     };
 
     let query = if state.db_type == Some(DbType::Postgres) {
@@ -421,10 +453,10 @@ async fn list_attestations(
     };
 
     let rows = match sqlx::query(query)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool.as_ref())
-    .await
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool.as_ref())
+        .await
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -433,8 +465,9 @@ async fn list_attestations(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": "Database query failed"
-                }))
-            ).into_response();
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -457,7 +490,12 @@ async fn list_attestations(
         })
         .collect();
 
-    info!(count = attestations.len(), limit = limit, offset = offset, "GET /attestations - returning results");
+    info!(
+        count = attestations.len(),
+        limit = limit,
+        offset = offset,
+        "GET /attestations - returning results"
+    );
 
     (
         StatusCode::OK,
@@ -466,8 +504,9 @@ async fn list_attestations(
             "count": attestations.len(),
             "limit": limit,
             "offset": offset,
-        }))
-    ).into_response()
+        })),
+    )
+        .into_response()
 }
 
 /// GET /attestations/slot/:slot_id - Get attestation for a specific DA slot height
@@ -478,13 +517,17 @@ async fn get_attestation_by_slot(
     info!(slot_id = slot_id, "GET /attestations/slot/{}", slot_id);
 
     let Some(pool) = &state.db_pool else {
-        warn!(slot_id = slot_id, "GET /attestations/slot - database not configured");
+        warn!(
+            slot_id = slot_id,
+            "GET /attestations/slot - database not configured"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "Database not configured"
-            }))
-        ).into_response();
+            })),
+        )
+            .into_response();
     };
 
     let query = if state.db_type == Some(DbType::Postgres) {
@@ -504,10 +547,10 @@ async fn get_attestation_by_slot(
     };
 
     let row = match sqlx::query(query)
-    .bind(slot_id)
-    .bind(slot_id)
-    .fetch_optional(pool.as_ref())
-    .await
+        .bind(slot_id)
+        .bind(slot_id)
+        .fetch_optional(pool.as_ref())
+        .await
     {
         Ok(row) => row,
         Err(e) => {
@@ -516,8 +559,9 @@ async fn get_attestation_by_slot(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": "Database query failed"
-                }))
-            ).into_response();
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -528,8 +572,8 @@ async fn get_attestation_by_slot(
             let da_end_height: i64 = row.try_get("da_end_height").unwrap_or(0);
             let attestation_json: String = row.try_get("attestation_json").unwrap_or_default();
             let created_at: String = row.try_get("created_at").unwrap_or_default();
-            let attestation: serde_json::Value = serde_json::from_str(&attestation_json)
-                .unwrap_or(serde_json::Value::Null);
+            let attestation: serde_json::Value =
+                serde_json::from_str(&attestation_json).unwrap_or(serde_json::Value::Null);
 
             info!(
                 slot_id = slot_id,
@@ -549,8 +593,9 @@ async fn get_attestation_by_slot(
                     "da_end_height": da_end_height,
                     "created_at": created_at,
                     "attestation": attestation,
-                }))
-            ).into_response()
+                })),
+            )
+                .into_response()
         }
         None => {
             info!(slot_id = slot_id, "GET /attestations/slot - not found");
@@ -560,8 +605,9 @@ async fn get_attestation_by_slot(
                     "found": false,
                     "slot_id": slot_id,
                     "message": format!("No attestation found for DA height {}", slot_id),
-                }))
-            ).into_response()
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -612,7 +658,7 @@ async fn setup_database(connection_string: &str) -> Result<(AnyPool, DbType)> {
             attestation_json TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        "#
+        "#,
     )
     .execute(&pool)
     .await?;
@@ -622,12 +668,15 @@ async fn setup_database(connection_string: &str) -> Result<(AnyPool, DbType)> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_tee_attestations_da_height 
         ON tee_attestations (da_start_height, da_end_height)
-        "#
+        "#,
     )
     .execute(&pool)
     .await?;
 
-    info!("TEE attestations database initialized (type: {:?})", db_type);
+    info!(
+        "TEE attestations database initialized (type: {:?})",
+        db_type
+    );
     Ok((pool, db_type))
 }
 
@@ -692,10 +741,22 @@ async fn main() -> Result<()> {
         "Attest endpoint: http://{}/attest",
         &cfg.oracle_server_bind_address
     );
-    tracing::info!("Pubkey endpoint: http://{}/pubkey", &cfg.oracle_server_bind_address);
-    tracing::info!("Policies endpoint: http://{}/policies", &cfg.oracle_server_bind_address);
-    tracing::info!("Attestations endpoint: http://{}/attestations", &cfg.oracle_server_bind_address);
-    tracing::info!("Attestation by slot endpoint: http://{}/attestations/slot/{{slot_id}}", &cfg.oracle_server_bind_address);
+    tracing::info!(
+        "Pubkey endpoint: http://{}/pubkey",
+        &cfg.oracle_server_bind_address
+    );
+    tracing::info!(
+        "Policies endpoint: http://{}/policies",
+        &cfg.oracle_server_bind_address
+    );
+    tracing::info!(
+        "Attestations endpoint: http://{}/attestations",
+        &cfg.oracle_server_bind_address
+    );
+    tracing::info!(
+        "Attestation by slot endpoint: http://{}/attestations/slot/{{slot_id}}",
+        &cfg.oracle_server_bind_address
+    );
 
     let _ = axum::serve(tcp_listener, app)
         .with_graceful_shutdown(async {

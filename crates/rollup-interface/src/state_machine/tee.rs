@@ -6,8 +6,7 @@ use tee::common::BatchPublicDataV1;
 /// 32-byte domain separator for oracle-signed TEE attestation statements (v1).
 ///
 /// This value is included in the signed message to prevent cross-protocol signature reuse.
-pub const TEE_ORACLE_STATEMENT_DOMAIN_V1: [u8; 32] =
-    *b"SOV_TEE_ORACLE_STATEMENT_V1\0\0\0\0\0";
+pub const TEE_ORACLE_STATEMENT_DOMAIN_V1: [u8; 32] = *b"SOV_TEE_ORACLE_STATEMENT_V1\0\0\0\0\0";
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize, Default, PartialEq, Eq)]
 /// Represents a TEE attestation along with its batch data.

@@ -113,6 +113,9 @@ pub fn router(state: AppState) -> Router {
         // FVK registry management endpoints
         .route("/fvks", get(list_fvks).post(add_fvk))
         .route("/fvks/:fvk_commitment", delete(delete_fvk))
+        // Prefunded wallets management (used by MCP to claim pre-funded wallets)
+        .route("/prefunded-wallets/import", post(import_prefunded_wallets))
+        .route("/prefunded-wallets/claim", post(claim_prefunded_wallet))
         // Frozen accounts management endpoints
         .route("/frozen", get(list_frozen).post(record_freeze))
         .route("/frozen/:privacy_address", get(get_frozen_status))
@@ -723,6 +726,388 @@ async fn delete_fvk(
 }
 
 // ============================================================================
+// Prefunded Wallets Endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PrefundedWalletImportItem {
+    /// Public wallet address (sov1...)
+    pub wallet_address: String,
+    /// Privacy address (bech32m privpool1...)
+    pub privacy_address: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportPrefundedWalletsRequest {
+    pub wallets: Vec<PrefundedWalletImportItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportPrefundedWalletsResponse {
+    pub processed: usize,
+    pub inserted: usize,
+    pub ignored: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ClaimPrefundedWalletRequest {
+    /// Optional identifier for who is claiming this wallet (e.g. MCP session id)
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClaimPrefundedWalletResponse {
+    pub wallet_address: String,
+    pub privacy_address: String,
+}
+
+/// Import prefunded wallets into the index DB.
+///
+/// This endpoint is idempotent: existing rows are not overwritten (especially `used`).
+#[utoipa::path(
+    post,
+    path = "/prefunded-wallets/import",
+    request_body = ImportPrefundedWalletsRequest,
+    responses(
+        (status = 200, description = "Import summary", body = ImportPrefundedWalletsResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "prefunded"
+)]
+async fn import_prefunded_wallets(
+    State(state): State<AppState>,
+    Json(req): Json<ImportPrefundedWalletsRequest>,
+) -> impl IntoResponse {
+    use crate::index_db as idx;
+    use sea_orm::{ActiveValue, ConnectionTrait, DatabaseBackend, EntityTrait};
+    use std::collections::HashSet;
+
+    const MAX_IMPORT_ITEMS: usize = 50_000;
+    if req.wallets.len() > MAX_IMPORT_ITEMS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Too many items: max {MAX_IMPORT_ITEMS}")
+            })),
+        )
+            .into_response();
+    }
+
+    let wallets = req.wallets;
+    let mut unique = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    for item in wallets {
+        let wallet_address = item.wallet_address.trim().to_string();
+        let privacy_address = item.privacy_address.trim().to_string();
+        if wallet_address.is_empty() || privacy_address.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "wallet_address and privacy_address are required"}),
+                ),
+            )
+                .into_response();
+        }
+        if seen.insert(wallet_address.clone()) {
+            unique.push((wallet_address, privacy_address));
+        }
+    }
+
+    if unique.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(ImportPrefundedWalletsResponse {
+                processed: 0,
+                inserted: 0,
+                ignored: 0,
+            }),
+        )
+            .into_response();
+    }
+
+    let processed = unique.len();
+
+    // Chunk inserts to avoid DB bind parameter limits:
+    // - SQLite commonly defaults to 999 variables
+    // - Postgres has a much higher limit, but very large batches can still hit it
+    let backend = state.db.get_database_backend();
+    let params_per_row = 4usize; // wallet_address, privacy_address, used, created_at
+    let max_params = match backend {
+        DatabaseBackend::Sqlite => 900usize,      // keep below 999
+        DatabaseBackend::Postgres => 60_000usize, // keep below 65535
+        DatabaseBackend::MySql => 60_000usize,
+    };
+    let mut batch_size = max_params / params_per_row;
+    batch_size = batch_size.max(1).min(10_000);
+
+    let mut inserted_total: usize = 0;
+    for chunk in unique.chunks(batch_size) {
+        let now = chrono::Utc::now();
+        let models = chunk
+            .iter()
+            .cloned()
+            .map(|(wallet_address, privacy_address)| {
+                idx::prefunded_wallets::ActiveModel {
+                    wallet_address: sea_orm::Set(wallet_address),
+                    privacy_address: sea_orm::Set(privacy_address),
+                    used: sea_orm::Set(false),
+                    created_at: sea_orm::Set(now),
+                    // Omit claimed fields so they default to NULL without consuming bind params.
+                    claimed_at: ActiveValue::NotSet,
+                    claimed_by: ActiveValue::NotSet,
+                }
+            });
+
+        let res = idx::prefunded_wallets::Entity::insert_many(models)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(
+                    idx::prefunded_wallets::Column::WalletAddress,
+                )
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(&state.db)
+            .await;
+
+        match res {
+            Ok(rows) => inserted_total = inserted_total.saturating_add(rows as usize),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to import prefunded wallets: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let inserted = inserted_total;
+    let ignored = processed.saturating_sub(inserted);
+
+    (
+        StatusCode::OK,
+        Json(ImportPrefundedWalletsResponse {
+            processed,
+            inserted,
+            ignored,
+        }),
+    )
+        .into_response()
+}
+
+/// Claim one available prefunded wallet (marks it as used).
+#[utoipa::path(
+    post,
+    path = "/prefunded-wallets/claim",
+    request_body = ClaimPrefundedWalletRequest,
+    responses(
+        (status = 200, description = "Claimed wallet", body = ClaimPrefundedWalletResponse),
+        (status = 404, description = "No wallet available", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    tag = "prefunded"
+)]
+async fn claim_prefunded_wallet(
+    State(state): State<AppState>,
+    Json(req): Json<ClaimPrefundedWalletRequest>,
+) -> impl IntoResponse {
+    use crate::index_db as idx;
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder,
+        Statement, TransactionTrait,
+    };
+
+    let claimed_by = req
+        .claimed_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let now = chrono::Utc::now();
+    let backend = state.db.get_database_backend();
+
+    // Postgres: single-statement claim using SKIP LOCKED to avoid lock waits under contention.
+    if backend == DatabaseBackend::Postgres {
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+WITH candidate AS (
+    SELECT wallet_address
+    FROM prefunded_wallets
+    WHERE used = false
+    ORDER BY created_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE prefunded_wallets p
+SET used = true,
+    claimed_at = $1,
+    claimed_by = $2
+FROM candidate
+WHERE p.wallet_address = candidate.wallet_address
+RETURNING p.wallet_address, p.privacy_address
+            "#,
+            [now.into(), claimed_by.clone().into()],
+        );
+
+        let row = match state.db.query_one(stmt).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to claim wallet: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+
+        let Some(row) = row else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "No prefunded wallets available"})),
+            )
+                .into_response();
+        };
+
+        let wallet_address: String = match row.try_get_by("wallet_address") {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to decode claimed wallet: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let privacy_address: String = match row.try_get_by("privacy_address") {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to decode claimed wallet: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+
+        return (
+            StatusCode::OK,
+            Json(ClaimPrefundedWalletResponse {
+                wallet_address,
+                privacy_address,
+            }),
+        )
+            .into_response();
+    }
+
+    // Other backends (SQLite dev): best-effort claim with short transactions and retries.
+    for attempt in 0..10 {
+        let txn = match state.db.begin().await {
+            Ok(txn) => txn,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to start transaction: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+
+        let candidate = match idx::prefunded_wallets::Entity::find()
+            .filter(idx::prefunded_wallets::Column::Used.eq(false))
+            .order_by_asc(idx::prefunded_wallets::Column::CreatedAt)
+            .one(&txn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to query available wallets: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+
+        let Some(candidate) = candidate else {
+            let _ = txn.rollback().await;
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "No prefunded wallets available"})),
+            )
+                .into_response();
+        };
+
+        let wallet_address = candidate.wallet_address.clone();
+        let privacy_address = candidate.privacy_address.clone();
+
+        let update = idx::prefunded_wallets::Entity::update_many()
+            .filter(idx::prefunded_wallets::Column::WalletAddress.eq(&wallet_address))
+            .filter(idx::prefunded_wallets::Column::Used.eq(false))
+            .col_expr(idx::prefunded_wallets::Column::Used, Expr::value(true))
+            .col_expr(idx::prefunded_wallets::Column::ClaimedAt, Expr::value(now))
+            .col_expr(
+                idx::prefunded_wallets::Column::ClaimedBy,
+                Expr::value(claimed_by.clone()),
+            )
+            .exec(&txn)
+            .await;
+
+        match update {
+            Ok(res) if res.rows_affected == 1 => {
+                if let Err(e) = txn.commit().await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to commit claim: {e}")})),
+                    )
+                        .into_response();
+                }
+
+                return (
+                    StatusCode::OK,
+                    Json(ClaimPrefundedWalletResponse {
+                        wallet_address,
+                        privacy_address,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(_) => {
+                // Lost the race: another concurrent claim updated the row first. Retry.
+                let _ = txn.rollback().await;
+                continue;
+            }
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                let retryable = backend == DatabaseBackend::Sqlite
+                    && (msg.contains("database is locked") || msg.contains("sqlite_busy"));
+                let _ = txn.rollback().await;
+                if retryable && attempt < 9 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    continue;
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to claim wallet: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "Failed to claim prefunded wallet after retries"})),
+    )
+        .into_response()
+}
+
+// ============================================================================
 // Frozen Accounts Endpoints
 // ============================================================================
 
@@ -1029,6 +1414,8 @@ async fn get_freeze_history(
         list_fvks,
         add_fvk,
         delete_fvk,
+        import_prefunded_wallets,
+        claim_prefunded_wallet,
         list_frozen,
         record_freeze,
         get_frozen_status,
@@ -1050,6 +1437,11 @@ async fn get_freeze_history(
         SuccessResponse,
         ErrorResponse,
         HealthResponse,
+        PrefundedWalletImportItem,
+        ImportPrefundedWalletsRequest,
+        ImportPrefundedWalletsResponse,
+        ClaimPrefundedWalletRequest,
+        ClaimPrefundedWalletResponse,
         RecordFreezeRequest,
         RecordFreezeResponse,
         FrozenListResponse,
@@ -1061,6 +1453,7 @@ async fn get_freeze_history(
         (name = "wallets", description = "Wallet-related endpoints"),
         (name = "transactions", description = "Transaction endpoints with privacy modes"),
         (name = "fvks", description = "FVK registry management"),
+        (name = "prefunded", description = "Prefunded wallet assignment"),
         (name = "frozen", description = "Frozen accounts management"),
         (name = "health", description = "Service health checks")
     )

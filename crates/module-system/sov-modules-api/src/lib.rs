@@ -118,8 +118,8 @@ pub use sov_rollup_interface::stf::{
     StoredEvent,
 };
 pub use sov_rollup_interface::tee::{
-    OracleAttestRequestV1, OracleAttestResponseV1, SerializedTEEAttestation,
-    TeeOracleSignedMAAAttestationV1, TeeOracleStatementV1, TEEAttestation, TEEAttestationType,
+    OracleAttestRequestV1, OracleAttestResponseV1, SerializedTEEAttestation, TEEAttestation,
+    TEEAttestationType, TeeOracleSignedMAAAttestationV1, TeeOracleStatementV1,
     TEE_ORACLE_STATEMENT_DOMAIN_V1,
 };
 pub use sov_rollup_interface::zk::aggregated_proof::{
