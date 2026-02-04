@@ -11,11 +11,15 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+futures = { workspace = true, features = ["std"] }
 rmcp = { version = "0.10", features = ["client", "transport-streamable-http-client-reqwest"] }
+reqwest.workspace = true
 serde_json.workspace = true
+sse-stream = "0.2.1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4", "std"] }
 
 [lints]
 workspace = true

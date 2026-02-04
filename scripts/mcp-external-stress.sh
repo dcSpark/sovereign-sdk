@@ -12,6 +12,9 @@ Required:
 
 Options:
   --endpoint <URL>     MCP endpoint (default: https://midnight-l2-testnet.shinkai.com/mcp/mcp)
+  --session-ids-file <PATH>
+                      File with stable MCP session IDs to reuse across runs
+                      (default: <repo>/.mcp-external-stress-session-ids.txt)
   --send-amount <N>    Amount (dust) per tx (default: 1)
   --confirm            Poll confirmation (adds extra load)
   --rust-log <SPEC>    Override RUST_LOG (default: mcp_external_stress=info,rmcp=warn)
@@ -19,6 +22,7 @@ Options:
 
 Environment variables (optional, flags override):
   MCP_ENDPOINT
+  MCP_STRESS_SESSION_IDS_FILE
   SEND_AMOUNT
   CONFIRM
   MCP_STRESS_RUST_LOG
@@ -27,6 +31,7 @@ EOF
 
 WALLETS=""
 TXS_PER_WALLET=""
+SESSION_IDS_FILE=""
 
 MCP_ENDPOINT="${MCP_ENDPOINT:-https://midnight-l2-testnet.shinkai.com/mcp/mcp}"
 SEND_AMOUNT="${SEND_AMOUNT:-1}"
@@ -51,6 +56,10 @@ else
         ;;
       --endpoint|--mcp-endpoint)
         MCP_ENDPOINT="${2:-}"
+        shift 2
+        ;;
+      --session-ids-file)
+        SESSION_IDS_FILE="${2:-}"
         shift 2
         ;;
       --send-amount)
@@ -99,12 +108,15 @@ export RUST_LOG
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+SESSION_IDS_FILE="${SESSION_IDS_FILE:-${MCP_STRESS_SESSION_IDS_FILE:-$REPO_ROOT/.mcp-external-stress-session-ids.txt}}"
+
 set -- \
   --mcp-endpoint "$MCP_ENDPOINT" \
   --wallets "$WALLETS" \
   --max-txs "$TXS_PER_WALLET" \
   --send-amount "$SEND_AMOUNT" \
   --duration-secs 0 \
+  --session-ids-file "$SESSION_IDS_FILE" \
   "$@"
 
 case "$CONFIRM" in

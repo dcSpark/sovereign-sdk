@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rmcp::model::{CallToolRequestParam, ErrorCode, JsonObject, RawContent};
 use rmcp::service::ServiceExt as _;
+use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use rmcp::transport::StreamableHttpClientTransport;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "mcp-external-stress")]
@@ -71,6 +74,17 @@ struct Args {
     /// Print the periodic progress line even if nothing changed since the previous print.
     #[arg(long, env = "MCP_STRESS_REPORT_UNCHANGED", default_value_t = false)]
     report_unchanged: bool,
+
+    /// Optional file storing stable MCP session IDs (one per line) to reuse across runs.
+    ///
+    /// If this is set and `--wallets N` exceeds the number of IDs in the file, new UUIDv4 values
+    /// are generated and appended.
+    #[arg(
+        long,
+        env = "MCP_STRESS_SESSION_IDS_FILE",
+        default_value = ".mcp-external-stress-session-ids.txt"
+    )]
+    session_ids_file: PathBuf,
 }
 
 struct Counters {
@@ -101,6 +115,79 @@ impl Counters {
     }
 }
 
+#[derive(Clone)]
+struct PinnedSessionHttpClient {
+    inner: reqwest::Client,
+    pinned_session_id: Arc<str>,
+}
+
+impl PinnedSessionHttpClient {
+    fn new(inner: reqwest::Client, pinned_session_id: Arc<str>) -> Self {
+        Self {
+            inner,
+            pinned_session_id,
+        }
+    }
+}
+
+impl StreamableHttpClient for PinnedSessionHttpClient {
+    type Error = reqwest::Error;
+
+    fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        let session_id = session_id.or_else(|| Some(self.pinned_session_id.clone()));
+        StreamableHttpClient::post_message(&self.inner, uri, message, session_id, auth_header)
+    }
+
+    fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            (),
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        StreamableHttpClient::delete_session(&self.inner, uri, session_id, auth_header)
+    }
+
+    fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            futures::stream::BoxStream<
+                'static,
+                std::result::Result<
+                    sse_stream::Sse,
+                    rmcp::transport::streamable_http_client::SseError,
+                >,
+            >,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        StreamableHttpClient::get_stream(&self.inner, uri, session_id, last_event_id, auth_header)
+    }
+}
+
 fn normalize_mcp_endpoint(endpoint: &str) -> Result<String> {
     let trimmed = endpoint.trim_end_matches('/');
     if trimmed.ends_with("/mcp") {
@@ -114,6 +201,49 @@ fn normalize_mcp_endpoint(endpoint: &str) -> Result<String> {
     Ok(format!("{trimmed}/mcp"))
 }
 
+fn parse_session_ids_file(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn ensure_session_ids_file(path: &Path, required: usize) -> Result<Vec<String>> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => parse_session_ids_file(&contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err).with_context(|| format!("read session ids file {path:?}")),
+    };
+
+    if existing.len() >= required {
+        return Ok(existing.into_iter().take(required).collect());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create session ids dir {parent:?}"))?;
+    }
+
+    let mut ids = existing;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open session ids file for append {path:?}"))?;
+
+    while ids.len() < required {
+        let id = Uuid::new_v4().to_string();
+        use std::io::Write as _;
+        writeln!(file, "{id}").with_context(|| format!("append session id to {path:?}"))?;
+        ids.push(id);
+    }
+
+    Ok(ids)
+}
+
 fn first_text_content(result: &rmcp::model::CallToolResult) -> Result<&str> {
     for content in &result.content {
         match &content.raw {
@@ -122,6 +252,17 @@ fn first_text_content(result: &rmcp::model::CallToolResult) -> Result<&str> {
         }
     }
     Err(anyhow!("tool response had no text content"))
+}
+
+async fn wallet_privacy_address(
+    client: &rmcp::service::Peer<rmcp::service::RoleClient>,
+) -> Result<String> {
+    let json = call_tool_json(client, "walletAddress", Some(rmcp::object!({}))).await?;
+    let privacy_address = json
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("walletAddress response missing address"))?;
+    Ok(privacy_address.to_string())
 }
 
 async fn call_tool_json(
@@ -266,13 +407,34 @@ async fn wallet_worker(
     args: Arc<Args>,
     counters: Arc<Counters>,
     stop_rx: tokio::sync::watch::Receiver<bool>,
+    session_id: String,
 ) -> Result<()> {
-    let transport = StreamableHttpClientTransport::from_uri(args.mcp_endpoint.clone());
+    let http = reqwest::Client::new();
+    let _ = http
+        .delete(args.mcp_endpoint.as_str())
+        .header(
+            rmcp::transport::common::http_header::HEADER_SESSION_ID,
+            session_id.as_str(),
+        )
+        .send()
+        .await;
+
+    let client =
+        PinnedSessionHttpClient::new(reqwest::Client::default(), session_id.clone().into());
+    let mut config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+            args.mcp_endpoint.clone(),
+        );
+    config.allow_stateless = false;
+    let transport = StreamableHttpClientTransport::with_client(client, config);
     let client = ().serve(transport).await.map_err(|e| anyhow!(e))?;
 
-    let (wallet_address, privacy_address) = create_wallet(&client)
-        .await
-        .with_context(|| format!("wallet[{idx}] createWallet"))?;
+    let (wallet_address, privacy_address) = match wallet_privacy_address(&client).await {
+        Ok(addr) => ("<reused>".to_string(), addr),
+        Err(_) => create_wallet(&client)
+            .await
+            .with_context(|| format!("wallet[{idx}] createWallet"))?,
+    };
 
     let _ = wait_for_wallet_balance(
         &client,
@@ -431,13 +593,16 @@ async fn main() -> Result<()> {
         return Err(anyhow!("--wallets must be >= 1"));
     }
 
+    let session_ids = ensure_session_ids_file(args.session_ids_file.as_path(), args.wallets)?;
+
     tracing::info!(
-        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={}",
+        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} session_ids_file={}",
         args.mcp_endpoint,
         args.wallets,
         args.send_amount,
         args.duration_secs,
-        args.confirm
+        args.confirm,
+        args.session_ids_file.display()
     );
 
     let counters = Arc::new(Counters::new());
@@ -541,11 +706,13 @@ async fn main() -> Result<()> {
 
     let mut join_set = tokio::task::JoinSet::new();
     for idx in 0..args.wallets {
+        let session_id = session_ids[idx].clone();
         join_set.spawn(wallet_worker(
             idx,
             args.clone(),
             counters.clone(),
             stop_rx.clone(),
+            session_id,
         ));
     }
 
