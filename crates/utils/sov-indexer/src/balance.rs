@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QuerySelect,
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, JsonValue,
+    QueryFilter, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -14,7 +14,8 @@ use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, P
 
 const DOMAIN: Hash32 = [1u8; 32];
 const NULLIFIER_CHUNK_SIZE: usize = 500;
-const EVENT_ID_CHUNK_SIZE: usize = 1000;
+// SQLite commonly defaults to 999 bind parameters; keep `IN (...)` batches below that.
+const EVENT_ID_CHUNK_SIZE: usize = 900;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BalanceRequest {
@@ -54,63 +55,32 @@ struct NoteState {
     nullifier: String,
 }
 
-struct DepositRow {
-    event_id: i32,
-    amount: Option<String>,
-    rho: Option<String>,
-    encrypted_notes: Option<serde_json::Value>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct DepositRowNoNotes {
-    event_id: i32,
-    amount: Option<String>,
-    rho: Option<String>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct DepositRowWithNotes {
-    event_id: i32,
-    amount: Option<String>,
-    rho: Option<String>,
-    encrypted_notes: Option<serde_json::Value>,
-}
-
-struct TransferRow {
-    event_id: i32,
-    encrypted_notes: Option<serde_json::Value>,
-    decrypted_notes: Option<serde_json::Value>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct TransferRowNoEncrypted {
-    event_id: i32,
-    decrypted_notes: Option<serde_json::Value>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct TransferRowWithEncrypted {
-    event_id: i32,
-    encrypted_notes: Option<serde_json::Value>,
-    decrypted_notes: Option<serde_json::Value>,
-}
-
-struct WithdrawRow {
-    event_id: i32,
-    encrypted_notes: Option<serde_json::Value>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct WithdrawRowQuery {
-    event_id: i32,
-    encrypted_notes: Option<serde_json::Value>,
-}
-
 pub async fn get_wallet_balance(
     db: &DatabaseConnection,
     address: &str,
     req: BalanceRequest,
 ) -> Result<BalanceResponse> {
+    #[derive(Debug)]
+    struct DepositRow {
+        event_id: i32,
+        amount: Option<String>,
+        rho: Option<String>,
+        encrypted_notes: Option<JsonValue>,
+    }
+
+    #[derive(Debug)]
+    struct TransferRow {
+        event_id: i32,
+        decrypted_notes: Option<JsonValue>,
+        encrypted_notes: Option<JsonValue>,
+    }
+
+    #[derive(Debug)]
+    struct WithdrawRow {
+        event_id: i32,
+        encrypted_notes: Option<JsonValue>,
+    }
+
     let parsed_address = address
         .parse::<PrivacyAddress>()
         .context("Invalid privacy address")?;
@@ -125,135 +95,177 @@ pub async fn get_wallet_balance(
         None => None,
     };
 
-    // Convert recipient hash to bech32m for querying deposits
-    let recipient_bech32m = viewer::hex_to_bech32m_address(&hex::encode(user_recipient))
-        .context("Failed to convert recipient to bech32m")?;
+    // Convert the wallet recipient hash to bech32m for querying deposits/transfers by involvement.
+    let wallet_bech32m = viewer::hex_to_bech32m_address(&hex::encode(user_recipient))
+        .context("Failed to convert wallet recipient to bech32m")?;
 
     let deposit_rows: Vec<DepositRow> = if vfk.is_some() {
+        #[derive(FromQueryResult)]
+        struct DepositDbRow {
+            event_id: i32,
+            amount: Option<String>,
+            rho: Option<String>,
+            encrypted_notes: Option<JsonValue>,
+        }
+
         idx::midnight_deposit::Entity::find()
             .select_only()
-            .columns([
-                idx::midnight_deposit::Column::EventId,
-                idx::midnight_deposit::Column::Amount,
-                idx::midnight_deposit::Column::Rho,
-                idx::midnight_deposit::Column::EncryptedNotes,
-            ])
-            .filter(idx::midnight_deposit::Column::Recipient.eq(recipient_bech32m.clone()))
-            .into_model::<DepositRowWithNotes>()
+            .column(idx::midnight_deposit::Column::EventId)
+            .column(idx::midnight_deposit::Column::Amount)
+            .column(idx::midnight_deposit::Column::Rho)
+            .column(idx::midnight_deposit::Column::EncryptedNotes)
+            .filter(idx::midnight_deposit::Column::Recipient.eq(wallet_bech32m.clone()))
+            .into_model::<DepositDbRow>()
             .all(db)
             .await?
             .into_iter()
-            .map(|row| DepositRow {
-                event_id: row.event_id,
-                amount: row.amount,
-                rho: row.rho,
-                encrypted_notes: row.encrypted_notes,
+            .map(|r| DepositRow {
+                event_id: r.event_id,
+                amount: r.amount,
+                rho: r.rho,
+                encrypted_notes: r.encrypted_notes,
             })
             .collect()
     } else {
+        #[derive(FromQueryResult)]
+        struct DepositDbRow {
+            event_id: i32,
+            amount: Option<String>,
+            rho: Option<String>,
+        }
+
         idx::midnight_deposit::Entity::find()
             .select_only()
-            .columns([
-                idx::midnight_deposit::Column::EventId,
-                idx::midnight_deposit::Column::Amount,
-                idx::midnight_deposit::Column::Rho,
-            ])
-            .filter(idx::midnight_deposit::Column::Recipient.eq(recipient_bech32m.clone()))
-            .into_model::<DepositRowNoNotes>()
+            .column(idx::midnight_deposit::Column::EventId)
+            .column(idx::midnight_deposit::Column::Amount)
+            .column(idx::midnight_deposit::Column::Rho)
+            .filter(idx::midnight_deposit::Column::Recipient.eq(wallet_bech32m.clone()))
+            .filter(idx::midnight_deposit::Column::Amount.is_not_null())
+            .filter(idx::midnight_deposit::Column::Rho.is_not_null())
+            .into_model::<DepositDbRow>()
             .all(db)
             .await?
             .into_iter()
-            .map(|row| DepositRow {
-                event_id: row.event_id,
-                amount: row.amount,
-                rho: row.rho,
+            .map(|r| DepositRow {
+                event_id: r.event_id,
+                amount: r.amount,
+                rho: r.rho,
                 encrypted_notes: None,
             })
             .collect()
     };
 
-    // When VFK is provided, fetch ALL transfers with encrypted notes so we can decrypt
-    // and find change notes from outgoing transfers. Without a VFK, prefer stored
-    // decrypted notes if available.
+    // Transfers:
+    // - Prefer indexed involvement fields (`recipient`, `privacy_sender`) to keep this query scoped
+    //   to the wallet and avoid scanning the entire transfer table.
+    // - When a VFK is provided, also include *untagged* transfers (missing recipient/privacy_sender)
+    //   that still have encrypted notes, so we can decrypt and recover change notes.
+    // - Without a VFK, include only a small backward-compatibility set: rows with decrypted notes
+    //   but missing involvement fields.
+    let missing_involvement_fields = Condition::all()
+        .add(idx::midnight_transfer::Column::Recipient.is_null())
+        .add(idx::midnight_transfer::Column::PrivacySender.is_null());
     let transfer_filter = if vfk.is_some() {
-        // Potentially expensive: scan all transfers that have note data we can decrypt/parse.
         Condition::any()
-            .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
-            .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
-    } else {
-        // Restrict to transfers involving this wallet, and only those we can interpret without VFK.
-        Condition::all()
+            .add(idx::midnight_transfer::Column::Recipient.eq(wallet_bech32m.clone()))
+            .add(idx::midnight_transfer::Column::PrivacySender.eq(wallet_bech32m.clone()))
             .add(
-                Condition::any()
-                    .add(idx::midnight_transfer::Column::Recipient.eq(recipient_bech32m.clone()))
-                    .add(
-                        idx::midnight_transfer::Column::PrivacySender.eq(recipient_bech32m.clone()),
-                    ),
+                Condition::all()
+                    .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+                    .add(missing_involvement_fields.clone()),
             )
-            .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
+    } else {
+        Condition::any()
+            .add(idx::midnight_transfer::Column::Recipient.eq(wallet_bech32m.clone()))
+            .add(idx::midnight_transfer::Column::PrivacySender.eq(wallet_bech32m.clone()))
+            .add(
+                Condition::all()
+                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
+                    .add(missing_involvement_fields.clone()),
+            )
     };
     let transfer_rows: Vec<TransferRow> = if vfk.is_some() {
+        #[derive(FromQueryResult)]
+        struct TransferDbRow {
+            event_id: i32,
+            decrypted_notes: Option<JsonValue>,
+            encrypted_notes: Option<JsonValue>,
+        }
+
         idx::midnight_transfer::Entity::find()
             .select_only()
-            .columns([
-                idx::midnight_transfer::Column::EventId,
-                idx::midnight_transfer::Column::EncryptedNotes,
-                idx::midnight_transfer::Column::DecryptedNotes,
-            ])
+            .column(idx::midnight_transfer::Column::EventId)
+            .column(idx::midnight_transfer::Column::DecryptedNotes)
+            .column(idx::midnight_transfer::Column::EncryptedNotes)
             .filter(transfer_filter)
-            .into_model::<TransferRowWithEncrypted>()
+            .into_model::<TransferDbRow>()
             .all(db)
             .await?
             .into_iter()
-            .map(|row| TransferRow {
-                event_id: row.event_id,
-                encrypted_notes: row.encrypted_notes,
-                decrypted_notes: row.decrypted_notes,
+            .map(|r| TransferRow {
+                event_id: r.event_id,
+                decrypted_notes: r.decrypted_notes,
+                encrypted_notes: r.encrypted_notes,
             })
             .collect()
     } else {
+        #[derive(FromQueryResult)]
+        struct TransferDbRow {
+            event_id: i32,
+            decrypted_notes: Option<JsonValue>,
+        }
+
         idx::midnight_transfer::Entity::find()
             .select_only()
-            .columns([
-                idx::midnight_transfer::Column::EventId,
-                idx::midnight_transfer::Column::DecryptedNotes,
-            ])
+            .column(idx::midnight_transfer::Column::EventId)
+            .column(idx::midnight_transfer::Column::DecryptedNotes)
+            .filter(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
             .filter(transfer_filter)
-            .into_model::<TransferRowNoEncrypted>()
+            .into_model::<TransferDbRow>()
             .all(db)
             .await?
             .into_iter()
-            .map(|row| TransferRow {
-                event_id: row.event_id,
+            .map(|r| TransferRow {
+                event_id: r.event_id,
+                decrypted_notes: r.decrypted_notes,
                 encrypted_notes: None,
-                decrypted_notes: row.decrypted_notes,
             })
             .collect()
     };
 
     let withdraw_rows: Vec<WithdrawRow> = if vfk.is_some() {
+        #[derive(FromQueryResult)]
+        struct WithdrawDbRow {
+            event_id: i32,
+            encrypted_notes: Option<JsonValue>,
+        }
+
+        let withdraw_filter = Condition::any()
+            .add(idx::midnight_withdraw::Column::PrivacySender.eq(wallet_bech32m.clone()))
+            // Backward-compat: include untagged withdraws so we can decrypt and recover
+            // change notes even if `privacy_sender` hasn't been backfilled yet.
+            .add(idx::midnight_withdraw::Column::PrivacySender.is_null());
+
         idx::midnight_withdraw::Entity::find()
             .select_only()
-            .columns([
-                idx::midnight_withdraw::Column::EventId,
-                idx::midnight_withdraw::Column::EncryptedNotes,
-            ])
+            .column(idx::midnight_withdraw::Column::EventId)
+            .column(idx::midnight_withdraw::Column::EncryptedNotes)
             .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
-            .into_model::<WithdrawRowQuery>()
+            .filter(withdraw_filter)
+            .into_model::<WithdrawDbRow>()
             .all(db)
             .await?
             .into_iter()
-            .map(|row| WithdrawRow {
-                event_id: row.event_id,
-                encrypted_notes: row.encrypted_notes,
+            .map(|r| WithdrawRow {
+                event_id: r.event_id,
+                encrypted_notes: r.encrypted_notes,
             })
             .collect()
     } else {
         Vec::new()
     };
 
-    let mut event_ids: Vec<i32> =
-        Vec::with_capacity(deposit_rows.len() + transfer_rows.len() + withdraw_rows.len());
+    let mut event_ids = Vec::new();
     event_ids.extend(deposit_rows.iter().map(|row| row.event_id));
     event_ids.extend(transfer_rows.iter().map(|row| row.event_id));
     event_ids.extend(withdraw_rows.iter().map(|row| row.event_id));
@@ -378,27 +390,32 @@ async fn load_event_map(
     db: &DatabaseConnection,
     event_ids: &[i32],
 ) -> Result<HashMap<i32, (String, i64)>> {
-    let mut ids = event_ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.is_empty() {
+    #[derive(FromQueryResult)]
+    struct EventMetaRow {
+        id: i32,
+        tx_hash: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    let mut event_ids = event_ids.to_vec();
+    event_ids.sort_unstable();
+    event_ids.dedup();
+
+    if event_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut map = HashMap::new();
-    for chunk in ids.chunks(EVENT_ID_CHUNK_SIZE) {
-        #[derive(Debug, FromQueryResult)]
-        struct EventMeta {
-            id: i32,
-            tx_hash: String,
-            created_at: chrono::DateTime<chrono::Utc>,
-        }
-
-        let events: Vec<EventMeta> = idx::Entity::find()
+    // Only fetch the event columns we need for balance computation. Avoid selecting
+    // large `payload`/`events` JSON blobs to reduce DB CPU + network I/O.
+    let mut map = HashMap::with_capacity(event_ids.len());
+    for chunk in event_ids.chunks(EVENT_ID_CHUNK_SIZE) {
+        let events: Vec<EventMetaRow> = idx::Entity::find()
             .select_only()
-            .columns([idx::Column::Id, idx::Column::TxHash, idx::Column::CreatedAt])
+            .column(idx::Column::Id)
+            .column(idx::Column::TxHash)
+            .column(idx::Column::CreatedAt)
             .filter(idx::Column::Id.is_in(chunk.to_vec()))
-            .into_model::<EventMeta>()
+            .into_model::<EventMetaRow>()
             .all(db)
             .await?;
 
@@ -477,6 +494,11 @@ async fn fetch_spent_nullifiers(
     db: &DatabaseConnection,
     nullifiers: &HashSet<String>,
 ) -> Result<HashSet<String>> {
+    #[derive(FromQueryResult)]
+    struct SpentNullifierRow {
+        nullifier: String,
+    }
+
     let mut spent = HashSet::new();
     if nullifiers.is_empty() {
         return Ok(spent);
@@ -487,8 +509,11 @@ async fn fetch_spent_nullifiers(
 
     for chunk in values.chunks(NULLIFIER_CHUNK_SIZE) {
         let chunk_vec: Vec<String> = chunk.to_vec();
-        let rows = idx::midnight_spent_nullifiers::Entity::find()
+        let rows: Vec<SpentNullifierRow> = idx::midnight_spent_nullifiers::Entity::find()
+            .select_only()
+            .column(idx::midnight_spent_nullifiers::Column::Nullifier)
             .filter(idx::midnight_spent_nullifiers::Column::Nullifier.is_in(chunk_vec))
+            .into_model::<SpentNullifierRow>()
             .all(db)
             .await?;
         for row in rows {

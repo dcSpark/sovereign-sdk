@@ -649,21 +649,45 @@ pub fn hex_to_bech32m_address(hex_str: &str) -> Option<String> {
 
 /// Extract recipient address from decrypted notes as bech32m.
 ///
-/// Looks for the first note with a `recipient` field and converts it to bech32m.
+/// Prefers a "real" recipient output where `recipient != sender_id` (i.e. not a change note).
+/// Falls back to the first decodable `recipient` if all notes are change/self outputs.
 pub fn extract_recipient_from_decrypted_notes(
     decrypted_notes: Option<&serde_json::Value>,
 ) -> Option<String> {
     let notes = decrypted_notes?;
     let arr = notes.as_array()?;
 
+    let mut fallback: Option<String> = None;
     for note in arr {
         if let Some(recipient_hex) = note.get("recipient").and_then(|r| r.as_str()) {
-            if let Some(bech32_addr) = hex_to_bech32m_address(recipient_hex) {
+            let Some(bech32_addr) = hex_to_bech32m_address(recipient_hex) else {
+                continue;
+            };
+
+            let is_change_note =
+                note.get("sender_id")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|sender_hex| {
+                        let normalize = |value: &str| {
+                            let trimmed = value.trim();
+                            trimmed
+                                .strip_prefix("0x")
+                                .unwrap_or(trimmed)
+                                .to_ascii_lowercase()
+                        };
+                        normalize(sender_hex) == normalize(recipient_hex)
+                    });
+
+            if !is_change_note {
                 return Some(bech32_addr);
+            }
+
+            if fallback.is_none() {
+                fallback = Some(bech32_addr);
             }
         }
     }
-    None
+    fallback
 }
 
 /// Extract sender address from decrypted notes as bech32m.
