@@ -146,15 +146,44 @@ impl StreamableHttpClient for PinnedSessionHttpClient {
         >,
     > + Send
            + '_ {
-        let session_id = session_id.or_else(|| Some(self.pinned_session_id.clone()));
-        StreamableHttpClient::post_message(&self.inner, uri, message, session_id, auth_header)
+        let pinned = self.pinned_session_id.clone();
+        let session_id = session_id.or_else(|| Some(pinned.clone()));
+        async move {
+            let response = StreamableHttpClient::post_message(
+                &self.inner,
+                uri,
+                message,
+                session_id,
+                auth_header,
+            )
+            .await?;
+            Ok(match response {
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted => {
+                    rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted
+                }
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
+                    message,
+                    session_id,
+                ) => rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
+                    message,
+                    session_id.or_else(|| Some(pinned.to_string())),
+                ),
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
+                    stream,
+                    session_id,
+                ) => rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
+                    stream,
+                    session_id.or_else(|| Some(pinned.to_string())),
+                ),
+            })
+        }
     }
 
     fn delete_session(
         &self,
-        uri: Arc<str>,
-        session_id: Arc<str>,
-        auth_header: Option<String>,
+        _uri: Arc<str>,
+        _session_id: Arc<str>,
+        _auth_header: Option<String>,
     ) -> impl std::future::Future<
         Output = std::result::Result<
             (),
@@ -162,7 +191,7 @@ impl StreamableHttpClient for PinnedSessionHttpClient {
         >,
     > + Send
            + '_ {
-        StreamableHttpClient::delete_session(&self.inner, uri, session_id, auth_header)
+        async move { Ok(()) }
     }
 
     fn get_stream(
@@ -254,15 +283,41 @@ fn first_text_content(result: &rmcp::model::CallToolResult) -> Result<&str> {
     Err(anyhow!("tool response had no text content"))
 }
 
-async fn wallet_privacy_address(
+async fn wallet_privacy_address_opt(
     client: &rmcp::service::Peer<rmcp::service::RoleClient>,
-) -> Result<String> {
-    let json = call_tool_json(client, "walletAddress", Some(rmcp::object!({}))).await?;
+) -> Result<Option<String>> {
+    let res = client
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("walletAddress"),
+            arguments: Some(rmcp::object!({})),
+        })
+        .await;
+
+    let result = match res {
+        Ok(ok) => ok,
+        Err(rmcp::service::ServiceError::McpError(err))
+            if err.code == ErrorCode::INVALID_PARAMS
+                && err.message.contains("No wallet loaded") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| "call_tool walletAddress failed");
+        }
+    };
+
+    if result.is_error.unwrap_or(false) {
+        return Err(anyhow!("tool walletAddress returned is_error=true"));
+    }
+
+    let text = first_text_content(&result).with_context(|| "tool walletAddress response")?;
+    let json: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| "tool walletAddress response was not valid JSON text")?;
     let privacy_address = json
         .get("address")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("walletAddress response missing address"))?;
-    Ok(privacy_address.to_string())
+    Ok(Some(privacy_address.to_string()))
 }
 
 async fn call_tool_json(
@@ -289,10 +344,37 @@ async fn call_tool_json(
     Ok(json)
 }
 
-async fn create_wallet(
+async fn create_wallet_opt(
     client: &rmcp::service::Peer<rmcp::service::RoleClient>,
-) -> Result<(String, String)> {
-    let json = call_tool_json(client, "createWallet", Some(rmcp::object!({}))).await?;
+) -> Result<Option<(String, String)>> {
+    let res = client
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("createWallet"),
+            arguments: Some(rmcp::object!({})),
+        })
+        .await;
+
+    let result = match res {
+        Ok(ok) => ok,
+        Err(rmcp::service::ServiceError::McpError(err))
+            if err.code == ErrorCode::INVALID_PARAMS
+                && err
+                    .message
+                    .contains("A wallet is already loaded. Call removeWallet first") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(anyhow!(e)).with_context(|| "call_tool createWallet failed"),
+    };
+
+    if result.is_error.unwrap_or(false) {
+        return Err(anyhow!("tool createWallet returned is_error=true"));
+    }
+
+    let text = first_text_content(&result).with_context(|| "tool createWallet response")?;
+    let json: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| "tool createWallet response was not valid JSON text")?;
+
     let wallet_address = json
         .get("wallet_address")
         .and_then(|v| v.as_str())
@@ -302,7 +384,10 @@ async fn create_wallet(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("createWallet response missing privacy_address"))?;
 
-    Ok((wallet_address.to_string(), privacy_address.to_string()))
+    Ok(Some((
+        wallet_address.to_string(),
+        privacy_address.to_string(),
+    )))
 }
 
 async fn wait_for_wallet_balance(
@@ -409,16 +494,6 @@ async fn wallet_worker(
     stop_rx: tokio::sync::watch::Receiver<bool>,
     session_id: String,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
-    let _ = http
-        .delete(args.mcp_endpoint.as_str())
-        .header(
-            rmcp::transport::common::http_header::HEADER_SESSION_ID,
-            session_id.as_str(),
-        )
-        .send()
-        .await;
-
     let client =
         PinnedSessionHttpClient::new(reqwest::Client::default(), session_id.clone().into());
     let mut config =
@@ -429,11 +504,49 @@ async fn wallet_worker(
     let transport = StreamableHttpClientTransport::with_client(client, config);
     let client = ().serve(transport).await.map_err(|e| anyhow!(e))?;
 
-    let (wallet_address, privacy_address) = match wallet_privacy_address(&client).await {
-        Ok(addr) => ("<reused>".to_string(), addr),
-        Err(_) => create_wallet(&client)
+    let (wallet_address, privacy_address) = match wallet_privacy_address_opt(&client).await {
+        Ok(Some(addr)) => ("<reused>".to_string(), addr),
+        Ok(None) => match create_wallet_opt(&client)
             .await
-            .with_context(|| format!("wallet[{idx}] createWallet"))?,
+            .with_context(|| format!("wallet[{idx}] createWallet"))?
+        {
+            Some((wallet_address, privacy_address)) => (wallet_address, privacy_address),
+            None => {
+                let addr = wallet_privacy_address_opt(&client)
+                    .await
+                    .with_context(|| format!("wallet[{idx}] walletAddress (after already-loaded)"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "wallet is already loaded but walletAddress still reports no wallet"
+                        )
+                    })?;
+                ("<reused>".to_string(), addr)
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                "wallet[{idx}] walletAddress failed; attempting createWallet anyway: {err:#}"
+            );
+
+            match create_wallet_opt(&client).await.with_context(|| {
+                format!("wallet[{idx}] createWallet (after walletAddress error)")
+            })? {
+                Some((wallet_address, privacy_address)) => (wallet_address, privacy_address),
+                None => {
+                    let addr = wallet_privacy_address_opt(&client)
+                        .await
+                        .with_context(|| {
+                            format!("wallet[{idx}] walletAddress (after already-loaded)")
+                        })?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "wallet is already loaded but walletAddress still reports no wallet"
+                            )
+                        })?;
+                    ("<reused>".to_string(), addr)
+                }
+            }
+        }
     };
 
     let _ = wait_for_wallet_balance(
