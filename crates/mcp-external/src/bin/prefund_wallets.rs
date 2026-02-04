@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
+use futures::stream::{self, StreamExt};
 use mcp_external::operations;
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
@@ -157,6 +158,8 @@ async fn main() -> Result<()> {
     let admin_wallet_private_key = env_required("ADMIN_WALLET_PRIVATE_KEY")?;
 
     let prefund_count = env_usize_optional("PREFUND_COUNT").unwrap_or(1000);
+    let prefund_concurrency_cfg = env_usize_optional("PREFUND_CONCURRENCY").unwrap_or(10);
+    let prefund_concurrency = prefund_concurrency_cfg.clamp(1, prefund_count.max(1));
     let output_file = env_required("PREFUND_OUTPUT_FILE")?;
     let append = env_bool_optional("PREFUND_APPEND").unwrap_or(true);
 
@@ -221,102 +224,123 @@ async fn main() -> Result<()> {
     let mut writer = BufWriter::new(file);
 
     tracing::info!(
-        "Prefunding {} wallets: deposit_amount={}, gas_reserve={}, l2_funding_amount={}, out={}",
+        "Prefunding {} wallets: deposit_amount={}, gas_reserve={}, l2_funding_amount={}, out={}, concurrency={}",
         prefund_count,
         deposit_amount,
         gas_reserve,
         l2_funding_amount,
-        output_file
+        output_file,
+        prefund_concurrency
     );
 
-    for i in 0..prefund_count {
-        let wallet_private_key_hex = generate_key_hex();
-        let privacy_spend_key_hex = generate_key_hex();
+    let mut completed = 0usize;
 
-        let wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
-            .with_context(|| format!("Failed to create wallet context (idx={})", i))?;
-        let wallet_address = wallet_ctx.get_address().to_string();
+    let mut tasks = stream::iter(0..prefund_count)
+        .map(|i| {
+            let provider = provider.clone();
+            let admin_wallet_ctx = admin_wallet_ctx.clone();
+            let gas_token_id = gas_token_id.clone();
+            async move {
+                let wallet_private_key_hex = generate_key_hex();
+                let privacy_spend_key_hex = generate_key_hex();
 
-        let privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
-            .with_context(|| format!("Failed to create privacy key (idx={})", i))?;
-        let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
+                let wallet_ctx = McpWalletContext::from_private_key_hex(&wallet_private_key_hex)
+                    .with_context(|| format!("Failed to create wallet context (idx={})", i))?;
+                let wallet_address = wallet_ctx.get_address().to_string();
 
-        tracing::info!(
-            "[{}/{}] Funding wallet {} (privacy {})",
-            i + 1,
-            prefund_count,
-            wallet_address,
-            privacy_address
-        );
+                let privacy_key = PrivacyKey::from_hex(&privacy_spend_key_hex)
+                    .with_context(|| format!("Failed to create privacy key (idx={})", i))?;
+                let privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
 
-        let send_res = operations::send_funds(
-            &provider,
-            &admin_wallet_ctx,
-            &wallet_address,
-            &gas_token_id,
-            Amount::from(l2_funding_amount),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to send funds to wallet {} (idx={})",
-                wallet_address, i
-            )
-        })?;
-        let funding_tx_hash = send_res.tx_hash.trim().to_string();
-        anyhow::ensure!(
-            !funding_tx_hash.is_empty(),
-            "Funding tx hash is empty (wallet {}, idx={})",
-            wallet_address,
-            i
-        );
+                tracing::info!(
+                    "[{}/{}] Funding wallet {} (privacy {})",
+                    i + 1,
+                    prefund_count,
+                    wallet_address,
+                    privacy_address
+                );
 
-        wait_for_sequencer_acceptance(&provider, &funding_tx_hash)
-            .await
-            .with_context(|| {
-                format!(
-                    "Funding tx not accepted by sequencer (tx={}, wallet={}, idx={})",
-                    funding_tx_hash, wallet_address, i
+                let send_res = operations::send_funds(
+                    &provider,
+                    &admin_wallet_ctx,
+                    &wallet_address,
+                    &gas_token_id,
+                    Amount::from(l2_funding_amount),
                 )
-            })?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to send funds to wallet {} (idx={})",
+                        wallet_address, i
+                    )
+                })?;
+                let funding_tx_hash = send_res.tx_hash.trim().to_string();
+                anyhow::ensure!(
+                    !funding_tx_hash.is_empty(),
+                    "Funding tx hash is empty (wallet {}, idx={})",
+                    wallet_address,
+                    i
+                );
 
-        let wallet_address_parsed: <McpSpec as Spec>::Address = wallet_address
-            .parse()
-            .with_context(|| format!("Invalid wallet address '{}'", wallet_address))?;
-        let _ = wait_for_balance(
-            &provider,
-            &wallet_address_parsed,
-            &gas_token_id,
-            l2_funding_amount,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed waiting for L2 funding (wallet={}, idx={})",
-                wallet_address, i
-            )
-        })?;
+                wait_for_sequencer_acceptance(&provider, &funding_tx_hash)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Funding tx not accepted by sequencer (tx={}, wallet={}, idx={})",
+                            funding_tx_hash, wallet_address, i
+                        )
+                    })?;
 
-        let deposit_res = operations::deposit(&provider, &wallet_ctx, deposit_amount, &privacy_key)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to deposit to privacy pool (wallet={}, idx={})",
-                    wallet_address, i
+                let wallet_address_parsed = wallet_ctx.get_address();
+                let _ = wait_for_balance(
+                    &provider,
+                    &wallet_address_parsed,
+                    &gas_token_id,
+                    l2_funding_amount,
                 )
-            })?;
-        let deposit_tx_hash = deposit_res.tx_hash.trim().to_string();
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed waiting for L2 funding (wallet={}, idx={})",
+                        wallet_address, i
+                    )
+                })?;
 
-        let json = serde_json::json!({
-            "wallet_private_key_hex": wallet_private_key_hex,
-            "privacy_spend_key_hex": privacy_spend_key_hex,
-            "wallet_address": wallet_address,
-            "privacy_address": privacy_address,
-            "funding_tx_hash": funding_tx_hash,
-            "deposit_tx_hash": deposit_tx_hash,
-        });
+                let deposit_res =
+                    operations::deposit(&provider, &wallet_ctx, deposit_amount, &privacy_key)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to deposit to privacy pool (wallet={}, idx={})",
+                                wallet_address, i
+                            )
+                        })?;
+                let deposit_tx_hash = deposit_res.tx_hash.trim().to_string();
+
+                Ok::<_, anyhow::Error>(serde_json::json!({
+                    "wallet_private_key_hex": wallet_private_key_hex,
+                    "privacy_spend_key_hex": privacy_spend_key_hex,
+                    "wallet_address": wallet_address,
+                    "privacy_address": privacy_address,
+                    "funding_tx_hash": funding_tx_hash,
+                    "deposit_tx_hash": deposit_tx_hash,
+                }))
+            }
+        })
+        .buffer_unordered(prefund_concurrency);
+
+    while let Some(res) = tasks.next().await {
+        let json = res?;
+        completed += 1;
         writeln!(&mut writer, "{}", json.to_string())?;
         writer.flush()?;
+        if completed % 10 == 0 || completed == prefund_count {
+            tracing::info!(
+                "[{}/{}] Prefunded wallets written",
+                completed,
+                prefund_count
+            );
+        }
     }
 
     Ok(())

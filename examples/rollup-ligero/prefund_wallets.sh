@@ -6,6 +6,7 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 OUT_FILE="${1:-${PREFUND_OUTPUT_FILE:-$SCRIPT_DIR/prefunded_wallets.jsonl}}"
 COUNT="${2:-${PREFUND_COUNT:-1000}}"
+CONCURRENCY="${3:-${PREFUND_CONCURRENCY:-10}}"
 
 export RUST_LOG="${RUST_LOG:-info}"
 export ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://localhost:12346}"
@@ -21,11 +22,12 @@ export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-}"
 
 export PREFUND_OUTPUT_FILE="$OUT_FILE"
 export PREFUND_COUNT="$COUNT"
+export PREFUND_CONCURRENCY="$CONCURRENCY"
 export PREFUND_APPEND="${PREFUND_APPEND:-true}"
 
 if [[ -z "${ADMIN_WALLET_PRIVATE_KEY}" ]]; then
   echo "ADMIN_WALLET_PRIVATE_KEY is required" >&2
-  echo "Usage: $0 [out_file] [count]" >&2
+  echo "Usage: $0 [out_file] [count] [concurrency]" >&2
   exit 1
 fi
 
