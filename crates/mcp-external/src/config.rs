@@ -91,6 +91,18 @@ pub struct Config {
     #[serde(default)]
     #[validate(custom(function = "validate_http_url"))]
     pub metrics_api_url: Option<Url>,
+
+    /// Optional Postgres connection string for MCP session persistence (env: MCP_SESSION_DB_URL).
+    #[serde(default)]
+    pub mcp_session_db_url: Option<String>,
+
+    /// Optional 32-byte encryption key (hex or base64) for MCP session persistence (env: MCP_SESSION_DB_ENCRYPTION_KEY).
+    #[serde(default)]
+    pub mcp_session_db_encryption_key: Option<String>,
+
+    /// Automatically send MCP `notifications/initialized` and bootstrap persisted sessions (env: MCP_AUTO_INITIALIZE_SESSIONS).
+    #[serde(default)]
+    pub mcp_auto_initialize_sessions: bool,
 }
 
 fn default_server_bind_address() -> String {
@@ -142,6 +154,18 @@ impl Config {
             .map(|s| s.to_string());
         cfg.midnight_fvk_service_admin_token = cfg
             .midnight_fvk_service_admin_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.mcp_session_db_url = cfg
+            .mcp_session_db_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.mcp_session_db_encryption_key = cfg
+            .mcp_session_db_encryption_key
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())

@@ -53,6 +53,9 @@ Configure the following environment variables:
 - `MCP_TRANSFER_WAIT_MODE` - Optional post-submit wait mode for `send`: `sequencer` (default) or `none`.
 - `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` - Admin token (shared with FVK service). If set, POST endpoints on `/authority` require `Authorization: Bearer <token>`.
 - `METRICS_API_URL` - Optional `sov-metrics-api` base URL used by `GET /authority/tps` (e.g. `http://127.0.0.1:13200`).
+- `MCP_SESSION_DB_URL` - Optional PostgreSQL connection string for MCP session persistence (e.g. `postgresql://admin:1234@localhost:5432/mcp_sessions`).
+- `MCP_SESSION_DB_ENCRYPTION_KEY` - Optional 32-byte encryption key (hex or base64) used to encrypt persisted session data. If unset, session data is stored unencrypted.
+- `MCP_AUTO_INITIALIZE_SESSIONS` - Optional boolean to auto-send `notifications/initialized` and allow resuming persisted sessions without an explicit initialize request.
 
 ### Start the Server
 

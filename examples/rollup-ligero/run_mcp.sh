@@ -20,6 +20,15 @@ export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-75fbf8d98746c2692e5
 export WALLET_PRIVATE_KEY="${WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export PRIVPOOL_SPEND_KEY="${PRIVPOOL_SPEND_KEY:-0xb23e0dc9d1f8869c8bc87ab4eaacd58cbe024a825bdc13fefa4d4c5eaa0b855f}"
 
+# Persistent session storage configuration
+if [[ -z "${MCP_SESSION_DB_URL:-}" ]]; then
+  echo "MCP_SESSION_DB_URL is required but not set"
+  exit 1
+fi
+export MCP_SESSION_DB_URL
+export MCP_SESSION_DB_ENCRYPTION_KEY="${MCP_SESSION_DB_ENCRYPTION_KEY:-7e2bdfe834ff9a47c8cdba8cf41c4dcd83410fef61b805ea9740c32335697d12}"
+export MCP_AUTO_INITIALIZE_SESSIONS="${MCP_AUTO_INITIALIZE_SESSIONS:-true}"
+
 # Authority API configuration for /authority/* HTTP endpoints
 # Uses MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for protected endpoints (freeze/thaw). If not set, write endpoints are disabled.
 # METRICS_API_URL: Base URL for sov-metrics-api, enables /authority/tps endpoint.
