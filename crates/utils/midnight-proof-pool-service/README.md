@@ -7,15 +7,15 @@ requested number of pending transactions to the sequencer, and the service refil
 
 ## Endpoints
 
-- `GET /status?token=...`
+- `GET /status?auth_token=...`
   - Returns `{ max_proofs, ready_proofs }`
-- `POST /send?token=...` with JSON body `{ "proof_quantity": N }`
+- `POST /send?auth_token=...` with JSON body `{ "proof_quantity": N }`
   - Flushes up to `N` pending txs to the sequencer (via verifier `/midnight-privacy/flush?limit=N`)
-  - Also supports: `GET /send?token=...&proof_quantity=N` (phone-friendly)
+- Also supports: `GET /send?auth_token=...&proof_quantity=N` (phone-friendly)
 
 ## Required env
 
-- `AUTH_TOKEN` - required; used as `?token=...` on all endpoints
+- `AUTH_TOKEN` - required; used as `?auth_token=...` on all endpoints
 - `MAX_PROOFS` - number of wallets / pending proofs to maintain
 - `ADMIN_WALLET_PRIVATE_KEY` - hex private key used to fund generated wallets
 - `ROLLUP_RPC_URL` - rollup node base URL (default: `http://127.0.0.1:12346`)
@@ -24,7 +24,7 @@ requested number of pending transactions to the sequencer, and the service refil
 
 ## Optional env
 
-- `PROOF_POOL_BIND_ADDR` - service bind address (default: `127.0.0.1:8888`)
+- `PROOF_POOL_BIND_ADDR` - service bind address (default: `127.0.0.1:11235`)
 - `INDEXER_URL` - indexer base URL (default: `http://localhost:13100`)
 - `DEPOSIT_AMOUNT` - initial shielded deposit per wallet (default: `200`)
 - `AUTO_FUND_GAS_RESERVE` - extra L2 funding per wallet, added to `DEPOSIT_AMOUNT` (default: `10000000`, min `DEFAULT_MAX_FEE`)
@@ -33,6 +33,8 @@ requested number of pending transactions to the sequencer, and the service refil
 - `MAX_CONCURRENT_PROOFS` - concurrent proof generations (default: `5`)
 - `LIGERO_PROGRAM_PATH` - circuit name or wasm path (default: `note_spend_guest`)
 - `VERIFIER_PROVER_SERVICE_URL` - overrides verifier-side remote `/verify` URL (default: `LIGERO_PROOF_SERVICE_URL`)
+- `POOL_FVK_PK` - when set, enables pool-signed viewer commitments; the service will fetch 1 viewer FVK per wallet from `MIDNIGHT_FVK_SERVICE_URL`
+- `MIDNIGHT_FVK_SERVICE_URL` - midnight-fvk-service base URL (default: `http://127.0.0.1:8088`)
 
 ## Run
 
@@ -47,6 +49,6 @@ cargo run -p midnight-proof-pool-service --release
 ```
 
 ```bash
-curl "http://127.0.0.1:8888/status?token=secret"
-curl "http://127.0.0.1:8888/send?token=secret&proof_quantity=25"
+curl "http://127.0.0.1:11235/status?auth_token=secret"
+curl "http://127.0.0.1:11235/send?auth_token=secret&proof_quantity=25"
 ```

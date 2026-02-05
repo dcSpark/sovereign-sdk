@@ -14,6 +14,7 @@ PATTERNS=(
     "proof-verifier"
     "sov-indexer"
     "mcp-external"
+    "midnight-proof-pool-service"
 )
 
 killed_any=false

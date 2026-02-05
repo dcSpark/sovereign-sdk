@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router, ServiceExt};
 use mcp_external::commitment_tree::{global_tree_syncer, start_background_tree_sync};
+use mcp_external::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use mcp_external::ligero::Ligero;
 use mcp_external::operations::{deposit, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE};
 use mcp_external::privacy_key::PrivacyKey;
@@ -64,7 +65,7 @@ impl Config {
             .context("MAX_PROOFS")?;
         anyhow::ensure!(max_proofs > 0, "MAX_PROOFS must be > 0");
 
-        let bind_addr = env_string("PROOF_POOL_BIND_ADDR", "127.0.0.1:8888")
+        let bind_addr = env_string("PROOF_POOL_BIND_ADDR", "127.0.0.1:11235")
             .parse::<SocketAddr>()
             .context("PROOF_POOL_BIND_ADDR")?;
 
@@ -129,6 +130,7 @@ struct PendingTransfer {
 struct PoolWallet {
     wallet: McpWalletContext,
     privacy_key: PrivacyKey,
+    viewer_fvk_bundle: Option<ViewerFvkBundle>,
     current_note: Option<NoteState>,
     pending: Option<PendingTransfer>,
     generating: bool,
@@ -148,12 +150,14 @@ struct ServiceState {
 
 #[derive(Debug, Deserialize)]
 struct TokenQuery {
-    token: Option<String>,
+    #[serde(alias = "token")]
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SendQuery {
-    token: Option<String>,
+    #[serde(alias = "token")]
+    auth_token: Option<String>,
     proof_quantity: Option<usize>,
 }
 
@@ -280,7 +284,7 @@ async fn status_handler(
     State(state): State<Arc<ServiceState>>,
     Query(query): Query<TokenQuery>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
-    check_auth(&state.cfg.auth_token, query.token.as_deref())?;
+    check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
     let ready = ready_proofs(&state).await;
     Ok(Json(StatusResponse {
         max_proofs: state.cfg.max_proofs,
@@ -308,7 +312,7 @@ async fn send_impl(
     query: SendQuery,
     body: Option<SendBody>,
 ) -> Result<Json<SendResponse>, StatusCode> {
-    check_auth(&state.cfg.auth_token, query.token.as_deref())?;
+    check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
     let requested = body
         .map(|b| b.proof_quantity)
         .or(query.proof_quantity)
@@ -434,7 +438,7 @@ async fn pick_wallet_to_generate(state: &Arc<ServiceState>) -> Option<usize> {
 
 async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usize) -> Result<()> {
     let result: Result<()> = async {
-        let (wallet, privacy_key, current_note) = {
+        let (wallet, privacy_key, viewer_fvk_bundle, current_note) = {
             let wallets = state.wallets.read().await;
             let w = wallets
                 .get(wallet_idx)
@@ -443,7 +447,12 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
                 .current_note
                 .clone()
                 .ok_or_else(|| anyhow!("wallet has no current note"))?;
-            (w.wallet.clone(), w.privacy_key.clone(), note)
+            (
+                w.wallet.clone(),
+                w.privacy_key.clone(),
+                w.viewer_fvk_bundle.clone(),
+                note,
+            )
         };
 
         wait_for_note_in_tree(state.provider.as_ref(), &privacy_key, &current_note).await?;
@@ -472,7 +481,7 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
             vec![input],
             destination_pk_spend,
             destination_pk_ivk,
-            None,
+            viewer_fvk_bundle,
         )
         .await
         .context("transfer (self)")?;
@@ -557,12 +566,15 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         wallets.push(PoolWallet {
             wallet,
             privacy_key,
+            viewer_fvk_bundle: None,
             current_note: None,
             pending: None,
             generating: false,
         });
     }
     *state.wallets.write().await = wallets;
+
+    maybe_fetch_viewer_fvk_bundles(&state).await?;
 
     tracing::info!(
         max_proofs = state.cfg.max_proofs,
@@ -607,6 +619,63 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         ready = ready_proofs(&state).await,
         "Startup complete"
     );
+
+    Ok(())
+}
+
+async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()> {
+    let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
+    let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
+    let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
+        return Ok(());
+    };
+    if pool_fvk_pk_raw.is_empty() {
+        return Ok(());
+    }
+
+    let pool_fvk_pk = parse_hex_32("POOL_FVK_PK", &pool_fvk_pk_raw)?;
+    tracing::info!(
+        wallets = state.cfg.max_proofs,
+        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
+    );
+
+    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
+
+    let wallets = state.wallets.read().await;
+    for (idx, w) in wallets.iter().enumerate() {
+        let http = state.http.clone();
+        let wallet_address = w.wallet.get_address().to_string();
+        let shielded_address = w.privacy_key.privacy_address(&DOMAIN).to_string();
+        let permit = sem.clone().acquire_owned().await?;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let bundle = fetch_viewer_fvk_bundle(
+                &http,
+                Some(pool_fvk_pk),
+                Some(&shielded_address),
+                Some(&wallet_address),
+            )
+            .await
+            .with_context(|| format!("fetch_viewer_fvk_bundle wallet_idx={idx}"))?;
+            Ok((idx, bundle))
+        });
+    }
+    drop(wallets);
+
+    let mut out: Vec<Option<ViewerFvkBundle>> = vec![None; state.cfg.max_proofs];
+    while let Some(res) = join_set.join_next().await {
+        let (idx, bundle) = res??;
+        out[idx] = Some(bundle);
+    }
+
+    let mut wallets = state.wallets.write().await;
+    for (idx, bundle) in out.into_iter().enumerate() {
+        let bundle = bundle.ok_or_else(|| anyhow!("missing viewer bundle for wallet {idx}"))?;
+        if let Some(w) = wallets.get_mut(idx) {
+            w.viewer_fvk_bundle = Some(bundle);
+        }
+    }
 
     Ok(())
 }
@@ -658,16 +727,36 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
             let _permit = permit;
             let start = Instant::now();
             let deadline = start + Duration::from_secs(60);
+            let mut last_err: Option<anyhow::Error> = None;
             loop {
-                let bal = provider
-                    .get_balance::<McpSpec>(&addr, &token_id)
-                    .await
-                    .context("get_balance")?
-                    .0;
+                let bal = match provider.get_balance::<McpSpec>(&addr, &token_id).await {
+                    Ok(amount) => {
+                        if last_err.is_some() {
+                            last_err = None;
+                        }
+                        amount.0
+                    }
+                    Err(e) => {
+                        // The bank balance endpoint returns 404 until the first transfer to that
+                        // address becomes queryable. Treat any transient query error as
+                        // "balance=0" and keep polling until the deadline.
+                        tracing::debug!(address = %addr, error = %e, "Failed to query L2 balance while waiting for funding");
+                        last_err = Some(e);
+                        0
+                    }
+                };
                 if bal >= min_balance {
                     return Ok(());
                 }
                 if Instant::now() > deadline {
+                    if let Some(e) = last_err {
+                        bail!(
+                            "Timed out waiting for wallet to be funded (have {}, need {}): {}",
+                            bal,
+                            min_balance,
+                            e
+                        );
+                    }
                     bail!(
                         "Timed out waiting for wallet to be funded (have {}, need {})",
                         bal,

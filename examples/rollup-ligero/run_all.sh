@@ -240,6 +240,14 @@ if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
   PROVER_PORT="1313"
 fi
 
+PROOF_POOL_BIND="${PROOF_POOL_BIND_ADDR:-127.0.0.1:11235}"
+PROOF_POOL_HOST="${PROOF_POOL_BIND%:*}"
+PROOF_POOL_PORT="${PROOF_POOL_BIND##*:}"
+if [[ "$PROOF_POOL_HOST" == "$PROOF_POOL_PORT" ]]; then
+  PROOF_POOL_HOST="$PROOF_POOL_BIND"
+  PROOF_POOL_PORT="11235"
+fi
+
 # Support both DEFER_SUBMISSION and DEFER_SEQUENCER_SUBMISSION
 if [[ -n "${DEFER_SUBMISSION:-}" && -z "${DEFER_SEQUENCER_SUBMISSION:-}" ]]; then
   export DEFER_SEQUENCER_SUBMISSION="$DEFER_SUBMISSION"
@@ -280,6 +288,10 @@ wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
 echo "Starting prover..."
 start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
 wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "$LAST_PID"
+
+echo "Starting proof-pool..."
+start_service "proof-pool" bash "$SCRIPT_DIR/run_proof_pool.sh"
+wait_for_port "proof-pool" "$PROOF_POOL_HOST" "$PROOF_POOL_PORT" "$LAST_PID"
 
 echo "Starting metrics..."
 start_service "metrics" bash "$SCRIPT_DIR/run_metrics.sh"
