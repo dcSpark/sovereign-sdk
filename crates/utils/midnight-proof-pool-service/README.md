@@ -9,6 +9,9 @@ requested number of pending transactions to the sequencer, and the service refil
 
 - `GET /status?auth_token=...`
   - Returns `{ max_proofs, ready_proofs }`
+- `POST /max_proofs?auth_token=...` with JSON body `{ "max_proofs": N }`
+  - Updates the target `MAX_PROOFS` (the service scales wallets up if needed and refills pending proofs to match)
+- Also supports: `GET /max_proofs?auth_token=...&max_proofs=N` (phone-friendly)
 - `POST /send?auth_token=...` with JSON body `{ "proof_quantity": N }`
   - Flushes up to `N` pending txs to the sequencer (via verifier `/midnight-privacy/flush?limit=N`)
 - Also supports: `GET /send?auth_token=...&proof_quantity=N` (phone-friendly)
@@ -19,7 +22,7 @@ requested number of pending transactions to the sequencer, and the service refil
 ## Required env
 
 - `AUTH_TOKEN` - required; used as `?auth_token=...` on all endpoints
-- `MAX_PROOFS` - number of wallets / pending proofs to maintain
+- `MAX_PROOFS` - initial number of wallets / target pending proofs to maintain (can be updated at runtime via `/max_proofs`)
 - `ADMIN_WALLET_PRIVATE_KEY` - hex private key used to fund generated wallets
 - `ROLLUP_RPC_URL` - rollup node base URL (default: `http://127.0.0.1:12346`)
 - `DA_CONNECTION_STRING` - **must match the node's DA DB** (e.g. `sqlite://.../demo_data/da.sqlite?mode=rwc`)
@@ -53,6 +56,7 @@ cargo run -p midnight-proof-pool-service --release
 
 ```bash
 curl "http://127.0.0.1:11235/status?auth_token=secret"
+curl "http://127.0.0.1:11235/max_proofs?auth_token=secret&max_proofs=25"
 curl "http://127.0.0.1:11235/send?auth_token=secret&proof_quantity=25"
 curl "http://127.0.0.1:11235/burst?auth_token=secret&proof_quantities=2,5,10"
 ```

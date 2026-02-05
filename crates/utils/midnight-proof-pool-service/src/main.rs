@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,7 +139,9 @@ struct PoolWallet {
 
 struct ServiceState {
     cfg: Config,
+    target_max_proofs: AtomicUsize,
     provider: Arc<Provider>,
+    deposit_provider: Arc<Provider>,
     http: HttpClient,
     verifier_url: String,
     ligero: Arc<Ligero>,
@@ -177,6 +180,18 @@ struct BurstQuery {
 #[derive(Debug, Deserialize)]
 struct BurstBody {
     proof_quantities: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MaxProofsQuery {
+    #[serde(alias = "token")]
+    auth_token: Option<String>,
+    max_proofs: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MaxProofsBody {
+    max_proofs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,8 +248,13 @@ async fn main() -> Result<()> {
     // Avoid a 10s sequencer confirmation wait in mcp-external::operations::transfer.
     std::env::set_var("MCP_TRANSFER_WAIT_MODE", "none");
 
-    let verifier_url = start_embedded_verifier(&cfg).await?;
+    let verifier_url = start_embedded_verifier(&cfg, true).await?;
     tracing::info!(verifier_url, "Embedded verifier started (defer mode)");
+    let deposit_verifier_url = start_embedded_verifier(&cfg, false).await?;
+    tracing::info!(
+        deposit_verifier_url,
+        "Deposit verifier started (immediate mode)"
+    );
 
     wait_for_sequencer_ready(&cfg.rollup_rpc_url, Duration::from_secs(60)).await?;
 
@@ -242,6 +262,11 @@ async fn main() -> Result<()> {
         Provider::new(&cfg.rollup_rpc_url, &verifier_url, &cfg.indexer_url)
             .await
             .context("Failed to create rollup provider")?,
+    );
+    let deposit_provider = Arc::new(
+        Provider::new(&cfg.rollup_rpc_url, &deposit_verifier_url, &cfg.indexer_url)
+            .await
+            .context("Failed to create deposit provider")?,
     );
     start_background_tree_sync(provider.clone());
 
@@ -266,7 +291,9 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(ServiceState {
         cfg: cfg.clone(),
+        target_max_proofs: AtomicUsize::new(cfg.max_proofs),
         provider: provider.clone(),
+        deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
         verifier_url: verifier_url.clone(),
         ligero: ligero.clone(),
@@ -276,12 +303,26 @@ async fn main() -> Result<()> {
         proof_semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_proofs)),
     });
 
-    setup_wallets_and_fill_pool(state.clone()).await?;
-    spawn_refill_loop(state.clone());
+    // Start the HTTP server immediately; perform wallet setup + initial pool fill in the background.
+    // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
+    let setup_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = setup_wallets_and_fill_pool(setup_state.clone()).await {
+            tracing::error!(error = %e, "Startup setup failed; proof pool will not generate proofs");
+            return;
+        }
+
+        spawn_refill_loop(setup_state.clone());
+        spawn_wallet_scale_loop(setup_state);
+    });
 
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
+        .route(
+            "/max_proofs",
+            post(max_proofs_handler).get(max_proofs_handler_get),
+        )
         .route("/send", post(send_handler).get(send_handler_get))
         .route("/burst", post(burst_handler).get(burst_handler_get))
         .with_state(state);
@@ -316,10 +357,26 @@ async fn status_handler(
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
     let ready = ready_proofs(&state).await;
+    let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
     Ok(Json(StatusResponse {
-        max_proofs: state.cfg.max_proofs,
+        max_proofs,
         ready_proofs: ready,
     }))
+}
+
+async fn max_proofs_handler_get(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<MaxProofsQuery>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    max_proofs_impl(state, query, None).await
+}
+
+async fn max_proofs_handler(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<MaxProofsQuery>,
+    body: Option<Json<MaxProofsBody>>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    max_proofs_impl(state, query, body.map(|b| b.0)).await
 }
 
 async fn send_handler_get(
@@ -350,6 +407,30 @@ async fn burst_handler(
     body: Option<Json<BurstBody>>,
 ) -> Result<Json<BurstResponse>, StatusCode> {
     burst_impl(state, query, body.map(|b| b.0)).await
+}
+
+async fn max_proofs_impl(
+    state: Arc<ServiceState>,
+    query: MaxProofsQuery,
+    body: Option<MaxProofsBody>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
+
+    let requested = body.map(|b| b.max_proofs).or(query.max_proofs);
+    if let Some(max_proofs) = requested {
+        if max_proofs == 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        state.target_max_proofs.store(max_proofs, Ordering::Relaxed);
+        tracing::info!(max_proofs, "Updated MAX_PROOFS target");
+    }
+
+    let ready = ready_proofs(&state).await;
+    let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
+    Ok(Json(StatusResponse {
+        max_proofs,
+        ready_proofs: ready,
+    }))
 }
 
 async fn send_impl(
@@ -495,7 +576,8 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
     tokio::spawn(async move {
         loop {
             let ready = ready_proofs(&state).await;
-            if ready >= state.cfg.max_proofs {
+            let target = state.target_max_proofs.load(Ordering::Relaxed);
+            if ready >= target {
                 sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -524,6 +606,25 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
                     tracing::warn!(wallet_idx, error = %e, "Failed to generate pending proof");
                 }
             });
+        }
+    });
+}
+
+fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
+    tokio::spawn(async move {
+        loop {
+            let target = state.target_max_proofs.load(Ordering::Relaxed);
+            let current = state.wallets.read().await.len();
+            if current < target {
+                let to_add = target - current;
+                tracing::info!(current, target, to_add, "Scaling wallet pool up");
+                if let Err(e) = setup_and_append_wallets(&state, to_add).await {
+                    tracing::error!(error = %e, "Failed to scale wallet pool");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+            sleep(Duration::from_secs(1)).await;
         }
     });
 }
@@ -700,9 +801,6 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
     );
     let deposit_notes = submit_deposits(&state).await?;
 
-    tracing::info!("Flushing deposits to sequencer");
-    let _ = flush_verifier(&state, None).await?;
-
     tracing::info!("Waiting for deposit notes to be indexed");
     for (wallet_idx, note) in deposit_notes.iter().enumerate() {
         let wallets = state.wallets.read().await;
@@ -721,16 +819,270 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         }
     }
 
-    tracing::info!("Generating initial pending proofs (MAX_PROOFS)");
-    fill_pool_initial(state.clone()).await?;
-
+    let ready = ready_proofs(&state).await;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
-        ready = ready_proofs(&state).await,
+        ready,
         "Startup complete"
     );
 
     Ok(())
+}
+
+async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    let l2_funding_amount = state.cfg.deposit_amount + state.cfg.auto_fund_gas_reserve;
+    tracing::info!(
+        count,
+        l2_funding_amount,
+        deposit_amount = state.cfg.deposit_amount,
+        "Setting up new wallets"
+    );
+
+    let mut new_wallets: Vec<PoolWallet> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let wallet = McpWalletContext::from_private_key_hex(&generate_key_hex())?;
+        let privacy_key = PrivacyKey::from_hex(generate_key_hex())?;
+        new_wallets.push(PoolWallet {
+            wallet,
+            privacy_key,
+            viewer_fvk_bundle: None,
+            current_note: None,
+            pending: None,
+            generating: false,
+        });
+    }
+
+    maybe_fetch_viewer_fvk_bundles_for_wallets(state, &mut new_wallets).await?;
+
+    fund_wallets_list(state, &new_wallets, l2_funding_amount).await?;
+    wait_for_wallet_balances_list(state, &new_wallets, l2_funding_amount).await?;
+
+    tracing::info!("Submitting new deposits");
+    let deposit_notes = submit_deposits_list(state, &new_wallets).await?;
+
+    tracing::info!("Waiting for new deposit notes to be indexed");
+    for (wallet_idx, note) in deposit_notes.iter().enumerate() {
+        let w = new_wallets
+            .get(wallet_idx)
+            .ok_or_else(|| anyhow!("wallet idx out of range"))?;
+        wait_for_note_in_tree(state.provider.as_ref(), &w.privacy_key, note).await?;
+    }
+
+    for (w, note) in new_wallets.iter_mut().zip(deposit_notes.into_iter()) {
+        w.current_note = Some(note);
+    }
+
+    let (start_idx, total) = {
+        let mut wallets = state.wallets.write().await;
+        let start_idx = wallets.len();
+        wallets.extend(new_wallets);
+        (start_idx, wallets.len())
+    };
+
+    tracing::info!(
+        start_idx,
+        total,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Wallet pool scaled up"
+    );
+    Ok(())
+}
+
+async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
+    state: &Arc<ServiceState>,
+    wallets: &mut [PoolWallet],
+) -> Result<()> {
+    let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
+    let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
+    let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
+        return Ok(());
+    };
+    if pool_fvk_pk_raw.is_empty() {
+        return Ok(());
+    }
+
+    let pool_fvk_pk = parse_hex_32("POOL_FVK_PK", &pool_fvk_pk_raw)?;
+    tracing::info!(
+        wallets = wallets.len(),
+        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
+    );
+
+    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
+
+    for (idx, w) in wallets.iter().enumerate() {
+        let http = state.http.clone();
+        let wallet_address = w.wallet.get_address().to_string();
+        let shielded_address = w.privacy_key.privacy_address(&DOMAIN).to_string();
+        let permit = sem.clone().acquire_owned().await?;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let bundle = fetch_viewer_fvk_bundle(
+                &http,
+                Some(pool_fvk_pk),
+                Some(&shielded_address),
+                Some(&wallet_address),
+            )
+            .await
+            .with_context(|| format!("fetch_viewer_fvk_bundle wallet_idx={idx}"))?;
+            Ok((idx, bundle))
+        });
+    }
+
+    let mut out: Vec<Option<ViewerFvkBundle>> = vec![None; wallets.len()];
+    while let Some(res) = join_set.join_next().await {
+        let (idx, bundle) = res??;
+        out[idx] = Some(bundle);
+    }
+
+    for (idx, bundle) in out.into_iter().enumerate() {
+        let bundle = bundle.ok_or_else(|| anyhow!("missing viewer bundle for wallet {idx}"))?;
+        if let Some(w) = wallets.get_mut(idx) {
+            w.viewer_fvk_bundle = Some(bundle);
+        }
+    }
+
+    Ok(())
+}
+
+async fn fund_wallets_list(
+    state: &Arc<ServiceState>,
+    wallets: &[PoolWallet],
+    amount: u128,
+) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+
+    for w in wallets.iter() {
+        let provider = state.provider.clone();
+        let admin = state.admin_wallet.clone();
+        let token_id = state.gas_token_id.clone();
+        let to_addr = w.wallet.get_address().to_string();
+        let permit = sem.clone().acquire_owned().await?;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let _res = send_funds(
+                provider.as_ref(),
+                admin.as_ref(),
+                &to_addr,
+                &token_id,
+                Amount::from(amount),
+            )
+            .await?;
+            Ok(())
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        res??;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_wallet_balances_list(
+    state: &Arc<ServiceState>,
+    wallets: &[PoolWallet],
+    min_balance: u128,
+) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+
+    for w in wallets.iter() {
+        let provider = state.provider.clone();
+        let token_id = state.gas_token_id.clone();
+        let addr = w.wallet.get_address();
+        let permit = sem.clone().acquire_owned().await?;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let start = Instant::now();
+            let deadline = start + Duration::from_secs(60);
+            let mut last_err: Option<anyhow::Error> = None;
+            loop {
+                let bal = match provider.get_balance::<McpSpec>(&addr, &token_id).await {
+                    Ok(amount) => {
+                        if last_err.is_some() {
+                            last_err = None;
+                        }
+                        amount.0
+                    }
+                    Err(e) => {
+                        tracing::debug!(address = %addr, error = %e, "Failed to query L2 balance while waiting for funding");
+                        last_err = Some(e);
+                        0
+                    }
+                };
+                if bal >= min_balance {
+                    return Ok(());
+                }
+                if Instant::now() > deadline {
+                    if let Some(e) = last_err {
+                        bail!(
+                            "Timed out waiting for wallet to be funded (have {}, need {}): {}",
+                            bal,
+                            min_balance,
+                            e
+                        );
+                    }
+                    bail!(
+                        "Timed out waiting for wallet to be funded (have {}, need {})",
+                        bal,
+                        min_balance
+                    );
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        res??;
+    }
+
+    Ok(())
+}
+
+async fn submit_deposits_list(
+    state: &Arc<ServiceState>,
+    wallets: &[PoolWallet],
+) -> Result<Vec<NoteState>> {
+    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let mut join_set: JoinSet<Result<(usize, NoteState)>> = JoinSet::new();
+
+    for (idx, w) in wallets.iter().enumerate() {
+        let provider = state.deposit_provider.clone();
+        let wallet = w.wallet.clone();
+        let privacy_key = w.privacy_key.clone();
+        let deposit_amount = state.cfg.deposit_amount;
+        let permit = sem.clone().acquire_owned().await?;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let res = deposit(provider.as_ref(), &wallet, deposit_amount, &privacy_key).await?;
+            Ok((
+                idx,
+                NoteState {
+                    value: deposit_amount,
+                    rho: res.rho,
+                    sender_id: privacy_key.recipient(&DOMAIN),
+                },
+            ))
+        });
+    }
+
+    let mut out: Vec<Option<NoteState>> = vec![None; wallets.len()];
+    while let Some(res) = join_set.join_next().await {
+        let (idx, note) = res??;
+        out[idx] = Some(note);
+    }
+
+    out.into_iter()
+        .map(|o| o.ok_or_else(|| anyhow!("missing deposit note result")))
+        .collect()
 }
 
 async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()> {
@@ -891,8 +1243,9 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     let mut join_set: JoinSet<Result<(usize, NoteState)>> = JoinSet::new();
 
     let wallets = state.wallets.read().await;
+    let wallets_len = wallets.len();
     for (idx, w) in wallets.iter().enumerate() {
-        let provider = state.provider.clone();
+        let provider = state.deposit_provider.clone();
         let wallet = w.wallet.clone();
         let privacy_key = w.privacy_key.clone();
         let deposit_amount = state.cfg.deposit_amount;
@@ -912,7 +1265,7 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     }
     drop(wallets);
 
-    let mut out: Vec<Option<NoteState>> = vec![None; state.cfg.max_proofs];
+    let mut out: Vec<Option<NoteState>> = vec![None; wallets_len];
     while let Some(res) = join_set.join_next().await {
         let (idx, note) = res??;
         out[idx] = Some(note);
@@ -921,25 +1274,6 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     out.into_iter()
         .map(|o| o.ok_or_else(|| anyhow!("missing deposit note result")))
         .collect()
-}
-
-async fn fill_pool_initial(state: Arc<ServiceState>) -> Result<()> {
-    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
-    for idx in 0..state.cfg.max_proofs {
-        let st = state.clone();
-        let permit = st.proof_semaphore.clone().acquire_owned().await?;
-        join_set.spawn(async move {
-            let _permit = permit;
-            generate_pending_for_wallet(&st, idx).await?;
-            Ok(())
-        });
-    }
-
-    while let Some(res) = join_set.join_next().await {
-        res??;
-    }
-
-    Ok(())
 }
 
 async fn flush_verifier(state: &Arc<ServiceState>, limit: Option<usize>) -> Result<FlushSummary> {
@@ -1022,7 +1356,7 @@ fn compute_ligero_method_id(program: &str) -> Result<[u8; 32]> {
     Ok(method_id)
 }
 
-async fn start_embedded_verifier(cfg: &Config) -> Result<String> {
+async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool) -> Result<String> {
     let method_id = compute_ligero_method_id(&cfg.ligero_program_path)?;
 
     type RollupSpec = sov_proof_verifier_service::RollupSpec;
@@ -1055,7 +1389,7 @@ async fn start_embedded_verifier(cfg: &Config) -> Result<String> {
         max_concurrent_verifications: cfg.max_concurrent_proofs,
         chain_id: 1,
         da_connection_string: cfg.da_connection_string.clone(),
-        defer_sequencer_submission: true,
+        defer_sequencer_submission,
         prover_service_url: cfg
             .verifier_prover_service_url
             .clone()
