@@ -68,6 +68,7 @@ use crate::common::{
     cache_sequencer_metrics, error_not_fully_synced, generic_accept_tx_error,
     loop_send_tx_notifications, poll_state_update, AcceptedTx, Sequencer, SequencerEventStream,
     SequencerMetrics, StateUpdateError, StateUpdateNotification, WithCachedTxHashes,
+    take_parallel_tx_failure,
 };
 use crate::metrics::{track_in_progress_batch_size, PreferredSequencerFetchBatchesToReplayMetrics};
 use crate::preferred::block_executor::{RollupBlockExecutor, RollupBlockExecutorError};
@@ -894,7 +895,15 @@ where
         };
 
         match res {
-            Ok(rx) => rx.await.map_err(database_error_500),
+            Ok(rx) => match rx.await {
+                Ok(accepted) => Ok(accepted),
+                Err(err) => {
+                    if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
+                        return Err(par_err);
+                    }
+                    Err(database_error_500(err))
+                }
+            },
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => {
                     return Err(sequencer_overloaded_503());
@@ -1013,7 +1022,16 @@ where
 
         let await_start = std::time::Instant::now();
         let result = match res {
-            Ok(rx) => rx.await.map_err(database_error_500),
+            Ok(rx) => match rx.await {
+                Ok(accepted) => Ok(accepted),
+                Err(err) => {
+                    if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
+                        Err(par_err)
+                    } else {
+                        Err(database_error_500(err))
+                    }
+                }
+            },
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => Err(sequencer_overloaded_503()),
                 AcceptTxError::NotFullySynced(details) => {

@@ -137,6 +137,22 @@ fn sequencer_metrics_map() -> &'static StdMutex<HashMap<TxHash, SequencerMetrics
     SEQUENCER_METRICS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+// Capture parallel execution failures so HTTP callers can see the real error
+// instead of a generic "channel closed" when the parallel worker drops its waiter.
+static PARALLEL_TX_FAILURES: OnceLock<StdMutex<HashMap<TxHash, ErrorObject>>> = OnceLock::new();
+
+fn parallel_tx_failures_map() -> &'static StdMutex<HashMap<TxHash, ErrorObject>> {
+    PARALLEL_TX_FAILURES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn cache_parallel_tx_failure(tx_hash: TxHash, err: ErrorObject) {
+    let _ = parallel_tx_failures_map().lock().unwrap().insert(tx_hash, err);
+}
+
+pub(crate) fn take_parallel_tx_failure(tx_hash: &TxHash) -> Option<ErrorObject> {
+    parallel_tx_failures_map().lock().unwrap().remove(tx_hash)
+}
+
 pub(crate) fn cache_sequencer_metrics(tx_hash: TxHash, metrics: SequencerMetrics) {
     let _ = sequencer_metrics_map()
         .lock()

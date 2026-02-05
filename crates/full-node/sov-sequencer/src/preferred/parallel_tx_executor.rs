@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::common::cache_parallel_tx_failure;
 use crate::preferred::cache_warm_up_executor::StartBlockNotification;
 use crate::preferred::PreferredSequencerConfig;
 use crate::preferred::RollupBlockExecutor;
@@ -469,11 +470,18 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     }
                                 }
                 Err(err) => {
-                    tracing::debug!(
+                    let err_obj = err.into_http_error();
+                    let status = err_obj.status;
+                    let message = err_obj.message.clone();
+                    let details = err_obj.details.clone();
+                    cache_parallel_tx_failure(request.tx_hash, err_obj);
+                    tracing::warn!(
                         worker_id,
                         tx_hash = %request.tx_hash,
-                        %err,
-                        "Parallel worker failed to execute transaction"
+                        %status,
+                        message = %message,
+                        details = ?details,
+                        "Parallel worker failed to execute transaction; cached failure for HTTP response"
                     );
                     // Notify the main sequencer so it can clean up the HTTP waiter
                     // and decrement the in-flight parallel counter, instead of
