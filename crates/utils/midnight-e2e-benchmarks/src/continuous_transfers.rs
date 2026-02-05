@@ -111,6 +111,8 @@ struct ContinuousConfig {
     wallet_offset: usize,
     /// Re-sync wallet generation from chain at the start of each cycle.
     resync_nonces_each_cycle: bool,
+    /// Timeout (seconds) while waiting for submitted transfers to appear in ledger.
+    ledger_inclusion_timeout_secs: u64,
     initial_deposit: bool,
     /// Amount to deposit initially into each wallet.
     deposit_amount: u128,
@@ -149,6 +151,12 @@ impl ContinuousConfig {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
+
+        let ledger_inclusion_timeout_secs = std::env::var("LEDGER_INCLUSION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15)
+            .max(1);
 
         let initial_deposit = std::env::var("INITIAL_DEPOSIT")
             .ok()
@@ -227,6 +235,7 @@ impl ContinuousConfig {
             num_wallets,
             wallet_offset,
             resync_nonces_each_cycle,
+            ledger_inclusion_timeout_secs,
             initial_deposit,
             deposit_amount,
             transfer_amount,
@@ -568,8 +577,9 @@ fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()>
     eprintln!("{}", prompt);
 
     if config.continuous {
-        // In continuous mode, just sleep for cycle_delay_ms instead of waiting for user input
-        std::thread::sleep(Duration::from_millis(config.cycle_delay_ms));
+        // In continuous mode, do not block here.
+        // Pacing is handled once at the end of each cycle.
+        return Ok(());
     } else {
         eprint!("Press Enter to continue...");
         std::io::stdout().flush().ok();
@@ -617,10 +627,11 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
         config.num_wallets,
         config.wallet_offset,
         config.resync_nonces_each_cycle,
+        config.ledger_inclusion_timeout_secs,
         config.initial_deposit,
         config.deposit_amount,
         config.transfer_amount,
@@ -2864,7 +2875,10 @@ async fn perform_transfer_cycle(
         transfer_submit_ms / transfer_hashes.len() as f64
     );
     // Interactive gate before flushing to the sequencer.
-    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+    // In continuous mode, skip this pause to reduce anchor staleness.
+    if !config.continuous {
+        wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+    }
     let flush_start = Instant::now();
     let resp = http
         .post(format!("{}/midnight-privacy/flush", verifier_url))
@@ -3038,7 +3052,8 @@ async fn perform_transfer_cycle(
             continue;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline =
+            Instant::now() + Duration::from_secs(config.ledger_inclusion_timeout_secs);
         loop {
             match client
                 .query_rest_endpoint::<api_types::LedgerTx>(&format!(
@@ -3074,8 +3089,8 @@ async fn perform_transfer_cycle(
                 Err(_) => {
                     if Instant::now() > deadline {
                         eprintln!(
-                            "[cycle] Timeout waiting for transfer {} to appear in ledger",
-                            hash_hex
+                            "[cycle] Timeout waiting for transfer {} to appear in ledger ({}s)",
+                            hash_hex, config.ledger_inclusion_timeout_secs
                         );
                         break;
                     }
