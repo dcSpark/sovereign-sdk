@@ -3056,6 +3056,10 @@ where
         TransactionState::Rejected
     });
     active_model.sequencer_status = Set(outcome.raw_response.clone());
+    // Use `created_at` as the "state transition timestamp" so metrics like peak TPS
+    // reflect *when* the sequencer processed the tx (accepted/rejected), not when it
+    // was first inserted as pending.
+    active_model.created_at = Set(Utc::now());
     active_model.update(conn).await.map_err(|err| {
         ServiceError::Internal(format!(
             "Failed to update worker transaction {tx_hash} after sequencer submission: {err}"
