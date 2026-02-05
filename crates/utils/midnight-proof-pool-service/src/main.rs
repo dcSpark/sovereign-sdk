@@ -166,6 +166,19 @@ struct SendBody {
     proof_quantity: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct BurstQuery {
+    #[serde(alias = "token")]
+    auth_token: Option<String>,
+    /// Comma-separated list, e.g. "2,5,10"
+    proof_quantities: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BurstBody {
+    proof_quantities: Vec<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     max_proofs: usize,
@@ -179,6 +192,22 @@ struct SendResponse {
     accepted: usize,
     rejected: usize,
     ready_proofs: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BurstStep {
+    requested: usize,
+    flushed: usize,
+    accepted: usize,
+    rejected: usize,
+    ready_proofs: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BurstResponse {
+    interval_seconds: u64,
+    steps: Vec<BurstStep>,
+    elapsed_ms: u128,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +283,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
         .route("/send", post(send_handler).get(send_handler_get))
+        .route("/burst", post(burst_handler).get(burst_handler_get))
         .with_state(state);
 
     tracing::info!(bind = %cfg.bind_addr, "HTTP server listening");
@@ -307,6 +337,21 @@ async fn send_handler(
     send_impl(state, query, body.map(|b| b.0)).await
 }
 
+async fn burst_handler_get(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<BurstQuery>,
+) -> Result<Json<BurstResponse>, StatusCode> {
+    burst_impl(state, query, None).await
+}
+
+async fn burst_handler(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<BurstQuery>,
+    body: Option<Json<BurstBody>>,
+) -> Result<Json<BurstResponse>, StatusCode> {
+    burst_impl(state, query, body.map(|b| b.0)).await
+}
+
 async fn send_impl(
     state: Arc<ServiceState>,
     query: SendQuery,
@@ -337,11 +382,76 @@ async fn send_impl(
     }))
 }
 
+async fn burst_impl(
+    state: Arc<ServiceState>,
+    query: BurstQuery,
+    body: Option<BurstBody>,
+) -> Result<Json<BurstResponse>, StatusCode> {
+    check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
+
+    let quantities = if let Some(body) = body {
+        body.proof_quantities
+    } else if let Some(ref csv) = query.proof_quantities {
+        parse_csv_usizes(csv)?
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    if quantities.is_empty() || quantities.iter().any(|&q| q == 0) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let started = Instant::now();
+    let interval = Duration::from_secs(2);
+    let burst_start = tokio::time::Instant::now();
+
+    let mut steps: Vec<BurstStep> = Vec::with_capacity(quantities.len());
+    for (idx, requested) in quantities.iter().copied().enumerate() {
+        tokio::time::sleep_until(burst_start + interval * (idx as u32)).await;
+
+        let flush = flush_verifier(&state, Some(requested))
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+        apply_flush_results(&state, &flush).await;
+        let ready = ready_proofs(&state).await;
+
+        steps.push(BurstStep {
+            requested,
+            flushed: flush.flushed,
+            accepted: flush.accepted,
+            rejected: flush.rejected,
+            ready_proofs: ready,
+        });
+    }
+
+    Ok(Json(BurstResponse {
+        interval_seconds: interval.as_secs(),
+        steps,
+        elapsed_ms: started.elapsed().as_millis(),
+    }))
+}
+
 fn check_auth(expected: &str, provided: Option<&str>) -> Result<(), StatusCode> {
     match provided {
         Some(tok) if tok == expected => Ok(()),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+fn parse_csv_usizes(csv: &str) -> Result<Vec<usize>, StatusCode> {
+    let mut out: Vec<usize> = Vec::new();
+    for part in csv.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        out.push(p.parse::<usize>().map_err(|_| StatusCode::BAD_REQUEST)?);
+    }
+    if out.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(out)
 }
 
 async fn ready_proofs(state: &Arc<ServiceState>) -> usize {

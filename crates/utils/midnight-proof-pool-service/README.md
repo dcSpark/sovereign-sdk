@@ -12,6 +12,9 @@ requested number of pending transactions to the sequencer, and the service refil
 - `POST /send?auth_token=...` with JSON body `{ "proof_quantity": N }`
   - Flushes up to `N` pending txs to the sequencer (via verifier `/midnight-privacy/flush?limit=N`)
 - Also supports: `GET /send?auth_token=...&proof_quantity=N` (phone-friendly)
+- `POST /burst?auth_token=...` with JSON body `{ "proof_quantities": [2, 5, 10] }`
+  - Runs a timed burst: flushes `2`, then `5`, then `10` pending txs, waiting **2 seconds** between steps
+- Also supports: `GET /burst?auth_token=...&proof_quantities=2,5,10` (phone-friendly)
 
 ## Required env
 
@@ -51,4 +54,5 @@ cargo run -p midnight-proof-pool-service --release
 ```bash
 curl "http://127.0.0.1:11235/status?auth_token=secret"
 curl "http://127.0.0.1:11235/send?auth_token=secret&proof_quantity=25"
+curl "http://127.0.0.1:11235/burst?auth_token=secret&proof_quantities=2,5,10"
 ```

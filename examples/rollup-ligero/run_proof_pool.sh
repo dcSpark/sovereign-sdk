@@ -57,6 +57,7 @@ echo ""
 echo "Endpoints:"
 echo "  GET  http://${PROOF_POOL_BIND_ADDR}/status?auth_token=$AUTH_TOKEN"
 echo "  GET  http://${PROOF_POOL_BIND_ADDR}/send?auth_token=$AUTH_TOKEN&proof_quantity=25"
+echo "  GET  http://${PROOF_POOL_BIND_ADDR}/burst?auth_token=$AUTH_TOKEN&proof_quantities=2,5,10"
 echo ""
 
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
