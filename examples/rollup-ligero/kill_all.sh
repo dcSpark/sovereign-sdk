@@ -6,7 +6,7 @@ set -euo pipefail
 echo "Looking for rollup-ligero related processes..."
 
 # Ports used by run_all.sh services
-PORTS=(12346 8080 9090 3000 3001 13100)
+PORTS=(12346 8080 8088 8090 11235 9090 13100 1313 13200 3000 3001)
 
 # Process patterns to kill
 PATTERNS=(
