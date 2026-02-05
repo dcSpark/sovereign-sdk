@@ -107,6 +107,8 @@ struct ProverServiceResponse {
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
     num_wallets: usize,
+    /// Start loading wallets from this genesis keypair index (defaults to 0).
+    wallet_offset: usize,
     initial_deposit: bool,
     /// Amount to deposit initially into each wallet.
     deposit_amount: u128,
@@ -132,6 +134,11 @@ impl ContinuousConfig {
     fn from_env() -> Result<Self> {
         // Number of wallets defaults to interactive prompt unless provided via env.
         let num_wallets = std::env::var("CONTINUOUS_NUM_WALLETS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0usize);
+
+        let wallet_offset = std::env::var("WALLET_OFFSET")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0usize);
@@ -211,6 +218,7 @@ impl ContinuousConfig {
 
         Ok(Self {
             num_wallets,
+            wallet_offset,
             initial_deposit,
             deposit_amount,
             transfer_amount,
@@ -601,8 +609,9 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} wallet_offset={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
         config.num_wallets,
+        config.wallet_offset,
         config.initial_deposit,
         config.deposit_amount,
         config.transfer_amount,
@@ -740,9 +749,16 @@ pub async fn run() -> Result<()> {
         serde_json::from_str(&keypairs_json)
             .with_context(|| "Failed to parse generated_keypairs.json")?;
 
-    if all_keypairs.len() < config.num_wallets {
+    let required_keypairs = config
+        .wallet_offset
+        .checked_add(config.num_wallets)
+        .ok_or_else(|| anyhow!("wallet_offset + num_wallets overflowed usize"))?;
+
+    if all_keypairs.len() < required_keypairs {
         bail!(
-            "Not enough keypairs in genesis file. Need {}, but only {} available.",
+            "Not enough keypairs in genesis file. Need {} keypairs to satisfy WALLET_OFFSET={} and CONTINUOUS_NUM_WALLETS={}, but only {} available.",
+            required_keypairs,
+            config.wallet_offset,
             config.num_wallets,
             all_keypairs.len()
         );
@@ -752,20 +768,21 @@ pub async fn run() -> Result<()> {
     let wallet_setup_start = Instant::now();
     let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
     for i in 0..config.num_wallets {
-        let account = all_keypairs[i].clone();
+        let keypair_idx = config.wallet_offset + i;
+        let account = all_keypairs[keypair_idx].clone();
         let nonce = fetch_initial_nonce(&http, &node_base_url, &account)
             .await
             .with_context(|| {
                 format!(
-                    "Failed to fetch latest nonce/generation for wallet {} (address={})",
-                    i, account.address
+                    "Failed to fetch latest nonce/generation for wallet {} (keypair_idx={}, address={})",
+                    i, keypair_idx, account.address
                 )
             })?;
 
         if config.detailed_wallet_logs {
             eprintln!(
-                "[setup] wallet {} address={} starting_nonce={}",
-                i, account.address, nonce
+                "[setup] wallet {} (keypair_idx={}) address={} starting_nonce={}",
+                i, keypair_idx, account.address, nonce
             );
         }
 
