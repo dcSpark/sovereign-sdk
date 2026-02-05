@@ -239,6 +239,7 @@ impl AppState {
 
         // For SQLite, we need to build SqliteConnectOptions with busy_timeout
         // For other databases, use standard ConnectOptions
+        let da_conn_string_redacted = redact_db_connection_string(&config.da_connection_string);
         let da_conn = if config.da_connection_string.starts_with("sqlite:") {
             use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
             use std::str::FromStr;
@@ -248,7 +249,7 @@ impl AppState {
                 .with_context(|| {
                     format!(
                         "Failed to parse SQLite connection string: {}",
-                        config.da_connection_string
+                        da_conn_string_redacted
                     )
                 })?
                 .busy_timeout(std::time::Duration::from_millis(30000)); // 30 seconds
@@ -265,11 +266,14 @@ impl AppState {
                 .with_context(|| {
                     format!(
                         "Failed to connect to SQLite database at {}",
-                        config.da_connection_string
+                        da_conn_string_redacted
                     )
                 })?;
 
-            info!("Verifier service connected to SQLite database (max_connections=10, busy_timeout=30s)");
+            info!(
+                db = %da_conn_string_redacted,
+                "Verifier service connected to SQLite database (max_connections=10, busy_timeout=30s)"
+            );
 
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
@@ -285,12 +289,15 @@ impl AppState {
                 .max_lifetime(std::time::Duration::from_secs(1800))
                 .sqlx_logging(false);
 
-            info!("Verifier service connecting to PostgreSQL database (max_connections=20)");
+            info!(
+                db = %da_conn_string_redacted,
+                "Verifier service connecting to PostgreSQL database (max_connections=20)"
+            );
 
             Database::connect(connect_opts).await.with_context(|| {
                 format!(
                     "Failed to connect to PostgreSQL database at {}",
-                    config.da_connection_string
+                    da_conn_string_redacted
                 )
             })?
         };
@@ -298,7 +305,14 @@ impl AppState {
             .await
             .context("Failed to initialize MockDA database schema")?;
 
-        info!("✓ Connected to MockDA database (busy_timeout applied per-connection)");
+        info!(
+            db = %da_conn_string_redacted,
+            backend = ?da_conn.get_database_backend(),
+            node_rpc_url = %config.node_rpc_url,
+            defer_sequencer_submission = config.defer_sequencer_submission,
+            "✓ Connected to MockDA database (busy_timeout applied per-connection). \
+             NOTE: The sequencer must be configured to use the SAME database for worker_verified_transactions lookups."
+        );
 
         Ok(Self {
             config: Arc::new(config),
@@ -1364,10 +1378,24 @@ async fn verify_and_record_midnight_handler(
         start: std::time::Instant,
         mut metrics: VerificationMetrics,
     ) -> Result<Json<VerifyAndSubmitResponse>, ServiceError> {
+        info!(
+            tx_hash,
+            da_connection = %redact_db_connection_string(&state.config.da_connection_string),
+            node_rpc_url = %state.config.node_rpc_url,
+            defer_submission = state.config.defer_sequencer_submission,
+            "handle_no_proof_midnight_call: starting persist+submit flow for deposit/no-proof tx"
+        );
+
         let persist_start = std::time::Instant::now();
         // Populate serialized_tx_base64 so sequencer flush path works uniformly.
         let pre_auth_data = match extract_pre_authenticated_data(tx) {
-            Ok(data) => Some(data),
+            Ok(data) => {
+                debug!(
+                    tx_hash,
+                    "✓ Extracted pre-authenticated data for no-proof call"
+                );
+                Some(data)
+            }
             Err(e) => {
                 error!("⚠️  Failed to extract pre-authenticated data for midnight no-proof call: {e}; falling back to base64 body only");
                 Some((
@@ -1394,10 +1422,17 @@ async fn verify_and_record_midnight_handler(
             None, // No encrypted notes (no view_ciphertexts)
         )
         .await?;
-        metrics.tx_creation_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+        let persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+        metrics.tx_creation_ms = persist_ms;
         metrics.proof_verify_ms = 0.0;
+        info!(
+            tx_hash,
+            persist_ms = format!("{:.2}", persist_ms),
+            "handle_no_proof_midnight_call: persist completed, proceeding to sequencer submission"
+        );
 
         if state.config.defer_sequencer_submission {
+            info!(tx_hash, "handle_no_proof_midnight_call: defer mode — skipping immediate sequencer submission");
             // Do not submit now; queued in DB
             metrics.node_submit_ms = 0.0;
             metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1410,10 +1445,24 @@ async fn verify_and_record_midnight_handler(
             }));
         }
 
+        info!(
+            tx_hash,
+            node_base_url = %state.node_client.base_url,
+            "handle_no_proof_midnight_call: submitting worker tx to sequencer (immediate mode)"
+        );
         let sequencer_start = std::time::Instant::now();
         let submission = submit_worker_tx_to_sequencer(state, tx_hash).await?;
         metrics.node_submit_ms = sequencer_start.elapsed().as_secs_f64() * 1000.0;
         metrics.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        info!(
+            tx_hash,
+            accepted = submission.accepted,
+            status_code = ?submission.status_code,
+            sequencer_latency_ms = format!("{:.2}", submission.latency_ms),
+            total_ms = format!("{:.2}", metrics.total_ms),
+            "handle_no_proof_midnight_call: sequencer submission completed"
+        );
 
         let error_message = if submission.accepted {
             None
@@ -2812,6 +2861,7 @@ pub async fn store_verified_midnight_transaction(
         .transpose()?;
 
     // Extract pre-authenticated data if available
+    let has_pre_auth = pre_auth_data.is_some();
     let (pub_key_hex, signature_hex, uniqueness_hex, details_hex, serialized_tx_base64) =
         match pre_auth_data {
             Some((pk, sig, uq, det, ser_tx)) => (
@@ -2845,6 +2895,20 @@ pub async fn store_verified_midnight_transaction(
         Ok((sender_addr.to_string(), recipient))
     })()?;
 
+    let db_backend = conn.get_database_backend();
+    info!(
+        tx_hash,
+        db_backend = ?db_backend,
+        signature_valid,
+        proof_verified = ?proof_verified,
+        sender = %sender_str,
+        recipient = ?recipient_str,
+        has_pre_auth,
+        has_full_tx_location = full_transaction_location.is_some(),
+        "Persisting worker transaction to DA database"
+    );
+
+    let persist_start = std::time::Instant::now();
     VerifiedEntity::insert(VerifiedActiveModel {
         tx_hash: Set(tx_hash.to_owned()),
         signature_valid: Set(signature_valid),
@@ -2894,8 +2958,22 @@ pub async fn store_verified_midnight_transaction(
     .exec(conn)
     .await
     .map_err(|err| {
+        error!(
+            tx_hash,
+            db_backend = ?db_backend,
+            error = %err,
+            "Failed to store verified transaction in DA database"
+        );
         ServiceError::Internal(format!("Failed to store verified transaction: {err}"))
     })?;
+
+    let persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+    info!(
+        tx_hash,
+        db_backend = ?db_backend,
+        persist_ms = format!("{:.2}", persist_ms),
+        "✓ Worker transaction persisted in DA database"
+    );
 
     Ok(())
 }
@@ -2924,6 +3002,13 @@ async fn send_worker_tx_to_sequencer(
     let url = format!(
         "{}/sequencer/worker_txs/{}",
         state.node_client.base_url, tx_hash
+    );
+    info!(
+        tx_hash,
+        url = %url,
+        node_base_url = %state.node_client.base_url,
+        da_connection = %redact_db_connection_string(&state.config.da_connection_string),
+        "Sending worker transaction to sequencer via POST"
     );
     let http_start = std::time::Instant::now();
     let http_result = state.http_client.post(&url).send().await;
@@ -2958,6 +3043,13 @@ async fn send_worker_tx_to_sequencer(
             };
 
             if status.is_success() {
+                info!(
+                    tx_hash,
+                    status = status.as_u16(),
+                    latency_ms = format!("{:.2}", latency_ms),
+                    internal_ms = ?internal_ms,
+                    "✓ Sequencer accepted worker transaction via POST"
+                );
                 SequencerSubmissionOutcome {
                     accepted: true,
                     status_code: Some(status.as_u16()),
@@ -2969,6 +3061,75 @@ async fn send_worker_tx_to_sequencer(
                     internal_breakdown,
                 }
             } else {
+                error!(
+                    tx_hash,
+                    status = status.as_u16(),
+                    url = %url,
+                    latency_ms = format!("{:.2}", latency_ms),
+                    response_body = %body,
+                    "Sequencer worker-tx endpoint returned non-success"
+                );
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    use worker_verified_transactions::{
+                        Column as VerifiedColumn, Entity as VerifiedEntity,
+                    };
+
+                    let local_db = redact_db_connection_string(&state.config.da_connection_string);
+                    let local_backend = state.da_conn.get_database_backend();
+
+                    error!(
+                        tx_hash,
+                        local_db = %local_db,
+                        local_backend = ?local_backend,
+                        sequencer_response = %body,
+                        "404 from sequencer — diagnosing: is the tx in our local DA DB?"
+                    );
+
+                    match VerifiedEntity::find()
+                        .filter(VerifiedColumn::TxHash.eq(tx_hash.to_string()))
+                        .one(state.da_conn.as_ref())
+                        .await
+                    {
+                        Ok(Some(model)) => {
+                            error!(
+                                tx_hash,
+                                local_db = %local_db,
+                                local_backend = ?local_backend,
+                                local_state = ?model.transaction_state,
+                                local_created_at = %model.created_at,
+                                local_signature_valid = model.signature_valid,
+                                local_proof_verified = ?model.proof_verified,
+                                local_sender = %model.sender,
+                                local_recipient = ?model.recipient,
+                                local_has_serialized_tx = model.serialized_tx_base64.is_some(),
+                                local_has_pub_key = model.pub_key_hex.is_some(),
+                                local_sequencer_status = ?model.sequencer_status,
+                                local_full_tx_location = ?model.full_transaction_location,
+                                "DIAGNOSTIC: Worker transaction EXISTS in verifier DA DB but sequencer returned 404. \
+                                 This strongly suggests verifier and sequencer are NOT sharing the same DA database, \
+                                 or the sequencer is reading from a different table/schema."
+                            );
+                        }
+                        Ok(None) => {
+                            error!(
+                                tx_hash,
+                                local_db = %local_db,
+                                local_backend = ?local_backend,
+                                "DIAGNOSTIC: Worker transaction MISSING in verifier DA DB as well — \
+                                 the insert likely failed silently or was rolled back"
+                            );
+                        }
+                        Err(err) => {
+                            error!(
+                                tx_hash,
+                                local_db = %local_db,
+                                local_backend = ?local_backend,
+                                error = %err,
+                                "DIAGNOSTIC: Failed to query verifier DA DB after sequencer 404"
+                            );
+                        }
+                    }
+                }
                 let body_value = parsed_json
                     .clone()
                     .unwrap_or_else(|| serde_json::Value::String(body.clone()));
@@ -2992,6 +3153,13 @@ async fn send_worker_tx_to_sequencer(
         }
         Err(err) => {
             let message = format!("Failed to reach sequencer endpoint: {err}");
+            error!(
+                tx_hash,
+                url = %url,
+                latency_ms = format!("{:.2}", latency_ms),
+                error = %err,
+                "Network error contacting sequencer — is the sequencer running and reachable?"
+            );
             let json_value = serde_json::json!({ "error": message });
             SequencerSubmissionOutcome {
                 accepted: false,
@@ -3007,6 +3175,32 @@ async fn send_worker_tx_to_sequencer(
     };
 
     Ok(outcome)
+}
+
+fn redact_db_connection_string(s: &str) -> String {
+    let Some(scheme_end) = s.find("://") else {
+        return s.to_string();
+    };
+    let (scheme, rest) = s.split_at(scheme_end + 3);
+
+    // Only treat `userinfo@...` as such if the '@' appears before any '/' or '?'.
+    let Some(at_pos) = rest.find('@') else {
+        return s.to_string();
+    };
+    let slash_pos = rest.find('/').unwrap_or(rest.len());
+    let q_pos = rest.find('?').unwrap_or(rest.len());
+    let end_userinfo = slash_pos.min(q_pos);
+    if at_pos > end_userinfo {
+        return s.to_string();
+    }
+
+    let userinfo = &rest[..at_pos];
+    let after = &rest[at_pos + 1..];
+    let Some(colon_pos) = userinfo.find(':') else {
+        return s.to_string();
+    };
+    let user = &userinfo[..colon_pos];
+    format!("{scheme}{user}:***@{after}")
 }
 
 /// Update the worker transaction record in the shared MockDA database after
@@ -3034,40 +3228,77 @@ where
         TransactionState,
     };
 
+    let db_backend = conn.get_database_backend();
+    debug!(
+        tx_hash,
+        accepted = outcome.accepted,
+        db_backend = ?db_backend,
+        "update_worker_tx_after_submission: fetching record from DA DB to update state"
+    );
+
     let record = VerifiedEntity::find()
         .filter(VerifiedColumn::TxHash.eq(tx_hash))
         .one(conn)
         .await
         .map_err(|err| {
+            error!(
+                tx_hash,
+                db_backend = ?db_backend,
+                error = %err,
+                "update_worker_tx_after_submission: failed to fetch worker tx from DA DB"
+            );
             ServiceError::Internal(format!(
                 "Failed to fetch worker transaction {tx_hash} before sequencer submission: {err}"
             ))
         })?
         .ok_or_else(|| {
+            error!(
+                tx_hash,
+                db_backend = ?db_backend,
+                "update_worker_tx_after_submission: worker tx NOT FOUND in DA DB after persisting — \
+                 row may have been deleted or insert was rolled back"
+            );
             ServiceError::Internal(format!(
                 "Worker transaction {tx_hash} not found after persisting"
             ))
         })?;
 
-    let mut active_model: VerifiedActiveModel = record.into();
-    active_model.transaction_state = Set(if outcome.accepted {
+    let new_state = if outcome.accepted {
         TransactionState::Accepted
     } else {
         TransactionState::Rejected
-    });
+    };
+    debug!(
+        tx_hash,
+        old_state = ?record.transaction_state,
+        new_state = ?new_state,
+        "update_worker_tx_after_submission: updating transaction state"
+    );
+
+    let mut active_model: VerifiedActiveModel = record.into();
+    active_model.transaction_state = Set(new_state);
     active_model.sequencer_status = Set(outcome.raw_response.clone());
     // Use `created_at` as the "state transition timestamp" so metrics like peak TPS
     // reflect *when* the sequencer processed the tx (accepted/rejected), not when it
     // was first inserted as pending.
     active_model.created_at = Set(Utc::now());
     active_model.update(conn).await.map_err(|err| {
+        error!(
+            tx_hash,
+            db_backend = ?db_backend,
+            error = %err,
+            "update_worker_tx_after_submission: failed to update worker tx in DA DB"
+        );
         ServiceError::Internal(format!(
             "Failed to update worker transaction {tx_hash} after sequencer submission: {err}"
         ))
     })?;
 
     if outcome.accepted {
-        debug!("✓ Sequencer accepted worker transaction {}", tx_hash);
+        info!(
+            tx_hash,
+            "✓ Worker transaction state updated to Accepted in DA DB"
+        );
     } else {
         let status_display = outcome
             .status_code
@@ -3076,6 +3307,7 @@ where
         error!(
             tx_hash,
             status = status_display.as_str(),
+            raw_response = ?outcome.raw_response,
             "Sequencer rejected worker transaction: {}",
             outcome.log_message
         );
@@ -3088,8 +3320,24 @@ async fn submit_worker_tx_to_sequencer(
     state: &AppState,
     tx_hash: &str,
 ) -> Result<SequencerSubmissionOutcome, ServiceError> {
+    info!(
+        tx_hash,
+        node_base_url = %state.node_client.base_url,
+        da_connection = %redact_db_connection_string(&state.config.da_connection_string),
+        "submit_worker_tx_to_sequencer: starting sequencer submission"
+    );
+
     // First, send the worker transaction to the sequencer and obtain its outcome.
     let outcome = send_worker_tx_to_sequencer(state, tx_hash).await?;
+
+    info!(
+        tx_hash,
+        accepted = outcome.accepted,
+        status_code = ?outcome.status_code,
+        latency_ms = format!("{:.2}", outcome.latency_ms),
+        internal_ms = ?outcome.internal_ms,
+        "submit_worker_tx_to_sequencer: sequencer responded"
+    );
 
     // Apply the DB update in the background so this function's latency is
     // dominated by the sequencer HTTP round-trip, not SQLite/Postgres writes.

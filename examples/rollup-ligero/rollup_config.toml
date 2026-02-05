@@ -4,7 +4,7 @@
 #  - "sqlite::memory:"
 #  - "postgresql://root:hunter2@aws.amazon.com/mock-da"
 # connection_string = "postgresql://admin:1234@localhost:5432/sovereign"
-connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
+connection_string = "postgresql://admin:1234@localhost:5432/da"
 # String representation of sequencer address.
 # For initial full node should match genesis of sequencer-registry.
 # It is going to be a DA address that blobs from this node will be associated with.

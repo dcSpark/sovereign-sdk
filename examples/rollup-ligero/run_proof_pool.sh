@@ -4,6 +4,35 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+redact_db_url() {
+  local url="$1"
+  case "$url" in
+    *"://"*)
+      local prefix="${url%%://*}://"
+      local rest="${url#*://}"
+      local at="${rest%%@*}"
+      local after_at="${rest#*@}"
+      if [[ "$rest" == "$after_at" ]]; then
+        echo "$url"
+        return 0
+      fi
+      local end_userinfo="${rest%%[/?]*}"
+      if [[ "${#at}" -gt "${#end_userinfo}" ]]; then
+        echo "$url"
+        return 0
+      fi
+      case "$at" in
+        *:*)
+          local user="${at%%:*}"
+          echo "${prefix}${user}:***@${after_at}"
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+  echo "$url"
+}
+
 normalize_host() {
   local host="$1"
   if [[ "$host" == "0.0.0.0" || "$host" == "::" ]]; then
@@ -52,7 +81,7 @@ echo "MAX_PROOFS:             $MAX_PROOFS"
 echo "ROLLUP_RPC_URL:         $ROLLUP_RPC_URL"
 echo "INDEXER_URL:            $INDEXER_URL"
 echo "LIGERO_PROOF_SERVICE_URL: $LIGERO_PROOF_SERVICE_URL"
-echo "DA_CONNECTION_STRING:   $DA_CONNECTION_STRING"
+echo "DA_CONNECTION_STRING:   $(redact_db_url "$DA_CONNECTION_STRING")"
 echo ""
 echo "Endpoints:"
 echo "  GET  http://${PROOF_POOL_BIND_ADDR}/status?auth_token=$AUTH_TOKEN"

@@ -143,6 +143,111 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+redact_db_url() {
+  local url="$1"
+  case "$url" in
+    *"://"*)
+      # Best-effort redaction of `user:pass@host` in connection strings.
+      # Only redact if the `@` appears before the first `/` or `?`.
+      local prefix="${url%%://*}://"
+      local rest="${url#*://}"
+      local at="${rest%%@*}"
+      local after_at="${rest#*@}"
+      if [[ "$rest" == "$after_at" ]]; then
+        echo "$url"
+        return 0
+      fi
+      local end_userinfo="${rest%%[/?]*}"
+      if [[ "${#at}" -gt "${#end_userinfo}" ]]; then
+        echo "$url"
+        return 0
+      fi
+      case "$at" in
+        *:*)
+          local user="${at%%:*}"
+          echo "${prefix}${user}:***@${after_at}"
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+  echo "$url"
+}
+
+extract_rollup_config_path() {
+  local default_path="$SCRIPT_DIR/rollup_config.toml"
+  local path="${ROLLUP_CONFIG_PATH:-$default_path}"
+
+  local i=0
+  while (( i < ${#ROLLUP_ARGS[@]} )); do
+    case "${ROLLUP_ARGS[$i]}" in
+      --rollup-config-path)
+        if (( i + 1 < ${#ROLLUP_ARGS[@]} )); then
+          path="${ROLLUP_ARGS[$((i+1))]}"
+        fi
+        break
+        ;;
+      --rollup-config-path=*)
+        path="${ROLLUP_ARGS[$i]#*=}"
+        break
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  echo "$path"
+}
+
+extract_da_connection_string_from_config() {
+  local path="$1"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    return 0
+  fi
+
+  awk '
+    BEGIN { in_da = 0 }
+    /^[[:space:]]*\[da\][[:space:]]*$/ { in_da = 1; next }
+    in_da && /^[[:space:]]*\[/ { in_da = 0 }
+    in_da && /^[[:space:]]*connection_string[[:space:]]*=/ {
+      sub(/^[[:space:]]*connection_string[[:space:]]*=[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 ~ /^".*"$/) { sub(/^"/, "", $0); sub(/"$/, "", $0) }
+      print $0
+      exit
+    }
+  ' "$path"
+}
+
+# Helpful diagnostics for common "worker tx not found" failures.
+ROLLUP_CFG_PATH="$(extract_rollup_config_path)"
+ROLLUP_DA_CONN="$(extract_da_connection_string_from_config "$ROLLUP_CFG_PATH")"
+if [[ -n "${DA_CONNECTION_STRING:-}" || -n "$ROLLUP_DA_CONN" ]]; then
+  echo ""
+  echo "DA DB configuration"
+  echo "  Rollup config path: ${ROLLUP_CFG_PATH}"
+  if [[ -n "$ROLLUP_DA_CONN" ]]; then
+    echo "  Rollup [da].connection_string: $(redact_db_url "$ROLLUP_DA_CONN")"
+  fi
+  if [[ -n "${DA_CONNECTION_STRING:-}" ]]; then
+    echo "  DA_CONNECTION_STRING env:      $(redact_db_url "$DA_CONNECTION_STRING")"
+  fi
+  if [[ -n "${DA_CONNECTION_STRING:-}" && -n "$ROLLUP_DA_CONN" && "${DA_CONNECTION_STRING}" != "${ROLLUP_DA_CONN}" ]]; then
+    echo ""
+    echo "  ERROR: DA_CONNECTION_STRING does not match the rollup DA connection_string!"
+    echo "         DA_CONNECTION_STRING env:          $(redact_db_url "$DA_CONNECTION_STRING")"
+    echo "         Rollup [da].connection_string:     $(redact_db_url "$ROLLUP_DA_CONN")"
+    echo ""
+    echo "         The verifier/proof-pool must write worker_txs into the SAME DB the rollup/sequencer reads."
+    echo "         Mismatches cause HTTP 404 'Worker transaction ... not found' on /sequencer/worker_txs/<hash>."
+    echo ""
+    echo "         Fix: update rollup_config.toml [da].connection_string to match DA_CONNECTION_STRING,"
+    echo "         or remove DA_CONNECTION_STRING so both use the value from rollup_config.toml."
+    exit 1
+  fi
+  echo ""
+fi
+
 ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://127.0.0.1:12346}"
 ROLLUP_HOST_PORT="${ROLLUP_RPC_URL#*://}"
 ROLLUP_HOST_PORT="${ROLLUP_HOST_PORT%%/*}"

@@ -32,6 +32,8 @@ clean:
 	@if [ -f "$(SOV_CLI_REL_PATH)" ]; then \
 		$(SOV_CLI_REL_PATH) transactions clean || true; \
 	fi
+	@echo "Dropping PostgreSQL DA tables (if any)..."
+	-psql postgresql://admin:1234@localhost:5432/da -c "DROP TABLE IF EXISTS blobs, block_headers, last_finalized_height, worker_verified_transactions CASCADE;"
 	mkdir -p demo_data
 
 ## Run tests
