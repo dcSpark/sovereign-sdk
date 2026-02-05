@@ -7389,11 +7389,15 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "reqwest 0.12.28",
  "rmcp",
  "serde_json",
+ "sse-stream",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
+ "uuid 1.19.0",
 ]
 
 [[package]]

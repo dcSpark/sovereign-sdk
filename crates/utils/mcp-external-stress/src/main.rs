@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rmcp::model::{CallToolRequestParam, ErrorCode, JsonObject, RawContent};
 use rmcp::service::ServiceExt as _;
+use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use rmcp::transport::StreamableHttpClientTransport;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "mcp-external-stress")]
@@ -71,6 +74,17 @@ struct Args {
     /// Print the periodic progress line even if nothing changed since the previous print.
     #[arg(long, env = "MCP_STRESS_REPORT_UNCHANGED", default_value_t = false)]
     report_unchanged: bool,
+
+    /// Optional file storing stable MCP session IDs (one per line) to reuse across runs.
+    ///
+    /// If this is set and `--wallets N` exceeds the number of IDs in the file, new UUIDv4 values
+    /// are generated and appended.
+    #[arg(
+        long,
+        env = "MCP_STRESS_SESSION_IDS_FILE",
+        default_value = ".mcp-external-stress-session-ids.txt"
+    )]
+    session_ids_file: PathBuf,
 }
 
 struct Counters {
@@ -101,6 +115,108 @@ impl Counters {
     }
 }
 
+#[derive(Clone)]
+struct PinnedSessionHttpClient {
+    inner: reqwest::Client,
+    pinned_session_id: Arc<str>,
+}
+
+impl PinnedSessionHttpClient {
+    fn new(inner: reqwest::Client, pinned_session_id: Arc<str>) -> Self {
+        Self {
+            inner,
+            pinned_session_id,
+        }
+    }
+}
+
+impl StreamableHttpClient for PinnedSessionHttpClient {
+    type Error = reqwest::Error;
+
+    fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        let pinned = self.pinned_session_id.clone();
+        let session_id = session_id.or_else(|| Some(pinned.clone()));
+        async move {
+            let response = StreamableHttpClient::post_message(
+                &self.inner,
+                uri,
+                message,
+                session_id,
+                auth_header,
+            )
+            .await?;
+            Ok(match response {
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted => {
+                    rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted
+                }
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
+                    message,
+                    session_id,
+                ) => rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
+                    message,
+                    session_id.or_else(|| Some(pinned.to_string())),
+                ),
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
+                    stream,
+                    session_id,
+                ) => rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
+                    stream,
+                    session_id.or_else(|| Some(pinned.to_string())),
+                ),
+            })
+        }
+    }
+
+    fn delete_session(
+        &self,
+        _uri: Arc<str>,
+        _session_id: Arc<str>,
+        _auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            (),
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        async move { Ok(()) }
+    }
+
+    fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            futures::stream::BoxStream<
+                'static,
+                std::result::Result<
+                    sse_stream::Sse,
+                    rmcp::transport::streamable_http_client::SseError,
+                >,
+            >,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+           + '_ {
+        StreamableHttpClient::get_stream(&self.inner, uri, session_id, last_event_id, auth_header)
+    }
+}
+
 fn normalize_mcp_endpoint(endpoint: &str) -> Result<String> {
     let trimmed = endpoint.trim_end_matches('/');
     if trimmed.ends_with("/mcp") {
@@ -114,6 +230,49 @@ fn normalize_mcp_endpoint(endpoint: &str) -> Result<String> {
     Ok(format!("{trimmed}/mcp"))
 }
 
+fn parse_session_ids_file(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn ensure_session_ids_file(path: &Path, required: usize) -> Result<Vec<String>> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => parse_session_ids_file(&contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err).with_context(|| format!("read session ids file {path:?}")),
+    };
+
+    if existing.len() >= required {
+        return Ok(existing.into_iter().take(required).collect());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create session ids dir {parent:?}"))?;
+    }
+
+    let mut ids = existing;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open session ids file for append {path:?}"))?;
+
+    while ids.len() < required {
+        let id = Uuid::new_v4().to_string();
+        use std::io::Write as _;
+        writeln!(file, "{id}").with_context(|| format!("append session id to {path:?}"))?;
+        ids.push(id);
+    }
+
+    Ok(ids)
+}
+
 fn first_text_content(result: &rmcp::model::CallToolResult) -> Result<&str> {
     for content in &result.content {
         match &content.raw {
@@ -122,6 +281,43 @@ fn first_text_content(result: &rmcp::model::CallToolResult) -> Result<&str> {
         }
     }
     Err(anyhow!("tool response had no text content"))
+}
+
+async fn wallet_privacy_address_opt(
+    client: &rmcp::service::Peer<rmcp::service::RoleClient>,
+) -> Result<Option<String>> {
+    let res = client
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("walletAddress"),
+            arguments: Some(rmcp::object!({})),
+        })
+        .await;
+
+    let result = match res {
+        Ok(ok) => ok,
+        Err(rmcp::service::ServiceError::McpError(err))
+            if err.code == ErrorCode::INVALID_PARAMS
+                && err.message.contains("No wallet loaded") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| "call_tool walletAddress failed");
+        }
+    };
+
+    if result.is_error.unwrap_or(false) {
+        return Err(anyhow!("tool walletAddress returned is_error=true"));
+    }
+
+    let text = first_text_content(&result).with_context(|| "tool walletAddress response")?;
+    let json: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| "tool walletAddress response was not valid JSON text")?;
+    let privacy_address = json
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("walletAddress response missing address"))?;
+    Ok(Some(privacy_address.to_string()))
 }
 
 async fn call_tool_json(
@@ -148,10 +344,37 @@ async fn call_tool_json(
     Ok(json)
 }
 
-async fn create_wallet(
+async fn create_wallet_opt(
     client: &rmcp::service::Peer<rmcp::service::RoleClient>,
-) -> Result<(String, String)> {
-    let json = call_tool_json(client, "createWallet", Some(rmcp::object!({}))).await?;
+) -> Result<Option<(String, String)>> {
+    let res = client
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("createWallet"),
+            arguments: Some(rmcp::object!({})),
+        })
+        .await;
+
+    let result = match res {
+        Ok(ok) => ok,
+        Err(rmcp::service::ServiceError::McpError(err))
+            if err.code == ErrorCode::INVALID_PARAMS
+                && err
+                    .message
+                    .contains("A wallet is already loaded. Call removeWallet first") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(anyhow!(e)).with_context(|| "call_tool createWallet failed"),
+    };
+
+    if result.is_error.unwrap_or(false) {
+        return Err(anyhow!("tool createWallet returned is_error=true"));
+    }
+
+    let text = first_text_content(&result).with_context(|| "tool createWallet response")?;
+    let json: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| "tool createWallet response was not valid JSON text")?;
+
     let wallet_address = json
         .get("wallet_address")
         .and_then(|v| v.as_str())
@@ -161,7 +384,10 @@ async fn create_wallet(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("createWallet response missing privacy_address"))?;
 
-    Ok((wallet_address.to_string(), privacy_address.to_string()))
+    Ok(Some((
+        wallet_address.to_string(),
+        privacy_address.to_string(),
+    )))
 }
 
 async fn wait_for_wallet_balance(
@@ -266,13 +492,62 @@ async fn wallet_worker(
     args: Arc<Args>,
     counters: Arc<Counters>,
     stop_rx: tokio::sync::watch::Receiver<bool>,
+    session_id: String,
 ) -> Result<()> {
-    let transport = StreamableHttpClientTransport::from_uri(args.mcp_endpoint.clone());
+    let client =
+        PinnedSessionHttpClient::new(reqwest::Client::default(), session_id.clone().into());
+    let mut config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+            args.mcp_endpoint.clone(),
+        );
+    config.allow_stateless = false;
+    let transport = StreamableHttpClientTransport::with_client(client, config);
     let client = ().serve(transport).await.map_err(|e| anyhow!(e))?;
 
-    let (wallet_address, privacy_address) = create_wallet(&client)
-        .await
-        .with_context(|| format!("wallet[{idx}] createWallet"))?;
+    let (wallet_address, privacy_address) = match wallet_privacy_address_opt(&client).await {
+        Ok(Some(addr)) => ("<reused>".to_string(), addr),
+        Ok(None) => match create_wallet_opt(&client)
+            .await
+            .with_context(|| format!("wallet[{idx}] createWallet"))?
+        {
+            Some((wallet_address, privacy_address)) => (wallet_address, privacy_address),
+            None => {
+                let addr = wallet_privacy_address_opt(&client)
+                    .await
+                    .with_context(|| format!("wallet[{idx}] walletAddress (after already-loaded)"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "wallet is already loaded but walletAddress still reports no wallet"
+                        )
+                    })?;
+                ("<reused>".to_string(), addr)
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                "wallet[{idx}] walletAddress failed; attempting createWallet anyway: {err:#}"
+            );
+
+            match create_wallet_opt(&client).await.with_context(|| {
+                format!("wallet[{idx}] createWallet (after walletAddress error)")
+            })? {
+                Some((wallet_address, privacy_address)) => (wallet_address, privacy_address),
+                None => {
+                    let addr = wallet_privacy_address_opt(&client)
+                        .await
+                        .with_context(|| {
+                            format!("wallet[{idx}] walletAddress (after already-loaded)")
+                        })?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "wallet is already loaded but walletAddress still reports no wallet"
+                            )
+                        })?;
+                    ("<reused>".to_string(), addr)
+                }
+            }
+        }
+    };
 
     let _ = wait_for_wallet_balance(
         &client,
@@ -431,13 +706,16 @@ async fn main() -> Result<()> {
         return Err(anyhow!("--wallets must be >= 1"));
     }
 
+    let session_ids = ensure_session_ids_file(args.session_ids_file.as_path(), args.wallets)?;
+
     tracing::info!(
-        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={}",
+        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} session_ids_file={}",
         args.mcp_endpoint,
         args.wallets,
         args.send_amount,
         args.duration_secs,
-        args.confirm
+        args.confirm,
+        args.session_ids_file.display()
     );
 
     let counters = Arc::new(Counters::new());
@@ -541,11 +819,13 @@ async fn main() -> Result<()> {
 
     let mut join_set = tokio::task::JoinSet::new();
     for idx in 0..args.wallets {
+        let session_id = session_ids[idx].clone();
         join_set.spawn(wallet_worker(
             idx,
             args.clone(),
             counters.clone(),
             stop_rx.clone(),
+            session_id,
         ));
     }
 

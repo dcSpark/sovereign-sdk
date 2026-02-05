@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use midnight_privacy::{Hash32, MerkleTree};
+use midnight_privacy::{Hash32, MerkleTree, MAX_TREE_DEPTH};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
@@ -65,6 +65,23 @@ fn position_lookup_config() -> PositionLookupConfig {
             retry_delay: Duration::from_millis(retry_delay_ms),
         }
     })
+}
+
+fn required_depth_for_next_position(next_position: u64) -> Result<u8> {
+    if next_position <= 1 {
+        return Ok(0);
+    }
+
+    let depth_u32 = 64u32 - (next_position - 1).leading_zeros();
+    let depth = u8::try_from(depth_u32).expect("depth_u32 <= 64");
+    anyhow::ensure!(
+        depth <= MAX_TREE_DEPTH,
+        "Commitment tree requires depth {} to fit next_position {}, but MAX_TREE_DEPTH is {}",
+        depth,
+        next_position,
+        MAX_TREE_DEPTH
+    );
+    Ok(depth)
 }
 
 /// Return the process-wide commitment tree syncer (shared across all wallets/sessions).
@@ -188,16 +205,16 @@ impl CachedTree {
 /// - Provide fast `cm -> position` lookups and Merkle openings.
 #[derive(Debug)]
 pub struct CommitmentTreeSyncer {
-    depth: u8,
+    default_depth: u8,
     state: RwLock<CachedTree>,
     sync_lock: Mutex<()>,
 }
 
 impl CommitmentTreeSyncer {
-    pub fn new(depth: u8) -> Self {
+    pub fn new(default_depth: u8) -> Self {
         Self {
-            depth,
-            state: RwLock::new(CachedTree::new(depth)),
+            default_depth,
+            state: RwLock::new(CachedTree::new(default_depth)),
             sync_lock: Mutex::new(()),
         }
     }
@@ -222,27 +239,39 @@ impl CommitmentTreeSyncer {
                 state.root.len()
             );
 
-            if let Some(chain_depth) = state.depth {
-                anyhow::ensure!(
-                    chain_depth == self.depth,
-                    "Unexpected commitment tree depth: chain={}, client={}",
-                    chain_depth,
-                    self.depth
-                );
-            }
-
             let mut expected_root = [0u8; 32];
             expected_root.copy_from_slice(&state.root);
             let expected_next = state.next_position;
-            let capacity = 1u64
-                .checked_shl(self.depth as u32)
-                .ok_or_else(|| anyhow::anyhow!("Invalid commitment tree depth: {}", self.depth))?;
+            let required_depth = required_depth_for_next_position(expected_next)?;
+            let expected_depth = match state.depth {
+                Some(chain_depth) => {
+                    anyhow::ensure!(
+                        chain_depth <= MAX_TREE_DEPTH,
+                        "Unexpected commitment tree depth {} exceeds MAX_TREE_DEPTH {}",
+                        chain_depth,
+                        MAX_TREE_DEPTH
+                    );
+                    anyhow::ensure!(
+                        chain_depth >= required_depth,
+                        "Commitment tree depth {} too small for next_position {} (requires >= {})",
+                        chain_depth,
+                        expected_next,
+                        required_depth
+                    );
+                    chain_depth
+                }
+                None => required_depth.max(self.default_depth),
+            };
+
+            let capacity = 1u64.checked_shl(expected_depth as u32).ok_or_else(|| {
+                anyhow::anyhow!("Invalid commitment tree depth: {}", expected_depth)
+            })?;
             anyhow::ensure!(
                 expected_next <= capacity,
                 "Commitment tree next_position {} exceeds capacity {} for depth {}",
                 expected_next,
                 capacity,
-                self.depth
+                expected_depth
             );
 
             // Quick no-op check before acquiring the sync lock.
@@ -285,14 +314,30 @@ impl CommitmentTreeSyncer {
                     "Commitment tree appears to have rewound; resetting local cache"
                 );
                 let mut st = self.state.write().await;
-                *st = CachedTree::new(self.depth);
+                *st = CachedTree::new(expected_depth);
+            }
+
+            // If the chain depth changed but next_position doesn't force a growth, reset the local
+            // cache to match the chain depth so roots/openings are computed consistently.
+            {
+                let st = self.state.read().await;
+                if st.tree.depth() != expected_depth && expected_next <= st.tree.len() as u64 {
+                    tracing::warn!(
+                        cached_depth = st.tree.depth(),
+                        chain_depth = expected_depth,
+                        "Commitment tree depth mismatch; resetting local cache"
+                    );
+                    drop(st);
+                    let mut st = self.state.write().await;
+                    *st = CachedTree::new(expected_depth);
+                }
             }
 
             // Heuristic: On a cold cache, prefer a full rebuild. Also prefer a full rebuild if
             // the delta is so large that per-leaf `set_leaf()` updates would likely dominate.
             let cached_next = { self.state.read().await.next_position };
             let delta = expected_next.saturating_sub(cached_next);
-            let depth_for_threshold = u64::from(self.depth).max(1);
+            let depth_for_threshold = u64::from(expected_depth).max(1);
             let full_rebuild_threshold = capacity / depth_for_threshold;
             let should_skip_incremental = delta > 0 && delta >= full_rebuild_threshold;
 
@@ -335,7 +380,7 @@ impl CommitmentTreeSyncer {
 
                         // Avoid serving an inconsistent tree while rebuilding.
                         let mut st = self.state.write().await;
-                        *st = CachedTree::new(self.depth);
+                        *st = CachedTree::new(expected_depth);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -350,7 +395,7 @@ impl CommitmentTreeSyncer {
             }
 
             match self
-                .full_rebuild(provider, expected_next, expected_root)
+                .full_rebuild(provider, expected_next, expected_root, expected_depth)
                 .await
                 .with_context(|| {
                     format!(
@@ -382,7 +427,7 @@ impl CommitmentTreeSyncer {
                     );
                     // Ensure we don't keep a partially-updated cache across retries.
                     let mut st = self.state.write().await;
-                    *st = CachedTree::new(self.depth);
+                    *st = CachedTree::new(expected_depth);
                     drop(st);
                     tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
                     continue;
@@ -536,6 +581,7 @@ impl CommitmentTreeSyncer {
         provider: &Provider,
         expected_next: u64,
         expected_root: Hash32,
+        depth: u8,
     ) -> Result<FullRebuildStats> {
         let mut pos_by_cm: HashMap<Hash32, u64> = HashMap::new();
 
@@ -558,7 +604,7 @@ impl CommitmentTreeSyncer {
             let apply_ms = apply_started.elapsed().as_millis();
 
             let tree_init_started = Instant::now();
-            let tree = MerkleTree::from_filled_leaves(self.depth, &leaves);
+            let tree = MerkleTree::from_filled_leaves(depth, &leaves);
             let tree_init_ms = tree_init_started.elapsed().as_millis();
 
             let rebuilt_root = tree.root();
@@ -585,7 +631,7 @@ impl CommitmentTreeSyncer {
 
         let fetch_ms = 0u128;
         let tree_init_started = Instant::now();
-        let tree = MerkleTree::new(self.depth);
+        let tree = MerkleTree::new(depth);
         let tree_init_ms = tree_init_started.elapsed().as_millis();
 
         let apply_ms = 0u128;
