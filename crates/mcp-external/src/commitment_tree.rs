@@ -384,10 +384,23 @@ impl CommitmentTreeSyncer {
                     }
                     Ok(None) => {}
                     Err(e) => {
+                        let cached = self.state.read().await;
+                        let cached_next_position = cached.next_position;
+                        let cached_depth = cached.tree.depth();
+                        let cached_root = cached.tree.root();
+                        drop(cached);
                         tracing::warn!(
                             attempt = attempt + 1,
                             max_attempts = SYNC_MAX_RETRIES,
+                            chain_next_position = expected_next,
+                            chain_depth = ?state.depth,
+                            expected_depth,
+                            expected_root = %RootHex(&expected_root),
+                            cached_next_position,
+                            cached_depth,
+                            cached_root = %RootHex(&cached_root),
                             error = %e,
+                            error_chain = %format!("{:#}", e),
                             "Commitment tree incremental sync failed; falling back to full rebuild"
                         );
                     }
@@ -419,10 +432,23 @@ impl CommitmentTreeSyncer {
                     return Ok(());
                 }
                 Err(e) => {
+                    let cached = self.state.read().await;
+                    let cached_next_position = cached.next_position;
+                    let cached_depth = cached.tree.depth();
+                    let cached_root = cached.tree.root();
+                    drop(cached);
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = SYNC_MAX_RETRIES,
+                        chain_next_position = expected_next,
+                        chain_depth = ?state.depth,
+                        expected_depth,
+                        expected_root = %RootHex(&expected_root),
+                        cached_next_position,
+                        cached_depth,
+                        cached_root = %RootHex(&cached_root),
                         error = %e,
+                        error_chain = %format!("{:#}", e),
                         "Commitment-tree full rebuild failed; retrying"
                     );
                     // Ensure we don't keep a partially-updated cache across retries.
@@ -435,9 +461,17 @@ impl CommitmentTreeSyncer {
             }
         }
 
+        let st = self.state.read().await;
+        let cached_next_position = st.next_position;
+        let cached_depth = st.tree.depth();
+        let cached_root = st.tree.root();
+        drop(st);
         anyhow::bail!(
-            "Failed to sync commitment tree after {} attempts",
-            SYNC_MAX_RETRIES
+            "Failed to sync commitment tree after {} attempts (cached_next_position={}, cached_depth={}, cached_root={})",
+            SYNC_MAX_RETRIES,
+            cached_next_position,
+            cached_depth,
+            hex::encode(cached_root)
         );
     }
 
@@ -608,6 +642,16 @@ impl CommitmentTreeSyncer {
             let tree_init_ms = tree_init_started.elapsed().as_millis();
 
             let rebuilt_root = tree.root();
+            if rebuilt_root != expected_root {
+                tracing::warn!(
+                    target_next_position = expected_next,
+                    depth,
+                    fetched_notes,
+                    rebuilt_root = %RootHex(&rebuilt_root),
+                    expected_root = %RootHex(&expected_root),
+                    "Commitment tree full rebuild root mismatch"
+                );
+            }
             anyhow::ensure!(
                 rebuilt_root == expected_root,
                 "Rebuilt tree root mismatch: rebuilt={} expected={}",
@@ -636,6 +680,15 @@ impl CommitmentTreeSyncer {
 
         let apply_ms = 0u128;
         let rebuilt_root = tree.root();
+        if rebuilt_root != expected_root {
+            tracing::warn!(
+                target_next_position = expected_next,
+                depth,
+                rebuilt_root = %RootHex(&rebuilt_root),
+                expected_root = %RootHex(&expected_root),
+                "Commitment tree full rebuild root mismatch on empty tree"
+            );
+        }
         anyhow::ensure!(
             rebuilt_root == expected_root,
             "Rebuilt tree root mismatch: rebuilt={} expected={}",
@@ -693,6 +746,15 @@ async fn fetch_notes(
             }
 
             empty_retries += 1;
+            tracing::warn!(
+                endpoint,
+                offset,
+                target_leaves,
+                empty_retries,
+                max_empty_retries = NOTES_EMPTY_PAGE_MAX_RETRIES,
+                retry_delay_ms = NOTES_EMPTY_PAGE_RETRY_DELAY_MS,
+                "Commitment tree notes endpoint returned empty page; retrying"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(
                 NOTES_EMPTY_PAGE_RETRY_DELAY_MS,
             ))

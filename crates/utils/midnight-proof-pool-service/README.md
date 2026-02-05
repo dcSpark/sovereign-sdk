@@ -10,7 +10,7 @@ requested number of pending transactions to the sequencer, and the service refil
 - `GET /status?auth_token=...`
   - Returns `{ max_proofs, ready_proofs }`
 - `POST /max_proofs?auth_token=...` with JSON body `{ "max_proofs": N }`
-  - Updates the target `MAX_PROOFS` (the service scales wallets up if needed and refills pending proofs to match)
+  - Updates the target `MAX_PROOFS` (the service scales wallets up in bounded batches and refills pending proofs to match)
 - Also supports: `GET /max_proofs?auth_token=...&max_proofs=N` (phone-friendly)
 - `POST /send?auth_token=...` with JSON body `{ "proof_quantity": N }`
   - Flushes up to `N` pending txs to the sequencer (via verifier `/midnight-privacy/flush?limit=N`)
@@ -36,6 +36,9 @@ requested number of pending transactions to the sequencer, and the service refil
 - `AUTO_FUND_GAS_RESERVE` - extra L2 funding per wallet, added to `DEPOSIT_AMOUNT` (default: `10000000`, min `DEFAULT_MAX_FEE`)
 - `TOPUP_GAS_RESERVE` - L2 top-up amount when a wallet balance drops below `DEFAULT_MAX_FEE` (default: `AUTO_FUND_GAS_RESERVE`)
 - `SETUP_CONCURRENCY` - concurrent wallet funding/deposit setup (default: `10`)
+- `WALLET_SETUP_BATCH_SIZE` - max number of wallets created/funded/deposited per scale-up batch (default: `5`)
+- `WALLET_SETUP_BACKOFF_MS` - delay between scale-up checks/batches and retry backoff when sequencer is not ready (default: `1000`)
+- `SEQUENCER_READY_CHECK_TIMEOUT_MS` - timeout for `/sequencer/ready` backpressure check before each scale-up batch (default: `2000`)
 - `MAX_CONCURRENT_PROOFS` - concurrent proof generations (default: `5`)
 - `LIGERO_PROGRAM_PATH` - circuit name or wasm path (default: `note_spend_guest`)
 - `VERIFIER_PROVER_SERVICE_URL` - overrides verifier-side remote `/verify` URL (default: `LIGERO_PROOF_SERVICE_URL`)

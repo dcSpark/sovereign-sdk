@@ -135,6 +135,31 @@ async fn fetch_rollup_chain_hash(node_client: &NodeClient) -> Result<[u8; 32]> {
     Ok(chain_hash)
 }
 
+const DEFAULT_VERIFIER_SQLITE_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_VERIFIER_SQLITE_MIN_CONNECTIONS: u32 = 1;
+const DEFAULT_VERIFIER_POSTGRES_MAX_CONNECTIONS: u32 = 12;
+const DEFAULT_VERIFIER_POSTGRES_MIN_CONNECTIONS: u32 = 1;
+const DEFAULT_VERIFIER_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_VERIFIER_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_VERIFIER_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_VERIFIER_MAX_LIFETIME_SECS: u64 = 1_800;
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 impl AppState {
     pub async fn new(config: ServiceConfig) -> Result<Self, anyhow::Error> {
         Self::new_with_incoming_worker_tx_saver(config, IncomingWorkerTxSaver::disabled()).await
@@ -244,6 +269,28 @@ impl AppState {
             use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
             use std::str::FromStr;
 
+            let sqlite_max_connections = env_u32(
+                "SOV_PROOF_VERIFIER_SQLITE_MAX_CONNECTIONS",
+                DEFAULT_VERIFIER_SQLITE_MAX_CONNECTIONS,
+            );
+            let sqlite_min_connections = env_u32(
+                "SOV_PROOF_VERIFIER_SQLITE_MIN_CONNECTIONS",
+                DEFAULT_VERIFIER_SQLITE_MIN_CONNECTIONS,
+            )
+            .min(sqlite_max_connections);
+            let sqlite_acquire_timeout_secs = env_u64(
+                "SOV_PROOF_VERIFIER_SQLITE_ACQUIRE_TIMEOUT_SECS",
+                DEFAULT_VERIFIER_ACQUIRE_TIMEOUT_SECS,
+            );
+            let sqlite_idle_timeout_secs = env_u64(
+                "SOV_PROOF_VERIFIER_SQLITE_IDLE_TIMEOUT_SECS",
+                DEFAULT_VERIFIER_IDLE_TIMEOUT_SECS,
+            );
+            let sqlite_max_lifetime_secs = env_u64(
+                "SOV_PROOF_VERIFIER_SQLITE_MAX_LIFETIME_SECS",
+                DEFAULT_VERIFIER_MAX_LIFETIME_SECS,
+            );
+
             // Parse connection string and set busy_timeout
             let sqlite_opts = SqliteConnectOptions::from_str(&config.da_connection_string)
                 .with_context(|| {
@@ -256,11 +303,15 @@ impl AppState {
 
             // Create pool with optimized settings for SQLite
             let pool = SqlitePoolOptions::new()
-                .max_connections(10) // Conservative for SQLite (single-writer)
-                .min_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .idle_timeout(Some(std::time::Duration::from_secs(300)))
-                .max_lifetime(Some(std::time::Duration::from_secs(1800)))
+                .max_connections(sqlite_max_connections) // Conservative for SQLite (single-writer)
+                .min_connections(sqlite_min_connections)
+                .acquire_timeout(std::time::Duration::from_secs(sqlite_acquire_timeout_secs))
+                .idle_timeout(Some(std::time::Duration::from_secs(
+                    sqlite_idle_timeout_secs,
+                )))
+                .max_lifetime(Some(std::time::Duration::from_secs(
+                    sqlite_max_lifetime_secs,
+                )))
                 .connect_with(sqlite_opts)
                 .await
                 .with_context(|| {
@@ -271,27 +322,64 @@ impl AppState {
                 })?;
 
             info!(
+                max_connections = sqlite_max_connections,
+                min_connections = sqlite_min_connections,
+                acquire_timeout_secs = sqlite_acquire_timeout_secs,
+                idle_timeout_secs = sqlite_idle_timeout_secs,
+                max_lifetime_secs = sqlite_max_lifetime_secs,
                 db = %da_conn_string_redacted,
-                "Verifier service connected to SQLite database (max_connections=10, busy_timeout=30s)"
+                "Verifier service connected to SQLite database (busy_timeout=30s)"
             );
 
             DatabaseConnection::SqlxSqlitePoolConnection(pool.into())
         } else {
             // PostgreSQL or other databases
+            let pg_max_connections = env_u32(
+                "SOV_PROOF_VERIFIER_POSTGRES_MAX_CONNECTIONS",
+                DEFAULT_VERIFIER_POSTGRES_MAX_CONNECTIONS,
+            );
+            let pg_min_connections = env_u32(
+                "SOV_PROOF_VERIFIER_POSTGRES_MIN_CONNECTIONS",
+                DEFAULT_VERIFIER_POSTGRES_MIN_CONNECTIONS,
+            )
+            .min(pg_max_connections);
+            let pg_connect_timeout_secs = env_u64(
+                "SOV_PROOF_VERIFIER_POSTGRES_CONNECT_TIMEOUT_SECS",
+                DEFAULT_VERIFIER_CONNECT_TIMEOUT_SECS,
+            );
+            let pg_acquire_timeout_secs = env_u64(
+                "SOV_PROOF_VERIFIER_POSTGRES_ACQUIRE_TIMEOUT_SECS",
+                DEFAULT_VERIFIER_ACQUIRE_TIMEOUT_SECS,
+            );
+            let pg_idle_timeout_secs = env_u64(
+                "SOV_PROOF_VERIFIER_POSTGRES_IDLE_TIMEOUT_SECS",
+                DEFAULT_VERIFIER_IDLE_TIMEOUT_SECS,
+            );
+            let pg_max_lifetime_secs = env_u64(
+                "SOV_PROOF_VERIFIER_POSTGRES_MAX_LIFETIME_SECS",
+                DEFAULT_VERIFIER_MAX_LIFETIME_SECS,
+            );
+
             let mut connect_opts = ConnectOptions::new(config.da_connection_string.clone());
 
             connect_opts
-                .max_connections(20)
-                .min_connections(1)
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .idle_timeout(std::time::Duration::from_secs(300))
-                .max_lifetime(std::time::Duration::from_secs(1800))
+                .max_connections(pg_max_connections)
+                .min_connections(pg_min_connections)
+                .connect_timeout(std::time::Duration::from_secs(pg_connect_timeout_secs))
+                .acquire_timeout(std::time::Duration::from_secs(pg_acquire_timeout_secs))
+                .idle_timeout(std::time::Duration::from_secs(pg_idle_timeout_secs))
+                .max_lifetime(std::time::Duration::from_secs(pg_max_lifetime_secs))
                 .sqlx_logging(false);
 
             info!(
+                max_connections = pg_max_connections,
+                min_connections = pg_min_connections,
+                connect_timeout_secs = pg_connect_timeout_secs,
+                acquire_timeout_secs = pg_acquire_timeout_secs,
+                idle_timeout_secs = pg_idle_timeout_secs,
+                max_lifetime_secs = pg_max_lifetime_secs,
                 db = %da_conn_string_redacted,
-                "Verifier service connecting to PostgreSQL database (max_connections=20)"
+                "Verifier service connecting to PostgreSQL database"
             );
 
             Database::connect(connect_opts).await.with_context(|| {
@@ -1048,28 +1136,51 @@ async fn pending_count_handler(
 #[derive(Debug, Deserialize)]
 struct FlushQuery {
     limit: Option<u64>,
+    /// When true, wait for DA DB state updates before returning the HTTP response.
+    #[serde(default)]
+    wait_for_db: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlushBody {
+    tx_hashes: Option<Vec<String>>,
 }
 
 /// Flush all pending worker-verified transactions to the sequencer in parallel.
 ///
-/// This returns as soon as all sequencer submissions have completed and the
-/// aggregate results are computed; the per-tx DB updates are applied in a
-/// background task so they don't block the HTTP response.
+/// This returns after all sequencer submissions have completed and aggregate
+/// results are computed. By default, per-tx DB updates are applied in the
+/// background; callers can force synchronous DB updates via `wait_for_db=true`.
 async fn flush_pending_handler(
     State(state): State<AppState>,
     Query(query): Query<FlushQuery>,
+    body: Option<Json<FlushBody>>,
 ) -> Result<Json<serde_json::Value>, ServiceError> {
     use sea_orm::{QueryOrder, QuerySelect};
     use worker_verified_transactions::{
         Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState,
     };
 
-    // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
+    let requested_hashes = body
+        .and_then(|b| b.0.tx_hashes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect::<Vec<_>>();
+
+    // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs).
+    // When tx hashes are provided, constrain the flush to those hashes.
     let mut pending_query = VerifiedEntity::find()
         .select_only()
         .column(VerifiedColumn::TxHash)
-        .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
-        .order_by_asc(VerifiedColumn::Id);
+        .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending));
+
+    if !requested_hashes.is_empty() {
+        pending_query = pending_query.filter(VerifiedColumn::TxHash.is_in(requested_hashes));
+    }
+
+    pending_query = pending_query.order_by_asc(VerifiedColumn::Id);
 
     if let Some(limit) = query.limit {
         pending_query = pending_query.limit(limit);
@@ -1198,41 +1309,29 @@ async fn flush_pending_handler(
         }
     }
 
-    // Apply DB updates in the background so the HTTP response isn't blocked on
-    // SQLite/Postgres write latency. Errors are logged but do not affect the
-    // response.
     if !db_updates.is_empty() {
-        let db_conn = state.da_conn.clone();
-        tokio::spawn(async move {
-            use sea_orm::TransactionTrait;
-
-            let txn_res = db_conn.begin().await;
-            let Ok(txn) = txn_res else {
-                if let Err(err) = txn_res {
+        if query.wait_for_db {
+            apply_flush_db_updates(state.da_conn.clone(), db_updates)
+                .await
+                .map_err(|err| {
+                    ServiceError::Internal(format!(
+                        "Failed to apply worker tx DB updates during flush: {err}"
+                    ))
+                })?;
+        } else {
+            // Apply DB updates in the background so the HTTP response isn't blocked on
+            // SQLite/Postgres write latency. Errors are logged but do not affect the
+            // response.
+            let db_conn = state.da_conn.clone();
+            tokio::spawn(async move {
+                if let Err(err) = apply_flush_db_updates(db_conn, db_updates).await {
                     error!(
-                        "Failed to begin transaction for worker tx updates in background: {}",
+                        "Failed to apply worker tx DB updates in background flush task: {}",
                         err
                     );
                 }
-                return;
-            };
-
-            for (txh, outcome) in db_updates {
-                if let Err(err) =
-                    update_worker_tx_after_submission_in_conn(&txn, &txh, &outcome).await
-                {
-                    error!(
-                        tx_hash = %txh,
-                        "Failed to update worker transaction after sequencer submission in background: {}",
-                        err
-                    );
-                }
-            }
-
-            if let Err(err) = txn.commit().await {
-                error!("Failed to commit worker tx updates in background: {}", err);
-            }
-        });
+            });
+        }
     }
 
     info!(
@@ -1245,6 +1344,34 @@ async fn flush_pending_handler(
         "rejected": rejected,
         "results": results,
     })))
+}
+
+async fn apply_flush_db_updates(
+    db_conn: Arc<DatabaseConnection>,
+    db_updates: Vec<(String, SequencerSubmissionOutcome)>,
+) -> Result<(), anyhow::Error> {
+    use sea_orm::TransactionTrait;
+
+    let txn = db_conn
+        .begin()
+        .await
+        .context("failed to begin transaction for worker tx updates")?;
+
+    for (txh, outcome) in db_updates {
+        if let Err(err) = update_worker_tx_after_submission_in_conn(&txn, &txh, &outcome).await {
+            error!(
+                tx_hash = %txh,
+                "Failed to update worker transaction after sequencer submission: {}",
+                err
+            );
+        }
+    }
+
+    txn.commit()
+        .await
+        .context("failed to commit worker tx updates transaction")?;
+
+    Ok(())
 }
 
 /// Main handler for verify-and-submit endpoint

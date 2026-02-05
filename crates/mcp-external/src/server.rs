@@ -1161,10 +1161,52 @@ impl CryptoServer {
             output_pk_ivk,
             viewer_fvk_bundle_for_transfer,
         )
-        .await
-        .map_err(|e| {
-            ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
-        })?;
+        .await;
+        let transfer_result = match transfer_result {
+            Ok(ok) => ok,
+            Err(e) => {
+                let error_text = e.to_string();
+                let nullifier_spent = error_text.contains("Nullifier already spent");
+                let verifier_client_reject = error_text.contains("error status 4");
+
+                if nullifier_spent {
+                    tracing::warn!(
+                        selected_inputs = selected.len(),
+                        error = %error_text,
+                        "Transfer rejected due to already-spent nullifier; marking selected notes as locally pending-spent to avoid immediate re-selection"
+                    );
+
+                    // Mark selected inputs as locally pending-spent so immediate retries
+                    // don't keep selecting the same stale notes while indexer state catches up.
+                    let mut pending = self.pending_spent_notes.lock().await;
+                    let mut local = self.local_notes.lock().await;
+                    pending.purge_expired();
+                    let now = std::time::Instant::now();
+                    for note in &selected {
+                        pending.by_rho.insert(note.rho.clone(), now);
+                        local.by_rho.remove(&note.rho);
+                    }
+
+                    return Err(ErrorData::invalid_params(
+                        "Transfer rejected: selected note is already spent (nullifier already spent). This is usually temporary indexer lag; retry shortly."
+                            .to_string(),
+                        None,
+                    ));
+                }
+
+                if verifier_client_reject {
+                    return Err(ErrorData::invalid_params(
+                        format!("Transfer rejected by verifier/sequencer: {error_text}"),
+                        None,
+                    ));
+                }
+
+                return Err(ErrorData::internal_error(
+                    format!("Failed to submit privacy transfer: {error_text}"),
+                    None,
+                ));
+            }
+        };
         let transfer_ms = transfer_started.elapsed().as_millis();
         tracing::debug!(
             elapsed_ms = transfer_ms,

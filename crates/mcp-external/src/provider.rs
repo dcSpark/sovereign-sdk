@@ -332,17 +332,37 @@ impl Provider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
+            let reason = parsed
+                .as_ref()
+                .and_then(|v| v.get("details"))
+                .and_then(|d| d.get("error"))
+                .and_then(|e| e.as_str())
+                .or_else(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get("message"))
+                        .and_then(|m| m.as_str())
+                })
+                .map(str::to_string);
             tracing::error!(
                 "Verifier service error - URL: {}, Status: {}, Body: {}",
                 endpoint,
                 status,
                 body
             );
-            anyhow::bail!(
-                "Verifier service returned error status {}: {}",
-                status,
-                body
-            );
+            match reason {
+                Some(reason) => anyhow::bail!(
+                    "Verifier service returned error status {}: {}",
+                    status,
+                    reason
+                ),
+                None => anyhow::bail!(
+                    "Verifier service returned error status {}: {}",
+                    status,
+                    body
+                ),
+            }
         }
 
         let body = resp

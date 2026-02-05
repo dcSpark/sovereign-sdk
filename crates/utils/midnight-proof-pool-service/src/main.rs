@@ -32,7 +32,7 @@ use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing_subscriber::EnvFilter;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
@@ -49,6 +49,9 @@ struct Config {
     auto_fund_gas_reserve: u128,
     topup_gas_reserve: u128,
     setup_concurrency: usize,
+    wallet_setup_batch_size: usize,
+    wallet_setup_backoff_ms: u64,
+    sequencer_ready_check_timeout_ms: u64,
     max_concurrent_proofs: usize,
     da_connection_string: String,
     ligero_program_path: String,
@@ -85,6 +88,10 @@ impl Config {
             env_u128("TOPUP_GAS_RESERVE", auto_fund_gas_reserve).max(DEFAULT_MAX_FEE);
 
         let setup_concurrency = env_usize("SETUP_CONCURRENCY", 10).max(1);
+        let wallet_setup_batch_size = env_usize("WALLET_SETUP_BATCH_SIZE", 5).max(1);
+        let wallet_setup_backoff_ms = env_u64("WALLET_SETUP_BACKOFF_MS", 1_000).max(50);
+        let sequencer_ready_check_timeout_ms =
+            env_u64("SEQUENCER_READY_CHECK_TIMEOUT_MS", 2_000).max(100);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
         let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
@@ -105,6 +112,9 @@ impl Config {
             auto_fund_gas_reserve,
             topup_gas_reserve,
             setup_concurrency,
+            wallet_setup_batch_size,
+            wallet_setup_backoff_ms,
+            sequencer_ready_check_timeout_ms,
             max_concurrent_proofs,
             da_connection_string,
             ligero_program_path,
@@ -286,6 +296,8 @@ async fn main() -> Result<()> {
         max_proofs = cfg.max_proofs,
         deposit_amount = cfg.deposit_amount,
         gas_reserve = cfg.auto_fund_gas_reserve,
+        wallet_setup_batch_size = cfg.wallet_setup_batch_size,
+        wallet_setup_backoff_ms = cfg.wallet_setup_backoff_ms,
         "Starting proof pool service"
     );
 
@@ -422,7 +434,13 @@ async fn max_proofs_impl(
             return Err(StatusCode::BAD_REQUEST);
         }
         state.target_max_proofs.store(max_proofs, Ordering::Relaxed);
-        tracing::info!(max_proofs, "Updated MAX_PROOFS target");
+        tracing::info!(
+            max_proofs,
+            setup_concurrency = state.cfg.setup_concurrency,
+            batch_size = state.cfg.wallet_setup_batch_size,
+            batch_delay_ms = state.cfg.wallet_setup_backoff_ms,
+            "Updated MAX_PROOFS target (wallet scale-up is paced)"
+        );
     }
 
     let ready = ready_proofs(&state).await;
@@ -447,12 +465,23 @@ async fn send_impl(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let flush = flush_verifier(&state, Some(requested))
+    let tx_hashes = collect_pending_hashes(&state, requested).await;
+    if tx_hashes.is_empty() {
+        let ready = ready_proofs(&state).await;
+        return Ok(Json(SendResponse {
+            requested,
+            flushed: 0,
+            accepted: 0,
+            rejected: 0,
+            ready_proofs: ready,
+        }));
+    }
+
+    let flush = flush_verifier(&state, &tx_hashes)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    apply_flush_results(&state, &flush).await;
-    let ready = ready_proofs(&state).await;
+    let ready = apply_flush_results(&state, &flush).await;
 
     Ok(Json(SendResponse {
         requested,
@@ -490,20 +519,31 @@ async fn burst_impl(
     for (idx, requested) in quantities.iter().copied().enumerate() {
         tokio::time::sleep_until(burst_start + interval * (idx as u32)).await;
 
-        let flush = flush_verifier(&state, Some(requested))
-            .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let tx_hashes = collect_pending_hashes(&state, requested).await;
+        if tx_hashes.is_empty() {
+            let ready = ready_proofs(&state).await;
+            steps.push(BurstStep {
+                requested,
+                flushed: 0,
+                accepted: 0,
+                rejected: 0,
+                ready_proofs: ready,
+            });
+        } else {
+            let flush = flush_verifier(&state, &tx_hashes)
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-        apply_flush_results(&state, &flush).await;
-        let ready = ready_proofs(&state).await;
+            let ready = apply_flush_results(&state, &flush).await;
 
-        steps.push(BurstStep {
-            requested,
-            flushed: flush.flushed,
-            accepted: flush.accepted,
-            rejected: flush.rejected,
-            ready_proofs: ready,
-        });
+            steps.push(BurstStep {
+                requested,
+                flushed: flush.flushed,
+                accepted: flush.accepted,
+                rejected: flush.rejected,
+                ready_proofs: ready,
+            });
+        }
     }
 
     Ok(Json(BurstResponse {
@@ -540,7 +580,16 @@ async fn ready_proofs(state: &Arc<ServiceState>) -> usize {
     wallets.iter().filter(|w| w.pending.is_some()).count()
 }
 
-async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) {
+async fn collect_pending_hashes(state: &Arc<ServiceState>, limit: usize) -> Vec<String> {
+    let wallets = state.wallets.read().await;
+    wallets
+        .iter()
+        .filter_map(|w| w.pending.as_ref().map(|p| p.tx_hash.clone()))
+        .take(limit)
+        .collect()
+}
+
+async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) -> usize {
     let mut wallets = state.wallets.write().await;
     let mut by_hash: HashMap<String, usize> = HashMap::new();
     for (idx, w) in wallets.iter().enumerate() {
@@ -570,6 +619,8 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) {
         }
         w.pending = None;
     }
+
+    wallets.iter().filter(|w| w.pending.is_some()).count()
 }
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
@@ -616,17 +667,66 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
             let target = state.target_max_proofs.load(Ordering::Relaxed);
             let current = state.wallets.read().await.len();
             if current < target {
-                let to_add = target - current;
-                tracing::info!(current, target, to_add, "Scaling wallet pool up");
+                if !sequencer_ready_for_wallet_setup(&state).await {
+                    tracing::warn!(
+                        current,
+                        target,
+                        backoff_ms = state.cfg.wallet_setup_backoff_ms,
+                        "Sequencer is not ready; delaying wallet scale-up batch"
+                    );
+                    sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
+                    continue;
+                }
+
+                let missing = target - current;
+                let to_add = missing.min(state.cfg.wallet_setup_batch_size);
+                tracing::info!(
+                    current,
+                    target,
+                    missing,
+                    batch_size = to_add,
+                    "Scaling wallet pool up in batch"
+                );
                 if let Err(e) = setup_and_append_wallets(&state, to_add).await {
                     tracing::error!(error = %e, "Failed to scale wallet pool");
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
+                } else {
+                    // Smooth large max_proofs increases by pacing successful scale-up batches.
+                    sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
                 }
                 continue;
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
         }
     });
+}
+
+async fn sequencer_ready_for_wallet_setup(state: &Arc<ServiceState>) -> bool {
+    let ready_url = format!(
+        "{}/sequencer/ready",
+        state.cfg.rollup_rpc_url.trim_end_matches('/')
+    );
+
+    let req = state.http.get(&ready_url).send();
+    match timeout(
+        Duration::from_millis(state.cfg.sequencer_ready_check_timeout_ms),
+        req,
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "Failed to query sequencer readiness");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = state.cfg.sequencer_ready_check_timeout_ms,
+                "Timed out querying sequencer readiness"
+            );
+            false
+        }
+    }
 }
 
 async fn pick_wallet_to_generate(state: &Arc<ServiceState>) -> Option<usize> {
@@ -1276,18 +1376,21 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
         .collect()
 }
 
-async fn flush_verifier(state: &Arc<ServiceState>, limit: Option<usize>) -> Result<FlushSummary> {
+async fn flush_verifier(state: &Arc<ServiceState>, tx_hashes: &[String]) -> Result<FlushSummary> {
     let mut url = format!(
         "{}/midnight-privacy/flush",
         state.verifier_url.trim_end_matches('/')
     );
-    if let Some(limit) = limit {
-        url = format!("{}?limit={}", url, limit);
+    let mut query_params: Vec<String> = vec!["wait_for_db=true".to_string()];
+    if !tx_hashes.is_empty() {
+        query_params.push(format!("limit={}", tx_hashes.len()));
     }
+    url = format!("{url}?{}", query_params.join("&"));
 
     let resp = state
         .http
         .post(&url)
+        .json(&serde_json::json!({ "tx_hashes": tx_hashes }))
         .send()
         .await
         .with_context(|| format!("POST {}", url))?;
@@ -1452,5 +1555,12 @@ fn env_u128(key: &str, default: u128) -> u128 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u128>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
 }

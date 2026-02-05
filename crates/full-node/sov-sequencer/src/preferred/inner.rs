@@ -67,8 +67,10 @@ const CHANNEL_SIZE: usize = 16384;
 const PARALLEL_COMPLETION_MAX_RETRIES: u8 = 50;
 const PARALLEL_COMPLETION_RETRY_DELAY_MS: u64 = 10;
 
-type AcceptTxRet<S, Rt> =
-    Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>;
+type AcceptTxRet<S, Rt> = Result<
+    oneshot::Receiver<Result<AcceptedTx<Confirmation<S, Rt>>, ParallelTxFailure>>,
+    AcceptTxError<S>,
+>;
 
 /// A inner sequencer struct containing state that requires synchronized access.
 /// This struct accepts/rejects transactions, then hands them to the side effects task
@@ -109,7 +111,10 @@ where
     parallel_tx_executor: ParallelTxExecutor<S, Rt>,
     // Parallel in-flight tracking and HTTP waiters
     pending_parallel_count: usize,
-    pending_http_waiters: HashMap<TxHash, oneshot::Sender<AcceptedTx<Confirmation<S, Rt>>>>,
+    pending_http_waiters: HashMap<
+        TxHash,
+        oneshot::Sender<Result<AcceptedTx<Confirmation<S, Rt>>, ParallelTxFailure>>,
+    >,
     /// Set when the batch should close but parallel txs are still in-flight.
     /// While true, new txs are routed to sequential path (not parallel workers).
     /// When pending_parallel_count reaches 0 and this is true, close the batch.
@@ -859,8 +864,16 @@ pub(crate) enum Message<S: Spec, Rt: Runtime<S>> {
     },
     ParallelTxFailed {
         tx_hash: TxHash,
+        error_kind: &'static str,
+        error_summary: String,
         reason: &'static str,
     },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParallelTxFailure {
+    pub error_kind: &'static str,
+    pub error_summary: String,
 }
 
 #[derive(Debug)]
@@ -1073,7 +1086,10 @@ where
         original_tx_queue_id: u64,
         reason: &'static str,
     ) -> Result<
-        Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>>,
+        Result<
+            oneshot::Receiver<Result<AcceptedTx<Confirmation<S, Rt>>, ParallelTxFailure>>,
+            AcceptTxError<S>,
+        >,
         SequencerStateUpdatorError,
     > {
         let (resp, recv) = oneshot::channel();
@@ -1495,20 +1511,38 @@ where
                     elapsed
                 );
             }
-            Message::ParallelTxFailed { tx_hash, reason } => {
+            Message::ParallelTxFailed {
+                tx_hash,
+                error_kind,
+                error_summary,
+                reason,
+            } => {
                 // Best-effort cleanup of HTTP waiter and parallel count so the caller doesn't hang forever.
                 let mut inner = self.get_inner_with_timing(reason).await;
-                tracing::warn!(
-                    %tx_hash,
-                    "Parallel worker reported failure; cleaning up pending waiter"
-                );
-                if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
-                    // Dropping the sender will cause the HTTP-side oneshot to error, surfacing as a 500.
-                    drop(waiter);
+                let waiter = inner.pending_http_waiters.remove(&tx_hash);
+                let had_waiter = waiter.is_some();
+                let pending_parallel_before = inner.pending_parallel_count;
+
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(Err(ParallelTxFailure {
+                        error_kind,
+                        error_summary: error_summary.clone(),
+                    }));
                 }
                 if inner.pending_parallel_count > 0 {
                     inner.pending_parallel_count -= 1;
                 }
+                let pending_parallel_after = inner.pending_parallel_count;
+
+                tracing::warn!(
+                    %tx_hash,
+                    error_kind,
+                    error_summary = %error_summary,
+                    had_waiter,
+                    pending_parallel_before,
+                    pending_parallel_after,
+                    "Parallel worker reported failure; cleaning up pending waiter"
+                );
             }
         }
 
@@ -1758,7 +1792,10 @@ where
         tx_hash: TxHash,
         original_tx_queue_id: u64,
         reason: &'static str,
-    ) -> Result<oneshot::Receiver<AcceptedTx<Confirmation<S, Rt>>>, AcceptTxError<S>> {
+    ) -> Result<
+        oneshot::Receiver<Result<AcceptedTx<Confirmation<S, Rt>>, ParallelTxFailure>>,
+        AcceptTxError<S>,
+    > {
         let stage1_start = std::time::Instant::now();
 
         // Clone message_sender before getting the inner guard to avoid borrow conflicts
@@ -2015,11 +2052,23 @@ where
             let (http_tx, http_rx) = oneshot::channel();
             // If the receiver dropped (e.g., HTTP request was cancelled), we simply
             // ignore the error – side effects are already enqueued.
-            let _ = http_tx.send(accepted_tx);
+            let _ = http_tx.send(Ok(accepted_tx));
             return Ok(http_rx);
         }
 
-        Ok(side_effects_rx)
+        let (http_tx, http_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = match side_effects_rx.await {
+                Ok(accepted_tx) => Ok(accepted_tx),
+                Err(err) => Err(ParallelTxFailure {
+                    error_kind: "side_effects_channel_closed",
+                    error_summary: format!("Failed to receive side-effects confirmation: {err}"),
+                }),
+            };
+            let _ = http_tx.send(result);
+        });
+
+        Ok(http_rx)
     }
 
     async fn process_latest_slot_number(&mut self, reason: &'static str) -> SlotNumber {
@@ -2065,7 +2114,12 @@ where
                     .pending_http_waiters
                     .remove(&parallel_response.tx_hash)
                 {
-                    drop(waiter);
+                    let _ = waiter.send(Err(ParallelTxFailure {
+                        error_kind: "max_retries_exceeded",
+                        error_summary: format!(
+                            "Parallel tx completion dropped after {retry_count} retries: {reason}"
+                        ),
+                    }));
                 }
                 if inner.pending_parallel_count > 0 {
                     inner.pending_parallel_count -= 1;
@@ -2145,7 +2199,12 @@ where
             Err(err) => {
                 tracing::debug!(%tx_hash, %err, "Main executor failed to commit precomputed tx; dropping");
                 if let Some(waiter) = inner.pending_http_waiters.remove(&tx_hash) {
-                    drop(waiter);
+                    let _ = waiter.send(Err(ParallelTxFailure {
+                        error_kind: "executor_commit_failed",
+                        error_summary: format!(
+                            "Main executor failed to commit precomputed tx: {err}"
+                        ),
+                    }));
                 }
                 if inner.pending_parallel_count > 0 {
                     inner.pending_parallel_count -= 1;
@@ -2219,8 +2278,13 @@ where
                 %tx_hash,
                 "Executor event channel closed during parallel tx completion; dropping HTTP waiter"
             );
-            // Drop waiter without sending - HTTP client will get channel-closed error
-            drop(maybe_waiter);
+            if let Some(waiter) = maybe_waiter.take() {
+                let _ = waiter.send(Err(ParallelTxFailure {
+                    error_kind: "executor_channel_closed",
+                    error_summary: "Executor event channel closed during parallel tx completion"
+                        .to_string(),
+                }));
+            }
             if inner.pending_parallel_count > 0 {
                 inner.pending_parallel_count -= 1;
             }
@@ -2238,7 +2302,7 @@ where
                 let waiter_bridge_start = std::time::Instant::now();
                 let accepted_for_http = accepted_with_budget_main.accepted_tx.clone();
                 tokio::spawn(async move {
-                    let _ = waiter.send(accepted_for_http);
+                    let _ = waiter.send(Ok(accepted_for_http));
                 });
                 waiter_bridge_time = waiter_bridge_start.elapsed();
             }
@@ -2251,7 +2315,7 @@ where
                 let waiter_bridge_start = std::time::Instant::now();
                 let accepted_for_http = accepted_with_budget_main.accepted_tx.clone();
                 tokio::spawn(async move {
-                    let _ = waiter.send(accepted_for_http);
+                    let _ = waiter.send(Ok(accepted_for_http));
                 });
                 waiter_bridge_time = waiter_bridge_start.elapsed();
             }

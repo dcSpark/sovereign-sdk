@@ -201,6 +201,16 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
         .to_owned();
     idx_db.execute(builder.build(&idx_stmt)).await?;
 
+    // Common time-range queries (e.g., median tx size) filter by kind + created_at.
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_notes_nullifiers_created_kind_created_at")
+        .table(idx::notes_nullifiers::Entity)
+        .col(idx::notes_nullifiers::Column::CreatedKind)
+        .col(idx::notes_nullifiers::Column::CreatedAt)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
     // Frozen accounts: quick lookup by privacy address
     let idx_stmt: IndexCreateStatement = Index::create()
         .name("idx_frozen_accounts_privacy_address")

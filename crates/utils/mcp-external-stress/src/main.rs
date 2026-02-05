@@ -51,13 +51,29 @@ struct Args {
     #[arg(
         long,
         env = "MCP_STRESS_WALLET_READY_TIMEOUT_SECS",
-        default_value_t = 600
+        default_value_t = 120
     )]
     wallet_ready_timeout_secs: u64,
 
     /// Poll interval while waiting for wallet to have balance.
-    #[arg(long, env = "MCP_STRESS_WALLET_READY_POLL_MS", default_value_t = 2000)]
+    #[arg(long, env = "MCP_STRESS_WALLET_READY_POLL_MS", default_value_t = 500)]
     wallet_ready_poll_ms: u64,
+
+    /// Number of consecutive walletBalance requests per readiness cycle before sleeping.
+    #[arg(
+        long,
+        env = "MCP_STRESS_WALLET_READY_BURST_REQUESTS",
+        default_value_t = 3
+    )]
+    wallet_ready_burst_requests: u32,
+
+    /// Per-call timeout for walletBalance while waiting for initial wallet readiness.
+    #[arg(
+        long,
+        env = "MCP_STRESS_WALLET_READY_CALL_TIMEOUT_MS",
+        default_value_t = 1500
+    )]
+    wallet_ready_call_timeout_ms: u64,
 
     /// Poll interval when confirmation is enabled.
     #[arg(long, env = "MCP_STRESS_CONFIRM_POLL_MS", default_value_t = 500)]
@@ -394,28 +410,93 @@ async fn wait_for_wallet_balance(
     client: &rmcp::service::Peer<rmcp::service::RoleClient>,
     timeout: Duration,
     poll: Duration,
+    burst_requests: u32,
+    per_call_timeout: Duration,
 ) -> Result<u128> {
     let start = Instant::now();
+    let mut consecutive_errors: u32 = 0;
+    let mut total_errors: u64 = 0;
+    let burst_requests = burst_requests.max(1);
+
     loop {
-        let json = call_tool_json(client, "walletBalance", Some(rmcp::object!({}))).await?;
-        let balance = json
-            .get("balance")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("walletBalance response missing balance"))?
-            .parse::<u128>()
-            .context("walletBalance balance is not a valid u128")?;
-        if balance > 0 {
-            return Ok(balance);
+        for burst_attempt in 0..burst_requests {
+            match tokio::time::timeout(
+                per_call_timeout,
+                call_tool_json(client, "walletBalance", Some(rmcp::object!({}))),
+            )
+            .await
+            {
+                Ok(Ok(json)) => {
+                    consecutive_errors = 0;
+                    let balance = json
+                        .get("balance")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("walletBalance response missing balance"))?
+                        .parse::<u128>()
+                        .context("walletBalance balance is not a valid u128")?;
+                    if balance > 0 {
+                        return Ok(balance);
+                    }
+                }
+                Ok(Err(e)) => {
+                    consecutive_errors += 1;
+                    total_errors += 1;
+                    if consecutive_errors == 1 || consecutive_errors % 5 == 0 {
+                        tracing::warn!(
+                            consecutive_errors,
+                            total_errors,
+                            burst_attempt = burst_attempt + 1,
+                            burst_requests,
+                            waited_ms = start.elapsed().as_millis(),
+                            error = format!("{:#}", e),
+                            "walletBalance call failed, will retry until timeout"
+                        );
+                    }
+                }
+                Err(_) => {
+                    consecutive_errors += 1;
+                    total_errors += 1;
+                    if consecutive_errors == 1 || consecutive_errors % 5 == 0 {
+                        tracing::warn!(
+                            consecutive_errors,
+                            total_errors,
+                            burst_attempt = burst_attempt + 1,
+                            burst_requests,
+                            waited_ms = start.elapsed().as_millis(),
+                            per_call_timeout_ms = per_call_timeout.as_millis(),
+                            "walletBalance call timed out, will retry until timeout"
+                        );
+                    }
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                break;
+            }
         }
 
         if start.elapsed() >= timeout {
+            if total_errors > 0 {
+                return Err(anyhow!(
+                    "wallet did not reach non-zero privacy balance within {:?} (walletBalance errors: total={}, consecutive={}, burst_requests={}, per_call_timeout={:?})",
+                    timeout,
+                    total_errors,
+                    consecutive_errors,
+                    burst_requests,
+                    per_call_timeout
+                ));
+            }
             return Err(anyhow!(
                 "wallet did not reach non-zero privacy balance within {:?}",
                 timeout
             ));
         }
 
-        tokio::time::sleep(poll).await;
+        if poll.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(poll).await;
+        }
     }
 }
 
@@ -553,6 +634,8 @@ async fn wallet_worker(
         &client,
         Duration::from_secs(args.wallet_ready_timeout_secs),
         Duration::from_millis(args.wallet_ready_poll_ms),
+        args.wallet_ready_burst_requests,
+        Duration::from_millis(args.wallet_ready_call_timeout_ms),
     )
     .await
     .with_context(|| format!("wallet[{idx}] waiting for initial balance"))?;
@@ -578,6 +661,14 @@ async fn wallet_worker(
             }
         }
         sent_attempts += 1;
+        if sent_attempts == 1 {
+            tracing::info!(
+                "wallet[{idx}] round=1 mapping: session_id={} wallet_address={} privacy_address={}",
+                session_id,
+                wallet_address,
+                privacy_address
+            );
+        }
 
         let send_started = Instant::now();
         let send_res = send_to_self(&client, &privacy_address, args.send_amount).await;
@@ -648,7 +739,7 @@ async fn wallet_worker(
         }
     }
 
-    let _ = client.cancel().await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), client.cancel()).await;
     Ok(())
 }
 
@@ -680,7 +771,7 @@ async fn probe_once(mcp_endpoint: &str) -> Result<()> {
         tracing::info!("tool: {}", tool.name);
     }
 
-    let _ = client.cancel().await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), client.cancel()).await;
     Ok(())
 }
 
@@ -709,12 +800,16 @@ async fn main() -> Result<()> {
     let session_ids = ensure_session_ids_file(args.session_ids_file.as_path(), args.wallets)?;
 
     tracing::info!(
-        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} session_ids_file={}",
+        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} wallet_ready_timeout_secs={} wallet_ready_poll_ms={} wallet_ready_burst_requests={} wallet_ready_call_timeout_ms={} session_ids_file={}",
         args.mcp_endpoint,
         args.wallets,
         args.send_amount,
         args.duration_secs,
         args.confirm,
+        args.wallet_ready_timeout_secs,
+        args.wallet_ready_poll_ms,
+        args.wallet_ready_burst_requests,
+        args.wallet_ready_call_timeout_ms,
         args.session_ids_file.display()
     );
 

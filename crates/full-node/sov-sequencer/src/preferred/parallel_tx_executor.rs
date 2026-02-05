@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::preferred::block_executor::RollupBlockExecutorError;
 use crate::preferred::cache_warm_up_executor::StartBlockNotification;
 use crate::preferred::PreferredSequencerConfig;
 use crate::preferred::RollupBlockExecutor;
@@ -29,6 +30,41 @@ static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 // This should be large enough to accommodate multiple transactions being processed simultaneously
 // by different workers, but not so large that it causes memory issues.
 const PARALLEL_TX_CHANNEL_SIZE: usize = 16_384;
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}...")
+}
+
+fn summarize_parallel_exec_error<S: Spec>(
+    err: &RollupBlockExecutorError<S>,
+) -> (&'static str, String) {
+    match err {
+        RollupBlockExecutorError::DecodeCall(decode_err) => ("decode_call", decode_err.to_string()),
+        RollupBlockExecutorError::Overloaded => (
+            "overloaded",
+            "The sequencer was temporarily overloaded while executing in parallel".to_string(),
+        ),
+        RollupBlockExecutorError::Rejected { reason, call } => (
+            "rejected",
+            format!(
+                "reason={reason:?}, call_preview={}",
+                truncate_for_log(call, 256)
+            ),
+        ),
+        RollupBlockExecutorError::UnsuccessfulTransaction { receipt } => (
+            "unsuccessful_transaction",
+            format!("receipt={:?}", receipt.receipt),
+        ),
+        RollupBlockExecutorError::UnexpectedFailure => (
+            "unexpected_failure",
+            "Rollup block executor task failed unexpectedly".to_string(),
+        ),
+    }
+}
 
 /// Result of parallel transaction execution that will be sent back to the main sequencer.
 /// Contains all the information needed to finalize the transaction without re-executing it.
@@ -469,10 +505,19 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                                     }
                                 }
                 Err(err) => {
-                    tracing::debug!(
+                    let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                    let (error_kind, error_summary) = summarize_parallel_exec_error(&err);
+                    tracing::warn!(
                         worker_id,
                         tx_hash = %request.tx_hash,
-                        %err,
+                        queue_id = request.original_tx_queue_id,
+                        sequence_number = ?request.sequence_number,
+                        tx_len = request.tx_len,
+                        elapsed_ms = format!("{:.2}", elapsed_ms),
+                        active_workers = active_count_after,
+                        error_kind,
+                        error = %err,
+                        error_summary = %error_summary,
                         "Parallel worker failed to execute transaction"
                     );
                     // Notify the main sequencer so it can clean up the HTTP waiter
@@ -480,6 +525,8 @@ impl<S: Spec, Rt: Runtime<S>> ParallelTxExecutor<S, Rt> {
                     // leaving the request hanging indefinitely.
                     let fail_msg = crate::preferred::inner::Message::ParallelTxFailed {
                         tx_hash: request.tx_hash,
+                        error_kind,
+                        error_summary,
                         reason: "parallel_tx_failed",
                     };
                     if let Err(send_err) = request.message_sender.send(fail_msg).await {
