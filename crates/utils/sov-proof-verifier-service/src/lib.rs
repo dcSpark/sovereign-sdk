@@ -5,10 +5,10 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -974,6 +974,10 @@ pub fn create_router(state: AppState) -> Router {
             post(verify_and_record_midnight_handler),
         )
         .route("/midnight-privacy/flush", post(flush_pending_handler))
+        .route(
+            "/midnight-privacy/pending_count",
+            get(pending_count_handler),
+        )
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
         // Remove default 2MB body limit and allow larger payloads.
@@ -1001,6 +1005,37 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
+#[derive(Debug, Serialize)]
+struct PendingCountResponse {
+    pending: u64,
+}
+
+async fn pending_count_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PendingCountResponse>, ServiceError> {
+    use sea_orm::PaginatorTrait;
+    use worker_verified_transactions::{
+        Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState,
+    };
+
+    let pending = VerifiedEntity::find()
+        .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
+        .count(state.da_conn.as_ref())
+        .await
+        .map_err(|err| {
+            ServiceError::Internal(format!(
+                "Failed to count pending worker transactions: {err}"
+            ))
+        })?;
+
+    Ok(Json(PendingCountResponse { pending }))
+}
+
+#[derive(Debug, Deserialize)]
+struct FlushQuery {
+    limit: Option<u64>,
+}
+
 /// Flush all pending worker-verified transactions to the sequencer in parallel.
 ///
 /// This returns as soon as all sequencer submissions have completed and the
@@ -1008,17 +1043,25 @@ async fn health_check() -> impl IntoResponse {
 /// background task so they don't block the HTTP response.
 async fn flush_pending_handler(
     State(state): State<AppState>,
+    Query(query): Query<FlushQuery>,
 ) -> Result<Json<serde_json::Value>, ServiceError> {
-    use sea_orm::QuerySelect;
+    use sea_orm::{QueryOrder, QuerySelect};
     use worker_verified_transactions::{
         Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState,
     };
 
     // Fetch list of pending tx hashes (only the tx_hash column, to avoid loading large blobs)
-    let pending_tx_hashes: Vec<String> = VerifiedEntity::find()
+    let mut pending_query = VerifiedEntity::find()
         .select_only()
         .column(VerifiedColumn::TxHash)
         .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
+        .order_by_asc(VerifiedColumn::Id);
+
+    if let Some(limit) = query.limit {
+        pending_query = pending_query.limit(limit);
+    }
+
+    let pending_tx_hashes: Vec<String> = pending_query
         .into_tuple::<(String,)>()
         .all(state.da_conn.as_ref())
         .await
