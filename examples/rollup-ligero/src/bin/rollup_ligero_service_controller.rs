@@ -808,6 +808,13 @@ async fn health_check(State(_app): State<Arc<AppState>>) -> Result<Json<HealthRe
             health_path: "/", // Oracle uses root endpoint for health check
             optional_env: None,
         },
+        ServiceDefinition {
+            name: "midnight-proof-pool-service",
+            env_var: "PROOF_POOL_BIND_ADDR",
+            default_url: "http://127.0.0.1:11235",
+            health_path: "/health",
+            optional_env: None,
+        },
     ];
 
     let client = reqwest::Client::builder()
