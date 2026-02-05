@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 const DEFAULT_RETENTION_SECS: u64 = 5 * 24 * 60 * 60;
+const DEFAULT_PEAK_TPS_MULTIPLIER: f64 = 1.0;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -13,6 +14,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub tsink_data_path: PathBuf,
     pub tsink_retention_secs: u64,
+    /// Multiplier applied to PeakTPS metric output on EMA endpoints and /tps/peak.
+    pub peak_tps_multiplier: f64,
 }
 
 impl Config {
@@ -68,12 +71,31 @@ impl Config {
             Err(_) => DEFAULT_RETENTION_SECS,
         };
 
+        let peak_tps_multiplier = match env::var("PEAK_TPS_MULTIPLIER") {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    DEFAULT_PEAK_TPS_MULTIPLIER
+                } else {
+                    let parsed = trimmed
+                        .parse::<f64>()
+                        .map_err(|_| anyhow!("PEAK_TPS_MULTIPLIER must be a valid number"))?;
+                    if parsed < 0.0 {
+                        return Err(anyhow!("PEAK_TPS_MULTIPLIER must be >= 0"));
+                    }
+                    parsed
+                }
+            }
+            Err(_) => DEFAULT_PEAK_TPS_MULTIPLIER,
+        };
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
             bind_addr,
             tsink_data_path: PathBuf::from(tsink_data_path),
             tsink_retention_secs,
+            peak_tps_multiplier,
         })
     }
 }
