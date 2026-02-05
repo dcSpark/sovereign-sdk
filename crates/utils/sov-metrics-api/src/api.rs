@@ -367,9 +367,12 @@ async fn tps_peak(
             if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
                 && entry.computed_up_to_ms >= window_start_ms
             {
-                // Apply multiplier to cached value
+                // Apply multiplier with noise to cached value
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(entry.peak_tps * state.peak_tps_multiplier),
+                    peak_tps: Some(apply_multiplier_with_noise(
+                        entry.peak_tps,
+                        state.peak_tps_multiplier,
+                    )),
                     peak_at_ms: Some(entry.peak_at_ms),
                     window_ms,
                     from_cache: true,
@@ -403,8 +406,9 @@ async fn tps_peak(
         });
     }
 
-    // Apply multiplier to output
-    let peak_tps_output = peak_tps.map(|tps| tps * state.peak_tps_multiplier);
+    // Apply multiplier with noise to output
+    let peak_tps_output =
+        peak_tps.map(|tps| apply_multiplier_with_noise(tps, state.peak_tps_multiplier));
 
     Json(TpsPeakResponse {
         peak_tps: peak_tps_output,
@@ -574,8 +578,8 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
             }
         };
 
-    // Apply peak TPS multiplier
-    let peak_tps = peak_tps * state.peak_tps_multiplier;
+    // Apply peak TPS multiplier with noise
+    let peak_tps = apply_multiplier_with_noise(peak_tps, state.peak_tps_multiplier);
 
     // Round TPS values to 2 decimal places to avoid showing tiny numbers
     let tps = round_to_precision(tps.unwrap_or(0.0), 2);
@@ -599,6 +603,14 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
 fn round_to_precision(value: f64, decimals: u32) -> f64 {
     let multiplier = 10_f64.powi(decimals as i32);
     (value * multiplier).round() / multiplier
+}
+
+/// Applies the peak TPS multiplier with random noise in the range [0.95, 1.05].
+fn apply_multiplier_with_noise(value: f64, multiplier: f64) -> f64 {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let noise = rng.gen_range(0.95..=1.05);
+    value * multiplier * noise
 }
 
 /// Query the database to find the peak TPS by counting transactions per block.
