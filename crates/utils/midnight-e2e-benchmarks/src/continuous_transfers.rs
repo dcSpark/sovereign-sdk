@@ -1671,7 +1671,10 @@ async fn perform_transfer_cycle(
         change_rho: Option<Hash32>,
     }
 
-    let depth_usize = TREE_DEPTH as usize;
+    // The commitment tree can grow past `TREE_DEPTH` on long-lived chains. Always bind proofs
+    // to the actual depth of the rebuilt tree.
+    let tree_depth = mt.depth();
+    let depth_usize = tree_depth as usize;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_proofs));
     let mut proof_tasks = Vec::with_capacity(plans.len());
 
@@ -1999,7 +2002,7 @@ async fn perform_transfer_cycle(
                 host.add_hex_arg(hex::encode(DOMAIN)); // 1: domain (PUBLIC)
                 host.add_hex_arg(hex::encode(in_spend_sk)); // 2: spend_sk (PRIVATE)
                 host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3: pk_ivk_owner (PRIVATE)
-                host.add_u64_arg(TREE_DEPTH as u64); // 4: depth (PUBLIC)
+                host.add_u64_arg(tree_depth as u64); // 4: depth (PUBLIC)
                 host.add_hex_arg(hex::encode(anchor)); // 5: anchor (PUBLIC)
                 host.add_u64_arg(n_in as u64); // 6: n_in (PUBLIC)
 
