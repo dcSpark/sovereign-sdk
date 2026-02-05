@@ -92,9 +92,6 @@ pub async fn get_privacy_notes(
 }
 
 /// Select up to `max_inputs` notes, largest-first.
-///
-/// This matches the tx-generator policy: always use as many notes as possible
-/// (up to 4), in descending value order.
 pub fn select_largest_notes(
     mut notes: Vec<SpendableNote>,
     max_inputs: usize,
@@ -108,15 +105,25 @@ pub fn select_largest_notes(
     notes
 }
 
-/// Convenience helper: select up to `max_inputs` notes and ensure the sum covers `send_amount`.
+/// Convenience helper: select the fewest largest-first notes needed to cover `send_amount`.
+///
+/// The selection remains capped by `max_inputs`.
 pub fn select_largest_notes_covering_amount(
     notes: Vec<SpendableNote>,
     send_amount: u128,
     max_inputs: usize,
 ) -> Result<Vec<SpendableNote>> {
     anyhow::ensure!(send_amount > 0, "send_amount must be > 0");
-    let selected = select_largest_notes(notes, max_inputs);
-    let total_in: u128 = selected.iter().map(|n| n.value).sum();
+    let notes = select_largest_notes(notes, max_inputs);
+    let mut selected: Vec<SpendableNote> = Vec::new();
+    let mut total_in: u128 = 0;
+    for note in notes {
+        total_in = total_in.saturating_add(note.value);
+        selected.push(note);
+        if total_in >= send_amount {
+            break;
+        }
+    }
     anyhow::ensure!(
         total_in >= send_amount,
         "insufficient funds within {} inputs: need {}, have {}",
@@ -125,4 +132,48 @@ pub fn select_largest_notes_covering_amount(
         total_in
     );
     Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_largest_notes_covering_amount, SpendableNote};
+
+    fn note(value: u128, rho_suffix: u8) -> SpendableNote {
+        SpendableNote {
+            value,
+            rho: format!("{:064x}", rho_suffix),
+            sender_id: format!("{:064x}", rho_suffix.saturating_add(1)),
+            tx_hash: format!("0x{:02x}", rho_suffix),
+            timestamp_ms: i64::from(rho_suffix),
+            kind: "transfer".to_string(),
+        }
+    }
+
+    #[test]
+    fn covering_amount_uses_minimum_inputs_largest_first() {
+        let notes = vec![note(9, 1), note(7, 2), note(3, 3), note(1, 4)];
+        let selected =
+            select_largest_notes_covering_amount(notes, 8, 4).expect("selection should succeed");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].value, 9);
+    }
+
+    #[test]
+    fn covering_amount_respects_input_cap() {
+        let notes = vec![note(4, 1), note(3, 2), note(2, 3), note(1, 4)];
+        let err = select_largest_notes_covering_amount(notes, 10, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("insufficient funds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn covering_amount_selects_multiple_when_needed() {
+        let notes = vec![note(5, 1), note(4, 2), note(3, 3)];
+        let selected =
+            select_largest_notes_covering_amount(notes, 8, 4).expect("selection should succeed");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.iter().map(|n| n.value).sum::<u128>(), 9);
+    }
 }

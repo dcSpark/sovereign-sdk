@@ -770,13 +770,23 @@ pub struct GetWalletStatusResult {
 }
 
 const DEFAULT_PENDING_SPENT_NOTE_TTL_SECS: u64 = 120;
+const DEFAULT_PENDING_SPENT_NOTE_RESERVE_TTL_SECS: u64 = 180;
 const DEFAULT_WAIT_FOR_FRESH_NOTES_SECS: u64 = 5;
+const DEFAULT_INVALID_ANCHOR_RETRY_MAX: u64 = 1;
 
 fn pending_spent_note_ttl() -> std::time::Duration {
     let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PENDING_SPENT_NOTE_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn pending_spent_note_reserve_ttl() -> std::time::Duration {
+    let secs = std::env::var("MCP_PENDING_SPENT_NOTE_RESERVE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PENDING_SPENT_NOTE_RESERVE_TTL_SECS);
     std::time::Duration::from_secs(secs)
 }
 
@@ -787,16 +797,130 @@ fn wait_for_fresh_notes_secs() -> u64 {
         .unwrap_or(DEFAULT_WAIT_FOR_FRESH_NOTES_SECS)
 }
 
+fn invalid_anchor_retry_max() -> u64 {
+    std::env::var("MCP_INVALID_ANCHOR_RETRY_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INVALID_ANCHOR_RETRY_MAX)
+}
+
+fn is_nullifier_already_spent_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("nullifier already spent")
+    })
+}
+
+fn is_invalid_anchor_root_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("invalid anchor root")
+    })
+}
+
+fn is_uncertain_verifier_submit_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let msg = cause.to_string().to_ascii_lowercase();
+        msg.contains("failed to send transaction to verifier service")
+            || msg.contains("verifier service returned error status")
+                && (msg.contains("error status 5") || msg.contains("error status 429"))
+            || msg.contains("failed to read verifier response")
+            || msg.contains("failed to parse verifier response")
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingNoteState {
+    Reserved,
+    Spent,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingNoteEntry {
+    state: PendingNoteState,
+    inserted_at: std::time::Instant,
+}
+
 #[derive(Debug, Default)]
 struct PendingSpentNotes {
-    by_rho: HashMap<String, std::time::Instant>,
+    by_rho: HashMap<String, PendingNoteEntry>,
 }
 
 impl PendingSpentNotes {
-    fn purge_expired(&mut self) {
-        let ttl = pending_spent_note_ttl();
-        self.by_rho
-            .retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+    fn refresh_with_indexer(&mut self, indexer_rhos: &std::collections::HashSet<String>) {
+        let spent_ttl = pending_spent_note_ttl();
+        let reserve_ttl = pending_spent_note_reserve_ttl();
+        self.by_rho.retain(|rho, entry| match entry.state {
+            PendingNoteState::Reserved => entry.inserted_at.elapsed() < reserve_ttl,
+            PendingNoteState::Spent => {
+                if indexer_rhos.contains(rho) {
+                    true
+                } else {
+                    entry.inserted_at.elapsed() < spent_ttl
+                }
+            }
+        });
+    }
+
+    fn reserve_rhos<'a, I>(&mut self, rhos: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let now = std::time::Instant::now();
+        for rho in rhos {
+            match self.by_rho.get_mut(rho) {
+                Some(entry) => {
+                    if entry.state != PendingNoteState::Spent {
+                        entry.state = PendingNoteState::Reserved;
+                        entry.inserted_at = now;
+                    }
+                }
+                None => {
+                    self.by_rho.insert(
+                        rho.to_string(),
+                        PendingNoteEntry {
+                            state: PendingNoteState::Reserved,
+                            inserted_at: now,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn mark_spent_rhos<'a, I>(&mut self, rhos: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let now = std::time::Instant::now();
+        for rho in rhos {
+            self.by_rho.insert(
+                rho.to_string(),
+                PendingNoteEntry {
+                    state: PendingNoteState::Spent,
+                    inserted_at: now,
+                },
+            );
+        }
+    }
+
+    fn release_reservations<'a, I>(&mut self, rhos: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for rho in rhos {
+            let remove = matches!(
+                self.by_rho.get(rho).map(|e| e.state),
+                Some(PendingNoteState::Reserved)
+            );
+            if remove {
+                self.by_rho.remove(rho);
+            }
+        }
     }
 }
 
@@ -823,8 +947,8 @@ pub struct CryptoServer {
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
     session_id: Option<String>,
     session_store: Option<Arc<SessionStore>>,
-    /// Best-effort local cache of recently-spent note identifiers (rho hex), used to avoid
-    /// double-spending when the indexer lags behind the sequencer.
+    /// Best-effort local cache of in-flight and recently-spent note identifiers (rho hex),
+    /// used to avoid double-spending when the indexer lags behind the sequencer.
     pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
     /// Best-effort local cache of newly-created change notes (owned by this wallet),
     /// so consecutive sends don't have to wait for indexer lag.
@@ -964,6 +1088,12 @@ impl CryptoServer {
                 None,
             ));
         }
+        let nf_key = privacy_key.nf_key(&DOMAIN).ok_or_else(|| {
+            ErrorData::internal_error(
+                "privacy key missing spend_sk; cannot derive nf_key".to_string(),
+                None,
+            )
+        })?;
 
         let from_privacy_address = privacy_key.privacy_address(&DOMAIN).to_string();
         let send_span = tracing::info_span!(
@@ -983,7 +1113,7 @@ impl CryptoServer {
         let mut notes_added_local_total: u64 = 0;
         let mut notes_returned_by_indexer_last: usize;
 
-        let notes = loop {
+        let mut notes = loop {
             notes_fetch_attempts += 1;
             let fetch_started = std::time::Instant::now();
             let mut notes =
@@ -998,18 +1128,23 @@ impl CryptoServer {
             notes_fetch_ms_total += fetch_started.elapsed().as_millis();
             notes_returned_by_indexer_last = notes.len();
 
+            let indexer_rhos: std::collections::HashSet<String> =
+                notes.iter().map(|n| n.rho.clone()).collect();
+
             let local_notes: Vec<crate::operations::SpendableNote> = {
                 let local = self.local_notes.lock().await;
                 local.by_rho.values().cloned().collect()
             };
 
-            let filtered = {
+            let pending_rhos: std::collections::HashSet<String> = {
                 let mut pending = self.pending_spent_notes.lock().await;
-                pending.purge_expired();
-                let before = notes.len();
-                notes.retain(|n| !pending.by_rho.contains_key(&n.rho));
-                before.saturating_sub(notes.len())
+                pending.refresh_with_indexer(&indexer_rhos);
+                pending.by_rho.keys().cloned().collect()
             };
+
+            let before = notes.len();
+            notes.retain(|n| !pending_rhos.contains(&n.rho));
+            let filtered = before.saturating_sub(notes.len());
             if filtered > 0 {
                 notes_filtered_pending_total += filtered as u64;
                 tracing::debug!(
@@ -1023,6 +1158,9 @@ impl CryptoServer {
                     notes.iter().map(|n| n.rho.clone()).collect();
                 let mut added = 0usize;
                 for note in local_notes {
+                    if pending_rhos.contains(&note.rho) {
+                        continue;
+                    }
                     if seen.insert(note.rho.clone()) {
                         notes.push(note);
                         added += 1;
@@ -1061,12 +1199,108 @@ impl CryptoServer {
         }
 
         let selection_started = std::time::Instant::now();
-        let selected = crate::operations::select_largest_notes_covering_amount(
-            notes,
-            send_amount,
-            crate::viewer::MAX_INS,
-        )
-        .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
+        let (selected, reserved_rhos) = loop {
+            let candidate = crate::operations::select_largest_notes_covering_amount(
+                notes.clone(),
+                send_amount,
+                crate::viewer::MAX_INS,
+            )
+            .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
+
+            let pending = self.pending_spent_notes.lock().await;
+            if candidate
+                .iter()
+                .any(|note| pending.by_rho.contains_key(&note.rho))
+            {
+                let pending_rhos: std::collections::HashSet<String> =
+                    pending.by_rho.keys().cloned().collect();
+                drop(pending);
+                notes.retain(|note| !pending_rhos.contains(&note.rho));
+                if notes.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "No unspent notes available to send.".to_string(),
+                        None,
+                    ));
+                }
+                continue;
+            }
+            drop(pending);
+
+            // Guard against indexer lag by checking selected candidate nullifiers on-chain.
+            let mut chain_spent_rhos: Vec<String> = Vec::new();
+            for note in &candidate {
+                let rho = parse_hex_32("rho", &note.rho).map_err(|e| {
+                    ErrorData::internal_error(
+                        format!(
+                            "Failed to decode rho while checking nullifier status: {}",
+                            e
+                        ),
+                        None,
+                    )
+                })?;
+                let nf = midnight_privacy::nullifier(&DOMAIN, &nf_key, &rho);
+                let endpoint = format!("/modules/midnight-privacy/nullifiers/{}", hex::encode(nf));
+                match provider
+                    .query_rest_endpoint::<midnight_privacy::NullifierResponse>(&endpoint)
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.is_spent {
+                            chain_spent_rhos.push(note.rho.clone());
+                        }
+                    }
+                    Err(err) => {
+                        // If this check is temporarily unavailable, keep current behavior.
+                        tracing::debug!(
+                            error = %err,
+                            endpoint,
+                            "Failed to query nullifier status during note selection"
+                        );
+                    }
+                }
+            }
+            if !chain_spent_rhos.is_empty() {
+                let spent_set: std::collections::HashSet<String> =
+                    chain_spent_rhos.into_iter().collect();
+                let mut pending = self.pending_spent_notes.lock().await;
+                pending.mark_spent_rhos(spent_set.iter().map(|rho| rho.as_str()));
+                drop(pending);
+
+                let before = notes.len();
+                notes.retain(|note| !spent_set.contains(&note.rho));
+                let removed = before.saturating_sub(notes.len());
+                tracing::debug!(removed, "Filtered candidate notes already spent on-chain");
+
+                if notes.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "No unspent notes available to send.".to_string(),
+                        None,
+                    ));
+                }
+                continue;
+            }
+
+            let mut pending = self.pending_spent_notes.lock().await;
+            if candidate
+                .iter()
+                .any(|note| pending.by_rho.contains_key(&note.rho))
+            {
+                let pending_rhos: std::collections::HashSet<String> =
+                    pending.by_rho.keys().cloned().collect();
+                drop(pending);
+                notes.retain(|note| !pending_rhos.contains(&note.rho));
+                if notes.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "No unspent notes available to send.".to_string(),
+                        None,
+                    ));
+                }
+                continue;
+            }
+            let reserved: Vec<String> = candidate.iter().map(|note| note.rho.clone()).collect();
+            pending.reserve_rhos(reserved.iter().map(|rho| rho.as_str()));
+            break (candidate, reserved);
+        };
 
         let total_in: u128 = selected.iter().map(|n| n.value).sum();
         let selection_ms = selection_started.elapsed().as_millis();
@@ -1148,26 +1382,94 @@ impl CryptoServer {
                 None,
             )
         })?;
+
         let transfer_started = std::time::Instant::now();
-        let transfer_result = crate::operations::transfer(
-            ligero_ref,
-            provider,
-            ctx,
-            spend_sk,
-            pk_ivk_owner,
-            send_amount,
-            inputs,
-            output_pk,
-            output_pk_ivk,
-            viewer_fvk_bundle_for_transfer,
-        )
-        .await
-        .map_err(|e| {
-            ErrorData::internal_error(format!("Failed to submit privacy transfer: {}", e), None)
-        })?;
+        let mut transfer_attempt: u64 = 0;
+        let max_anchor_retries = invalid_anchor_retry_max();
+        let transfer_result = loop {
+            transfer_attempt += 1;
+            let transfer_result = crate::operations::transfer(
+                ligero_ref,
+                provider,
+                ctx,
+                spend_sk,
+                pk_ivk_owner,
+                send_amount,
+                inputs.clone(),
+                output_pk,
+                output_pk_ivk,
+                viewer_fvk_bundle_for_transfer.clone(),
+            )
+            .await;
+
+            match transfer_result {
+                Ok(result) => break Ok(result),
+                Err(err)
+                    if is_invalid_anchor_root_error(&err)
+                        && transfer_attempt <= max_anchor_retries =>
+                {
+                    tracing::warn!(
+                        attempt = transfer_attempt,
+                        max_attempts = max_anchor_retries + 1,
+                        error = %err,
+                        "[send] Transfer failed with invalid anchor root; retrying with refreshed anchor"
+                    );
+                    continue;
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        let transfer_result = match transfer_result {
+            Ok(res) => res,
+            Err(e) => {
+                let keep_pending = is_nullifier_already_spent_error(&e);
+                let invalid_anchor = is_invalid_anchor_root_error(&e);
+                let uncertain_submit = is_uncertain_verifier_submit_error(&e);
+                if keep_pending {
+                    let mut pending = self.pending_spent_notes.lock().await;
+                    let mut local = self.local_notes.lock().await;
+                    pending.mark_spent_rhos(reserved_rhos.iter().map(|rho| rho.as_str()));
+                    for rho in &reserved_rhos {
+                        local.by_rho.remove(rho);
+                    }
+                } else if uncertain_submit {
+                    let mut pending = self.pending_spent_notes.lock().await;
+                    let mut local = self.local_notes.lock().await;
+                    pending.reserve_rhos(reserved_rhos.iter().map(|rho| rho.as_str()));
+                    for rho in &reserved_rhos {
+                        local.by_rho.remove(rho);
+                    }
+                } else {
+                    let mut pending = self.pending_spent_notes.lock().await;
+                    pending.release_reservations(reserved_rhos.iter().map(|rho| rho.as_str()));
+                }
+                if keep_pending {
+                    tracing::warn!(
+                        "[send] Transfer failed with nullifier already spent; keeping {} reserved note(s) pending",
+                        reserved_rhos.len()
+                    );
+                } else if invalid_anchor {
+                    tracing::warn!(
+                        "[send] Transfer failed with invalid anchor root; released {} reservation(s)",
+                        reserved_rhos.len()
+                    );
+                } else if uncertain_submit {
+                    tracing::warn!(
+                        "[send] Transfer failed during verifier submission (outcome uncertain); keeping {} reservation(s) for retry window",
+                        reserved_rhos.len()
+                    );
+                }
+                return Err(ErrorData::internal_error(
+                    format!("Failed to submit privacy transfer: {}", e),
+                    None,
+                ));
+            }
+        };
+
         let transfer_ms = transfer_started.elapsed().as_millis();
         tracing::debug!(
             elapsed_ms = transfer_ms,
+            attempts = transfer_attempt,
             tx_hash = %transfer_result.tx_hash,
             "Transfer call completed"
         );
@@ -1175,28 +1477,61 @@ impl CryptoServer {
         {
             let mut pending = self.pending_spent_notes.lock().await;
             let mut local = self.local_notes.lock().await;
-            pending.purge_expired();
-            let now = std::time::Instant::now();
-            for note in &selected {
-                pending.by_rho.insert(note.rho.clone(), now);
-                local.by_rho.remove(&note.rho);
-            }
+            let sequencer_confirmed =
+                transfer_result.confirmation.as_str() == "sequencer_confirmed";
 
-            if let (Some(change_amount), Some(change_rho)) =
-                (transfer_result.change_amount, transfer_result.change_rho)
-            {
-                let rho_hex = hex::encode(change_rho);
-                let sender_id_hex = hex::encode(privacy_key.recipient(&DOMAIN));
-                local.by_rho.insert(
-                    rho_hex.clone(),
-                    crate::operations::SpendableNote {
-                        value: change_amount,
-                        rho: rho_hex,
-                        sender_id: sender_id_hex,
-                        tx_hash: transfer_result.tx_hash.clone(),
-                        timestamp_ms: transfer_result.created_at,
-                        kind: "transfer".to_string(),
-                    },
+            if sequencer_confirmed {
+                pending.mark_spent_rhos(reserved_rhos.iter().map(|rho| rho.as_str()));
+                for note in &selected {
+                    local.by_rho.remove(&note.rho);
+                }
+
+                let own_recipient = privacy_key.recipient(&DOMAIN);
+                if transfer_result.output_recipient == own_recipient {
+                    let rho_hex = hex::encode(transfer_result.output_rho);
+                    let sender_id_hex = hex::encode(own_recipient);
+                    local.by_rho.insert(
+                        rho_hex.clone(),
+                        crate::operations::SpendableNote {
+                            value: transfer_result.amount_sent,
+                            rho: rho_hex,
+                            sender_id: sender_id_hex,
+                            tx_hash: transfer_result.tx_hash.clone(),
+                            timestamp_ms: transfer_result.created_at,
+                            kind: "transfer".to_string(),
+                        },
+                    );
+                }
+
+                if let (Some(change_amount), Some(change_rho)) =
+                    (transfer_result.change_amount, transfer_result.change_rho)
+                {
+                    let rho_hex = hex::encode(change_rho);
+                    let sender_id_hex = hex::encode(privacy_key.recipient(&DOMAIN));
+                    local.by_rho.insert(
+                        rho_hex.clone(),
+                        crate::operations::SpendableNote {
+                            value: change_amount,
+                            rho: rho_hex,
+                            sender_id: sender_id_hex,
+                            tx_hash: transfer_result.tx_hash.clone(),
+                            timestamp_ms: transfer_result.created_at,
+                            kind: "transfer".to_string(),
+                        },
+                    );
+                }
+            } else {
+                // Confirmation timed out/skipped: keep inputs reserved and avoid creating
+                // local spendable outputs that may never be finalized on-chain.
+                pending.reserve_rhos(reserved_rhos.iter().map(|rho| rho.as_str()));
+                for rho in &reserved_rhos {
+                    local.by_rho.remove(rho);
+                }
+                tracing::warn!(
+                    tx_hash = %transfer_result.tx_hash,
+                    confirmation = transfer_result.confirmation.as_str(),
+                    reserved_inputs = reserved_rhos.len(),
+                    "[send] Transfer accepted by verifier but not sequencer-confirmed yet; keeping inputs reserved"
                 );
             }
         }

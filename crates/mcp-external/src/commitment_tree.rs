@@ -14,8 +14,8 @@ use crate::provider::Provider;
 pub const DEFAULT_TREE_DEPTH: u8 = 16;
 
 const NOTES_PAGE_LIMIT: usize = 1000;
-const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 5;
-const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
+const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 20;
+const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 200;
 const SYNC_MAX_RETRIES: usize = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 200;
 
@@ -178,7 +178,7 @@ struct NotesResp {
     count: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CachedTree {
     tree: MerkleTree,
     /// Number of filled leaves (next insertion position), as reported by the rollup.
@@ -224,6 +224,7 @@ impl CommitmentTreeSyncer {
     /// This is safe to call concurrently: only one task will perform network fetches and
     /// tree updates at a time.
     pub async fn sync_to_latest(&self, provider: &Provider) -> Result<()> {
+        let mut last_sync_error: Option<anyhow::Error> = None;
         for attempt in 0..SYNC_MAX_RETRIES {
             let started = Instant::now();
             let state_started = Instant::now();
@@ -333,64 +334,50 @@ impl CommitmentTreeSyncer {
                 }
             }
 
-            // Heuristic: On a cold cache, prefer a full rebuild. Also prefer a full rebuild if
-            // the delta is so large that per-leaf `set_leaf()` updates would likely dominate.
-            let cached_next = { self.state.read().await.next_position };
-            let delta = expected_next.saturating_sub(cached_next);
-            let depth_for_threshold = u64::from(expected_depth).max(1);
-            let full_rebuild_threshold = capacity / depth_for_threshold;
-            let should_skip_incremental = delta > 0 && delta >= full_rebuild_threshold;
-
             // Try incremental sync first; on mismatch/error, fall back to a full rebuild.
-            if !should_skip_incremental {
-                match self
-                    .try_incremental_sync(provider, expected_next, expected_root)
-                    .await
-                {
-                    Ok(Some(stats)) if stats.root_match => {
-                        let elapsed_ms = started.elapsed().as_millis();
-                        tracing::debug!(
-                            elapsed_ms,
-                            state_ms,
-                            fetch_ms = stats.fetch_ms,
-                            apply_ms = stats.apply_ms,
-                            fetched_notes = stats.fetched_notes,
-                            start_offset = stats.start_offset,
-                            target_next_position = stats.target_next_position,
-                            "Commitment tree synced (incremental)"
-                        );
-                        return Ok(());
-                    }
-                    Ok(Some(stats)) => {
-                        let elapsed_ms = started.elapsed().as_millis();
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
-                            elapsed_ms,
-                            state_ms,
-                            start_offset = stats.start_offset,
-                            target_next_position = stats.target_next_position,
-                            fetched_notes = stats.fetched_notes,
-                            fetch_ms = stats.fetch_ms,
-                            apply_ms = stats.apply_ms,
-                            rebuilt_root = %RootHex(&stats.rebuilt_root),
-                            expected_root = %RootHex(&expected_root),
-                            "Commitment tree incremental sync root mismatch; falling back to full rebuild"
-                        );
-
-                        // Avoid serving an inconsistent tree while rebuilding.
-                        let mut st = self.state.write().await;
-                        *st = CachedTree::new(expected_depth);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
-                            error = %e,
-                            "Commitment tree incremental sync failed; falling back to full rebuild"
-                        );
-                    }
+            match self
+                .try_incremental_sync(provider, expected_next, expected_root)
+                .await
+            {
+                Ok(Some(stats)) if stats.root_match => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    tracing::debug!(
+                        elapsed_ms,
+                        state_ms,
+                        fetch_ms = stats.fetch_ms,
+                        apply_ms = stats.apply_ms,
+                        fetched_notes = stats.fetched_notes,
+                        start_offset = stats.start_offset,
+                        target_next_position = stats.target_next_position,
+                        "Commitment tree synced (incremental)"
+                    );
+                    return Ok(());
+                }
+                Ok(Some(stats)) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = SYNC_MAX_RETRIES,
+                        elapsed_ms,
+                        state_ms,
+                        start_offset = stats.start_offset,
+                        target_next_position = stats.target_next_position,
+                        fetched_notes = stats.fetched_notes,
+                        fetch_ms = stats.fetch_ms,
+                        apply_ms = stats.apply_ms,
+                        rebuilt_root = %RootHex(&stats.rebuilt_root),
+                        expected_root = %RootHex(&expected_root),
+                        "Commitment tree incremental sync root mismatch; falling back to full rebuild"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = SYNC_MAX_RETRIES,
+                        error = %e,
+                        "Commitment tree incremental sync failed; falling back to full rebuild"
+                    );
                 }
             }
 
@@ -419,20 +406,26 @@ impl CommitmentTreeSyncer {
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    last_sync_error = Some(e);
+                    tracing::debug!(
                         attempt = attempt + 1,
                         max_attempts = SYNC_MAX_RETRIES,
-                        error = %e,
+                        error = %last_sync_error
+                            .as_ref()
+                            .expect("last_sync_error just set"),
                         "Commitment-tree full rebuild failed; retrying"
                     );
-                    // Ensure we don't keep a partially-updated cache across retries.
-                    let mut st = self.state.write().await;
-                    *st = CachedTree::new(expected_depth);
-                    drop(st);
                     tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
                     continue;
                 }
             }
+        }
+
+        if let Some(err) = last_sync_error {
+            return Err(err).context(format!(
+                "Failed to sync commitment tree after {} attempts",
+                SYNC_MAX_RETRIES
+            ));
         }
 
         anyhow::bail!(
@@ -547,23 +540,30 @@ impl CommitmentTreeSyncer {
             return Ok(None);
         }
 
-        if expected_next as usize > st.tree.len() {
-            st.tree.grow_to_fit(expected_next as usize);
+        // Apply updates on a clone and only commit on root match, so a transient mismatch
+        // never poisons the cached tree.
+        let mut candidate = st.clone();
+
+        if expected_next as usize > candidate.tree.len() {
+            candidate.tree.grow_to_fit(expected_next as usize);
         }
 
         let fetched_notes = notes.len();
         for (pos, cm) in notes {
-            if pos as usize >= st.tree.len() {
-                st.tree.grow_to_fit(pos as usize + 1);
+            if pos as usize >= candidate.tree.len() {
+                candidate.tree.grow_to_fit(pos as usize + 1);
             }
-            st.tree.set_leaf(pos as usize, cm);
-            st.pos_by_cm.insert(cm, pos);
+            candidate.tree.set_leaf(pos as usize, cm);
+            candidate.pos_by_cm.insert(cm, pos);
         }
-        st.next_position = expected_next;
+        candidate.next_position = expected_next;
         let apply_ms = apply_started.elapsed().as_millis();
 
-        let rebuilt_root = st.tree.root();
+        let rebuilt_root = candidate.tree.root();
         let root_match = rebuilt_root == expected_root;
+        if root_match {
+            *st = candidate;
+        }
 
         Ok(Some(IncrementalSyncStats {
             start_offset,

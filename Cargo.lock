@@ -13444,6 +13444,7 @@ dependencies = [
  "axum 0.7.9",
  "chrono",
  "dotenvy",
+ "rand 0.8.5",
  "sea-orm",
  "serde",
  "serde_json",
