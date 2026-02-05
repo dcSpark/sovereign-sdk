@@ -109,6 +109,8 @@ struct ContinuousConfig {
     num_wallets: usize,
     /// Start loading wallets from this genesis keypair index (defaults to 0).
     wallet_offset: usize,
+    /// Re-sync wallet generation from chain at the start of each cycle.
+    resync_nonces_each_cycle: bool,
     initial_deposit: bool,
     /// Amount to deposit initially into each wallet.
     deposit_amount: u128,
@@ -142,6 +144,11 @@ impl ContinuousConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0usize);
+
+        let resync_nonces_each_cycle = std::env::var("RESYNC_NONCES_EACH_CYCLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
 
         let initial_deposit = std::env::var("INITIAL_DEPOSIT")
             .ok()
@@ -219,6 +226,7 @@ impl ContinuousConfig {
         Ok(Self {
             num_wallets,
             wallet_offset,
+            resync_nonces_each_cycle,
             initial_deposit,
             deposit_amount,
             transfer_amount,
@@ -609,9 +617,10 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} wallet_offset={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
         config.num_wallets,
         config.wallet_offset,
+        config.resync_nonces_each_cycle,
         config.initial_deposit,
         config.deposit_amount,
         config.transfer_amount,
@@ -763,6 +772,10 @@ pub async fn run() -> Result<()> {
             all_keypairs.len()
         );
     }
+    eprintln!(
+        "[config] keypair_index_range=[{}..{})",
+        config.wallet_offset, required_keypairs
+    );
 
     let node_base_url = node_url.clone();
     let wallet_setup_start = Instant::now();
@@ -931,6 +944,7 @@ pub async fn run() -> Result<()> {
             res = perform_transfer_cycle(
                 &client,
                 &http,
+                &node_url,
                 &mut wallets,
                 &chain_hash,
                 &program_path,
@@ -1324,6 +1338,45 @@ async fn fetch_initial_nonce(
     Ok(body.generation.unwrap_or(0))
 }
 
+async fn resync_wallet_nonces(
+    http: &HttpClient,
+    node_url: &str,
+    wallets: &mut [WalletState],
+    detailed_wallet_logs: bool,
+) -> Result<()> {
+    let mut updated = 0usize;
+    for (idx, wallet) in wallets.iter_mut().enumerate() {
+        let latest_generation = fetch_initial_nonce(http, node_url, &wallet.account)
+            .await
+            .with_context(|| format!("Failed to refresh generation for wallet {}", idx))?;
+        if latest_generation > wallet.nonce {
+            if detailed_wallet_logs {
+                eprintln!(
+                    "[nonce-sync] wallet {} generation advanced {} -> {}",
+                    idx, wallet.nonce, latest_generation
+                );
+            }
+            wallet.nonce = latest_generation;
+            updated += 1;
+        } else if detailed_wallet_logs && latest_generation < wallet.nonce {
+            eprintln!(
+                "[nonce-sync] wallet {} local generation {} ahead of chain {} (keeping local)",
+                idx, wallet.nonce, latest_generation
+            );
+        }
+    }
+
+    if updated > 0 || detailed_wallet_logs {
+        eprintln!(
+            "[nonce-sync] refreshed {} wallet generation(s) out of {}",
+            updated,
+            wallets.len()
+        );
+    }
+
+    Ok(())
+}
+
 async fn wait_for_sequencer_ready(
     http: &HttpClient,
     node_url: &str,
@@ -1351,6 +1404,7 @@ async fn wait_for_sequencer_ready(
 async fn perform_transfer_cycle(
     client: &NodeClient,
     http: &HttpClient,
+    node_url: &str,
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
     program_path: &str,
@@ -1362,6 +1416,10 @@ async fn perform_transfer_cycle(
     cached_root: &mut Option<Hash32>,
     cached_pos_by_cm: &mut HashMap<[u8; 32], u64>,
 ) -> Result<CycleSummary> {
+    if config.resync_nonces_each_cycle {
+        resync_wallet_nonces(http, node_url, wallets, config.detailed_wallet_logs).await?;
+    }
+
     // Fetch tree state incrementally; reuse cached tree when possible to avoid O(n) rebuilds.
     let tree_rebuild_phase_start = Instant::now();
     let mut attempts_made = 0;
@@ -2388,6 +2446,18 @@ async fn perform_transfer_cycle(
         change_note: Option<NoteState>,
     }
 
+    #[derive(Debug)]
+    struct PendingWalletUpdate {
+        sender_idx: usize,
+        dest_idx: usize,
+        new_nonce: u64,
+        spent_rhos: Vec<Hash32>,
+        pay_note: NoteState,
+        change_note: Option<NoteState>,
+        cm_pay: Hash32,
+        cm_change: Option<Hash32>,
+    }
+
     let mut build_tasks = Vec::with_capacity(proofs.len());
     for (i, proof_result) in proofs.into_iter().enumerate() {
         let sender_idx = proof_result.sender_idx;
@@ -2583,12 +2653,13 @@ async fn perform_transfer_cycle(
     }
     built.sort_by_key(|b| b.idx);
 
-    let mut expected_output_commitments: Vec<Hash32> = Vec::new();
+    let mut pending_updates_by_hash: HashMap<String, PendingWalletUpdate> =
+        HashMap::with_capacity(built.len());
     for b in built {
-        transfer_hashes.push(b.tx_hash);
+        let tx_hash = b.tx_hash.clone();
+        transfer_hashes.push(tx_hash.clone());
         transfer_txs_b64.push((b.sender_idx, b.tx_b64));
 
-        // Track expected output commitments so the next cycle can find them in the tree.
         let pay_value_u64: u64 = b
             .pay_note
             .value
@@ -2605,9 +2676,8 @@ async fn perform_transfer_cycle(
             &pay_recipient,
             &b.pay_note.sender_id,
         );
-        expected_output_commitments.push(cm_pay);
 
-        if let Some(ref change) = b.change_note {
+        let cm_change = if let Some(ref change) = b.change_note {
             let change_value_u64: u64 = change
                 .value
                 .try_into()
@@ -2623,22 +2693,24 @@ async fn perform_transfer_cycle(
                 &change_recipient,
                 &change.sender_id,
             );
-            expected_output_commitments.push(cm_change);
-        }
+            Some(cm_change)
+        } else {
+            None
+        };
 
-        // Update sender wallet: consume inputs and add change (if any).
-        {
-            let w = &mut wallets[b.sender_idx];
-            w.nonce = b.new_nonce;
-            let spent: HashSet<Hash32> = b.spent_rhos.iter().copied().collect();
-            w.notes.retain(|n| !spent.contains(&n.rho));
-            if let Some(change) = b.change_note {
-                w.notes.push(change);
-            }
-        }
-
-        // Update destination wallet: add the pay note.
-        wallets[b.dest_idx].notes.push(b.pay_note);
+        pending_updates_by_hash.insert(
+            tx_hash,
+            PendingWalletUpdate {
+                sender_idx: b.sender_idx,
+                dest_idx: b.dest_idx,
+                new_nonce: b.new_nonce,
+                spent_rhos: b.spent_rhos,
+                pay_note: b.pay_note,
+                change_note: b.change_note,
+                cm_pay,
+                cm_change,
+            },
+        );
     }
     let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -2868,8 +2940,24 @@ async fn perform_transfer_cycle(
     // Track per-tx sequencer times and breakdown for this cycle
     let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
     let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
+    let mut rejected_by_hash: HashMap<String, String> = HashMap::new();
+    let mut anchor_rejects = 0usize;
     for entry in flush.results {
         if let Some(hash) = entry.tx_hash {
+            if !entry.accepted {
+                let reason = entry
+                    .error
+                    .clone()
+                    .or_else(|| entry.response.as_ref().map(|v| v.to_string()))
+                    .unwrap_or_else(|| "unknown rejection".to_string());
+                if reason
+                    .to_ascii_lowercase()
+                    .contains("invalid anchor root")
+                {
+                    anchor_rejects += 1;
+                }
+                rejected_by_hash.insert(hash.clone(), reason);
+            }
             if let Some(b) = entry.sequencer_breakdown {
                 let total_ms = b.total_ms.unwrap_or(0.0);
                 let decode_ms = b.decode_ms.unwrap_or(0.0);
@@ -2902,11 +2990,23 @@ async fn perform_transfer_cycle(
             }
         }
     }
+    if !rejected_by_hash.is_empty() {
+        eprintln!(
+            "[cycle] sequencer rejected {} transfer(s) during flush{}",
+            rejected_by_hash.len(),
+            if anchor_rejects > 0 {
+                format!(" (invalid_anchor_root={})", anchor_rejects)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     // After flush, verify inclusion and collect per-batch statistics and timing
     let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
     let mut num_included = 0usize;
     let num_transfers = transfer_hashes.len();
+    let mut included_hashes: Vec<String> = Vec::new();
     let mut first_included_at: Option<Instant> = None;
     let mut last_included_at: Option<Instant> = None;
     let mut first_included_wall: Option<SystemTime> = None;
@@ -2928,6 +3028,16 @@ async fn perform_transfer_cycle(
     let mut seq_stf_sum_ms = 0.0f64;
 
     for hash_hex in &transfer_hashes {
+        if let Some(reason) = rejected_by_hash.get(hash_hex) {
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] transfer {} rejected before inclusion: {}",
+                    hash_hex, reason
+                );
+            }
+            continue;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match client
@@ -2938,12 +3048,13 @@ async fn perform_transfer_cycle(
                 .await
             {
                 Ok(ltx) => {
-                    anyhow::ensure!(
-                        ltx.receipt.result == api_types::TxReceiptResult::Successful,
-                        "Transfer {} included but not successful: {:?}",
-                        hash_hex,
-                        ltx.receipt
-                    );
+                    if ltx.receipt.result != api_types::TxReceiptResult::Successful {
+                        eprintln!(
+                            "[cycle] transfer {} included but not successful: {:?}",
+                            hash_hex, ltx.receipt
+                        );
+                        break;
+                    }
                     let now_instant = Instant::now();
                     let now_wall = SystemTime::now();
                     let batch_number = ltx.batch_number;
@@ -2957,6 +3068,7 @@ async fn perform_transfer_cycle(
                     last_batch_number = Some(batch_number);
                     *batches.entry(batch_number).or_insert(0) += 1;
                     num_included += 1;
+                    included_hashes.push(hash_hex.clone());
                     break;
                 }
                 Err(_) => {
@@ -2971,6 +3083,39 @@ async fn perform_transfer_cycle(
                 }
             }
         }
+    }
+
+    // Apply wallet changes only for transfers that were actually included successfully.
+    let mut expected_output_commitments: Vec<Hash32> = Vec::new();
+    for hash in &included_hashes {
+        let Some(update) = pending_updates_by_hash.remove(hash) else {
+            continue;
+        };
+
+        {
+            let w = &mut wallets[update.sender_idx];
+            if update.new_nonce > w.nonce {
+                w.nonce = update.new_nonce;
+            }
+            let spent: HashSet<Hash32> = update.spent_rhos.iter().copied().collect();
+            w.notes.retain(|n| !spent.contains(&n.rho));
+            if let Some(change) = update.change_note {
+                w.notes.push(change);
+            }
+        }
+        wallets[update.dest_idx].notes.push(update.pay_note);
+        expected_output_commitments.push(update.cm_pay);
+        if let Some(cm_change) = update.cm_change {
+            expected_output_commitments.push(cm_change);
+        }
+    }
+
+    let rejected_or_not_included = num_transfers.saturating_sub(num_included);
+    if rejected_or_not_included > 0 {
+        eprintln!(
+            "[cycle] {} / {} transfer(s) were not included and were left unapplied locally",
+            rejected_or_not_included, num_transfers
+        );
     }
 
     // Summarize when the first and last txs were observed in the ledger.
