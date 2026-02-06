@@ -137,6 +137,7 @@ function App() {
 
   const healthyCount = health?.services.filter(s => s.status === 'healthy').length ?? 0;
   const totalCount = health?.services.length ?? 0;
+  const hasRunningServices = health?.services.some((service) => service.running) ?? false;
   const servicesStatusText = `${healthyCount}/${totalCount} healthy`;
   const servicesStatusColor = healthyCount === totalCount ? 'healthy' : healthyCount === 0 ? 'unhealthy' : 'warning';
 
@@ -243,6 +244,22 @@ function App() {
                   >
                     <span className="btn-icon">🗑</span>
                     {actionLoadingKey === actionKey('clean') ? 'Cleaning...' : 'Clean Data'}
+                  </button>
+                  <button
+                    className="control-btn clean-db"
+                    onClick={() => handleAction('clean-database')}
+                    disabled={actionLoadingKey !== null || hasRunningServices}
+                  >
+                    <span className="btn-icon">⌫</span>
+                    {actionLoadingKey === actionKey('clean-database') ? 'Cleaning...' : 'Clean Database'}
+                  </button>
+                  <button
+                    className="control-btn reset-tee"
+                    onClick={() => handleAction('reset-tee')}
+                    disabled={actionLoadingKey !== null || hasRunningServices}
+                  >
+                    <span className="btn-icon">⟲</span>
+                    {actionLoadingKey === actionKey('reset-tee') ? 'Resetting...' : 'Reset TEE'}
                   </button>
                 </div>
                 {actionResult && (

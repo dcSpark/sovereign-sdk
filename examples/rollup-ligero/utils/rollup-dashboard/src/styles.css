@@ -413,6 +413,24 @@ body {
   color: white;
 }
 
+.control-btn.clean-db {
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+}
+.control-btn.clean-db:hover:not(:disabled) {
+  background: var(--color-warning);
+  color: white;
+}
+
+.control-btn.reset-tee {
+  border-color: var(--color-info);
+  color: var(--color-info);
+}
+.control-btn.reset-tee:hover:not(:disabled) {
+  background: var(--color-info);
+  color: white;
+}
+
 .action-toast {
   margin-top: 12px;
   padding: 8px 12px;

@@ -5,7 +5,7 @@ A modern, Midnight-styled React dashboard for monitoring and controlling the Rol
 ## Features
 
 - Real-time health monitoring of all services (rollup, worker, fvk, indexer, mcp, metrics, oracle)
-- Global service controls (Start All, Stop All, Restart All, Clean)
+- Global service controls (Start All, Stop All, Restart All, Clean, Clean Database, Reset TEE)
 - Per-service controls directly in the services table (Start/Stop/Restart by service id)
 - Auto-refresh with 5-second intervals
 - Response time / latency tracking
@@ -58,6 +58,8 @@ The dashboard communicates with these endpoints:
 | `/start`    | POST/GET   | Start default service set            |
 | `/stop`     | POST/GET   | Stop all running services            |
 | `/restart`  | POST/GET   | Restart default service set          |
+| `/clean-database`| POST/GET   | Drop all tables with CASCADE in `da`, `indexer`, `fvk`, `mcp_sessions` |
+| `/reset-tee`| POST/GET   | Trigger TEE reset via configured upstream URL |
 | `/start/:service`   | POST/GET | Start one service (`rollup`, `worker`, `indexer`, `mcp`, `metrics`, `oracle`, `fvk`) |
 | `/stop/:service`    | POST/GET | Stop one service |
 | `/restart/:service` | POST/GET | Restart one service |
@@ -118,6 +120,24 @@ SERVICE_WORKER_URL=http://10.0.0.42:8080
 ```
 
 The dashboard will display `Process = remote`, disable actions for that service, and use the configured remote URL as endpoint.
+
+### Reset TEE configuration
+
+The `Reset TEE` button calls `POST /controller/reset-tee`. Configure the upstream target and bearer token on the service controller process:
+
+```bash
+TEE_RESET_URL=http://74.235.106.62:9898/reset
+TEE_RESET_BEARER_TOKEN=replace_with_real_token
+```
+
+Success is treated as HTTP `204 No Content` from the upstream service.
+This action is allowed only when all managed services are stopped (same precondition as `Clean Data`).
+
+### Clean Database configuration
+
+The `Clean Database` button calls `POST /controller/clean-database` on the service controller.  
+It requires `DA_CONNECTION_STRING` to be set on the service controller process (must be PostgreSQL).
+This action is allowed only when all managed services are stopped (same precondition as `Clean Data`).
 
 ## Design
 

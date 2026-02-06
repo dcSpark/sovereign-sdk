@@ -17,7 +17,7 @@ export interface HealthResponse {
   checkedAt: string;
 }
 
-export type ActionType = 'start' | 'stop' | 'restart' | 'clean';
+export type ActionType = 'start' | 'stop' | 'restart' | 'clean' | 'clean-database' | 'reset-tee';
 
 export interface ActionResult {
   success: boolean;

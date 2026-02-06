@@ -14085,6 +14085,7 @@ dependencies = [
  "sov-test-utils",
  "sov-universal-wallet",
  "sov-zkvm-utils",
+ "sqlx",
  "sysinfo 0.32.1",
  "tempfile",
  "tiny_http 0.12.0",

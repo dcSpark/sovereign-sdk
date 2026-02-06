@@ -99,6 +99,7 @@ tiny_http = "0.12"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 futures = "0.3"
 sysinfo = "0.32"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }

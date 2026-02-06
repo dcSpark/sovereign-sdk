@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -14,6 +15,7 @@ use axum::Json;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sysinfo::{Disks, System};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -26,6 +28,9 @@ const LOG_BUFFER_SIZE: usize = 1000;
 
 /// Broadcast channel capacity
 const BROADCAST_CAPACITY: usize = 256;
+
+/// Databases cleaned by `/clean-database`
+const CLEAN_DATABASES: [&str; 4] = ["da", "indexer", "fvk", "mcp_sessions"];
 
 #[derive(Clone, Copy)]
 enum StartMode {
@@ -492,6 +497,8 @@ async fn main() -> anyhow::Result<()> {
             post(restart_service).get(restart_service),
         )
         .route("/clean", post(clean).get(clean))
+        .route("/clean-database", post(clean_database).get(clean_database))
+        .route("/reset-tee", post(reset_tee).get(reset_tee))
         .route("/services", get(services))
         .route("/health", get(health_check))
         .route("/stats", get(system_stats))
@@ -984,14 +991,7 @@ async fn restart_service(
 }
 
 async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
-    let mut state = app.state.lock().await;
-    if state.any_running() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Services must be stopped before cleaning",
-        ));
-    }
-    drop(state);
+    ensure_services_stopped_for_clean_like_actions(&app).await?;
 
     // Also clear log buffer
     {
@@ -1016,6 +1016,180 @@ async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
             app.demo_data_dir.display()
         ))
     }
+}
+
+async fn ensure_services_stopped_for_clean_like_actions(app: &Arc<AppState>) -> Result<(), ApiError> {
+    let mut state = app.state.lock().await;
+    if state.any_running() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Services must be stopped"));
+    }
+    Ok(())
+}
+
+fn escape_pg_identifier(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+async fn clean_database(State(app): State<Arc<AppState>>) -> ApiResult {
+    ensure_services_stopped_for_clean_like_actions(&app).await?;
+
+    let connection_string = std::env::var("DA_CONNECTION_STRING").map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DA_CONNECTION_STRING is not set",
+        )
+    })?;
+
+    if !(connection_string.starts_with("postgres://")
+        || connection_string.starts_with("postgresql://"))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "DA_CONNECTION_STRING must use postgres/postgresql scheme for /clean-database",
+        ));
+    }
+
+    let base_options = PgConnectOptions::from_str(&connection_string).map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid DA_CONNECTION_STRING: {err}"),
+        )
+    })?;
+
+    let mut summary = Vec::new();
+
+    for database_name in CLEAN_DATABASES {
+        let options = base_options.clone().database(database_name);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(options)
+            .await
+            .map_err(|err| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to connect to database '{database_name}': {err}"),
+                )
+            })?;
+
+        let mut tx = pool.begin().await.map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open transaction for '{database_name}': {err}"),
+            )
+        })?;
+
+        let tables: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT schemaname, tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY schemaname, tablename
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list tables for '{database_name}': {err}"),
+            )
+        })?;
+
+        for (schema_name, table_name) in &tables {
+            let drop_stmt = format!(
+                "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                escape_pg_identifier(schema_name),
+                escape_pg_identifier(table_name)
+            );
+
+            sqlx::query(&drop_stmt).execute(&mut *tx).await.map_err(|err| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to drop table '{}.{}' in '{}': {err}",
+                        schema_name, table_name, database_name
+                    ),
+                )
+            })?;
+        }
+
+        tx.commit().await.map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to commit cleanup for '{database_name}': {err}"),
+            )
+        })?;
+
+        summary.push(format!("{database_name}: {}", tables.len()));
+    }
+
+    Ok(format!(
+        "Cleaned databases (tables dropped): {}",
+        summary.join(", ")
+    ))
+}
+
+async fn reset_tee(State(app): State<Arc<AppState>>) -> ApiResult {
+    ensure_services_stopped_for_clean_like_actions(&app).await?;
+
+    let reset_url = std::env::var("TEE_RESET_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http://74.235.106.62:9898/reset".to_string());
+
+    let token = std::env::var("TEE_RESET_BEARER_TOKEN")
+        .or_else(|_| std::env::var("TEE_RESET_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TEE reset token not configured (set TEE_RESET_BEARER_TOKEN)",
+            )
+        })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create HTTP client for TEE reset: {err}"),
+            )
+        })?;
+
+    let response = client
+        .post(&reset_url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("TEE reset request failed: {err}"),
+            )
+        })?;
+
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok("TEE reset successful".to_string());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let message = if body.trim().is_empty() {
+        format!("TEE reset failed: upstream returned {}", status)
+    } else {
+        format!(
+            "TEE reset failed: upstream returned {} ({})",
+            status,
+            body.trim()
+        )
+    };
+
+    Err(ApiError::new(StatusCode::BAD_GATEWAY, message))
 }
 
 async fn services(State(app): State<Arc<AppState>>) -> Json<Vec<ManagedServiceStatus>> {

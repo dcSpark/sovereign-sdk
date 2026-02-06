@@ -122,6 +122,8 @@ curl -X POST http://127.0.0.1:9090/start
 curl -X POST http://127.0.0.1:9090/stop
 curl -X POST http://127.0.0.1:9090/restart
 curl -X POST http://127.0.0.1:9090/clean
+curl -X POST http://127.0.0.1:9090/clean-database
+curl -X POST http://127.0.0.1:9090/reset-tee
 
 # Per-service controls
 curl -X POST http://127.0.0.1:9090/start/rollup
@@ -140,6 +142,13 @@ Notes:
   - Set `SERVICE_WORKER_REMOTE=1` to disable local start/stop/restart for worker.
   - Set `SERVICE_WORKER_URL=https://<remote-host>:8080` to show/check the remote endpoint in `/health`.
   - Legacy alias `SERVICE_VERIFIER_REMOTE` / `SERVICE_VERIFIER_URL` is also supported.
+- TEE reset action:
+  - Set `TEE_RESET_URL` (default: `http://74.235.106.62:9898/reset`).
+  - Set `TEE_RESET_BEARER_TOKEN` (required for `/reset-tee`; alias: `TEE_RESET_TOKEN`).
+- Database cleanup action:
+  - Set `DA_CONNECTION_STRING` on the controller process (PostgreSQL URL).
+  - `/clean-database` drops all tables with `CASCADE` from databases: `da`, `indexer`, `fvk`, `mcp_sessions`.
+- `Clean Data`, `/clean-database`, and `/reset-tee` only run when all managed services are stopped.
 - `/clean` removes `demo_data` and only runs when services are stopped
 
 ### Linux Services

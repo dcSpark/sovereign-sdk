@@ -72,10 +72,16 @@ background services on Linux.
   - `POST /stop`: Stop all running services
   - `POST /restart`: Restart all services
   - `POST /clean`: Remove the `demo_data` directory
+  - `POST /clean-database`: Drop all tables with `CASCADE` from `da`, `indexer`, `fvk`, `mcp_sessions`
+  - `POST /reset-tee`: Trigger TEE reset on the configured upstream endpoint
   - `GET /health`: Check health of all services (rollup, worker, indexer, mcp, fvk)
+  - Note: `clean`, `clean-database`, and `reset-tee` require all managed services to be stopped
   Configure via environment variables:
   - `SERVICE_CONTROLLER_BIND`: Bind address (default: `127.0.0.1:9090`)
   - `SERVICE_CONTROLLER_AUTO_START`: Set to `1` to auto-start all services when the controller starts
+  - `DA_CONNECTION_STRING`: PostgreSQL base connection string used by `/clean-database`
+  - `TEE_RESET_URL`: TEE reset endpoint URL (default: `http://74.235.106.62:9898/reset`)
+  - `TEE_RESET_BEARER_TOKEN`: Bearer token for `TEE_RESET_URL` (`TEE_RESET_TOKEN` alias also supported)
   - `SERVICE_<SERVICE>_REMOTE`: Set to `1` to mark a service as remote (example: `SERVICE_WORKER_REMOTE=1`)
   - `SERVICE_<SERVICE>_URL`: Override health endpoint URL for that service (example: `SERVICE_WORKER_URL=http://remote-host:8080`)
 - Ensure that all services run under a user with permission to access the
