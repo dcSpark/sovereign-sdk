@@ -185,6 +185,7 @@ Flush pending worker-verified transactions to the sequencer when `--defer-submis
 ### POST `/prove`
 
 Generate a proof with the local daemon prover pool. Response shape is compatible with `ligero-http-server`.
+Set `binary: true` to receive raw proof bytes instead of JSON/base64.
 
 **Request:**
 ```json
@@ -193,11 +194,12 @@ Generate a proof with the local daemon prover pool. Response shape is compatible
   "args": [{ "i64": 1 }, { "i64": 2 }],
   "privateIndices": [1],
   "packing": 8192,
-  "gzip": false
+  "gzip": false,
+  "binary": false
 }
 ```
 
-**Response:**
+**Response (`binary=false`, default):**
 ```json
 {
   "success": true,
@@ -205,6 +207,10 @@ Generate a proof with the local daemon prover pool. Response shape is compatible
   "proof": "base64-proof-bytes"
 }
 ```
+
+**Response (`binary=true`):**
+- HTTP body is raw proof bytes
+- `Content-Type: application/octet-stream`
 
 ### POST `/verify`
 

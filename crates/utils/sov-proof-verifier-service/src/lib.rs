@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -652,6 +652,10 @@ struct ProveVerifyRequest {
     /// Optional gzip toggle for `/prove` (defaults to false).
     #[serde(default)]
     gzip: Option<bool>,
+    /// Optional response mode for `/prove`.
+    /// When true, `/prove` returns raw proof bytes (`application/octet-stream`) instead of JSON/base64.
+    #[serde(default)]
+    binary: Option<bool>,
 }
 
 /// Response body for the local `/prove` and `/verify` endpoints.
@@ -952,7 +956,7 @@ fn verify_with_ligero_verifier_daemon(
 fn prove_with_ligero_daemon(
     req: &ProveVerifyRequest,
     workers: usize,
-) -> Result<String, ServiceError> {
+) -> Result<Vec<u8>, ServiceError> {
     let program = resolve_circuit_program(&req.circuit)?;
     let paths = discover_ligero_paths()?;
     let pool = get_or_create_prover_daemon_pool(&paths, workers)?;
@@ -1000,7 +1004,7 @@ fn prove_with_ligero_daemon(
         .unwrap_or(proof_path);
     let proof_bytes = std::fs::read(&proof_file)
         .map_err(|e| ServiceError::Internal(format!("Failed to read proof output: {e}")))?;
-    Ok(BASE64_STANDARD.encode(&proof_bytes))
+    Ok(proof_bytes)
 }
 
 fn verify_with_ligero_daemon_api(
@@ -1256,11 +1260,7 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-fn prove_verify_error_response(
-    status: StatusCode,
-    exit_code: i32,
-    message: String,
-) -> (StatusCode, Json<ProveVerifyResponse>) {
+fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: String) -> Response {
     (
         status,
         Json(ProveVerifyResponse {
@@ -1270,12 +1270,13 @@ fn prove_verify_error_response(
             error: Some(message),
         }),
     )
+        .into_response()
 }
 
 async fn prove_handler(
     State(state): State<AppState>,
     Json(req): Json<ProveVerifyRequest>,
-) -> (StatusCode, Json<ProveVerifyResponse>) {
+) -> Response {
     let _permit = match state.verification_semaphore.acquire().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -1287,19 +1288,32 @@ async fn prove_handler(
         }
     };
 
+    let return_binary = req.binary.unwrap_or(false);
     let workers = state.config.max_concurrent_verifications;
     let result = tokio::task::spawn_blocking(move || prove_with_ligero_daemon(&req, workers)).await;
 
     match result {
-        Ok(Ok(proof_b64)) => (
-            StatusCode::OK,
-            Json(ProveVerifyResponse {
-                success: true,
-                exit_code: 0,
-                proof: Some(proof_b64),
-                error: None,
-            }),
-        ),
+        Ok(Ok(proof_bytes)) => {
+            if return_binary {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    proof_bytes,
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(ProveVerifyResponse {
+                        success: true,
+                        exit_code: 0,
+                        proof: Some(BASE64_STANDARD.encode(&proof_bytes)),
+                        error: None,
+                    }),
+                )
+                    .into_response()
+            }
+        }
         Ok(Err(ServiceError::ParseError(msg))) => {
             prove_verify_error_response(StatusCode::BAD_REQUEST, 1, msg)
         }
@@ -1318,7 +1332,7 @@ async fn prove_handler(
 async fn verify_handler(
     State(state): State<AppState>,
     Json(req): Json<ProveVerifyRequest>,
-) -> (StatusCode, Json<ProveVerifyResponse>) {
+) -> Response {
     let _permit = match state.verification_semaphore.acquire().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -1343,7 +1357,8 @@ async fn verify_handler(
                 proof: None,
                 error: None,
             }),
-        ),
+        )
+            .into_response(),
         Ok(Err(ServiceError::ParseError(msg))) => {
             prove_verify_error_response(StatusCode::BAD_REQUEST, 1, msg)
         }
