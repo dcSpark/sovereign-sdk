@@ -28,10 +28,7 @@ pub struct SpendableNote {
 }
 
 fn normalize_hash32_hex(value: &str) -> Option<String> {
-    let normalized = value
-        .trim()
-        .trim_start_matches("0x")
-        .to_ascii_lowercase();
+    let normalized = value.trim().trim_start_matches("0x").to_ascii_lowercase();
     let is_hex_32 = normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit());
     if is_hex_32 {
         Some(normalized)
@@ -88,10 +85,7 @@ pub async fn get_privacy_notes(
                     .trim_start_matches("0x")
                     .to_ascii_lowercase()
             });
-            let sender_id_raw = note
-                .sender_id
-                .as_deref()
-                .unwrap_or(&deposit_sender_id_hex);
+            let sender_id_raw = note.sender_id.as_deref().unwrap_or(&deposit_sender_id_hex);
             let sender_id =
                 normalize_sender_id_hex(sender_id_raw).unwrap_or_else(|| sender_id_raw.to_string());
 

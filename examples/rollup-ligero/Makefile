@@ -4,6 +4,12 @@
 
 # Paths
 SOV_CLI_REL_PATH := ../../target/release/sov-cli
+LOCAL_DA_PG_URL ?= postgresql://admin:1234@localhost:5432/da
+LOCAL_INDEX_DB_PG_URL ?= postgresql://admin:1234@localhost:5432/indexer
+LOCAL_MCP_SESSION_DB_PG_URL ?= postgresql://admin:1234@localhost:5432/mcp_sessions
+LOCAL_FVK_DB_PG_URL ?= postgresql://admin:1234@localhost:5432/fvk
+LOCAL_ROLLUP_DA_PG_URL ?= postgresql://admin:1234@localhost:5432/rollup_ligero_da
+LOCAL_ROLLUP_SEQUENCER_PG_URL ?= postgresql://admin:1234@localhost:5432/rollup_sequencer
 
 all: build
 
@@ -32,8 +38,39 @@ clean:
 	@if [ -f "$(SOV_CLI_REL_PATH)" ]; then \
 		$(SOV_CLI_REL_PATH) transactions clean || true; \
 	fi
-	@echo "Dropping PostgreSQL DA tables (if any)..."
-	-psql postgresql://admin:1234@localhost:5432/da -c "DROP TABLE IF EXISTS blobs, block_headers, last_finalized_height, worker_verified_transactions CASCADE;"
+	@echo "Truncating local PostgreSQL DBs with RESTART IDENTITY CASCADE (if configured)..."
+	@set -eu; \
+	if command -v psql >/dev/null 2>&1; then \
+		truncate_pg_db() { \
+			db_url="$$1"; \
+			db_name="$$2"; \
+			if [ -z "$$db_url" ]; then \
+				return 0; \
+			fi; \
+			case "$$db_url" in \
+				postgres://*|postgresql://*) ;; \
+				*) \
+					echo "  - skipping $$db_name (non-Postgres URL)"; \
+					return 0; \
+					;; \
+			esac; \
+			echo "  - truncating $$db_name"; \
+			tables="$$(psql "$$db_url" -v ON_ERROR_STOP=1 -Atqc "SELECT string_agg(quote_ident(schemaname) || '.' || quote_ident(tablename), ', ') FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null)" \
+				|| { echo "    warning: failed to query $$db_name at $$db_url"; return 0; }; \
+			if [ -n "$$tables" ]; then \
+				psql "$$db_url" -v ON_ERROR_STOP=1 -q -c "TRUNCATE TABLE $$tables RESTART IDENTITY CASCADE;" >/dev/null \
+					|| echo "    warning: failed to truncate $$db_name at $$db_url"; \
+			fi; \
+		}; \
+		truncate_pg_db "$${DA_CONNECTION_STRING:-$(LOCAL_DA_PG_URL)}" "da"; \
+		truncate_pg_db "$${INDEX_DB:-$(LOCAL_INDEX_DB_PG_URL)}" "indexer"; \
+		truncate_pg_db "$${MCP_SESSION_DB_URL:-$(LOCAL_MCP_SESSION_DB_PG_URL)}" "mcp_sessions"; \
+		truncate_pg_db "$${MIDNIGHT_FVK_SERVICE_DB:-$(LOCAL_FVK_DB_PG_URL)}" "fvk"; \
+		truncate_pg_db "$${ROLLUP_DA_DB_URL:-$(LOCAL_ROLLUP_DA_PG_URL)}" "rollup_ligero_da"; \
+		truncate_pg_db "$${ROLLUP_SEQUENCER_DB_URL:-$(LOCAL_ROLLUP_SEQUENCER_PG_URL)}" "rollup_sequencer"; \
+	else \
+		echo "  - skipping Postgres DB cleanup (psql not found)"; \
+	fi
 	mkdir -p demo_data
 
 ## Run tests
@@ -67,4 +104,3 @@ help:
 	@echo ""
 	@echo "Note: Use sov-cli from demo-rollup to interact with this rollup"
 	@echo "      Run 'make build-cli' to build it"
-

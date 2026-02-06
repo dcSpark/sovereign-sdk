@@ -13,7 +13,7 @@ use sea_orm::{
 };
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const PRIVACY_DOMAIN: Hash32 = [1u8; 32];
@@ -140,17 +140,75 @@ fn extract_deposit_commitment(events: Option<&serde_json::Value>) -> Option<Stri
         .or_else(|| extract_commitment_from_events(events, "/NoteCreated", "note_created"))
 }
 
+fn normalize_commitment_hex_for_lookup(cm: &str) -> String {
+    cm.trim()
+        .strip_prefix("0x")
+        .unwrap_or(cm.trim())
+        .to_ascii_lowercase()
+}
+
+fn extract_note_created_rollup_heights(events: Option<&serde_json::Value>) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let Some(events) = events else {
+        return out;
+    };
+    let Some(arr) = events.as_array() else {
+        return out;
+    };
+
+    for ev in arr {
+        let Some(key) = ev.get("key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !key.ends_with("/NoteCreatedAtHeight") {
+            continue;
+        }
+
+        let Some(value) = ev.get("value") else {
+            continue;
+        };
+        let Some(inner) = value
+            .as_object()
+            .and_then(|obj| obj.get("note_created_at_height"))
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+
+        let commitment = inner
+            .get("commitment")
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| normalize_commitment_hex_for_lookup(s))
+                    .or_else(|| commitment_from_u8_array(v))
+            })
+            .map(|s| normalize_commitment_hex_for_lookup(&s));
+        let rollup_height = inner.get("rollup_height").and_then(|v| v.as_u64());
+
+        if let (Some(cm), Some(height)) = (commitment, rollup_height) {
+            out.insert(cm, height);
+        }
+    }
+
+    out
+}
+
 async fn index_output_notes(
     idx_db: &DatabaseConnection,
     tx_hash: &str,
     created_at: chrono::DateTime<chrono::Utc>,
     kind: &str,
     decrypted: &[viewer::DecryptedNote],
+    note_created_rollup_heights: Option<&HashMap<String, u64>>,
 ) -> Result<()> {
     for note in decrypted {
         let Some(cm) = note.cm.as_deref() else {
             continue;
         };
+        let cm_key = normalize_commitment_hex_for_lookup(cm);
+        let created_rollup_height = note_created_rollup_heights
+            .and_then(|m| m.get(&cm_key))
+            .copied();
         let cm_ins_json = note.cm_ins.as_ref().and_then(|arr| {
             let filtered: Vec<serde_json::Value> = arr
                 .iter()
@@ -175,6 +233,7 @@ async fn index_output_notes(
             cm_ins_json,
             Some(tx_hash),
             Some(created_at),
+            created_rollup_height,
             Some(kind),
         )
         .await?;
@@ -188,6 +247,7 @@ async fn index_output_note_metadata(
     created_at: chrono::DateTime<chrono::Utc>,
     kind: &str,
     encrypted_notes: Option<&serde_json::Value>,
+    note_created_rollup_heights: Option<&HashMap<String, u64>>,
 ) -> Result<()> {
     let Some(arr) = encrypted_notes.and_then(|v| v.as_array()) else {
         return Ok(());
@@ -196,7 +256,19 @@ async fn index_output_note_metadata(
         let Some(cm) = note.get("cm").and_then(|v| v.as_str()) else {
             continue;
         };
-        db::upsert_note_created_metadata(idx_db, cm, tx_hash, created_at, kind).await?;
+        let cm_key = normalize_commitment_hex_for_lookup(cm);
+        let created_rollup_height = note_created_rollup_heights
+            .and_then(|m| m.get(&cm_key))
+            .copied();
+        db::upsert_note_created_metadata(
+            idx_db,
+            cm,
+            tx_hash,
+            created_at,
+            created_rollup_height,
+            kind,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -290,6 +362,7 @@ async fn index_accepted_row(
         let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
             .ok()
             .flatten();
+        let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
         let deposit_cm_from_events = extract_deposit_commitment(ev_json.as_ref());
         let status = extract_status_from_status(row.sequencer_status.as_deref());
         let event_id = db::insert_event(
@@ -318,6 +391,7 @@ async fn index_accepted_row(
             row.created_at,
             &kind,
             encrypted_notes.as_ref(),
+            Some(&note_created_rollup_heights),
         )
         .await?;
         viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
@@ -330,7 +404,15 @@ async fn index_accepted_row(
         let decrypted_notes =
             viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
         let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-        index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+        index_output_notes(
+            idx,
+            &row.tx_hash,
+            row.created_at,
+            &kind,
+            &decrypted_vec,
+            Some(&note_created_rollup_heights),
+        )
+        .await?;
 
         // Prefer recipient from decrypted notes (already in proper format), fallback to parsed payload.
         let recipient =
@@ -347,7 +429,17 @@ async fn index_accepted_row(
         // Deposits may not include any viewer ciphertexts; still index the created output commitment
         // so later spends (cm_ins) can be linked back to this deposit.
         if let Some(cm) = deposit_cm.as_deref() {
-            db::upsert_note_created_metadata(idx, cm, &row.tx_hash, row.created_at, &kind).await?;
+            let cm_key = normalize_commitment_hex_for_lookup(cm);
+            let created_rollup_height = note_created_rollup_heights.get(&cm_key).copied();
+            db::upsert_note_created_metadata(
+                idx,
+                cm,
+                &row.tx_hash,
+                row.created_at,
+                created_rollup_height,
+                &kind,
+            )
+            .await?;
         }
 
         // If there were no encrypted notes (common for deposits), still record deposit note fields
@@ -370,6 +462,9 @@ async fn index_accepted_row(
                     None,
                     Some(&row.tx_hash),
                     Some(row.created_at),
+                    note_created_rollup_heights
+                        .get(&normalize_commitment_hex_for_lookup(cm))
+                        .copied(),
                     Some("deposit"),
                 )
                 .await?;
@@ -400,6 +495,7 @@ async fn index_accepted_row(
             let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
                 .ok()
                 .flatten();
+            let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
             let status = extract_status_from_status(row.sequencer_status.as_deref());
             let event_id = db::insert_event(
                 idx,
@@ -437,6 +533,7 @@ async fn index_accepted_row(
                 row.created_at,
                 &kind,
                 encrypted_notes.as_ref(),
+                Some(&note_created_rollup_heights),
             )
             .await?;
             viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
@@ -449,7 +546,15 @@ async fn index_accepted_row(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
             let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-            index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+            index_output_notes(
+                idx,
+                &row.tx_hash,
+                row.created_at,
+                &kind,
+                &decrypted_vec,
+                Some(&note_created_rollup_heights),
+            )
+            .await?;
             index_spent_inputs(
                 idx,
                 &row.tx_hash,
@@ -487,6 +592,7 @@ async fn index_accepted_row(
         let ev_json = extract_events_from_status(row.sequencer_status.as_deref())
             .ok()
             .flatten();
+        let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
         let status = extract_status_from_status(row.sequencer_status.as_deref());
         let event_id = db::insert_event(
             idx,
@@ -524,6 +630,7 @@ async fn index_accepted_row(
             row.created_at,
             &kind,
             encrypted_notes.as_ref(),
+            Some(&note_created_rollup_heights),
         )
         .await?;
         viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
@@ -536,7 +643,15 @@ async fn index_accepted_row(
         let decrypted_notes =
             viewer::try_decrypt_notes_with_registry(fvk_registry, encrypted_notes.as_ref());
         let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-        index_output_notes(idx, &row.tx_hash, row.created_at, &kind, &decrypted_vec).await?;
+        index_output_notes(
+            idx,
+            &row.tx_hash,
+            row.created_at,
+            &kind,
+            &decrypted_vec,
+            Some(&note_created_rollup_heights),
+        )
+        .await?;
         index_spent_inputs(
             idx,
             &row.tx_hash,
@@ -584,12 +699,45 @@ struct ExistingEventTxHash {
 struct ReconcileStats {
     missing_events_repaired: usize,
     spent_nullifiers_repaired: usize,
+    created_rollup_heights_repaired: usize,
 }
 
 impl ReconcileStats {
     fn total(self) -> usize {
-        self.missing_events_repaired + self.spent_nullifiers_repaired
+        self.missing_events_repaired
+            + self.spent_nullifiers_repaired
+            + self.created_rollup_heights_repaired
     }
+}
+
+async fn repair_note_created_rollup_heights_for_row(
+    idx: &DatabaseConnection,
+    row: &worker_verified_transactions::Model,
+    kind: &str,
+) -> Result<usize> {
+    let events_json = extract_events_from_status(row.sequencer_status.as_deref())
+        .ok()
+        .flatten();
+    let note_created_rollup_heights = extract_note_created_rollup_heights(events_json.as_ref());
+    if note_created_rollup_heights.is_empty() {
+        return Ok(0);
+    }
+
+    let mut repaired = 0usize;
+    for (cm, rollup_height) in note_created_rollup_heights {
+        db::upsert_note_created_metadata(
+            idx,
+            &cm,
+            &row.tx_hash,
+            row.created_at,
+            Some(rollup_height),
+            kind,
+        )
+        .await?;
+        repaired += 1;
+    }
+
+    Ok(repaired)
 }
 
 async fn reconcile_missing_accepted_rows(
@@ -638,6 +786,9 @@ async fn reconcile_missing_accepted_rows(
             &row.transaction_data,
         )
         .unwrap_or(("other".to_string(), None, None, None));
+
+        stats.created_rollup_heights_repaired +=
+            repair_note_created_rollup_heights_for_row(idx, &row, &kind).await?;
 
         if existing_hashes.contains(&row.tx_hash) {
             // Event already exists, but we may still be missing flattened spent-nullifier rows.
@@ -692,6 +843,7 @@ pub async fn backfill_index(
             tracing::info!(
                 missing_events_repaired = stats.missing_events_repaired,
                 spent_nullifiers_repaired = stats.spent_nullifiers_repaired,
+                created_rollup_heights_repaired = stats.created_rollup_heights_repaired,
                 "Reconciled accepted transactions into index DB"
             );
         }
@@ -817,9 +969,10 @@ async fn backfill_notes_nullifiers_deposits(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
-    // v3: compute deposit `cm` even when `events` are missing/unexpected by falling back to
+    // v4: same as v3 plus persist created_rollup_height from NoteCreatedAtHeight when available.
+    // compute deposit `cm` even when `events` are missing/unexpected by falling back to
     // `cm = note_commitment(domain, amount, rho, recipient, sender_id=recipient)`.
-    const META_KEY: &str = "notes_nullifiers_deposit_last_event_id_v3";
+    const META_KEY: &str = "notes_nullifiers_deposit_last_event_id_v4";
     let mut updated = 0usize;
     let mut last_id = db::get_index_meta(idx_db, META_KEY)
         .await?
@@ -869,6 +1022,7 @@ async fn backfill_notes_nullifiers_deposits(
             let Some((tx_hash, created_at, ev_json)) = event_map.get(&row.event_id) else {
                 continue;
             };
+            let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
 
             let deposit_cm = extract_deposit_commitment(ev_json.as_ref()).or_else(|| {
                 compute_deposit_commitment_fallback(
@@ -878,8 +1032,17 @@ async fn backfill_notes_nullifiers_deposits(
                 )
             });
             if let Some(cm) = deposit_cm.as_deref() {
-                db::upsert_note_created_metadata(idx_db, cm, tx_hash, *created_at, "deposit")
-                    .await?;
+                let cm_key = normalize_commitment_hex_for_lookup(cm);
+                let created_rollup_height = note_created_rollup_heights.get(&cm_key).copied();
+                db::upsert_note_created_metadata(
+                    idx_db,
+                    cm,
+                    tx_hash,
+                    *created_at,
+                    created_rollup_height,
+                    "deposit",
+                )
+                .await?;
             }
 
             index_output_note_metadata(
@@ -888,6 +1051,7 @@ async fn backfill_notes_nullifiers_deposits(
                 *created_at,
                 "deposit",
                 row.encrypted_notes.as_ref(),
+                Some(&note_created_rollup_heights),
             )
             .await?;
 
@@ -910,6 +1074,9 @@ async fn backfill_notes_nullifiers_deposits(
                         None,
                         Some(tx_hash),
                         Some(*created_at),
+                        note_created_rollup_heights
+                            .get(&normalize_commitment_hex_for_lookup(cm))
+                            .copied(),
                         Some("deposit"),
                     )
                     .await?;
@@ -925,7 +1092,15 @@ async fn backfill_notes_nullifiers_deposits(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-            index_output_notes(idx_db, tx_hash, *created_at, "deposit", &decrypted_vec).await?;
+            index_output_notes(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "deposit",
+                &decrypted_vec,
+                Some(&note_created_rollup_heights),
+            )
+            .await?;
 
             db::set_index_meta(idx_db, META_KEY, &last_id.to_string()).await?;
             updated += 1;
@@ -940,8 +1115,9 @@ async fn backfill_notes_nullifiers_transfers(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
-    // v2: use tx payload `nullifiers[]` and align with decrypted `cm_ins[]` to fill `spent_nullifier`.
-    const META_KEY: &str = "notes_nullifiers_transfer_last_event_id_v2";
+    // v3: same as v2 plus persist created_rollup_height from NoteCreatedAtHeight when available.
+    // use tx payload `nullifiers[]` and align with decrypted `cm_ins[]` to fill `spent_nullifier`.
+    const META_KEY: &str = "notes_nullifiers_transfer_last_event_id_v3";
     let mut updated = 0usize;
     let mut last_id = db::get_index_meta(idx_db, META_KEY)
         .await?
@@ -968,29 +1144,32 @@ async fn backfill_notes_nullifiers_transfers(
             tx_hash: String,
             created_at: chrono::DateTime<chrono::Utc>,
             payload: String,
+            events: Option<sea_orm::JsonValue>,
         }
 
-        // Only select columns we need for this backfill; avoid pulling JSON columns.
+        // Select payload + events so we can recover NoteCreatedAtHeight metadata.
         let events: Vec<PayloadEventRow> = idx::Entity::find()
             .select_only()
             .column(idx::Column::Id)
             .column(idx::Column::TxHash)
             .column(idx::Column::CreatedAt)
             .column(idx::Column::Payload)
+            .column(idx::Column::Events)
             .filter(idx::Column::Id.is_in(ids))
             .into_model::<PayloadEventRow>()
             .all(idx_db)
             .await?;
         let mut event_map = std::collections::HashMap::new();
         for ev in events {
-            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload));
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload, ev.events));
         }
 
         for row in rows {
             last_id = row.event_id;
-            let Some((tx_hash, created_at, payload)) = event_map.get(&row.event_id) else {
+            let Some((tx_hash, created_at, payload, ev_json)) = event_map.get(&row.event_id) else {
                 continue;
             };
+            let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
             let nullifiers = parse_kind_amount_roots(payload)
                 .ok()
                 .and_then(|(_, _, _, nfs)| nfs);
@@ -1001,6 +1180,7 @@ async fn backfill_notes_nullifiers_transfers(
                 *created_at,
                 "transfer",
                 row.encrypted_notes.as_ref(),
+                Some(&note_created_rollup_heights),
             )
             .await?;
             viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
@@ -1013,7 +1193,15 @@ async fn backfill_notes_nullifiers_transfers(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-            index_output_notes(idx_db, tx_hash, *created_at, "transfer", &decrypted_vec).await?;
+            index_output_notes(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "transfer",
+                &decrypted_vec,
+                Some(&note_created_rollup_heights),
+            )
+            .await?;
             index_spent_inputs(
                 idx_db,
                 tx_hash,
@@ -1043,8 +1231,9 @@ async fn backfill_notes_nullifiers_withdraws(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<usize> {
-    // v2: use tx payload `nullifiers[]` (or `nullifier`) and align with decrypted `cm_ins[]`.
-    const META_KEY: &str = "notes_nullifiers_withdraw_last_event_id_v2";
+    // v3: same as v2 plus persist created_rollup_height from NoteCreatedAtHeight when available.
+    // use tx payload `nullifiers[]` (or `nullifier`) and align with decrypted `cm_ins[]`.
+    const META_KEY: &str = "notes_nullifiers_withdraw_last_event_id_v3";
     let mut updated = 0usize;
     let mut last_id = db::get_index_meta(idx_db, META_KEY)
         .await?
@@ -1071,29 +1260,32 @@ async fn backfill_notes_nullifiers_withdraws(
             tx_hash: String,
             created_at: chrono::DateTime<chrono::Utc>,
             payload: String,
+            events: Option<sea_orm::JsonValue>,
         }
 
-        // Only select columns we need for this backfill; avoid pulling JSON columns.
+        // Select payload + events so we can recover NoteCreatedAtHeight metadata.
         let events: Vec<PayloadEventRow> = idx::Entity::find()
             .select_only()
             .column(idx::Column::Id)
             .column(idx::Column::TxHash)
             .column(idx::Column::CreatedAt)
             .column(idx::Column::Payload)
+            .column(idx::Column::Events)
             .filter(idx::Column::Id.is_in(ids))
             .into_model::<PayloadEventRow>()
             .all(idx_db)
             .await?;
         let mut event_map = std::collections::HashMap::new();
         for ev in events {
-            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload));
+            event_map.insert(ev.id, (ev.tx_hash, ev.created_at, ev.payload, ev.events));
         }
 
         for row in rows {
             last_id = row.event_id;
-            let Some((tx_hash, created_at, payload)) = event_map.get(&row.event_id) else {
+            let Some((tx_hash, created_at, payload, ev_json)) = event_map.get(&row.event_id) else {
                 continue;
             };
+            let note_created_rollup_heights = extract_note_created_rollup_heights(ev_json.as_ref());
             let nullifiers = parse_kind_amount_roots(payload)
                 .ok()
                 .and_then(|(_, _, _, nfs)| nfs);
@@ -1104,6 +1296,7 @@ async fn backfill_notes_nullifiers_withdraws(
                 *created_at,
                 "withdraw",
                 row.encrypted_notes.as_ref(),
+                Some(&note_created_rollup_heights),
             )
             .await?;
             viewer::maybe_fetch_missing_fvks_for_encrypted_notes(
@@ -1116,7 +1309,15 @@ async fn backfill_notes_nullifiers_withdraws(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let decrypted_vec = decrypted_notes_from_json(decrypted_notes.as_ref());
-            index_output_notes(idx_db, tx_hash, *created_at, "withdraw", &decrypted_vec).await?;
+            index_output_notes(
+                idx_db,
+                tx_hash,
+                *created_at,
+                "withdraw",
+                &decrypted_vec,
+                Some(&note_created_rollup_heights),
+            )
+            .await?;
             index_spent_inputs(
                 idx_db,
                 tx_hash,

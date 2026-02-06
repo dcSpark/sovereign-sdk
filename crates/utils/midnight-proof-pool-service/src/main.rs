@@ -36,6 +36,8 @@ use tokio::time::{sleep, timeout};
 use tracing_subscriber::EnvFilter;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
+const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
+const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -782,20 +784,62 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
             sender_id: current_note.sender_id,
         };
 
-        let res = transfer(
-            state.ligero.as_ref(),
-            state.provider.as_ref(),
-            &wallet,
-            spend_sk,
-            pk_ivk_owner,
-            current_note.value,
-            vec![input],
-            destination_pk_spend,
-            destination_pk_ivk,
-            viewer_fvk_bundle,
-        )
-        .await
-        .context("transfer (self)")?;
+        let tree_retry_attempts = tree_resolve_retry_attempts();
+        let tree_retry_delay = Duration::from_millis(tree_resolve_retry_delay_ms());
+        let mut transfer_attempt: u32 = 0;
+        let res = loop {
+            transfer_attempt += 1;
+            let res = transfer(
+                state.ligero.as_ref(),
+                state.provider.as_ref(),
+                &wallet,
+                spend_sk,
+                pk_ivk_owner,
+                current_note.value,
+                vec![input.clone()],
+                destination_pk_spend,
+                destination_pk_ivk,
+                viewer_fvk_bundle.clone(),
+            )
+            .await;
+
+            match res {
+                Ok(ok) => break ok,
+                Err(e) => {
+                    let error_text = format!("{:#}", e);
+                    if is_tree_positions_resolution_error(&error_text)
+                        && transfer_attempt <= tree_retry_attempts + 1
+                    {
+                        tracing::warn!(
+                            wallet_idx,
+                            attempt = transfer_attempt,
+                            max_attempts = tree_retry_attempts + 1,
+                            retry_delay_ms = tree_retry_delay.as_millis(),
+                            error = %error_text,
+                            "Self-transfer hit transient commitment-tree lag; retrying"
+                        );
+                        sleep(tree_retry_delay).await;
+                        continue;
+                    }
+                    if is_invalid_anchor_root_error(&error_text)
+                        && transfer_attempt <= tree_retry_attempts + 1
+                    {
+                        tracing::warn!(
+                            wallet_idx,
+                            attempt = transfer_attempt,
+                            max_attempts = tree_retry_attempts + 1,
+                            retry_delay_ms = tree_retry_delay.as_millis(),
+                            error = %error_text,
+                            "Self-transfer rejected due to stale/invalid anchor root; resetting commitment-tree cache and retrying"
+                        );
+                        global_tree_syncer().reset_cache().await;
+                        sleep(tree_retry_delay).await;
+                        continue;
+                    }
+                    return Err(e).context("transfer (self)");
+                }
+            }
+        };
 
         let next_note = NoteState {
             value: current_note.value,
@@ -1563,4 +1607,28 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn tree_resolve_retry_attempts() -> u32 {
+    std::env::var("PROOF_POOL_TREE_RESOLVE_RETRY_ATTEMPTS")
+        .ok()
+        .or_else(|| std::env::var("MCP_TREE_RESOLVE_RETRY_ATTEMPTS").ok())
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS)
+}
+
+fn tree_resolve_retry_delay_ms() -> u64 {
+    std::env::var("PROOF_POOL_TREE_RESOLVE_RETRY_DELAY_MS")
+        .ok()
+        .or_else(|| std::env::var("MCP_TREE_RESOLVE_RETRY_DELAY_MS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
+}
+
+fn is_tree_positions_resolution_error(error_text: &str) -> bool {
+    error_text.contains("Failed to resolve Merkle positions/openings from cached commitment tree")
+}
+
+fn is_invalid_anchor_root_error(error_text: &str) -> bool {
+    error_text.contains("Invalid anchor root")
 }

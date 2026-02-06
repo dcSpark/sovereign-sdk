@@ -780,6 +780,7 @@ const NOTES_WAIT_POLL_MS: u64 = 500;
 const NOTES_WAIT_PROGRESS_LOG_SECS: u64 = 5;
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
+const DEFAULT_LOCAL_NOTES_TREE_BYPASS: bool = false;
 
 fn pending_spent_note_ttl() -> std::time::Duration {
     let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
@@ -817,8 +818,24 @@ fn tree_resolve_retry_delay_ms() -> u64 {
         .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
 }
 
+fn local_notes_tree_bypass_enabled() -> bool {
+    std::env::var("MCP_LOCAL_NOTES_TREE_BYPASS")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(DEFAULT_LOCAL_NOTES_TREE_BYPASS)
+}
+
 fn is_tree_positions_resolution_error(error_text: &str) -> bool {
     error_text.contains("Failed to resolve Merkle positions/openings from cached commitment tree")
+}
+
+fn is_invalid_anchor_root_error(error_text: &str) -> bool {
+    error_text.contains("Invalid anchor root")
 }
 
 fn note_commitment_for_owner(
@@ -846,11 +863,12 @@ impl PendingSpentNotes {
     fn purge_expired(&mut self) {
         let ttl = pending_spent_note_ttl();
         let now = std::time::SystemTime::now();
-        self.by_rho.retain(|_, inserted_at| match now.duration_since(*inserted_at) {
-            Ok(elapsed) => elapsed < ttl,
-            // Keep entries when local clock moves backwards.
-            Err(_) => true,
-        });
+        self.by_rho
+            .retain(|_, inserted_at| match now.duration_since(*inserted_at) {
+                Ok(elapsed) => elapsed < ttl,
+                // Keep entries when local clock moves backwards.
+                Err(_) => true,
+            });
     }
 
     fn snapshot_entries(&mut self) -> Vec<PendingSpentNoteSnapshot> {
@@ -1133,6 +1151,10 @@ impl CryptoServer {
                 );
             }
 
+            // Compute local_note_rhos BEFORE consuming local_notes via into_iter.
+            let local_note_rhos: std::collections::HashSet<String> =
+                local_notes.iter().map(|note| note.rho.clone()).collect();
+
             if !local_notes.is_empty() {
                 let mut seen: std::collections::HashSet<String> =
                     notes.iter().map(|n| n.rho.clone()).collect();
@@ -1196,14 +1218,13 @@ impl CryptoServer {
             let candidate_notes: Vec<crate::operations::SpendableNote> =
                 notes_with_cm.iter().map(|(note, _)| note.clone()).collect();
             let mut tree_visible_notes = Vec::with_capacity(before_tree_filter);
+            let local_tree_bypass = local_notes_tree_bypass_enabled();
             for ((note, _), present) in notes_with_cm.into_iter().zip(presence.into_iter()) {
-                // Only include notes whose commitments are present in the cached commitment
-                // tree.  Do NOT bypass this check for local_notes — while local notes are
-                // valid candidates for amount-covering calculations (they tell the wait loop
-                // "these notes exist, keep waiting for the tree"), including them in the
-                // transfer without tree presence causes expensive failed proof-generation
-                // retries (~33s) because resolve_positions_and_openings cannot find them.
-                if present {
+                // When enabled via MCP_LOCAL_NOTES_TREE_BYPASS=1, local notes can bypass
+                // tree visibility at selection time. This is disabled by default because
+                // under sequencer congestion local outputs may not become tree-visible
+                // quickly enough and cause repeated pre-transfer timeouts.
+                if present || (local_tree_bypass && local_note_rhos.contains(&note.rho)) {
                     tree_visible_notes.push(note);
                 }
             }
@@ -1233,7 +1254,11 @@ impl CryptoServer {
                 notes_tree_blocked_covering = true;
             }
 
-            let notes_wait_limit = if notes_tree_blocked_covering {
+            // When we have local in-flight state (recent pending spends or locally-cached outputs),
+            // short fresh-note waits are too aggressive under sequencer/indexer congestion.
+            // Use the longer tree-visible window so retries don't fail prematurely.
+            let has_inflight_note_state = filtered > 0 || !local_note_rhos.is_empty();
+            let notes_wait_limit = if notes_tree_blocked_covering || has_inflight_note_state {
                 tree_visible_wait_limit
             } else {
                 fresh_notes_wait_limit
@@ -1395,6 +1420,112 @@ impl CryptoServer {
                 None,
             )
         })?;
+        // --- Pre-transfer tree-presence wait ---
+        // The notes-wait loop above may have included local notes that bypass the tree-
+        // visibility check.  Before attempting the expensive proof generation (which
+        // needs Merkle openings from the tree), ensure all selected input commitments
+        // are actually present in the cached commitment tree.
+        {
+            let selected_cms: Vec<midnight_privacy::Hash32> = selected
+                .iter()
+                .filter_map(|n| note_commitment_for_owner(n, &owner_recipient))
+                .collect();
+            if !selected_cms.is_empty() {
+                let tree_wait_limit =
+                    std::time::Duration::from_secs(wait_for_tree_visible_notes_secs());
+                let tree_wait_started = std::time::Instant::now();
+                let mut tree_wait_polls: u64 = 0;
+                let mut tree_wait_last_progress_log = std::time::Instant::now();
+                let mut last_tree_sync_error: Option<String>;
+                loop {
+                    tree_wait_polls += 1;
+                    let all_present = match global_tree_syncer()
+                        .commitment_presence(provider, &selected_cms)
+                        .await
+                    {
+                        Ok(v) => {
+                            last_tree_sync_error = None;
+                            v.iter().all(|p| *p)
+                        }
+                        Err(e) => {
+                            let error_text = format!("{:#}", e);
+                            last_tree_sync_error = Some(error_text.clone());
+                            if tree_wait_last_progress_log.elapsed().as_secs()
+                                >= NOTES_WAIT_PROGRESS_LOG_SECS
+                            {
+                                tracing::warn!(
+                                    elapsed_ms = tree_wait_started.elapsed().as_millis(),
+                                    polls = tree_wait_polls,
+                                    inputs = selected_cms.len(),
+                                    error = %error_text,
+                                    "Pre-transfer commitment-tree sync failed while waiting for selected inputs"
+                                );
+                                tree_wait_last_progress_log = std::time::Instant::now();
+                            }
+                            false
+                        }
+                    };
+                    if all_present {
+                        let elapsed = tree_wait_started.elapsed();
+                        if elapsed.as_millis() > 100 {
+                            tracing::info!(
+                                elapsed_ms = elapsed.as_millis(),
+                                polls = tree_wait_polls,
+                                inputs = selected_cms.len(),
+                                "Pre-transfer tree-presence wait completed"
+                            );
+                        }
+                        break;
+                    }
+                    if tree_wait_started.elapsed() >= tree_wait_limit {
+                        // If we timed out waiting for selected inputs to become tree-visible,
+                        // evict any selected entries from the local note cache so they are not
+                        // repeatedly re-selected forever in subsequent retries.
+                        let mut evicted_local_notes = 0usize;
+                        {
+                            let mut local = self.local_notes.lock().await;
+                            for note in &selected {
+                                if local.by_rho.remove(&note.rho).is_some() {
+                                    evicted_local_notes += 1;
+                                }
+                            }
+                        }
+                        if evicted_local_notes > 0 {
+                            tracing::warn!(
+                                evicted_local_notes,
+                                "Evicted stale local notes after tree-presence timeout"
+                            );
+                            self.persist_note_caches_to_session_snapshot().await;
+                        }
+                        tracing::warn!(
+                            elapsed_ms = tree_wait_started.elapsed().as_millis(),
+                            polls = tree_wait_polls,
+                            inputs = selected_cms.len(),
+                            "Selected inputs not visible in commitment tree after waiting"
+                        );
+                        let detail = last_tree_sync_error
+                            .as_deref()
+                            .map(|e| e.chars().take(280).collect::<String>());
+                        return Err(ErrorData::invalid_params(
+                            match detail {
+                                Some(detail) => format!(
+                                    "Transfer inputs are not yet visible in the commitment tree after waiting {}s. Last tree sync error: {}",
+                                    tree_wait_limit.as_secs(),
+                                    detail
+                                ),
+                                None => format!(
+                                    "Transfer inputs are not yet visible in the commitment tree after waiting {}s. Retry shortly.",
+                                    tree_wait_limit.as_secs()
+                                ),
+                            },
+                            None,
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
+                }
+            }
+        }
+
         let transfer_started = std::time::Instant::now();
         let tree_retry_attempts = tree_resolve_retry_attempts();
         let tree_retry_delay = std::time::Duration::from_millis(tree_resolve_retry_delay_ms());
@@ -1418,7 +1549,10 @@ impl CryptoServer {
             match res {
                 Ok(ok) => break Ok(ok),
                 Err(e) => {
-                    let error_text = e.to_string();
+                    // Use {:#} to serialize the full anyhow error chain, not just
+                    // the outermost .context(). Without this, nested causes like
+                    // "Nullifier already spent" are invisible to pattern matching.
+                    let error_text = format!("{:#}", e);
                     if is_tree_positions_resolution_error(&error_text)
                         && transfer_attempt <= tree_retry_attempts + 1
                     {
@@ -1432,6 +1566,20 @@ impl CryptoServer {
                         tokio::time::sleep(tree_retry_delay).await;
                         continue;
                     }
+                    if is_invalid_anchor_root_error(&error_text)
+                        && transfer_attempt <= tree_retry_attempts + 1
+                    {
+                        tracing::warn!(
+                            attempt = transfer_attempt,
+                            max_attempts = tree_retry_attempts + 1,
+                            retry_delay_ms = tree_retry_delay.as_millis(),
+                            error = %error_text,
+                            "Transfer rejected due to stale/invalid anchor root; resetting commitment-tree cache and retrying"
+                        );
+                        global_tree_syncer().reset_cache().await;
+                        tokio::time::sleep(tree_retry_delay).await;
+                        continue;
+                    }
                     break Err(e);
                 }
             }
@@ -1439,7 +1587,11 @@ impl CryptoServer {
         let transfer_result = match transfer_result {
             Ok(ok) => ok,
             Err(e) => {
-                let error_text = e.to_string();
+                // Use {:#} to serialize the full anyhow error chain so that
+                // nested causes (e.g. "Nullifier already spent" inside
+                // "Failed to submit transaction to verifier service") are
+                // visible to the pattern-matching checks below.
+                let error_text = format!("{:#}", e);
                 let nullifier_spent = error_text.contains("Nullifier already spent");
                 let verifier_client_reject = error_text.contains("error status 4");
                 let tree_resolution_error = is_tree_positions_resolution_error(&error_text);
@@ -1458,7 +1610,9 @@ impl CryptoServer {
                         let mut local = self.local_notes.lock().await;
                         pending.purge_expired();
                         for note in &selected {
-                            pending.by_rho.insert(note.rho.clone(), std::time::SystemTime::now());
+                            pending
+                                .by_rho
+                                .insert(note.rho.clone(), std::time::SystemTime::now());
                             local.by_rho.remove(&note.rho);
                         }
                     }

@@ -16,6 +16,8 @@ use sov_api_spec::types;
 use sov_bank::TokenId;
 use sov_modules_api::{CryptoSpec, Spec};
 use sov_node_client::NodeClient;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -31,6 +33,22 @@ pub struct ChainData {
 pub struct VerifierSubmitResult {
     pub tx_hash: String,
     pub created_at: i64,
+}
+
+/// Snapshot of note commitments emitted by midnight-privacy `NoteCreated` events.
+#[derive(Debug, Clone)]
+pub struct IndexerNoteCreated {
+    pub commitment: [u8; 32],
+    /// Rollup height where the commitment was queued (when available).
+    pub rollup_height: Option<u64>,
+}
+
+/// Snapshot of note commitments emitted by midnight-privacy `NoteCreated` events.
+#[derive(Debug, Clone)]
+pub struct IndexerNoteCreatedBatch {
+    pub upto_event_id: i64,
+    pub notes: Vec<IndexerNoteCreated>,
+    pub rows_scanned: usize,
 }
 
 /// Transaction involvement item from the indexer
@@ -146,6 +164,7 @@ pub struct Provider {
     verifier_url: String,
     indexer_url: String,
     http_client: reqwest::Client,
+    index_db_pool: Option<PgPool>,
 }
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
@@ -181,6 +200,28 @@ fn verifier_submit_retry_delay_ms() -> u64 {
         .unwrap_or(DEFAULT_VERIFIER_SUBMIT_RETRY_DELAY_MS)
 }
 
+fn optional_index_db_url() -> Option<String> {
+    std::env::var("MCP_INDEX_DB_URL")
+        .ok()
+        .or_else(|| std::env::var("INDEX_DB").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_hash32_hex(value: &str) -> Result<[u8; 32]> {
+    let trimmed = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    let bytes = hex::decode(trimmed)
+        .with_context(|| format!("Invalid hex commitment in midnight_note_created: {}", value))?;
+    anyhow::ensure!(
+        bytes.len() == 32,
+        "Invalid commitment length in midnight_note_created: expected 32, got {}",
+        bytes.len()
+    );
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 impl Provider {
     /// Create a new provider connected to the given RPC URL, verifier service, and indexer
     pub async fn new(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> Result<Self> {
@@ -194,12 +235,35 @@ impl Provider {
             .build()
             .context("Failed to create HTTP client for provider")?;
 
+        let index_db_pool = if let Some(index_db_url) = optional_index_db_url() {
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&index_db_url)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to connect to indexer Postgres for commitment-tree sync: {}",
+                        index_db_url
+                    )
+                })?;
+            tracing::info!(
+                "[mcp] INDEX_DB connected (available for DB-backed features and optional tree sync)"
+            );
+            Some(pool)
+        } else {
+            tracing::warn!(
+                "[mcp] INDEX_DB/MCP_INDEX_DB_URL not set; commitment-tree sync will use rollup REST endpoints"
+            );
+            None
+        };
+
         Ok(Self {
             client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
             verifier_url: verifier_url.to_string(),
             indexer_url: indexer_url.to_string(),
             http_client,
+            index_db_pool,
         })
     }
 
@@ -402,16 +466,26 @@ impl Provider {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
+            // The verifier response may nest the error under `body.details.error`
+            // (when the sequencer rejects the tx) or directly under `details.error`.
             let reason = parsed
                 .as_ref()
-                .and_then(|v| v.get("details"))
-                .and_then(|d| d.get("error"))
-                .and_then(|e| e.as_str())
-                .or_else(|| {
-                    parsed
-                        .as_ref()
-                        .and_then(|v| v.get("message"))
-                        .and_then(|m| m.as_str())
+                .and_then(|v| {
+                    v.get("body")
+                        .and_then(|b| b.get("details"))
+                        .and_then(|d| d.get("error"))
+                        .and_then(|e| e.as_str())
+                        .or_else(|| {
+                            v.get("details")
+                                .and_then(|d| d.get("error"))
+                                .and_then(|e| e.as_str())
+                        })
+                        .or_else(|| {
+                            v.get("body")
+                                .and_then(|b| b.get("message"))
+                                .and_then(|m| m.as_str())
+                        })
+                        .or_else(|| v.get("message").and_then(|m| m.as_str()))
                 })
                 .map(str::to_string);
             tracing::error!(
@@ -484,6 +558,93 @@ impl Provider {
     /// Get the indexer URL this provider is configured with
     pub fn indexer_url(&self) -> &str {
         &self.indexer_url
+    }
+
+    pub fn has_index_db(&self) -> bool {
+        self.index_db_pool.is_some()
+    }
+
+    /// Fetch a consistent batch of note commitments from the dedicated
+    /// `midnight_note_created` index table.
+    ///
+    /// `last_event_id` is treated as the table cursor (`midnight_note_created.id`), not
+    /// the `events.id` cursor.
+    pub async fn fetch_midnight_note_created_since(
+        &self,
+        last_event_id: i64,
+    ) -> Result<Option<IndexerNoteCreatedBatch>> {
+        let Some(pool) = self.index_db_pool.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut tx = pool
+            .begin()
+            .await
+            .context("Failed to begin indexer DB transaction for commitment-tree sync")?;
+
+        let upto_event_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(id)::BIGINT
+             FROM midnight_note_created",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to read latest midnight_note_created cursor from indexer DB")?
+        .unwrap_or(0);
+
+        if upto_event_id <= last_event_id {
+            tx.commit().await.context(
+                "Failed to commit indexer DB transaction for commitment-tree sync (no-op)",
+            )?;
+            return Ok(Some(IndexerNoteCreatedBatch {
+                upto_event_id,
+                notes: Vec::new(),
+                rows_scanned: 0,
+            }));
+        }
+
+        let rows = sqlx::query(
+            "SELECT id::BIGINT AS id, cm, rollup_height::BIGINT AS rollup_height
+             FROM midnight_note_created
+             WHERE id > $1
+               AND id <= $2
+             ORDER BY id ASC",
+        )
+        .bind(last_event_id)
+        .bind(upto_event_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("Failed to read midnight_note_created batch from indexer DB")?;
+
+        let mut notes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let cm_hex: String = row
+                .try_get("cm")
+                .context("Failed to decode midnight_note_created.cm from indexer DB row")?;
+            let rollup_height_i64: i64 = row.try_get("rollup_height").context(
+                "Failed to decode midnight_note_created.rollup_height from indexer DB row",
+            )?;
+            let rollup_height = u64::try_from(rollup_height_i64).with_context(|| {
+                format!(
+                    "midnight_note_created.rollup_height is negative: {}",
+                    rollup_height_i64
+                )
+            })?;
+            let commitment = parse_hash32_hex(&cm_hex)?;
+            notes.push(IndexerNoteCreated {
+                commitment,
+                rollup_height: Some(rollup_height),
+            });
+        }
+
+        tx.commit()
+            .await
+            .context("Failed to commit indexer DB transaction for commitment-tree sync")?;
+
+        Ok(Some(IndexerNoteCreatedBatch {
+            upto_event_id,
+            notes,
+            rows_scanned: rows.len(),
+        }))
     }
 
     /// Check if the rollup is healthy and responding

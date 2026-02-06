@@ -40,6 +40,8 @@ requested number of pending transactions to the sequencer, and the service refil
 - `WALLET_SETUP_BACKOFF_MS` - delay between scale-up checks/batches and retry backoff when sequencer is not ready (default: `1000`)
 - `SEQUENCER_READY_CHECK_TIMEOUT_MS` - timeout for `/sequencer/ready` backpressure check before each scale-up batch (default: `2000`)
 - `MAX_CONCURRENT_PROOFS` - concurrent proof generations (default: `5`)
+- `PROOF_POOL_TREE_RESOLVE_RETRY_ATTEMPTS` - extra retries for transient tree lag / stale anchor root during self-transfer generation (default: `1`)
+- `PROOF_POOL_TREE_RESOLVE_RETRY_DELAY_MS` - delay between those retries in ms (default: `750`)
 - `LIGERO_PROGRAM_PATH` - circuit name or wasm path (default: `note_spend_guest`)
 - `VERIFIER_PROVER_SERVICE_URL` - overrides verifier-side remote `/verify` URL (default: `LIGERO_PROOF_SERVICE_URL`)
 - `POOL_FVK_PK` - when set, enables pool-signed viewer commitments; the service will fetch 1 viewer FVK per wallet from `MIDNIGHT_FVK_SERVICE_URL`
