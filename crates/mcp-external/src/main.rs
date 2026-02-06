@@ -39,7 +39,7 @@ mod test_utils;
 use std::cell::RefCell;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
@@ -47,7 +47,7 @@ use crate::fvk_service::ViewerFvkBundle;
 use crate::ligero::Ligero;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::server::{CryptoServer, McpWalletContext};
+use crate::server::{CryptoServer, LocalNotes, McpWalletContext, PendingSpentNotes};
 use crate::session_store::{SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
 
@@ -420,6 +420,8 @@ async fn restore_session_state(
     privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
     viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     wallet_explicitly_loaded: Arc<RwLock<bool>>,
+    pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
+    local_notes: Arc<Mutex<LocalNotes>>,
 ) -> anyhow::Result<()> {
     let snapshot = match session_store.load_session(&session_id).await? {
         Some(snapshot) => snapshot,
@@ -480,6 +482,25 @@ async fn restore_session_state(
     *privacy_key.write().await = restored_privacy_key;
     *viewer_fvk_bundle.write().await = restored_viewer_fvk;
     *wallet_explicitly_loaded.write().await = loaded;
+    {
+        let mut pending = pending_spent_notes.lock().await;
+        pending.by_rho.clear();
+        for entry in &snapshot.pending_spent_notes {
+            let inserted_at = std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_millis(
+                    entry.inserted_at_ms.max(0) as u64,
+                ))
+                .unwrap_or(std::time::UNIX_EPOCH);
+            pending.by_rho.insert(entry.rho.clone(), inserted_at);
+        }
+    }
+    {
+        let mut local = local_notes.lock().await;
+        local.by_rho.clear();
+        for note in &snapshot.local_notes {
+            local.by_rho.insert(note.rho.clone(), note.clone());
+        }
+    }
 
     Ok(())
 }
@@ -680,6 +701,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // created/restored via MCP tools within this session.
             // Sessions start empty and remain "unlocked" by default.
             let wallet_explicitly_loaded = Arc::new(RwLock::new(false));
+            let pending_spent_notes = Arc::new(Mutex::new(PendingSpentNotes::default()));
+            let local_notes = Arc::new(Mutex::new(LocalNotes::default()));
 
             let session_id = SESSION_CONTEXT
                 .try_with(|ctx| {
@@ -700,6 +723,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let privacy_key_restore = privacy_key.clone();
                 let viewer_fvk_restore = viewer_fvk_bundle.clone();
                 let wallet_loaded_restore = wallet_explicitly_loaded.clone();
+                let pending_restore = pending_spent_notes.clone();
+                let local_restore = local_notes.clone();
                 tokio::spawn(async move {
                     if let Err(err) = restore_session_state(
                         store,
@@ -708,6 +733,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         privacy_key_restore,
                         viewer_fvk_restore,
                         wallet_loaded_restore,
+                        pending_restore,
+                        local_restore,
                     )
                     .await
                     {
@@ -735,6 +762,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_explicitly_loaded,
                 session_id,
                 session_store_for_service.clone(),
+                pending_spent_notes,
+                local_notes,
             ))
         },
         session_manager.clone(),

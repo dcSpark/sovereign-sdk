@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
 use crate::fvk_service::{parse_hex_32, ViewerFvkBundle};
+use crate::operations::SpendableNote;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSpentNoteSnapshot {
+    pub rho: String,
+    pub inserted_at_ms: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -14,6 +21,10 @@ pub struct SessionSnapshot {
     pub privacy_spend_key_hex: Option<String>,
     pub viewer_fvk_bundle: Option<ViewerFvkBundleStored>,
     pub wallet_explicitly_loaded: bool,
+    #[serde(default)]
+    pub pending_spent_notes: Vec<PendingSpentNoteSnapshot>,
+    #[serde(default)]
+    pub local_notes: Vec<SpendableNote>,
 }
 
 impl SessionSnapshot {
@@ -23,6 +34,8 @@ impl SessionSnapshot {
             privacy_spend_key_hex: None,
             viewer_fvk_bundle: None,
             wallet_explicitly_loaded: false,
+            pending_spent_notes: Vec::new(),
+            local_notes: Vec::new(),
         }
     }
 
@@ -36,6 +49,8 @@ impl SessionSnapshot {
             privacy_spend_key_hex: Some(privacy_spend_key_hex),
             viewer_fvk_bundle: viewer_fvk_bundle.map(ViewerFvkBundleStored::from),
             wallet_explicitly_loaded: true,
+            pending_spent_notes: Vec::new(),
+            local_notes: Vec::new(),
         }
     }
 }

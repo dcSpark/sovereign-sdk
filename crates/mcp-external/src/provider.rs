@@ -8,6 +8,7 @@
 //! - Schema queries (chain_id, chain_name)
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -147,6 +148,23 @@ pub struct Provider {
     http_client: reqwest::Client,
 }
 
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+fn http_timeout_secs() -> u64 {
+    std::env::var("MCP_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS)
+}
+
+fn http_connect_timeout_secs() -> u64 {
+    std::env::var("MCP_HTTP_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT_SECS)
+}
+
 impl Provider {
     /// Create a new provider connected to the given RPC URL, verifier service, and indexer
     pub async fn new(rpc_url: &str, verifier_url: &str, indexer_url: &str) -> Result<Self> {
@@ -154,12 +172,18 @@ impl Provider {
             .await
             .with_context(|| format!("Failed to connect to rollup node at {}", rpc_url))?;
 
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(http_timeout_secs()))
+            .connect_timeout(Duration::from_secs(http_connect_timeout_secs()))
+            .build()
+            .context("Failed to create HTTP client for provider")?;
+
         Ok(Self {
             client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
             verifier_url: verifier_url.to_string(),
             indexer_url: indexer_url.to_string(),
-            http_client: reqwest::Client::new(),
+            http_client,
         })
     }
 

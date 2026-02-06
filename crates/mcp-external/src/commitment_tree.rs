@@ -362,6 +362,52 @@ impl CommitmentTreeSyncer {
                         return Ok(());
                     }
                     Ok(Some(stats)) => {
+                        // If the chain advanced between the initial `/tree/state` read and our
+                        // incremental note fetch, a root mismatch is expected. In that case we
+                        // should retry against fresh chain state instead of immediately forcing
+                        // an expensive full rebuild.
+                        let latest_state_retry = provider
+                            .query_rest_endpoint::<TreeStateResp>(
+                                "/modules/midnight-privacy/tree/state",
+                            )
+                            .await
+                            .ok()
+                            .and_then(|latest| {
+                                if latest.root.len() != 32 {
+                                    return None;
+                                }
+                                let mut latest_root = [0u8; 32];
+                                latest_root.copy_from_slice(&latest.root);
+                                Some((latest_root, latest.next_position))
+                            });
+                        if let Some((latest_root, latest_next_position)) = latest_state_retry {
+                            if latest_root != expected_root || latest_next_position != expected_next
+                            {
+                                let elapsed_ms = started.elapsed().as_millis();
+                                tracing::warn!(
+                                    attempt = attempt + 1,
+                                    max_attempts = SYNC_MAX_RETRIES,
+                                    elapsed_ms,
+                                    state_ms,
+                                    start_offset = stats.start_offset,
+                                    target_next_position = stats.target_next_position,
+                                    fetched_notes = stats.fetched_notes,
+                                    fetch_ms = stats.fetch_ms,
+                                    apply_ms = stats.apply_ms,
+                                    rebuilt_root = %RootHex(&stats.rebuilt_root),
+                                    expected_root = %RootHex(&expected_root),
+                                    latest_root = %RootHex(&latest_root),
+                                    latest_next_position,
+                                    "Commitment tree state advanced during incremental sync; retrying with fresh state"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    SYNC_RETRY_DELAY_MS,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        }
+
                         let elapsed_ms = started.elapsed().as_millis();
                         tracing::warn!(
                             attempt = attempt + 1,
@@ -555,6 +601,24 @@ impl CommitmentTreeSyncer {
             cms.len(),
             sample.join(", ")
         );
+    }
+
+    /// Single-pass membership lookup for commitments in the local tree cache.
+    ///
+    /// Unlike `resolve_positions_and_openings`, this does not perform additional retry loops.
+    /// It is useful as a lightweight pre-filter when selecting spendable inputs.
+    pub async fn commitment_presence(
+        &self,
+        provider: &Provider,
+        cms: &[Hash32],
+    ) -> Result<Vec<bool>> {
+        if cms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.sync_to_latest(provider).await?;
+        let st = self.state.read().await;
+        Ok(cms.iter().map(|cm| st.pos_by_cm.contains_key(cm)).collect())
     }
 
     async fn try_incremental_sync(

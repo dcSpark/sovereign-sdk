@@ -671,7 +671,13 @@ async fn wallet_worker(
         }
 
         let send_started = Instant::now();
-        let send_res = send_to_self(&client, &privacy_address, args.send_amount).await;
+        let send_res = tokio::select! {
+            res = send_to_self(&client, &privacy_address, args.send_amount) => res,
+            _ = stop_rx.changed() => {
+                tracing::info!("wallet[{idx}] interrupted by stop signal during send");
+                break;
+            }
+        };
         let send_elapsed = send_started.elapsed();
 
         let send_elapsed_us = send_elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
@@ -691,8 +697,13 @@ async fn wallet_worker(
                 );
                 if args.confirm {
                     let confirm_started = Instant::now();
-                    let confirm_res =
-                        wait_for_tx_confirmed(&client, &tx_id, confirm_poll, confirm_timeout).await;
+                    let confirm_res = tokio::select! {
+                        res = wait_for_tx_confirmed(&client, &tx_id, confirm_poll, confirm_timeout) => res,
+                        _ = stop_rx.changed() => {
+                            tracing::info!("wallet[{idx}] interrupted by stop signal during confirm");
+                            break;
+                        }
+                    };
                     let confirm_elapsed = confirm_started.elapsed();
 
                     let confirm_elapsed_us =
@@ -828,7 +839,12 @@ async fn main() -> Result<()> {
         } else {
             let _ = tokio::signal::ctrl_c().await;
         }
+        tracing::info!("stop signal received, shutting down workers...");
         let _ = stop_tx.send(true);
+        // Second Ctrl+C force-exits immediately.
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::warn!("second Ctrl+C received; forcing exit");
+        std::process::exit(130);
     });
 
     let reporter_counters = counters.clone();

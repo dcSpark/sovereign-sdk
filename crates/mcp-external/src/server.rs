@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::commitment_tree::global_tree_syncer;
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use crate::ligero::Ligero as LigeroProver;
 use crate::prefunded_wallets::PrefundedWalletStore;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
-use crate::session_store::{SessionSnapshot, SessionStore};
+use crate::session_store::{PendingSpentNoteSnapshot, SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
 use demo_stf::runtime::Runtime;
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
+use midnight_privacy::{note_commitment, Hash32};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -771,6 +775,11 @@ pub struct GetWalletStatusResult {
 
 const DEFAULT_PENDING_SPENT_NOTE_TTL_SECS: u64 = 120;
 const DEFAULT_WAIT_FOR_FRESH_NOTES_SECS: u64 = 5;
+const DEFAULT_WAIT_FOR_TREE_VISIBLE_NOTES_SECS: u64 = 300;
+const NOTES_WAIT_POLL_MS: u64 = 500;
+const NOTES_WAIT_PROGRESS_LOG_SECS: u64 = 5;
+const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
+const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
 
 fn pending_spent_note_ttl() -> std::time::Duration {
     let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
@@ -787,22 +796,84 @@ fn wait_for_fresh_notes_secs() -> u64 {
         .unwrap_or(DEFAULT_WAIT_FOR_FRESH_NOTES_SECS)
 }
 
+fn wait_for_tree_visible_notes_secs() -> u64 {
+    std::env::var("MCP_WAIT_FOR_TREE_VISIBLE_NOTES_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WAIT_FOR_TREE_VISIBLE_NOTES_SECS)
+}
+
+fn tree_resolve_retry_attempts() -> u32 {
+    std::env::var("MCP_TREE_RESOLVE_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS)
+}
+
+fn tree_resolve_retry_delay_ms() -> u64 {
+    std::env::var("MCP_TREE_RESOLVE_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
+}
+
+fn is_tree_positions_resolution_error(error_text: &str) -> bool {
+    error_text.contains("Failed to resolve Merkle positions/openings from cached commitment tree")
+}
+
+fn note_commitment_for_owner(
+    note: &crate::operations::SpendableNote,
+    owner_recipient: &Hash32,
+) -> Option<Hash32> {
+    let value = u64::try_from(note.value).ok()?;
+    let rho = parse_hex_32("rho", &note.rho).ok()?;
+    let sender_id = parse_hex_32("sender_id", &note.sender_id).ok()?;
+    Some(note_commitment(
+        &DOMAIN,
+        value,
+        &rho,
+        owner_recipient,
+        &sender_id,
+    ))
+}
+
 #[derive(Debug, Default)]
-struct PendingSpentNotes {
-    by_rho: HashMap<String, std::time::Instant>,
+pub(crate) struct PendingSpentNotes {
+    pub(crate) by_rho: HashMap<String, std::time::SystemTime>,
 }
 
 impl PendingSpentNotes {
     fn purge_expired(&mut self) {
         let ttl = pending_spent_note_ttl();
+        let now = std::time::SystemTime::now();
+        self.by_rho.retain(|_, inserted_at| match now.duration_since(*inserted_at) {
+            Ok(elapsed) => elapsed < ttl,
+            // Keep entries when local clock moves backwards.
+            Err(_) => true,
+        });
+    }
+
+    fn snapshot_entries(&mut self) -> Vec<PendingSpentNoteSnapshot> {
+        self.purge_expired();
         self.by_rho
-            .retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+            .iter()
+            .map(|(rho, inserted_at)| {
+                let inserted_at_ms = inserted_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                PendingSpentNoteSnapshot {
+                    rho: rho.clone(),
+                    inserted_at_ms,
+                }
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Default)]
-struct LocalNotes {
-    by_rho: HashMap<String, crate::operations::SpendableNote>,
+pub(crate) struct LocalNotes {
+    pub(crate) by_rho: HashMap<String, crate::operations::SpendableNote>,
 }
 
 #[derive(Clone)]
@@ -826,15 +897,15 @@ pub struct CryptoServer {
     /// Best-effort local cache of recently-spent note identifiers (rho hex), used to avoid
     /// double-spending when the indexer lags behind the sequencer.
     pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
-    /// Best-effort local cache of newly-created change notes (owned by this wallet),
-    /// so consecutive sends don't have to wait for indexer lag.
+    /// Best-effort local cache of newly-created owned notes, so consecutive sends don't have to
+    /// wait for indexer lag.
     local_notes: Arc<Mutex<LocalNotes>>,
 }
 
 #[allow(rust_analyzer::macro_error)]
 #[tool_router]
 impl CryptoServer {
-    pub fn new(
+    pub(crate) fn new(
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
         admin_wallet_context: Option<Arc<McpWalletContext>>,
@@ -848,6 +919,8 @@ impl CryptoServer {
         wallet_explicitly_loaded: Arc<RwLock<bool>>,
         session_id: Option<String>,
         session_store: Option<Arc<SessionStore>>,
+        pending_spent_notes: Arc<Mutex<PendingSpentNotes>>,
+        local_notes: Arc<Mutex<LocalNotes>>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -864,8 +937,8 @@ impl CryptoServer {
             wallet_explicitly_loaded,
             session_id,
             session_store,
-            pending_spent_notes: Arc::new(Mutex::new(PendingSpentNotes::default())),
-            local_notes: Arc::new(Mutex::new(LocalNotes::default())),
+            pending_spent_notes,
+            local_notes,
         }
     }
 
@@ -892,6 +965,41 @@ impl CryptoServer {
         };
         if let Err(err) = store.delete_session(session_id).await {
             tracing::warn!("[mcp] Failed to delete session {session_id}: {err}");
+        }
+    }
+
+    async fn persist_note_caches_to_session_snapshot(&self) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let Some(session_id) = self.session_id.as_deref() else {
+            tracing::warn!("[mcp] Session persistence enabled but session id is missing");
+            return;
+        };
+
+        let mut snapshot = match store.load_session(session_id).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!("[mcp] Failed to load session {session_id} for cache update: {err}");
+                return;
+            }
+        };
+
+        let pending_spent_notes = {
+            let mut pending = self.pending_spent_notes.lock().await;
+            pending.snapshot_entries()
+        };
+        let local_notes = {
+            let local = self.local_notes.lock().await;
+            local.by_rho.values().cloned().collect()
+        };
+
+        snapshot.pending_spent_notes = pending_spent_notes;
+        snapshot.local_notes = local_notes;
+
+        if let Err(err) = store.save_session(session_id, &snapshot).await {
+            tracing::warn!("[mcp] Failed to persist note caches for session {session_id}: {err}");
         }
     }
 
@@ -976,12 +1084,20 @@ impl CryptoServer {
         let send_started = std::time::Instant::now();
 
         let notes_wait_started = std::time::Instant::now();
-        let notes_wait_limit = std::time::Duration::from_secs(wait_for_fresh_notes_secs());
+        let fresh_notes_wait_limit = std::time::Duration::from_secs(wait_for_fresh_notes_secs());
+        let tree_visible_wait_limit = std::time::Duration::from_secs(
+            wait_for_fresh_notes_secs().max(wait_for_tree_visible_notes_secs()),
+        );
+        let mut notes_wait_last_progress_log = notes_wait_started;
         let mut notes_fetch_attempts: u64 = 0;
         let mut notes_fetch_ms_total: u128 = 0;
         let mut notes_filtered_pending_total: u64 = 0;
         let mut notes_added_local_total: u64 = 0;
+        let mut notes_filtered_tree_missing_total: u64 = 0;
+        let mut notes_unparsable_total: u64 = 0;
+        let mut notes_tree_blocked_covering = false;
         let mut notes_returned_by_indexer_last: usize;
+        let owner_recipient = privacy_key.recipient(&DOMAIN);
 
         let notes = loop {
             notes_fetch_attempts += 1;
@@ -1002,6 +1118,8 @@ impl CryptoServer {
                 let local = self.local_notes.lock().await;
                 local.by_rho.values().cloned().collect()
             };
+            let local_note_rhos: HashSet<String> =
+                local_notes.iter().map(|note| note.rho.clone()).collect();
 
             let filtered = {
                 let mut pending = self.pending_spent_notes.lock().await;
@@ -1030,15 +1148,112 @@ impl CryptoServer {
                 }
                 if added > 0 {
                     notes_added_local_total += added as u64;
-                    tracing::debug!("[send] Added {} local change note(s) to candidates", added);
+                    tracing::debug!(
+                        "[send] Added {} locally-cached owned note(s) to candidates",
+                        added
+                    );
                 }
             }
 
-            if !notes.is_empty() || notes_wait_started.elapsed() >= notes_wait_limit {
-                break notes;
+            // Only use notes whose commitments are already visible in the current commitment tree.
+            // This avoids selecting very fresh notes that indexer can see before tree endpoints catch up.
+            let mut notes_with_cm: Vec<(crate::operations::SpendableNote, Hash32)> =
+                Vec::with_capacity(notes.len());
+            for note in notes {
+                if let Some(cm) = note_commitment_for_owner(&note, &owner_recipient) {
+                    notes_with_cm.push((note, cm));
+                } else {
+                    notes_unparsable_total += 1;
+                }
+            }
+            let cms: Vec<Hash32> = notes_with_cm.iter().map(|(_, cm)| *cm).collect();
+            let presence = global_tree_syncer()
+                .commitment_presence(provider, &cms)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!(
+                            "Failed to verify note commitments in commitment tree: {}",
+                            e
+                        ),
+                        None,
+                    )
+                })?;
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let owner_recipient_hex = hex::encode(owner_recipient);
+                for ((note, cm), present) in notes_with_cm.iter().zip(presence.iter()).take(6) {
+                    tracing::debug!(
+                        owner_recipient = %owner_recipient_hex,
+                        note_value = note.value,
+                        note_rho = %note.rho,
+                        note_sender_id = %note.sender_id,
+                        note_kind = %note.kind,
+                        note_tx_hash = %note.tx_hash,
+                        computed_cm = %hex::encode(cm),
+                        present_in_tree = *present,
+                        "[send] Candidate note commitment presence"
+                    );
+                }
+            }
+            let before_tree_filter = notes_with_cm.len();
+            let candidate_notes: Vec<crate::operations::SpendableNote> =
+                notes_with_cm.iter().map(|(note, _)| note.clone()).collect();
+            let mut tree_visible_notes = Vec::with_capacity(before_tree_filter);
+            for ((note, _), present) in notes_with_cm.into_iter().zip(presence.into_iter()) {
+                if present || local_note_rhos.contains(&note.rho) {
+                    tree_visible_notes.push(note);
+                }
+            }
+            let filtered_tree = before_tree_filter.saturating_sub(tree_visible_notes.len());
+            if filtered_tree > 0 {
+                notes_filtered_tree_missing_total += filtered_tree as u64;
+                tracing::debug!(
+                    "[send] Filtered {} note(s) not yet visible in commitment tree",
+                    filtered_tree
+                );
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let has_covering_candidates = crate::operations::select_largest_notes_covering_amount(
+                candidate_notes,
+                send_amount,
+                crate::viewer::MAX_INS,
+            )
+            .is_ok();
+            let has_covering_notes = crate::operations::select_largest_notes_covering_amount(
+                tree_visible_notes.clone(),
+                send_amount,
+                crate::viewer::MAX_INS,
+            )
+            .is_ok();
+
+            if has_covering_candidates && !has_covering_notes {
+                notes_tree_blocked_covering = true;
+            }
+
+            let notes_wait_limit = if notes_tree_blocked_covering {
+                tree_visible_wait_limit
+            } else {
+                fresh_notes_wait_limit
+            };
+
+            if has_covering_notes || notes_wait_started.elapsed() >= notes_wait_limit {
+                break tree_visible_notes;
+            }
+
+            if notes_wait_last_progress_log.elapsed().as_secs() >= NOTES_WAIT_PROGRESS_LOG_SECS {
+                tracing::info!(
+                    elapsed_ms = notes_wait_started.elapsed().as_millis(),
+                    wait_limit_ms = notes_wait_limit.as_millis(),
+                    notes_fetch_attempts,
+                    notes_candidates_with_cm = before_tree_filter,
+                    notes_tree_visible = tree_visible_notes.len(),
+                    notes_tree_blocked_covering,
+                    "Waiting for spendable notes"
+                );
+                notes_wait_last_progress_log = std::time::Instant::now();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
         };
 
         let notes_wait_ms = notes_wait_started.elapsed().as_millis();
@@ -1049,11 +1264,22 @@ impl CryptoServer {
             notes_returned_by_indexer_last,
             notes_filtered_pending_total,
             notes_added_local_total,
+            notes_filtered_tree_missing_total,
+            notes_unparsable_total,
             notes_candidates = notes.len(),
             "Unspent notes ready"
         );
 
         if notes.is_empty() {
+            if notes_tree_blocked_covering || notes_filtered_tree_missing_total > 0 {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "Spendable notes were found but are not yet visible in the commitment tree after waiting {}s. Retry shortly.",
+                        tree_visible_wait_limit.as_secs()
+                    ),
+                    None,
+                ));
+            }
             return Err(ErrorData::invalid_params(
                 "No unspent notes available to send.".to_string(),
                 None,
@@ -1061,12 +1287,28 @@ impl CryptoServer {
         }
 
         let selection_started = std::time::Instant::now();
-        let selected = crate::operations::select_largest_notes_covering_amount(
+        let selected = match crate::operations::select_largest_notes_covering_amount(
             notes,
             send_amount,
             crate::viewer::MAX_INS,
-        )
-        .map_err(|e| ErrorData::invalid_params(format!("Insufficient funds: {}", e), None))?;
+        ) {
+            Ok(selected) => selected,
+            Err(e) => {
+                if notes_filtered_tree_missing_total > 0 || notes_tree_blocked_covering {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "Inputs are not yet visible in the commitment tree (filtered {} candidate notes). Retry shortly.",
+                            notes_filtered_tree_missing_total
+                        ),
+                        None,
+                    ));
+                }
+                return Err(ErrorData::invalid_params(
+                    format!("Insufficient funds: {}", e),
+                    None,
+                ));
+            }
+        };
 
         let total_in: u128 = selected.iter().map(|n| n.value).sum();
         let selection_ms = selection_started.elapsed().as_millis();
@@ -1142,6 +1384,8 @@ impl CryptoServer {
             )
         })?;
         let pk_ivk_owner = privacy_key.pk_ivk(&DOMAIN);
+        let sender_id_out =
+            midnight_privacy::recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk_owner);
         let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
                 "Ligero proof service not configured; set LIGERO_PROOF_SERVICE_URL.".to_string(),
@@ -1149,25 +1393,53 @@ impl CryptoServer {
             )
         })?;
         let transfer_started = std::time::Instant::now();
-        let transfer_result = crate::operations::transfer(
-            ligero_ref,
-            provider,
-            ctx,
-            spend_sk,
-            pk_ivk_owner,
-            send_amount,
-            inputs,
-            output_pk,
-            output_pk_ivk,
-            viewer_fvk_bundle_for_transfer,
-        )
-        .await;
+        let tree_retry_attempts = tree_resolve_retry_attempts();
+        let tree_retry_delay = std::time::Duration::from_millis(tree_resolve_retry_delay_ms());
+        let mut transfer_attempt: u32 = 0;
+        let transfer_result = loop {
+            transfer_attempt += 1;
+            let res = crate::operations::transfer(
+                ligero_ref,
+                provider,
+                ctx,
+                spend_sk,
+                pk_ivk_owner,
+                send_amount,
+                inputs.clone(),
+                output_pk,
+                output_pk_ivk,
+                viewer_fvk_bundle_for_transfer.clone(),
+            )
+            .await;
+
+            match res {
+                Ok(ok) => break Ok(ok),
+                Err(e) => {
+                    let error_text = e.to_string();
+                    if is_tree_positions_resolution_error(&error_text)
+                        && transfer_attempt <= tree_retry_attempts + 1
+                    {
+                        tracing::warn!(
+                            attempt = transfer_attempt,
+                            max_attempts = tree_retry_attempts + 1,
+                            retry_delay_ms = tree_retry_delay.as_millis(),
+                            error = %error_text,
+                            "Transfer hit transient commitment-tree lag; retrying"
+                        );
+                        tokio::time::sleep(tree_retry_delay).await;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        };
         let transfer_result = match transfer_result {
             Ok(ok) => ok,
             Err(e) => {
                 let error_text = e.to_string();
                 let nullifier_spent = error_text.contains("Nullifier already spent");
                 let verifier_client_reject = error_text.contains("error status 4");
+                let tree_resolution_error = is_tree_positions_resolution_error(&error_text);
 
                 if nullifier_spent {
                     tracing::warn!(
@@ -1178,14 +1450,17 @@ impl CryptoServer {
 
                     // Mark selected inputs as locally pending-spent so immediate retries
                     // don't keep selecting the same stale notes while indexer state catches up.
-                    let mut pending = self.pending_spent_notes.lock().await;
-                    let mut local = self.local_notes.lock().await;
-                    pending.purge_expired();
-                    let now = std::time::Instant::now();
-                    for note in &selected {
-                        pending.by_rho.insert(note.rho.clone(), now);
-                        local.by_rho.remove(&note.rho);
+                    {
+                        let mut pending = self.pending_spent_notes.lock().await;
+                        let mut local = self.local_notes.lock().await;
+                        pending.purge_expired();
+                        for note in &selected {
+                            pending.by_rho.insert(note.rho.clone(), std::time::SystemTime::now());
+                            local.by_rho.remove(&note.rho);
+                        }
                     }
+
+                    self.persist_note_caches_to_session_snapshot().await;
 
                     return Err(ErrorData::invalid_params(
                         "Transfer rejected: selected note is already spent (nullifier already spent). This is usually temporary indexer lag; retry shortly."
@@ -1197,6 +1472,14 @@ impl CryptoServer {
                 if verifier_client_reject {
                     return Err(ErrorData::invalid_params(
                         format!("Transfer rejected by verifier/sequencer: {error_text}"),
+                        None,
+                    ));
+                }
+
+                if tree_resolution_error {
+                    return Err(ErrorData::invalid_params(
+                        "Transfer inputs are not yet visible in the commitment tree (transient lag under load). Retry shortly."
+                            .to_string(),
                         None,
                     ));
                 }
@@ -1218,17 +1501,36 @@ impl CryptoServer {
             let mut pending = self.pending_spent_notes.lock().await;
             let mut local = self.local_notes.lock().await;
             pending.purge_expired();
-            let now = std::time::Instant::now();
             for note in &selected {
-                pending.by_rho.insert(note.rho.clone(), now);
+                pending
+                    .by_rho
+                    .insert(note.rho.clone(), std::time::SystemTime::now());
                 local.by_rho.remove(&note.rho);
+            }
+
+            // Cache owned primary outputs immediately so follow-up sends do not depend on indexer
+            // timing. This is critical for send-to-self flows where there may be no change.
+            if transfer_result.output_recipient == owner_recipient {
+                let rho_hex = hex::encode(transfer_result.output_rho);
+                let sender_id_hex = hex::encode(sender_id_out);
+                local.by_rho.insert(
+                    rho_hex.clone(),
+                    crate::operations::SpendableNote {
+                        value: send_amount,
+                        rho: rho_hex,
+                        sender_id: sender_id_hex,
+                        tx_hash: transfer_result.tx_hash.clone(),
+                        timestamp_ms: transfer_result.created_at,
+                        kind: "transfer".to_string(),
+                    },
+                );
             }
 
             if let (Some(change_amount), Some(change_rho)) =
                 (transfer_result.change_amount, transfer_result.change_rho)
             {
                 let rho_hex = hex::encode(change_rho);
-                let sender_id_hex = hex::encode(privacy_key.recipient(&DOMAIN));
+                let sender_id_hex = hex::encode(sender_id_out);
                 local.by_rho.insert(
                     rho_hex.clone(),
                     crate::operations::SpendableNote {
@@ -1242,6 +1544,7 @@ impl CryptoServer {
                 );
             }
         }
+        self.persist_note_caches_to_session_snapshot().await;
 
         let created_at = transfer_result.created_at;
         let total_ms = send_started.elapsed().as_millis();
