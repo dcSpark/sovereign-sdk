@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -82,7 +82,8 @@ pub struct ServiceConfig {
     /// If true, do NOT submit to sequencer immediately; queue and wait for an explicit flush.
     /// Useful for benchmarks to remove the worker bottleneck and release all txs at once.
     pub defer_sequencer_submission: bool,
-    /// URL of the ligero-http-server prover/verifier service (default: http://localhost:1313)
+    /// Optional URL of a remote ligero-http-server prover/verifier service.
+    /// When `None`, local daemon pools are used.
     pub prover_service_url: Option<String>,
 }
 
@@ -632,6 +633,151 @@ struct ProverServiceVerifyResponse {
     error: Option<String>,
 }
 
+/// Request body for the local `/prove` and `/verify` endpoints.
+#[derive(Debug, Clone, Deserialize)]
+struct ProveVerifyRequest {
+    /// Circuit name (e.g. "note_spend_guest") or direct wasm path.
+    circuit: String,
+    /// Ligero program arguments.
+    args: Vec<ligero_runner::LigeroArg>,
+    /// Base64 proof bytes (required for `/verify`, ignored for `/prove`).
+    #[serde(default)]
+    proof: Option<String>,
+    /// Optional private argument indices.
+    #[serde(default, rename = "privateIndices")]
+    private_indices: Vec<usize>,
+    /// Optional packing size (defaults to 8192).
+    #[serde(default)]
+    packing: Option<u32>,
+    /// Optional gzip toggle for `/prove` (defaults to false).
+    #[serde(default)]
+    gzip: Option<bool>,
+    /// Optional response mode for `/prove`.
+    /// When true, `/prove` returns raw proof bytes (`application/octet-stream`) instead of JSON/base64.
+    #[serde(default)]
+    binary: Option<bool>,
+}
+
+/// Response body for the local `/prove` and `/verify` endpoints.
+#[derive(Debug, Clone, Serialize)]
+struct ProveVerifyResponse {
+    success: bool,
+    #[serde(rename = "exitCode")]
+    exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn discover_ligero_paths() -> Result<ligero_runner::LigeroPaths, ServiceError> {
+    ligero_runner::LigeroPaths::discover()
+        .or_else(|_| Ok::<_, anyhow::Error>(ligero_runner::LigeroPaths::fallback()))
+        .map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to discover Ligero prover/verifier paths: {e}"
+            ))
+        })
+}
+
+fn resolve_circuit_program(circuit: &str) -> Result<std::path::PathBuf, ServiceError> {
+    if circuit.contains('/') || circuit.contains('\\') || circuit.ends_with(".wasm") {
+        if let Ok(path) = ligero_runner::resolve_program(circuit) {
+            return Ok(path);
+        }
+    }
+
+    let candidates = [
+        circuit.to_string(),
+        format!("{}_guest", circuit),
+        format!("{}_guest.wasm", circuit),
+        format!("{}.wasm", circuit),
+    ];
+
+    for candidate in candidates {
+        if let Ok(path) = ligero_runner::resolve_program(&candidate) {
+            return Ok(path);
+        }
+    }
+
+    Err(ServiceError::ParseError(format!(
+        "Could not resolve circuit '{}'",
+        circuit
+    )))
+}
+
+fn get_or_create_prover_daemon_pool(
+    paths: &ligero_runner::LigeroPaths,
+    workers: usize,
+) -> Result<ligero_runner::daemon::DaemonPool, ServiceError> {
+    use std::collections::HashMap;
+
+    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+
+    let key = format!(
+        "{}|{}",
+        paths.prover_bin.display(),
+        paths.shader_dir.display()
+    );
+
+    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = pools_lock.lock().unwrap();
+    if let Some(pool) = guard.get(&key) {
+        return Ok(pool.clone());
+    }
+
+    info!(
+        "Starting Ligero prover daemon pool (workers={}) using prover_bin={} shader_dir={}",
+        workers.max(1),
+        paths.prover_bin.display(),
+        paths.shader_dir.display(),
+    );
+
+    let pool =
+        ligero_runner::daemon::DaemonPool::new_prover(paths, workers.max(1)).map_err(|e| {
+            ServiceError::ProofError(format!("Failed to start prover daemon pool: {e}"))
+        })?;
+    guard.insert(key, pool.clone());
+    Ok(pool)
+}
+
+fn get_or_create_verifier_daemon_pool(
+    paths: &ligero_runner::LigeroPaths,
+    workers: usize,
+) -> Result<ligero_runner::daemon::DaemonPool, ServiceError> {
+    use std::collections::HashMap;
+
+    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
+        OnceLock::new();
+
+    let key = format!(
+        "{}|{}",
+        paths.verifier_bin.display(),
+        paths.shader_dir.display()
+    );
+
+    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = pools_lock.lock().unwrap();
+    if let Some(pool) = guard.get(&key) {
+        return Ok(pool.clone());
+    }
+
+    info!(
+        "Starting Ligero verifier daemon pool (workers={}) using verifier_bin={} shader_dir={}",
+        workers.max(1),
+        paths.verifier_bin.display(),
+        paths.shader_dir.display(),
+    );
+
+    let pool =
+        ligero_runner::daemon::DaemonPool::new_verifier(paths, workers.max(1)).map_err(|e| {
+            ServiceError::ProofError(format!("Failed to start verifier daemon pool: {e}"))
+        })?;
+    guard.insert(key, pool.clone());
+    Ok(pool)
+}
+
 /// Verify proof using the remote ligero-http-server prover service via REST API.
 ///
 /// This sends an HTTP POST to the prover service's /verify endpoint.
@@ -807,6 +953,117 @@ fn verify_with_ligero_verifier_daemon(
     Ok(())
 }
 
+fn prove_with_ligero_daemon(
+    req: &ProveVerifyRequest,
+    workers: usize,
+) -> Result<Vec<u8>, ServiceError> {
+    let program = resolve_circuit_program(&req.circuit)?;
+    let paths = discover_ligero_paths()?;
+    let pool = get_or_create_prover_daemon_pool(&paths, workers)?;
+
+    let use_gzip = req.gzip.unwrap_or(false);
+    let packing = req.packing.unwrap_or(8192);
+    let proof_filename = if use_gzip {
+        "proof_data.gz"
+    } else {
+        "proof_data.bin"
+    };
+
+    let proof_dir = tempfile::tempdir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to create proof temp dir: {e}")))?;
+    let proof_path = proof_dir.path().join(proof_filename);
+
+    let mut cfg = serde_json::json!({
+        "program": program.to_string_lossy(),
+        "shader-path": paths.shader_dir.to_string_lossy(),
+        "packing": packing,
+        "gzip-proof": use_gzip,
+        "args": req.args,
+        "proof-path": proof_path.to_string_lossy().to_string(),
+    });
+    if !req.private_indices.is_empty() {
+        cfg["private-indices"] = serde_json::json!(req.private_indices);
+    }
+
+    let resp = pool
+        .prove(cfg)
+        .map_err(|e| ServiceError::ProofError(format!("Prover daemon request failed: {e}")))?;
+
+    if !resp.ok {
+        return Err(ServiceError::ProofError(format!(
+            "Prover daemon returned ok=false (exit_code={:?}): {}",
+            resp.exit_code,
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+
+    let proof_file = resp
+        .proof_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or(proof_path);
+    let proof_bytes = std::fs::read(&proof_file)
+        .map_err(|e| ServiceError::Internal(format!("Failed to read proof output: {e}")))?;
+    Ok(proof_bytes)
+}
+
+fn verify_with_ligero_daemon_api(
+    req: &ProveVerifyRequest,
+    workers: usize,
+) -> Result<(), ServiceError> {
+    let proof_b64 = req
+        .proof
+        .as_ref()
+        .ok_or_else(|| ServiceError::ParseError("Proof is required for /verify".to_string()))?;
+    let proof_bytes = BASE64_STANDARD
+        .decode(proof_b64)
+        .map_err(|e| ServiceError::ParseError(format!("Failed to decode proof: {e}")))?;
+
+    let program = resolve_circuit_program(&req.circuit)?;
+    let paths = discover_ligero_paths()?;
+    let pool = get_or_create_verifier_daemon_pool(&paths, workers)?;
+
+    let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
+    let proof_filename = if is_gzip {
+        "proof_data.gz"
+    } else {
+        "proof_data.bin"
+    };
+
+    let dir = tempfile::tempdir()
+        .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
+    let proof_path = dir.path().join(proof_filename);
+    std::fs::write(&proof_path, &proof_bytes)
+        .map_err(|e| ServiceError::Internal(format!("Failed to write proof file: {e}")))?;
+
+    let redacted_args = ligero_runner::redaction::redacted_args(&req.args, &req.private_indices);
+    let mut cfg = serde_json::json!({
+        "program": program.to_string_lossy(),
+        "shader-path": paths.shader_dir.to_string_lossy(),
+        "packing": req.packing.unwrap_or(8192),
+        "gzip-proof": is_gzip,
+        "args": redacted_args,
+    });
+    if !req.private_indices.is_empty() {
+        cfg["private-indices"] = serde_json::json!(req.private_indices);
+    }
+
+    let resp = pool
+        .verify(cfg, proof_path.to_string_lossy().as_ref())
+        .map_err(|e| ServiceError::ProofError(format!("Verifier daemon request failed: {e}")))?;
+
+    if !resp.ok || resp.verify_ok != Some(true) {
+        return Err(ServiceError::ProofError(format!(
+            "Verification failed (exit_code={:?}, verify_ok={:?}): {}",
+            resp.exit_code,
+            resp.verify_ok,
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+
+    Ok(())
+}
+
 /// Request body for proof verification
 #[derive(Debug, Deserialize)]
 pub struct VerifyAndSubmitRequest {
@@ -974,6 +1231,8 @@ pub fn create_router(state: AppState) -> Router {
             post(verify_and_record_midnight_handler),
         )
         .route("/midnight-privacy/flush", post(flush_pending_handler))
+        .route("/prove", post(prove_handler))
+        .route("/verify", post(verify_handler))
         .route("/health", axum::routing::get(health_check))
         .with_state(state)
         // Remove default 2MB body limit and allow larger payloads.
@@ -999,6 +1258,120 @@ async fn health_check() -> impl IntoResponse {
         "status": "healthy",
         "service": "proof-verifier",
     }))
+}
+
+fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: String) -> Response {
+    (
+        status,
+        Json(ProveVerifyResponse {
+            success: false,
+            exit_code,
+            proof: None,
+            error: Some(message),
+        }),
+    )
+        .into_response()
+}
+
+async fn prove_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ProveVerifyRequest>,
+) -> Response {
+    let _permit = match state.verification_semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(e) => {
+            return prove_verify_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                1,
+                format!("Semaphore error: {e}"),
+            );
+        }
+    };
+
+    let return_binary = req.binary.unwrap_or(false);
+    let workers = state.config.max_concurrent_verifications;
+    let result = tokio::task::spawn_blocking(move || prove_with_ligero_daemon(&req, workers)).await;
+
+    match result {
+        Ok(Ok(proof_bytes)) => {
+            if return_binary {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    proof_bytes,
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(ProveVerifyResponse {
+                        success: true,
+                        exit_code: 0,
+                        proof: Some(BASE64_STANDARD.encode(&proof_bytes)),
+                        error: None,
+                    }),
+                )
+                    .into_response()
+            }
+        }
+        Ok(Err(ServiceError::ParseError(msg))) => {
+            prove_verify_error_response(StatusCode::BAD_REQUEST, 1, msg)
+        }
+        Ok(Err(ServiceError::Internal(msg))) => {
+            prove_verify_error_response(StatusCode::INTERNAL_SERVER_ERROR, 1, msg)
+        }
+        Ok(Err(err)) => prove_verify_error_response(StatusCode::BAD_REQUEST, 1, err.to_string()),
+        Err(join_err) => prove_verify_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            1,
+            format!("Prover task join error: {join_err}"),
+        ),
+    }
+}
+
+async fn verify_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ProveVerifyRequest>,
+) -> Response {
+    let _permit = match state.verification_semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(e) => {
+            return prove_verify_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                1,
+                format!("Semaphore error: {e}"),
+            );
+        }
+    };
+
+    let workers = state.config.max_concurrent_verifications;
+    let result =
+        tokio::task::spawn_blocking(move || verify_with_ligero_daemon_api(&req, workers)).await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(ProveVerifyResponse {
+                success: true,
+                exit_code: 0,
+                proof: None,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Ok(Err(ServiceError::ParseError(msg))) => {
+            prove_verify_error_response(StatusCode::BAD_REQUEST, 1, msg)
+        }
+        Ok(Err(ServiceError::Internal(msg))) => {
+            prove_verify_error_response(StatusCode::INTERNAL_SERVER_ERROR, 1, msg)
+        }
+        Ok(Err(err)) => prove_verify_error_response(StatusCode::BAD_REQUEST, 1, err.to_string()),
+        Err(join_err) => prove_verify_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            1,
+            format!("Verifier task join error: {join_err}"),
+        ),
+    }
 }
 
 /// Flush all pending worker-verified transactions to the sequencer in parallel.
@@ -1190,7 +1563,7 @@ async fn flush_pending_handler(
     })))
 }
 
-/// Main handler for verify-and-submit endpoint
+/// Main handler for the `/value-setter-zk` endpoint.
 async fn verify_and_submit_handler(
     State(state): State<AppState>,
     Json(req): Json<VerifyAndSubmitRequest>,
