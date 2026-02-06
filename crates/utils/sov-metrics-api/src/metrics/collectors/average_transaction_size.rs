@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::indexer_db::midnight_transfer;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
@@ -37,27 +36,10 @@ impl MetricCollector for AverageTransactionSizeCollector {
 
     fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
-            let rows = midnight_transfer::Entity::find()
-                .filter(midnight_transfer::Column::Amount.is_not_null())
-                .all(&self.db)
-                .await
-                .with_context(|| "Failed to load midnight_transfer rows")?;
-
-            let mut total_amount: u128 = 0;
-            let mut total_transactions: u64 = 0;
-
-            for row in rows {
-                let amount = row
-                    .amount
-                    .as_ref()
-                    .with_context(|| "Missing transfer amount")?
-                    .parse::<u128>()
-                    .with_context(|| "Invalid transfer amount")?;
-                total_amount = total_amount
-                    .checked_add(amount)
-                    .with_context(|| "Transfer amount overflow")?;
-                total_transactions += 1;
-            }
+            let (total_amount, total_transactions) =
+                super::amount_aggregates::transfer_amount_totals(&self.db)
+                    .await
+                    .with_context(|| "Failed to aggregate average transaction size")?;
 
             let payload = AverageTransactionSizePayload {
                 total_amount: total_amount.to_string(),

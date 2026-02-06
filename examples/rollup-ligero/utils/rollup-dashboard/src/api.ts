@@ -2,6 +2,8 @@ import type {
   HealthResponse,
   ActionType,
   ActionResult,
+  EmaWindow,
+  EmaMetricsResponse,
   MetricsData,
   TpsResponse,
   TotalTransactionsResponse,
@@ -48,9 +50,10 @@ export async function fetchSystemStats(): Promise<SystemStats | null> {
   }
 }
 
-export async function performAction(action: ActionType): Promise<ActionResult> {
+export async function performAction(action: ActionType, serviceId?: string): Promise<ActionResult> {
   try {
-    const response = await fetch(`${API_BASE}/${action}`, {
+    const suffix = serviceId ? `/${encodeURIComponent(serviceId)}` : '';
+    const response = await fetch(`${API_BASE}/${action}${suffix}`, {
       method: 'POST',
     });
     const message = await response.text();
@@ -83,6 +86,10 @@ async function fetchMetricEndpoint<T>(endpoint: string): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+export async function fetchEmaMetrics(window: EmaWindow): Promise<EmaMetricsResponse | null> {
+  return fetchMetricEndpoint<EmaMetricsResponse>(`/${window}`);
 }
 
 export async function fetchMetrics(): Promise<MetricsData> {

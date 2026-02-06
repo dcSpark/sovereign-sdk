@@ -101,8 +101,7 @@ async fn count_fvk_registry_entries(db: &DatabaseConnection) -> Result<u64> {
     use crate::indexer_db::fvk_registry;
 
     let count = fvk_registry::Entity::find()
-        .paginate(db, 1)
-        .num_items()
+        .count(db)
         .await
         .context("Failed to count fvk_registry entries")?;
 
@@ -205,16 +204,14 @@ async fn count_disclosure_events(db: &DatabaseConnection) -> Result<u64> {
     // Count transfers with view_attestations
     let transfer_disclosures = midnight_transfer::Entity::find()
         .filter(midnight_transfer::Column::ViewAttestations.is_not_null())
-        .paginate(db, 1)
-        .num_items()
+        .count(db)
         .await
         .context("Failed to count transfer disclosures")?;
 
     // Count withdraws with view_attestations
     let withdraw_disclosures = midnight_withdraw::Entity::find()
         .filter(midnight_withdraw::Column::ViewAttestations.is_not_null())
-        .paginate(db, 1)
-        .num_items()
+        .count(db)
         .await
         .context("Failed to count withdraw disclosures")?;
 

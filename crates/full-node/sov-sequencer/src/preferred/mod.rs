@@ -66,8 +66,9 @@ use transaction_subscriptions::TransactionCache;
 
 use crate::common::{
     cache_sequencer_metrics, error_not_fully_synced, generic_accept_tx_error,
-    loop_send_tx_notifications, poll_state_update, AcceptedTx, Sequencer, SequencerEventStream,
-    SequencerMetrics, StateUpdateError, StateUpdateNotification, WithCachedTxHashes,
+    loop_send_tx_notifications, poll_state_update, take_parallel_tx_failure, AcceptedTx, Sequencer,
+    SequencerEventStream, SequencerMetrics, StateUpdateError, StateUpdateNotification,
+    WithCachedTxHashes,
 };
 use crate::metrics::{track_in_progress_batch_size, PreferredSequencerFetchBatchesToReplayMetrics};
 use crate::preferred::block_executor::{RollupBlockExecutor, RollupBlockExecutorError};
@@ -894,10 +895,16 @@ where
         };
 
         match res {
-            Ok(rx) => rx
-                .await
-                .map_err(database_error_500)?
-                .map_err(parallel_tx_failure_to_error),
+            Ok(rx) => match rx.await {
+                Ok(accepted) => accepted.map_err(parallel_tx_failure_to_error),
+                Err(err) => {
+                    if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
+                        Err(par_err)
+                    } else {
+                        Err(database_error_500(err))
+                    }
+                }
+            },
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => {
                     return Err(sequencer_overloaded_503());
@@ -1016,10 +1023,16 @@ where
 
         let await_start = std::time::Instant::now();
         let result = match res {
-            Ok(rx) => rx
-                .await
-                .map_err(database_error_500)?
-                .map_err(parallel_tx_failure_to_error),
+            Ok(rx) => match rx.await {
+                Ok(accepted) => accepted.map_err(parallel_tx_failure_to_error),
+                Err(err) => {
+                    if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
+                        Err(par_err)
+                    } else {
+                        Err(database_error_500(err))
+                    }
+                }
+            },
             Err(e) => match e {
                 AcceptTxError::SequencerOverloaded503 => Err(sequencer_overloaded_503()),
                 AcceptTxError::NotFullySynced(details) => {

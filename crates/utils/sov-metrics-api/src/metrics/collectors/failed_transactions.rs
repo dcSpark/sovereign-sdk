@@ -42,22 +42,18 @@ impl MetricCollector for FailedTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let total_paginator = Entity::find()
+            let total_transactions = Entity::find()
                 .filter(
                     Column::TransactionState
                         .is_in([TransactionState::Accepted, TransactionState::Rejected]),
                 )
-                .paginate(&self.db, 1);
-            let total_transactions = total_paginator
-                .num_items()
+                .count(&self.db)
                 .await
                 .with_context(|| "Failed to count completed transactions")?;
 
-            let rejected_paginator = Entity::find()
+            let failed_transactions = Entity::find()
                 .filter(Column::TransactionState.eq(TransactionState::Rejected))
-                .paginate(&self.db, 1);
-            let failed_transactions = rejected_paginator
-                .num_items()
+                .count(&self.db)
                 .await
                 .with_context(|| "Failed to count rejected transactions")?;
 

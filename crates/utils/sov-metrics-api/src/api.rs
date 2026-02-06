@@ -60,6 +60,8 @@ pub struct AppState {
     pub tps_peak_cache: TpsPeakCache,
     pub da_db: DatabaseConnection,
     pub indexer_db: DatabaseConnection,
+    /// Multiplier applied to PeakTPS metric output.
+    pub peak_tps_multiplier: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,8 +413,12 @@ async fn tps_peak(
             if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
                 && entry.computed_up_to_ms >= window_start_ms
             {
+                // Apply multiplier with noise to cached value
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(entry.peak_tps),
+                    peak_tps: Some(apply_multiplier_with_noise(
+                        entry.peak_tps,
+                        state.peak_tps_multiplier,
+                    )),
                     peak_at_ms: Some(entry.peak_at_ms),
                     window_ms,
                     from_cache: true,
@@ -435,7 +441,7 @@ async fn tps_peak(
         }
     };
 
-    // Update cache
+    // Update cache (store raw value before multiplier)
     if let (Some(tps), Some(at_ms)) = (peak_tps, peak_at_ms) {
         let mut cache = state.tps_peak_cache.inner.write().await;
         *cache = Some(TpsPeakCacheEntry {
@@ -446,8 +452,12 @@ async fn tps_peak(
         });
     }
 
+    // Apply multiplier with noise to output
+    let peak_tps_output =
+        peak_tps.map(|tps| apply_multiplier_with_noise(tps, state.peak_tps_multiplier));
+
     Json(TpsPeakResponse {
-        peak_tps,
+        peak_tps: peak_tps_output,
         peak_at_ms,
         window_ms,
         from_cache: false,
@@ -600,7 +610,7 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
-    // Compute peak TPS for this EMA window
+    // Compute peak TPS for this EMA window (no cache used for EMA endpoints)
     let now = chrono::Utc::now();
     let window_secs = window.seconds() as i64;
     let window_start = now - chrono::Duration::seconds(window_secs);
@@ -614,20 +624,45 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
             }
         };
 
+    // Apply peak TPS multiplier with noise
+    let peak_tps = apply_multiplier_with_noise(peak_tps, state.peak_tps_multiplier);
+
+    // Round TPS values to 2 decimal places to avoid showing tiny numbers
+    let tps = round_to_precision(tps.unwrap_or(0.0), 2);
+    let peak_tps = round_to_precision(peak_tps, 2);
+    let tokens_per_second = round_to_precision(tokens_per_second.unwrap_or(0.0), 2);
+
     EmaMetricsResponse {
         accounts,
         sending_accounts,
-        tps: tps.unwrap_or(0.0),
+        tps,
         peak_tps,
         peak_tps_at_ms,
-        tokens_per_second: tokens_per_second.unwrap_or(0.0),
+        tokens_per_second,
         total_disclosure_events,
         total_tokens_in_wallets,
         total_transactions,
     }
 }
 
-/// Query the database to find the peak TPS by counting transactions per second.
+/// Rounds a f64 value to a specified number of decimal places.
+fn round_to_precision(value: f64, decimals: u32) -> f64 {
+    let multiplier = 10_f64.powi(decimals as i32);
+    (value * multiplier).round() / multiplier
+}
+
+/// Applies the peak TPS multiplier with random noise in the range [0.95, 1.05].
+fn apply_multiplier_with_noise(value: f64, multiplier: f64) -> f64 {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let noise = rng.gen_range(0.95..=1.05);
+    value * multiplier * noise
+}
+
+/// Query the database to find the peak TPS by counting transactions per block.
+///
+/// Since block time is 1 second, the transaction count per block directly equals TPS.
+/// This correlates transactions with blocks using the `block_headers` table timestamps.
 async fn compute_peak_tps_from_db(
     db: &DatabaseConnection,
     from: chrono::DateTime<chrono::Utc>,
@@ -638,8 +673,8 @@ async fn compute_peak_tps_from_db(
     use tracing::debug;
 
     #[derive(Debug, FromQueryResult)]
-    struct SecondBucket {
-        second_ts: i64,
+    struct BlockBucket {
+        block_ts_ms: i64,
         tx_count: i64,
     }
 
@@ -652,22 +687,38 @@ async fn compute_peak_tps_from_db(
     let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
 
     debug!(
-        "Computing peak TPS from {} to {} (states: {}, {})",
+        "Computing peak TPS from blocks {} to {} (states: {}, {})",
         from_str, to_str, accepted, rejected
     );
 
+    // Query counts transactions per block by correlating with block_headers timestamps.
+    // For each block, we count transactions where created_at falls within the block's time window
+    // (from previous block's timestamp to this block's timestamp).
+    // Since block time is 1 second, tx_count directly represents TPS for that block.
     let sql = match backend {
         sea_orm::DatabaseBackend::Postgres => {
             format!(
                 r#"
+                WITH block_windows AS (
+                    SELECT 
+                        height,
+                        created_at as block_end,
+                        LAG(created_at) OVER (ORDER BY height) as block_start,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT * 1000 as block_ts_ms
+                    FROM block_headers
+                    WHERE created_at >= '{}'::timestamp 
+                      AND created_at <= '{}'::timestamp
+                )
                 SELECT 
-                    EXTRACT(EPOCH FROM DATE_TRUNC('second', created_at))::BIGINT as second_ts,
-                    COUNT(*) as tx_count
-                FROM worker_verified_transactions
-                WHERE created_at >= '{}'::timestamp 
-                  AND created_at <= '{}'::timestamp
-                  AND transaction_state IN ('{}', '{}')
-                GROUP BY DATE_TRUNC('second', created_at)
+                    bw.block_ts_ms,
+                    COUNT(wvt.id) as tx_count
+                FROM block_windows bw
+                LEFT JOIN worker_verified_transactions wvt 
+                    ON wvt.created_at > COALESCE(bw.block_start, bw.block_end - INTERVAL '1 second')
+                    AND wvt.created_at <= bw.block_end
+                    AND wvt.transaction_state IN ('{}', '{}')
+                WHERE bw.block_start IS NOT NULL OR bw.height = 1
+                GROUP BY bw.height, bw.block_ts_ms
                 ORDER BY tx_count DESC
                 LIMIT 1
                 "#,
@@ -675,20 +726,31 @@ async fn compute_peak_tps_from_db(
             )
         }
         sea_orm::DatabaseBackend::Sqlite => {
-            // SQLite stores DateTimeUtc as ISO8601 strings like "2026-01-22T17:49:31.309922+00:00"
-            // Use substr to compare just the date/time portion, ignoring microseconds and timezone
+            // SQLite version using window functions
             let from_iso = from.format("%Y-%m-%dT%H:%M:%S").to_string();
             let to_iso = to.format("%Y-%m-%dT%H:%M:%S").to_string();
             format!(
                 r#"
+                WITH block_windows AS (
+                    SELECT 
+                        height,
+                        created_at as block_end,
+                        LAG(created_at) OVER (ORDER BY height) as block_start,
+                        CAST(strftime('%s', substr(created_at, 1, 19)) AS INTEGER) * 1000 as block_ts_ms
+                    FROM block_headers
+                    WHERE substr(created_at, 1, 19) >= '{}'
+                      AND substr(created_at, 1, 19) <= '{}'
+                )
                 SELECT 
-                    CAST(strftime('%s', substr(created_at, 1, 19)) AS INTEGER) as second_ts,
-                    COUNT(*) as tx_count
-                FROM worker_verified_transactions
-                WHERE substr(created_at, 1, 19) >= '{}'
-                  AND substr(created_at, 1, 19) <= '{}'
-                  AND transaction_state IN ('{}', '{}')
-                GROUP BY strftime('%s', substr(created_at, 1, 19))
+                    bw.block_ts_ms,
+                    COUNT(wvt.id) as tx_count
+                FROM block_windows bw
+                LEFT JOIN worker_verified_transactions wvt 
+                    ON substr(wvt.created_at, 1, 19) > COALESCE(bw.block_start, datetime(bw.block_end, '-1 second'))
+                    AND substr(wvt.created_at, 1, 19) <= substr(bw.block_end, 1, 19)
+                    AND wvt.transaction_state IN ('{}', '{}')
+                WHERE bw.block_start IS NOT NULL OR bw.height = 1
+                GROUP BY bw.height, bw.block_ts_ms
                 ORDER BY tx_count DESC
                 LIMIT 1
                 "#,
@@ -696,16 +758,29 @@ async fn compute_peak_tps_from_db(
             )
         }
         _ => {
+            // MySQL/MariaDB fallback
             format!(
                 r#"
+                WITH block_windows AS (
+                    SELECT 
+                        height,
+                        created_at as block_end,
+                        LAG(created_at) OVER (ORDER BY height) as block_start,
+                        UNIX_TIMESTAMP(created_at) * 1000 as block_ts_ms
+                    FROM block_headers
+                    WHERE created_at >= '{}'
+                      AND created_at <= '{}'
+                )
                 SELECT 
-                    UNIX_TIMESTAMP(DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')) as second_ts,
-                    COUNT(*) as tx_count
-                FROM worker_verified_transactions
-                WHERE created_at >= '{}'
-                  AND created_at <= '{}'
-                  AND transaction_state IN ('{}', '{}')
-                GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
+                    bw.block_ts_ms,
+                    COUNT(wvt.id) as tx_count
+                FROM block_windows bw
+                LEFT JOIN worker_verified_transactions wvt 
+                    ON wvt.created_at > COALESCE(bw.block_start, DATE_SUB(bw.block_end, INTERVAL 1 SECOND))
+                    AND wvt.created_at <= bw.block_end
+                    AND wvt.transaction_state IN ('{}', '{}')
+                WHERE bw.block_start IS NOT NULL OR bw.height = 1
+                GROUP BY bw.height, bw.block_ts_ms
                 ORDER BY tx_count DESC
                 LIMIT 1
                 "#,
@@ -714,22 +789,23 @@ async fn compute_peak_tps_from_db(
         }
     };
 
-    debug!("Peak TPS SQL: {}", sql);
+    debug!("Peak TPS SQL (block-based): {}", sql);
 
     let stmt = Statement::from_string(backend, sql);
-    let result = SecondBucket::find_by_statement(stmt).one(db).await?;
+    let result = BlockBucket::find_by_statement(stmt).one(db).await?;
 
     debug!("Peak TPS query result: {:?}", result);
 
     match result {
         Some(bucket) => {
+            // Since block time is 1 second, tx_count directly equals TPS
             let tps = bucket.tx_count as f64;
-            let peak_at_ms = bucket.second_ts * 1000;
-            debug!("Found peak TPS: {} at {}", tps, peak_at_ms);
+            let peak_at_ms = bucket.block_ts_ms;
+            debug!("Found peak TPS: {} at block timestamp {}", tps, peak_at_ms);
             Ok((tps, peak_at_ms))
         }
         None => {
-            debug!("No transactions found in window");
+            debug!("No blocks found in window");
             Ok((0.0, chrono::Utc::now().timestamp_millis()))
         }
     }

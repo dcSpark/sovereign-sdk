@@ -92,21 +92,20 @@ struct ProverServiceRequest {
     /// Optional packing size (defaults to 8192 on server)
     #[serde(skip_serializing_if = "Option::is_none")]
     packing: Option<u32>,
-}
-
-/// Response body from prover service.
-#[derive(Clone, serde::Deserialize)]
-struct ProverServiceResponse {
-    success: bool,
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
-    proof: Option<String>,
-    error: Option<String>,
+    /// Request binary proof response (`application/octet-stream`) from /prove.
+    #[serde(default)]
+    binary: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
     num_wallets: usize,
+    /// Start loading wallets from this genesis keypair index (defaults to 0).
+    wallet_offset: usize,
+    /// Re-sync wallet generation from chain at the start of each cycle.
+    resync_nonces_each_cycle: bool,
+    /// Timeout (seconds) while waiting for submitted transfers to appear in ledger.
+    ledger_inclusion_timeout_secs: u64,
     initial_deposit: bool,
     /// Amount to deposit initially into each wallet.
     deposit_amount: u128,
@@ -116,7 +115,7 @@ struct ContinuousConfig {
     cycle_delay_ms: u64,
     external_node_url: Option<String>,
     external_verifier_url: Option<String>,
-    /// Optional URL of the prover service (e.g., http://127.0.0.1:1313).
+    /// Optional URL of the prover service (e.g., http://127.0.0.1:8080).
     /// When set, proofs are generated via HTTP calls to this service instead of
     /// the local daemon pool. This allows offloading proving to a remote GPU server.
     prover_service_url: Option<String>,
@@ -135,6 +134,22 @@ impl ContinuousConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0usize);
+
+        let wallet_offset = std::env::var("WALLET_OFFSET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0usize);
+
+        let resync_nonces_each_cycle = std::env::var("RESYNC_NONCES_EACH_CYCLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        let ledger_inclusion_timeout_secs = std::env::var("LEDGER_INCLUSION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15)
+            .max(1);
 
         let initial_deposit = std::env::var("INITIAL_DEPOSIT")
             .ok()
@@ -179,12 +194,12 @@ impl ContinuousConfig {
             .ok()
             .or_else(|| Some("http://localhost:8080".to_string()));
 
-        // Prover service URL for remote proving (defaults to http://127.0.0.1:1313).
+        // Prover service URL for remote proving (defaults to http://127.0.0.1:8080).
         // Set PROVER_SERVICE_URL="" to use local daemon pool instead.
         let prover_service_url = std::env::var("PROVER_SERVICE_URL")
             .ok()
             .map(|v| if v.is_empty() { None } else { Some(v) })
-            .unwrap_or_else(|| Some("http://127.0.0.1:1313".to_string()));
+            .unwrap_or_else(|| Some("http://127.0.0.1:8080".to_string()));
 
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()
@@ -211,6 +226,9 @@ impl ContinuousConfig {
 
         Ok(Self {
             num_wallets,
+            wallet_offset,
+            resync_nonces_each_cycle,
+            ledger_inclusion_timeout_secs,
             initial_deposit,
             deposit_amount,
             transfer_amount,
@@ -552,8 +570,9 @@ fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()>
     eprintln!("{}", prompt);
 
     if config.continuous {
-        // In continuous mode, just sleep for cycle_delay_ms instead of waiting for user input
-        std::thread::sleep(Duration::from_millis(config.cycle_delay_ms));
+        // In continuous mode, do not block here.
+        // Pacing is handled once at the end of each cycle.
+        return Ok(());
     } else {
         eprint!("Press Enter to continue...");
         std::io::stdout().flush().ok();
@@ -601,8 +620,11 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
         config.num_wallets,
+        config.wallet_offset,
+        config.resync_nonces_each_cycle,
+        config.ledger_inclusion_timeout_secs,
         config.initial_deposit,
         config.deposit_amount,
         config.transfer_amount,
@@ -740,32 +762,44 @@ pub async fn run() -> Result<()> {
         serde_json::from_str(&keypairs_json)
             .with_context(|| "Failed to parse generated_keypairs.json")?;
 
-    if all_keypairs.len() < config.num_wallets {
+    let required_keypairs = config
+        .wallet_offset
+        .checked_add(config.num_wallets)
+        .ok_or_else(|| anyhow!("wallet_offset + num_wallets overflowed usize"))?;
+
+    if all_keypairs.len() < required_keypairs {
         bail!(
-            "Not enough keypairs in genesis file. Need {}, but only {} available.",
+            "Not enough keypairs in genesis file. Need {} keypairs to satisfy WALLET_OFFSET={} and CONTINUOUS_NUM_WALLETS={}, but only {} available.",
+            required_keypairs,
+            config.wallet_offset,
             config.num_wallets,
             all_keypairs.len()
         );
     }
+    eprintln!(
+        "[config] keypair_index_range=[{}..{})",
+        config.wallet_offset, required_keypairs
+    );
 
     let node_base_url = node_url.clone();
     let wallet_setup_start = Instant::now();
     let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
     for i in 0..config.num_wallets {
-        let account = all_keypairs[i].clone();
+        let keypair_idx = config.wallet_offset + i;
+        let account = all_keypairs[keypair_idx].clone();
         let nonce = fetch_initial_nonce(&http, &node_base_url, &account)
             .await
             .with_context(|| {
                 format!(
-                    "Failed to fetch latest nonce/generation for wallet {} (address={})",
-                    i, account.address
+                    "Failed to fetch latest nonce/generation for wallet {} (keypair_idx={}, address={})",
+                    i, keypair_idx, account.address
                 )
             })?;
 
         if config.detailed_wallet_logs {
             eprintln!(
-                "[setup] wallet {} address={} starting_nonce={}",
-                i, account.address, nonce
+                "[setup] wallet {} (keypair_idx={}) address={} starting_nonce={}",
+                i, keypair_idx, account.address, nonce
             );
         }
 
@@ -914,6 +948,7 @@ pub async fn run() -> Result<()> {
             res = perform_transfer_cycle(
                 &client,
                 &http,
+                &node_url,
                 &mut wallets,
                 &chain_hash,
                 &program_path,
@@ -1307,6 +1342,45 @@ async fn fetch_initial_nonce(
     Ok(body.generation.unwrap_or(0))
 }
 
+async fn resync_wallet_nonces(
+    http: &HttpClient,
+    node_url: &str,
+    wallets: &mut [WalletState],
+    detailed_wallet_logs: bool,
+) -> Result<()> {
+    let mut updated = 0usize;
+    for (idx, wallet) in wallets.iter_mut().enumerate() {
+        let latest_generation = fetch_initial_nonce(http, node_url, &wallet.account)
+            .await
+            .with_context(|| format!("Failed to refresh generation for wallet {}", idx))?;
+        if latest_generation > wallet.nonce {
+            if detailed_wallet_logs {
+                eprintln!(
+                    "[nonce-sync] wallet {} generation advanced {} -> {}",
+                    idx, wallet.nonce, latest_generation
+                );
+            }
+            wallet.nonce = latest_generation;
+            updated += 1;
+        } else if detailed_wallet_logs && latest_generation < wallet.nonce {
+            eprintln!(
+                "[nonce-sync] wallet {} local generation {} ahead of chain {} (keeping local)",
+                idx, wallet.nonce, latest_generation
+            );
+        }
+    }
+
+    if updated > 0 || detailed_wallet_logs {
+        eprintln!(
+            "[nonce-sync] refreshed {} wallet generation(s) out of {}",
+            updated,
+            wallets.len()
+        );
+    }
+
+    Ok(())
+}
+
 async fn wait_for_sequencer_ready(
     http: &HttpClient,
     node_url: &str,
@@ -1334,6 +1408,7 @@ async fn wait_for_sequencer_ready(
 async fn perform_transfer_cycle(
     client: &NodeClient,
     http: &HttpClient,
+    node_url: &str,
     wallets: &mut [WalletState],
     chain_hash: &[u8; 32],
     program_path: &str,
@@ -1345,6 +1420,10 @@ async fn perform_transfer_cycle(
     cached_root: &mut Option<Hash32>,
     cached_pos_by_cm: &mut HashMap<[u8; 32], u64>,
 ) -> Result<CycleSummary> {
+    if config.resync_nonces_each_cycle {
+        resync_wallet_nonces(http, node_url, wallets, config.detailed_wallet_logs).await?;
+    }
+
     // Fetch tree state incrementally; reuse cached tree when possible to avoid O(n) rebuilds.
     let tree_rebuild_phase_start = Instant::now();
     let mut attempts_made = 0;
@@ -2149,6 +2228,7 @@ async fn perform_transfer_cycle(
                             proof: None,
                             private_indices: private_indices.clone(),
                             packing: Some(cfg.packing),
+                            binary: true,
                         };
 
                         // Retry logic for transient failures (timeouts, connection errors)
@@ -2156,32 +2236,36 @@ async fn perform_transfer_cycle(
                         const RETRY_DELAY_MS: u64 = 2000;
 
                         let mut last_error: Option<anyhow::Error> = None;
-                        let mut body: Option<ProverServiceResponse> = None;
+                        let mut proof_bytes: Option<Vec<u8>> = None;
 
                         for attempt in 1..=MAX_RETRIES {
                             match blocking_client.post(&url).json(&request).send() {
                                 Ok(resp) => {
                                     let status = resp.status();
-                                    match resp.json::<ProverServiceResponse>() {
-                                        Ok(parsed) => {
-                                            if !status.is_success() || !parsed.success {
-                                                last_error = Some(anyhow::anyhow!(
-                                                    "Prover service returned error (status={}, exit_code={}): {}",
-                                                    status,
-                                                    parsed.exit_code,
-                                                    parsed.error.clone().unwrap_or_else(|| "unknown error".to_string())
-                                                ));
-                                                // Don't retry on application-level errors
-                                                body = Some(parsed);
-                                                break;
-                                            }
-                                            body = Some(parsed);
+                                    if !status.is_success() {
+                                        let err_body = resp
+                                            .text()
+                                            .unwrap_or_else(|_| "<failed to read error body>".to_string());
+                                        last_error = Some(anyhow::anyhow!(
+                                            "Prover service returned error (status={}): {}",
+                                            status,
+                                            err_body
+                                        ));
+                                        // Don't retry on application-level errors
+                                        break;
+                                    }
+                                    match resp.bytes() {
+                                        Ok(bytes) => {
+                                            proof_bytes = Some(bytes.to_vec());
                                             last_error = None;
                                             break;
                                         }
                                         Err(e) => {
-                                            last_error = Some(anyhow::anyhow!("Failed to parse prover service response: {}", e));
-                                            // Don't retry parse errors
+                                            last_error = Some(anyhow::anyhow!(
+                                                "Failed to read binary prover service response: {}",
+                                                e
+                                            ));
+                                            // Don't retry parse/read errors
                                             break;
                                         }
                                     }
@@ -2206,15 +2290,8 @@ async fn perform_transfer_cycle(
                             return Err(err);
                         }
 
-                        let body = body.ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
-
-                        let proof_b64 = body
-                            .proof
-                            .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
-
-                        let proof_bytes = BASE64_STANDARD
-                            .decode(&proof_b64)
-                            .context("Failed to decode base64 proof from prover service")?;
+                        let proof_bytes = proof_bytes
+                            .ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
 
                         let args_json = serde_json::to_vec(&args)?;
                         let pkg = ligero_runner::LigeroProofPackage::new(
@@ -2369,6 +2446,18 @@ async fn perform_transfer_cycle(
         spent_rhos: Vec<Hash32>,
         pay_note: NoteState,
         change_note: Option<NoteState>,
+    }
+
+    #[derive(Debug)]
+    struct PendingWalletUpdate {
+        sender_idx: usize,
+        dest_idx: usize,
+        new_nonce: u64,
+        spent_rhos: Vec<Hash32>,
+        pay_note: NoteState,
+        change_note: Option<NoteState>,
+        cm_pay: Hash32,
+        cm_change: Option<Hash32>,
     }
 
     let mut build_tasks = Vec::with_capacity(proofs.len());
@@ -2566,12 +2655,13 @@ async fn perform_transfer_cycle(
     }
     built.sort_by_key(|b| b.idx);
 
-    let mut expected_output_commitments: Vec<Hash32> = Vec::new();
+    let mut pending_updates_by_hash: HashMap<String, PendingWalletUpdate> =
+        HashMap::with_capacity(built.len());
     for b in built {
-        transfer_hashes.push(b.tx_hash);
+        let tx_hash = b.tx_hash.clone();
+        transfer_hashes.push(tx_hash.clone());
         transfer_txs_b64.push((b.sender_idx, b.tx_b64));
 
-        // Track expected output commitments so the next cycle can find them in the tree.
         let pay_value_u64: u64 = b
             .pay_note
             .value
@@ -2588,9 +2678,8 @@ async fn perform_transfer_cycle(
             &pay_recipient,
             &b.pay_note.sender_id,
         );
-        expected_output_commitments.push(cm_pay);
 
-        if let Some(ref change) = b.change_note {
+        let cm_change = if let Some(ref change) = b.change_note {
             let change_value_u64: u64 = change
                 .value
                 .try_into()
@@ -2606,22 +2695,24 @@ async fn perform_transfer_cycle(
                 &change_recipient,
                 &change.sender_id,
             );
-            expected_output_commitments.push(cm_change);
-        }
+            Some(cm_change)
+        } else {
+            None
+        };
 
-        // Update sender wallet: consume inputs and add change (if any).
-        {
-            let w = &mut wallets[b.sender_idx];
-            w.nonce = b.new_nonce;
-            let spent: HashSet<Hash32> = b.spent_rhos.iter().copied().collect();
-            w.notes.retain(|n| !spent.contains(&n.rho));
-            if let Some(change) = b.change_note {
-                w.notes.push(change);
-            }
-        }
-
-        // Update destination wallet: add the pay note.
-        wallets[b.dest_idx].notes.push(b.pay_note);
+        pending_updates_by_hash.insert(
+            tx_hash,
+            PendingWalletUpdate {
+                sender_idx: b.sender_idx,
+                dest_idx: b.dest_idx,
+                new_nonce: b.new_nonce,
+                spent_rhos: b.spent_rhos,
+                pay_note: b.pay_note,
+                change_note: b.change_note,
+                cm_pay,
+                cm_change,
+            },
+        );
     }
     let transfer_txs_ms = transfer_txs_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -2775,7 +2866,10 @@ async fn perform_transfer_cycle(
         transfer_submit_ms / transfer_hashes.len() as f64
     );
     // Interactive gate before flushing to the sequencer.
-    wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+    // In continuous mode, skip this pause to reduce anchor staleness.
+    if !config.continuous {
+        wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+    }
     let flush_start = Instant::now();
     let resp = http
         .post(format!("{}/midnight-privacy/flush", verifier_url))
@@ -2851,8 +2945,21 @@ async fn perform_transfer_cycle(
     // Track per-tx sequencer times and breakdown for this cycle
     let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
     let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
+    let mut rejected_by_hash: HashMap<String, String> = HashMap::new();
+    let mut anchor_rejects = 0usize;
     for entry in flush.results {
         if let Some(hash) = entry.tx_hash {
+            if !entry.accepted {
+                let reason = entry
+                    .error
+                    .clone()
+                    .or_else(|| entry.response.as_ref().map(|v| v.to_string()))
+                    .unwrap_or_else(|| "unknown rejection".to_string());
+                if reason.to_ascii_lowercase().contains("invalid anchor root") {
+                    anchor_rejects += 1;
+                }
+                rejected_by_hash.insert(hash.clone(), reason);
+            }
             if let Some(b) = entry.sequencer_breakdown {
                 let total_ms = b.total_ms.unwrap_or(0.0);
                 let decode_ms = b.decode_ms.unwrap_or(0.0);
@@ -2885,11 +2992,23 @@ async fn perform_transfer_cycle(
             }
         }
     }
+    if !rejected_by_hash.is_empty() {
+        eprintln!(
+            "[cycle] sequencer rejected {} transfer(s) during flush{}",
+            rejected_by_hash.len(),
+            if anchor_rejects > 0 {
+                format!(" (invalid_anchor_root={})", anchor_rejects)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     // After flush, verify inclusion and collect per-batch statistics and timing
     let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
     let mut num_included = 0usize;
     let num_transfers = transfer_hashes.len();
+    let mut included_hashes: Vec<String> = Vec::new();
     let mut first_included_at: Option<Instant> = None;
     let mut last_included_at: Option<Instant> = None;
     let mut first_included_wall: Option<SystemTime> = None;
@@ -2911,7 +3030,17 @@ async fn perform_transfer_cycle(
     let mut seq_stf_sum_ms = 0.0f64;
 
     for hash_hex in &transfer_hashes {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        if let Some(reason) = rejected_by_hash.get(hash_hex) {
+            if config.detailed_wallet_logs {
+                eprintln!(
+                    "[cycle] transfer {} rejected before inclusion: {}",
+                    hash_hex, reason
+                );
+            }
+            continue;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(config.ledger_inclusion_timeout_secs);
         loop {
             match client
                 .query_rest_endpoint::<api_types::LedgerTx>(&format!(
@@ -2921,12 +3050,13 @@ async fn perform_transfer_cycle(
                 .await
             {
                 Ok(ltx) => {
-                    anyhow::ensure!(
-                        ltx.receipt.result == api_types::TxReceiptResult::Successful,
-                        "Transfer {} included but not successful: {:?}",
-                        hash_hex,
-                        ltx.receipt
-                    );
+                    if ltx.receipt.result != api_types::TxReceiptResult::Successful {
+                        eprintln!(
+                            "[cycle] transfer {} included but not successful: {:?}",
+                            hash_hex, ltx.receipt
+                        );
+                        break;
+                    }
                     let now_instant = Instant::now();
                     let now_wall = SystemTime::now();
                     let batch_number = ltx.batch_number;
@@ -2940,13 +3070,14 @@ async fn perform_transfer_cycle(
                     last_batch_number = Some(batch_number);
                     *batches.entry(batch_number).or_insert(0) += 1;
                     num_included += 1;
+                    included_hashes.push(hash_hex.clone());
                     break;
                 }
                 Err(_) => {
                     if Instant::now() > deadline {
                         eprintln!(
-                            "[cycle] Timeout waiting for transfer {} to appear in ledger",
-                            hash_hex
+                            "[cycle] Timeout waiting for transfer {} to appear in ledger ({}s)",
+                            hash_hex, config.ledger_inclusion_timeout_secs
                         );
                         break;
                     }
@@ -2954,6 +3085,39 @@ async fn perform_transfer_cycle(
                 }
             }
         }
+    }
+
+    // Apply wallet changes only for transfers that were actually included successfully.
+    let mut expected_output_commitments: Vec<Hash32> = Vec::new();
+    for hash in &included_hashes {
+        let Some(update) = pending_updates_by_hash.remove(hash) else {
+            continue;
+        };
+
+        {
+            let w = &mut wallets[update.sender_idx];
+            if update.new_nonce > w.nonce {
+                w.nonce = update.new_nonce;
+            }
+            let spent: HashSet<Hash32> = update.spent_rhos.iter().copied().collect();
+            w.notes.retain(|n| !spent.contains(&n.rho));
+            if let Some(change) = update.change_note {
+                w.notes.push(change);
+            }
+        }
+        wallets[update.dest_idx].notes.push(update.pay_note);
+        expected_output_commitments.push(update.cm_pay);
+        if let Some(cm_change) = update.cm_change {
+            expected_output_commitments.push(cm_change);
+        }
+    }
+
+    let rejected_or_not_included = num_transfers.saturating_sub(num_included);
+    if rejected_or_not_included > 0 {
+        eprintln!(
+            "[cycle] {} / {} transfer(s) were not included and were left unapplied locally",
+            rejected_or_not_included, num_transfers
+        );
     }
 
     // Summarize when the first and last txs were observed in the ledger.

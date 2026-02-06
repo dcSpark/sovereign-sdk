@@ -1,9 +1,9 @@
 # Rollup Ligero Services (Linux)
 
 This directory contains systemd unit files for running the Sovereign SDK
-rollup demo, its Ligero proof verifier, the Ligero prover service, the indexer,
-the MCP external server, the service controller, and the continuous transfers
-load generator as background services on Linux.
+rollup demo, its Ligero proof verifier, the indexer, the MCP external server,
+the service controller, and the continuous transfers load generator as
+background services on Linux.
 
 ## Prerequisites
 - A Linux host with `systemd`
@@ -20,7 +20,6 @@ load generator as background services on Linux.
    ```bash
    sudo cp rollup-ligero.service /etc/systemd/system/
    sudo cp rollup-ligero-verifier.service /etc/systemd/system/
-   sudo cp rollup-ligero-prover.service /etc/systemd/system/
    sudo cp rollup-ligero-indexer.service /etc/systemd/system/
    sudo cp rollup-ligero-continuous-transfers.service /etc/systemd/system/
    sudo cp rollup-ligero-mcp.service /etc/systemd/system/
@@ -34,7 +33,6 @@ load generator as background services on Linux.
    ```bash
    sudo systemctl enable --now rollup-ligero.service
    sudo systemctl enable --now rollup-ligero-verifier.service
-   sudo systemctl enable --now rollup-ligero-prover.service
    sudo systemctl enable --now rollup-ligero-indexer.service
    sudo systemctl enable --now rollup-ligero-continuous-transfers.service
    sudo systemctl enable --now rollup-ligero-mcp.service
@@ -54,14 +52,6 @@ load generator as background services on Linux.
 - The verifier service wraps `run_verifier_service.sh`, which builds and runs
   `sov-proof-verifier-service`. Adjust environment variables inside the script
   (or in the unit file) if you need non-default Ligero settings.
-- The prover service wraps `run_prover.sh`, which builds and runs the
-  `ligero-http-server` binary from the ligero-prover git dependency. It provides
-  HTTP endpoints for ZK proof generation (`POST /prove`) and verification
-  (`POST /verify`). Configure via environment variables:
-  - `PROVER_BIND_ADDR`: Bind address (default: `0.0.0.0:1313`)
-  - `PROVER_THREADS`: Number of HTTP worker threads (default: CPU count)
-  - `PROVER_PROOF_OUTPUTS`: Directory for proof outputs
-  - `PROVER_KEEP_PROOF_DIRS`: Set to `1` to keep proof directories for debugging
 - The indexer service runs `cargo run -p sov-indexer --release` from
   `crates/utils/sov-indexer` and loads `.env` via `EnvironmentFile=`. Ensure
   `DA_CONNECTION_STRING` points to your rollup DA SQLite DB
@@ -82,9 +72,17 @@ load generator as background services on Linux.
   - `POST /stop`: Stop all running services
   - `POST /restart`: Restart all services
   - `POST /clean`: Remove the `demo_data` directory
-  - `GET /health`: Check health of all services (rollup, verifier, indexer, mcp, prover, fvk)
+  - `POST /clean-database`: Drop all tables with `CASCADE` from `da`, `indexer`, `fvk`, `mcp_sessions`
+  - `POST /reset-tee`: Trigger TEE reset on the configured upstream endpoint
+  - `GET /health`: Check health of all services (rollup, worker, indexer, mcp, fvk)
+  - Note: `clean`, `clean-database`, and `reset-tee` require all managed services to be stopped
   Configure via environment variables:
   - `SERVICE_CONTROLLER_BIND`: Bind address (default: `127.0.0.1:9090`)
   - `SERVICE_CONTROLLER_AUTO_START`: Set to `1` to auto-start all services when the controller starts
+  - `DA_CONNECTION_STRING`: PostgreSQL base connection string used by `/clean-database`
+  - `TEE_RESET_URL`: TEE reset endpoint URL (default: `http://74.235.106.62:9898/reset`)
+  - `TEE_RESET_BEARER_TOKEN`: Bearer token for `TEE_RESET_URL` (`TEE_RESET_TOKEN` alias also supported)
+  - `SERVICE_<SERVICE>_REMOTE`: Set to `1` to mark a service as remote (example: `SERVICE_WORKER_REMOTE=1`)
+  - `SERVICE_<SERVICE>_URL`: Override health endpoint URL for that service (example: `SERVICE_WORKER_URL=http://remote-host:8080`)
 - Ensure that all services run under a user with permission to access the
   workspace and required key material.

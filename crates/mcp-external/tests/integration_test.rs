@@ -5,7 +5,7 @@
 //! Make sure all services are running before executing these tests.
 //! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL, PRIVPOOL_SPEND_KEY)
 //! should be set in .env (INDEXER_URL is optional, defaults to http://localhost:13100).
-//! Proof tests also require LIGERO_PROOF_SERVICE_URL (defaults to http://127.0.0.1:1313).
+//! Proof tests also require LIGERO_PROOF_SERVICE_URL (defaults to http://127.0.0.1:8080).
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
@@ -31,7 +31,7 @@ fn create_test_ligero() -> Option<Ligero> {
     let program =
         std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
     let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
     if program.trim().is_empty() || proof_service_url.trim().is_empty() {
         return None;
@@ -98,7 +98,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
     let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let privpool_spend_key = std::env::var("PRIVPOOL_SPEND_KEY")
         .expect("PRIVPOOL_SPEND_KEY must be set in .env (hex or privpool1... address)");
 
@@ -361,7 +361,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
     let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:1313".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let startup_deposit_amount = 1000u128; // Test deposit amount
 
     assert!(

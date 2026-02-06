@@ -68,10 +68,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     defer_submission: bool,
 
-    /// URL of the ligero-http-server prover/verifier service for remote proof verification.
-    /// When set, proofs will be verified via REST calls instead of local daemon processes.
-    /// Default: http://localhost:1313
-    #[arg(long, default_value = "http://localhost:1313")]
+    /// Optional URL of a remote ligero-http-server prover/verifier service.
+    /// When set, internal proof verification routes to this URL.
+    /// When omitted, the service uses local in-process daemon pools.
+    #[arg(long)]
     prover_service_url: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
@@ -201,6 +201,8 @@ async fn main() -> Result<()> {
     info!("📝 Endpoints:");
     info!("  POST {}/value-setter-zk", args.bind);
     info!("  POST {}/midnight-privacy", args.bind);
+    info!("  POST {}/prove", args.bind);
+    info!("  POST {}/verify", args.bind);
     info!("  GET  {}/health", args.bind);
 
     // Use the Axum server API

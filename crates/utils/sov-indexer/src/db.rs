@@ -987,307 +987,288 @@ pub async fn list_wallet_txs(
     let mut withdraw_matches = 0u64;
     let mut transfer_matches = 0u64;
 
-    // Deposits by sender OR recipient
-    debug!(
-        "Fetching midnight_deposit records for sender or recipient={}",
-        normalized_address
-    );
-    let deposit_filter = if should_scan_privacy {
-        Condition::any()
-            .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
-            .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
-            .add(
-                Condition::all()
-                    .add(idx::midnight_deposit::Column::Recipient.is_null())
-                    .add(idx::midnight_deposit::Column::EncryptedNotes.is_not_null()),
-            )
-    } else {
-        Condition::any()
-            .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
-            .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
-    };
-    let deps = idx::midnight_deposit::Entity::find()
-        .filter(deposit_filter)
-        .all(db)
-        .await?;
-    debug!("Got {} midnight_deposit records", deps.len());
-
-    for md in deps.iter() {
-        trace!("Processing deposit event_id {}", md.event_id);
-        let Some(ev) = idx::Entity::find_by_id(md.event_id).one(db).await? else {
-            trace!("Deposit event id {} not found in idx::Entity", md.event_id);
-            continue;
-        };
-        let decrypted_notes = resolve_decrypted_notes(vfk, md.encrypted_notes.as_ref());
-        let privacy_recipient = md
-            .recipient
-            .clone()
-            .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
-        let matches = if address_is_privacy {
-            privacy_recipient.as_deref() == Some(normalized_address.as_str())
-                || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address)
-        } else {
-            md.sender.as_deref() == Some(address)
-        };
-        if matches {
-            deposit_matches += 1;
-        }
-        if !matches {
-            continue;
-        }
-        if let Some(ref cur) = cursor {
-            if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                trace!(
-                    "Deposit {} not after cursor (ts={}, tx_hash={}), skipping",
-                    ev.tx_hash,
-                    ev.created_at.timestamp_millis(),
-                    ev.tx_hash
-                );
-                continue;
-            }
-        }
-        if let Some(ref t) = type_filter {
-            if t != "deposit" {
-                trace!(
-                    "Deposit {} filtered out by type (expected deposit, got {})",
-                    ev.tx_hash,
-                    t
-                );
-                continue;
-            }
-        }
+    if type_filter.is_none() || type_filter.as_deref() == Some("deposit") {
+        // Deposits by sender OR recipient
         debug!(
-            "Adding deposit involvement item for tx_hash={} event_id={}",
-            ev.tx_hash, md.event_id
+            "Fetching midnight_deposit records for sender or recipient={}",
+            normalized_address
         );
-        collected.push(InvolvementItem {
-            tx_hash: ev.tx_hash.clone(),
-            timestamp_ms: ev.created_at.timestamp_millis(),
-            kind: ev.kind.clone(),
-            sender: md.sender.clone(),
-            recipient: privacy_recipient.clone(),
-            privacy_sender: None,
-            privacy_recipient,
-            amount: md.amount.clone(),
-            anchor_root: None,
-            nullifier: None,
-            view_fvks: md.view_fvks.clone(),
-            view_attestations: None,
-            events: ev.events.clone(),
-            status: ev.status.clone(),
-            encrypted_notes: if include_encrypted {
-                md.encrypted_notes.clone()
-            } else {
-                None
-            },
-            decrypted_notes,
-            payload: serde_json::from_str(&ev.payload).ok(),
-        });
-    }
-
-    // Withdrawals by sender or recipient
-    debug!(
-        "Fetching midnight_withdraw records for sender or recipient={}",
-        address
-    );
-    let mut withdraw_filter = Condition::any()
-        .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
-        .add(idx::midnight_withdraw::Column::ToAddr.eq(address.to_string()));
-    if address_is_privacy {
-        withdraw_filter = withdraw_filter
-            .add(idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()));
-        if should_scan_privacy {
-            withdraw_filter = withdraw_filter.add(
-                Condition::all()
-                    .add(idx::midnight_withdraw::Column::PrivacySender.is_null())
-                    .add(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null()),
-            );
-        }
-    }
-    let wds = idx::midnight_withdraw::Entity::find()
-        .filter(withdraw_filter)
-        .all(db)
-        .await?;
-    debug!("Got {} midnight_withdraw records", wds.len());
-    for mw in wds.iter() {
-        trace!("Processing withdraw event_id {}", mw.event_id);
-        let Some(ev) = idx::Entity::find_by_id(mw.event_id).one(db).await? else {
-            trace!("Withdraw event id {} not found in idx::Entity", mw.event_id);
-            continue;
-        };
-        let decrypted_notes = resolve_decrypted_notes(vfk, mw.encrypted_notes.as_ref());
-        let privacy_sender = mw
-            .privacy_sender
-            .clone()
-            .or_else(|| viewer::extract_sender_from_decrypted_notes(decrypted_notes.as_ref()));
-        let matches = if address_is_privacy {
-            privacy_sender.as_deref() == Some(normalized_address.as_str())
-        } else {
-            mw.sender.as_deref() == Some(address) || mw.to_addr.as_deref() == Some(address)
-        };
-        if matches {
-            withdraw_matches += 1;
-        }
-        if !matches {
-            continue;
-        }
-        if let Some(ref cur) = cursor {
-            if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                trace!(
-                    "Withdraw {} not after cursor (ts={}, tx_hash={}), skipping",
-                    ev.tx_hash,
-                    ev.created_at.timestamp_millis(),
-                    ev.tx_hash
-                );
-                continue;
-            }
-        }
-        if let Some(ref t) = type_filter {
-            if t != "withdraw" {
-                trace!(
-                    "Withdraw {} filtered out by type (expected withdraw, got {})",
-                    ev.tx_hash,
-                    t
-                );
-                continue;
-            }
-        }
-        debug!(
-            "Adding withdraw involvement item for tx_hash={} event_id={}",
-            ev.tx_hash, mw.event_id
-        );
-        collected.push(InvolvementItem {
-            tx_hash: ev.tx_hash.clone(),
-            timestamp_ms: ev.created_at.timestamp_millis(),
-            kind: ev.kind.clone(),
-            sender: mw.sender.clone(),
-            recipient: mw.to_addr.clone(),
-            privacy_sender,
-            privacy_recipient: None,
-            amount: mw.amount.clone(),
-            anchor_root: mw.anchor_root.clone(),
-            nullifier: mw.nullifier.clone(),
-            view_fvks: None,
-            view_attestations: mw.view_attestations.clone(),
-            events: ev.events.clone(),
-            status: ev.status.clone(),
-            encrypted_notes: if include_encrypted {
-                mw.encrypted_notes.clone()
-            } else {
-                None
-            },
-            decrypted_notes,
-            payload: serde_json::from_str(&ev.payload).ok(),
-        });
-    }
-
-    // Transfers by sender or recipient
-    debug!(
-        "Fetching midnight_transfer records for sender or recipient={}",
-        normalized_address
-    );
-    let mut transfer_filter = Condition::any()
-        .add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
-        .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
-        .add(idx::midnight_transfer::Column::PrivacySender.eq(normalized_address.clone()));
-    if should_scan_privacy {
-        transfer_filter = transfer_filter.add(
-            Condition::all()
-                .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+        let deposit_filter = if should_scan_privacy {
+            Condition::any()
+                .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+                .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
                 .add(
-                    Condition::any()
-                        .add(idx::midnight_transfer::Column::Recipient.is_null())
-                        .add(idx::midnight_transfer::Column::PrivacySender.is_null()),
-                ),
-        );
-    }
-    let tfs = idx::midnight_transfer::Entity::find()
-        .filter(transfer_filter)
-        .all(db)
-        .await?;
-    debug!("Got {} midnight_transfer records", tfs.len());
-    for mt in tfs.iter() {
-        trace!("Processing transfer event_id {}", mt.event_id);
-        let Some(ev) = idx::Entity::find_by_id(mt.event_id).one(db).await? else {
-            trace!("Transfer event id {} not found in idx::Entity", mt.event_id);
-            continue;
-        };
-        let decrypted_notes = resolve_decrypted_notes(vfk, mt.encrypted_notes.as_ref());
-        let privacy_sender = mt
-            .privacy_sender
-            .clone()
-            .or_else(|| viewer::extract_sender_from_decrypted_notes(decrypted_notes.as_ref()));
-        let privacy_recipient = mt
-            .recipient
-            .clone()
-            .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
-        let matches_recipient = privacy_recipient.as_deref() == Some(normalized_address.as_str())
-            || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
-        let matches_sender = privacy_sender.as_deref() == Some(normalized_address.as_str());
-        let matches = if address_is_privacy {
-            matches_recipient || matches_sender
+                    Condition::all()
+                        .add(idx::midnight_deposit::Column::Recipient.is_null())
+                        .add(idx::midnight_deposit::Column::EncryptedNotes.is_not_null()),
+                )
         } else {
-            mt.sender.as_deref() == Some(address)
+            Condition::any()
+                .add(idx::midnight_deposit::Column::Sender.eq(address.to_string()))
+                .add(idx::midnight_deposit::Column::Recipient.eq(normalized_address.clone()))
         };
-        if matches {
-            transfer_matches += 1;
-        }
-        if !matches {
-            trace!(
-                "Transfer {} does not match address {}, skipping",
-                ev.tx_hash,
-                normalized_address
-            );
-            continue;
-        }
-        if let Some(ref cur) = cursor {
-            if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
-                trace!(
-                    "Transfer {} not after cursor (ts={}, tx_hash={}), skipping",
-                    ev.tx_hash,
-                    ev.created_at.timestamp_millis(),
-                    ev.tx_hash
-                );
+        let deps = idx::midnight_deposit::Entity::find()
+            .filter(deposit_filter)
+            .find_also_related(idx::Entity)
+            .all(db)
+            .await?;
+        debug!("Got {} midnight_deposit records", deps.len());
+
+        for (md, ev) in deps {
+            trace!("Processing deposit event_id {}", md.event_id);
+            let Some(ev) = ev else {
+                trace!("Deposit event id {} not found in idx::Entity", md.event_id);
                 continue;
-            }
-        }
-        if let Some(ref t) = type_filter {
-            if t != "transfer" {
-                trace!(
-                    "Transfer {} filtered out by type (expected transfer, got {})",
-                    ev.tx_hash,
-                    t
-                );
-                continue;
-            }
-        }
-        debug!(
-            "Adding transfer involvement item for tx_hash={} event_id={}",
-            ev.tx_hash, mt.event_id
-        );
-        collected.push(InvolvementItem {
-            tx_hash: ev.tx_hash.clone(),
-            timestamp_ms: ev.created_at.timestamp_millis(),
-            kind: ev.kind.clone(),
-            sender: mt.sender.clone(),
-            recipient: privacy_recipient.clone(),
-            privacy_sender,
-            privacy_recipient,
-            amount: None,
-            anchor_root: mt.anchor_root.clone(),
-            nullifier: mt.nullifier.clone(),
-            view_fvks: None,
-            view_attestations: mt.view_attestations.clone(),
-            events: ev.events.clone(),
-            status: ev.status.clone(),
-            encrypted_notes: if include_encrypted {
-                mt.encrypted_notes.clone()
+            };
+            let decrypted_notes = resolve_decrypted_notes(vfk, md.encrypted_notes.as_ref());
+            let privacy_recipient = md.recipient.clone().or_else(|| {
+                viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
+            });
+            let matches = if address_is_privacy {
+                privacy_recipient.as_deref() == Some(normalized_address.as_str())
+                    || decrypted_notes_match_recipient(
+                        decrypted_notes.as_ref(),
+                        &normalized_address,
+                    )
             } else {
-                None
-            },
-            decrypted_notes,
-            payload: serde_json::from_str(&ev.payload).ok(),
-        });
+                md.sender.as_deref() == Some(address)
+            };
+            if matches {
+                deposit_matches += 1;
+            }
+            if !matches {
+                continue;
+            }
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    trace!(
+                        "Deposit {} not after cursor (ts={}, tx_hash={}), skipping",
+                        ev.tx_hash,
+                        ev.created_at.timestamp_millis(),
+                        ev.tx_hash
+                    );
+                    continue;
+                }
+            }
+            debug!(
+                "Adding deposit involvement item for tx_hash={} event_id={}",
+                ev.tx_hash, md.event_id
+            );
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: md.sender.clone(),
+                recipient: privacy_recipient.clone(),
+                privacy_sender: None,
+                privacy_recipient,
+                amount: md.amount.clone(),
+                anchor_root: None,
+                nullifier: None,
+                view_fvks: md.view_fvks.clone(),
+                view_attestations: None,
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: if include_encrypted {
+                    md.encrypted_notes.clone()
+                } else {
+                    None
+                },
+                decrypted_notes,
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
+    }
+
+    if type_filter.is_none() || type_filter.as_deref() == Some("withdraw") {
+        // Withdrawals by sender or recipient
+        debug!(
+            "Fetching midnight_withdraw records for sender or recipient={}",
+            address
+        );
+        let mut withdraw_filter = Condition::any()
+            .add(idx::midnight_withdraw::Column::Sender.eq(address.to_string()))
+            .add(idx::midnight_withdraw::Column::ToAddr.eq(address.to_string()));
+        if address_is_privacy {
+            withdraw_filter = withdraw_filter
+                .add(idx::midnight_withdraw::Column::PrivacySender.eq(normalized_address.clone()));
+            if should_scan_privacy {
+                withdraw_filter = withdraw_filter.add(
+                    Condition::all()
+                        .add(idx::midnight_withdraw::Column::PrivacySender.is_null())
+                        .add(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null()),
+                );
+            }
+        }
+        let wds = idx::midnight_withdraw::Entity::find()
+            .filter(withdraw_filter)
+            .find_also_related(idx::Entity)
+            .all(db)
+            .await?;
+        debug!("Got {} midnight_withdraw records", wds.len());
+        for (mw, ev) in wds {
+            trace!("Processing withdraw event_id {}", mw.event_id);
+            let Some(ev) = ev else {
+                trace!("Withdraw event id {} not found in idx::Entity", mw.event_id);
+                continue;
+            };
+            let decrypted_notes = resolve_decrypted_notes(vfk, mw.encrypted_notes.as_ref());
+            let privacy_sender = mw
+                .privacy_sender
+                .clone()
+                .or_else(|| viewer::extract_sender_from_decrypted_notes(decrypted_notes.as_ref()));
+            let matches = if address_is_privacy {
+                privacy_sender.as_deref() == Some(normalized_address.as_str())
+            } else {
+                mw.sender.as_deref() == Some(address) || mw.to_addr.as_deref() == Some(address)
+            };
+            if matches {
+                withdraw_matches += 1;
+            }
+            if !matches {
+                continue;
+            }
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    trace!(
+                        "Withdraw {} not after cursor (ts={}, tx_hash={}), skipping",
+                        ev.tx_hash,
+                        ev.created_at.timestamp_millis(),
+                        ev.tx_hash
+                    );
+                    continue;
+                }
+            }
+            debug!(
+                "Adding withdraw involvement item for tx_hash={} event_id={}",
+                ev.tx_hash, mw.event_id
+            );
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: mw.sender.clone(),
+                recipient: mw.to_addr.clone(),
+                privacy_sender,
+                privacy_recipient: None,
+                amount: mw.amount.clone(),
+                anchor_root: mw.anchor_root.clone(),
+                nullifier: mw.nullifier.clone(),
+                view_fvks: None,
+                view_attestations: mw.view_attestations.clone(),
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: if include_encrypted {
+                    mw.encrypted_notes.clone()
+                } else {
+                    None
+                },
+                decrypted_notes,
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
+    }
+
+    if type_filter.is_none() || type_filter.as_deref() == Some("transfer") {
+        // Transfers by sender or recipient
+        debug!(
+            "Fetching midnight_transfer records for sender or recipient={}",
+            normalized_address
+        );
+        let mut transfer_filter = Condition::any()
+            .add(idx::midnight_transfer::Column::Sender.eq(address.to_string()))
+            .add(idx::midnight_transfer::Column::Recipient.eq(normalized_address.clone()))
+            .add(idx::midnight_transfer::Column::PrivacySender.eq(normalized_address.clone()));
+        if should_scan_privacy {
+            transfer_filter = transfer_filter.add(
+                Condition::all()
+                    .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
+                    .add(
+                        Condition::any()
+                            .add(idx::midnight_transfer::Column::Recipient.is_null())
+                            .add(idx::midnight_transfer::Column::PrivacySender.is_null()),
+                    ),
+            );
+        }
+        let tfs = idx::midnight_transfer::Entity::find()
+            .filter(transfer_filter)
+            .find_also_related(idx::Entity)
+            .all(db)
+            .await?;
+        debug!("Got {} midnight_transfer records", tfs.len());
+        for (mt, ev) in tfs {
+            trace!("Processing transfer event_id {}", mt.event_id);
+            let Some(ev) = ev else {
+                trace!("Transfer event id {} not found in idx::Entity", mt.event_id);
+                continue;
+            };
+            let decrypted_notes = resolve_decrypted_notes(vfk, mt.encrypted_notes.as_ref());
+            let privacy_sender = mt
+                .privacy_sender
+                .clone()
+                .or_else(|| viewer::extract_sender_from_decrypted_notes(decrypted_notes.as_ref()));
+            let privacy_recipient = mt.recipient.clone().or_else(|| {
+                viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
+            });
+            let matches_recipient = privacy_recipient.as_deref()
+                == Some(normalized_address.as_str())
+                || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
+            let matches_sender = privacy_sender.as_deref() == Some(normalized_address.as_str());
+            let matches = if address_is_privacy {
+                matches_recipient || matches_sender
+            } else {
+                mt.sender.as_deref() == Some(address)
+            };
+            if matches {
+                transfer_matches += 1;
+            }
+            if !matches {
+                trace!(
+                    "Transfer {} does not match address {}, skipping",
+                    ev.tx_hash,
+                    normalized_address
+                );
+                continue;
+            }
+            if let Some(ref cur) = cursor {
+                if !after_cursor(cur, ev.created_at, &ev.tx_hash) {
+                    trace!(
+                        "Transfer {} not after cursor (ts={}, tx_hash={}), skipping",
+                        ev.tx_hash,
+                        ev.created_at.timestamp_millis(),
+                        ev.tx_hash
+                    );
+                    continue;
+                }
+            }
+            debug!(
+                "Adding transfer involvement item for tx_hash={} event_id={}",
+                ev.tx_hash, mt.event_id
+            );
+            collected.push(InvolvementItem {
+                tx_hash: ev.tx_hash.clone(),
+                timestamp_ms: ev.created_at.timestamp_millis(),
+                kind: ev.kind.clone(),
+                sender: mt.sender.clone(),
+                recipient: privacy_recipient.clone(),
+                privacy_sender,
+                privacy_recipient,
+                amount: None,
+                anchor_root: mt.anchor_root.clone(),
+                nullifier: mt.nullifier.clone(),
+                view_fvks: None,
+                view_attestations: mt.view_attestations.clone(),
+                events: ev.events.clone(),
+                status: ev.status.clone(),
+                encrypted_notes: if include_encrypted {
+                    mt.encrypted_notes.clone()
+                } else {
+                    None
+                },
+                decrypted_notes,
+                payload: serde_json::from_str(&ev.payload).ok(),
+            });
+        }
     }
 
     let total = match type_filter.as_deref() {

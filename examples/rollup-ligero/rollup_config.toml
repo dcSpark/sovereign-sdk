@@ -5,6 +5,7 @@
 #  - "postgresql://root:hunter2@aws.amazon.com/mock-da"
 # connection_string = "postgresql://admin:1234@localhost:5432/sovereign"
 connection_string = "postgresql://admin:1234@localhost:5432/da"
+# connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
 # String representation of sequencer address.
 # For initial full node should match genesis of sequencer-registry.
 # It is going to be a DA address that blobs from this node will be associated with.
@@ -13,7 +14,7 @@ finalization = 40
 
 # Where to persist full incoming worker transactions (for auditing/debugging).
 # Options: "none" | "disk" | "gcs"
-save_incoming_worker_txs = "disk"
+save_incoming_worker_txs = "none"
 
 # If `save_incoming_worker_txs = "disk"`, writes `<tx_hash>.json` into this directory.
 # Relative paths are resolved relative to this rollup_config.toml location.

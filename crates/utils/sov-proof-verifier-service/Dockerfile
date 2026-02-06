@@ -148,7 +148,6 @@ ENV \
     SIGNING_KEY_PATH=/app/keys/token_deployer_private_key.json \
     ROLLUP_CONFIG_PATH=/app/rollup_config.toml \
     METHOD_ID=0x698c44527e4fa3f934471015da3caa61da1f4e167107dbba9df71a6545396fb3 \
-    MAX_CONCURRENT_VERIFICATIONS=5 \
     LOG_LEVEL=debug \
     LIGERO_PROGRAM_PATH=/app/ligero/programs/note_spend_guest.wasm \
     LIGERO_SHADER_PATH=/app/ligero/shader \

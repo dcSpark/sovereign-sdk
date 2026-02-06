@@ -111,7 +111,7 @@ Arguments are forwarded to `run_rollup.sh`:
 
 ### Service Controller API
 
-The controller runs the same `run_all.sh` flow and provides HTTP endpoints to start/stop:
+The controller now manages each service script independently (`run_rollup.sh`, `run_verifier_service.sh`, etc.), and supports both global and per-service actions:
 
 ```bash
 cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release
@@ -122,11 +122,33 @@ curl -X POST http://127.0.0.1:9090/start
 curl -X POST http://127.0.0.1:9090/stop
 curl -X POST http://127.0.0.1:9090/restart
 curl -X POST http://127.0.0.1:9090/clean
+curl -X POST http://127.0.0.1:9090/clean-database
+curl -X POST http://127.0.0.1:9090/reset-tee
+
+# Per-service controls
+curl -X POST http://127.0.0.1:9090/start/rollup
+curl -X POST http://127.0.0.1:9090/stop/worker
+curl -X POST http://127.0.0.1:9090/restart/indexer
+curl -X POST http://127.0.0.1:9090/start/mcp
+
+# Discover known services and controller process status
+curl http://127.0.0.1:9090/services
 ```
 
 Notes:
 - Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
-- Auto-start services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
+- Auto-start default services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
+- Per-service remote mode:
+  - Set `SERVICE_WORKER_REMOTE=1` to disable local start/stop/restart for worker.
+  - Set `SERVICE_WORKER_URL=https://<remote-host>:8080` to show/check the remote endpoint in `/health`.
+  - Legacy alias `SERVICE_VERIFIER_REMOTE` / `SERVICE_VERIFIER_URL` is also supported.
+- TEE reset action:
+  - Set `TEE_RESET_URL` (default: `http://74.235.106.62:9898/reset`).
+  - Set `TEE_RESET_BEARER_TOKEN` (required for `/reset-tee`; alias: `TEE_RESET_TOKEN`).
+- Database cleanup action:
+  - Set `DA_CONNECTION_STRING` on the controller process (PostgreSQL URL).
+  - `/clean-database` drops all tables with `CASCADE` from databases: `da`, `indexer`, `fvk`, `mcp_sessions`.
+- `Clean Data`, `/clean-database`, and `/reset-tee` only run when all managed services are stopped.
 - `/clean` removes `demo_data` and only runs when services are stopped
 
 ### Linux Services
