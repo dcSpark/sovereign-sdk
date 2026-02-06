@@ -150,6 +150,8 @@ pub struct Provider {
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_VERIFIER_SUBMIT_RETRIES: u32 = 3;
+const DEFAULT_VERIFIER_SUBMIT_RETRY_DELAY_MS: u64 = 1000;
 
 fn http_timeout_secs() -> u64 {
     std::env::var("MCP_HTTP_TIMEOUT_SECS")
@@ -163,6 +165,20 @@ fn http_connect_timeout_secs() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT_SECS)
+}
+
+fn verifier_submit_retries() -> u32 {
+    std::env::var("MCP_VERIFIER_SUBMIT_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_VERIFIER_SUBMIT_RETRIES)
+}
+
+fn verifier_submit_retry_delay_ms() -> u64 {
+    std::env::var("MCP_VERIFIER_SUBMIT_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_VERIFIER_SUBMIT_RETRY_DELAY_MS)
 }
 
 impl Provider {
@@ -345,13 +361,42 @@ impl Provider {
             tx_b64.len()
         );
 
-        let resp = self
-            .http_client
-            .post(&endpoint)
-            .json(&serde_json::json!({ "body": tx_b64 }))
-            .send()
-            .await
-            .context("Failed to send transaction to verifier service")?;
+        let max_retries = verifier_submit_retries();
+        let retry_delay = Duration::from_millis(verifier_submit_retry_delay_ms());
+        let mut last_err: Option<anyhow::Error> = None;
+
+        let resp = 'submit: {
+            for attempt in 0..=max_retries {
+                match self
+                    .http_client
+                    .post(&endpoint)
+                    .json(&serde_json::json!({ "body": tx_b64 }))
+                    .send()
+                    .await
+                {
+                    Ok(r) => break 'submit r,
+                    Err(e) => {
+                        if attempt < max_retries {
+                            let delay = retry_delay * (attempt + 1);
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                max_attempts = max_retries + 1,
+                                retry_delay_ms = delay.as_millis(),
+                                error = %e,
+                                "Verifier submission failed (transient); retrying"
+                            );
+                            tokio::time::sleep(delay).await;
+                            last_err = Some(e.into());
+                        } else {
+                            last_err = Some(e.into());
+                        }
+                    }
+                }
+            }
+            return Err(last_err
+                .unwrap_or_else(|| anyhow::anyhow!("Verifier submission failed"))
+                .context("Failed to send transaction to verifier service after retries"));
+        };
 
         let status = resp.status();
         if !status.is_success() {

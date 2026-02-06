@@ -91,6 +91,14 @@ struct Args {
     #[arg(long, env = "MCP_STRESS_REPORT_UNCHANGED", default_value_t = false)]
     report_unchanged: bool,
 
+    /// Max retries per send on transient errors (tree lag, verifier overload).
+    #[arg(long, env = "MCP_STRESS_SEND_RETRIES", default_value_t = 3)]
+    send_retries: u32,
+
+    /// Initial delay between send retries (doubled on each retry).
+    #[arg(long, env = "MCP_STRESS_SEND_RETRY_DELAY_MS", default_value_t = 2000)]
+    send_retry_delay_ms: u64,
+
     /// Optional file storing stable MCP session IDs (one per line) to reuse across runs.
     ///
     /// If this is set and `--wallets N` exceeds the number of IDs in the file, new UUIDv4 values
@@ -107,6 +115,7 @@ struct Counters {
     wallets_ready: AtomicU64,
     sends_ok: AtomicU64,
     sends_err: AtomicU64,
+    sends_retried: AtomicU64,
     confirms_ok: AtomicU64,
     confirms_err: AtomicU64,
     send_latency_us_total: AtomicU64,
@@ -121,6 +130,7 @@ impl Counters {
             wallets_ready: AtomicU64::new(0),
             sends_ok: AtomicU64::new(0),
             sends_err: AtomicU64::new(0),
+            sends_retried: AtomicU64::new(0),
             confirms_ok: AtomicU64::new(0),
             confirms_err: AtomicU64::new(0),
             send_latency_us_total: AtomicU64::new(0),
@@ -671,13 +681,62 @@ async fn wallet_worker(
         }
 
         let send_started = Instant::now();
-        let send_res = tokio::select! {
-            res = send_to_self(&client, &privacy_address, args.send_amount) => res,
-            _ = stop_rx.changed() => {
-                tracing::info!("wallet[{idx}] interrupted by stop signal during send");
+        let base_retry_delay = Duration::from_millis(args.send_retry_delay_ms);
+        let mut send_res: Result<String> = Err(anyhow!("no attempt made"));
+        let mut retries_used: u32 = 0;
+
+        for attempt in 0..=args.send_retries {
+            if *stop_rx.borrow() {
                 break;
             }
-        };
+            let attempt_res = tokio::select! {
+                res = send_to_self(&client, &privacy_address, args.send_amount) => res,
+                _ = stop_rx.changed() => {
+                    tracing::info!("wallet[{idx}] interrupted by stop signal during send");
+                    send_res = Err(anyhow!("interrupted"));
+                    break;
+                }
+            };
+
+            match &attempt_res {
+                Ok(_) => {
+                    send_res = attempt_res;
+                    break;
+                }
+                Err(e) => {
+                    let err_msg = format!("{e:#}");
+                    let is_transient = err_msg.contains("not yet visible in the commitment tree")
+                        || err_msg.contains("Failed to submit transaction to verifier service")
+                        || err_msg.contains("Retry shortly")
+                        || err_msg.contains("No unspent notes available");
+
+                    if is_transient && attempt < args.send_retries {
+                        retries_used += 1;
+                        let delay = base_retry_delay * (attempt + 1);
+                        tracing::info!(
+                            "wallet[{idx}] transient send error (attempt {}/{}), retrying in {}ms: {err_msg}",
+                            attempt + 1,
+                            args.send_retries + 1,
+                            delay.as_millis()
+                        );
+                        counters.sends_retried.fetch_add(1, Ordering::Relaxed);
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = stop_rx.changed() => {
+                                send_res = Err(anyhow!("interrupted during retry delay"));
+                                break;
+                            }
+                        }
+                        send_res = attempt_res;
+                        continue;
+                    }
+
+                    send_res = attempt_res;
+                    break;
+                }
+            }
+        }
+
         let send_elapsed = send_started.elapsed();
 
         let send_elapsed_us = send_elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
@@ -691,8 +750,13 @@ async fn wallet_worker(
         match send_res {
             Ok(tx_id) => {
                 counters.sends_ok.fetch_add(1, Ordering::Relaxed);
+                let retry_info = if retries_used > 0 {
+                    format!(" (after {retries_used} retries)")
+                } else {
+                    String::new()
+                };
                 tracing::info!(
-                    "wallet[{idx}] sent tx_id={tx_id} elapsed_ms={}",
+                    "wallet[{idx}] sent tx_id={tx_id} elapsed_ms={}{retry_info}",
                     send_elapsed.as_millis()
                 );
                 if args.confirm {
@@ -811,12 +875,14 @@ async fn main() -> Result<()> {
     let session_ids = ensure_session_ids_file(args.session_ids_file.as_path(), args.wallets)?;
 
     tracing::info!(
-        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} wallet_ready_timeout_secs={} wallet_ready_poll_ms={} wallet_ready_burst_requests={} wallet_ready_call_timeout_ms={} session_ids_file={}",
+        "starting: endpoint={} wallets={} send_amount={} duration_secs={} confirm={} send_retries={} send_retry_delay_ms={} wallet_ready_timeout_secs={} wallet_ready_poll_ms={} wallet_ready_burst_requests={} wallet_ready_call_timeout_ms={} session_ids_file={}",
         args.mcp_endpoint,
         args.wallets,
         args.send_amount,
         args.duration_secs,
         args.confirm,
+        args.send_retries,
+        args.send_retry_delay_ms,
         args.wallet_ready_timeout_secs,
         args.wallet_ready_poll_ms,
         args.wallet_ready_burst_requests,
@@ -913,8 +979,9 @@ async fn main() -> Result<()> {
                         last_confirms_ok = confirms_ok;
                         last_confirms_err = confirms_err;
 
+                        let sends_retried = reporter_counters.sends_retried.load(Ordering::Relaxed);
                         eprintln!(
-                            "ready={ready}/{wallets} sends_ok={sends_ok} (+{delta_ok}/{interval}s) sends_err={sends_err} (+{delta_err}/{interval}s) send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
+                            "ready={ready}/{wallets} sends_ok={sends_ok} (+{delta_ok}/{interval}s) sends_err={sends_err} (+{delta_err}/{interval}s) sends_retried={sends_retried} send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
                             wallets = wallets_total,
                             interval = report_interval_secs.max(1),
                             send_avg_ms = send_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
@@ -955,6 +1022,7 @@ async fn main() -> Result<()> {
     let ready = counters.wallets_ready.load(Ordering::Relaxed);
     let sends_ok = counters.sends_ok.load(Ordering::Relaxed);
     let sends_err = counters.sends_err.load(Ordering::Relaxed);
+    let sends_retried = counters.sends_retried.load(Ordering::Relaxed);
     let confirms_ok = counters.confirms_ok.load(Ordering::Relaxed);
     let confirms_err = counters.confirms_err.load(Ordering::Relaxed);
     let send_us_total = counters.send_latency_us_total.load(Ordering::Relaxed);
@@ -965,7 +1033,7 @@ async fn main() -> Result<()> {
     let confirm_avg_us = avg_us(confirm_us_total, confirms_ok + confirms_err);
 
     eprintln!(
-        "done: ready={ready} sends_ok={sends_ok} sends_err={sends_err} send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
+        "done: ready={ready} sends_ok={sends_ok} sends_err={sends_err} sends_retried={sends_retried} send_avg_ms={send_avg_ms} send_max_ms={send_max_ms} confirms_ok={confirms_ok} confirms_err={confirms_err} confirm_avg_ms={confirm_avg_ms} confirm_max_ms={confirm_max_ms}",
         send_avg_ms = send_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),
         send_max_ms = send_us_max as f64 / 1000.0,
         confirm_avg_ms = confirm_avg_us.map(|v| v as f64 / 1000.0).unwrap_or(0.0),

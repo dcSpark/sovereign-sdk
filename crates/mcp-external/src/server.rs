@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::commitment_tree::global_tree_syncer;
@@ -775,7 +775,7 @@ pub struct GetWalletStatusResult {
 
 const DEFAULT_PENDING_SPENT_NOTE_TTL_SECS: u64 = 120;
 const DEFAULT_WAIT_FOR_FRESH_NOTES_SECS: u64 = 5;
-const DEFAULT_WAIT_FOR_TREE_VISIBLE_NOTES_SECS: u64 = 300;
+const DEFAULT_WAIT_FOR_TREE_VISIBLE_NOTES_SECS: u64 = 60;
 const NOTES_WAIT_POLL_MS: u64 = 500;
 const NOTES_WAIT_PROGRESS_LOG_SECS: u64 = 5;
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
@@ -1118,9 +1118,6 @@ impl CryptoServer {
                 let local = self.local_notes.lock().await;
                 local.by_rho.values().cloned().collect()
             };
-            let local_note_rhos: HashSet<String> =
-                local_notes.iter().map(|note| note.rho.clone()).collect();
-
             let filtered = {
                 let mut pending = self.pending_spent_notes.lock().await;
                 pending.purge_expired();
@@ -1200,7 +1197,13 @@ impl CryptoServer {
                 notes_with_cm.iter().map(|(note, _)| note.clone()).collect();
             let mut tree_visible_notes = Vec::with_capacity(before_tree_filter);
             for ((note, _), present) in notes_with_cm.into_iter().zip(presence.into_iter()) {
-                if present || local_note_rhos.contains(&note.rho) {
+                // Only include notes whose commitments are present in the cached commitment
+                // tree.  Do NOT bypass this check for local_notes — while local notes are
+                // valid candidates for amount-covering calculations (they tell the wait loop
+                // "these notes exist, keep waiting for the tree"), including them in the
+                // transfer without tree presence causes expensive failed proof-generation
+                // retries (~33s) because resolve_positions_and_openings cannot find them.
+                if present {
                     tree_visible_notes.push(note);
                 }
             }
