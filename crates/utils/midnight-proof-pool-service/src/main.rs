@@ -98,7 +98,7 @@ impl Config {
 
         let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
         let ligero_proof_service_url =
-            env_string("LIGERO_PROOF_SERVICE_URL", "http://127.0.0.1:1313");
+            env_string("LIGERO_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
         let verifier_prover_service_url = env_optional_string("VERIFIER_PROVER_SERVICE_URL")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());

@@ -26,7 +26,7 @@ requested number of pending transactions to the sequencer, and the service refil
 - `ADMIN_WALLET_PRIVATE_KEY` - hex private key used to fund generated wallets
 - `ROLLUP_RPC_URL` - rollup node base URL (default: `http://127.0.0.1:12346`)
 - `DA_CONNECTION_STRING` - **must match the node's DA DB** (e.g. `sqlite://.../demo_data/da.sqlite?mode=rwc`)
-- `LIGERO_PROOF_SERVICE_URL` - ligero-http-server base URL (default: `http://127.0.0.1:1313`)
+- `LIGERO_PROOF_SERVICE_URL` - ligero-http-server base URL (default: `http://127.0.0.1:8080`)
 
 ## Optional env
 
@@ -55,7 +55,7 @@ MAX_PROOFS=100 \
 ADMIN_WALLET_PRIVATE_KEY=0x... \
 ROLLUP_RPC_URL=http://127.0.0.1:12346 \
 DA_CONNECTION_STRING="sqlite://$(pwd)/examples/rollup-ligero/demo_data/da.sqlite?mode=rwc" \
-LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:1313 \
+LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:8080 \
 cargo run -p midnight-proof-pool-service --release
 ```
 
