@@ -16,8 +16,8 @@ pub const DEFAULT_TREE_DEPTH: u8 = 16;
 const NOTES_PAGE_LIMIT: usize = 1000;
 const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 5;
 const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
-const SYNC_MAX_RETRIES: usize = 3;
-const SYNC_RETRY_DELAY_MS: u64 = 200;
+const DEFAULT_SYNC_MAX_RETRIES: usize = 3;
+const DEFAULT_SYNC_RETRY_DELAY_MS: u64 = 200;
 
 const DEFAULT_POSITION_LOOKUP_MAX_RETRIES: usize = 50;
 const DEFAULT_POSITION_LOOKUP_RETRY_DELAY_MS: u64 = 200;
@@ -27,7 +27,14 @@ const BACKGROUND_SYNC_ERROR_BACKOFF_SECS: u64 = 3;
 
 static GLOBAL_TREE_SYNCER: OnceLock<CommitmentTreeSyncer> = OnceLock::new();
 static BACKGROUND_SYNC_STARTED: OnceLock<()> = OnceLock::new();
+static SYNC_CONFIG: OnceLock<SyncConfig> = OnceLock::new();
 static POSITION_LOOKUP_CONFIG: OnceLock<PositionLookupConfig> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct SyncConfig {
+    max_retries: usize,
+    retry_delay: Duration,
+}
 
 #[derive(Clone, Copy)]
 struct PositionLookupConfig {
@@ -59,6 +66,22 @@ fn use_index_db_tree_sync() -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+fn sync_config() -> SyncConfig {
+    *SYNC_CONFIG.get_or_init(|| {
+        let max_retries =
+            env_usize("MCP_COMMITMENT_TREE_SYNC_MAX_RETRIES", DEFAULT_SYNC_MAX_RETRIES).max(1);
+        let retry_delay_ms = env_u64(
+            "MCP_COMMITMENT_TREE_SYNC_RETRY_DELAY_MS",
+            DEFAULT_SYNC_RETRY_DELAY_MS,
+        );
+
+        SyncConfig {
+            max_retries,
+            retry_delay: Duration::from_millis(retry_delay_ms),
+        }
+    })
 }
 
 fn position_lookup_config() -> PositionLookupConfig {
@@ -300,7 +323,8 @@ impl CommitmentTreeSyncer {
             return self.sync_to_latest_from_index_db(provider).await;
         }
 
-        for attempt in 0..SYNC_MAX_RETRIES {
+        let sync = sync_config();
+        for attempt in 0..sync.max_retries {
             let started = Instant::now();
 
             // We use /tree/state only as a depth hint. Root/count come from /notes snapshots.
@@ -314,12 +338,12 @@ impl CommitmentTreeSyncer {
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
-                        max_attempts = SYNC_MAX_RETRIES,
+                        max_attempts = sync.max_retries,
                         error = %e,
                         error_chain = %format!("{:#}", e),
                         "Commitment tree state query failed; retrying"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                    tokio::time::sleep(sync.retry_delay).await;
                     continue;
                 }
             };
@@ -340,13 +364,13 @@ impl CommitmentTreeSyncer {
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
-                        max_attempts = SYNC_MAX_RETRIES,
+                        max_attempts = sync.max_retries,
                         start_offset,
                         error = %e,
                         error_chain = %format!("{:#}", e),
                         "Commitment tree notes snapshot fetch failed; retrying"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                    tokio::time::sleep(sync.retry_delay).await;
                     continue;
                 }
             };
@@ -484,7 +508,7 @@ impl CommitmentTreeSyncer {
                         let elapsed_ms = started.elapsed().as_millis();
                         tracing::warn!(
                             attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
+                            max_attempts = sync.max_retries,
                             elapsed_ms,
                             state_ms,
                             start_offset = stats.start_offset,
@@ -504,13 +528,12 @@ impl CommitmentTreeSyncer {
                     Ok(None) => {
                         tracing::warn!(
                             attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
+                            max_attempts = sync.max_retries,
                             start_offset,
                             expected_next,
                             "Commitment tree cache changed during incremental sync; retrying"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS))
-                            .await;
+                        tokio::time::sleep(sync.retry_delay).await;
                         continue;
                     }
                     Err(e) => {
@@ -521,7 +544,7 @@ impl CommitmentTreeSyncer {
                         drop(cached);
                         tracing::warn!(
                             attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
+                            max_attempts = sync.max_retries,
                             notes_next_position = expected_next,
                             chain_depth_hint = ?state.depth,
                             expected_depth,
@@ -544,7 +567,7 @@ impl CommitmentTreeSyncer {
                     format!(
                         "Full rebuild failed (attempt {} of {})",
                         attempt + 1,
-                        SYNC_MAX_RETRIES
+                        sync.max_retries
                     )
                 }) {
                 Ok(stats) => {
@@ -569,7 +592,7 @@ impl CommitmentTreeSyncer {
                     drop(cached);
                     tracing::warn!(
                         attempt = attempt + 1,
-                        max_attempts = SYNC_MAX_RETRIES,
+                        max_attempts = sync.max_retries,
                         notes_next_position = expected_next,
                         chain_depth_hint = ?state.depth,
                         expected_depth,
@@ -585,7 +608,7 @@ impl CommitmentTreeSyncer {
                     let mut st = self.state.write().await;
                     *st = CachedTree::new(expected_depth);
                     drop(st);
-                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                    tokio::time::sleep(sync.retry_delay).await;
                     continue;
                 }
             }
@@ -598,7 +621,7 @@ impl CommitmentTreeSyncer {
         drop(st);
         anyhow::bail!(
             "Failed to sync commitment tree after {} attempts (cached_next_position={}, cached_depth={}, cached_root={})",
-            SYNC_MAX_RETRIES,
+            sync.max_retries,
             cached_next_position,
             cached_depth,
             hex::encode(cached_root)
@@ -606,8 +629,12 @@ impl CommitmentTreeSyncer {
     }
 
     async fn sync_to_latest_from_index_db(&self, provider: &Provider) -> Result<()> {
-        for attempt in 0..SYNC_MAX_RETRIES {
+        let sync = sync_config();
+        for attempt in 0..sync.max_retries {
             let started = Instant::now();
+            // Serialize DB-backed snapshot reads + cache updates to avoid N parallel
+            // callers racing on stale checkpoints and exhausting retry budget.
+            let _guard = self.sync_lock.lock().await;
             let start_event_id = { self.state.read().await.indexer_last_event_id };
 
             let delta_fetch_started = Instant::now();
@@ -623,7 +650,7 @@ impl CommitmentTreeSyncer {
             if delta_batch.upto_event_id < start_event_id {
                 tracing::warn!(
                     attempt = attempt + 1,
-                    max_attempts = SYNC_MAX_RETRIES,
+                    max_attempts = sync.max_retries,
                     cached_event_id = start_event_id,
                     db_event_id = delta_batch.upto_event_id,
                     "Indexer event stream appears to have rewound; resetting commitment-tree cache"
@@ -631,7 +658,8 @@ impl CommitmentTreeSyncer {
                 let mut st = self.state.write().await;
                 *st = CachedTree::new(self.default_depth);
                 drop(st);
-                tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                drop(_guard);
+                tokio::time::sleep(sync.retry_delay).await;
                 continue;
             }
 
@@ -645,33 +673,20 @@ impl CommitmentTreeSyncer {
                 return Ok(());
             }
 
-            let _guard = self.sync_lock.lock().await;
-            let checkpoint_now = { self.state.read().await.indexer_last_event_id };
-            if checkpoint_now != start_event_id {
-                tracing::debug!(
-                    attempt = attempt + 1,
-                    max_attempts = SYNC_MAX_RETRIES,
-                    start_event_id,
-                    checkpoint_now,
-                    "Commitment-tree checkpoint changed while waiting for sync lock; retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
-                continue;
-            }
-
             if delta_batch.notes.is_empty() {
                 let mut st = self.state.write().await;
                 if delta_batch.upto_event_id < st.indexer_last_event_id {
                     tracing::warn!(
                         attempt = attempt + 1,
-                        max_attempts = SYNC_MAX_RETRIES,
+                        max_attempts = sync.max_retries,
                         cached_event_id = st.indexer_last_event_id,
                         db_event_id = delta_batch.upto_event_id,
                         "Indexer event id regressed relative to cache; resetting commitment-tree cache"
                     );
                     *st = CachedTree::new(self.default_depth);
                     drop(st);
-                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                    drop(_guard);
+                    tokio::time::sleep(sync.retry_delay).await;
                     continue;
                 }
 
@@ -750,7 +765,7 @@ impl CommitmentTreeSyncer {
                     Err(e) => {
                         tracing::warn!(
                             attempt = attempt + 1,
-                            max_attempts = SYNC_MAX_RETRIES,
+                            max_attempts = sync.max_retries,
                             checkpoint = snapshot.upto_event_id,
                             error = %e,
                             error_chain = %format!("{:#}", e),
@@ -761,7 +776,7 @@ impl CommitmentTreeSyncer {
 
                 tracing::warn!(
                     attempt = attempt + 1,
-                    max_attempts = SYNC_MAX_RETRIES,
+                    max_attempts = sync.max_retries,
                     checkpoint = delta_batch.upto_event_id,
                     "Indexer DB snapshot contains legacy NoteCreated rows without usable rollup_height ordering; falling back to legacy append order"
                 );
@@ -773,14 +788,15 @@ impl CommitmentTreeSyncer {
             if delta_batch.upto_event_id < st.indexer_last_event_id {
                 tracing::warn!(
                     attempt = attempt + 1,
-                    max_attempts = SYNC_MAX_RETRIES,
+                    max_attempts = sync.max_retries,
                     cached_event_id = st.indexer_last_event_id,
                     db_event_id = delta_batch.upto_event_id,
                     "Indexer event id regressed relative to cache; resetting commitment-tree cache"
                 );
                 *st = CachedTree::new(self.default_depth);
                 drop(st);
-                tokio::time::sleep(std::time::Duration::from_millis(SYNC_RETRY_DELAY_MS)).await;
+                drop(_guard);
+                tokio::time::sleep(sync.retry_delay).await;
                 continue;
             }
 
@@ -816,7 +832,7 @@ impl CommitmentTreeSyncer {
         let st = self.state.read().await;
         anyhow::bail!(
             "Failed to sync commitment tree from indexer DB after {} attempts (cached_next_position={}, cached_depth={}, cached_root={}, checkpoint={})",
-            SYNC_MAX_RETRIES,
+            sync.max_retries,
             st.next_position,
             st.tree.depth(),
             hex::encode(st.tree.root()),
