@@ -100,7 +100,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 futures = "0.3"
 sysinfo = "0.32"
 # ligero-runner for the prover service binary
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133" }
+ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "7b6ac4849035fef8f108e7cadce2a601e63e5200" }
 midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
 midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }

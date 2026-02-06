@@ -3393,7 +3393,7 @@ dependencies = [
 [[package]]
 name = "ligero-runner"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133#b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=7b6ac4849035fef8f108e7cadce2a601e63e5200#7b6ac4849035fef8f108e7cadce2a601e63e5200"
 dependencies = [
  "anyhow",
  "base64",
@@ -3413,7 +3413,7 @@ dependencies = [
 [[package]]
 name = "ligetron"
 version = "1.1.0"
-source = "git+https://github.com/dcSpark/ligero-prover.git?rev=b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133#b1960a2e6c0d3000ae4c3f704fc45fccb2ebf133"
+source = "git+https://github.com/dcSpark/ligero-prover.git?rev=7b6ac4849035fef8f108e7cadce2a601e63e5200#7b6ac4849035fef8f108e7cadce2a601e63e5200"
 dependencies = [
  "ark-bn254",
  "ark-ff 0.5.0",
