@@ -3,7 +3,7 @@ set -e
 
 # Support both env var naming conventions (Docker style and shell script style)
 BIND="${BIND_ADDR:-${BIND_ADDRESS:-0.0.0.0:8080}}"
-MAX_CONC="${MAX_CONCURRENT:-${MAX_CONCURRENT_VERIFICATIONS:-10}}"
+MAX_CONC="${MAX_CONCURRENT:-${MAX_CONCURRENT_VERIFICATIONS:-}}"
 ROLLUP_CFG="${ROLLUP_CONFIG_PATH:-/app/rollup_config.toml}"
 
 set -- \
@@ -11,10 +11,13 @@ set -- \
   --node-rpc-url "${NODE_RPC_URL:-http://127.0.0.1:12346}" \
   --signing-key-path "${SIGNING_KEY_PATH:-/app/keys/token_deployer_private_key.json}" \
   --chain-id "${CHAIN_ID:-4321}" \
-  --max-concurrent "${MAX_CONC}" \
   --log-level "${LOG_LEVEL:-info}" \
   --rollup-config-path "${ROLLUP_CFG}" \
   "$@"
+
+if [ -n "${MAX_CONC}" ]; then
+  set -- --max-concurrent "${MAX_CONC}" "$@"
+fi
 
 if [ -n "${METHOD_ID:-}" ]; then
   set -- --method-id "${METHOD_ID}" "$@"
@@ -26,6 +29,10 @@ fi
 
 if [ -n "${DA_DB:-}" ]; then
   set -- --da-db "${DA_DB}" "$@"
+fi
+
+if [ -n "${PROVER_SERVICE_URL:-}" ]; then
+  set -- --prover-service-url "${PROVER_SERVICE_URL}" "$@"
 fi
 
 # Support both DEFER_SUBMISSION and DEFER_SEQUENCER_SUBMISSION
