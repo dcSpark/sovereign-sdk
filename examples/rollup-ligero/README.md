@@ -111,7 +111,7 @@ Arguments are forwarded to `run_rollup.sh`:
 
 ### Service Controller API
 
-The controller runs the same `run_all.sh` flow and provides HTTP endpoints to start/stop:
+The controller now manages each service script independently (`run_rollup.sh`, `run_verifier_service.sh`, etc.), and supports both global and per-service actions:
 
 ```bash
 cargo run -p sov-rollup-ligero --bin rollup-ligero-service-controller --release
@@ -122,11 +122,20 @@ curl -X POST http://127.0.0.1:9090/start
 curl -X POST http://127.0.0.1:9090/stop
 curl -X POST http://127.0.0.1:9090/restart
 curl -X POST http://127.0.0.1:9090/clean
+
+# Per-service controls
+curl -X POST http://127.0.0.1:9090/start/rollup
+curl -X POST http://127.0.0.1:9090/stop/verifier
+curl -X POST http://127.0.0.1:9090/restart/indexer
+curl -X POST http://127.0.0.1:9090/start/mcp
+
+# Discover known services and controller process status
+curl http://127.0.0.1:9090/services
 ```
 
 Notes:
 - Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
-- Auto-start services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
+- Auto-start default services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
 - `/clean` removes `demo_data` and only runs when services are stopped
 
 ### Linux Services

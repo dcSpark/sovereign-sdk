@@ -4,8 +4,9 @@ A modern, Midnight-styled React dashboard for monitoring and controlling the Rol
 
 ## Features
 
-- Real-time health monitoring of all services (rollup, verifier, fvk-service, indexer, mcp, prover)
-- Service control buttons (Start, Stop, Restart, Clean)
+- Real-time health monitoring of all services (rollup, verifier, fvk-service, indexer, mcp, prover, metrics, oracle)
+- Global service controls (Start All, Stop All, Restart All, Clean)
+- Per-service controls directly in the services table (Start/Stop/Restart by service id)
 - Auto-refresh with 5-second intervals
 - Response time / latency tracking
 - Midnight Network inspired dark theme
@@ -53,9 +54,13 @@ The dashboard communicates with these endpoints:
 | Endpoint    | Method     | Description                          |
 |-------------|------------|--------------------------------------|
 | `/health`   | GET        | Get health status of all services    |
-| `/start`    | POST/GET   | Start all services                   |
-| `/stop`     | POST/GET   | Stop all services                    |
-| `/restart`  | POST/GET   | Restart all services                 |
+| `/services` | GET        | Get controller-managed process state |
+| `/start`    | POST/GET   | Start default service set            |
+| `/stop`     | POST/GET   | Stop all running services            |
+| `/restart`  | POST/GET   | Restart default service set          |
+| `/start/:service`   | POST/GET | Start one service (`rollup`, `verifier`, `indexer`, `mcp`, `prover`, `metrics`, `oracle`, `fvk-service`) |
+| `/stop/:service`    | POST/GET | Stop one service |
+| `/restart/:service` | POST/GET | Restart one service |
 | `/clean`    | POST/GET   | Clean the demo_data directory        |
 
 ## Build for Production
@@ -100,8 +105,9 @@ The dashboard uses `/controller/` for API calls, which nginx already proxies to 
 | fvk-service | http://127.0.0.1:8088        | /health        |
 | indexer     | http://127.0.0.1:13100       | /health        |
 | mcp         | http://127.0.0.1:3000        | /health        |
-| mcp-2       | http://127.0.0.1:3001        | /health        |
 | prover      | http://127.0.0.1:1313        | /health        |
+| metrics     | http://127.0.0.1:13200       | /health        |
+| oracle      | http://127.0.0.1:8090        | /              |
 
 ## Design
 

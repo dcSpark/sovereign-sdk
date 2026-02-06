@@ -1,7 +1,10 @@
 export interface ServiceHealth {
+  id: string;
   name: string;
   url: string;
   status: string;
+  running: boolean;
+  pid?: number;
   error?: string;
   response_time_ms?: number;
 }
@@ -17,6 +20,20 @@ export type ActionType = 'start' | 'stop' | 'restart' | 'clean';
 export interface ActionResult {
   success: boolean;
   message: string;
+}
+
+export type EmaWindow = 's2' | 's5' | 'm1' | 'm5' | 'm15';
+
+export interface EmaMetricsResponse {
+  Accounts: number;
+  SendingAccounts: number;
+  TPS: number;
+  PeakTPS: number;
+  PeakTPSAtMs: number | null;
+  TokensPerSecond: number;
+  TotalDisclosureEvents: number;
+  TotalTokensInWallets: number;
+  TotalTransactions: number;
 }
 
 // Metrics API types

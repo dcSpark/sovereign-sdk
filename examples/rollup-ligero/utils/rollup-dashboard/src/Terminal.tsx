@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 
 interface LogLine {
   timestamp: string;
+  service: string;
   stream: 'stdout' | 'stderr';
   content: string;
 }
@@ -14,7 +15,8 @@ export function Terminal({ wsUrl = '/controller/logs' }: TerminalProps) {
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [connected, setConnected] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [filter, setFilter] = useState<'all' | 'stdout' | 'stderr'>('all');
+  const [streamFilter, setStreamFilter] = useState<'all' | 'stdout' | 'stderr'>('all');
+  const [serviceFilter, setServiceFilter] = useState<string>('all');
   const terminalRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -94,11 +96,23 @@ export function Terminal({ wsUrl = '/controller/logs' }: TerminalProps) {
 
   const clearLogs = () => {
     setLogs([]);
+    setServiceFilter('all');
   };
 
-  const filteredLogs = filter === 'all' 
-    ? logs 
-    : logs.filter((log) => log.stream === filter);
+  const availableServices = Array.from(
+    new Set(logs.map((log) => (log.service?.trim() ? log.service : 'unknown')))
+  ).sort((a, b) => a.localeCompare(b));
+
+  if (serviceFilter !== 'all' && !availableServices.includes(serviceFilter)) {
+    availableServices.unshift(serviceFilter);
+  }
+
+  const filteredLogs = logs.filter((log) => {
+    const resolvedService = log.service?.trim() ? log.service : 'unknown';
+    const matchesStream = streamFilter === 'all' || log.stream === streamFilter;
+    const matchesService = serviceFilter === 'all' || resolvedService === serviceFilter;
+    return matchesStream && matchesService;
+  });
 
   const formatTimestamp = (timestamp: string) => {
     try {
@@ -126,24 +140,39 @@ export function Terminal({ wsUrl = '/controller/logs' }: TerminalProps) {
         <div className="terminal-controls">
           <div className="filter-buttons">
             <button
-              className={`filter-btn ${filter === 'all' ? 'active' : ''}`}
-              onClick={() => setFilter('all')}
+              className={`filter-btn ${streamFilter === 'all' ? 'active' : ''}`}
+              onClick={() => setStreamFilter('all')}
             >
               All
             </button>
             <button
-              className={`filter-btn ${filter === 'stdout' ? 'active' : ''}`}
-              onClick={() => setFilter('stdout')}
+              className={`filter-btn ${streamFilter === 'stdout' ? 'active' : ''}`}
+              onClick={() => setStreamFilter('stdout')}
             >
               stdout
             </button>
             <button
-              className={`filter-btn ${filter === 'stderr' ? 'active' : ''}`}
-              onClick={() => setFilter('stderr')}
+              className={`filter-btn ${streamFilter === 'stderr' ? 'active' : ''}`}
+              onClick={() => setStreamFilter('stderr')}
             >
               stderr
             </button>
           </div>
+          <label className="service-filter-label">
+            <span>Service</span>
+            <select
+              className="service-filter-select"
+              value={serviceFilter}
+              onChange={(e) => setServiceFilter(e.target.value)}
+            >
+              <option value="all">All services</option>
+              {availableServices.map((service) => (
+                <option key={service} value={service}>
+                  {service}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="auto-scroll-toggle">
             <input
               type="checkbox"
@@ -168,6 +197,7 @@ export function Terminal({ wsUrl = '/controller/logs' }: TerminalProps) {
           filteredLogs.map((log, index) => (
             <div key={index} className={`log-line ${log.stream}`}>
               <span className="log-timestamp">{formatTimestamp(log.timestamp)}</span>
+              <span className="log-service">{log.service || '-'}</span>
               <span className={`log-stream ${log.stream}`}>{log.stream}</span>
               <span className="log-content">{log.content}</span>
             </div>

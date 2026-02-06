@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { HealthResponse, ActionType, ActionResult, MetricsData } from './types';
-import { fetchHealth, performAction, fetchMetrics } from './api';
-import { MetricsCharts } from './MetricsCharts';
+import type { HealthResponse, ActionType, ActionResult, EmaMetricsResponse, EmaWindow } from './types';
+import { fetchHealth, performAction, fetchEmaMetrics } from './api';
 import { SystemStatsPanel } from './SystemStats';
 import { Terminal } from './Terminal';
 import './styles.css';
@@ -31,12 +30,22 @@ function DashboardRow({ title, children, defaultExpanded = true, badge, badgeCol
   );
 }
 
+const EMA_WINDOW_OPTIONS: Array<{ value: EmaWindow; label: string }> = [
+  { value: 's2', label: '2s' },
+  { value: 's5', label: '5s' },
+  { value: 'm1', label: '1m' },
+  { value: 'm5', label: '5m' },
+  { value: 'm15', label: '15m' },
+];
+
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [metrics, setMetrics] = useState<MetricsData | null>(null);
+  const [l2Metrics, setL2Metrics] = useState<EmaMetricsResponse | null>(null);
+  const [l2MetricsWindow, setL2MetricsWindow] = useState<EmaWindow>('m1');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [actionLoading, setActionLoading] = useState<ActionType | null>(null);
+  const [l2MetricsError, setL2MetricsError] = useState<string | null>(null);
+  const [actionLoadingKey, setActionLoadingKey] = useState<string | null>(null);
   const [actionResult, setActionResult] = useState<ActionResult | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [refreshInterval, setRefreshInterval] = useState(5000);
@@ -53,29 +62,38 @@ function App() {
     }
   }, []);
 
-  const loadMetrics = useCallback(async () => {
-    const data = await fetchMetrics();
-    setMetrics(data);
-  }, []);
+  const loadL2Metrics = useCallback(async () => {
+    try {
+      const data = await fetchEmaMetrics(l2MetricsWindow);
+      setL2Metrics(data);
+      setL2MetricsError(data ? null : 'EMA metrics unavailable');
+    } catch (err) {
+      setL2Metrics(null);
+      setL2MetricsError(err instanceof Error ? err.message : 'Failed to fetch EMA metrics');
+    }
+  }, [l2MetricsWindow]);
 
   useEffect(() => {
     loadHealth();
-    loadMetrics();
+    loadL2Metrics();
     if (autoRefresh) {
       const interval = setInterval(() => {
         loadHealth();
-        loadMetrics();
+        loadL2Metrics();
       }, refreshInterval);
       return () => clearInterval(interval);
     }
-  }, [loadHealth, loadMetrics, autoRefresh, refreshInterval]);
+  }, [loadHealth, loadL2Metrics, autoRefresh, refreshInterval]);
 
-  const handleAction = async (action: ActionType) => {
-    setActionLoading(action);
+  const actionKey = (action: ActionType, serviceId?: string) => `${action}:${serviceId ?? 'all'}`;
+
+  const handleAction = async (action: ActionType, serviceId?: string) => {
+    const key = actionKey(action, serviceId);
+    setActionLoadingKey(key);
     setActionResult(null);
-    const result = await performAction(action);
+    const result = await performAction(action, serviceId);
     setActionResult(result);
-    setActionLoading(null);
+    setActionLoadingKey(null);
     setTimeout(loadHealth, 1000);
   };
 
@@ -95,6 +113,11 @@ function App() {
     return `${ms.toFixed(0)}ms`;
   };
 
+  const formatProcessState = (running: boolean, pid?: number) => {
+    if (!running) return 'stopped';
+    return pid ? `managed (pid ${pid})` : 'managed';
+  };
+
   const formatNumber = (value: number | undefined | null, decimals: number = 2): string => {
     if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     if (Math.abs(value) >= 1_000_000) {
@@ -106,28 +129,9 @@ function App() {
     return value.toFixed(decimals);
   };
 
-  const formatPercent = (value: number | undefined | null): string => {
-    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
-    return `${value.toFixed(2)}%`;
-  };
-
   const formatTps = (value: number | undefined | null): string => {
     if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
     return value.toFixed(3);
-  };
-
-  const formatTokenAmount = (value: number | undefined | null): string => {
-    if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) return '-';
-    if (Math.abs(value) >= 1_000_000) {
-      return `${(value / 1_000_000).toFixed(2)}M`;
-    }
-    if (Math.abs(value) >= 1_000) {
-      return `${(value / 1_000).toFixed(2)}K`;
-    }
-    if (Math.abs(value) >= 1) {
-      return value.toFixed(2);
-    }
-    return value.toFixed(4);
   };
 
   const healthyCount = health?.services.filter(s => s.status === 'healthy').length ?? 0;
@@ -175,7 +179,7 @@ function App() {
               />
               <span className="toggle-slider" />
             </label>
-            <button className="icon-btn refresh" onClick={() => { loadHealth(); loadMetrics(); }} disabled={loading}>
+            <button className="icon-btn refresh" onClick={() => { loadHealth(); loadL2Metrics(); }} disabled={loading}>
               <span className={loading ? 'spinning' : ''}>↻</span>
             </button>
           </div>
@@ -210,34 +214,34 @@ function App() {
                   <button
                     className="control-btn start"
                     onClick={() => handleAction('start')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoadingKey !== null}
                   >
                     <span className="btn-icon">▶</span>
-                    {actionLoading === 'start' ? 'Starting...' : 'Start'}
+                    {actionLoadingKey === actionKey('start') ? 'Starting...' : 'Start All'}
                   </button>
                   <button
                     className="control-btn stop"
                     onClick={() => handleAction('stop')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoadingKey !== null}
                   >
                     <span className="btn-icon">■</span>
-                    {actionLoading === 'stop' ? 'Stopping...' : 'Stop'}
+                    {actionLoadingKey === actionKey('stop') ? 'Stopping...' : 'Stop All'}
                   </button>
                   <button
                     className="control-btn restart"
                     onClick={() => handleAction('restart')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoadingKey !== null}
                   >
                     <span className="btn-icon">↻</span>
-                    {actionLoading === 'restart' ? 'Restarting...' : 'Restart'}
+                    {actionLoadingKey === actionKey('restart') ? 'Restarting...' : 'Restart All'}
                   </button>
                   <button
                     className="control-btn clean"
                     onClick={() => handleAction('clean')}
-                    disabled={actionLoading !== null}
+                    disabled={actionLoadingKey !== null}
                   >
                     <span className="btn-icon">🗑</span>
-                    {actionLoading === 'clean' ? 'Cleaning...' : 'Clean Data'}
+                    {actionLoadingKey === actionKey('clean') ? 'Cleaning...' : 'Clean Data'}
                   </button>
                 </div>
                 {actionResult && (
@@ -248,41 +252,59 @@ function App() {
               </div>
             </DashboardRow>
 
-            {/* Row: Quick Stats Overview */}
-            <DashboardRow title="Overview" defaultExpanded={true}>
+            {/* Row: L2 Metrics */}
+            <DashboardRow title="L2 Metrics" defaultExpanded={true}>
+              <div className="charts-header">
+                <div className="time-range-selector">
+                  {EMA_WINDOW_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      className={`time-range-btn ${l2MetricsWindow === option.value ? 'active' : ''}`}
+                      onClick={() => setL2MetricsWindow(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {l2MetricsError && (
+                <div className="panel-error">EMA metrics unavailable: {l2MetricsError}</div>
+              )}
               <div className="overview-panels">
-                {/* Key Metrics Stats */}
                 <div className="stat-panel highlight">
                   <div className="stat-panel-label">TPS</div>
-                  <div className="stat-panel-value">{formatTps(metrics?.tps?.tps)}</div>
+                  <div className="stat-panel-value">{formatTps(l2Metrics?.TPS)}</div>
                   <div className="stat-panel-subtext">transactions/sec</div>
                 </div>
                 <div className="stat-panel">
-                  <div className="stat-panel-label">Total Transactions</div>
-                  <div className="stat-panel-value">{formatNumber(metrics?.totalTransactions?.total_transactions, 0)}</div>
+                  <div className="stat-panel-label">Peak TPS</div>
+                  <div className="stat-panel-value">{formatTps(l2Metrics?.PeakTPS)}</div>
+                  <div className="stat-panel-subtext">local peak</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Accounts</div>
+                  <div className="stat-panel-value">{formatNumber(l2Metrics?.Accounts, 0)}</div>
+                  <div className="stat-panel-subtext">total</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Sending Accounts</div>
+                  <div className="stat-panel-value">{formatNumber(l2Metrics?.SendingAccounts, 0)}</div>
+                  <div className="stat-panel-subtext">active senders</div>
+                </div>
+                <div className="stat-panel">
+                  <div className="stat-panel-label">Disclosure Events</div>
+                  <div className="stat-panel-value">{formatNumber(l2Metrics?.TotalDisclosureEvents, 0)}</div>
                   <div className="stat-panel-subtext">cumulative</div>
                 </div>
                 <div className="stat-panel">
-                  <div className="stat-panel-label">Failed Rate</div>
-                  <div className={`stat-panel-value ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
-                    {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
-                  </div>
-                  <div className="stat-panel-subtext">failure rate</div>
+                  <div className="stat-panel-label">Tokens In Wallets</div>
+                  <div className="stat-panel-value">{formatNumber(l2Metrics?.TotalTokensInWallets, 0)}</div>
+                  <div className="stat-panel-subtext">total tokens</div>
                 </div>
                 <div className="stat-panel">
-                  <div className="stat-panel-label">Value Spent (24h)</div>
-                  <div className="stat-panel-value">{formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}</div>
-                  <div className="stat-panel-subtext">tokens</div>
-                </div>
-                <div className="stat-panel">
-                  <div className="stat-panel-label">Avg Tx Size</div>
-                  <div className="stat-panel-value">{formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}</div>
-                  <div className="stat-panel-subtext">tokens (24h)</div>
-                </div>
-                <div className="stat-panel">
-                  <div className="stat-panel-label">Token Velocity</div>
-                  <div className="stat-panel-value">{formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}</div>
-                  <div className="stat-panel-subtext">turnover rate</div>
+                  <div className="stat-panel-label">Total Transactions</div>
+                  <div className="stat-panel-value">{formatNumber(l2Metrics?.TotalTransactions, 0)}</div>
+                  <div className="stat-panel-subtext">cumulative</div>
                 </div>
               </div>
             </DashboardRow>
@@ -306,10 +328,12 @@ function App() {
                     <div className="col-name">Service</div>
                     <div className="col-endpoint">Endpoint</div>
                     <div className="col-latency">Latency</div>
+                    <div className="col-process">Process</div>
+                    <div className="col-actions">Actions</div>
                     <div className="col-error">Error</div>
                   </div>
                   {health.services.map((service) => (
-                    <div key={service.name} className={`table-row ${getStatusColor(service.status)}`}>
+                    <div key={service.id} className={`table-row ${getStatusColor(service.status)}`}>
                       <div className="col-status">
                         <span className="status-indicator-dot" />
                       </div>
@@ -318,106 +342,37 @@ function App() {
                         <code>{service.url}</code>
                       </div>
                       <div className="col-latency">{formatResponseTime(service.response_time_ms)}</div>
+                      <div className="col-process">{formatProcessState(service.running, service.pid)}</div>
+                      <div className="col-actions">
+                        <div className="service-actions">
+                          <button
+                            className="service-action-btn start"
+                            onClick={() => handleAction('start', service.id)}
+                            disabled={actionLoadingKey !== null || service.running}
+                          >
+                            {actionLoadingKey === actionKey('start', service.id) ? '...' : 'Start'}
+                          </button>
+                          <button
+                            className="service-action-btn stop"
+                            onClick={() => handleAction('stop', service.id)}
+                            disabled={actionLoadingKey !== null || !service.running}
+                          >
+                            {actionLoadingKey === actionKey('stop', service.id) ? '...' : 'Stop'}
+                          </button>
+                          <button
+                            className="service-action-btn restart"
+                            onClick={() => handleAction('restart', service.id)}
+                            disabled={actionLoadingKey !== null}
+                          >
+                            {actionLoadingKey === actionKey('restart', service.id) ? '...' : 'Restart'}
+                          </button>
+                        </div>
+                      </div>
                       <div className="col-error">{service.error || '-'}</div>
                     </div>
                   ))}
                 </div>
               </div>
-            </DashboardRow>
-
-            {/* Row: Network Metrics Details */}
-            <DashboardRow title="Network Metrics" defaultExpanded={false}>
-              <div className="metrics-detail-panel">
-                {metrics?.error ? (
-                  <div className="panel-error">Metrics unavailable: {metrics.error}</div>
-                ) : (
-                  <div className="metrics-detail-grid">
-                    {/* TPS Details */}
-                    <div className="metric-detail-card">
-                      <div className="metric-card-header">
-                        <span className="metric-icon">⚡</span>
-                        <h3>Transactions Per Second</h3>
-                      </div>
-                      <div className="metric-big-value">{formatTps(metrics?.tps?.tps)}</div>
-                      <div className="metric-card-stats">
-                        <div className="stat-row">
-                          <span className="stat-label">Delta Transactions</span>
-                          <span className="stat-value">{formatNumber(metrics?.tps?.delta_transactions, 0)}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Transaction Size */}
-                    <div className="metric-detail-card">
-                      <div className="metric-card-header">
-                        <span className="metric-icon">📏</span>
-                        <h3>Transaction Sizes</h3>
-                      </div>
-                      <div className="metric-card-stats">
-                        <div className="stat-row">
-                          <span className="stat-label">Average (24h)</span>
-                          <span className="stat-value">{formatTokenAmount(metrics?.averageTransactionSize?.average_amount)}</span>
-                        </div>
-                        <div className="stat-row">
-                          <span className="stat-label">Median (24h)</span>
-                          <span className="stat-value">{formatTokenAmount(metrics?.medianTransactionSize?.median_amount)}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Token Economics */}
-                    <div className="metric-detail-card">
-                      <div className="metric-card-header">
-                        <span className="metric-icon">💰</span>
-                        <h3>Token Economics</h3>
-                      </div>
-                      <div className="metric-card-stats">
-                        <div className="stat-row">
-                          <span className="stat-label">Value Spent (24h)</span>
-                          <span className="stat-value">{formatTokenAmount(metrics?.tokenValueSpent?.value_spent)}</span>
-                        </div>
-                        <div className="stat-row">
-                          <span className="stat-label">Token Velocity</span>
-                          <span className="stat-value">{formatNumber(metrics?.tokenVelocity?.token_velocity, 4)}</span>
-                        </div>
-                        <div className="stat-row">
-                          <span className="stat-label">Total Supply</span>
-                          <span className="stat-value">{formatTokenAmount(metrics?.tokenVelocity?.total_tokens)}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Failed Transactions */}
-                    <div className="metric-detail-card">
-                      <div className="metric-card-header">
-                        <span className="metric-icon">⚠️</span>
-                        <h3>Transaction Health</h3>
-                      </div>
-                      <div className="metric-card-stats">
-                        <div className="stat-row">
-                          <span className="stat-label">Failure Rate</span>
-                          <span className={`stat-value ${(metrics?.failedTransactionsRate?.rate_percent ?? 0) > 5 ? 'warning' : ''}`}>
-                            {formatPercent(metrics?.failedTransactionsRate?.rate_percent)}
-                          </span>
-                        </div>
-                        <div className="stat-row">
-                          <span className="stat-label">Failed Txs</span>
-                          <span className="stat-value">{formatNumber(metrics?.failedTransactionsRate?.failed_transactions, 0)}</span>
-                        </div>
-                        <div className="stat-row">
-                          <span className="stat-label">Total Txs</span>
-                          <span className="stat-value">{formatNumber(metrics?.failedTransactionsRate?.total_transactions, 0)}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </DashboardRow>
-
-            {/* Row: Historic Charts */}
-            <DashboardRow title="Historic Data" defaultExpanded={true}>
-              <MetricsCharts autoRefresh={autoRefresh} />
             </DashboardRow>
 
             {/* Row: Service Logs */}

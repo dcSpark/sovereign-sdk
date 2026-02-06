@@ -146,7 +146,10 @@ fn parallel_tx_failures_map() -> &'static StdMutex<HashMap<TxHash, ErrorObject>>
 }
 
 pub(crate) fn cache_parallel_tx_failure(tx_hash: TxHash, err: ErrorObject) {
-    let _ = parallel_tx_failures_map().lock().unwrap().insert(tx_hash, err);
+    let _ = parallel_tx_failures_map()
+        .lock()
+        .unwrap()
+        .insert(tx_hash, err);
 }
 
 pub(crate) fn take_parallel_tx_failure(tx_hash: &TxHash) -> Option<ErrorObject> {
