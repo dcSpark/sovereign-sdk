@@ -31,6 +31,11 @@ const BROADCAST_CAPACITY: usize = 256;
 
 /// Databases cleaned by `/clean-database`
 const CLEAN_DATABASES: [&str; 4] = ["da", "indexer", "fvk", "mcp_sessions"];
+const ROLLUP_HEALTH_PATH: &str = "/healthcheck";
+const ROLLUP_DEFAULT_URL: &str = "http://127.0.0.1:12346";
+const ROLLUP_HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
+const ROLLUP_HEALTH_POLL_INTERVAL_MS: u64 = 500;
+const DEFAULT_ROLLUP_HEALTH_WAIT_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Copy)]
 enum StartMode {
@@ -771,6 +776,102 @@ async fn start_single_service(
     Ok(message)
 }
 
+fn rollup_health_wait_timeout() -> Duration {
+    std::env::var("SERVICE_CONTROLLER_ROLLUP_HEALTH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_ROLLUP_HEALTH_WAIT_TIMEOUT_SECS))
+}
+
+async fn ensure_rollup_healthy_for_start(
+    app: &Arc<AppState>,
+    target_service: &'static ManagedServiceDefinition,
+    wait_for_rollup_health: bool,
+) -> Result<(), ApiError> {
+    if target_service.id == "rollup" {
+        return Ok(());
+    }
+
+    if !service_is_remote("rollup") {
+        let rollup_running = {
+            let mut state = app.state.lock().await;
+            state.refresh_service("rollup")
+        };
+        if !rollup_running {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "Cannot start '{}' because rollup is not running",
+                    target_service.id
+                ),
+            ));
+        }
+    }
+
+    let rollup_base_url = resolve_service_url("rollup", "ROLLUP_RPC_URL", ROLLUP_DEFAULT_URL);
+    let rollup_health_url = format!("{rollup_base_url}{ROLLUP_HEALTH_PATH}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(ROLLUP_HEALTH_CHECK_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create rollup health-check client: {err}"),
+            )
+        })?;
+
+    if !wait_for_rollup_health {
+        return check_service_health(&client, &rollup_health_url)
+            .await
+            .map_err(|err| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot start '{}' because rollup is not healthy at {} ({})",
+                        target_service.id, rollup_health_url, err
+                    ),
+                )
+            });
+    }
+
+    let timeout_duration = rollup_health_wait_timeout();
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        match check_service_health(&client, &rollup_health_url).await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "Cannot start '{}' because rollup did not become healthy within {}s at {} ({})",
+                            target_service.id,
+                            timeout_duration.as_secs(),
+                            rollup_health_url,
+                            err
+                        ),
+                    ));
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(ROLLUP_HEALTH_POLL_INTERVAL_MS)).await;
+    }
+}
+
+async fn guarded_start_single_service(
+    app: &Arc<AppState>,
+    service: &'static ManagedServiceDefinition,
+    wait_for_rollup_health: bool,
+) -> ApiResult {
+    ensure_rollup_healthy_for_start(app, service, wait_for_rollup_health).await?;
+    start_single_service(app, service).await
+}
+
 async fn stop_single_service(
     app: &Arc<AppState>,
     service: &'static ManagedServiceDefinition,
@@ -883,9 +984,14 @@ async fn start(State(app): State<Arc<AppState>>) -> ApiResult {
     let mut already_running = Vec::new();
 
     for service in services_to_start {
-        match start_single_service(&app, service).await {
+        match guarded_start_single_service(&app, service, true).await {
             Ok(_) => started.push(service.id),
-            Err(err) if err.status == StatusCode::CONFLICT => already_running.push(service.id),
+            Err(err)
+                if err.status == StatusCode::CONFLICT
+                    && err.message.contains("already running") =>
+            {
+                already_running.push(service.id)
+            }
             Err(err) => {
                 return Err(ApiError::new(
                     err.status,
@@ -928,7 +1034,7 @@ async fn start(State(app): State<Arc<AppState>>) -> ApiResult {
 async fn start_service(Path(service): Path<String>, State(app): State<Arc<AppState>>) -> ApiResult {
     let service = resolve_managed_service(&service)?;
     maybe_clear_logs_on_fresh_start(&app).await;
-    start_single_service(&app, service).await
+    guarded_start_single_service(&app, service, false).await
 }
 
 async fn stop(State(app): State<Arc<AppState>>) -> ApiResult {
@@ -1004,7 +1110,7 @@ async fn restart_service(
         Err(err) => return Err(err),
     }
 
-    start_single_service(&app, service).await
+    guarded_start_single_service(&app, service, false).await
 }
 
 async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
