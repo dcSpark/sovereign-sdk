@@ -88,7 +88,7 @@ RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && chown -R mcp:mcp /app /opt/ligero
 
 ENV MCP_SERVER_BIND_ADDRESS=0.0.0.0:3000 \
-    LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:1313 \
+    LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:8080 \
     LIGERO_PROGRAM_PATH=note_spend_guest \
     RUST_LOG=info
 

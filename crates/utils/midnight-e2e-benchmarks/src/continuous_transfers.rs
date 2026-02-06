@@ -115,7 +115,7 @@ struct ContinuousConfig {
     cycle_delay_ms: u64,
     external_node_url: Option<String>,
     external_verifier_url: Option<String>,
-    /// Optional URL of the prover service (e.g., http://127.0.0.1:1313).
+    /// Optional URL of the prover service (e.g., http://127.0.0.1:8080).
     /// When set, proofs are generated via HTTP calls to this service instead of
     /// the local daemon pool. This allows offloading proving to a remote GPU server.
     prover_service_url: Option<String>,
@@ -194,12 +194,12 @@ impl ContinuousConfig {
             .ok()
             .or_else(|| Some("http://localhost:8080".to_string()));
 
-        // Prover service URL for remote proving (defaults to http://127.0.0.1:1313).
+        // Prover service URL for remote proving (defaults to http://127.0.0.1:8080).
         // Set PROVER_SERVICE_URL="" to use local daemon pool instead.
         let prover_service_url = std::env::var("PROVER_SERVICE_URL")
             .ok()
             .map(|v| if v.is_empty() { None } else { Some(v) })
-            .unwrap_or_else(|| Some("http://127.0.0.1:1313".to_string()));
+            .unwrap_or_else(|| Some("http://127.0.0.1:8080".to_string()));
 
         let max_concurrent_proofs = std::env::var("MAX_CONCURRENT_PROOFS")
             .ok()

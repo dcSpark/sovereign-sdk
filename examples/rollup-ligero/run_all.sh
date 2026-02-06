@@ -232,14 +232,6 @@ fi
 METRICS_HOST_NORMALIZED="$(normalize_host "$METRICS_HOST")"
 export METRICS_API_URL="${METRICS_API_URL:-http://${METRICS_HOST_NORMALIZED}:${METRICS_PORT}}"
 
-PROVER_BIND="${PROVER_BIND_ADDR:-0.0.0.0:1313}"
-PROVER_HOST="${PROVER_BIND%:*}"
-PROVER_PORT="${PROVER_BIND##*:}"
-if [[ "$PROVER_HOST" == "$PROVER_PORT" ]]; then
-  PROVER_HOST="$PROVER_BIND"
-  PROVER_PORT="1313"
-fi
-
 # Support both DEFER_SUBMISSION and DEFER_SEQUENCER_SUBMISSION
 if [[ -n "${DEFER_SUBMISSION:-}" && -z "${DEFER_SEQUENCER_SUBMISSION:-}" ]]; then
   export DEFER_SEQUENCER_SUBMISSION="$DEFER_SUBMISSION"
@@ -276,10 +268,6 @@ wait_for_port "indexer" "$INDEXER_HOST" "$INDEXER_PORT" "$LAST_PID"
 echo "Starting mcp..."
 start_service "mcp" bash "$SCRIPT_DIR/run_mcp.sh"
 wait_for_port "mcp" "$MCP_HOST" "$MCP_PORT" "$LAST_PID"
-
-echo "Starting prover..."
-start_service "prover" bash "$SCRIPT_DIR/run_prover.sh"
-wait_for_port "prover" "$PROVER_HOST" "$PROVER_PORT" "$LAST_PID"
 
 echo "Starting metrics..."
 start_service "metrics" bash "$SCRIPT_DIR/run_metrics.sh"

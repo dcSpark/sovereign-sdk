@@ -100,7 +100,7 @@ cargo build --release
 ./target/release/proof-verifier \
     --bind 0.0.0.0:8080 \
     --node-rpc-url http://127.0.0.1:12346 \
-    --prover-service-url http://localhost:1313 \
+    --prover-service-url http://localhost:8080 \
     --signing-key-path ../test-data/keys/token_deployer_private_key.json \
     --method-id 0x1234... \
     --midnight-method-id 0xabcd... \
@@ -121,7 +121,7 @@ export MIDNIGHT_METHOD_ID="0x..."
 # Optional override; if unset, defaults to CPU core count.
 export MAX_CONCURRENT_VERIFICATIONS="5"
 # Optional: use external ligero-http-server instead of local daemon pools.
-export PROVER_SERVICE_URL="http://127.0.0.1:1313"
+export PROVER_SERVICE_URL="http://127.0.0.1:8080"
 export LOG_LEVEL="info"
 # Optional: enforce pool-signed viewing + require ciphertext bytes for Transfer/Withdraw
 export POOL_FVK_PK="0x<32-byte-ed25519-public-key-hex>"

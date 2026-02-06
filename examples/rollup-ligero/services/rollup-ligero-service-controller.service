@@ -23,7 +23,6 @@ Environment="MIDNIGHT_FVK_SERVICE_URL=http://127.0.0.1:8088"
 Environment="INDEXER_BIND=http://127.0.0.1:13100"
 Environment="MCP_SERVER_BIND_ADDRESS=http://127.0.0.1:3000"
 Environment="MCP_SERVER_BIND_ADDRESS_2=http://127.0.0.1:3001"
-Environment="PROVER_BIND_ADDR=http://127.0.0.1:1313"
 Environment="METRICS_API_BIND=http://127.0.0.1:13200"
 
 # FVK service signing keys
@@ -35,6 +34,13 @@ Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=ADMIN_TOKEN"
 # Auto-funding configuration
 Environment="AUTO_FUND_DEPOSIT_AMOUNT=100"
 Environment="AUTO_FUND_GAS_RESERVE=1000000"
+
+# PostgreSQL connection string used by /clean-database
+#Environment="DA_CONNECTION_STRING=postgresql://admin:1234@localhost:5432/da"
+
+# TEE reset endpoint configuration (used by dashboard "Reset TEE" button)
+#Environment="TEE_RESET_URL=http://74.235.106.62:9898/reset"
+#Environment="TEE_RESET_BEARER_TOKEN=REPLACE_WITH_SECRET_TOKEN"
 
 # Defer sequencer submission
 #Environment="DEFER_SUBMISSION=1"

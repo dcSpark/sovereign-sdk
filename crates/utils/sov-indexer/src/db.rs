@@ -837,13 +837,15 @@ pub async fn list_wallet_txs(
                 continue;
             };
             let decrypted_notes = resolve_decrypted_notes(vfk, md.encrypted_notes.as_ref());
-            let privacy_recipient = md
-                .recipient
-                .clone()
-                .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
+            let privacy_recipient = md.recipient.clone().or_else(|| {
+                viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
+            });
             let matches = if address_is_privacy {
                 privacy_recipient.as_deref() == Some(normalized_address.as_str())
-                    || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address)
+                    || decrypted_notes_match_recipient(
+                        decrypted_notes.as_ref(),
+                        &normalized_address,
+                    )
             } else {
                 md.sender.as_deref() == Some(address)
             };
@@ -1021,11 +1023,11 @@ pub async fn list_wallet_txs(
                 .privacy_sender
                 .clone()
                 .or_else(|| viewer::extract_sender_from_decrypted_notes(decrypted_notes.as_ref()));
-            let privacy_recipient = mt
-                .recipient
-                .clone()
-                .or_else(|| viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref()));
-            let matches_recipient = privacy_recipient.as_deref() == Some(normalized_address.as_str())
+            let privacy_recipient = mt.recipient.clone().or_else(|| {
+                viewer::extract_recipient_from_decrypted_notes(decrypted_notes.as_ref())
+            });
+            let matches_recipient = privacy_recipient.as_deref()
+                == Some(normalized_address.as_str())
                 || decrypted_notes_match_recipient(decrypted_notes.as_ref(), &normalized_address);
             let matches_sender = privacy_sender.as_deref() == Some(normalized_address.as_str());
             let matches = if address_is_privacy {

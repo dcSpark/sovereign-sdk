@@ -30,7 +30,7 @@ Note: the first request for a new session must be the MCP `initialize` request.
 
 - Rust toolchain
 - Running Sovereign SDK L2 rollup node
-- Ligero proof service (`ligero-http-server`) running (default: `http://127.0.0.1:1313`)
+- Ligero proof service (`ligero-http-server`) running (default: `http://127.0.0.1:8080`)
 
 ### Configuration
 
@@ -43,7 +43,7 @@ Configure the following environment variables:
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
-- `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:1313`)
+- `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:8080`)
 - `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
 - `PRIVPOOL_SPEND_KEY` - Deprecated/ignored (use `restoreWallet` per session)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
@@ -156,7 +156,7 @@ Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be repo
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
-- `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:1313`)
+- `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:8080`)
 - `LIGERO_PROGRAM_PATH` (defaults to `note_spend_guest`)
 
 Set `RUST_LOG=debug` for verbose logging during development.
