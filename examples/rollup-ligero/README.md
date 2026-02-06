@@ -130,12 +130,14 @@ curl -X POST http://127.0.0.1:9090/start/rollup
 curl -X POST http://127.0.0.1:9090/stop/worker
 curl -X POST http://127.0.0.1:9090/restart/indexer
 curl -X POST http://127.0.0.1:9090/start/mcp
+curl -X POST http://127.0.0.1:9090/start/proof-pool
 
 # Discover known services and controller process status
 curl http://127.0.0.1:9090/services
 ```
 
 Notes:
+- Managed service IDs: `oracle`, `rollup`, `worker`, `fvk`, `indexer`, `proof-pool`, `mcp`, `metrics`
 - Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
 - Auto-start default services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
 - Per-service remote mode:

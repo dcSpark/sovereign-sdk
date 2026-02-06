@@ -47,7 +47,7 @@ struct ManagedServiceDefinition {
     start_mode: StartMode,
 }
 
-const MANAGED_SERVICES: [ManagedServiceDefinition; 7] = [
+const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
     ManagedServiceDefinition {
         id: "oracle",
         display_name: "oracle",
@@ -76,6 +76,12 @@ const MANAGED_SERVICES: [ManagedServiceDefinition; 7] = [
         id: "indexer",
         display_name: "indexer",
         script: "run_indexer.sh",
+        start_mode: StartMode::Always,
+    },
+    ManagedServiceDefinition {
+        id: "proof-pool",
+        display_name: "proof pool",
+        script: "run_proof_pool.sh",
         start_mode: StartMode::Always,
     },
     ManagedServiceDefinition {
@@ -115,6 +121,11 @@ fn service_config_names(service_id: &str) -> Vec<String> {
         "fvk" => {
             names.push("fvk-service".to_string());
             names.push("fvk_service".to_string());
+        }
+        "proof-pool" => {
+            names.push("proofpool".to_string());
+            names.push("proof-pool-service".to_string());
+            names.push("midnight-proof-pool-service".to_string());
         }
         _ => {}
     }
@@ -180,6 +191,12 @@ fn find_managed_service(service: &str) -> Option<&'static ManagedServiceDefiniti
     let normalized = service.trim().to_ascii_lowercase();
     let canonical = match normalized.as_str() {
         "verifier" | "proof-verifier" => "worker",
+        "proof pool"
+        | "proof_pool"
+        | "proofpool"
+        | "proof-pool-service"
+        | "midnight-proof-pool-service"
+        | "midnight_proof_pool_service" => "proof-pool",
         other => other,
     };
 
@@ -1455,7 +1472,8 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             optional_env: None,
         },
         ServiceDefinition {
-            name: "midnight-proof-pool-service",
+            id: "proof-pool",
+            name: "proof pool",
             env_var: "PROOF_POOL_BIND_ADDR",
             default_url: "http://127.0.0.1:11235",
             health_path: "/health",
