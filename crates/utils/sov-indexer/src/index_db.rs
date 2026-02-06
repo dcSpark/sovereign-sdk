@@ -350,6 +350,10 @@ pub mod notes_nullifiers {
         #[sea_orm(column_type = "TimestampWithTimeZone", nullable)]
         pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 
+        /// Rollup height where this note commitment was queued (from NoteCreatedAtHeight event)
+        #[sea_orm(column_type = "BigInteger", nullable)]
+        pub created_rollup_height: Option<i64>,
+
         /// Kind of creating tx: deposit / transfer / withdraw
         #[sea_orm(column_type = "Text", nullable)]
         pub created_kind: Option<String>,
@@ -369,6 +373,47 @@ pub mod notes_nullifiers {
         /// Kind of spending tx: transfer / withdraw
         #[sea_orm(column_type = "Text", nullable)]
         pub spent_kind: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Canonical note-creation index used for commitment-tree reconstruction.
+///
+/// This stores only the minimum fields required for deterministic ordering:
+/// `(rollup_height, cm)`, plus optional tx metadata for observability.
+pub mod midnight_note_created {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "midnight_note_created")]
+    pub struct Model {
+        /// Internal monotonic row id (used as incremental cursor).
+        #[sea_orm(primary_key)]
+        pub id: i64,
+
+        /// Note commitment (32 bytes hex, no 0x prefix).
+        #[sea_orm(column_type = "String(StringLen::N(64))", unique)]
+        pub cm: String,
+
+        /// Rollup height where the commitment was queued.
+        #[sea_orm(column_type = "BigInteger")]
+        pub rollup_height: i64,
+
+        /// Creating tx hash (optional metadata).
+        #[sea_orm(column_type = "Text", nullable)]
+        pub created_tx_hash: Option<String>,
+
+        /// Creating tx timestamp (optional metadata).
+        #[sea_orm(column_type = "TimestampWithTimeZone", nullable)]
+        pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+
+        /// Creating tx kind (optional metadata).
+        #[sea_orm(column_type = "Text", nullable)]
+        pub created_kind: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

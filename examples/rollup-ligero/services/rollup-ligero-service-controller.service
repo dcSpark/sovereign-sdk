@@ -32,7 +32,7 @@ Environment="POOL_FVK_PK=PUBLIC_KEY"
 Environment="MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN=ADMIN_TOKEN"
 
 # Auto-funding configuration
-Environment="AUTO_FUND_DEPOSIT_AMOUNT=100"
+Environment="AUTO_FUND_DEPOSIT_AMOUNT=1000"
 Environment="AUTO_FUND_GAS_RESERVE=1000000"
 
 # PostgreSQL connection string used by /clean-database

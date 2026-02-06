@@ -74,7 +74,7 @@ background services on Linux.
   - `POST /clean`: Remove the `demo_data` directory
   - `POST /clean-database`: Drop all tables with `CASCADE` from `da`, `indexer`, `fvk`, `mcp_sessions`
   - `POST /reset-tee`: Trigger TEE reset on the configured upstream endpoint
-  - `GET /health`: Check health of all services (rollup, worker, indexer, mcp, fvk)
+  - `GET /health`: Check health of all services (`oracle`, `rollup`, `worker`, `fvk`, `indexer`, `proof-pool`, `mcp`, `metrics`)
   - Note: `clean`, `clean-database`, and `reset-tee` require all managed services to be stopped
   Configure via environment variables:
   - `SERVICE_CONTROLLER_BIND`: Bind address (default: `127.0.0.1:9090`)

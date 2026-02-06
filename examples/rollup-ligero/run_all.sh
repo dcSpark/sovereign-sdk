@@ -28,6 +28,186 @@ normalize_host() {
   echo "$host"
 }
 
+is_postgres_url() {
+  local url="$1"
+  [[ "$url" == postgres://* || "$url" == postgresql://* ]]
+}
+
+env_nonneg_int_or_default() {
+  local key="$1"
+  local default="$2"
+  local value="${!key:-}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+  else
+    echo "$default"
+  fi
+}
+
+postgres_hostport_from_url() {
+  local url="$1"
+  if ! is_postgres_url "$url"; then
+    return 1
+  fi
+
+  local rest="${url#*://}"
+  local authority="${rest%%/*}"
+  authority="${authority%%\?*}"
+  authority="${authority%%#*}"
+  local hostport="${authority##*@}"
+
+  if [[ -z "$hostport" ]]; then
+    return 1
+  fi
+
+  # Default Postgres port when absent.
+  if [[ "$hostport" != *:* && "$hostport" != \[*\]* ]]; then
+    hostport="${hostport}:5432"
+  elif [[ "$hostport" == \[*\] && "$hostport" != *"]:*" ]]; then
+    hostport="${hostport}:5432"
+  fi
+
+  echo "$hostport"
+}
+
+check_postgres_connection_budget() {
+  local da_conn="$1"
+  if [[ -z "$da_conn" ]]; then
+    return 0
+  fi
+
+  local mode="${SOV_POSTGRES_POOL_BUDGET_MODE:-warn}"
+  local mode_lc
+  mode_lc="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$mode_lc" == "off" ]]; then
+    return 0
+  fi
+
+  if ! is_postgres_url "$da_conn"; then
+    return 0
+  fi
+
+  local da_hostport
+  da_hostport="$(postgres_hostport_from_url "$da_conn" 2>/dev/null || true)"
+
+  # Defaults mirror service code:
+  # - StorableMidnightDaLayer: 20
+  # - Worker DB (sequencer REST): 10
+  # - Preferred sequencer DB: 10
+  # - Proof verifier DB: 12
+  # - Indexer Postgres DB: 20
+  local da_pool_max
+  da_pool_max="$(env_nonneg_int_or_default "SOV_MIDNIGHT_DA_POSTGRES_MAX_CONNECTIONS" "20")"
+  local worker_db_pool_max
+  worker_db_pool_max="$(env_nonneg_int_or_default "SOV_WORKER_DB_POSTGRES_MAX_CONNECTIONS" "10")"
+  local preferred_db_pool_max
+  preferred_db_pool_max="$(env_nonneg_int_or_default "SOV_PREFERRED_DB_POSTGRES_MAX_CONNECTIONS" "10")"
+  local verifier_pool_max
+  verifier_pool_max="$(env_nonneg_int_or_default "SOV_PROOF_VERIFIER_POSTGRES_MAX_CONNECTIONS" "12")"
+  local indexer_pool_max
+  indexer_pool_max="$(env_nonneg_int_or_default "SOV_INDEXER_POSTGRES_MAX_CONNECTIONS" "20")"
+
+  # run_all.sh starts:
+  # - 1 standalone verifier service
+  # - proof-pool service, which starts 2 embedded verifier instances
+  local proof_pool_embedded_verifiers
+  proof_pool_embedded_verifiers="$(env_nonneg_int_or_default "SOV_PROOF_POOL_EMBEDDED_VERIFIER_COUNT" "2")"
+  local verifier_total
+  verifier_total=$((verifier_pool_max * (1 + proof_pool_embedded_verifiers)))
+
+  # Indexer always opens DA DB and index DB. Count the index DB pool only when it points
+  # to the same Postgres host:port as the DA DB; otherwise skip it in this budget.
+  local index_db_url="${INDEX_DB:-sqlite://demo_data/wallet_index.sqlite?mode=rwc}"
+  local index_db_pool_max=0
+  if is_postgres_url "$index_db_url"; then
+    local index_db_hostport
+    index_db_hostport="$(postgres_hostport_from_url "$index_db_url" 2>/dev/null || true)"
+    if [[ -n "$da_hostport" && -n "$index_db_hostport" && "$index_db_hostport" == "$da_hostport" ]]; then
+      index_db_pool_max="$indexer_pool_max"
+    fi
+  fi
+
+  # Optional manual buffer for other pools on the same DB (e.g. metrics API, MCP session DB).
+  local extra_pool_max
+  extra_pool_max="$(env_nonneg_int_or_default "SOV_POSTGRES_POOL_BUDGET_EXTRA_CONNECTIONS" "0")"
+
+  local estimated_total
+  estimated_total=$((da_pool_max + worker_db_pool_max + preferred_db_pool_max + verifier_total + indexer_pool_max + index_db_pool_max + extra_pool_max))
+
+  echo ""
+  echo "Postgres pool budget (estimated for DA DB host)"
+  echo "  Target DB: $(redact_db_url "$da_conn")"
+  echo "  rollup.da_pool:               $da_pool_max (SOV_MIDNIGHT_DA_POSTGRES_MAX_CONNECTIONS)"
+  echo "  rollup.worker_db_pool:        $worker_db_pool_max (SOV_WORKER_DB_POSTGRES_MAX_CONNECTIONS)"
+  echo "  rollup.preferred_db_pool:     $preferred_db_pool_max (SOV_PREFERRED_DB_POSTGRES_MAX_CONNECTIONS)"
+  echo "  verifier pools total:         $verifier_total (SOV_PROOF_VERIFIER_POSTGRES_MAX_CONNECTIONS x (1 + SOV_PROOF_POOL_EMBEDDED_VERIFIER_COUNT))"
+  echo "  indexer.da_pool:              $indexer_pool_max (SOV_INDEXER_POSTGRES_MAX_CONNECTIONS)"
+  if [[ "$index_db_pool_max" -gt 0 ]]; then
+    echo "  indexer.index_pool:           $index_db_pool_max (INDEX_DB points to same Postgres host)"
+  fi
+  if [[ "$extra_pool_max" -gt 0 ]]; then
+    echo "  extra_manual_pools:           $extra_pool_max (SOV_POSTGRES_POOL_BUDGET_EXTRA_CONNECTIONS)"
+  fi
+  echo "  -------------------------------------------------------------"
+  echo "  estimated_pool_max_total:     $estimated_total"
+
+  if ! command -v psql >/dev/null 2>&1; then
+    echo "  WARN: psql not found; cannot compare against server max_connections."
+    if [[ "$mode_lc" == "enforce" ]]; then
+      echo "  ERROR: SOV_POSTGRES_POOL_BUDGET_MODE=enforce requires psql in PATH."
+      exit 1
+    fi
+    return 0
+  fi
+
+  local connect_timeout_secs
+  connect_timeout_secs="$(env_nonneg_int_or_default "SOV_POSTGRES_POOL_BUDGET_CONNECT_TIMEOUT_SECS" "3")"
+  local settings
+  settings="$(PGCONNECT_TIMEOUT="$connect_timeout_secs" psql "$da_conn" -Atqc "SELECT current_setting('max_connections'), current_setting('superuser_reserved_connections')" 2>/dev/null || true)"
+
+  if [[ ! "$settings" =~ ^([0-9]+)\|([0-9]+)$ ]]; then
+    echo "  WARN: could not query max_connections from Postgres (connection or auth issue)."
+    if [[ "$mode_lc" == "enforce" ]]; then
+      echo "  ERROR: budget enforcement is enabled but Postgres limits could not be read."
+      exit 1
+    fi
+    return 0
+  fi
+
+  local max_connections="${BASH_REMATCH[1]}"
+  local reserved_connections="${BASH_REMATCH[2]}"
+  local usable_connections=$((max_connections - reserved_connections))
+  if (( usable_connections < 0 )); then
+    usable_connections=0
+  fi
+
+  local headroom
+  headroom="$(env_nonneg_int_or_default "SOV_POSTGRES_POOL_BUDGET_HEADROOM" "10")"
+  local safe_budget=$((usable_connections - headroom))
+  if (( safe_budget < 0 )); then
+    safe_budget=0
+  fi
+
+  echo "  server.max_connections:       $max_connections"
+  echo "  server.reserved_connections:  $reserved_connections"
+  echo "  server.usable_connections:    $usable_connections"
+  echo "  required_headroom:            $headroom (SOV_POSTGRES_POOL_BUDGET_HEADROOM)"
+  echo "  safe_budget:                  $safe_budget"
+
+  if (( estimated_total > safe_budget )); then
+    local over_by=$((estimated_total - safe_budget))
+    echo "  STATUS: OVER BUDGET by $over_by connection(s)."
+    echo "  Hint: lower one or more *_MAX_CONNECTIONS env vars or raise server max_connections."
+    if [[ "$mode_lc" == "enforce" ]]; then
+      echo "  ERROR: refusing to start services due to Postgres pool budget overflow."
+      exit 1
+    fi
+  else
+    local margin=$((safe_budget - estimated_total))
+    echo "  STATUS: OK (margin: $margin connection(s))."
+  fi
+}
+
 wait_for_port() {
   local name="$1"
   local host="$2"
@@ -142,6 +322,114 @@ cleanup() {
 }
 
 trap cleanup INT TERM EXIT
+
+redact_db_url() {
+  local url="$1"
+  case "$url" in
+    *"://"*)
+      # Best-effort redaction of `user:pass@host` in connection strings.
+      # Only redact if the `@` appears before the first `/` or `?`.
+      local prefix="${url%%://*}://"
+      local rest="${url#*://}"
+      local at="${rest%%@*}"
+      local after_at="${rest#*@}"
+      if [[ "$rest" == "$after_at" ]]; then
+        echo "$url"
+        return 0
+      fi
+      local end_userinfo="${rest%%[/?]*}"
+      if [[ "${#at}" -gt "${#end_userinfo}" ]]; then
+        echo "$url"
+        return 0
+      fi
+      case "$at" in
+        *:*)
+          local user="${at%%:*}"
+          echo "${prefix}${user}:***@${after_at}"
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+  echo "$url"
+}
+
+extract_rollup_config_path() {
+  local default_path="$SCRIPT_DIR/rollup_config.toml"
+  local path="${ROLLUP_CONFIG_PATH:-$default_path}"
+
+  local i=0
+  while (( i < ${#ROLLUP_ARGS[@]} )); do
+    case "${ROLLUP_ARGS[$i]}" in
+      --rollup-config-path)
+        if (( i + 1 < ${#ROLLUP_ARGS[@]} )); then
+          path="${ROLLUP_ARGS[$((i+1))]}"
+        fi
+        break
+        ;;
+      --rollup-config-path=*)
+        path="${ROLLUP_ARGS[$i]#*=}"
+        break
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  echo "$path"
+}
+
+extract_da_connection_string_from_config() {
+  local path="$1"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    return 0
+  fi
+
+  awk '
+    BEGIN { in_da = 0 }
+    /^[[:space:]]*\[da\][[:space:]]*$/ { in_da = 1; next }
+    in_da && /^[[:space:]]*\[/ { in_da = 0 }
+    in_da && /^[[:space:]]*connection_string[[:space:]]*=/ {
+      sub(/^[[:space:]]*connection_string[[:space:]]*=[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*#.*/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 ~ /^".*"$/) { sub(/^"/, "", $0); sub(/"$/, "", $0) }
+      print $0
+      exit
+    }
+  ' "$path"
+}
+
+# Helpful diagnostics for common "worker tx not found" failures.
+ROLLUP_CFG_PATH="$(extract_rollup_config_path)"
+ROLLUP_DA_CONN="$(extract_da_connection_string_from_config "$ROLLUP_CFG_PATH")"
+if [[ -n "${DA_CONNECTION_STRING:-}" || -n "$ROLLUP_DA_CONN" ]]; then
+  echo ""
+  echo "DA DB configuration"
+  echo "  Rollup config path: ${ROLLUP_CFG_PATH}"
+  if [[ -n "$ROLLUP_DA_CONN" ]]; then
+    echo "  Rollup [da].connection_string: $(redact_db_url "$ROLLUP_DA_CONN")"
+  fi
+  if [[ -n "${DA_CONNECTION_STRING:-}" ]]; then
+    echo "  DA_CONNECTION_STRING env:      $(redact_db_url "$DA_CONNECTION_STRING")"
+  fi
+  if [[ -n "${DA_CONNECTION_STRING:-}" && -n "$ROLLUP_DA_CONN" && "${DA_CONNECTION_STRING}" != "${ROLLUP_DA_CONN}" ]]; then
+    echo ""
+    echo "  ERROR: DA_CONNECTION_STRING does not match the rollup DA connection_string!"
+    echo "         DA_CONNECTION_STRING env:          $(redact_db_url "$DA_CONNECTION_STRING")"
+    echo "         Rollup [da].connection_string:     $(redact_db_url "$ROLLUP_DA_CONN")"
+    echo ""
+    echo "         The verifier/proof-pool must write worker_txs into the SAME DB the rollup/sequencer reads."
+    echo "         Mismatches cause HTTP 404 'Worker transaction ... not found' on /sequencer/worker_txs/<hash>."
+    echo ""
+    echo "         Fix: update rollup_config.toml [da].connection_string to match DA_CONNECTION_STRING,"
+    echo "         or remove DA_CONNECTION_STRING so both use the value from rollup_config.toml."
+    exit 1
+  fi
+  echo ""
+fi
+
+EFFECTIVE_DA_CONN="${DA_CONNECTION_STRING:-$ROLLUP_DA_CONN}"
+check_postgres_connection_budget "$EFFECTIVE_DA_CONN"
 
 ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://127.0.0.1:12346}"
 ROLLUP_HOST_PORT="${ROLLUP_RPC_URL#*://}"

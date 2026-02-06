@@ -17,6 +17,31 @@ use viewer::FvkRegistry;
 
 // main only handles wiring; API, DB, sync live in modules
 
+const DEFAULT_INDEXER_SQLITE_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_INDEXER_SQLITE_MIN_CONNECTIONS: u32 = 1;
+const DEFAULT_INDEXER_POSTGRES_MAX_CONNECTIONS: u32 = 20;
+const DEFAULT_INDEXER_POSTGRES_MIN_CONNECTIONS: u32 = 2;
+const DEFAULT_INDEXER_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_INDEXER_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_INDEXER_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_INDEXER_MAX_LIFETIME_SECS: u64 = 1_800;
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -119,6 +144,28 @@ async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<Data
         };
         use std::str::FromStr;
 
+        let sqlite_max_connections = env_u32(
+            "SOV_INDEXER_SQLITE_MAX_CONNECTIONS",
+            DEFAULT_INDEXER_SQLITE_MAX_CONNECTIONS,
+        );
+        let sqlite_min_connections = env_u32(
+            "SOV_INDEXER_SQLITE_MIN_CONNECTIONS",
+            DEFAULT_INDEXER_SQLITE_MIN_CONNECTIONS,
+        )
+        .min(sqlite_max_connections);
+        let sqlite_acquire_timeout_secs = env_u64(
+            "SOV_INDEXER_SQLITE_ACQUIRE_TIMEOUT_SECS",
+            DEFAULT_INDEXER_ACQUIRE_TIMEOUT_SECS,
+        );
+        let sqlite_idle_timeout_secs = env_u64(
+            "SOV_INDEXER_SQLITE_IDLE_TIMEOUT_SECS",
+            DEFAULT_INDEXER_IDLE_TIMEOUT_SECS,
+        );
+        let sqlite_max_lifetime_secs = env_u64(
+            "SOV_INDEXER_SQLITE_MAX_LIFETIME_SECS",
+            DEFAULT_INDEXER_MAX_LIFETIME_SECS,
+        );
+
         let sqlite_opts = SqliteConnectOptions::from_str(connection_string)
             .with_context(|| format!("Failed to parse {} SQLite connection string", label))?
             .journal_mode(SqliteJournalMode::Wal)
@@ -126,11 +173,11 @@ async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<Data
             .busy_timeout(Duration::from_millis(30_000));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(10)
-            .min_connections(1)
-            .acquire_timeout(Duration::from_secs(30))
-            .idle_timeout(Some(Duration::from_secs(300)))
-            .max_lifetime(Some(Duration::from_secs(1800)))
+            .max_connections(sqlite_max_connections)
+            .min_connections(sqlite_min_connections)
+            .acquire_timeout(Duration::from_secs(sqlite_acquire_timeout_secs))
+            .idle_timeout(Some(Duration::from_secs(sqlite_idle_timeout_secs)))
+            .max_lifetime(Some(Duration::from_secs(sqlite_max_lifetime_secs)))
             .connect_with(sqlite_opts)
             .await
             .with_context(|| {
@@ -141,25 +188,62 @@ async fn connect_db(connection_string: &str, label: &str) -> anyhow::Result<Data
             })?;
 
         info!(
-            "Connecting to {} SQLite DB with tuned pool settings (max_connections=10, WAL, synchronous=NORMAL)",
-            label
+            max_connections = sqlite_max_connections,
+            min_connections = sqlite_min_connections,
+            acquire_timeout_secs = sqlite_acquire_timeout_secs,
+            idle_timeout_secs = sqlite_idle_timeout_secs,
+            max_lifetime_secs = sqlite_max_lifetime_secs,
+            "Connecting to {} SQLite DB with tuned pool settings (WAL, synchronous=NORMAL)",
+            label,
         );
 
         Ok(DatabaseConnection::SqlxSqlitePoolConnection(pool.into()))
     } else {
+        let pg_max_connections = env_u32(
+            "SOV_INDEXER_POSTGRES_MAX_CONNECTIONS",
+            DEFAULT_INDEXER_POSTGRES_MAX_CONNECTIONS,
+        );
+        let pg_min_connections = env_u32(
+            "SOV_INDEXER_POSTGRES_MIN_CONNECTIONS",
+            DEFAULT_INDEXER_POSTGRES_MIN_CONNECTIONS,
+        )
+        .min(pg_max_connections);
+        let pg_connect_timeout_secs = env_u64(
+            "SOV_INDEXER_POSTGRES_CONNECT_TIMEOUT_SECS",
+            DEFAULT_INDEXER_CONNECT_TIMEOUT_SECS,
+        );
+        let pg_acquire_timeout_secs = env_u64(
+            "SOV_INDEXER_POSTGRES_ACQUIRE_TIMEOUT_SECS",
+            DEFAULT_INDEXER_ACQUIRE_TIMEOUT_SECS,
+        );
+        let pg_idle_timeout_secs = env_u64(
+            "SOV_INDEXER_POSTGRES_IDLE_TIMEOUT_SECS",
+            DEFAULT_INDEXER_IDLE_TIMEOUT_SECS,
+        );
+        let pg_max_lifetime_secs = env_u64(
+            "SOV_INDEXER_POSTGRES_MAX_LIFETIME_SECS",
+            DEFAULT_INDEXER_MAX_LIFETIME_SECS,
+        );
+
         let mut connect_opts = ConnectOptions::new(connection_string.to_string());
         connect_opts
-            .max_connections(50)
-            .min_connections(5)
-            .connect_timeout(Duration::from_secs(30))
-            .acquire_timeout(Duration::from_secs(30))
-            .idle_timeout(Duration::from_secs(300))
-            .max_lifetime(Duration::from_secs(1800))
+            .max_connections(pg_max_connections)
+            .min_connections(pg_min_connections)
+            .connect_timeout(Duration::from_secs(pg_connect_timeout_secs))
+            .acquire_timeout(Duration::from_secs(pg_acquire_timeout_secs))
+            .idle_timeout(Duration::from_secs(pg_idle_timeout_secs))
+            .max_lifetime(Duration::from_secs(pg_max_lifetime_secs))
             .sqlx_logging(false);
 
         info!(
-            "Connecting to {} database with tuned pool settings (max_connections=50, min_connections=5)",
-            label
+            max_connections = pg_max_connections,
+            min_connections = pg_min_connections,
+            connect_timeout_secs = pg_connect_timeout_secs,
+            acquire_timeout_secs = pg_acquire_timeout_secs,
+            idle_timeout_secs = pg_idle_timeout_secs,
+            max_lifetime_secs = pg_max_lifetime_secs,
+            "Connecting to {} database with tuned pool settings",
+            label,
         );
 
         Database::connect(connect_opts)

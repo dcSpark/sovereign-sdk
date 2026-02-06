@@ -896,12 +896,13 @@ where
 
         match res {
             Ok(rx) => match rx.await {
-                Ok(accepted) => Ok(accepted),
+                Ok(accepted) => accepted.map_err(parallel_tx_failure_to_error),
                 Err(err) => {
                     if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
-                        return Err(par_err);
+                        Err(par_err)
+                    } else {
+                        Err(database_error_500(err))
                     }
-                    Err(database_error_500(err))
                 }
             },
             Err(e) => match e {
@@ -1023,7 +1024,7 @@ where
         let await_start = std::time::Instant::now();
         let result = match res {
             Ok(rx) => match rx.await {
-                Ok(accepted) => Ok(accepted),
+                Ok(accepted) => accepted.map_err(parallel_tx_failure_to_error),
                 Err(err) => {
                     if let Some(par_err) = take_parallel_tx_failure(&tx_hash) {
                         Err(par_err)
@@ -1125,6 +1126,22 @@ fn shut_down_error() -> ErrorObject {
         message: "The sequencer is shutting down".to_string(),
         details: sov_rest_utils::json_obj!({
             "error": "The sequencer is shutting down. Transactions cannot be accepted at this time".to_string(),
+        }),
+    }
+}
+
+fn parallel_tx_failure_to_error(failure: ParallelTxFailure) -> ErrorObject {
+    let status = match failure.error_kind {
+        "unsuccessful_transaction" | "decode_call" | "rejected" => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    ErrorObject {
+        status,
+        message: "Transaction execution failed".to_string(),
+        details: sov_rest_utils::json_obj!({
+            "error_kind": failure.error_kind,
+            "error": failure.error_summary,
         }),
     }
 }

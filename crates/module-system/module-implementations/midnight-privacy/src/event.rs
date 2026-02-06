@@ -30,6 +30,7 @@ pub struct ViewerBinding {
 /// For authoritative position/root data, indexers should:
 /// 1. Query `/modules/midnight-privacy/notes` endpoint after block finalization
 /// 2. Use `AnchorRootRecorded` events which are emitted during flush with real roots
+/// 3. Or reconstruct flush order from `NoteCreatedAtHeight` by sorting `(rollup_height, commitment)`
 #[derive(Debug, PartialEq, Clone, schemars::JsonSchema)]
 #[serialize(Borsh, Serde)]
 #[serde(bound = "S: Spec", rename_all = "snake_case")]
@@ -116,8 +117,8 @@ pub enum Event<S: Spec> {
 
     // === Deny-map (freeze/blacklist) events ===
     //
-    // IMPORTANT: These variants are intentionally appended at the end of the enum to preserve
-    // the discriminant indices of previously-emitted events under Borsh serialization.
+    // IMPORTANT: Keep this section's relative ordering stable to preserve existing discriminant
+    // indices under Borsh serialization. New variants should be appended after this section.
     /// Deny-map root (blacklist) was updated by a pool admin.
     BlacklistRootUpdated {
         /// Previous root.
@@ -148,5 +149,16 @@ pub enum Event<S: Spec> {
     PoolAdminRemoved {
         /// The admin address that was removed.
         admin: S::Address,
+    },
+    /// Commitment queued for this rollup height.
+    ///
+    /// This event carries the rollup height used by `end_block_flush` for deterministic
+    /// ordering (height, then commitment bytes). Indexers can combine this with commitment
+    /// values to reconstruct canonical tree positions without querying `/notes`.
+    NoteCreatedAtHeight {
+        /// The note commitment
+        commitment: Hash32,
+        /// Rollup height where the commitment was queued
+        rollup_height: u64,
     },
 }

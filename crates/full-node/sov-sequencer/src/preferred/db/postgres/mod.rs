@@ -17,6 +17,28 @@ pub struct PostgresBackend {
     backoff_policy: ExponentialBuilder,
 }
 
+const DEFAULT_PREFERRED_DB_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_PREFERRED_DB_MIN_CONNECTIONS: u32 = 1;
+const DEFAULT_PREFERRED_DB_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_PREFERRED_DB_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_PREFERRED_DB_MAX_LIFETIME_SECS: u64 = 1_800;
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 // We need a macro to get around lifetime issues with async functions. Otherwise, Rust complains about FnMut
 // outliving the lifetime of the function.
 macro_rules! run_with_retries {
@@ -56,9 +78,47 @@ impl PostgresBackend {
             .with_factor(2.0)
             .with_max_times(8);
 
+        let max_connections = env_u32(
+            "SOV_PREFERRED_DB_POSTGRES_MAX_CONNECTIONS",
+            DEFAULT_PREFERRED_DB_MAX_CONNECTIONS,
+        );
+        let min_connections = env_u32(
+            "SOV_PREFERRED_DB_POSTGRES_MIN_CONNECTIONS",
+            DEFAULT_PREFERRED_DB_MIN_CONNECTIONS,
+        )
+        .min(max_connections);
+        let acquire_timeout_secs = env_u64(
+            "SOV_PREFERRED_DB_POSTGRES_ACQUIRE_TIMEOUT_SECS",
+            DEFAULT_PREFERRED_DB_ACQUIRE_TIMEOUT_SECS,
+        );
+        let idle_timeout_secs = env_u64(
+            "SOV_PREFERRED_DB_POSTGRES_IDLE_TIMEOUT_SECS",
+            DEFAULT_PREFERRED_DB_IDLE_TIMEOUT_SECS,
+        );
+        let max_lifetime_secs = env_u64(
+            "SOV_PREFERRED_DB_POSTGRES_MAX_LIFETIME_SECS",
+            DEFAULT_PREFERRED_DB_MAX_LIFETIME_SECS,
+        );
+
+        tracing::info!(
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+            idle_timeout_secs,
+            max_lifetime_secs,
+            "Initializing preferred sequencer Postgres pool"
+        );
+
+        let pool_options = PgPoolOptions::default()
+            .max_connections(max_connections)
+            .min_connections(min_connections)
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+            .idle_timeout(Some(Duration::from_secs(idle_timeout_secs)))
+            .max_lifetime(Some(Duration::from_secs(max_lifetime_secs)));
+
         let pool = run_with_retries!(
             &backoff_policy,
-            PgPoolOptions::default().connect(connection_string),
+            pool_options.clone().connect(connection_string),
             "postgres_db_backend_connect"
         )?;
 

@@ -15,7 +15,7 @@ Options:
   --session-ids-file <PATH>
                       File with stable MCP session IDs to reuse across runs
                       (default: <repo>/.mcp-external-stress-session-ids.txt)
-  --send-amount <N>    Amount (dust) per tx (default: 1)
+  --send-amount <N>    Amount (dust) per tx (default: 1000)
   --confirm            Poll confirmation (adds extra load)
   --rust-log <SPEC>    Override RUST_LOG (default: mcp_external_stress=info,rmcp=warn)
   -h, --help           Show help
@@ -34,7 +34,7 @@ TXS_PER_WALLET=""
 SESSION_IDS_FILE=""
 
 MCP_ENDPOINT="${MCP_ENDPOINT:-https://midnight-l2-testnet.shinkai.com/mcp/mcp}"
-SEND_AMOUNT="${SEND_AMOUNT:-1}"
+SEND_AMOUNT="${SEND_AMOUNT:-1000}"
 CONFIRM="${CONFIRM:-0}"
 RUST_LOG="${MCP_STRESS_RUST_LOG:-mcp_external_stress=info,rmcp=warn}"
 

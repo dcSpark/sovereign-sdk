@@ -88,6 +88,16 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
             .to_owned(),
     );
     idx_db.execute(stmt).await?;
+    ensure_notes_nullifiers_created_rollup_height_column(idx_db).await?;
+
+    // Canonical note-created index used by mcp-external commitment-tree sync.
+    let stmt = builder.build(
+        &schema
+            .create_table_from_entity(idx::midnight_note_created::Entity)
+            .if_not_exists()
+            .to_owned(),
+    );
+    idx_db.execute(stmt).await?;
 
     // Frozen accounts tracking table (freeze/unfreeze history with reasons)
     let stmt = builder.build(
@@ -201,6 +211,26 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
         .to_owned();
     idx_db.execute(builder.build(&idx_stmt)).await?;
 
+    // Common time-range queries (e.g., median tx size) filter by kind + created_at.
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_notes_nullifiers_created_kind_created_at")
+        .table(idx::notes_nullifiers::Entity)
+        .col(idx::notes_nullifiers::Column::CreatedKind)
+        .col(idx::notes_nullifiers::Column::CreatedAt)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
+    // Commitment-tree reconstruction order: (rollup_height, cm).
+    let idx_stmt: IndexCreateStatement = Index::create()
+        .name("idx_midnight_note_created_rollup_height_cm")
+        .table(idx::midnight_note_created::Entity)
+        .col(idx::midnight_note_created::Column::RollupHeight)
+        .col(idx::midnight_note_created::Column::Cm)
+        .if_not_exists()
+        .to_owned();
+    idx_db.execute(builder.build(&idx_stmt)).await?;
+
     // Frozen accounts: quick lookup by privacy address
     let idx_stmt: IndexCreateStatement = Index::create()
         .name("idx_frozen_accounts_privacy_address")
@@ -228,6 +258,76 @@ pub async fn init_index_db(idx_db: &DatabaseConnection) -> Result<()> {
         .to_owned();
     idx_db.execute(builder.build(&idx_stmt)).await?;
 
+    Ok(())
+}
+
+async fn ensure_notes_nullifiers_created_rollup_height_column(
+    idx_db: &DatabaseConnection,
+) -> Result<()> {
+    let backend = idx_db.get_database_backend();
+    let exists = match backend {
+        DatabaseBackend::Sqlite => {
+            let rows = idx_db
+                .query_all(Statement::from_string(
+                    backend,
+                    "PRAGMA table_info(\"notes_nullifiers\")",
+                ))
+                .await?;
+            rows.iter().any(|row| {
+                row.try_get::<String>("", "name")
+                    .map(|name| name == "created_rollup_height")
+                    .unwrap_or(false)
+            })
+        }
+        DatabaseBackend::Postgres => {
+            let rows = idx_db
+                .query_all(Statement::from_string(
+                    backend,
+                    "SELECT 1 AS present
+                     FROM information_schema.columns
+                     WHERE table_schema = current_schema()
+                       AND table_name = 'notes_nullifiers'
+                       AND column_name = 'created_rollup_height'
+                     LIMIT 1",
+                ))
+                .await?;
+            !rows.is_empty()
+        }
+        DatabaseBackend::MySql => {
+            let rows = idx_db
+                .query_all(Statement::from_string(
+                    backend,
+                    "SELECT 1 AS present
+                     FROM information_schema.columns
+                     WHERE table_schema = DATABASE()
+                       AND table_name = 'notes_nullifiers'
+                       AND column_name = 'created_rollup_height'
+                     LIMIT 1",
+                ))
+                .await?;
+            !rows.is_empty()
+        }
+    };
+
+    if exists {
+        return Ok(());
+    }
+
+    let alter_sql = match backend {
+        DatabaseBackend::Sqlite => {
+            "ALTER TABLE \"notes_nullifiers\" ADD COLUMN \"created_rollup_height\" INTEGER"
+        }
+        DatabaseBackend::Postgres => {
+            "ALTER TABLE \"notes_nullifiers\" ADD COLUMN \"created_rollup_height\" BIGINT"
+        }
+        DatabaseBackend::MySql => {
+            "ALTER TABLE `notes_nullifiers` ADD COLUMN `created_rollup_height` BIGINT NULL"
+        }
+    };
+
+    idx_db
+        .execute(Statement::from_string(backend, alter_sql))
+        .await?;
     Ok(())
 }
 
@@ -577,18 +677,69 @@ fn normalize_privacy_addr_bech32m(value: &str) -> Result<String> {
     })
 }
 
+fn normalize_rollup_height(value: Option<u64>) -> Result<Option<i64>> {
+    match value {
+        Some(v) => {
+            let as_i64 = i64::try_from(v)
+                .map_err(|_| anyhow::anyhow!("rollup_height {} does not fit in i64", v))?;
+            Ok(Some(as_i64))
+        }
+        None => Ok(None),
+    }
+}
+
+pub async fn upsert_midnight_note_created(
+    idx_db: &DatabaseConnection,
+    cm: &str,
+    rollup_height: u64,
+    created_tx_hash: Option<&str>,
+    created_at: Option<DateTime<Utc>>,
+    created_kind: Option<&str>,
+) -> Result<()> {
+    let cm = normalize_hash32_hex(cm)?;
+    let rollup_height = i64::try_from(rollup_height)
+        .map_err(|_| anyhow::anyhow!("rollup_height {} does not fit in i64", rollup_height))?;
+
+    idx::midnight_note_created::Entity::insert(idx::midnight_note_created::ActiveModel {
+        cm: Set(cm),
+        rollup_height: Set(rollup_height),
+        created_tx_hash: Set(created_tx_hash.map(|s| s.to_string())),
+        created_at: Set(created_at),
+        created_kind: Set(created_kind.map(|s| s.to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(idx::midnight_note_created::Column::Cm)
+            .update_columns([
+                idx::midnight_note_created::Column::RollupHeight,
+                idx::midnight_note_created::Column::CreatedTxHash,
+                idx::midnight_note_created::Column::CreatedAt,
+                idx::midnight_note_created::Column::CreatedKind,
+            ])
+            .to_owned(),
+    )
+    .exec(idx_db)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn upsert_note_created_metadata(
     idx_db: &DatabaseConnection,
     cm: &str,
     created_tx_hash: &str,
     created_at: DateTime<Utc>,
+    created_rollup_height: Option<u64>,
     created_kind: &str,
 ) -> Result<()> {
     let cm = normalize_hash32_hex(cm)?;
+    let cm_for_note_index = cm.clone();
+    let created_rollup_height = normalize_rollup_height(created_rollup_height)?;
     idx::notes_nullifiers::Entity::insert(idx::notes_nullifiers::ActiveModel {
         cm: Set(cm),
         created_tx_hash: Set(Some(created_tx_hash.to_string())),
         created_at: Set(Some(created_at)),
+        created_rollup_height: Set(created_rollup_height),
         created_kind: Set(Some(created_kind.to_string())),
         ..Default::default()
     })
@@ -597,12 +748,28 @@ pub async fn upsert_note_created_metadata(
             .update_columns([
                 idx::notes_nullifiers::Column::CreatedTxHash,
                 idx::notes_nullifiers::Column::CreatedAt,
+                idx::notes_nullifiers::Column::CreatedRollupHeight,
                 idx::notes_nullifiers::Column::CreatedKind,
             ])
             .to_owned(),
     )
     .exec(idx_db)
     .await?;
+
+    if let Some(height) = created_rollup_height {
+        let height_u64 = u64::try_from(height)
+            .map_err(|_| anyhow::anyhow!("created_rollup_height {} is negative", height))?;
+        upsert_midnight_note_created(
+            idx_db,
+            &cm_for_note_index,
+            height_u64,
+            Some(created_tx_hash),
+            Some(created_at),
+            Some(created_kind),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -617,9 +784,11 @@ pub async fn upsert_note_created(
     cm_ins: Option<JsonValue>,
     created_tx_hash: Option<&str>,
     created_at: Option<DateTime<Utc>>,
+    created_rollup_height: Option<u64>,
     created_kind: Option<&str>,
 ) -> Result<()> {
     let cm = normalize_hash32_hex(cm)?;
+    let cm_for_note_index = cm.clone();
     let domain = match domain {
         Some(v) => Some(normalize_hash32_hex(v)?),
         None => None,
@@ -636,6 +805,7 @@ pub async fn upsert_note_created(
         Some(v) => Some(normalize_privacy_addr_bech32m(v)?),
         None => None,
     };
+    let created_rollup_height_i64 = normalize_rollup_height(created_rollup_height)?;
 
     idx::notes_nullifiers::Entity::insert(idx::notes_nullifiers::ActiveModel {
         cm: Set(cm),
@@ -647,6 +817,7 @@ pub async fn upsert_note_created(
         cm_ins: Set(cm_ins),
         created_tx_hash: Set(created_tx_hash.map(|s| s.to_string())),
         created_at: Set(created_at),
+        created_rollup_height: Set(created_rollup_height_i64),
         created_kind: Set(created_kind.map(|s| s.to_string())),
         ..Default::default()
     })
@@ -661,12 +832,25 @@ pub async fn upsert_note_created(
                 idx::notes_nullifiers::Column::CmIns,
                 idx::notes_nullifiers::Column::CreatedTxHash,
                 idx::notes_nullifiers::Column::CreatedAt,
+                idx::notes_nullifiers::Column::CreatedRollupHeight,
                 idx::notes_nullifiers::Column::CreatedKind,
             ])
             .to_owned(),
     )
     .exec(idx_db)
     .await?;
+
+    if let Some(height) = created_rollup_height {
+        upsert_midnight_note_created(
+            idx_db,
+            &cm_for_note_index,
+            height,
+            created_tx_hash,
+            created_at,
+            created_kind,
+        )
+        .await?;
+    }
 
     Ok(())
 }

@@ -342,6 +342,13 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Emit event - position is assigned at flush time
         self.emit_event(state, Event::NoteCreated { commitment });
+        self.emit_event(
+            state,
+            Event::NoteCreatedAtHeight {
+                commitment,
+                rollup_height: current_height.get(),
+            },
+        );
 
         Ok(())
     }

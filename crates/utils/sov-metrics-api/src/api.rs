@@ -59,6 +59,7 @@ pub struct AppState {
     pub retention_secs: u64,
     pub tps_peak_cache: TpsPeakCache,
     pub da_db: DatabaseConnection,
+    pub indexer_db: DatabaseConnection,
     /// Multiplier applied to PeakTPS metric output.
     pub peak_tps_multiplier: f64,
 }
@@ -94,6 +95,42 @@ struct HistoricWindowQuery {
     from_ms: Option<i64>,
     to_ms: Option<i64>,
 }
+
+const POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL: &str = r#"
+WITH windowed AS (
+    SELECT
+        mt.event_id,
+        CAST(mt.amount AS numeric) AS amount
+    FROM midnight_transfer mt
+    INNER JOIN events ev ON ev.id = mt.event_id
+    WHERE mt.amount IS NOT NULL
+      AND mt.amount ~ '^[0-9]+$'
+      AND ev.created_at >= $1
+      AND ev.created_at <= $2
+)
+SELECT
+    AVG(windowed.amount)::double precision AS average_amount,
+    COALESCE(SUM(windowed.amount), 0)::text AS delta_amount,
+    COUNT(*)::bigint AS delta_transactions
+FROM windowed
+"#;
+
+const POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL: &str = r#"
+WITH windowed AS (
+    SELECT
+        mt.event_id,
+        CAST(mt.amount AS numeric) AS amount
+    FROM midnight_transfer mt
+    INNER JOIN events ev ON ev.id = mt.event_id
+    WHERE mt.amount IS NOT NULL
+      AND mt.amount ~ '^[0-9]+$'
+      AND ev.created_at >= $1
+      AND ev.created_at <= $2
+)
+SELECT
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY windowed.amount)::double precision AS median_amount
+FROM windowed
+"#;
 
 pub fn router(state: AppState) -> Router {
     let swagger_ui =
@@ -889,16 +926,80 @@ async fn average_transaction_size(
     State(state): State<AppState>,
     Query(params): Query<WindowQuery>,
 ) -> Json<AverageTransactionSizeResponse> {
+    let window_ms = match params.window_seconds {
+        Some(window_seconds) => window_ms(Some(window_seconds)),
+        None => window_ms(Some(86_400)),
+    };
+
+    let backend = {
+        use sea_orm::ConnectionTrait;
+        state.indexer_db.get_database_backend()
+    };
+    if should_query_average_from_indexer(backend, window_ms) {
+        use sea_orm::{FromQueryResult, Statement};
+
+        #[derive(Debug, FromQueryResult)]
+        struct AverageRow {
+            average_amount: Option<f64>,
+            delta_amount: String,
+            delta_transactions: i64,
+        }
+
+        let now = chrono::Utc::now();
+        let now_ms = now.timestamp_millis();
+        let start_ms = window_ms
+            .and_then(|window_ms| now_ms.checked_sub(window_ms))
+            .unwrap_or(now_ms);
+        let delta_ms = now_ms.saturating_sub(start_ms);
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
+
+        let stmt = Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL,
+            [start.into(), now.into()],
+        );
+
+        match AverageRow::find_by_statement(stmt)
+            .one(&state.indexer_db)
+            .await
+        {
+            Ok(Some(row)) => {
+                let delta_transactions = u64::try_from(row.delta_transactions).ok();
+                return Json(AverageTransactionSizeResponse {
+                    average_amount: row.average_amount,
+                    delta_amount: Some(row.delta_amount),
+                    delta_transactions,
+                    delta_ms: Some(delta_ms),
+                    retention_seconds: state.retention_secs,
+                });
+            }
+            Ok(None) => {
+                return Json(AverageTransactionSizeResponse {
+                    average_amount: None,
+                    delta_amount: Some("0".to_string()),
+                    delta_transactions: Some(0),
+                    delta_ms: Some(delta_ms),
+                    retention_seconds: state.retention_secs,
+                });
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to query average transaction size from indexer DB");
+                return Json(AverageTransactionSizeResponse {
+                    average_amount: None,
+                    delta_amount: Some("0".to_string()),
+                    delta_transactions: Some(0),
+                    delta_ms: Some(delta_ms),
+                    retention_seconds: state.retention_secs,
+                });
+            }
+        }
+    }
+
     let series_snapshot = state
         .store
         .snapshot("token-value-spent")
         .await
         .map(map_average_transaction_size_series);
-
-    let window_ms = match params.window_seconds {
-        Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
-    };
     let (average_amount, delta_amount, delta_transactions, delta_ms) =
         match series_snapshot.as_ref() {
             Some(series) => compute_average_transaction_size(series, window_ms),
@@ -1007,10 +1108,48 @@ async fn median_transaction_size(
         None => window_ms(Some(86_400)),
     };
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now = chrono::Utc::now();
+    let now_ms = now.timestamp_millis();
     let start_ms = window_ms
         .and_then(|window_ms| now_ms.checked_sub(window_ms))
         .unwrap_or(now_ms);
+
+    let backend = {
+        use sea_orm::ConnectionTrait;
+        state.indexer_db.get_database_backend()
+    };
+    if should_query_median_from_indexer(backend) {
+        use sea_orm::{FromQueryResult, Statement};
+
+        #[derive(Debug, FromQueryResult)]
+        struct MedianRow {
+            median_amount: Option<f64>,
+        }
+
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
+        let stmt = Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL,
+            [start.into(), now.into()],
+        );
+
+        match MedianRow::find_by_statement(stmt)
+            .one(&state.indexer_db)
+            .await
+        {
+            Ok(row) => {
+                return Json(MedianTransactionSizeResponse {
+                    median_amount: row.and_then(|row| row.median_amount),
+                });
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to query median transaction size from indexer DB");
+                return Json(MedianTransactionSizeResponse {
+                    median_amount: None,
+                });
+            }
+        }
+    }
 
     let mut values = state
         .store
@@ -1370,6 +1509,17 @@ fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
             None
         }
     }
+}
+
+fn should_query_average_from_indexer(
+    backend: sea_orm::DatabaseBackend,
+    window_ms: Option<i64>,
+) -> bool {
+    backend == sea_orm::DatabaseBackend::Postgres && window_ms.is_some()
+}
+
+fn should_query_median_from_indexer(backend: sea_orm::DatabaseBackend) -> bool {
+    backend == sea_orm::DatabaseBackend::Postgres
 }
 
 fn resolve_range(from_ms: Option<i64>, to_ms: Option<i64>) -> Option<(i64, i64)> {
@@ -2281,3 +2431,66 @@ struct TokenVelocityHistoricSample {
     )
 )]
 struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_common_transfer_filters(sql: &str) {
+        let required_filters = [
+            "FROM midnight_transfer mt",
+            "JOIN events ev ON ev.id = mt.event_id",
+            "mt.amount IS NOT NULL",
+            "mt.amount ~ '^[0-9]+$'",
+            "ev.created_at >= $1",
+            "ev.created_at <= $2",
+        ];
+
+        for filter in required_filters {
+            assert!(
+                sql.contains(filter),
+                "expected SQL to contain filter: {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_average_sql_keeps_expected_filters() {
+        assert_common_transfer_filters(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL);
+        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("AVG(windowed.amount)"));
+        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("COUNT(*)::bigint"));
+    }
+
+    #[test]
+    fn postgres_median_sql_keeps_expected_filters() {
+        assert_common_transfer_filters(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL);
+        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("ORDER BY windowed.amount"));
+        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("percentile_cont(0.5) WITHIN GROUP"));
+    }
+
+    #[test]
+    fn average_indexer_query_gate_requires_postgres_and_window() {
+        use sea_orm::DatabaseBackend;
+
+        assert!(should_query_average_from_indexer(
+            DatabaseBackend::Postgres,
+            Some(60_000)
+        ));
+        assert!(!should_query_average_from_indexer(
+            DatabaseBackend::Postgres,
+            None
+        ));
+        assert!(!should_query_average_from_indexer(
+            DatabaseBackend::Sqlite,
+            Some(60_000)
+        ));
+    }
+
+    #[test]
+    fn median_indexer_query_gate_requires_postgres() {
+        use sea_orm::DatabaseBackend;
+
+        assert!(should_query_median_from_indexer(DatabaseBackend::Postgres));
+        assert!(!should_query_median_from_indexer(DatabaseBackend::Sqlite));
+    }
+}

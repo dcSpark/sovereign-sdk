@@ -14,18 +14,19 @@ export ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://localhost:12346}"
 export VERIFIER_URL="${VERIFIER_URL:-http://localhost:8080}"
 export INDEXER_URL="${INDEXER_URL:-http://localhost:13100}"
 export MIDNIGHT_FVK_SERVICE_URL="${MIDNIGHT_FVK_SERVICE_URL:-http://127.0.0.1:8088}"
-export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-100}"
+export AUTO_FUND_DEPOSIT_AMOUNT="${AUTO_FUND_DEPOSIT_AMOUNT:-1000}"
 export AUTO_FUND_GAS_RESERVE="${AUTO_FUND_GAS_RESERVE:-1000000}"
 export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export WALLET_PRIVATE_KEY="${WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export PRIVPOOL_SPEND_KEY="${PRIVPOOL_SPEND_KEY:-0xb23e0dc9d1f8869c8bc87ab4eaacd58cbe024a825bdc13fefa4d4c5eaa0b855f}"
 
 # Persistent session storage configuration
-if [[ -z "${MCP_SESSION_DB_URL:-}" ]]; then
-  echo "MCP_SESSION_DB_URL is required but not set"
-  exit 1
+# NOTE: MCP session persistence currently supports PostgreSQL only.
+if [[ -n "${MCP_SESSION_DB_URL:-}" ]]; then
+  export MCP_SESSION_DB_URL
+else
+  echo "MCP_SESSION_DB_URL not set; MCP session persistence disabled."
 fi
-export MCP_SESSION_DB_URL
 export MCP_SESSION_DB_ENCRYPTION_KEY="${MCP_SESSION_DB_ENCRYPTION_KEY:-7e2bdfe834ff9a47c8cdba8cf41c4dcd83410fef61b805ea9740c32335697d12}"
 export MCP_AUTO_INITIALIZE_SESSIONS="${MCP_AUTO_INITIALIZE_SESSIONS:-true}"
 

@@ -4,7 +4,7 @@
 //! returning the per-note details needed for transaction generation.
 
 use anyhow::{Context, Result};
-use midnight_privacy::FullViewingKey;
+use midnight_privacy::{recipient_from_pk_v2, FullViewingKey, PrivacyAddress};
 use serde::{Deserialize, Serialize};
 
 use crate::privacy_key::PrivacyKey;
@@ -25,6 +25,28 @@ pub struct SpendableNote {
     pub tx_hash: String,
     pub timestamp_ms: i64,
     pub kind: String,
+}
+
+fn normalize_hash32_hex(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_start_matches("0x").to_ascii_lowercase();
+    let is_hex_32 = normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex_32 {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn normalize_sender_id_hex(raw_sender_id: &str) -> Option<String> {
+    if let Some(hex_sender_id) = normalize_hash32_hex(raw_sender_id) {
+        return Some(hex_sender_id);
+    }
+
+    // Backward/forward compatibility: some indexer paths may return bech32m recipient strings.
+    // Convert those to the NOTE_V2 sender_id hash (recipient hash) expected by tx generation.
+    let parsed_addr: PrivacyAddress = raw_sender_id.parse().ok()?;
+    let sender_id = recipient_from_pk_v2(&DOMAIN, &parsed_addr.to_pk(), &parsed_addr.pk_ivk());
+    Some(hex::encode(sender_id))
 }
 
 /// Fetch all available (unspent) notes for `privacy_key`, sorted by value descending.
@@ -57,18 +79,15 @@ pub async fn get_privacy_notes(
         .into_iter()
         .map(|note| {
             let value = note.value.parse::<u128>().unwrap_or(0);
-            let rho = note
-                .rho
-                .trim()
-                .trim_start_matches("0x")
-                .to_ascii_lowercase();
-            let sender_id = note
-                .sender_id
-                .as_deref()
-                .unwrap_or(&deposit_sender_id_hex)
-                .trim()
-                .trim_start_matches("0x")
-                .to_ascii_lowercase();
+            let rho = normalize_hash32_hex(&note.rho).unwrap_or_else(|| {
+                note.rho
+                    .trim()
+                    .trim_start_matches("0x")
+                    .to_ascii_lowercase()
+            });
+            let sender_id_raw = note.sender_id.as_deref().unwrap_or(&deposit_sender_id_hex);
+            let sender_id =
+                normalize_sender_id_hex(sender_id_raw).unwrap_or_else(|| sender_id_raw.to_string());
 
             SpendableNote {
                 value,
