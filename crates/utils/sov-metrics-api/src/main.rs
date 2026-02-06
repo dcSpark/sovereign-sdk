@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         retention_secs: tsink_retention_secs,
         tps_peak_cache: api::TpsPeakCache::new(),
         da_db: db.clone(),
+        indexer_db: indexer_db.clone(),
     });
 
     info!("sov-metrics-api listening on {}", bind_addr);
