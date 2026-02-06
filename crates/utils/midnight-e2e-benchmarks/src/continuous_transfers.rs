@@ -55,7 +55,7 @@ const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
 const MISSING_NOTE_RETRY_MAX: usize = 10;
 const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
 const DOMAIN: [u8; 32] = [1u8; 32];
-const INITIAL_DEPOSIT_AMOUNT: u128 = 200;
+const INITIAL_DEPOSIT_AMOUNT: u128 = 1000;
 
 fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
     static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
@@ -156,7 +156,7 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
 
-        // Deposit amount configurable via DEPOSIT_AMOUNT env var, defaults to INITIAL_DEPOSIT_AMOUNT (200).
+        // Deposit amount configurable via DEPOSIT_AMOUNT env var, defaults to INITIAL_DEPOSIT_AMOUNT (1000).
         let deposit_amount = std::env::var("DEPOSIT_AMOUNT")
             .ok()
             .and_then(|v| v.parse().ok())

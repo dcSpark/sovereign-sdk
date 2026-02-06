@@ -97,48 +97,39 @@ struct HistoricWindowQuery {
 }
 
 const POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL: &str = r#"
-WITH per_tx AS (
+WITH windowed AS (
     SELECT
-        nn.created_tx_hash,
-        SUM(nn.value::numeric) AS tx_amount
-    FROM notes_nullifiers nn
-    WHERE nn.value IS NOT NULL
-      AND nn.value ~ '^[0-9]+$'
-      AND nn.created_tx_hash IS NOT NULL
-      AND nn.created_kind = 'transfer'
-      AND nn.created_at >= $1
-      AND nn.created_at <= $2
-      AND nn.sender_id IS NOT NULL
-      AND nn.recipient IS NOT NULL
-      AND nn.recipient <> nn.sender_id
-    GROUP BY nn.created_tx_hash
+        mt.event_id,
+        CAST(mt.amount AS numeric) AS amount
+    FROM midnight_transfer mt
+    INNER JOIN events ev ON ev.id = mt.event_id
+    WHERE mt.amount IS NOT NULL
+      AND mt.amount ~ '^[0-9]+$'
+      AND ev.created_at >= $1
+      AND ev.created_at <= $2
 )
 SELECT
-    AVG(per_tx.tx_amount)::double precision AS average_amount,
-    COALESCE(SUM(per_tx.tx_amount), 0)::text AS delta_amount,
+    AVG(windowed.amount)::double precision AS average_amount,
+    COALESCE(SUM(windowed.amount), 0)::text AS delta_amount,
     COUNT(*)::bigint AS delta_transactions
-FROM per_tx
+FROM windowed
 "#;
 
 const POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL: &str = r#"
-SELECT
-    percentile_cont(0.5) WITHIN GROUP (ORDER BY per_tx.tx_amount)::double precision AS median_amount
-FROM (
+WITH windowed AS (
     SELECT
-        nn.created_tx_hash,
-        SUM(nn.value::numeric) AS tx_amount
-    FROM notes_nullifiers nn
-    WHERE nn.value IS NOT NULL
-      AND nn.value ~ '^[0-9]+$'
-      AND nn.created_tx_hash IS NOT NULL
-      AND nn.created_kind = 'transfer'
-      AND nn.created_at >= $1
-      AND nn.created_at <= $2
-      AND nn.sender_id IS NOT NULL
-      AND nn.recipient IS NOT NULL
-      AND nn.recipient <> nn.sender_id
-    GROUP BY nn.created_tx_hash
-) per_tx
+        mt.event_id,
+        CAST(mt.amount AS numeric) AS amount
+    FROM midnight_transfer mt
+    INNER JOIN events ev ON ev.id = mt.event_id
+    WHERE mt.amount IS NOT NULL
+      AND mt.amount ~ '^[0-9]+$'
+      AND ev.created_at >= $1
+      AND ev.created_at <= $2
+)
+SELECT
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY windowed.amount)::double precision AS median_amount
+FROM windowed
 "#;
 
 pub fn router(state: AppState) -> Router {
@@ -2447,13 +2438,12 @@ mod tests {
 
     fn assert_common_transfer_filters(sql: &str) {
         let required_filters = [
-            "nn.value ~ '^[0-9]+$'",
-            "nn.created_kind = 'transfer'",
-            "nn.created_at >= $1",
-            "nn.created_at <= $2",
-            "nn.sender_id IS NOT NULL",
-            "nn.recipient IS NOT NULL",
-            "nn.recipient <> nn.sender_id",
+            "FROM midnight_transfer mt",
+            "JOIN events ev ON ev.id = mt.event_id",
+            "mt.amount IS NOT NULL",
+            "mt.amount ~ '^[0-9]+$'",
+            "ev.created_at >= $1",
+            "ev.created_at <= $2",
         ];
 
         for filter in required_filters {
@@ -2467,13 +2457,14 @@ mod tests {
     #[test]
     fn postgres_average_sql_keeps_expected_filters() {
         assert_common_transfer_filters(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL);
-        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("AVG(per_tx.tx_amount)"));
+        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("AVG(windowed.amount)"));
         assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("COUNT(*)::bigint"));
     }
 
     #[test]
     fn postgres_median_sql_keeps_expected_filters() {
         assert_common_transfer_filters(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL);
+        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("ORDER BY windowed.amount"));
         assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("percentile_cont(0.5) WITHIN GROUP"));
     }
 

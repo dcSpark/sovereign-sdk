@@ -14,7 +14,7 @@ export VERIFIER_URL="${VERIFIER_URL:-http://localhost:8080}"
 export INDEXER_URL="${INDEXER_URL:-http://localhost:13100}"
 
 # Funding config (defaults match mcp-external's AUTO_FUND_* envs for convenience)
-export PREFUND_DEPOSIT_AMOUNT="${PREFUND_DEPOSIT_AMOUNT:-${AUTO_FUND_DEPOSIT_AMOUNT:-100}}"
+export PREFUND_DEPOSIT_AMOUNT="${PREFUND_DEPOSIT_AMOUNT:-${AUTO_FUND_DEPOSIT_AMOUNT:-1000}}"
 export PREFUND_GAS_RESERVE="${PREFUND_GAS_RESERVE:-${AUTO_FUND_GAS_RESERVE:-1000000}}"
 
 # Required: wallet that will fund new wallets (must have sufficient balance)

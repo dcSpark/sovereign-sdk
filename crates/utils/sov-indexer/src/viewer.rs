@@ -722,6 +722,7 @@ pub fn extract_amount_from_decrypted_notes(
     let arr = notes.as_array()?;
 
     let mut total: u128 = 0;
+    let mut first_transfer_value: Option<u128> = None;
     for note in arr {
         // Get the value - skip this note if missing
         let Some(value_str) = note.get("value").and_then(|v| v.as_str()) else {
@@ -733,6 +734,13 @@ pub fn extract_amount_from_decrypted_notes(
 
         let recipient = note.get("recipient").and_then(|v| v.as_str());
         let sender_id = note.get("sender_id").and_then(|v| v.as_str());
+
+        // Keep a deterministic fallback for self-transfers where all outputs look like
+        // change notes (recipient == sender_id). We use the first transfer output value,
+        // which matches how transfer outputs are emitted (payment output first).
+        if sender_id.is_some() && first_transfer_value.is_none() {
+            first_transfer_value = Some(value);
+        }
 
         // Only count notes that are NOT change (recipient != sender)
         // If sender_id is None (deposit notes), count all notes
@@ -750,6 +758,49 @@ pub fn extract_amount_from_decrypted_notes(
     if total > 0 {
         Some(total.to_string())
     } else {
-        None
+        first_transfer_value.map(|value| value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_amount_from_decrypted_notes;
+
+    #[test]
+    fn extract_amount_prefers_non_change_outputs() {
+        let notes = serde_json::json!([
+            {
+                "value": "500",
+                "recipient": "recipient_a",
+                "sender_id": "sender_a"
+            },
+            {
+                "value": "500",
+                "recipient": "sender_a",
+                "sender_id": "sender_a"
+            }
+        ]);
+
+        let amount = extract_amount_from_decrypted_notes(Some(&notes));
+        assert_eq!(amount.as_deref(), Some("500"));
+    }
+
+    #[test]
+    fn extract_amount_falls_back_for_self_transfer_outputs() {
+        let notes = serde_json::json!([
+            {
+                "value": "500",
+                "recipient": "sender_a",
+                "sender_id": "sender_a"
+            },
+            {
+                "value": "500",
+                "recipient": "sender_a",
+                "sender_id": "sender_a"
+            }
+        ]);
+
+        let amount = extract_amount_from_decrypted_notes(Some(&notes));
+        assert_eq!(amount.as_deref(), Some("500"));
     }
 }
