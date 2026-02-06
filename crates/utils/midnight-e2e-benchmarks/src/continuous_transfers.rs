@@ -92,16 +92,9 @@ struct ProverServiceRequest {
     /// Optional packing size (defaults to 8192 on server)
     #[serde(skip_serializing_if = "Option::is_none")]
     packing: Option<u32>,
-}
-
-/// Response body from prover service.
-#[derive(Clone, serde::Deserialize)]
-struct ProverServiceResponse {
-    success: bool,
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
-    proof: Option<String>,
-    error: Option<String>,
+    /// Request binary proof response (`application/octet-stream`) from /prove.
+    #[serde(default)]
+    binary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2235,6 +2228,7 @@ async fn perform_transfer_cycle(
                             proof: None,
                             private_indices: private_indices.clone(),
                             packing: Some(cfg.packing),
+                            binary: true,
                         };
 
                         // Retry logic for transient failures (timeouts, connection errors)
@@ -2242,32 +2236,36 @@ async fn perform_transfer_cycle(
                         const RETRY_DELAY_MS: u64 = 2000;
 
                         let mut last_error: Option<anyhow::Error> = None;
-                        let mut body: Option<ProverServiceResponse> = None;
+                        let mut proof_bytes: Option<Vec<u8>> = None;
 
                         for attempt in 1..=MAX_RETRIES {
                             match blocking_client.post(&url).json(&request).send() {
                                 Ok(resp) => {
                                     let status = resp.status();
-                                    match resp.json::<ProverServiceResponse>() {
-                                        Ok(parsed) => {
-                                            if !status.is_success() || !parsed.success {
-                                                last_error = Some(anyhow::anyhow!(
-                                                    "Prover service returned error (status={}, exit_code={}): {}",
-                                                    status,
-                                                    parsed.exit_code,
-                                                    parsed.error.clone().unwrap_or_else(|| "unknown error".to_string())
-                                                ));
-                                                // Don't retry on application-level errors
-                                                body = Some(parsed);
-                                                break;
-                                            }
-                                            body = Some(parsed);
+                                    if !status.is_success() {
+                                        let err_body = resp
+                                            .text()
+                                            .unwrap_or_else(|_| "<failed to read error body>".to_string());
+                                        last_error = Some(anyhow::anyhow!(
+                                            "Prover service returned error (status={}): {}",
+                                            status,
+                                            err_body
+                                        ));
+                                        // Don't retry on application-level errors
+                                        break;
+                                    }
+                                    match resp.bytes() {
+                                        Ok(bytes) => {
+                                            proof_bytes = Some(bytes.to_vec());
                                             last_error = None;
                                             break;
                                         }
                                         Err(e) => {
-                                            last_error = Some(anyhow::anyhow!("Failed to parse prover service response: {}", e));
-                                            // Don't retry parse errors
+                                            last_error = Some(anyhow::anyhow!(
+                                                "Failed to read binary prover service response: {}",
+                                                e
+                                            ));
+                                            // Don't retry parse/read errors
                                             break;
                                         }
                                     }
@@ -2292,15 +2290,8 @@ async fn perform_transfer_cycle(
                             return Err(err);
                         }
 
-                        let body = body.ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
-
-                        let proof_b64 = body
-                            .proof
-                            .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
-
-                        let proof_bytes = BASE64_STANDARD
-                            .decode(&proof_b64)
-                            .context("Failed to decode base64 proof from prover service")?;
+                        let proof_bytes = proof_bytes
+                            .ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
 
                         let args_json = serde_json::to_vec(&args)?;
                         let pkg = ligero_runner::LigeroProofPackage::new(
@@ -2964,10 +2955,7 @@ async fn perform_transfer_cycle(
                     .clone()
                     .or_else(|| entry.response.as_ref().map(|v| v.to_string()))
                     .unwrap_or_else(|| "unknown rejection".to_string());
-                if reason
-                    .to_ascii_lowercase()
-                    .contains("invalid anchor root")
-                {
+                if reason.to_ascii_lowercase().contains("invalid anchor root") {
                     anchor_rejects += 1;
                 }
                 rejected_by_hash.insert(hash.clone(), reason);
@@ -3052,8 +3040,7 @@ async fn perform_transfer_cycle(
             continue;
         }
 
-        let deadline =
-            Instant::now() + Duration::from_secs(config.ledger_inclusion_timeout_secs);
+        let deadline = Instant::now() + Duration::from_secs(config.ledger_inclusion_timeout_secs);
         loop {
             match client
                 .query_rest_endpoint::<api_types::LedgerTx>(&format!(

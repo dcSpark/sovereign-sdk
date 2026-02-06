@@ -28,7 +28,7 @@ This service provides a high-throughput, parallel proof verification layer that 
 ### **Parallel Verification** 🚀
 
 - Process multiple proofs concurrently using Tokio async tasks
-- Configurable concurrency limit (default: 10)
+- Configurable concurrency limit (default: number of CPU cores)
 - **NOT limited by sequential transaction processing** on the node
 
 ### **Off-Chain Computation** 💰
@@ -91,16 +91,19 @@ cargo build --release
 ### Run the Service
 
 ```bash
-# Default configuration (uses remote prover service at localhost:1313)
+# Default configuration:
+# - Local Ligero prover/verifier daemon pools
+# - Worker count = number of CPU cores
 ./target/release/proof-verifier
 
-# Custom configuration with remote prover service
+# Optional: route verification through an external ligero-http-server
 ./target/release/proof-verifier \
     --bind 0.0.0.0:8080 \
     --node-rpc-url http://127.0.0.1:12346 \
     --prover-service-url http://localhost:1313 \
     --signing-key-path ../test-data/keys/token_deployer_private_key.json \
     --method-id 0x1234... \
+    --midnight-method-id 0xabcd... \
     --max-concurrent 10 \
     --log-level debug
 ```
@@ -108,11 +111,17 @@ cargo build --release
 ### Environment Variables
 
 ```bash
+# Note: these are primarily for Docker/docker-entrypoint.sh wrappers.
+# The binary itself uses CLI flags.
 export BIND_ADDRESS="127.0.0.1:8080"
 export NODE_RPC_URL="http://127.0.0.1:12346"
 export SIGNING_KEY_PATH="../test-data/keys/token_deployer_private_key.json"
 export METHOD_ID="0x..."
+export MIDNIGHT_METHOD_ID="0x..."
+# Optional override; if unset, defaults to CPU core count.
 export MAX_CONCURRENT_VERIFICATIONS="5"
+# Optional: use external ligero-http-server instead of local daemon pools.
+export PROVER_SERVICE_URL="http://127.0.0.1:1313"
 export LOG_LEVEL="info"
 # Optional: enforce pool-signed viewing + require ciphertext bytes for Transfer/Withdraw
 export POOL_FVK_PK="0x<32-byte-ed25519-public-key-hex>"
@@ -131,9 +140,9 @@ Note: `view_attestations` only contains `ct_hash`/`mac` bindings; the ciphertext
 
 ## API Endpoints
 
-### POST `/verify-and-submit`
+### POST `/value-setter-zk`
 
-Verify a Ligero proof and submit a non-ZK transaction to the node.
+Verify a signed value-setter-zk transaction and submit a transformed non-ZK transaction.
 
 **Request:**
 ```json
@@ -142,7 +151,7 @@ Verify a Ligero proof and submit a non-ZK transaction to the node.
 }
 ```
 
-**Response (Success):**
+**Response:**
 ```json
 {
   "success": true,
@@ -158,12 +167,71 @@ Verify a Ligero proof and submit a non-ZK transaction to the node.
 }
 ```
 
-**Response (Error):**
+### POST `/midnight-privacy`
+
+Verify signed midnight-privacy transactions (deposit/transfer/withdraw/admin ops), persist verified metadata, and optionally submit to sequencer immediately.
+
+**Request:**
+```json
+{
+  "body": "base64-encoded-signed-transaction"
+}
+```
+
+### POST `/midnight-privacy/flush`
+
+Flush pending worker-verified transactions to the sequencer when `--defer-submission` is enabled.
+
+### POST `/prove`
+
+Generate a proof with the local daemon prover pool. Response shape is compatible with `ligero-http-server`.
+Set `binary: true` to receive raw proof bytes instead of JSON/base64.
+
+**Request:**
+```json
+{
+  "circuit": "note_spend_guest",
+  "args": [{ "i64": 1 }, { "i64": 2 }],
+  "privateIndices": [1],
+  "packing": 8192,
+  "gzip": false,
+  "binary": false
+}
+```
+
+**Response (`binary=false`, default):**
+```json
+{
+  "success": true,
+  "exitCode": 0,
+  "proof": "base64-proof-bytes"
+}
+```
+
+**Response (`binary=true`):**
+- HTTP body is raw proof bytes
+- `Content-Type: application/octet-stream`
+
+### POST `/verify`
+
+Verify a proof with the local daemon verifier pool. Response shape is compatible with `ligero-http-server`.
+
+**Request:**
+```json
+{
+  "circuit": "note_spend_guest",
+  "args": [{ "i64": 1 }, { "i64": 2 }],
+  "privateIndices": [1],
+  "proof": "base64-proof-bytes"
+}
+```
+
+**Response:**
 ```json
 {
   "success": false,
-  "error": "Proof verification failed: ...",
-  "metrics": { ... }
+  "exitCode": 1,
+  "error": "Verification failed: ..."
 }
 ```
 
@@ -221,7 +289,7 @@ cd ../../..
     | base64 > signed_tx.b64
 
 # 3. Submit to verifier service
-curl -X POST http://127.0.0.1:8080/verify-and-submit \
+curl -X POST http://127.0.0.1:8080/value-setter-zk \
     -H "Content-Type: application/json" \
     -d "{\"body\": \"$(cat signed_tx.b64)\"}"
 ```
