@@ -42,7 +42,7 @@ struct ManagedServiceDefinition {
     start_mode: StartMode,
 }
 
-const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
+const MANAGED_SERVICES: [ManagedServiceDefinition; 7] = [
     ManagedServiceDefinition {
         id: "oracle",
         display_name: "oracle",
@@ -56,14 +56,14 @@ const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
         start_mode: StartMode::Always,
     },
     ManagedServiceDefinition {
-        id: "verifier",
-        display_name: "verifier",
+        id: "worker",
+        display_name: "worker",
         script: "run_verifier_service.sh",
         start_mode: StartMode::Always,
     },
     ManagedServiceDefinition {
-        id: "fvk-service",
-        display_name: "fvk-service",
+        id: "fvk",
+        display_name: "fvk",
         script: "run_fvk_service.sh",
         start_mode: StartMode::WhenEnvPresent("POOL_FVK_PK"),
     },
@@ -77,12 +77,6 @@ const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
         id: "mcp",
         display_name: "mcp",
         script: "run_mcp.sh",
-        start_mode: StartMode::Always,
-    },
-    ManagedServiceDefinition {
-        id: "prover",
-        display_name: "prover",
-        script: "run_prover.sh",
         start_mode: StartMode::Always,
     },
     ManagedServiceDefinition {
@@ -109,6 +103,59 @@ fn env_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn service_config_names(service_id: &str) -> Vec<String> {
+    let mut names = vec![service_id.to_string()];
+    match service_id {
+        "worker" => names.push("verifier".to_string()),
+        "fvk" => {
+            names.push("fvk-service".to_string());
+            names.push("fvk_service".to_string());
+        }
+        _ => {}
+    }
+    names
+}
+
+fn service_config_env_keys(service_id: &str, suffix: &str) -> Vec<String> {
+    service_config_names(service_id)
+        .into_iter()
+        .map(|name| {
+            format!(
+                "SERVICE_{}_{}",
+                name.replace('-', "_").to_ascii_uppercase(),
+                suffix
+            )
+        })
+        .collect()
+}
+
+fn primary_service_remote_env(service_id: &str) -> String {
+    service_config_env_keys(service_id, "REMOTE")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "SERVICE_UNKNOWN_REMOTE".to_string())
+}
+
+fn service_is_remote(service_id: &str) -> bool {
+    service_config_env_keys(service_id, "REMOTE")
+        .into_iter()
+        .any(|env_key| env_flag(&env_key))
+}
+
+fn resolve_env_url(env_var: &str) -> Option<String> {
+    let value = std::env::var(env_var).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Some(value.to_string())
+    } else {
+        Some(format!("http://{}", value))
+    }
+}
+
 fn should_start_by_default(service: &ManagedServiceDefinition) -> bool {
     match service.start_mode {
         StartMode::Always => true,
@@ -127,9 +174,7 @@ fn service_order(service_id: &str) -> usize {
 fn find_managed_service(service: &str) -> Option<&'static ManagedServiceDefinition> {
     let normalized = service.trim().to_ascii_lowercase();
     let canonical = match normalized.as_str() {
-        "worker" | "proof-verifier" => "verifier",
-        "ligero-proving-system" | "ligero-prover" => "prover",
-        "fvk" => "fvk-service",
+        "verifier" | "proof-verifier" => "worker",
         other => other,
     };
 
@@ -336,6 +381,8 @@ pub struct ManagedServiceStatus {
     pub name: String,
     pub script: String,
     pub start_by_default: bool,
+    pub remote: bool,
+    pub controllable: bool,
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -370,6 +417,8 @@ pub struct ServiceHealth {
     pub name: String,
     pub url: String,
     pub status: String,
+    pub remote: bool,
+    pub controllable: bool,
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -604,6 +653,17 @@ async fn start_single_service(
     app: &Arc<AppState>,
     service: &'static ManagedServiceDefinition,
 ) -> ApiResult {
+    if service_is_remote(service.id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "Service '{}' is configured as remote and cannot be started locally (set {}=0 to re-enable local actions)",
+                service.id,
+                primary_service_remote_env(service.id)
+            ),
+        ));
+    }
+
     let script_path = app.script_dir.join(service.script);
     if !script_path.exists() {
         return Err(ApiError::new(
@@ -691,6 +751,16 @@ async fn stop_single_service(
     app: &Arc<AppState>,
     service: &'static ManagedServiceDefinition,
 ) -> ApiResult {
+    if service_is_remote(service.id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "Service '{}' is configured as remote and cannot be stopped locally",
+                service.id
+            ),
+        ));
+    }
+
     let mut state = app.state.lock().await;
     if !state.refresh_service(service.id) {
         return Err(ApiError::new(
@@ -757,15 +827,31 @@ async fn stop_single_service(
 async fn start(State(app): State<Arc<AppState>>) -> ApiResult {
     maybe_clear_logs_on_fresh_start(&app).await;
 
+    let skipped_remote = MANAGED_SERVICES
+        .iter()
+        .filter(|service| should_start_by_default(service) && service_is_remote(service.id))
+        .map(|service| service.id)
+        .collect::<Vec<_>>();
+
     let services_to_start = MANAGED_SERVICES
         .iter()
-        .filter(|service| should_start_by_default(service))
+        .filter(|service| should_start_by_default(service) && !service_is_remote(service.id))
         .collect::<Vec<_>>();
 
     if services_to_start.is_empty() {
+        if skipped_remote.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "No services configured for default start",
+            ));
+        }
+
         return Err(ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "No services configured for default start",
+            StatusCode::CONFLICT,
+            format!(
+                "All default services are configured as remote: {}",
+                skipped_remote.join(", ")
+            ),
         ));
     }
 
@@ -795,15 +881,24 @@ async fn start(State(app): State<Arc<AppState>>) -> ApiResult {
         ));
     }
 
-    if already_running.is_empty() {
-        Ok(format!("Started services: {}", started.join(", ")))
+    let mut message = if already_running.is_empty() {
+        format!("Started services: {}", started.join(", "))
     } else {
-        Ok(format!(
+        format!(
             "Started services: {} (already running: {})",
             started.join(", "),
             already_running.join(", ")
-        ))
+        )
+    };
+
+    if !skipped_remote.is_empty() {
+        message.push_str(&format!(
+            " (remote and not started locally: {})",
+            skipped_remote.join(", ")
+        ));
     }
+
+    Ok(message)
 }
 
 async fn start_service(Path(service): Path<String>, State(app): State<Arc<AppState>>) -> ApiResult {
@@ -931,13 +1026,22 @@ async fn services(State(app): State<Arc<AppState>>) -> Json<Vec<ManagedServiceSt
 
     let services = MANAGED_SERVICES
         .iter()
-        .map(|service| ManagedServiceStatus {
-            id: service.id.to_string(),
-            name: service.display_name.to_string(),
-            script: service.script.to_string(),
-            start_by_default: should_start_by_default(service),
-            running: running_snapshot.contains_key(service.id),
-            pid: running_snapshot.get(service.id).copied().flatten(),
+        .map(|service| {
+            let remote = service_is_remote(service.id);
+            ManagedServiceStatus {
+                id: service.id.to_string(),
+                name: service.display_name.to_string(),
+                script: service.script.to_string(),
+                start_by_default: should_start_by_default(service) && !remote,
+                remote,
+                controllable: !remote,
+                running: !remote && running_snapshot.contains_key(service.id),
+                pid: if remote {
+                    None
+                } else {
+                    running_snapshot.get(service.id).copied().flatten()
+                },
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1129,16 +1233,16 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             optional_env: None,
         },
         ServiceDefinition {
-            id: "verifier",
-            name: "verifier",
+            id: "worker",
+            name: "worker",
             env_var: "BIND_ADDR",
             default_url: "http://127.0.0.1:8080",
             health_path: "/health",
             optional_env: None,
         },
         ServiceDefinition {
-            id: "fvk-service",
-            name: "fvk-service",
+            id: "fvk",
+            name: "fvk",
             env_var: "MIDNIGHT_FVK_SERVICE_URL",
             default_url: "http://127.0.0.1:8088",
             health_path: "/health",
@@ -1157,14 +1261,6 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             name: "mcp",
             env_var: "MCP_SERVER_BIND_ADDRESS",
             default_url: "http://127.0.0.1:3000",
-            health_path: "/health",
-            optional_env: None,
-        },
-        ServiceDefinition {
-            id: "prover",
-            name: "prover",
-            env_var: "PROVER_BIND_ADDR",
-            default_url: "http://127.0.0.1:1313",
             health_path: "/health",
             optional_env: None,
         },
@@ -1200,23 +1296,26 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
     let mut all_healthy = true;
 
     for svc in services {
-        let running = running_snapshot.contains_key(svc.id);
-        let pid = running_snapshot.get(svc.id).copied().flatten();
+        let remote = service_is_remote(svc.id);
+        let running = !remote && running_snapshot.contains_key(svc.id);
+        let pid = if remote {
+            None
+        } else {
+            running_snapshot.get(svc.id).copied().flatten()
+        };
 
-        let enabled_by_env = if svc.id == "oracle" {
-            env_flag("START_ORACLE")
-        } else if let Some(required_env) = svc.optional_env {
+        let enabled_by_env = if let Some(required_env) = svc.optional_env {
             env_present(required_env)
         } else {
             true
         };
 
         // Hide optional services unless explicitly enabled or actively running.
-        if !enabled_by_env && !running {
+        if !enabled_by_env && !running && !remote {
             continue;
         }
 
-        let base_url = resolve_service_url(svc.env_var, svc.default_url);
+        let base_url = resolve_service_url(svc.id, svc.env_var, svc.default_url);
         let health_url = format!("{}{}", base_url, svc.health_path);
 
         let start = std::time::Instant::now();
@@ -1236,6 +1335,8 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             name: svc.name.to_string(),
             url: base_url,
             status,
+            remote,
+            controllable: !remote,
             running,
             pid,
             error,
@@ -1253,17 +1354,15 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
 }
 
 /// Resolve the service URL from environment variable or use default
-fn resolve_service_url(env_var: &str, default_url: &str) -> String {
-    if let Ok(value) = std::env::var(env_var) {
-        let value = value.trim();
-        if !value.is_empty() {
-            // If it looks like a URL, use it directly
-            if value.starts_with("http://") || value.starts_with("https://") {
-                return value.to_string();
-            }
-            // Otherwise, assume it's a host:port and prepend http://
-            return format!("http://{}", value);
+fn resolve_service_url(service_id: &str, env_var: &str, default_url: &str) -> String {
+    for service_url_env in service_config_env_keys(service_id, "URL") {
+        if let Some(url) = resolve_env_url(&service_url_env) {
+            return url;
         }
+    }
+
+    if let Some(url) = resolve_env_url(env_var) {
+        return url;
     }
     default_url.to_string()
 }

@@ -14035,7 +14035,6 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "ligero",
- "ligero-runner",
  "midnight-base-crypto",
  "midnight-onchain-state",
  "midnight-privacy",

@@ -592,6 +592,11 @@ body {
   gap: 6px;
 }
 
+.service-action-note {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
 .service-action-btn {
   border: 1px solid transparent;
   border-radius: var(--radius);

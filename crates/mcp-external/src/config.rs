@@ -9,7 +9,7 @@ fn default_ligero_program() -> String {
 }
 
 fn default_ligero_proof_service_url() -> Url {
-    Url::parse("http://127.0.0.1:1313").expect("default proof service URL is valid")
+    Url::parse("http://127.0.0.1:8080").expect("default proof service URL is valid")
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]

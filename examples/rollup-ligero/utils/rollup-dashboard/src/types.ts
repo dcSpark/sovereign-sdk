@@ -3,6 +3,8 @@ export interface ServiceHealth {
   name: string;
   url: string;
   status: string;
+  remote?: boolean;
+  controllable?: boolean;
   running: boolean;
   pid?: number;
   error?: string;

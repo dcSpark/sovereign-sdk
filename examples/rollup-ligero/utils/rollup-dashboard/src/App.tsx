@@ -113,7 +113,8 @@ function App() {
     return `${ms.toFixed(0)}ms`;
   };
 
-  const formatProcessState = (running: boolean, pid?: number) => {
+  const formatProcessState = (running: boolean, pid?: number, remote?: boolean) => {
+    if (remote) return 'remote';
     if (!running) return 'stopped';
     return pid ? `managed (pid ${pid})` : 'managed';
   };
@@ -332,45 +333,52 @@ function App() {
                     <div className="col-actions">Actions</div>
                     <div className="col-error">Error</div>
                   </div>
-                  {health.services.map((service) => (
-                    <div key={service.id} className={`table-row ${getStatusColor(service.status)}`}>
-                      <div className="col-status">
-                        <span className="status-indicator-dot" />
-                      </div>
-                      <div className="col-name">{service.name}</div>
-                      <div className="col-endpoint">
-                        <code>{service.url}</code>
-                      </div>
-                      <div className="col-latency">{formatResponseTime(service.response_time_ms)}</div>
-                      <div className="col-process">{formatProcessState(service.running, service.pid)}</div>
-                      <div className="col-actions">
-                        <div className="service-actions">
-                          <button
-                            className="service-action-btn start"
-                            onClick={() => handleAction('start', service.id)}
-                            disabled={actionLoadingKey !== null || service.running}
-                          >
-                            {actionLoadingKey === actionKey('start', service.id) ? '...' : 'Start'}
-                          </button>
-                          <button
-                            className="service-action-btn stop"
-                            onClick={() => handleAction('stop', service.id)}
-                            disabled={actionLoadingKey !== null || !service.running}
-                          >
-                            {actionLoadingKey === actionKey('stop', service.id) ? '...' : 'Stop'}
-                          </button>
-                          <button
-                            className="service-action-btn restart"
-                            onClick={() => handleAction('restart', service.id)}
-                            disabled={actionLoadingKey !== null}
-                          >
-                            {actionLoadingKey === actionKey('restart', service.id) ? '...' : 'Restart'}
-                          </button>
+                  {health.services.map((service) => {
+                    const controllable = service.controllable ?? !service.remote;
+                    return (
+                      <div key={service.id} className={`table-row ${getStatusColor(service.status)}`}>
+                        <div className="col-status">
+                          <span className="status-indicator-dot" />
                         </div>
+                        <div className="col-name">{service.name}</div>
+                        <div className="col-endpoint">
+                          <code>{service.url}</code>
+                        </div>
+                        <div className="col-latency">{formatResponseTime(service.response_time_ms)}</div>
+                        <div className="col-process">{formatProcessState(service.running, service.pid, service.remote)}</div>
+                        <div className="col-actions">
+                          {controllable ? (
+                            <div className="service-actions">
+                              <button
+                                className="service-action-btn start"
+                                onClick={() => handleAction('start', service.id)}
+                                disabled={actionLoadingKey !== null || service.running}
+                              >
+                                {actionLoadingKey === actionKey('start', service.id) ? '...' : 'Start'}
+                              </button>
+                              <button
+                                className="service-action-btn stop"
+                                onClick={() => handleAction('stop', service.id)}
+                                disabled={actionLoadingKey !== null || !service.running}
+                              >
+                                {actionLoadingKey === actionKey('stop', service.id) ? '...' : 'Stop'}
+                              </button>
+                              <button
+                                className="service-action-btn restart"
+                                onClick={() => handleAction('restart', service.id)}
+                                disabled={actionLoadingKey !== null}
+                              >
+                                {actionLoadingKey === actionKey('restart', service.id) ? '...' : 'Restart'}
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="service-action-note">Remote</span>
+                          )}
+                        </div>
+                        <div className="col-error">{service.error || '-'}</div>
                       </div>
-                      <div className="col-error">{service.error || '-'}</div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </DashboardRow>

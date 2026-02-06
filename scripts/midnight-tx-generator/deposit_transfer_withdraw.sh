@@ -10,7 +10,7 @@ NC='\033[0m'
 
 # Use remote prover service by default (daemon mode - faster for multiple proofs)
 # Set PROVER_SERVICE_URL="" to use local prover binary instead
-PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-http://127.0.0.1:1313}"
+PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-http://127.0.0.1:8080}"
 
 # Best-effort: auto-discover the Ligero portable `webgpu_prover` binary from the Cargo git checkout.
 # This avoids relying on PATH while keeping Sovereign free of extra Ligero env vars.

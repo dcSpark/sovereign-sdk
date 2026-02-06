@@ -125,7 +125,7 @@ curl -X POST http://127.0.0.1:9090/clean
 
 # Per-service controls
 curl -X POST http://127.0.0.1:9090/start/rollup
-curl -X POST http://127.0.0.1:9090/stop/verifier
+curl -X POST http://127.0.0.1:9090/stop/worker
 curl -X POST http://127.0.0.1:9090/restart/indexer
 curl -X POST http://127.0.0.1:9090/start/mcp
 
@@ -136,6 +136,10 @@ curl http://127.0.0.1:9090/services
 Notes:
 - Bind address: `SERVICE_CONTROLLER_BIND` (default `127.0.0.1:9090`)
 - Auto-start default services on controller start: set `SERVICE_CONTROLLER_AUTO_START=1`
+- Per-service remote mode:
+  - Set `SERVICE_WORKER_REMOTE=1` to disable local start/stop/restart for worker.
+  - Set `SERVICE_WORKER_URL=https://<remote-host>:8080` to show/check the remote endpoint in `/health`.
+  - Legacy alias `SERVICE_VERIFIER_REMOTE` / `SERVICE_VERIFIER_URL` is also supported.
 - `/clean` removes `demo_data` and only runs when services are stopped
 
 ### Linux Services

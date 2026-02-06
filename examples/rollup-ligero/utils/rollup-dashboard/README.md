@@ -4,7 +4,7 @@ A modern, Midnight-styled React dashboard for monitoring and controlling the Rol
 
 ## Features
 
-- Real-time health monitoring of all services (rollup, verifier, fvk-service, indexer, mcp, prover, metrics, oracle)
+- Real-time health monitoring of all services (rollup, worker, fvk, indexer, mcp, metrics, oracle)
 - Global service controls (Start All, Stop All, Restart All, Clean)
 - Per-service controls directly in the services table (Start/Stop/Restart by service id)
 - Auto-refresh with 5-second intervals
@@ -58,7 +58,7 @@ The dashboard communicates with these endpoints:
 | `/start`    | POST/GET   | Start default service set            |
 | `/stop`     | POST/GET   | Stop all running services            |
 | `/restart`  | POST/GET   | Restart default service set          |
-| `/start/:service`   | POST/GET | Start one service (`rollup`, `verifier`, `indexer`, `mcp`, `prover`, `metrics`, `oracle`, `fvk-service`) |
+| `/start/:service`   | POST/GET | Start one service (`rollup`, `worker`, `indexer`, `mcp`, `metrics`, `oracle`, `fvk`) |
 | `/stop/:service`    | POST/GET | Stop one service |
 | `/restart/:service` | POST/GET | Restart one service |
 | `/clean`    | POST/GET   | Clean the demo_data directory        |
@@ -101,13 +101,23 @@ The dashboard uses `/controller/` for API calls, which nginx already proxies to 
 | Service     | Default URL                  | Health Path    |
 |-------------|------------------------------|----------------|
 | rollup      | http://127.0.0.1:12346       | /healthcheck   |
-| verifier    | http://127.0.0.1:8080        | /health        |
-| fvk-service | http://127.0.0.1:8088        | /health        |
+| worker      | http://127.0.0.1:8080        | /health        |
+| fvk         | http://127.0.0.1:8088        | /health        |
 | indexer     | http://127.0.0.1:13100       | /health        |
 | mcp         | http://127.0.0.1:3000        | /health        |
-| prover      | http://127.0.0.1:1313        | /health        |
 | metrics     | http://127.0.0.1:13200       | /health        |
 | oracle      | http://127.0.0.1:8090        | /              |
+
+### Remote services
+
+To show a service as remote (no local Start/Stop/Restart actions), set:
+
+```bash
+SERVICE_WORKER_REMOTE=1
+SERVICE_WORKER_URL=http://10.0.0.42:8080
+```
+
+The dashboard will display `Process = remote`, disable actions for that service, and use the configured remote URL as endpoint.
 
 ## Design
 

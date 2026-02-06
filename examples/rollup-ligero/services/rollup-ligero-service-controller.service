@@ -23,7 +23,6 @@ Environment="MIDNIGHT_FVK_SERVICE_URL=http://127.0.0.1:8088"
 Environment="INDEXER_BIND=http://127.0.0.1:13100"
 Environment="MCP_SERVER_BIND_ADDRESS=http://127.0.0.1:3000"
 Environment="MCP_SERVER_BIND_ADDRESS_2=http://127.0.0.1:3001"
-Environment="PROVER_BIND_ADDR=http://127.0.0.1:1313"
 Environment="METRICS_API_BIND=http://127.0.0.1:13200"
 
 # FVK service signing keys
