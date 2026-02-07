@@ -314,6 +314,31 @@ impl CommitmentTreeSyncer {
         *st = CachedTree::new(self.default_depth);
     }
 
+    /// Try to resolve all commitment positions and Merkle openings from the current in-memory
+    /// cache without triggering any network sync.
+    async fn try_resolve_from_cache(
+        &self,
+        cms: &[Hash32],
+    ) -> Option<(Hash32, Vec<u64>, Vec<Vec<Hash32>>, u64, u128)> {
+        let st = self.state.read().await;
+        let mut positions = Vec::with_capacity(cms.len());
+        for cm in cms {
+            match st.pos_by_cm.get(cm).copied() {
+                Some(pos) => positions.push(pos),
+                None => return None,
+            }
+        }
+
+        let open_start = Instant::now();
+        let siblings = positions
+            .iter()
+            .map(|pos| st.tree.open(*pos as usize))
+            .collect();
+        let open_ms = open_start.elapsed().as_millis();
+
+        Some((st.tree.root(), positions, siblings, st.next_position, open_ms))
+    }
+
     /// Sync the local cached tree to the latest stable `/notes` snapshot.
     ///
     /// This is safe to call concurrently: only one task will perform network fetches and
@@ -842,8 +867,9 @@ impl CommitmentTreeSyncer {
 
     /// Resolve positions and Merkle openings for all `cms`, using the cached tree.
     ///
-    /// This method performs a `sync_to_latest()` first, and then retries position resolution
-    /// briefly in case the caller's notes were just created and haven't been appended yet.
+    /// This method first tries to resolve directly from the in-memory cache. On miss, it performs
+    /// one explicit `sync_to_latest()` and then retries cache lookups briefly while waiting for
+    /// eventual visibility.
     pub async fn resolve_positions_and_openings(
         &self,
         provider: &Provider,
@@ -854,49 +880,45 @@ impl CommitmentTreeSyncer {
         let lookup = position_lookup_config();
         let started = Instant::now();
         let mut sync_time_ms: u128 = 0;
-        let open_time_ms: u128;
+        // Fast path: try serving directly from the in-memory cache.
+        if let Some((root, positions, siblings, tree_size, open_ms)) =
+            self.try_resolve_from_cache(cms).await
+        {
+            tracing::info!(
+                attempt = 0,
+                total_ms = started.elapsed().as_millis(),
+                sync_ms = sync_time_ms,
+                open_ms,
+                cms = cms.len(),
+                tree_size,
+                "[TREE_TIMING] Resolved commitment positions"
+            );
+            return Ok((root, positions, siblings));
+        }
 
-        for attempt in 0..=lookup.max_retries {
-            // Sync first (cheap no-op if already up-to-date), then resolve positions/openings.
-            let sync_start = Instant::now();
-            self.sync_to_latest(provider).await?;
-            sync_time_ms += sync_start.elapsed().as_millis();
+        // Cache miss: perform one explicit sync, then poll cache for eventual visibility.
+        let sync_start = Instant::now();
+        self.sync_to_latest(provider).await?;
+        sync_time_ms += sync_start.elapsed().as_millis();
+
+        let post_sync_attempts = lookup.max_retries.saturating_add(1);
+        for attempt in 1..=post_sync_attempts {
+            if let Some((root, positions, siblings, tree_size, open_ms)) =
+                self.try_resolve_from_cache(cms).await
             {
-                let st = self.state.read().await;
-                let mut positions = Vec::with_capacity(cms.len());
-                let mut missing = false;
-                for cm in cms {
-                    match st.pos_by_cm.get(cm).copied() {
-                        Some(pos) => positions.push(pos),
-                        None => {
-                            missing = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !missing {
-                    let open_start = Instant::now();
-                    let siblings = positions
-                        .iter()
-                        .map(|pos| st.tree.open(*pos as usize))
-                        .collect();
-                    open_time_ms = open_start.elapsed().as_millis();
-
-                    tracing::info!(
-                        attempt,
-                        total_ms = started.elapsed().as_millis(),
-                        sync_ms = sync_time_ms,
-                        open_ms = open_time_ms,
-                        cms = cms.len(),
-                        tree_size = st.next_position,
-                        "[TREE_TIMING] Resolved commitment positions"
-                    );
-                    return Ok((st.tree.root(), positions, siblings));
-                }
+                tracing::info!(
+                    attempt,
+                    total_ms = started.elapsed().as_millis(),
+                    sync_ms = sync_time_ms,
+                    open_ms,
+                    cms = cms.len(),
+                    tree_size,
+                    "[TREE_TIMING] Resolved commitment positions"
+                );
+                return Ok((root, positions, siblings));
             }
 
-            if attempt == lookup.max_retries {
+            if attempt == post_sync_attempts {
                 break;
             }
 
@@ -924,8 +946,9 @@ impl CommitmentTreeSyncer {
 
     /// Single-pass membership lookup for commitments in the local tree cache.
     ///
-    /// Unlike `resolve_positions_and_openings`, this does not perform additional retry loops.
-    /// It is useful as a lightweight pre-filter when selecting spendable inputs.
+    /// This method checks the in-memory cache first and only performs one `sync_to_latest()` when
+    /// at least one commitment is missing. Unlike `resolve_positions_and_openings`, it does not
+    /// perform additional retry loops.
     pub async fn commitment_presence(
         &self,
         provider: &Provider,
@@ -935,9 +958,26 @@ impl CommitmentTreeSyncer {
             return Ok(Vec::new());
         }
 
+        let mut presence = {
+            let st = self.state.read().await;
+            cms.iter()
+                .map(|cm| st.pos_by_cm.contains_key(cm))
+                .collect::<Vec<bool>>()
+        };
+
+        if presence.iter().all(|present| *present) {
+            return Ok(presence);
+        }
+
         self.sync_to_latest(provider).await?;
-        let st = self.state.read().await;
-        Ok(cms.iter().map(|cm| st.pos_by_cm.contains_key(cm)).collect())
+        presence = {
+            let st = self.state.read().await;
+            cms.iter()
+                .map(|cm| st.pos_by_cm.contains_key(cm))
+                .collect::<Vec<bool>>()
+        };
+
+        Ok(presence)
     }
 
     async fn try_incremental_sync(
