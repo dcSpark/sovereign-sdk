@@ -283,6 +283,55 @@ impl MerkleTree {
         assert_eq!(path.len(), self.depth as usize);
         path
     }
+
+    /// Return a reference to the leaf-level data.
+    #[inline]
+    pub fn leaves(&self) -> &[Hash32] {
+        &self.levels[0]
+    }
+
+    /// Efficiently set a contiguous range of leaves starting at `start` and rebuild
+    /// only the affected internal nodes bottom-up.
+    ///
+    /// This is much faster than calling `set_leaf()` in a loop for contiguous updates:
+    /// total hashing work is O(values.len()) instead of O(values.len() * depth).
+    ///
+    /// # Panics
+    /// Panics if `start + values.len() > self.len()`.
+    pub fn set_leaves_contiguous(&mut self, start: usize, values: &[Hash32]) {
+        if values.is_empty() {
+            return;
+        }
+        let end = start + values.len();
+        assert!(
+            end <= self.len(),
+            "set_leaves_contiguous: range {}..{} exceeds tree len {}",
+            start,
+            end,
+            self.len()
+        );
+
+        // Set leaf values via memcpy.
+        self.levels[0][start..end].copy_from_slice(values);
+
+        // Rebuild only the affected internal nodes bottom-up.
+        // At each level, track which parent nodes cover the modified range.
+        let mut range_start = start;
+        let mut range_end = end;
+        for lvl in 0..self.depth as usize {
+            let parent_start = range_start / 2;
+            let parent_end = (range_end + 1) / 2;
+
+            for parent in parent_start..parent_end {
+                let left = self.levels[lvl][parent * 2];
+                let right = self.levels[lvl][parent * 2 + 1];
+                self.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
+            }
+
+            range_start = parent_start;
+            range_end = parent_end;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +375,65 @@ mod tests {
         for idx in [0usize, 1, 2, filled - 1, capacity - 1] {
             assert_eq!(via_set_leaf.open(idx), via_bulk.open(idx));
         }
+    }
+
+    #[test]
+    fn set_leaves_contiguous_matches_set_leaf() {
+        let depth: u8 = 8;
+        let capacity = 1usize << (depth as usize);
+
+        // Prepare a base tree with some initial leaves.
+        let prefix_len = 50usize;
+        let mut base_leaves: Vec<Hash32> = Vec::with_capacity(prefix_len);
+        for i in 0..prefix_len {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+            base_leaves.push(h);
+        }
+
+        // New contiguous values to set at positions [prefix_len, prefix_len + count).
+        let count = 100usize;
+        assert!(prefix_len + count <= capacity);
+        let mut values: Vec<Hash32> = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&((prefix_len + i) as u64).to_le_bytes());
+            values.push(h);
+        }
+
+        // Reference: set_leaf one by one.
+        let mut via_set_leaf = MerkleTree::from_filled_leaves(depth, &base_leaves);
+        for (i, val) in values.iter().enumerate() {
+            via_set_leaf.set_leaf(prefix_len + i, *val);
+        }
+
+        // Bulk: set_leaves_contiguous.
+        let mut via_bulk = MerkleTree::from_filled_leaves(depth, &base_leaves);
+        via_bulk.set_leaves_contiguous(prefix_len, &values);
+
+        assert_eq!(via_set_leaf.root(), via_bulk.root());
+        for idx in [
+            0usize,
+            prefix_len - 1,
+            prefix_len,
+            prefix_len + count - 1,
+            capacity - 1,
+        ] {
+            assert_eq!(
+                via_set_leaf.open(idx),
+                via_bulk.open(idx),
+                "opening mismatch at index {}",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn set_leaves_contiguous_empty_is_noop() {
+        let depth: u8 = 4;
+        let tree_a = MerkleTree::new(depth);
+        let mut tree_b = MerkleTree::new(depth);
+        tree_b.set_leaves_contiguous(0, &[]);
+        assert_eq!(tree_a.root(), tree_b.root());
     }
 }

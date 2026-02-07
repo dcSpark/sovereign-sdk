@@ -271,7 +271,10 @@ struct NotesFetch {
 
 #[derive(Debug)]
 struct CachedTree {
-    tree: MerkleTree,
+    /// The Merkle tree wrapped in Arc so that readers (opening computation) can
+    /// clone the Arc and work without holding the RwLock, while writers use
+    /// `Arc::make_mut` for copy-on-write semantics.
+    tree: Arc<MerkleTree>,
     /// Number of filled leaves (next insertion position), as reported by the rollup.
     next_position: u64,
     /// Highest indexer `events.id` incorporated into this cache when DB sync is enabled.
@@ -283,7 +286,7 @@ struct CachedTree {
 impl CachedTree {
     fn new(depth: u8) -> Self {
         Self {
-            tree: MerkleTree::new(depth),
+            tree: Arc::new(MerkleTree::new(depth)),
             next_position: 0,
             indexer_last_event_id: 0,
             pos_by_cm: HashMap::new(),
@@ -845,8 +848,78 @@ impl CommitmentTreeSyncer {
                 sort_rollup_height_commitments(&mut ordered_delta_notes);
             }
 
-            // Serialize only cache mutation. Network/DB fetches are intentionally done before
-            // locking so most callers can progress concurrently.
+            // --- Pre-build snapshot tree BEFORE acquiring any lock ---
+            // If a snapshot rebuild is needed, do the expensive O(N) tree construction
+            // on a blocking thread. This prevents starving the async runtime and ensures
+            // locks are held only for the brief final swap.
+            #[allow(clippy::type_complexity)]
+            let prebuilt_snapshot: Option<(
+                Arc<MerkleTree>,    // tree
+                HashMap<Hash32, u64>, // pos_by_cm
+                u64,                // expected_next
+                i64,                // snapshot_upto_event_id
+                usize,              // snapshot_rows
+                &'static str,       // ordering_mode
+                u128,               // snapshot_fetch_ms
+                u128,               // apply_ms
+            )> = if let Some((
+                ordered_notes,
+                snapshot_upto_event_id,
+                snapshot_rows,
+                ordering_mode,
+                snapshot_fetch_ms,
+            )) = snapshot_rebuild
+            {
+                let default_depth = self.default_depth;
+                let apply_started = Instant::now();
+
+                // Heavy work in spawn_blocking — no locks held.
+                let (tree, pos_by_cm, expected_next) =
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        let expected_next = ordered_notes.len() as u64;
+                        let depth = required_depth_for_next_position(expected_next)?
+                            .max(default_depth);
+
+                        // Collect commitments into a dense prefix for bulk construction.
+                        let mut leaves: Vec<Hash32> =
+                            Vec::with_capacity(ordered_notes.len());
+                        let mut pos_by_cm: HashMap<Hash32, u64> =
+                            HashMap::with_capacity(ordered_notes.len());
+                        for (pos, note) in ordered_notes.into_iter().enumerate() {
+                            leaves.push(note.commitment);
+                            pos_by_cm.insert(note.commitment, pos as u64);
+                        }
+
+                        // O(N) bulk construction vs O(N * depth) per-leaf set_leaf.
+                        let tree = MerkleTree::from_filled_leaves(depth, &leaves);
+                        Ok((Arc::new(tree), pos_by_cm, expected_next))
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Commitment tree snapshot rebuild panicked: {}",
+                            e
+                        )
+                    })??;
+
+                let apply_ms = apply_started.elapsed().as_millis();
+                Some((
+                    tree,
+                    pos_by_cm,
+                    expected_next,
+                    snapshot_upto_event_id,
+                    snapshot_rows,
+                    ordering_mode,
+                    snapshot_fetch_ms,
+                    apply_ms,
+                ))
+            } else {
+                None
+            };
+
+            // Serialize only cache mutation. Network/DB fetches and heavy tree
+            // construction are intentionally done before locking so most callers
+            // can progress concurrently.
             let _guard = self.sync_lock.lock().await;
             let mut st = self.state.write().await;
 
@@ -881,35 +954,22 @@ impl CommitmentTreeSyncer {
             }
 
             if let Some((
-                ordered_notes,
+                tree,
+                pos_by_cm,
+                expected_next,
                 snapshot_upto_event_id,
                 snapshot_rows,
                 ordering_mode,
                 snapshot_fetch_ms,
-            )) = snapshot_rebuild
+                apply_ms,
+            )) = prebuilt_snapshot
             {
-                let apply_started = Instant::now();
-                let expected_next = ordered_notes.len() as u64;
-                let depth =
-                    required_depth_for_next_position(expected_next)?.max(self.default_depth);
-                let mut tree = MerkleTree::new(depth);
-                if expected_next > tree.len() as u64 {
-                    tree.grow_to_fit(expected_next as usize);
-                }
-
-                let mut pos_by_cm: HashMap<Hash32, u64> =
-                    HashMap::with_capacity(ordered_notes.len());
-                for (pos, note) in ordered_notes.into_iter().enumerate() {
-                    tree.set_leaf(pos, note.commitment);
-                    pos_by_cm.insert(note.commitment, pos as u64);
-                }
-
+                // Brief swap of pre-built tree — no heavy computation under lock.
                 st.tree = tree;
                 st.pos_by_cm = pos_by_cm;
                 st.next_position = expected_next;
                 st.indexer_last_event_id = snapshot_upto_event_id;
                 let tree_size = st.next_position;
-                let apply_ms = apply_started.elapsed().as_millis();
                 drop(st);
 
                 tracing::debug!(
@@ -928,16 +988,34 @@ impl CommitmentTreeSyncer {
                 return Ok(());
             }
 
+            // --- Incremental append ---
             let apply_started = Instant::now();
-            for note in &ordered_delta_notes {
-                let cm = note.commitment;
-                let pos = st.next_position;
-                if pos as usize >= st.tree.len() {
-                    st.tree.grow_to_fit(pos as usize + 1);
+            let delta_len = ordered_delta_notes.len();
+            if delta_len > 0 {
+                let final_next = st.next_position + delta_len as u64;
+                let start_pos = st.next_position as usize;
+
+                // Collect commitments for bulk set.
+                let cms: Vec<Hash32> = ordered_delta_notes
+                    .iter()
+                    .map(|n| n.commitment)
+                    .collect();
+
+                // Mutate tree: pre-grow once to final size, then bulk-set contiguous
+                // leaves. O(delta) hashes vs O(delta * depth) for per-leaf set_leaf.
+                let tree = Arc::make_mut(&mut st.tree);
+                if final_next as usize > tree.len() {
+                    tree.grow_to_fit(final_next as usize);
                 }
-                st.tree.set_leaf(pos as usize, cm);
-                st.pos_by_cm.insert(cm, pos);
-                st.next_position = pos + 1;
+                tree.set_leaves_contiguous(start_pos, &cms);
+
+                // Update position map.
+                let base_pos = st.next_position;
+                for (i, note) in ordered_delta_notes.iter().enumerate() {
+                    st.pos_by_cm
+                        .insert(note.commitment, base_pos + i as u64);
+                }
+                st.next_position = final_next;
             }
             st.indexer_last_event_id = delta_batch.upto_event_id;
             let tree_size = st.next_position;
@@ -977,33 +1055,38 @@ impl CommitmentTreeSyncer {
 
     /// Try to resolve all commitment positions and Merkle openings from the current in-memory
     /// cache without triggering any network sync.
+    ///
+    /// The read lock is held only briefly to look up positions and clone the `Arc<MerkleTree>`.
+    /// Opening computation (O(depth) per commitment) runs entirely without any lock, so
+    /// concurrent writers are never blocked by opening computation.
     async fn try_resolve_from_cache(
         &self,
         cms: &[Hash32],
     ) -> Option<(Hash32, Vec<u64>, Vec<Vec<Hash32>>, u64, u128)> {
-        let st = self.state.read().await;
-        let mut positions = Vec::with_capacity(cms.len());
-        for cm in cms {
-            match st.pos_by_cm.get(cm).copied() {
-                Some(pos) => positions.push(pos),
-                None => return None,
+        // Phase 1: Look up positions and snapshot the tree Arc under a brief read lock.
+        let (tree, positions, next_position) = {
+            let st = self.state.read().await;
+            let mut positions = Vec::with_capacity(cms.len());
+            for cm in cms {
+                match st.pos_by_cm.get(cm).copied() {
+                    Some(pos) => positions.push(pos),
+                    None => return None,
+                }
             }
-        }
+            (Arc::clone(&st.tree), positions, st.next_position)
+        };
+        // Read lock released — writers are no longer blocked.
 
+        // Phase 2: Compute openings from the snapshot without holding any lock.
         let open_started = Instant::now();
+        let root = tree.root();
         let siblings = positions
             .iter()
-            .map(|pos| st.tree.open(*pos as usize))
+            .map(|pos| tree.open(*pos as usize))
             .collect();
         let open_ms = open_started.elapsed().as_millis();
 
-        Some((
-            st.tree.root(),
-            positions,
-            siblings,
-            st.next_position,
-            open_ms,
-        ))
+        Some((root, positions, siblings, next_position, open_ms))
     }
 
     /// Resolve positions and Merkle openings for all `cms`, using the cached tree.
@@ -1147,16 +1230,20 @@ impl CommitmentTreeSyncer {
             return Ok(None);
         }
 
-        if expected_next as usize > st.tree.len() {
-            st.tree.grow_to_fit(expected_next as usize);
-        }
-
         let fetched_notes = notes.len();
+
+        // Mutate tree through Arc::make_mut (copy-on-write if readers exist).
+        // Pre-grow once to final size — no per-leaf capacity checks needed.
+        let tree = Arc::make_mut(&mut st.tree);
+        if expected_next as usize > tree.len() {
+            tree.grow_to_fit(expected_next as usize);
+        }
+        for &(pos, cm) in &notes {
+            tree.set_leaf(pos as usize, cm);
+        }
+        // tree borrow ends (NLL) — st is accessible again.
+
         for (pos, cm) in notes {
-            if pos as usize >= st.tree.len() {
-                st.tree.grow_to_fit(pos as usize + 1);
-            }
-            st.tree.set_leaf(pos as usize, cm);
             st.pos_by_cm.insert(cm, pos);
         }
         st.next_position = expected_next;
@@ -1206,11 +1293,22 @@ impl CommitmentTreeSyncer {
             }
             let apply_ms = apply_started.elapsed().as_millis();
 
+            // Move heavy tree construction off the async runtime.
             let tree_init_started = Instant::now();
-            let tree = MerkleTree::from_filled_leaves(depth, &leaves);
+            let (tree, rebuilt_root) = tokio::task::spawn_blocking(move || {
+                let tree = MerkleTree::from_filled_leaves(depth, &leaves);
+                let root = tree.root();
+                (tree, root)
+            })
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Tree construction panicked during full rebuild: {}",
+                    e
+                )
+            })?;
             let tree_init_ms = tree_init_started.elapsed().as_millis();
 
-            let rebuilt_root = tree.root();
             if rebuilt_root != expected_root {
                 tracing::warn!(
                     target_next_position = expected_next,
@@ -1228,8 +1326,9 @@ impl CommitmentTreeSyncer {
                 hex::encode(expected_root)
             );
 
+            // Brief lock to swap in the pre-built tree.
             let mut st = self.state.write().await;
-            st.tree = tree;
+            st.tree = Arc::new(tree);
             st.pos_by_cm = pos_by_cm;
             st.next_position = expected_next;
 
@@ -1266,7 +1365,7 @@ impl CommitmentTreeSyncer {
         );
 
         let mut st = self.state.write().await;
-        st.tree = tree;
+        st.tree = Arc::new(tree);
         st.pos_by_cm = pos_by_cm;
         st.next_position = expected_next;
 
