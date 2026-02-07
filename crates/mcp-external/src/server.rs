@@ -1118,6 +1118,7 @@ impl CryptoServer {
         let mut notes_wait_last_progress_log = notes_wait_started;
         let mut notes_fetch_attempts: u64 = 0;
         let tree_presence_sync_every_polls_cfg = tree_presence_sync_every_polls();
+        let mut tree_sync_round = global_tree_syncer().current_sync_round();
         let mut notes_fetch_ms_total: u128 = 0;
         let mut notes_filtered_pending_total: u64 = 0;
         let mut notes_added_local_total: u64 = 0;
@@ -1214,6 +1215,7 @@ impl CryptoServer {
                             None,
                         )
                     })?;
+                tree_sync_round = global_tree_syncer().current_sync_round();
             }
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let owner_recipient_hex = hex::encode(owner_recipient);
@@ -1298,7 +1300,13 @@ impl CryptoServer {
                 notes_wait_last_progress_log = std::time::Instant::now();
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
+            let poll_delay = std::time::Duration::from_millis(NOTES_WAIT_POLL_MS);
+            if global_tree_syncer()
+                .wait_for_sync_round_advance(tree_sync_round, poll_delay)
+                .await
+            {
+                tree_sync_round = global_tree_syncer().current_sync_round();
+            }
         };
 
         let notes_wait_ms = notes_wait_started.elapsed().as_millis();
@@ -1451,6 +1459,7 @@ impl CryptoServer {
                 let tree_wait_limit =
                     std::time::Duration::from_secs(wait_for_tree_visible_notes_secs());
                 let tree_sync_every_polls = tree_presence_sync_every_polls();
+                let mut tree_sync_round = global_tree_syncer().current_sync_round();
                 let tree_wait_started = std::time::Instant::now();
                 let mut tree_wait_polls: u64 = 0;
                 let mut tree_wait_last_progress_log = std::time::Instant::now();
@@ -1471,6 +1480,7 @@ impl CryptoServer {
                             Ok(v) => {
                                 last_tree_sync_error = None;
                                 all_present = v.iter().all(|p| *p);
+                                tree_sync_round = global_tree_syncer().current_sync_round();
                             }
                             Err(e) => {
                                 let error_text = format!("{:#}", e);
@@ -1546,7 +1556,13 @@ impl CryptoServer {
                             None,
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
+                    let poll_delay = std::time::Duration::from_millis(NOTES_WAIT_POLL_MS);
+                    if global_tree_syncer()
+                        .wait_for_sync_round_advance(tree_sync_round, poll_delay)
+                        .await
+                    {
+                        tree_sync_round = global_tree_syncer().current_sync_round();
+                    }
                 }
             }
         }

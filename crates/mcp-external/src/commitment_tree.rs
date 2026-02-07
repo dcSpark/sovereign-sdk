@@ -363,6 +363,29 @@ impl CommitmentTreeSyncer {
         *st = CachedTree::new(self.default_depth);
     }
 
+    /// Return the latest published sync round for this process-wide tree cache.
+    pub fn current_sync_round(&self) -> u64 {
+        *self.sync_flight_tx.borrow()
+    }
+
+    /// Wait for a new sync round to be published, or timeout.
+    ///
+    /// Returns `true` when a newer round was observed, `false` on timeout.
+    pub async fn wait_for_sync_round_advance(
+        &self,
+        observed_round: u64,
+        timeout: Duration,
+    ) -> bool {
+        let mut rx = self.sync_flight_tx.subscribe();
+        if *rx.borrow() != observed_round {
+            return true;
+        }
+        matches!(
+            tokio::time::timeout(timeout, rx.changed()).await,
+            Ok(Ok(()))
+        )
+    }
+
     /// Sync the local cached tree to the latest stable `/notes` snapshot.
     ///
     /// This is safe to call concurrently. When many tasks request a sync at once, a
@@ -545,16 +568,20 @@ impl CommitmentTreeSyncer {
                 }
             }
 
-            // Ensure cache isn't ahead of the chain (reorg / reset).
+            // If this snapshot is behind our cache, treat it as stale and retry.
+            // With single-flight enabled, this is typically endpoint lag, not a real rewind.
             let current_next = { self.state.read().await.next_position };
             if expected_next < current_next {
                 tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = sync.max_retries,
                     cached_next_position = current_next,
                     notes_next_position = expected_next,
-                    "Commitment tree appears to have rewound; resetting local cache"
+                    "Commitment tree snapshot is behind cache; retrying without reset"
                 );
-                let mut st = self.state.write().await;
-                *st = CachedTree::new(expected_depth);
+                drop(_guard);
+                tokio::time::sleep(sync.retry_delay).await;
+                continue;
             }
 
             // If the chain depth changed but next_position doesn't force a growth, reset the local
@@ -1014,6 +1041,7 @@ impl CommitmentTreeSyncer {
         let sync_started = Instant::now();
         self.sync_to_latest(provider).await?;
         sync_time_ms += sync_started.elapsed().as_millis();
+        let mut observed_round = self.current_sync_round();
 
         let post_sync_attempts = lookup.max_retries.saturating_add(1);
         for attempt in 1..=post_sync_attempts {
@@ -1036,7 +1064,20 @@ impl CommitmentTreeSyncer {
                 break;
             }
 
-            tokio::time::sleep(lookup.retry_delay).await;
+            // Prefer waiting for published tree updates. If no update arrives before the retry
+            // delay, trigger one explicit sync attempt and continue.
+            if self
+                .wait_for_sync_round_advance(observed_round, lookup.retry_delay)
+                .await
+            {
+                observed_round = self.current_sync_round();
+                continue;
+            }
+
+            let sync_started = Instant::now();
+            self.sync_to_latest(provider).await?;
+            sync_time_ms += sync_started.elapsed().as_millis();
+            observed_round = self.current_sync_round();
         }
 
         let st = self.state.read().await;
