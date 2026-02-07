@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,8 @@ struct Config {
     wallet_setup_batch_size: usize,
     wallet_setup_backoff_ms: u64,
     sequencer_ready_check_timeout_ms: u64,
+    proof_generation_interval_ms: u64,
+    proof_generation_batch_size: usize,
     max_concurrent_proofs: usize,
     da_connection_string: String,
     ligero_program_path: String,
@@ -94,6 +96,8 @@ impl Config {
         let wallet_setup_backoff_ms = env_u64("WALLET_SETUP_BACKOFF_MS", 1_000).max(50);
         let sequencer_ready_check_timeout_ms =
             env_u64("SEQUENCER_READY_CHECK_TIMEOUT_MS", 2_000).max(100);
+        let proof_generation_interval_ms = env_u64("PROOF_GENERATION_INTERVAL_MS", 0);
+        let proof_generation_batch_size = env_usize("PROOF_GENERATION_BATCH_SIZE", 1).max(1);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
         let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
@@ -117,6 +121,8 @@ impl Config {
             wallet_setup_batch_size,
             wallet_setup_backoff_ms,
             sequencer_ready_check_timeout_ms,
+            proof_generation_interval_ms,
+            proof_generation_batch_size,
             max_concurrent_proofs,
             da_connection_string,
             ligero_program_path,
@@ -152,6 +158,9 @@ struct PoolWallet {
 struct ServiceState {
     cfg: Config,
     target_max_proofs: AtomicUsize,
+    proof_generation_enabled: AtomicBool,
+    proof_generation_interval_ms: AtomicU64,
+    proof_generation_batch_size: AtomicUsize,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
     http: HttpClient,
@@ -206,10 +215,30 @@ struct MaxProofsBody {
     max_proofs: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProofGenerationQuery {
+    #[serde(alias = "token")]
+    auth_token: Option<String>,
+    state: Option<String>,
+    interval_ms: Option<u64>,
+    batch_size: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProofGenerationBody {
+    state: Option<String>,
+    interval_ms: Option<u64>,
+    batch_size: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     max_proofs: usize,
     ready_proofs: usize,
+    proof_generation_active: bool,
+    proof_generation_state: &'static str,
+    proof_generation_interval_ms: u64,
+    proof_generation_batch_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,12 +329,17 @@ async fn main() -> Result<()> {
         gas_reserve = cfg.auto_fund_gas_reserve,
         wallet_setup_batch_size = cfg.wallet_setup_batch_size,
         wallet_setup_backoff_ms = cfg.wallet_setup_backoff_ms,
+        proof_generation_interval_ms = cfg.proof_generation_interval_ms,
+        proof_generation_batch_size = cfg.proof_generation_batch_size,
         "Starting proof pool service"
     );
 
     let state = Arc::new(ServiceState {
         cfg: cfg.clone(),
         target_max_proofs: AtomicUsize::new(cfg.max_proofs),
+        proof_generation_enabled: AtomicBool::new(true),
+        proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
+        proof_generation_batch_size: AtomicUsize::new(cfg.proof_generation_batch_size),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
@@ -337,6 +371,10 @@ async fn main() -> Result<()> {
             "/max_proofs",
             post(max_proofs_handler).get(max_proofs_handler_get),
         )
+        .route(
+            "/proof_generation",
+            post(proof_generation_handler).get(proof_generation_handler_get),
+        )
         .route("/send", post(send_handler).get(send_handler_get))
         .route("/burst", post(burst_handler).get(burst_handler_get))
         .with_state(state);
@@ -361,6 +399,34 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }
 
+fn proof_generation_state_label(active: bool) -> &'static str {
+    if active { "started" } else { "stopped" }
+}
+
+fn parse_proof_generation_state(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "started" | "start" | "active" | "on" | "true" | "1" => Some(true),
+        "stopped" | "stop" | "inactive" | "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
+    let ready = ready_proofs(state).await;
+    let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
+    let active = state.proof_generation_enabled.load(Ordering::Relaxed);
+    let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
+    let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
+    StatusResponse {
+        max_proofs,
+        ready_proofs: ready,
+        proof_generation_active: active,
+        proof_generation_state: proof_generation_state_label(active),
+        proof_generation_interval_ms: interval_ms,
+        proof_generation_batch_size: batch_size,
+    }
+}
+
 async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
@@ -370,12 +436,7 @@ async fn status_handler(
     Query(query): Query<TokenQuery>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
-    let ready = ready_proofs(&state).await;
-    let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
-    Ok(Json(StatusResponse {
-        max_proofs,
-        ready_proofs: ready,
-    }))
+    Ok(Json(status_snapshot(&state).await))
 }
 
 async fn max_proofs_handler_get(
@@ -391,6 +452,21 @@ async fn max_proofs_handler(
     body: Option<Json<MaxProofsBody>>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     max_proofs_impl(state, query, body.map(|b| b.0)).await
+}
+
+async fn proof_generation_handler_get(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<ProofGenerationQuery>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    proof_generation_impl(state, query, None).await
+}
+
+async fn proof_generation_handler(
+    State(state): State<Arc<ServiceState>>,
+    Query(query): Query<ProofGenerationQuery>,
+    body: Option<Json<ProofGenerationBody>>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    proof_generation_impl(state, query, body.map(|b| b.0)).await
 }
 
 async fn send_handler_get(
@@ -445,12 +521,73 @@ async fn max_proofs_impl(
         );
     }
 
-    let ready = ready_proofs(&state).await;
-    let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
-    Ok(Json(StatusResponse {
-        max_proofs,
-        ready_proofs: ready,
-    }))
+    Ok(Json(status_snapshot(&state).await))
+}
+
+async fn proof_generation_impl(
+    state: Arc<ServiceState>,
+    query: ProofGenerationQuery,
+    body: Option<ProofGenerationBody>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
+
+    let body_state = body.as_ref().and_then(|b| b.state.as_deref());
+    let requested_state = body
+        .as_ref()
+        .and_then(|b| b.state.as_deref())
+        .and_then(parse_proof_generation_state)
+        .or_else(|| {
+            query
+                .state
+                .as_deref()
+                .and_then(parse_proof_generation_state)
+        });
+
+    if let Some(enabled) = requested_state {
+        state
+            .proof_generation_enabled
+            .store(enabled, Ordering::Relaxed);
+        tracing::info!(
+            proof_generation_active = enabled,
+            proof_generation_state = proof_generation_state_label(enabled),
+            "Updated proof generation state"
+        );
+    } else if body_state.is_some() || query.state.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let requested_interval_ms = body
+        .as_ref()
+        .and_then(|b| b.interval_ms)
+        .or(query.interval_ms);
+    if let Some(interval_ms) = requested_interval_ms {
+        state
+            .proof_generation_interval_ms
+            .store(interval_ms, Ordering::Relaxed);
+        tracing::info!(
+            proof_generation_interval_ms = interval_ms,
+            "Updated proof generation throttle interval"
+        );
+    }
+
+    let requested_batch_size = body
+        .as_ref()
+        .and_then(|b| b.batch_size)
+        .or(query.batch_size);
+    if let Some(batch_size) = requested_batch_size {
+        if batch_size == 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        state
+            .proof_generation_batch_size
+            .store(batch_size, Ordering::Relaxed);
+        tracing::info!(
+            proof_generation_batch_size = batch_size,
+            "Updated proof generation batch size"
+        );
+    }
+
+    Ok(Json(status_snapshot(&state).await))
 }
 
 async fn send_impl(
@@ -515,11 +652,12 @@ async fn burst_impl(
 
     let started = Instant::now();
     let interval = Duration::from_secs(2);
-    let burst_start = tokio::time::Instant::now();
 
     let mut steps: Vec<BurstStep> = Vec::with_capacity(quantities.len());
     for (idx, requested) in quantities.iter().copied().enumerate() {
-        tokio::time::sleep_until(burst_start + interval * (idx as u32)).await;
+        if idx > 0 {
+            sleep(interval).await;
+        }
 
         let tx_hashes = collect_pending_hashes(&state, requested).await;
         if tx_hashes.is_empty() {
@@ -627,38 +765,68 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
     tokio::spawn(async move {
+        let mut next_allowed_generation = tokio::time::Instant::now();
         loop {
+            if !state.proof_generation_enabled.load(Ordering::Relaxed) {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
+            let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
+            let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
+            if interval_ms > 0 {
+                let now = tokio::time::Instant::now();
+                if now < next_allowed_generation {
+                    sleep(next_allowed_generation - now).await;
+                    continue;
+                }
+            }
+
             let ready = ready_proofs(&state).await;
             let target = state.target_max_proofs.load(Ordering::Relaxed);
             if ready >= target {
                 sleep(Duration::from_millis(200)).await;
                 continue;
             }
+            let deficit = target - ready;
+            let launches_target = deficit.min(batch_size);
 
-            let permit = match state.proof_semaphore.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            };
+            let mut launched = 0usize;
+            for _ in 0..launches_target {
+                let permit = match state.proof_semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
 
-            let wallet_idx = match pick_wallet_to_generate(&state).await {
-                Some(idx) => idx,
-                None => {
-                    drop(permit);
-                    sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
+                let wallet_idx = match pick_wallet_to_generate(&state).await {
+                    Some(idx) => idx,
+                    None => {
+                        drop(permit);
+                        break;
+                    }
+                };
 
-            let st = state.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) = generate_pending_for_wallet(&st, wallet_idx).await {
-                    tracing::warn!(wallet_idx, error = %e, "Failed to generate pending proof");
-                }
-            });
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = generate_pending_for_wallet(&st, wallet_idx).await {
+                        tracing::warn!(wallet_idx, error = %e, "Failed to generate pending proof");
+                    }
+                });
+                launched += 1;
+            }
+
+            if launched == 0 {
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            if interval_ms > 0 {
+                next_allowed_generation =
+                    tokio::time::Instant::now() + Duration::from_millis(interval_ms);
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
     });
 }
@@ -946,12 +1114,15 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
     let deposit_notes = submit_deposits(&state).await?;
 
     tracing::info!("Waiting for deposit notes to be indexed");
-    for (wallet_idx, note) in deposit_notes.iter().enumerate() {
+    let privacy_keys: Vec<PrivacyKey> = {
         let wallets = state.wallets.read().await;
-        let w = wallets
+        wallets.iter().map(|w| w.privacy_key.clone()).collect()
+    };
+    for (wallet_idx, note) in deposit_notes.iter().enumerate() {
+        let privacy_key = privacy_keys
             .get(wallet_idx)
             .ok_or_else(|| anyhow!("wallet idx out of range"))?;
-        wait_for_note_in_tree(state.provider.as_ref(), &w.privacy_key, note).await?;
+        wait_for_note_in_tree(state.provider.as_ref(), privacy_key, note).await?;
     }
 
     {
@@ -1247,12 +1418,23 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
 
     let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
     let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
+    let wallet_targets: Vec<(usize, String, String)> = {
+        let wallets = state.wallets.read().await;
+        wallets
+            .iter()
+            .enumerate()
+            .map(|(idx, w)| {
+                (
+                    idx,
+                    w.wallet.get_address().to_string(),
+                    w.privacy_key.privacy_address(&DOMAIN).to_string(),
+                )
+            })
+            .collect()
+    };
 
-    let wallets = state.wallets.read().await;
-    for (idx, w) in wallets.iter().enumerate() {
+    for (idx, wallet_address, shielded_address) in wallet_targets.iter().cloned() {
         let http = state.http.clone();
-        let wallet_address = w.wallet.get_address().to_string();
-        let shielded_address = w.privacy_key.privacy_address(&DOMAIN).to_string();
         let permit = sem.clone().acquire_owned().await?;
         join_set.spawn(async move {
             let _permit = permit;
@@ -1267,9 +1449,8 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
             Ok((idx, bundle))
         });
     }
-    drop(wallets);
 
-    let mut out: Vec<Option<ViewerFvkBundle>> = vec![None; state.cfg.max_proofs];
+    let mut out: Vec<Option<ViewerFvkBundle>> = vec![None; wallet_targets.len()];
     while let Some(res) = join_set.join_next().await {
         let (idx, bundle) = res??;
         out[idx] = Some(bundle);
@@ -1290,12 +1471,17 @@ async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
     let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
-    let wallets = state.wallets.read().await;
-    for w in wallets.iter() {
+    let to_addrs: Vec<String> = {
+        let wallets = state.wallets.read().await;
+        wallets
+            .iter()
+            .map(|w| w.wallet.get_address().to_string())
+            .collect()
+    };
+    for to_addr in to_addrs {
         let provider = state.provider.clone();
         let admin = state.admin_wallet.clone();
         let token_id = state.gas_token_id.clone();
-        let to_addr = w.wallet.get_address().to_string();
         let permit = sem.clone().acquire_owned().await?;
         join_set.spawn(async move {
             let _permit = permit;
@@ -1310,7 +1496,6 @@ async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
             Ok(())
         });
     }
-    drop(wallets);
 
     while let Some(res) = join_set.join_next().await {
         res??;
@@ -1323,11 +1508,13 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
     let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
-    let wallets = state.wallets.read().await;
-    for w in wallets.iter() {
+    let addrs: Vec<_> = {
+        let wallets = state.wallets.read().await;
+        wallets.iter().map(|w| w.wallet.get_address()).collect()
+    };
+    for addr in addrs {
         let provider = state.provider.clone();
         let token_id = state.gas_token_id.clone();
-        let addr = w.wallet.get_address();
         let permit = sem.clone().acquire_owned().await?;
         join_set.spawn(async move {
             let _permit = permit;
@@ -1373,7 +1560,6 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
             }
         });
     }
-    drop(wallets);
 
     while let Some(res) = join_set.join_next().await {
         res??;
@@ -1386,12 +1572,17 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
     let mut join_set: JoinSet<Result<(usize, NoteState)>> = JoinSet::new();
 
-    let wallets = state.wallets.read().await;
-    let wallets_len = wallets.len();
-    for (idx, w) in wallets.iter().enumerate() {
+    let wallet_inputs: Vec<(usize, McpWalletContext, PrivacyKey)> = {
+        let wallets = state.wallets.read().await;
+        wallets
+            .iter()
+            .enumerate()
+            .map(|(idx, w)| (idx, w.wallet.clone(), w.privacy_key.clone()))
+            .collect()
+    };
+    let wallets_len = wallet_inputs.len();
+    for (idx, wallet, privacy_key) in wallet_inputs {
         let provider = state.deposit_provider.clone();
-        let wallet = w.wallet.clone();
-        let privacy_key = w.privacy_key.clone();
         let deposit_amount = state.cfg.deposit_amount;
         let permit = sem.clone().acquire_owned().await?;
         join_set.spawn(async move {
@@ -1407,7 +1598,6 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
             ))
         });
     }
-    drop(wallets);
 
     let mut out: Vec<Option<NoteState>> = vec![None; wallets_len];
     while let Some(res) = join_set.join_next().await {

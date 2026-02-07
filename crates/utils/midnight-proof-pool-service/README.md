@@ -8,10 +8,16 @@ requested number of pending transactions to the sequencer, and the service refil
 ## Endpoints
 
 - `GET /status?auth_token=...`
-  - Returns `{ max_proofs, ready_proofs }`
+  - Returns `{ max_proofs, ready_proofs, proof_generation_active, proof_generation_state, proof_generation_interval_ms, proof_generation_batch_size }`
 - `POST /max_proofs?auth_token=...` with JSON body `{ "max_proofs": N }`
   - Updates the target `MAX_PROOFS` (the service scales wallets up in bounded batches and refills pending proofs to match)
 - Also supports: `GET /max_proofs?auth_token=...&max_proofs=N` (phone-friendly)
+- `POST /proof_generation?auth_token=...` with optional JSON body fields:
+  - `{ "state": "started" | "stopped", "interval_ms": N, "batch_size": M }`
+  - `state` toggles background proof refill generation on/off (send/burst keep working either way)
+  - `interval_ms` sets minimum delay between generation batches (`0` means no interval throttle)
+  - `batch_size` sets max number of proofs started per refill batch/tick (must be `> 0`)
+- Also supports query params: `GET /proof_generation?auth_token=...&state=started|stopped&interval_ms=N&batch_size=M` (phone-friendly)
 - `POST /send?auth_token=...` with JSON body `{ "proof_quantity": N }`
   - Flushes up to `N` pending txs to the sequencer (via verifier `/midnight-privacy/flush?limit=N`)
 - Also supports: `GET /send?auth_token=...&proof_quantity=N` (phone-friendly)
@@ -39,6 +45,8 @@ requested number of pending transactions to the sequencer, and the service refil
 - `WALLET_SETUP_BATCH_SIZE` - max number of wallets created/funded/deposited per scale-up batch (default: `5`)
 - `WALLET_SETUP_BACKOFF_MS` - delay between scale-up checks/batches and retry backoff when sequencer is not ready (default: `1000`)
 - `SEQUENCER_READY_CHECK_TIMEOUT_MS` - timeout for `/sequencer/ready` backpressure check before each scale-up batch (default: `2000`)
+- `PROOF_GENERATION_INTERVAL_MS` - minimum delay between refill batches in the refill loop (default: `0`, no interval throttle)
+- `PROOF_GENERATION_BATCH_SIZE` - max proofs started per refill batch/tick (default: `1`)
 - `MAX_CONCURRENT_PROOFS` - concurrent proof generations (default: `5`)
 - `PROOF_POOL_TREE_RESOLVE_RETRY_ATTEMPTS` - extra retries for transient tree lag / stale anchor root during self-transfer generation (default: `1`)
 - `PROOF_POOL_TREE_RESOLVE_RETRY_DELAY_MS` - delay between those retries in ms (default: `750`)
@@ -62,6 +70,9 @@ cargo run -p midnight-proof-pool-service --release
 ```bash
 curl "http://127.0.0.1:11235/status?auth_token=secret"
 curl "http://127.0.0.1:11235/max_proofs?auth_token=secret&max_proofs=25"
+curl "http://127.0.0.1:11235/proof_generation?auth_token=secret&state=stopped"
+curl "http://127.0.0.1:11235/proof_generation?auth_token=secret&state=started"
+curl "http://127.0.0.1:11235/proof_generation?auth_token=secret&interval_ms=500&batch_size=3"
 curl "http://127.0.0.1:11235/send?auth_token=secret&proof_quantity=25"
 curl "http://127.0.0.1:11235/burst?auth_token=secret&proof_quantities=2,5,10"
 ```
