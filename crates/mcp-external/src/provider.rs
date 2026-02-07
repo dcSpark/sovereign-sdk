@@ -620,19 +620,19 @@ impl Provider {
             let cm_hex: String = row
                 .try_get("cm")
                 .context("Failed to decode midnight_note_created.cm from indexer DB row")?;
-            let rollup_height_i64: i64 = row.try_get("rollup_height").context(
+            let rollup_height_i64: Option<i64> = row.try_get("rollup_height").context(
                 "Failed to decode midnight_note_created.rollup_height from indexer DB row",
             )?;
-            let rollup_height = u64::try_from(rollup_height_i64).with_context(|| {
-                format!(
-                    "midnight_note_created.rollup_height is negative: {}",
-                    rollup_height_i64
-                )
-            })?;
+            let rollup_height = match rollup_height_i64 {
+                Some(value) => Some(u64::try_from(value).with_context(|| {
+                    format!("midnight_note_created.rollup_height is negative: {}", value)
+                })?),
+                None => None,
+            };
             let commitment = parse_hash32_hex(&cm_hex)?;
             notes.push(IndexerNoteCreated {
                 commitment,
-                rollup_height: Some(rollup_height),
+                rollup_height,
             });
         }
 

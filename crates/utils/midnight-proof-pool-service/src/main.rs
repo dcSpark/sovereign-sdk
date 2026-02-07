@@ -158,6 +158,7 @@ struct PoolWallet {
 struct ServiceState {
     cfg: Config,
     target_max_proofs: AtomicUsize,
+    ready_proofs_count: AtomicUsize,
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
     proof_generation_batch_size: AtomicUsize,
@@ -337,6 +338,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(ServiceState {
         cfg: cfg.clone(),
         target_max_proofs: AtomicUsize::new(cfg.max_proofs),
+        ready_proofs_count: AtomicUsize::new(0),
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
         proof_generation_batch_size: AtomicUsize::new(cfg.proof_generation_batch_size),
@@ -400,7 +402,11 @@ fn init_tracing() {
 }
 
 fn proof_generation_state_label(active: bool) -> &'static str {
-    if active { "started" } else { "stopped" }
+    if active {
+        "started"
+    } else {
+        "stopped"
+    }
 }
 
 fn parse_proof_generation_state(raw: &str) -> Option<bool> {
@@ -412,7 +418,7 @@ fn parse_proof_generation_state(raw: &str) -> Option<bool> {
 }
 
 async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
-    let ready = ready_proofs(state).await;
+    let ready = ready_proofs(state);
     let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
@@ -532,9 +538,7 @@ async fn proof_generation_impl(
     check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
 
     let body_state = body.as_ref().and_then(|b| b.state.as_deref());
-    let requested_state = body
-        .as_ref()
-        .and_then(|b| b.state.as_deref())
+    let requested_state = body_state
         .and_then(parse_proof_generation_state)
         .or_else(|| {
             query
@@ -606,7 +610,7 @@ async fn send_impl(
 
     let tx_hashes = collect_pending_hashes(&state, requested).await;
     if tx_hashes.is_empty() {
-        let ready = ready_proofs(&state).await;
+        let ready = ready_proofs(&state);
         return Ok(Json(SendResponse {
             requested,
             flushed: 0,
@@ -661,7 +665,7 @@ async fn burst_impl(
 
         let tx_hashes = collect_pending_hashes(&state, requested).await;
         if tx_hashes.is_empty() {
-            let ready = ready_proofs(&state).await;
+            let ready = ready_proofs(&state);
             steps.push(BurstStep {
                 requested,
                 flushed: 0,
@@ -715,9 +719,8 @@ fn parse_csv_usizes(csv: &str) -> Result<Vec<usize>, StatusCode> {
     Ok(out)
 }
 
-async fn ready_proofs(state: &Arc<ServiceState>) -> usize {
-    let wallets = state.wallets.read().await;
-    wallets.iter().filter(|w| w.pending.is_some()).count()
+fn ready_proofs(state: &ServiceState) -> usize {
+    state.ready_proofs_count.load(Ordering::Relaxed)
 }
 
 async fn collect_pending_hashes(state: &Arc<ServiceState>, limit: usize) -> Vec<String> {
@@ -738,6 +741,7 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
         }
     }
 
+    let mut cleared = 0usize;
     for entry in flush.results.iter() {
         let Some(ref tx_hash) = entry.tx_hash else {
             continue;
@@ -758,9 +762,19 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
             w.current_note = Some(pending.next_note);
         }
         w.pending = None;
+        cleared += 1;
     }
 
-    wallets.iter().filter(|w| w.pending.is_some()).count()
+    drop(wallets);
+    if cleared > 0 {
+        let _ = state
+            .ready_proofs_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(cleared))
+            });
+    }
+
+    ready_proofs(state)
 }
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
@@ -782,7 +796,7 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
                 }
             }
 
-            let ready = ready_proofs(&state).await;
+            let ready = ready_proofs(&state);
             let target = state.target_max_proofs.load(Ordering::Relaxed);
             if ready >= target {
                 sleep(Duration::from_millis(200)).await;
@@ -1015,16 +1029,23 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
             sender_id: privacy_key.recipient(&DOMAIN),
         };
 
+        let became_pending;
         {
             let mut wallets = state.wallets.write().await;
             let w = wallets
                 .get_mut(wallet_idx)
                 .ok_or_else(|| anyhow!("wallet idx out of range (write)"))?;
+            let was_pending = w.pending.is_some();
             w.pending = Some(PendingTransfer {
                 tx_hash: res.tx_hash.clone(),
                 next_note,
             });
             w.generating = false;
+            became_pending = !was_pending;
+        }
+
+        if became_pending {
+            state.ready_proofs_count.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -1134,7 +1155,7 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         }
     }
 
-    let ready = ready_proofs(&state).await;
+    let ready = ready_proofs(&state);
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         ready,
