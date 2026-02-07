@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use midnight_privacy::{Hash32, MerkleTree, MAX_TREE_DEPTH};
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::provider::{IndexerNoteCreated, Provider};
 
@@ -287,6 +287,29 @@ impl CachedTree {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SyncFlightOutcome {
+    Success,
+    Error(String),
+}
+
+#[derive(Debug)]
+struct SyncFlightState {
+    in_flight: bool,
+    completed_round: u64,
+    outcome: SyncFlightOutcome,
+}
+
+impl Default for SyncFlightState {
+    fn default() -> Self {
+        Self {
+            in_flight: false,
+            completed_round: 0,
+            outcome: SyncFlightOutcome::Success,
+        }
+    }
+}
+
 /// Shared, incremental syncer for the Midnight Privacy commitment tree.
 ///
 /// Goals:
@@ -298,6 +321,8 @@ pub struct CommitmentTreeSyncer {
     default_depth: u8,
     state: RwLock<CachedTree>,
     sync_lock: Mutex<()>,
+    sync_flight: Mutex<SyncFlightState>,
+    sync_flight_notify: Notify,
 }
 
 impl CommitmentTreeSyncer {
@@ -306,6 +331,8 @@ impl CommitmentTreeSyncer {
             default_depth,
             state: RwLock::new(CachedTree::new(default_depth)),
             sync_lock: Mutex::new(()),
+            sync_flight: Mutex::new(SyncFlightState::default()),
+            sync_flight_notify: Notify::new(),
         }
     }
 
@@ -341,9 +368,55 @@ impl CommitmentTreeSyncer {
 
     /// Sync the local cached tree to the latest stable `/notes` snapshot.
     ///
-    /// This is safe to call concurrently: only one task will perform network fetches and
-    /// tree updates at a time.
+    /// This is safe to call concurrently. When multiple callers request a sync at the same time,
+    /// one task performs the sync and all others wait for and reuse that outcome.
     pub async fn sync_to_latest(&self, provider: &Provider) -> Result<()> {
+        loop {
+            let wait_state = {
+                let mut flight = self.sync_flight.lock().await;
+                if !flight.in_flight {
+                    flight.in_flight = true;
+                    None
+                } else {
+                    Some((flight.completed_round, self.sync_flight_notify.notified()))
+                }
+            };
+
+            if let Some((observed_round, notified)) = wait_state {
+                notified.await;
+
+                let flight = self.sync_flight.lock().await;
+                if flight.completed_round == observed_round {
+                    // Spurious wakeup, or leader has not published a new outcome yet.
+                    continue;
+                }
+                return match &flight.outcome {
+                    SyncFlightOutcome::Success => Ok(()),
+                    SyncFlightOutcome::Error(error) => {
+                        anyhow::bail!("Commitment tree single-flight sync failed: {error}")
+                    }
+                };
+            }
+
+            let result = self.sync_to_latest_impl(provider).await;
+            let outcome = match &result {
+                Ok(()) => SyncFlightOutcome::Success,
+                Err(err) => SyncFlightOutcome::Error(format!("{:#}", err)),
+            };
+
+            {
+                let mut flight = self.sync_flight.lock().await;
+                flight.in_flight = false;
+                flight.completed_round = flight.completed_round.wrapping_add(1);
+                flight.outcome = outcome;
+            }
+            self.sync_flight_notify.notify_waiters();
+
+            return result;
+        }
+    }
+
+    async fn sync_to_latest_impl(&self, provider: &Provider) -> Result<()> {
         if use_index_db_tree_sync() && provider.has_index_db() {
             return self.sync_to_latest_from_index_db(provider).await;
         }
