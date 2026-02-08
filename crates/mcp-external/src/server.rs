@@ -781,6 +781,7 @@ const NOTES_WAIT_PROGRESS_LOG_SECS: u64 = 5;
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
 const DEFAULT_LOCAL_NOTES_TREE_BYPASS: bool = false;
+const DEFAULT_TREE_PRESENCE_SYNC_EVERY_POLLS: u64 = 4;
 
 fn pending_spent_note_ttl() -> std::time::Duration {
     let secs = std::env::var("MCP_PENDING_SPENT_NOTE_TTL_SECS")
@@ -816,6 +817,14 @@ fn tree_resolve_retry_delay_ms() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
+}
+
+fn tree_presence_sync_every_polls() -> u64 {
+    std::env::var("MCP_TREE_PRESENCE_SYNC_EVERY_POLLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TREE_PRESENCE_SYNC_EVERY_POLLS)
+        .max(1)
 }
 
 fn local_notes_tree_bypass_enabled() -> bool {
@@ -1108,6 +1117,8 @@ impl CryptoServer {
         );
         let mut notes_wait_last_progress_log = notes_wait_started;
         let mut notes_fetch_attempts: u64 = 0;
+        let tree_presence_sync_every_polls_cfg = tree_presence_sync_every_polls();
+        let mut tree_sync_round = global_tree_syncer().current_sync_round();
         let mut notes_fetch_ms_total: u128 = 0;
         let mut notes_filtered_pending_total: u64 = 0;
         let mut notes_added_local_total: u64 = 0;
@@ -1186,18 +1197,26 @@ impl CryptoServer {
                 }
             }
             let cms: Vec<Hash32> = notes_with_cm.iter().map(|(_, cm)| *cm).collect();
-            let presence = global_tree_syncer()
-                .commitment_presence(provider, &cms)
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error(
-                        format!(
-                            "Failed to verify note commitments in commitment tree: {}",
-                            e
-                        ),
-                        None,
-                    )
-                })?;
+            let mut presence = global_tree_syncer().commitment_presence_cached(&cms).await;
+            let cache_complete = presence.iter().all(|present| *present);
+            if !cache_complete
+                && (notes_fetch_attempts == 1
+                    || notes_fetch_attempts % tree_presence_sync_every_polls_cfg == 0)
+            {
+                presence = global_tree_syncer()
+                    .commitment_presence(provider, &cms)
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!(
+                                "Failed to verify note commitments in commitment tree: {}",
+                                e
+                            ),
+                            None,
+                        )
+                    })?;
+                tree_sync_round = global_tree_syncer().current_sync_round();
+            }
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let owner_recipient_hex = hex::encode(owner_recipient);
                 for ((note, cm), present) in notes_with_cm.iter().zip(presence.iter()).take(6) {
@@ -1281,7 +1300,13 @@ impl CryptoServer {
                 notes_wait_last_progress_log = std::time::Instant::now();
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
+            let poll_delay = std::time::Duration::from_millis(NOTES_WAIT_POLL_MS);
+            if global_tree_syncer()
+                .wait_for_sync_round_advance(tree_sync_round, poll_delay)
+                .await
+            {
+                tree_sync_round = global_tree_syncer().current_sync_round();
+            }
         };
 
         let notes_wait_ms = notes_wait_started.elapsed().as_millis();
@@ -1433,38 +1458,48 @@ impl CryptoServer {
             if !selected_cms.is_empty() {
                 let tree_wait_limit =
                     std::time::Duration::from_secs(wait_for_tree_visible_notes_secs());
+                let tree_sync_every_polls = tree_presence_sync_every_polls();
+                let mut tree_sync_round = global_tree_syncer().current_sync_round();
                 let tree_wait_started = std::time::Instant::now();
                 let mut tree_wait_polls: u64 = 0;
                 let mut tree_wait_last_progress_log = std::time::Instant::now();
-                let mut last_tree_sync_error: Option<String>;
+                let mut last_tree_sync_error: Option<String> = None;
                 loop {
                     tree_wait_polls += 1;
-                    let all_present = match global_tree_syncer()
-                        .commitment_presence(provider, &selected_cms)
-                        .await
-                    {
-                        Ok(v) => {
-                            last_tree_sync_error = None;
-                            v.iter().all(|p| *p)
-                        }
-                        Err(e) => {
-                            let error_text = format!("{:#}", e);
-                            last_tree_sync_error = Some(error_text.clone());
-                            if tree_wait_last_progress_log.elapsed().as_secs()
-                                >= NOTES_WAIT_PROGRESS_LOG_SECS
-                            {
-                                tracing::warn!(
-                                    elapsed_ms = tree_wait_started.elapsed().as_millis(),
-                                    polls = tree_wait_polls,
-                                    inputs = selected_cms.len(),
-                                    error = %error_text,
-                                    "Pre-transfer commitment-tree sync failed while waiting for selected inputs"
-                                );
-                                tree_wait_last_progress_log = std::time::Instant::now();
+                    let presence = global_tree_syncer()
+                        .commitment_presence_cached(&selected_cms)
+                        .await;
+                    let mut all_present = presence.iter().all(|p| *p);
+                    if all_present {
+                        last_tree_sync_error = None;
+                    } else if tree_wait_polls == 1 || tree_wait_polls % tree_sync_every_polls == 0 {
+                        match global_tree_syncer()
+                            .commitment_presence(provider, &selected_cms)
+                            .await
+                        {
+                            Ok(v) => {
+                                last_tree_sync_error = None;
+                                all_present = v.iter().all(|p| *p);
+                                tree_sync_round = global_tree_syncer().current_sync_round();
                             }
-                            false
+                            Err(e) => {
+                                let error_text = format!("{:#}", e);
+                                last_tree_sync_error = Some(error_text.clone());
+                                if tree_wait_last_progress_log.elapsed().as_secs()
+                                    >= NOTES_WAIT_PROGRESS_LOG_SECS
+                                {
+                                    tracing::warn!(
+                                        elapsed_ms = tree_wait_started.elapsed().as_millis(),
+                                        polls = tree_wait_polls,
+                                        inputs = selected_cms.len(),
+                                        error = %error_text,
+                                        "Pre-transfer commitment-tree sync failed while waiting for selected inputs"
+                                    );
+                                    tree_wait_last_progress_log = std::time::Instant::now();
+                                }
+                            }
                         }
-                    };
+                    }
                     if all_present {
                         let elapsed = tree_wait_started.elapsed();
                         if elapsed.as_millis() > 100 {
@@ -1521,7 +1556,13 @@ impl CryptoServer {
                             None,
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(NOTES_WAIT_POLL_MS)).await;
+                    let poll_delay = std::time::Duration::from_millis(NOTES_WAIT_POLL_MS);
+                    if global_tree_syncer()
+                        .wait_for_sync_round_advance(tree_sync_round, poll_delay)
+                        .await
+                    {
+                        tree_sync_round = global_tree_syncer().current_sync_round();
+                    }
                 }
             }
         }

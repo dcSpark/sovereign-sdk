@@ -723,8 +723,28 @@ async fn repair_note_created_rollup_heights_for_row(
         return Ok(0);
     }
 
+    // Batch existence check: which commitments are already in midnight_note_created?
+    let cm_keys: Vec<String> = note_created_rollup_heights
+        .keys()
+        .map(|cm| normalize_commitment_hex_for_lookup(cm))
+        .collect();
+
+    let existing_cms: HashSet<String> = idx::midnight_note_created::Entity::find()
+        .filter(idx::midnight_note_created::Column::Cm.is_in(cm_keys))
+        .select_only()
+        .column(idx::midnight_note_created::Column::Cm)
+        .into_tuple()
+        .all(idx)
+        .await?
+        .into_iter()
+        .collect();
+
     let mut repaired = 0usize;
     for (cm, rollup_height) in note_created_rollup_heights {
+        let normalized = normalize_commitment_hex_for_lookup(&cm);
+        if existing_cms.contains(&normalized) {
+            continue; // Already indexed — skip redundant upsert.
+        }
         db::upsert_note_created_metadata(
             idx,
             &cm,
@@ -792,10 +812,31 @@ async fn reconcile_missing_accepted_rows(
 
         if existing_hashes.contains(&row.tx_hash) {
             // Event already exists, but we may still be missing flattened spent-nullifier rows.
-            // Upserting here is idempotent and heals partial-index states.
             if kind == "transfer" || kind == "withdraw" {
                 if let Some(nfs) = nullifiers.as_ref() {
+                    // Batch existence check: which nullifiers are already indexed?
+                    let nf_keys: Vec<String> = nfs
+                        .iter()
+                        .map(|nf| normalize_commitment_hex_for_lookup(nf))
+                        .collect();
+                    let existing_nfs: HashSet<String> =
+                        idx::midnight_spent_nullifiers::Entity::find()
+                            .filter(
+                                idx::midnight_spent_nullifiers::Column::Nullifier.is_in(nf_keys),
+                            )
+                            .select_only()
+                            .column(idx::midnight_spent_nullifiers::Column::Nullifier)
+                            .into_tuple()
+                            .all(idx)
+                            .await?
+                            .into_iter()
+                            .collect();
+
                     for nf in nfs {
+                        let normalized = normalize_commitment_hex_for_lookup(nf);
+                        if existing_nfs.contains(&normalized) {
+                            continue; // Already indexed — skip redundant upsert.
+                        }
                         db::upsert_spent_nullifier(idx, nf, &row.tx_hash, row.created_at, &kind)
                             .await?;
                         stats.spent_nullifiers_repaired += 1;
@@ -840,11 +881,11 @@ pub async fn backfill_index(
     // This heals races where a tx transitions Pending -> Accepted after `last_id` advanced.
     match reconcile_missing_accepted_rows(da, idx, fvk_registry, fvk_service).await {
         Ok(stats) if stats.total() > 0 => {
-            tracing::info!(
+            tracing::warn!(
                 missing_events_repaired = stats.missing_events_repaired,
                 spent_nullifiers_repaired = stats.spent_nullifiers_repaired,
                 created_rollup_heights_repaired = stats.created_rollup_heights_repaired,
-                "Reconciled accepted transactions into index DB"
+                "Reconciliation found and repaired missing index data"
             );
         }
         Ok(_) => {}

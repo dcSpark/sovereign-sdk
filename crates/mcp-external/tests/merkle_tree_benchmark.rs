@@ -137,6 +137,15 @@ fn bench_merkle_tree_rebuild_offline() {
         t0.elapsed().as_secs_f64() * 1000.0
     );
 
+    let t_sdk = Instant::now();
+    let sdk_tree = MerkleTree::from_filled_leaves(depth, &leaves);
+    let root_sdk = sdk_tree.root();
+    black_box(root_sdk);
+    eprintln!(
+        "[sdk] MerkleTree::from_filled_leaves(): {:.2} ms",
+        t_sdk.elapsed().as_secs_f64() * 1000.0
+    );
+
     let t1 = Instant::now();
     let levels = build_levels_bottom_up(depth, &leaves);
     let root_bottom_up = levels[depth as usize][0];
@@ -146,6 +155,10 @@ fn bench_merkle_tree_rebuild_offline() {
         t1.elapsed().as_secs_f64() * 1000.0
     );
 
+    assert_eq!(
+        root_set_leaf, root_sdk,
+        "roots differ between set_leaf and sdk"
+    );
     assert_eq!(
         root_set_leaf, root_bottom_up,
         "roots differ between algorithms"

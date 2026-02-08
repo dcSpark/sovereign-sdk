@@ -7671,6 +7671,7 @@ dependencies = [
  "ligero-runner",
  "ligetron",
  "once_cell",
+ "rayon",
  "schemars 0.8.22",
  "sea-orm",
  "serde",

@@ -10,11 +10,55 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{mt_combine, Hash32};
+#[cfg(feature = "parallel-merkle")]
+use rayon::prelude::*;
+#[cfg(all(feature = "parallel-merkle", target_arch = "wasm32"))]
+compile_error!("feature `parallel-merkle` is not supported on wasm32 targets");
 
 /// Maximum tree depth supported by the guest circuit.
 /// The guest uses `1u64 << depth` for position bounds, so depth must be ≤ 63
 /// to avoid undefined behavior from shifting by 64 bits.
 pub const MAX_TREE_DEPTH: u8 = 63;
+/// Minimum number of parent hashes at a level before parallel rebuild is used.
+///
+/// This avoids Rayon scheduling overhead on small levels where sequential hashing is faster.
+#[cfg(feature = "parallel-merkle")]
+const PARALLEL_PARENT_THRESHOLD: usize = 2_048;
+
+#[cfg(feature = "parallel-merkle")]
+#[inline]
+fn should_parallelize(parent_count: usize) -> bool {
+    parent_count >= PARALLEL_PARENT_THRESHOLD && rayon::current_num_threads() > 1
+}
+
+#[inline]
+fn recompute_parent_slice(
+    children: &[Hash32],
+    parents: &mut [Hash32],
+    lvl: usize,
+    start_parent: usize,
+) {
+    #[cfg(feature = "parallel-merkle")]
+    if should_parallelize(parents.len()) {
+        parents
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(offset, parent_node)| {
+                let parent = start_parent + offset;
+                let left = children[parent * 2];
+                let right = children[parent * 2 + 1];
+                *parent_node = mt_combine(lvl as u8, &left, &right);
+            });
+        return;
+    }
+
+    for (offset, parent_node) in parents.iter_mut().enumerate() {
+        let parent = start_parent + offset;
+        let left = children[parent * 2];
+        let right = children[parent * 2 + 1];
+        *parent_node = mt_combine(lvl as u8, &left, &right);
+    }
+}
 
 /// An incremental Merkle tree that caches all internal nodes.
 /// - levels[0] = leaves
@@ -120,12 +164,10 @@ impl MerkleTree {
             affected = (affected + 1) >> 1; // ceil(prev / 2)
             debug_assert!(affected >= 1);
             debug_assert!(affected <= tree.levels[lvl + 1].len());
-
-            for parent in 0..affected {
-                let left = tree.levels[lvl][parent * 2];
-                let right = tree.levels[lvl][parent * 2 + 1];
-                tree.levels[lvl + 1][parent] = mt_combine(lvl as u8, &left, &right);
-            }
+            let (children_levels, parent_levels) = tree.levels.split_at_mut(lvl + 1);
+            let children = &children_levels[lvl];
+            let parents = &mut parent_levels[0][..affected];
+            recompute_parent_slice(children, parents, lvl, 0);
         }
 
         tree
@@ -207,24 +249,31 @@ impl MerkleTree {
         self.defaults.push(new_default);
 
         let mut levels: Vec<Vec<Hash32>> = Vec::with_capacity(new_depth as usize + 1);
+        let mut old_iter = old_levels.into_iter();
 
-        // Leaves: old tree in left half, right half default
-        let mut leaves = vec![self.defaults[0]; new_leaf_len];
-        leaves[..old_leaf_len].copy_from_slice(&old_levels[0]);
+        // Leaves: reuse the old leaf vector and extend with default leaves.
+        let mut leaves = old_iter.next().expect("MerkleTree missing leaf level");
+        debug_assert_eq!(leaves.len(), old_leaf_len);
+        leaves.resize(new_leaf_len, self.defaults[0]);
         levels.push(leaves);
 
-        // Internal levels 1..=old_depth: copy left subtree, right subtree stays default
+        // Internal levels 1..=old_depth: reuse old vectors and extend with defaults.
         for lvl in 1..=old_depth as usize {
+            let mut nodes = old_iter
+                .next()
+                .expect("MerkleTree missing internal level during grow");
             let len_new = new_leaf_len >> lvl; // 2^(new_depth - lvl)
-            let len_old = old_levels[lvl].len();
-            let mut nodes = vec![self.defaults[lvl]; len_new];
-            nodes[..len_old].copy_from_slice(&old_levels[lvl]);
+            nodes.resize(len_new, self.defaults[lvl]);
             levels.push(nodes);
         }
+        debug_assert!(
+            old_iter.next().is_none(),
+            "MerkleTree had unexpected extra levels"
+        );
 
-        // New root level: combine old root with default right-subtree root
-        let left_root = old_levels[old_depth as usize][0];
-        let right_root = self.defaults[old_depth as usize]; // default root for depth `old_depth`
+        // New root level: combine old root with new right-subtree root.
+        let left_root = levels[old_depth as usize][0];
+        let right_root = levels[old_depth as usize][1];
         let root = mt_combine(old_depth, &left_root, &right_root);
         levels.push(vec![root]);
 
@@ -283,6 +332,53 @@ impl MerkleTree {
         assert_eq!(path.len(), self.depth as usize);
         path
     }
+
+    /// Return a reference to the leaf-level data.
+    #[inline]
+    pub fn leaves(&self) -> &[Hash32] {
+        &self.levels[0]
+    }
+
+    /// Efficiently set a contiguous range of leaves starting at `start` and rebuild
+    /// only the affected internal nodes bottom-up.
+    ///
+    /// This is much faster than calling `set_leaf()` in a loop for contiguous updates:
+    /// total hashing work is O(values.len()) instead of O(values.len() * depth).
+    ///
+    /// # Panics
+    /// Panics if `start + values.len() > self.len()`.
+    pub fn set_leaves_contiguous(&mut self, start: usize, values: &[Hash32]) {
+        if values.is_empty() {
+            return;
+        }
+        let end = start + values.len();
+        assert!(
+            end <= self.len(),
+            "set_leaves_contiguous: range {}..{} exceeds tree len {}",
+            start,
+            end,
+            self.len()
+        );
+
+        // Set leaf values via memcpy.
+        self.levels[0][start..end].copy_from_slice(values);
+
+        // Rebuild only the affected internal nodes bottom-up.
+        // At each level, track which parent nodes cover the modified range.
+        let mut range_start = start;
+        let mut range_end = end;
+        for lvl in 0..self.depth as usize {
+            let parent_start = range_start / 2;
+            let parent_end = (range_end + 1) / 2;
+            let (children_levels, parent_levels) = self.levels.split_at_mut(lvl + 1);
+            let children = &children_levels[lvl];
+            let parents = &mut parent_levels[0][parent_start..parent_end];
+            recompute_parent_slice(children, parents, lvl, parent_start);
+
+            range_start = parent_start;
+            range_end = parent_end;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +422,65 @@ mod tests {
         for idx in [0usize, 1, 2, filled - 1, capacity - 1] {
             assert_eq!(via_set_leaf.open(idx), via_bulk.open(idx));
         }
+    }
+
+    #[test]
+    fn set_leaves_contiguous_matches_set_leaf() {
+        let depth: u8 = 8;
+        let capacity = 1usize << (depth as usize);
+
+        // Prepare a base tree with some initial leaves.
+        let prefix_len = 50usize;
+        let mut base_leaves: Vec<Hash32> = Vec::with_capacity(prefix_len);
+        for i in 0..prefix_len {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+            base_leaves.push(h);
+        }
+
+        // New contiguous values to set at positions [prefix_len, prefix_len + count).
+        let count = 100usize;
+        assert!(prefix_len + count <= capacity);
+        let mut values: Vec<Hash32> = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&((prefix_len + i) as u64).to_le_bytes());
+            values.push(h);
+        }
+
+        // Reference: set_leaf one by one.
+        let mut via_set_leaf = MerkleTree::from_filled_leaves(depth, &base_leaves);
+        for (i, val) in values.iter().enumerate() {
+            via_set_leaf.set_leaf(prefix_len + i, *val);
+        }
+
+        // Bulk: set_leaves_contiguous.
+        let mut via_bulk = MerkleTree::from_filled_leaves(depth, &base_leaves);
+        via_bulk.set_leaves_contiguous(prefix_len, &values);
+
+        assert_eq!(via_set_leaf.root(), via_bulk.root());
+        for idx in [
+            0usize,
+            prefix_len - 1,
+            prefix_len,
+            prefix_len + count - 1,
+            capacity - 1,
+        ] {
+            assert_eq!(
+                via_set_leaf.open(idx),
+                via_bulk.open(idx),
+                "opening mismatch at index {}",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn set_leaves_contiguous_empty_is_noop() {
+        let depth: u8 = 4;
+        let tree_a = MerkleTree::new(depth);
+        let mut tree_b = MerkleTree::new(depth);
+        tree_b.set_leaves_contiguous(0, &[]);
+        assert_eq!(tree_a.root(), tree_b.root());
     }
 }

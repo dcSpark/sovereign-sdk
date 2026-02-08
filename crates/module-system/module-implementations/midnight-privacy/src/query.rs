@@ -2,7 +2,7 @@
 
 use crate::hash::{
     blacklist_pos_from_recipient, empty_blacklist_bucket_entries, recipient_from_pk_v2,
-    sparse_default_nodes, BlacklistNodeKey, Hash32, NullifierKey, BLACKLIST_BUCKET_SIZE,
+    sparse_default_nodes, BlacklistNodeKey, Hash32, NullifierKey, RootKey, BLACKLIST_BUCKET_SIZE,
     BLACKLIST_TREE_DEPTH,
 };
 use crate::types::PrivacyAddress;
@@ -178,6 +178,18 @@ pub struct BlacklistOpeningResponse {
     pub bucket_entries: [Hash32; BLACKLIST_BUCKET_SIZE],
     /// Sibling nodes (bottom-up), length == `BLACKLIST_TREE_DEPTH`.
     pub siblings: Vec<Hash32>,
+}
+
+/// Response for anchor root validation.
+///
+/// Checks whether a given Merkle root is a valid anchor — i.e. it exists in
+/// `recent_roots` (sliding window) or `all_roots` (permanent history).
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct IsValidAnchorResponse {
+    /// The root being validated.
+    pub root: Hash32,
+    /// Whether the root is a valid anchor.
+    pub valid: bool,
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -498,6 +510,45 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         }
         .into())
     }
+
+    /// Check if a Merkle root is a valid anchor.
+    ///
+    /// A root is valid if it exists in either `recent_roots` (the sliding window
+    /// used for fast mempool checks) or `all_roots` (the permanent NOMT-backed
+    /// history of every root ever produced).  This mirrors the on-chain
+    /// `is_valid_anchor` check performed during transaction execution.
+    async fn route_is_valid_anchor(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+        Path(root_hex): Path<String>,
+    ) -> ApiResult<IsValidAnchorResponse> {
+        let root_bytes =
+            hex::decode(&root_hex).map_err(|e| errors::bad_request_400("Invalid hex string", e))?;
+
+        let root: Hash32 = root_bytes
+            .try_into()
+            .map_err(|_| errors::bad_request_400("Root must be 32 bytes", "Invalid length"))?;
+
+        // Fast path: check the recent roots sliding window first.
+        let recent_roots = state
+            .recent_roots
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or_else(VecDeque::new);
+
+        let valid = if recent_roots.contains(&root) {
+            true
+        } else {
+            // Fallback: check the permanent all_roots index.
+            state
+                .all_roots
+                .get(&RootKey(root), &mut accessor)
+                .unwrap_infallible()
+                .is_some()
+        };
+
+        Ok(IsValidAnchorResponse { root, valid }.into())
+    }
 }
 
 impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
@@ -512,6 +563,11 @@ impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
             )
             // Tree state
             .route("/tree/state", get(Self::route_tree_state))
+            // Anchor root validation
+            .route(
+                "/tree/is_valid_anchor/:root_hex",
+                get(Self::route_is_valid_anchor),
+            )
             // List all notes
             .route("/notes", get(Self::route_list_notes))
             // Recent roots (anchor window)
