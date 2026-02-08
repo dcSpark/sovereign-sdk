@@ -50,7 +50,7 @@ base64.workspace = true
 borsh.workspace = true
 sov-value-setter-zk.workspace = true
 sov-modules-stf-blueprint.workspace = true
-midnight-privacy = { workspace = true }
+midnight-privacy = { workspace = true, features = ["native", "parallel-merkle"] }
 rand = { workspace = true }
 sov-api-spec = { workspace = true }
 ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "7b6ac4849035fef8f108e7cadce2a601e63e5200" }

@@ -618,6 +618,7 @@ impl CommitmentTreeSyncer {
                         start_offset,
                         expected_next,
                         expected_root,
+                        expected_depth,
                         incremental_notes,
                         fetch_ms,
                     )
@@ -653,10 +654,6 @@ impl CommitmentTreeSyncer {
                             expected_root = %RootHex(&expected_root),
                             "Commitment tree incremental sync root mismatch; falling back to full rebuild"
                         );
-
-                        // Avoid serving an inconsistent tree while rebuilding.
-                        let mut st = self.state.write().await;
-                        *st = CachedTree::new(expected_depth);
                     }
                     Ok(None) => {
                         tracing::warn!(
@@ -693,6 +690,12 @@ impl CommitmentTreeSyncer {
                 }
             }
 
+            let rebuild_trigger = if should_skip_incremental {
+                if cached_next == 0 { "cold_cache" } else { "large_delta" }
+            } else {
+                "incremental_fallback"
+            };
+
             match self
                 .full_rebuild(provider, snapshot, expected_depth)
                 .await
@@ -705,9 +708,19 @@ impl CommitmentTreeSyncer {
                 }) {
                 Ok(stats) => {
                     let elapsed_ms = started.elapsed().as_millis();
+                    let tree_mem_bytes: u128 = (capacity as u128)
+                        .saturating_mul(2u128)
+                        .saturating_mul(std::mem::size_of::<Hash32>() as u128);
                     tracing::debug!(
                         elapsed_ms,
                         state_ms,
+                        rebuild_trigger,
+                        depth = expected_depth,
+                        capacity,
+                        cached_next_before = cached_next,
+                        delta,
+                        full_rebuild_threshold,
+                        tree_mem_bytes,
                         target_next_position = stats.target_next_position,
                         fetched_notes = stats.fetched_notes,
                         tree_init_ms = stats.tree_init_ms,
@@ -726,6 +739,11 @@ impl CommitmentTreeSyncer {
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = sync.max_retries,
+                        rebuild_trigger,
+                        depth = expected_depth,
+                        capacity,
+                        delta,
+                        full_rebuild_threshold,
                         notes_next_position = expected_next,
                         chain_depth_hint = ?state.depth,
                         expected_depth,
@@ -765,7 +783,10 @@ impl CommitmentTreeSyncer {
         let sync = sync_config();
         for attempt in 0..sync.max_retries {
             let started = Instant::now();
-            let start_event_id = { self.state.read().await.indexer_last_event_id };
+            let (start_event_id, cached_next_before) = {
+                let st = self.state.read().await;
+                (st.indexer_last_event_id, st.next_position)
+            };
 
             let delta_fetch_started = Instant::now();
             let delta_batch = provider
@@ -854,14 +875,14 @@ impl CommitmentTreeSyncer {
             // locks are held only for the brief final swap.
             #[allow(clippy::type_complexity)]
             let prebuilt_snapshot: Option<(
-                Arc<MerkleTree>,    // tree
+                Arc<MerkleTree>,      // tree
                 HashMap<Hash32, u64>, // pos_by_cm
-                u64,                // expected_next
-                i64,                // snapshot_upto_event_id
-                usize,              // snapshot_rows
-                &'static str,       // ordering_mode
-                u128,               // snapshot_fetch_ms
-                u128,               // apply_ms
+                u64,                  // expected_next
+                i64,                  // snapshot_upto_event_id
+                usize,                // snapshot_rows
+                &'static str,         // ordering_mode
+                u128,                 // snapshot_fetch_ms
+                u128,                 // apply_ms
             )> = if let Some((
                 ordered_notes,
                 snapshot_upto_event_id,
@@ -877,12 +898,11 @@ impl CommitmentTreeSyncer {
                 let (tree, pos_by_cm, expected_next) =
                     tokio::task::spawn_blocking(move || -> Result<_> {
                         let expected_next = ordered_notes.len() as u64;
-                        let depth = required_depth_for_next_position(expected_next)?
-                            .max(default_depth);
+                        let depth =
+                            required_depth_for_next_position(expected_next)?.max(default_depth);
 
                         // Collect commitments into a dense prefix for bulk construction.
-                        let mut leaves: Vec<Hash32> =
-                            Vec::with_capacity(ordered_notes.len());
+                        let mut leaves: Vec<Hash32> = Vec::with_capacity(ordered_notes.len());
                         let mut pos_by_cm: HashMap<Hash32, u64> =
                             HashMap::with_capacity(ordered_notes.len());
                         for (pos, note) in ordered_notes.into_iter().enumerate() {
@@ -896,10 +916,7 @@ impl CommitmentTreeSyncer {
                     })
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Commitment tree snapshot rebuild panicked: {}",
-                            e
-                        )
+                        anyhow::anyhow!("Commitment tree snapshot rebuild panicked: {}", e)
                     })??;
 
                 let apply_ms = apply_started.elapsed().as_millis();
@@ -965,6 +982,10 @@ impl CommitmentTreeSyncer {
             )) = prebuilt_snapshot
             {
                 // Brief swap of pre-built tree — no heavy computation under lock.
+                let depth = tree.depth();
+                let tree_mem_bytes: u128 = (1u128 << depth as u32)
+                    .saturating_mul(2u128)
+                    .saturating_mul(std::mem::size_of::<Hash32>() as u128);
                 st.tree = tree;
                 st.pos_by_cm = pos_by_cm;
                 st.next_position = expected_next;
@@ -974,6 +995,10 @@ impl CommitmentTreeSyncer {
 
                 tracing::debug!(
                     elapsed_ms = started.elapsed().as_millis(),
+                    rebuild_trigger = "mixed_metadata",
+                    depth,
+                    cached_next_before,
+                    tree_mem_bytes,
                     delta_fetch_ms,
                     snapshot_fetch_ms,
                     apply_ms,
@@ -992,14 +1017,12 @@ impl CommitmentTreeSyncer {
             let apply_started = Instant::now();
             let delta_len = ordered_delta_notes.len();
             if delta_len > 0 {
+                st.pos_by_cm.reserve(delta_len);
                 let final_next = st.next_position + delta_len as u64;
                 let start_pos = st.next_position as usize;
 
                 // Collect commitments for bulk set.
-                let cms: Vec<Hash32> = ordered_delta_notes
-                    .iter()
-                    .map(|n| n.commitment)
-                    .collect();
+                let cms: Vec<Hash32> = ordered_delta_notes.iter().map(|n| n.commitment).collect();
 
                 // Mutate tree: pre-grow once to final size, then bulk-set contiguous
                 // leaves. O(delta) hashes vs O(delta * depth) for per-leaf set_leaf.
@@ -1012,8 +1035,7 @@ impl CommitmentTreeSyncer {
                 // Update position map.
                 let base_pos = st.next_position;
                 for (i, note) in ordered_delta_notes.iter().enumerate() {
-                    st.pos_by_cm
-                        .insert(note.commitment, base_pos + i as u64);
+                    st.pos_by_cm.insert(note.commitment, base_pos + i as u64);
                 }
                 st.next_position = final_next;
             }
@@ -1219,6 +1241,7 @@ impl CommitmentTreeSyncer {
         start_offset: u64,
         expected_next: u64,
         expected_root: Hash32,
+        expected_depth: u8,
         notes: Vec<(u64, Hash32)>,
         fetch_ms: u128,
     ) -> Result<Option<IncrementalSyncStats>> {
@@ -1231,6 +1254,7 @@ impl CommitmentTreeSyncer {
         }
 
         let fetched_notes = notes.len();
+        st.pos_by_cm.reserve(fetched_notes);
 
         // Mutate tree through Arc::make_mut (copy-on-write if readers exist).
         // Pre-grow once to final size — no per-leaf capacity checks needed.
@@ -1238,19 +1262,47 @@ impl CommitmentTreeSyncer {
         if expected_next as usize > tree.len() {
             tree.grow_to_fit(expected_next as usize);
         }
-        for &(pos, cm) in &notes {
-            tree.set_leaf(pos as usize, cm);
+        let mut contiguous_cms = Vec::with_capacity(fetched_notes);
+        let mut is_contiguous = true;
+        for (i, (pos, cm)) in notes.iter().enumerate() {
+            match start_offset.checked_add(i as u64) {
+                Some(expected) if *pos == expected => contiguous_cms.push(*cm),
+                _ => {
+                    is_contiguous = false;
+                    break;
+                }
+            }
+        }
+        if is_contiguous {
+            let start = start_offset as usize;
+            tree.set_leaves_contiguous(start, &contiguous_cms);
+            for (i, cm) in contiguous_cms.into_iter().enumerate() {
+                let pos = start_offset.checked_add(i as u64).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Commitment position overflow while inserting contiguous notes"
+                    )
+                })?;
+                st.pos_by_cm.insert(cm, pos);
+            }
+        } else {
+            for &(pos, cm) in &notes {
+                tree.set_leaf(pos as usize, cm);
+            }
+            for (pos, cm) in notes {
+                st.pos_by_cm.insert(cm, pos);
+            }
         }
         // tree borrow ends (NLL) — st is accessible again.
-
-        for (pos, cm) in notes {
-            st.pos_by_cm.insert(cm, pos);
-        }
         st.next_position = expected_next;
         let apply_ms = apply_started.elapsed().as_millis();
 
         let rebuilt_root = st.tree.root();
         let root_match = rebuilt_root == expected_root;
+        if !root_match {
+            // Never expose a fabricated/inconsistent root to concurrent readers.
+            // Reset while still holding the write lock; caller will rebuild from snapshot.
+            *st = CachedTree::new(expected_depth);
+        }
 
         Ok(Some(IncrementalSyncStats {
             start_offset,
@@ -1302,10 +1354,7 @@ impl CommitmentTreeSyncer {
             })
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Tree construction panicked during full rebuild: {}",
-                    e
-                )
+                anyhow::anyhow!("Tree construction panicked during full rebuild: {}", e)
             })?;
             let tree_init_ms = tree_init_started.elapsed().as_millis();
 
