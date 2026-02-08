@@ -4,9 +4,8 @@
 //! a value is within a valid range without revealing the computation details.
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Program argument encoding expected by the Ligero prover/verifier JSON interface.
 pub use ligero_runner::LigeroArg as LigeroProgramArguments;
@@ -89,6 +88,7 @@ impl Ligero {
             args,
             proof: None,
             private_indices,
+            binary: Some(true),
         };
 
         let request_start = Instant::now();
@@ -103,40 +103,26 @@ impl Ligero {
             .with_context(|| format!("POST {endpoint} returned error status"))?;
         let http_ms = request_start.elapsed().as_millis();
 
-        let parse_start = Instant::now();
-        let payload: ProveResponse = response
-            .json()
+        let read_start = Instant::now();
+        let proof_bytes = response
+            .bytes()
             .await
-            .context("Failed to deserialize Ligero proof service response")?;
-        let parse_ms = parse_start.elapsed().as_millis();
+            .context("Failed to read binary proof bytes from response")?
+            .to_vec();
+        let read_ms = read_start.elapsed().as_millis();
 
-        if !payload.success || payload.exit_code != 0 {
-            let error = payload.error.unwrap_or_else(|| "unknown error".to_string());
-            anyhow::bail!(
-                "Ligero proof service failed (exitCode={}): {}",
-                payload.exit_code,
-                error
-            );
-        }
-
-        let proof_b64 = payload
-            .proof
-            .context("Ligero proof service response missing proof payload")?;
-        let proof_b64 = proof_b64.trim();
-        let decode_start = Instant::now();
-        let proof_bytes = general_purpose::STANDARD
-            .decode(proof_b64)
-            .context("Failed to decode base64 proof payload")?;
-        let decode_ms = decode_start.elapsed().as_millis();
+        anyhow::ensure!(
+            !proof_bytes.is_empty(),
+            "Ligero proof service returned empty proof payload"
+        );
 
         tracing::info!(
             endpoint,
             num_args,
             http_ms,
-            parse_ms,
-            decode_ms,
+            read_ms,
             proof_bytes_len = proof_bytes.len(),
-            "[LIGERO_TIMING] Proof service call completed"
+            "[LIGERO_TIMING] Proof service call completed (binary mode)"
         );
 
         Ok(proof_bytes)
@@ -154,13 +140,5 @@ struct ProveRequest {
     args: Vec<LigeroProgramArguments>,
     proof: Option<String>,
     private_indices: Vec<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProveResponse {
-    success: bool,
-    exit_code: i32,
-    proof: Option<String>,
-    error: Option<String>,
+    binary: Option<bool>,
 }
