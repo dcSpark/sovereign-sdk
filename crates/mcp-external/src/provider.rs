@@ -48,7 +48,9 @@ pub struct IndexerNoteCreated {
 pub struct IndexerNoteCreatedBatch {
     pub upto_event_id: i64,
     pub notes: Vec<IndexerNoteCreated>,
-    pub rows_scanned: usize,
+    /// Number of raw rows returned by the DB query (may differ from `notes.len()`
+    /// due to filtering). Kept for diagnostic logging.
+    pub _rows_scanned: usize,
 }
 
 /// Transaction involvement item from the indexer
@@ -598,7 +600,7 @@ impl Provider {
             return Ok(Some(IndexerNoteCreatedBatch {
                 upto_event_id,
                 notes: Vec::new(),
-                rows_scanned: 0,
+                _rows_scanned: 0,
             }));
         }
 
@@ -643,7 +645,7 @@ impl Provider {
         Ok(Some(IndexerNoteCreatedBatch {
             upto_event_id,
             notes,
-            rows_scanned: rows.len(),
+            _rows_scanned: rows.len(),
         }))
     }
 
@@ -735,6 +737,30 @@ impl Provider {
             .query_rest_endpoint(endpoint)
             .await
             .with_context(|| format!("Failed to query REST endpoint: {}", endpoint))
+    }
+
+    /// Check if a Merkle root is a valid on-chain anchor.
+    ///
+    /// Queries the rollup's `/modules/midnight-privacy/tree/is_valid_anchor/:root`
+    /// endpoint, which checks both `recent_roots` and `all_roots`.
+    /// Returns `Ok(true)` when the root is known, `Ok(false)` otherwise.
+    pub async fn is_valid_anchor(&self, root: &[u8; 32]) -> Result<bool> {
+        let root_hex = hex::encode(root);
+        let endpoint = format!(
+            "/modules/midnight-privacy/tree/is_valid_anchor/{}",
+            root_hex
+        );
+
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            valid: bool,
+        }
+
+        let resp: Resp = self
+            .query_rest_endpoint(&endpoint)
+            .await
+            .with_context(|| "Failed to query is_valid_anchor endpoint")?;
+        Ok(resp.valid)
     }
 
     /// Get transactions for a specific wallet address from the indexer

@@ -57,17 +57,9 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn use_index_db_tree_sync() -> bool {
-    std::env::var("MCP_USE_INDEX_DB_TREE_SYNC")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
+// NOTE: use_index_db_tree_sync() removed — hybrid approach no longer needs
+// a global toggle; Index DB is always tried first for rebuilds when available,
+// with RPC as the canonical fallback for incremental syncs.
 
 fn sync_config() -> SyncConfig {
     *SYNC_CONFIG.get_or_init(|| {
@@ -236,8 +228,27 @@ struct FullRebuildStats {
     apply_ms: u128,
 }
 
+#[derive(Debug)]
+struct IndexDbRebuildResult {
+    tree: Arc<MerkleTree>,
+    pos_by_cm: HashMap<Hash32, u64>,
+    next_position: u64,
+    indexer_last_event_id: i64,
+    root: Hash32,
+    notes_count: usize,
+    fetch_ms: u128,
+    apply_ms: u128,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct TreeStateResp {
+    // root and next_position are deserialized but not read directly;
+    // we only use `depth` as a hint. Prefix with _ to suppress dead-code lint
+    // while keeping the fields available for debugging / future use.
+    #[serde(default)]
+    _root: Option<Vec<u8>>,
+    #[serde(default)]
+    _next_position: Option<u64>,
     #[serde(default)]
     depth: Option<u8>,
 }
@@ -255,6 +266,11 @@ struct NotesResp {
     current_root: Option<Vec<u8>>,
     #[serde(default)]
     count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LedgerSlotResp {
+    number: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,18 +464,45 @@ impl CommitmentTreeSyncer {
     }
 
     async fn sync_to_latest_impl(&self, provider: &Provider) -> Result<()> {
-        if use_index_db_tree_sync() && provider.has_index_db() {
-            return self.sync_to_latest_from_index_db(provider).await;
-        }
+        // ---------- Hybrid strategy ----------
+        //
+        // Index DB path  → fast bulk load (single SQL query), but ordering may diverge
+        //                  from canonical on-chain order under concurrent load.
+        // RPC/REST path  → authoritative canonical ordering + built-in root validation,
+        //                  but slower for large rebuilds (paginated HTTP).
+        //
+        // Hybrid approach:
+        //   • Full rebuilds (cold cache / large delta) → prefer Index DB for speed,
+        //     validate result with `is_valid_anchor`, fall back to RPC if invalid.
+        //   • Incremental syncs → always use RPC (correct by construction).
 
         let sync = sync_config();
         for attempt in 0..sync.max_retries {
             let started = Instant::now();
 
+            let slot_number_started = Instant::now();
+            let sync_slot_number = match fetch_latest_slot_number(provider).await {
+                Ok(slot_number) => slot_number,
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = sync.max_retries,
+                        error = %e,
+                        error_chain = %format!("{:#}", e),
+                        "Failed to fetch latest slot number for commitment-tree sync; retrying"
+                    );
+                    tokio::time::sleep(sync.retry_delay).await;
+                    continue;
+                }
+            };
+            let slot_number_ms = slot_number_started.elapsed().as_millis();
+
             // We use /tree/state only as a depth hint. Root/count come from /notes snapshots.
             let state_started = Instant::now();
+            let tree_state_endpoint =
+                append_slot_number_query("/modules/midnight-privacy/tree/state", sync_slot_number);
             let state: TreeStateResp = match provider
-                .query_rest_endpoint("/modules/midnight-privacy/tree/state")
+                .query_rest_endpoint(&tree_state_endpoint)
                 .await
                 .context("Failed to query midnight-privacy tree state")
             {
@@ -468,6 +511,7 @@ impl CommitmentTreeSyncer {
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = sync.max_retries,
+                        slot_number = sync_slot_number,
                         error = %e,
                         error_chain = %format!("{:#}", e),
                         "Commitment tree state query failed; retrying"
@@ -488,12 +532,21 @@ impl CommitmentTreeSyncer {
 
             let start_offset = { self.state.read().await.next_position };
             let fetch_started = Instant::now();
-            let fetched = match fetch_notes(provider, start_offset as usize, None, None).await {
+            let fetched = match fetch_notes(
+                provider,
+                start_offset as usize,
+                None,
+                None,
+                sync_slot_number,
+            )
+            .await
+            {
                 Ok(fetched) => fetched,
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = sync.max_retries,
+                        slot_number = sync_slot_number,
                         start_offset,
                         error = %e,
                         error_chain = %format!("{:#}", e),
@@ -543,6 +596,8 @@ impl CommitmentTreeSyncer {
                 let st = self.state.read().await;
                 if st.next_position == expected_next && st.tree.root() == expected_root {
                     tracing::debug!(
+                        slot_number = sync_slot_number,
+                        slot_number_ms,
                         state_ms,
                         fetch_ms,
                         next_position = expected_next,
@@ -561,6 +616,8 @@ impl CommitmentTreeSyncer {
                 let st = self.state.read().await;
                 if st.next_position == expected_next && st.tree.root() == expected_root {
                     tracing::debug!(
+                        slot_number = sync_slot_number,
+                        slot_number_ms,
                         state_ms,
                         fetch_ms,
                         next_position = expected_next,
@@ -578,6 +635,7 @@ impl CommitmentTreeSyncer {
                 tracing::warn!(
                     attempt = attempt + 1,
                     max_attempts = sync.max_retries,
+                    slot_number = sync_slot_number,
                     cached_next_position = current_next,
                     notes_next_position = expected_next,
                     "Commitment tree snapshot is behind cache; retrying without reset"
@@ -611,7 +669,7 @@ impl CommitmentTreeSyncer {
             let full_rebuild_threshold = capacity / depth_for_threshold;
             let should_skip_incremental = delta > 0 && delta >= full_rebuild_threshold;
 
-            // Try incremental sync first; on mismatch/error, fall back to a full rebuild.
+            // Try incremental sync first (RPC path — canonical ordering + root validation).
             if !should_skip_incremental {
                 match self
                     .try_incremental_sync(
@@ -627,6 +685,8 @@ impl CommitmentTreeSyncer {
                     Ok(Some(stats)) if stats.root_match => {
                         let elapsed_ms = started.elapsed().as_millis();
                         tracing::debug!(
+                            slot_number = sync_slot_number,
+                            slot_number_ms,
                             elapsed_ms,
                             state_ms,
                             fetch_ms = stats.fetch_ms,
@@ -643,6 +703,7 @@ impl CommitmentTreeSyncer {
                         tracing::warn!(
                             attempt = attempt + 1,
                             max_attempts = sync.max_retries,
+                            slot_number = sync_slot_number,
                             elapsed_ms,
                             state_ms,
                             start_offset = stats.start_offset,
@@ -659,6 +720,7 @@ impl CommitmentTreeSyncer {
                         tracing::warn!(
                             attempt = attempt + 1,
                             max_attempts = sync.max_retries,
+                            slot_number = sync_slot_number,
                             start_offset,
                             expected_next,
                             "Commitment tree cache changed during incremental sync; retrying"
@@ -675,6 +737,7 @@ impl CommitmentTreeSyncer {
                         tracing::warn!(
                             attempt = attempt + 1,
                             max_attempts = sync.max_retries,
+                            slot_number = sync_slot_number,
                             notes_next_position = expected_next,
                             chain_depth_hint = ?state.depth,
                             expected_depth,
@@ -690,14 +753,103 @@ impl CommitmentTreeSyncer {
                 }
             }
 
+            let is_cold_cache = cached_next == 0;
             let rebuild_trigger = if should_skip_incremental {
-                if cached_next == 0 { "cold_cache" } else { "large_delta" }
+                if is_cold_cache {
+                    "cold_cache"
+                } else {
+                    "large_delta"
+                }
             } else {
                 "incremental_fallback"
             };
 
+            // --- Full rebuild ---
+            // Only try Index DB on cold start (empty cache).  On warm-cache fallbacks
+            // (incremental_fallback / large_delta), the DB consistently produces invalid
+            // roots because its ordering lags behind the canonical on-chain order.
+            // Going straight to the canonical RPC rebuild avoids the wasted DB round-trip
+            // AND prevents a window where an invalid DB root could be observed by readers.
+            if is_cold_cache && provider.has_index_db() {
+                match self
+                    .build_tree_from_index_db(provider, expected_depth)
+                    .await
+                {
+                    Ok(db_result) => {
+                        let db_root = db_result.root;
+                        let db_next = db_result.next_position;
+                        // Validate the DB-built root against the chain BEFORE
+                        // committing to the cache.  This closes the window where
+                        // concurrent readers could observe a fabricated root.
+                        let anchor_valid = match provider.is_valid_anchor(&db_root).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    attempt = attempt + 1,
+                                    error = %e,
+                                    slot_number = sync_slot_number,
+                                    "is_valid_anchor check failed after Index DB rebuild; \
+                                             falling back to RPC (will not assume valid)"
+                                );
+                                false
+                            }
+                        };
+
+                        if anchor_valid {
+                            // Only NOW commit the validated tree to the cache.
+                            let mut st = self.state.write().await;
+                            st.tree = db_result.tree;
+                            st.pos_by_cm = db_result.pos_by_cm;
+                            st.next_position = db_result.next_position;
+                            st.indexer_last_event_id = db_result.indexer_last_event_id;
+                            drop(st);
+
+                            let elapsed_ms = started.elapsed().as_millis();
+                            tracing::info!(
+                                elapsed_ms,
+                                state_ms,
+                                rebuild_trigger,
+                                rebuild_source = "index_db",
+                                depth = expected_depth,
+                                db_fetch_ms = db_result.fetch_ms,
+                                db_apply_ms = db_result.apply_ms,
+                                db_notes = db_result.notes_count,
+                                tree_size = db_next,
+                                "Commitment tree synced (full rebuild from Index DB, anchor valid)"
+                            );
+                            return Ok(());
+                        }
+
+                        // DB root is not a valid anchor — ordering diverged.
+                        // We did NOT write to cache, so no reset needed.
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts = sync.max_retries,
+                            slot_number = sync_slot_number,
+                            rebuild_trigger,
+                            db_root = %RootHex(&db_root),
+                            db_next_position = db_next,
+                            "Index DB rebuild produced invalid anchor root; \
+                             falling back to RPC full rebuild"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts = sync.max_retries,
+                            slot_number = sync_slot_number,
+                            rebuild_trigger,
+                            error = %e,
+                            error_chain = %format!("{:#}", e),
+                            "Index DB full rebuild failed; falling back to RPC full rebuild"
+                        );
+                    }
+                }
+            }
+
+            // RPC full rebuild (last resort, always canonical).
             match self
-                .full_rebuild(provider, snapshot, expected_depth)
+                .full_rebuild(provider, snapshot, expected_depth, sync_slot_number)
                 .await
                 .with_context(|| {
                     format!(
@@ -712,9 +864,12 @@ impl CommitmentTreeSyncer {
                         .saturating_mul(2u128)
                         .saturating_mul(std::mem::size_of::<Hash32>() as u128);
                     tracing::debug!(
+                        slot_number = sync_slot_number,
+                        slot_number_ms,
                         elapsed_ms,
                         state_ms,
                         rebuild_trigger,
+                        rebuild_source = "rpc",
                         depth = expected_depth,
                         capacity,
                         cached_next_before = cached_next,
@@ -726,7 +881,7 @@ impl CommitmentTreeSyncer {
                         tree_init_ms = stats.tree_init_ms,
                         fetch_ms = stats.fetch_ms,
                         apply_ms = stats.apply_ms,
-                        "Commitment tree synced (full rebuild)"
+                        "Commitment tree synced (full rebuild from RPC)"
                     );
                     return Ok(());
                 }
@@ -739,6 +894,7 @@ impl CommitmentTreeSyncer {
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_attempts = sync.max_retries,
+                        slot_number = sync_slot_number,
                         rebuild_trigger,
                         depth = expected_depth,
                         capacity,
@@ -776,302 +932,6 @@ impl CommitmentTreeSyncer {
             cached_next_position,
             cached_depth,
             hex::encode(cached_root)
-        );
-    }
-
-    async fn sync_to_latest_from_index_db(&self, provider: &Provider) -> Result<()> {
-        let sync = sync_config();
-        for attempt in 0..sync.max_retries {
-            let started = Instant::now();
-            let (start_event_id, cached_next_before) = {
-                let st = self.state.read().await;
-                (st.indexer_last_event_id, st.next_position)
-            };
-
-            let delta_fetch_started = Instant::now();
-            let delta_batch = provider
-                .fetch_midnight_note_created_since(start_event_id)
-                .await
-                .context("Failed to fetch commitment-tree snapshot from indexer DB")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "INDEX_DB-backed commitment-tree sync requested, but DB pool is not configured"
-                    )
-                })?;
-            let delta_fetch_ms = delta_fetch_started.elapsed().as_millis();
-
-            if delta_batch.upto_event_id == start_event_id && delta_batch.notes.is_empty() {
-                tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis(),
-                    delta_fetch_ms,
-                    checkpoint = delta_batch.upto_event_id,
-                    "Commitment tree cache already up-to-date (indexer DB)"
-                );
-                return Ok(());
-            }
-
-            let has_any_rollup_height = delta_batch.notes.iter().any(|n| n.rollup_height.is_some());
-            let has_any_without_rollup_height =
-                delta_batch.notes.iter().any(|n| n.rollup_height.is_none());
-            let mut ordered_delta_notes = delta_batch.notes;
-
-            // Mixed metadata (some rows with rollup_height, some without) can make incremental
-            // append ordering ambiguous. Rebuild from a deterministic snapshot in that case.
-            let mut snapshot_rebuild: Option<(
-                Vec<IndexerNoteCreated>,
-                i64,
-                usize,
-                &'static str,
-                u128,
-            )> = None;
-            if has_any_rollup_height && has_any_without_rollup_height {
-                let snapshot_fetch_started = Instant::now();
-                let snapshot = provider
-                    .fetch_midnight_note_created_since(-1)
-                    .await
-                    .context("Failed to fetch full commitment-tree note snapshot from indexer DB")?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "INDEX_DB-backed commitment-tree sync requested, but DB pool is not configured"
-                        )
-                    })?;
-                let snapshot_fetch_ms = snapshot_fetch_started.elapsed().as_millis();
-
-                match reorder_snapshot_notes_for_db_sync(snapshot.notes) {
-                    Ok((ordered_notes, ordering_mode)) => {
-                        snapshot_rebuild = Some((
-                            ordered_notes,
-                            snapshot.upto_event_id,
-                            snapshot.rows_scanned,
-                            ordering_mode,
-                            snapshot_fetch_ms,
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_attempts = sync.max_retries,
-                            checkpoint = snapshot.upto_event_id,
-                            error = %e,
-                            error_chain = %format!("{:#}", e),
-                            "Indexer DB snapshot could not be deterministically ordered; falling back to legacy append order"
-                        );
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_attempts = sync.max_retries,
-                            checkpoint = start_event_id,
-                            "Indexer DB snapshot contains mixed rollup_height metadata; using legacy append order for this delta"
-                        );
-                    }
-                }
-            } else if has_any_rollup_height {
-                // Deterministic per-delta ordering when metadata is available.
-                sort_rollup_height_commitments(&mut ordered_delta_notes);
-            }
-
-            // --- Pre-build snapshot tree BEFORE acquiring any lock ---
-            // If a snapshot rebuild is needed, do the expensive O(N) tree construction
-            // on a blocking thread. This prevents starving the async runtime and ensures
-            // locks are held only for the brief final swap.
-            #[allow(clippy::type_complexity)]
-            let prebuilt_snapshot: Option<(
-                Arc<MerkleTree>,      // tree
-                HashMap<Hash32, u64>, // pos_by_cm
-                u64,                  // expected_next
-                i64,                  // snapshot_upto_event_id
-                usize,                // snapshot_rows
-                &'static str,         // ordering_mode
-                u128,                 // snapshot_fetch_ms
-                u128,                 // apply_ms
-            )> = if let Some((
-                ordered_notes,
-                snapshot_upto_event_id,
-                snapshot_rows,
-                ordering_mode,
-                snapshot_fetch_ms,
-            )) = snapshot_rebuild
-            {
-                let default_depth = self.default_depth;
-                let apply_started = Instant::now();
-
-                // Heavy work in spawn_blocking — no locks held.
-                let (tree, pos_by_cm, expected_next) =
-                    tokio::task::spawn_blocking(move || -> Result<_> {
-                        let expected_next = ordered_notes.len() as u64;
-                        let depth =
-                            required_depth_for_next_position(expected_next)?.max(default_depth);
-
-                        // Collect commitments into a dense prefix for bulk construction.
-                        let mut leaves: Vec<Hash32> = Vec::with_capacity(ordered_notes.len());
-                        let mut pos_by_cm: HashMap<Hash32, u64> =
-                            HashMap::with_capacity(ordered_notes.len());
-                        for (pos, note) in ordered_notes.into_iter().enumerate() {
-                            leaves.push(note.commitment);
-                            pos_by_cm.insert(note.commitment, pos as u64);
-                        }
-
-                        // O(N) bulk construction vs O(N * depth) per-leaf set_leaf.
-                        let tree = MerkleTree::from_filled_leaves(depth, &leaves);
-                        Ok((Arc::new(tree), pos_by_cm, expected_next))
-                    })
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Commitment tree snapshot rebuild panicked: {}", e)
-                    })??;
-
-                let apply_ms = apply_started.elapsed().as_millis();
-                Some((
-                    tree,
-                    pos_by_cm,
-                    expected_next,
-                    snapshot_upto_event_id,
-                    snapshot_rows,
-                    ordering_mode,
-                    snapshot_fetch_ms,
-                    apply_ms,
-                ))
-            } else {
-                None
-            };
-
-            // Serialize only cache mutation. Network/DB fetches and heavy tree
-            // construction are intentionally done before locking so most callers
-            // can progress concurrently.
-            let _guard = self.sync_lock.lock().await;
-            let mut st = self.state.write().await;
-
-            // Another task may have already advanced/rebuilt while we were fetching.
-            if st.indexer_last_event_id != start_event_id {
-                if st.indexer_last_event_id >= delta_batch.upto_event_id {
-                    tracing::debug!(
-                        elapsed_ms = started.elapsed().as_millis(),
-                        cached_event_id = st.indexer_last_event_id,
-                        fetched_start_event_id = start_event_id,
-                        fetched_upto_event_id = delta_batch.upto_event_id,
-                        "Commitment tree cache advanced while indexer delta was in-flight"
-                    );
-                    return Ok(());
-                }
-                drop(st);
-                continue;
-            }
-
-            if delta_batch.upto_event_id < st.indexer_last_event_id {
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    max_attempts = sync.max_retries,
-                    cached_event_id = st.indexer_last_event_id,
-                    db_event_id = delta_batch.upto_event_id,
-                    "Indexer event stream appears to have rewound; resetting commitment-tree cache"
-                );
-                *st = CachedTree::new(self.default_depth);
-                drop(st);
-                tokio::time::sleep(sync.retry_delay).await;
-                continue;
-            }
-
-            if let Some((
-                tree,
-                pos_by_cm,
-                expected_next,
-                snapshot_upto_event_id,
-                snapshot_rows,
-                ordering_mode,
-                snapshot_fetch_ms,
-                apply_ms,
-            )) = prebuilt_snapshot
-            {
-                // Brief swap of pre-built tree — no heavy computation under lock.
-                let depth = tree.depth();
-                let tree_mem_bytes: u128 = (1u128 << depth as u32)
-                    .saturating_mul(2u128)
-                    .saturating_mul(std::mem::size_of::<Hash32>() as u128);
-                st.tree = tree;
-                st.pos_by_cm = pos_by_cm;
-                st.next_position = expected_next;
-                st.indexer_last_event_id = snapshot_upto_event_id;
-                let tree_size = st.next_position;
-                drop(st);
-
-                tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis(),
-                    rebuild_trigger = "mixed_metadata",
-                    depth,
-                    cached_next_before,
-                    tree_mem_bytes,
-                    delta_fetch_ms,
-                    snapshot_fetch_ms,
-                    apply_ms,
-                    ordering_mode,
-                    new_notes = ordered_delta_notes.len(),
-                    scanned_rows = delta_batch.rows_scanned,
-                    snapshot_rows,
-                    checkpoint = snapshot_upto_event_id,
-                    tree_size,
-                    "Commitment tree synced from indexer DB (snapshot rebuild)"
-                );
-                return Ok(());
-            }
-
-            // --- Incremental append ---
-            let apply_started = Instant::now();
-            let delta_len = ordered_delta_notes.len();
-            if delta_len > 0 {
-                st.pos_by_cm.reserve(delta_len);
-                let final_next = st.next_position + delta_len as u64;
-                let start_pos = st.next_position as usize;
-
-                // Collect commitments for bulk set.
-                let cms: Vec<Hash32> = ordered_delta_notes.iter().map(|n| n.commitment).collect();
-
-                // Mutate tree: pre-grow once to final size, then bulk-set contiguous
-                // leaves. O(delta) hashes vs O(delta * depth) for per-leaf set_leaf.
-                let tree = Arc::make_mut(&mut st.tree);
-                if final_next as usize > tree.len() {
-                    tree.grow_to_fit(final_next as usize);
-                }
-                tree.set_leaves_contiguous(start_pos, &cms);
-
-                // Update position map.
-                let base_pos = st.next_position;
-                for (i, note) in ordered_delta_notes.iter().enumerate() {
-                    st.pos_by_cm.insert(note.commitment, base_pos + i as u64);
-                }
-                st.next_position = final_next;
-            }
-            st.indexer_last_event_id = delta_batch.upto_event_id;
-            let tree_size = st.next_position;
-            let apply_ms = apply_started.elapsed().as_millis();
-            let ordering_mode = if has_any_rollup_height && !has_any_without_rollup_height {
-                "deterministic rollup_height sort"
-            } else {
-                "legacy append order"
-            };
-            let new_notes = ordered_delta_notes.len();
-            drop(st);
-
-            tracing::debug!(
-                elapsed_ms = started.elapsed().as_millis(),
-                delta_fetch_ms,
-                apply_ms,
-                ordering_mode,
-                new_notes,
-                scanned_rows = delta_batch.rows_scanned,
-                checkpoint = delta_batch.upto_event_id,
-                tree_size,
-                "Commitment tree synced from indexer DB (incremental)"
-            );
-            return Ok(());
-        }
-
-        let st = self.state.read().await;
-        anyhow::bail!(
-            "Failed to sync commitment tree from indexer DB after {} attempts (cached_next_position={}, cached_depth={}, cached_root={}, checkpoint={})",
-            sync.max_retries,
-            st.next_position,
-            st.tree.depth(),
-            hex::encode(st.tree.root()),
-            st.indexer_last_event_id
         );
     }
 
@@ -1278,9 +1138,7 @@ impl CommitmentTreeSyncer {
             tree.set_leaves_contiguous(start, &contiguous_cms);
             for (i, cm) in contiguous_cms.into_iter().enumerate() {
                 let pos = start_offset.checked_add(i as u64).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Commitment position overflow while inserting contiguous notes"
-                    )
+                    anyhow::anyhow!("Commitment position overflow while inserting contiguous notes")
                 })?;
                 st.pos_by_cm.insert(cm, pos);
             }
@@ -1315,11 +1173,91 @@ impl CommitmentTreeSyncer {
         }))
     }
 
+    /// Build a commitment tree from the Index DB **without writing to the cache**.
+    ///
+    /// Loads all notes from `midnight_note_created` in a single SQL query, sorts them
+    /// by `(rollup_height, commitment)` for canonical ordering, and builds the tree.
+    ///
+    /// The caller MUST validate the resulting root with `is_valid_anchor` and only
+    /// commit the tree to the cache after successful validation.  This prevents a
+    /// window where concurrent readers could observe a fabricated (non-canonical) root.
+    async fn build_tree_from_index_db(
+        &self,
+        provider: &Provider,
+        depth: u8,
+    ) -> Result<IndexDbRebuildResult> {
+        let fetch_started = Instant::now();
+        let batch = provider
+            .fetch_midnight_note_created_since(-1)
+            .await
+            .context("Index DB full rebuild: failed to fetch all notes")?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Index DB full rebuild requested but DB pool is not configured")
+            })?;
+        let fetch_ms = fetch_started.elapsed().as_millis();
+
+        let upto_event_id = batch.upto_event_id;
+        let notes_count = batch.notes.len();
+
+        // Sort into canonical order: (rollup_height ASC, commitment ASC).
+        let mut notes = batch.notes;
+        let has_all_heights = notes.iter().all(|n| n.rollup_height.is_some());
+        if has_all_heights && !notes.is_empty() {
+            sort_rollup_height_commitments(&mut notes);
+        } else if !notes.is_empty() {
+            // Mixed or missing rollup_height — attempt reorder, bail if impossible.
+            notes = reorder_snapshot_notes_for_db_sync(notes)
+                .context("Index DB full rebuild: cannot determine canonical ordering")?
+                .0;
+        }
+
+        let default_depth = depth.max(self.default_depth);
+        let apply_started = Instant::now();
+        let (tree, pos_by_cm, expected_next) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let expected_next = notes.len() as u64;
+            let depth = required_depth_for_next_position(expected_next)?.max(default_depth);
+
+            let mut leaves: Vec<Hash32> = Vec::with_capacity(notes.len());
+            let mut pos_by_cm: HashMap<Hash32, u64> = HashMap::with_capacity(notes.len());
+            for (pos, note) in notes.into_iter().enumerate() {
+                leaves.push(note.commitment);
+                pos_by_cm.insert(note.commitment, pos as u64);
+            }
+
+            let tree = MerkleTree::from_filled_leaves(depth, &leaves);
+            Ok((Arc::new(tree), pos_by_cm, expected_next))
+        })
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Index DB full rebuild tree construction panicked: {}", e)
+        })??;
+        let apply_ms = apply_started.elapsed().as_millis();
+
+        let root = tree.root();
+
+        // NOTE: We intentionally do NOT write to the cache here.
+        // The caller must validate the root first via is_valid_anchor,
+        // then commit to the cache only if valid.  This prevents exposing
+        // fabricated roots to concurrent readers.
+
+        Ok(IndexDbRebuildResult {
+            tree,
+            pos_by_cm,
+            next_position: expected_next,
+            indexer_last_event_id: upto_event_id,
+            root,
+            notes_count,
+            fetch_ms,
+            apply_ms,
+        })
+    }
+
     async fn full_rebuild(
         &self,
         provider: &Provider,
         snapshot: NotesSnapshot,
         depth: u8,
+        slot_number: u64,
     ) -> Result<FullRebuildStats> {
         let expected_next = snapshot.next_position;
         let expected_root = snapshot.root;
@@ -1328,9 +1266,15 @@ impl CommitmentTreeSyncer {
         let mut fetched_notes = 0usize;
         if expected_next > 0 {
             let fetch_started = Instant::now();
-            let notes = fetch_notes(provider, 0, Some(expected_next), Some(snapshot))
-                .await?
-                .notes;
+            let notes = fetch_notes(
+                provider,
+                0,
+                Some(expected_next),
+                Some(snapshot),
+                slot_number,
+            )
+            .await?
+            .notes;
             let fetch_ms = fetch_started.elapsed().as_millis();
 
             fetched_notes = notes.len();
@@ -1457,11 +1401,28 @@ fn notes_snapshot_from_response(resp: &NotesResp, endpoint: &str) -> Result<Note
     })
 }
 
+fn append_slot_number_query(endpoint: &str, slot_number: u64) -> String {
+    if endpoint.contains('?') {
+        format!("{endpoint}&slot_number={slot_number}")
+    } else {
+        format!("{endpoint}?slot_number={slot_number}")
+    }
+}
+
+async fn fetch_latest_slot_number(provider: &Provider) -> Result<u64> {
+    let latest_slot: LedgerSlotResp = provider
+        .query_rest_endpoint("/ledger/slots/latest")
+        .await
+        .context("Failed to query latest slot number from /ledger/slots/latest")?;
+    Ok(latest_slot.number)
+}
+
 async fn fetch_notes(
     provider: &Provider,
     start_offset: usize,
     target_leaves: Option<u64>,
     expected_snapshot: Option<NotesSnapshot>,
+    slot_number: u64,
 ) -> Result<NotesFetch> {
     let mut out: Vec<(u64, Hash32)> = Vec::new();
     let mut offset = start_offset;
@@ -1485,6 +1446,7 @@ async fn fetch_notes(
             "/modules/midnight-privacy/notes?limit={}&offset={}",
             NOTES_PAGE_LIMIT, offset
         );
+        let endpoint = append_slot_number_query(&endpoint, slot_number);
         let mut empty_retries = 0usize;
         let resp: NotesResp = loop {
             let resp: NotesResp = provider
