@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use mcp_external::server::{McpSpec, McpWalletContext};
 use midnight_privacy::{note_commitment, Hash32};
 use rand::RngCore;
 use reqwest::Client as HttpClient;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sov_bank::TokenId;
 use sov_modules_api::Amount;
@@ -38,6 +40,7 @@ use tracing_subscriber::EnvFilter;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
+const POOL_STATE_TABLE: &str = "pool_wallets";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -50,12 +53,9 @@ struct Config {
     deposit_amount: u128,
     auto_fund_gas_reserve: u128,
     topup_gas_reserve: u128,
-    setup_concurrency: usize,
-    wallet_setup_batch_size: usize,
     wallet_setup_backoff_ms: u64,
     sequencer_ready_check_timeout_ms: u64,
     proof_generation_interval_ms: u64,
-    proof_generation_batch_size: usize,
     max_concurrent_proofs: usize,
     da_connection_string: String,
     ligero_program_path: String,
@@ -92,13 +92,10 @@ impl Config {
         let topup_gas_reserve =
             env_u128("TOPUP_GAS_RESERVE", auto_fund_gas_reserve).max(DEFAULT_MAX_FEE);
 
-        let setup_concurrency = env_usize("SETUP_CONCURRENCY", 10).max(1);
-        let wallet_setup_batch_size = env_usize("WALLET_SETUP_BATCH_SIZE", 5).max(1);
         let wallet_setup_backoff_ms = env_u64("WALLET_SETUP_BACKOFF_MS", 1_000).max(50);
         let sequencer_ready_check_timeout_ms =
             env_u64("SEQUENCER_READY_CHECK_TIMEOUT_MS", 2_000).max(100);
         let proof_generation_interval_ms = env_u64("PROOF_GENERATION_INTERVAL_MS", 0);
-        let proof_generation_batch_size = env_usize("PROOF_GENERATION_BATCH_SIZE", 1).max(1);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
         let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
@@ -122,12 +119,9 @@ impl Config {
             deposit_amount,
             auto_fund_gas_reserve,
             topup_gas_reserve,
-            setup_concurrency,
-            wallet_setup_batch_size,
             wallet_setup_backoff_ms,
             sequencer_ready_check_timeout_ms,
             proof_generation_interval_ms,
-            proof_generation_batch_size,
             max_concurrent_proofs,
             da_connection_string,
             ligero_program_path,
@@ -153,20 +147,20 @@ struct PendingTransfer {
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedNote {
     value: u128,
     rho_hex: String,
     sender_id_hex: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedPending {
     tx_hash: String,
     next_note: PersistedNote,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedWallet {
     wallet_private_key_hex: String,
     privacy_spend_key_hex: String,
@@ -174,7 +168,7 @@ struct PersistedWallet {
     pending: Option<PersistedPending>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedPoolState {
     wallets: Vec<PersistedWallet>,
 }
@@ -229,7 +223,6 @@ struct ServiceState {
     state_save_notify: Arc<Notify>,
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
-    proof_generation_batch_size: AtomicUsize,
     max_concurrent_proofs: AtomicUsize,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
@@ -289,17 +282,23 @@ struct MaxProofsBody {
 struct ProofGenerationQuery {
     #[serde(alias = "token")]
     auth_token: Option<String>,
+    proof_generation_state: Option<String>,
+    proof_generation_active: Option<bool>,
+    proof_generation_interval_ms: Option<u64>,
+    // Backward-compatible aliases.
     state: Option<String>,
     interval_ms: Option<u64>,
-    batch_size: Option<usize>,
     max_concurrent_proofs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProofGenerationBody {
+    proof_generation_state: Option<String>,
+    proof_generation_active: Option<bool>,
+    proof_generation_interval_ms: Option<u64>,
+    // Backward-compatible aliases.
     state: Option<String>,
     interval_ms: Option<u64>,
-    batch_size: Option<usize>,
     max_concurrent_proofs: Option<usize>,
 }
 
@@ -310,7 +309,6 @@ struct StatusResponse {
     proof_generation_active: bool,
     proof_generation_state: &'static str,
     proof_generation_interval_ms: u64,
-    proof_generation_batch_size: usize,
     max_concurrent_proofs: usize,
 }
 
@@ -395,17 +393,17 @@ async fn main() -> Result<()> {
         McpWalletContext::from_private_key_hex(&cfg.admin_wallet_private_key_hex)
             .context("ADMIN_WALLET_PRIVATE_KEY")?,
     );
+    let pool_state_sqlite_file = cfg.pool_state_file.as_deref().unwrap_or("(disabled)");
     tracing::info!(
         admin_address = %admin_wallet.get_address(),
         max_proofs = cfg.max_proofs,
         deposit_amount = cfg.deposit_amount,
         gas_reserve = cfg.auto_fund_gas_reserve,
-        wallet_setup_batch_size = cfg.wallet_setup_batch_size,
+        wallet_setup_parallelism = cfg.max_concurrent_proofs,
         wallet_setup_backoff_ms = cfg.wallet_setup_backoff_ms,
         proof_generation_interval_ms = cfg.proof_generation_interval_ms,
-        proof_generation_batch_size = cfg.proof_generation_batch_size,
         max_concurrent_proofs = cfg.max_concurrent_proofs,
-        pool_state_file = cfg.pool_state_file.as_deref().unwrap_or("(disabled)"),
+        pool_state_sqlite_file,
         "Starting proof pool service"
     );
 
@@ -417,7 +415,6 @@ async fn main() -> Result<()> {
         state_save_notify: Arc::new(Notify::new()),
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
-        proof_generation_batch_size: AtomicUsize::new(cfg.proof_generation_batch_size),
         max_concurrent_proofs: AtomicUsize::new(cfg.max_concurrent_proofs),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
@@ -435,7 +432,7 @@ async fn main() -> Result<()> {
     // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
     let setup_state = state.clone();
     tokio::spawn(async move {
-        // Try to restore from a previous state file first.
+        // Try to restore from a previous state DB first.
         let restored = match restore_wallets_from_state(&setup_state).await {
             Ok(true) => {
                 // Re-fetch viewer FVK bundles (not persisted; cheap to re-fetch).
@@ -446,8 +443,11 @@ async fn main() -> Result<()> {
             }
             Ok(false) => false,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to restore pool state, starting fresh");
-                false
+                tracing::error!(
+                    error = %e,
+                    "Failed to restore pool state; refusing to start fresh to prevent data loss"
+                );
+                return;
             }
         };
 
@@ -525,12 +525,52 @@ fn parse_proof_generation_state(raw: &str) -> Option<bool> {
     }
 }
 
+fn parse_optional_proof_generation_state(raw: Option<&str>) -> Result<Option<bool>, StatusCode> {
+    raw.map(|value| parse_proof_generation_state(value).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()
+}
+
+fn resolve_requested_proof_generation_state(
+    canonical_state: Option<&str>,
+    legacy_state: Option<&str>,
+    active: Option<bool>,
+) -> Result<Option<bool>, StatusCode> {
+    let canonical_parsed = parse_optional_proof_generation_state(canonical_state)?;
+    let legacy_parsed = parse_optional_proof_generation_state(legacy_state)?;
+    let state_from_string = match (canonical_parsed, legacy_parsed) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => {
+            return Err(StatusCode::BAD_REQUEST)
+        }
+        (Some(canonical), _) => Some(canonical),
+        (None, Some(legacy)) => Some(legacy),
+        (None, None) => None,
+    };
+
+    match (state_from_string, active) {
+        (Some(from_string), Some(active)) if from_string != active => Err(StatusCode::BAD_REQUEST),
+        (Some(from_string), _) => Ok(Some(from_string)),
+        (None, Some(active)) => Ok(Some(active)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_requested_proof_generation_interval_ms(
+    canonical_interval_ms: Option<u64>,
+    legacy_interval_ms: Option<u64>,
+) -> Result<Option<u64>, StatusCode> {
+    match (canonical_interval_ms, legacy_interval_ms) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => Err(StatusCode::BAD_REQUEST),
+        (Some(canonical), _) => Ok(Some(canonical)),
+        (None, Some(legacy)) => Ok(Some(legacy)),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
     let ready = ready_proofs(state);
     let max_proofs = state.target_max_proofs.load(Ordering::Relaxed);
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
-    let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
     let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
     StatusResponse {
         max_proofs,
@@ -538,7 +578,6 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
         proof_generation_active: active,
         proof_generation_state: proof_generation_state_label(active),
         proof_generation_interval_ms: interval_ms,
-        proof_generation_batch_size: batch_size,
         max_concurrent_proofs: max_concurrent,
     }
 }
@@ -630,8 +669,7 @@ async fn max_proofs_impl(
         state.target_max_proofs.store(max_proofs, Ordering::Relaxed);
         tracing::info!(
             max_proofs,
-            setup_concurrency = state.cfg.setup_concurrency,
-            batch_size = state.cfg.wallet_setup_batch_size,
+            wallet_setup_parallelism = state.max_concurrent_proofs.load(Ordering::Relaxed),
             batch_delay_ms = state.cfg.wallet_setup_backoff_ms,
             "Updated MAX_PROOFS target (wallet scale-up is paced)"
         );
@@ -647,15 +685,30 @@ async fn proof_generation_impl(
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_auth(&state.cfg.auth_token, query.auth_token.as_deref())?;
 
-    let body_state = body.as_ref().and_then(|b| b.state.as_deref());
-    let requested_state = body_state
-        .and_then(parse_proof_generation_state)
-        .or_else(|| {
-            query
-                .state
-                .as_deref()
-                .and_then(parse_proof_generation_state)
-        });
+    let body_requested_state = body
+        .as_ref()
+        .map(|b| {
+            resolve_requested_proof_generation_state(
+                b.proof_generation_state.as_deref(),
+                b.state.as_deref(),
+                b.proof_generation_active,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let query_requested_state = resolve_requested_proof_generation_state(
+        query.proof_generation_state.as_deref(),
+        query.state.as_deref(),
+        query.proof_generation_active,
+    )?;
+    let requested_state = match (body_requested_state, query_requested_state) {
+        (Some(body_state), Some(query_state)) if body_state != query_state => {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        (Some(body_state), _) => Some(body_state),
+        (None, Some(query_state)) => Some(query_state),
+        (None, None) => None,
+    };
 
     if let Some(enabled) = requested_state {
         state
@@ -666,14 +719,30 @@ async fn proof_generation_impl(
             proof_generation_state = proof_generation_state_label(enabled),
             "Updated proof generation state"
         );
-    } else if body_state.is_some() || query.state.is_some() {
-        return Err(StatusCode::BAD_REQUEST);
     }
 
-    let requested_interval_ms = body
+    let body_requested_interval_ms = body
         .as_ref()
-        .and_then(|b| b.interval_ms)
-        .or(query.interval_ms);
+        .map(|b| {
+            resolve_requested_proof_generation_interval_ms(
+                b.proof_generation_interval_ms,
+                b.interval_ms,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let query_requested_interval_ms = resolve_requested_proof_generation_interval_ms(
+        query.proof_generation_interval_ms,
+        query.interval_ms,
+    )?;
+    let requested_interval_ms = match (body_requested_interval_ms, query_requested_interval_ms) {
+        (Some(body_interval), Some(query_interval)) if body_interval != query_interval => {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        (Some(body_interval), _) => Some(body_interval),
+        (None, Some(query_interval)) => Some(query_interval),
+        (None, None) => None,
+    };
     if let Some(interval_ms) = requested_interval_ms {
         state
             .proof_generation_interval_ms
@@ -681,23 +750,6 @@ async fn proof_generation_impl(
         tracing::info!(
             proof_generation_interval_ms = interval_ms,
             "Updated proof generation throttle interval"
-        );
-    }
-
-    let requested_batch_size = body
-        .as_ref()
-        .and_then(|b| b.batch_size)
-        .or(query.batch_size);
-    if let Some(batch_size) = requested_batch_size {
-        if batch_size == 0 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        state
-            .proof_generation_batch_size
-            .store(batch_size, Ordering::Relaxed);
-        tracing::info!(
-            proof_generation_batch_size = batch_size,
-            "Updated proof generation batch size"
         );
     }
 
@@ -915,7 +967,6 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
             }
 
             let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
-            let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
             if interval_ms > 0 {
                 let now = tokio::time::Instant::now();
                 if now < next_allowed_generation {
@@ -933,10 +984,9 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
             let deficit = target - ready;
 
             let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
-            let in_flight =
-                PROOF_SEMAPHORE_CAPACITY - state.proof_semaphore.available_permits();
+            let in_flight = PROOF_SEMAPHORE_CAPACITY - state.proof_semaphore.available_permits();
             let room = max_concurrent.saturating_sub(in_flight);
-            let launches_target = deficit.min(batch_size).min(room);
+            let launches_target = deficit.min(room);
 
             if launches_target == 0 {
                 sleep(Duration::from_millis(50)).await;
@@ -983,6 +1033,10 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
     });
 }
 
+fn wallet_setup_parallelism(state: &Arc<ServiceState>) -> usize {
+    state.max_concurrent_proofs.load(Ordering::Relaxed).max(1)
+}
+
 fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
     tokio::spawn(async move {
         loop {
@@ -1001,12 +1055,13 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
                 }
 
                 let missing = target - current;
-                let to_add = missing.min(state.cfg.wallet_setup_batch_size);
+                let to_add = missing.min(wallet_setup_parallelism(&state));
                 tracing::info!(
                     current,
                     target,
                     missing,
                     batch_size = to_add,
+                    wallet_setup_parallelism = wallet_setup_parallelism(&state),
                     "Scaling wallet pool up in batch"
                 );
                 if let Err(e) = setup_and_append_wallets(&state, to_add).await {
@@ -1397,7 +1452,7 @@ async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
         "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
     );
 
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
 
     for (idx, w) in wallets.iter().enumerate() {
@@ -1440,7 +1495,7 @@ async fn fund_wallets_list(
     wallets: &[PoolWallet],
     amount: u128,
 ) -> Result<()> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
     for w in wallets.iter() {
@@ -1475,7 +1530,7 @@ async fn wait_for_wallet_balances_list(
     wallets: &[PoolWallet],
     min_balance: u128,
 ) -> Result<()> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
     for w in wallets.iter() {
@@ -1536,7 +1591,7 @@ async fn submit_deposits_list(
     state: &Arc<ServiceState>,
     wallets: &[PoolWallet],
 ) -> Result<Vec<NoteState>> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<(usize, NoteState)>> = JoinSet::new();
 
     for (idx, w) in wallets.iter().enumerate() {
@@ -1586,7 +1641,7 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
         "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
     );
 
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
     let wallet_targets: Vec<(usize, String, String)> = {
         let wallets = state.wallets.read().await;
@@ -1638,7 +1693,7 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
 }
 
 async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
     let to_addrs: Vec<String> = {
@@ -1675,7 +1730,7 @@ async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
 }
 
 async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) -> Result<()> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
     let addrs: Vec<_> = {
@@ -1739,7 +1794,7 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
 }
 
 async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
-    let sem = Arc::new(Semaphore::new(state.cfg.setup_concurrency));
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
     let mut join_set: JoinSet<Result<(usize, NoteState)>> = JoinSet::new();
 
     let wallet_inputs: Vec<(usize, McpWalletContext, PrivacyKey)> = {
@@ -1807,7 +1862,6 @@ async fn flush_verifier(state: &Arc<ServiceState>, tx_hashes: &[String]) -> Resu
 
     serde_json::from_str(&body).context("Failed to parse verifier flush response")
 }
-
 async fn wait_for_note_in_tree(
     provider: &Provider,
     privacy_key: &PrivacyKey,
@@ -1893,7 +1947,9 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
         signing_key_path: tmpkey.path().to_string_lossy().to_string(),
         value_setter_method_id: None,
         midnight_method_id: Some(method_id),
-        max_concurrent_verifications: cfg.max_concurrent_proofs,
+        // Keep embedded verifier request-cap well above proof-pool runtime tuning so
+        // `max_concurrent_proofs` from proof-pool remains the effective single knob.
+        max_concurrent_verifications: PROOF_SEMAPHORE_CAPACITY,
         chain_id: 1,
         da_connection_string: cfg.da_connection_string.clone(),
         defer_sequencer_submission,
@@ -1932,9 +1988,115 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
 
 // ── Pool state persistence ───────────────────────────────────────────────────
 
+fn configured_pool_state_sqlite_path(cfg: &Config) -> Option<&str> {
+    cfg.pool_state_file.as_deref()
+}
+
+fn open_pool_state_sqlite(db_path: &str) -> Result<Connection> {
+    if let Some(parent) = Path::new(db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create pool state DB parent directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open pool state SQLite DB {}", db_path))?;
+    conn.execute_batch(&format!(
+        "\
+PRAGMA journal_mode=WAL;\
+PRAGMA synchronous=NORMAL;\
+CREATE TABLE IF NOT EXISTS {POOL_STATE_TABLE} (\
+    wallet_idx INTEGER PRIMARY KEY,\
+    wallet_private_key_hex TEXT NOT NULL,\
+    privacy_spend_key_hex TEXT NOT NULL,\
+    current_note_value TEXT,\
+    current_note_rho_hex TEXT,\
+    current_note_sender_id_hex TEXT,\
+    pending_tx_hash TEXT,\
+    pending_next_note_value TEXT,\
+    pending_next_note_rho_hex TEXT,\
+    pending_next_note_sender_id_hex TEXT\
+);"
+    ))
+    .with_context(|| {
+        format!(
+            "Failed to initialize pool state SQLite schema in {}",
+            db_path
+        )
+    })?;
+    ensure_pool_state_schema(&conn, db_path)?;
+    Ok(conn)
+}
+
+fn ensure_pool_state_schema(conn: &Connection, db_path: &str) -> Result<()> {
+    let pragma_sql = format!("PRAGMA table_info({POOL_STATE_TABLE})");
+    let mut stmt = conn
+        .prepare(&pragma_sql)
+        .with_context(|| format!("Failed to inspect pool state schema in {}", db_path))?;
+    let mut rows = stmt
+        .query([])
+        .with_context(|| format!("Failed to query pool state schema in {}", db_path))?;
+
+    let mut existing_columns: HashSet<String> = HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("Failed to read pool state schema row in {}", db_path))?
+    {
+        let name: String = row
+            .get(1)
+            .with_context(|| format!("Failed to parse pool state column name in {}", db_path))?;
+        existing_columns.insert(name);
+    }
+
+    if !existing_columns.contains("wallet_idx")
+        || !existing_columns.contains("wallet_private_key_hex")
+        || !existing_columns.contains("privacy_spend_key_hex")
+    {
+        bail!(
+            "Pool state DB {} has incompatible schema for table {} (missing required base columns)",
+            db_path,
+            POOL_STATE_TABLE
+        );
+    }
+
+    for (column_name, sql_type) in [
+        ("current_note_value", "TEXT"),
+        ("current_note_rho_hex", "TEXT"),
+        ("current_note_sender_id_hex", "TEXT"),
+        ("pending_tx_hash", "TEXT"),
+        ("pending_next_note_value", "TEXT"),
+        ("pending_next_note_rho_hex", "TEXT"),
+        ("pending_next_note_sender_id_hex", "TEXT"),
+    ] {
+        if existing_columns.contains(column_name) {
+            continue;
+        }
+        let alter_sql =
+            format!("ALTER TABLE {POOL_STATE_TABLE} ADD COLUMN {column_name} {sql_type}");
+        conn.execute(&alter_sql, []).with_context(|| {
+            format!(
+                "Failed to add missing column {} to pool state DB {}",
+                column_name, db_path
+            )
+        })?;
+        tracing::warn!(
+            db_path,
+            column_name,
+            "Auto-migrated pool state DB by adding missing column"
+        );
+    }
+
+    Ok(())
+}
+
 async fn save_pool_state(state: &Arc<ServiceState>) -> Result<()> {
-    let path = match state.cfg.pool_state_file.as_deref() {
-        Some(p) => p,
+    let db_path = match configured_pool_state_sqlite_path(&state.cfg) {
+        Some(path) => path.to_string(),
         None => return Ok(()), // persistence not enabled
     };
 
@@ -1956,55 +2118,286 @@ async fn save_pool_state(state: &Arc<ServiceState>) -> Result<()> {
         }
     };
 
-    let json = serde_json::to_string_pretty(&persisted)
-        .context("Failed to serialize pool state")?;
-
-    // Atomic write: write to temp file then rename
-    let tmp_path = format!("{}.tmp", path);
-    tokio::fs::write(&tmp_path, json.as_bytes())
+    tokio::task::spawn_blocking(move || save_pool_state_sqlite_sync(&db_path, persisted))
         .await
-        .with_context(|| format!("Failed to write {}", tmp_path))?;
-    tokio::fs::rename(&tmp_path, path)
-        .await
-        .with_context(|| format!("Failed to rename {} -> {}", tmp_path, path))?;
+        .context("Pool state SQLite save task failed to join")?
+}
 
+fn save_pool_state_sqlite_sync(db_path: &str, persisted: PersistedPoolState) -> Result<()> {
+    let mut conn = open_pool_state_sqlite(db_path)?;
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("Failed to begin pool state transaction in {}", db_path))?;
+
+    tx.execute(&format!("DELETE FROM {POOL_STATE_TABLE}"), [])
+        .with_context(|| format!("Failed to clear pool state table in {}", db_path))?;
+
+    let insert_sql = format!(
+        "INSERT INTO {POOL_STATE_TABLE} (\
+            wallet_idx,\
+            wallet_private_key_hex,\
+            privacy_spend_key_hex,\
+            current_note_value,\
+            current_note_rho_hex,\
+            current_note_sender_id_hex,\
+            pending_tx_hash,\
+            pending_next_note_value,\
+            pending_next_note_rho_hex,\
+            pending_next_note_sender_id_hex\
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+    );
+    let mut stmt = tx
+        .prepare(&insert_sql)
+        .with_context(|| format!("Failed to prepare pool state insert in {}", db_path))?;
+
+    for (wallet_idx, wallet) in persisted.wallets.into_iter().enumerate() {
+        let current_note_value = wallet
+            .current_note
+            .as_ref()
+            .map(|note| note.value.to_string());
+        let current_note_rho_hex = wallet
+            .current_note
+            .as_ref()
+            .map(|note| note.rho_hex.as_str());
+        let current_note_sender_id_hex = wallet
+            .current_note
+            .as_ref()
+            .map(|note| note.sender_id_hex.as_str());
+
+        let pending_tx_hash = wallet
+            .pending
+            .as_ref()
+            .map(|pending| pending.tx_hash.as_str());
+        let pending_next_note_value = wallet
+            .pending
+            .as_ref()
+            .map(|pending| pending.next_note.value.to_string());
+        let pending_next_note_rho_hex = wallet
+            .pending
+            .as_ref()
+            .map(|pending| pending.next_note.rho_hex.as_str());
+        let pending_next_note_sender_id_hex = wallet
+            .pending
+            .as_ref()
+            .map(|pending| pending.next_note.sender_id_hex.as_str());
+
+        stmt.execute(params![
+            i64::try_from(wallet_idx).context("wallet index overflow while persisting state")?,
+            wallet.wallet_private_key_hex,
+            wallet.privacy_spend_key_hex,
+            current_note_value.as_deref(),
+            current_note_rho_hex,
+            current_note_sender_id_hex,
+            pending_tx_hash,
+            pending_next_note_value.as_deref(),
+            pending_next_note_rho_hex,
+            pending_next_note_sender_id_hex
+        ])
+        .with_context(|| {
+            format!(
+                "Failed to insert persisted wallet {} into {}",
+                wallet_idx, db_path
+            )
+        })?;
+    }
+
+    drop(stmt);
+    tx.commit()
+        .with_context(|| format!("Failed to commit pool state transaction in {}", db_path))?;
     Ok(())
 }
 
-async fn load_pool_state(path: &str) -> Result<Option<PersistedPoolState>> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(json) => {
-            let persisted: PersistedPoolState =
-                serde_json::from_str(&json).context("Failed to parse pool state file")?;
-            Ok(Some(persisted))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::from(e).context("Failed to read pool state file")),
+fn note_from_db_columns(
+    value: Option<String>,
+    rho_hex: Option<String>,
+    sender_id_hex: Option<String>,
+    field_name: &str,
+    wallet_idx: usize,
+) -> Result<Option<PersistedNote>> {
+    match (value, rho_hex, sender_id_hex) {
+        (None, None, None) => Ok(None),
+        (Some(value), Some(rho_hex), Some(sender_id_hex)) => Ok(Some(PersistedNote {
+            value: value.parse::<u128>().with_context(|| {
+                format!(
+                    "Failed to parse {} value as u128 for wallet {}",
+                    field_name, wallet_idx
+                )
+            })?,
+            rho_hex,
+            sender_id_hex,
+        })),
+        _ => bail!(
+            "Incomplete {} columns for wallet {} in persisted state DB",
+            field_name,
+            wallet_idx
+        ),
     }
 }
 
-/// Restore wallets from a previously persisted state file.
-/// Returns `Ok(true)` if wallets were restored, `Ok(false)` if no state file found.
+fn load_pool_state_sqlite_sync(db_path: &str) -> Result<Option<PersistedPoolState>> {
+    if !Path::new(db_path).exists() {
+        return Ok(None);
+    }
+
+    let conn = open_pool_state_sqlite(db_path)?;
+    let query_sql = format!(
+        "SELECT wallet_idx, wallet_private_key_hex, privacy_spend_key_hex, \
+         current_note_value, current_note_rho_hex, current_note_sender_id_hex, \
+         pending_tx_hash, pending_next_note_value, pending_next_note_rho_hex, \
+         pending_next_note_sender_id_hex \
+         FROM {POOL_STATE_TABLE} \
+         ORDER BY wallet_idx ASC"
+    );
+    let mut stmt = conn
+        .prepare(&query_sql)
+        .with_context(|| format!("Failed to prepare pool state query in {}", db_path))?;
+    let mut rows = stmt
+        .query([])
+        .with_context(|| format!("Failed to query pool state rows from {}", db_path))?;
+
+    let mut wallets: Vec<PersistedWallet> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("Failed to read row from {}", db_path))?
+    {
+        let wallet_idx_raw: i64 = row
+            .get(0)
+            .with_context(|| format!("Failed to read wallet_idx from {}", db_path))?;
+        let wallet_idx = usize::try_from(wallet_idx_raw).with_context(|| {
+            format!(
+                "Invalid negative or overflowing wallet_idx {} in {}",
+                wallet_idx_raw, db_path
+            )
+        })?;
+        let expected_wallet_idx = wallets.len();
+        if wallet_idx != expected_wallet_idx {
+            bail!(
+                "Corrupt pool state DB {}: expected wallet_idx {}, found {}",
+                db_path,
+                expected_wallet_idx,
+                wallet_idx
+            );
+        }
+
+        let wallet_private_key_hex: String = row.get(1).with_context(|| {
+            format!(
+                "Failed to read wallet_private_key_hex for wallet {} from {}",
+                wallet_idx, db_path
+            )
+        })?;
+        let privacy_spend_key_hex: String = row.get(2).with_context(|| {
+            format!(
+                "Failed to read privacy_spend_key_hex for wallet {} from {}",
+                wallet_idx, db_path
+            )
+        })?;
+        let current_note = note_from_db_columns(
+            row.get(3).with_context(|| {
+                format!(
+                    "Failed to read current_note_value for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            row.get(4).with_context(|| {
+                format!(
+                    "Failed to read current_note_rho_hex for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            row.get(5).with_context(|| {
+                format!(
+                    "Failed to read current_note_sender_id_hex for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            "current_note",
+            wallet_idx,
+        )?;
+
+        let pending_note = note_from_db_columns(
+            row.get(7).with_context(|| {
+                format!(
+                    "Failed to read pending_next_note_value for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            row.get(8).with_context(|| {
+                format!(
+                    "Failed to read pending_next_note_rho_hex for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            row.get(9).with_context(|| {
+                format!(
+                    "Failed to read pending_next_note_sender_id_hex for wallet {} from {}",
+                    wallet_idx, db_path
+                )
+            })?,
+            "pending_next_note",
+            wallet_idx,
+        )?;
+
+        let pending_tx_hash: Option<String> = row.get(6).with_context(|| {
+            format!(
+                "Failed to read pending_tx_hash for wallet {} from {}",
+                wallet_idx, db_path
+            )
+        })?;
+        let pending = match (pending_tx_hash, pending_note) {
+            (None, None) => None,
+            (Some(tx_hash), Some(next_note)) => Some(PersistedPending { tx_hash, next_note }),
+            (Some(_), None) | (None, Some(_)) => {
+                bail!(
+                    "Incomplete pending columns for wallet {} in persisted state DB {}",
+                    wallet_idx,
+                    db_path
+                );
+            }
+        };
+
+        wallets.push(PersistedWallet {
+            wallet_private_key_hex,
+            privacy_spend_key_hex,
+            current_note,
+            pending,
+        });
+    }
+
+    if wallets.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PersistedPoolState { wallets }))
+}
+
+async fn load_pool_state_sqlite(db_path: &str) -> Result<Option<PersistedPoolState>> {
+    let db_path = db_path.to_string();
+    tokio::task::spawn_blocking(move || load_pool_state_sqlite_sync(&db_path))
+        .await
+        .context("Pool state SQLite load task failed to join")?
+}
+
+/// Restore wallets from a persisted SQLite DB.
+/// Returns `Ok(true)` if wallets were restored, `Ok(false)` if no state DB found.
 async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
-    let path = match state.cfg.pool_state_file.as_deref() {
-        Some(p) => p,
+    let sqlite_path = match configured_pool_state_sqlite_path(&state.cfg) {
+        Some(path) => path.to_string(),
         None => return Ok(false),
     };
-
-    let persisted = match load_pool_state(path).await? {
-        Some(p) => p,
+    let persisted = match load_pool_state_sqlite(&sqlite_path).await? {
+        Some(state) => state,
         None => return Ok(false),
     };
 
     if persisted.wallets.is_empty() {
-        tracing::info!("Pool state file is empty, starting fresh");
+        tracing::info!(sqlite_path, "Pool state DB is empty, starting fresh");
         return Ok(false);
     }
 
     tracing::info!(
         wallet_count = persisted.wallets.len(),
-        path,
-        "Restoring wallets from state file"
+        sqlite_path,
+        "Restoring wallets from persisted state"
     );
 
     let mut wallets = Vec::with_capacity(persisted.wallets.len());
@@ -2053,13 +2446,11 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
 
     let wallet_count = wallets.len();
     *state.wallets.write().await = wallets;
-    state.ready_proofs_count.store(ready_count, Ordering::Relaxed);
+    state
+        .ready_proofs_count
+        .store(ready_count, Ordering::Relaxed);
 
-    tracing::info!(
-        wallet_count,
-        ready_count,
-        "Wallets restored from state file"
-    );
+    tracing::info!(wallet_count, ready_count, "Wallets restored from state DB");
 
     Ok(true)
 }
