@@ -17,6 +17,7 @@ midnight-privacy = { workspace = true, features = ["native"] }
 mcp-external = { path = "../../mcp-external" }
 rand.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+rusqlite = { version = "0.32.1" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = false }
 sov-bank = { workspace = true }
