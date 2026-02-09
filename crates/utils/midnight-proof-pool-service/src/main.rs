@@ -155,6 +155,10 @@ struct PoolWallet {
     generating: bool,
 }
 
+/// Upper bound for the semaphore so that `available_permits()` can be used to
+/// derive the number of in-flight proof generations at any moment.
+const PROOF_SEMAPHORE_CAPACITY: usize = 4096;
+
 struct ServiceState {
     cfg: Config,
     target_max_proofs: AtomicUsize,
@@ -162,6 +166,7 @@ struct ServiceState {
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
     proof_generation_batch_size: AtomicUsize,
+    max_concurrent_proofs: AtomicUsize,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
     http: HttpClient,
@@ -223,6 +228,7 @@ struct ProofGenerationQuery {
     state: Option<String>,
     interval_ms: Option<u64>,
     batch_size: Option<usize>,
+    max_concurrent_proofs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +236,7 @@ struct ProofGenerationBody {
     state: Option<String>,
     interval_ms: Option<u64>,
     batch_size: Option<usize>,
+    max_concurrent_proofs: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +247,7 @@ struct StatusResponse {
     proof_generation_state: &'static str,
     proof_generation_interval_ms: u64,
     proof_generation_batch_size: usize,
+    max_concurrent_proofs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +340,7 @@ async fn main() -> Result<()> {
         wallet_setup_backoff_ms = cfg.wallet_setup_backoff_ms,
         proof_generation_interval_ms = cfg.proof_generation_interval_ms,
         proof_generation_batch_size = cfg.proof_generation_batch_size,
+        max_concurrent_proofs = cfg.max_concurrent_proofs,
         "Starting proof pool service"
     );
 
@@ -342,6 +351,7 @@ async fn main() -> Result<()> {
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
         proof_generation_batch_size: AtomicUsize::new(cfg.proof_generation_batch_size),
+        max_concurrent_proofs: AtomicUsize::new(cfg.max_concurrent_proofs),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
@@ -350,7 +360,7 @@ async fn main() -> Result<()> {
         admin_wallet: admin_wallet.clone(),
         gas_token_id,
         wallets: RwLock::new(Vec::new()),
-        proof_semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_proofs)),
+        proof_semaphore: Arc::new(Semaphore::new(PROOF_SEMAPHORE_CAPACITY)),
     });
 
     // Start the HTTP server immediately; perform wallet setup + initial pool fill in the background.
@@ -423,6 +433,7 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
     let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
+    let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
     StatusResponse {
         max_proofs,
         ready_proofs: ready,
@@ -430,6 +441,7 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
         proof_generation_state: proof_generation_state_label(active),
         proof_generation_interval_ms: interval_ms,
         proof_generation_batch_size: batch_size,
+        max_concurrent_proofs: max_concurrent,
     }
 }
 
@@ -588,6 +600,23 @@ async fn proof_generation_impl(
         tracing::info!(
             proof_generation_batch_size = batch_size,
             "Updated proof generation batch size"
+        );
+    }
+
+    let requested_max_concurrent = body
+        .as_ref()
+        .and_then(|b| b.max_concurrent_proofs)
+        .or(query.max_concurrent_proofs);
+    if let Some(max_concurrent) = requested_max_concurrent {
+        if max_concurrent == 0 || max_concurrent > PROOF_SEMAPHORE_CAPACITY {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        state
+            .max_concurrent_proofs
+            .store(max_concurrent, Ordering::Relaxed);
+        tracing::info!(
+            max_concurrent_proofs = max_concurrent,
+            "Updated max concurrent proofs"
         );
     }
 
@@ -803,7 +832,17 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
                 continue;
             }
             let deficit = target - ready;
-            let launches_target = deficit.min(batch_size);
+
+            let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
+            let in_flight =
+                PROOF_SEMAPHORE_CAPACITY - state.proof_semaphore.available_permits();
+            let room = max_concurrent.saturating_sub(in_flight);
+            let launches_target = deficit.min(batch_size).min(room);
+
+            if launches_target == 0 {
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
 
             let mut launched = 0usize;
             for _ in 0..launches_target {
