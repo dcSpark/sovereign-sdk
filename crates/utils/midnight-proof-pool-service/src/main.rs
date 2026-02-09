@@ -30,7 +30,7 @@ use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
 use sov_rollup_interface::zk::{CodeCommitment, Zkvm, ZkvmHost};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::EnvFilter;
@@ -61,6 +61,7 @@ struct Config {
     ligero_program_path: String,
     ligero_proof_service_url: String,
     verifier_prover_service_url: Option<String>,
+    pool_state_file: Option<String>,
 }
 
 impl Config {
@@ -107,6 +108,10 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let pool_state_file = env_optional_string("POOL_STATE_FILE")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         Ok(Self {
             auth_token,
             max_proofs,
@@ -128,6 +133,7 @@ impl Config {
             ligero_program_path,
             ligero_proof_service_url,
             verifier_prover_service_url,
+            pool_state_file,
         })
     }
 }
@@ -145,23 +151,86 @@ struct PendingTransfer {
     next_note: NoteState,
 }
 
+// ── Persistence ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct PersistedNote {
+    value: u128,
+    rho_hex: String,
+    sender_id_hex: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPending {
+    tx_hash: String,
+    next_note: PersistedNote,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedWallet {
+    wallet_private_key_hex: String,
+    privacy_spend_key_hex: String,
+    current_note: Option<PersistedNote>,
+    pending: Option<PersistedPending>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPoolState {
+    wallets: Vec<PersistedWallet>,
+}
+
+impl NoteState {
+    fn to_persisted(&self) -> PersistedNote {
+        PersistedNote {
+            value: self.value,
+            rho_hex: hex::encode(self.rho),
+            sender_id_hex: hex::encode(self.sender_id),
+        }
+    }
+
+    fn from_persisted(p: &PersistedNote) -> Result<Self> {
+        Ok(Self {
+            value: p.value,
+            rho: parse_hash32(&p.rho_hex).context("rho")?,
+            sender_id: parse_hash32(&p.sender_id_hex).context("sender_id")?,
+        })
+    }
+}
+
+fn parse_hash32(hex_str: &str) -> Result<Hash32> {
+    let bytes = hex::decode(hex_str).context("invalid hex")?;
+    anyhow::ensure!(bytes.len() == 32, "expected 32 bytes, got {}", bytes.len());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
 #[derive(Clone)]
 struct PoolWallet {
     wallet: McpWalletContext,
+    wallet_private_key_hex: String,
     privacy_key: PrivacyKey,
+    privacy_spend_key_hex: String,
     viewer_fvk_bundle: Option<ViewerFvkBundle>,
     current_note: Option<NoteState>,
     pending: Option<PendingTransfer>,
     generating: bool,
 }
 
+/// Upper bound for the semaphore so that `available_permits()` can be used to
+/// derive the number of in-flight proof generations at any moment.
+const PROOF_SEMAPHORE_CAPACITY: usize = 4096;
+
 struct ServiceState {
     cfg: Config,
     target_max_proofs: AtomicUsize,
     ready_proofs_count: AtomicUsize,
+    state_dirty: AtomicBool,
+    state_save_notify: Arc<Notify>,
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
     proof_generation_batch_size: AtomicUsize,
+    max_concurrent_proofs: AtomicUsize,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
     http: HttpClient,
@@ -223,6 +292,7 @@ struct ProofGenerationQuery {
     state: Option<String>,
     interval_ms: Option<u64>,
     batch_size: Option<usize>,
+    max_concurrent_proofs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +300,7 @@ struct ProofGenerationBody {
     state: Option<String>,
     interval_ms: Option<u64>,
     batch_size: Option<usize>,
+    max_concurrent_proofs: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +311,7 @@ struct StatusResponse {
     proof_generation_state: &'static str,
     proof_generation_interval_ms: u64,
     proof_generation_batch_size: usize,
+    max_concurrent_proofs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +404,8 @@ async fn main() -> Result<()> {
         wallet_setup_backoff_ms = cfg.wallet_setup_backoff_ms,
         proof_generation_interval_ms = cfg.proof_generation_interval_ms,
         proof_generation_batch_size = cfg.proof_generation_batch_size,
+        max_concurrent_proofs = cfg.max_concurrent_proofs,
+        pool_state_file = cfg.pool_state_file.as_deref().unwrap_or("(disabled)"),
         "Starting proof pool service"
     );
 
@@ -339,9 +413,12 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         target_max_proofs: AtomicUsize::new(cfg.max_proofs),
         ready_proofs_count: AtomicUsize::new(0),
+        state_dirty: AtomicBool::new(false),
+        state_save_notify: Arc::new(Notify::new()),
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
         proof_generation_batch_size: AtomicUsize::new(cfg.proof_generation_batch_size),
+        max_concurrent_proofs: AtomicUsize::new(cfg.max_concurrent_proofs),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
@@ -350,16 +427,35 @@ async fn main() -> Result<()> {
         admin_wallet: admin_wallet.clone(),
         gas_token_id,
         wallets: RwLock::new(Vec::new()),
-        proof_semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_proofs)),
+        proof_semaphore: Arc::new(Semaphore::new(PROOF_SEMAPHORE_CAPACITY)),
     });
+    spawn_state_saver(state.clone());
 
     // Start the HTTP server immediately; perform wallet setup + initial pool fill in the background.
     // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
     let setup_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = setup_wallets_and_fill_pool(setup_state.clone()).await {
-            tracing::error!(error = %e, "Startup setup failed; proof pool will not generate proofs");
-            return;
+        // Try to restore from a previous state file first.
+        let restored = match restore_wallets_from_state(&setup_state).await {
+            Ok(true) => {
+                // Re-fetch viewer FVK bundles (not persisted; cheap to re-fetch).
+                if let Err(e) = maybe_fetch_viewer_fvk_bundles(&setup_state).await {
+                    tracing::warn!(error = %e, "Failed to re-fetch viewer FVK bundles after restore");
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to restore pool state, starting fresh");
+                false
+            }
+        };
+
+        if !restored {
+            if let Err(e) = setup_wallets_and_fill_pool(setup_state.clone()).await {
+                tracing::error!(error = %e, "Startup setup failed; proof pool will not generate proofs");
+                return;
+            }
         }
 
         spawn_refill_loop(setup_state.clone());
@@ -379,17 +475,29 @@ async fn main() -> Result<()> {
         )
         .route("/send", post(send_handler).get(send_handler_get))
         .route("/burst", post(burst_handler).get(burst_handler_get))
-        .with_state(state);
+        .with_state(state.clone());
 
     tracing::info!(bind = %cfg.bind_addr, "HTTP server listening");
     let listener = TcpListener::bind(cfg.bind_addr)
         .await
         .context("Failed to bind proof pool service")?;
 
+    let shutdown_state = state.clone();
+    let shutdown_signal = async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Shutdown signal received, saving pool state…");
+        if let Err(e) = save_pool_state(&shutdown_state).await {
+            tracing::error!(error = %e, "Failed to save pool state on shutdown");
+        } else {
+            tracing::info!("Pool state saved successfully");
+        }
+    };
+
     axum::serve(
         listener,
         ServiceExt::<axum::extract::Request>::into_make_service(app),
     )
+    .with_graceful_shutdown(shutdown_signal)
     .await
     .context("Failed to serve proof pool service")?;
 
@@ -423,6 +531,7 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
     let batch_size = state.proof_generation_batch_size.load(Ordering::Relaxed);
+    let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
     StatusResponse {
         max_proofs,
         ready_proofs: ready,
@@ -430,6 +539,7 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
         proof_generation_state: proof_generation_state_label(active),
         proof_generation_interval_ms: interval_ms,
         proof_generation_batch_size: batch_size,
+        max_concurrent_proofs: max_concurrent,
     }
 }
 
@@ -588,6 +698,23 @@ async fn proof_generation_impl(
         tracing::info!(
             proof_generation_batch_size = batch_size,
             "Updated proof generation batch size"
+        );
+    }
+
+    let requested_max_concurrent = body
+        .as_ref()
+        .and_then(|b| b.max_concurrent_proofs)
+        .or(query.max_concurrent_proofs);
+    if let Some(max_concurrent) = requested_max_concurrent {
+        if max_concurrent == 0 || max_concurrent > PROOF_SEMAPHORE_CAPACITY {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        state
+            .max_concurrent_proofs
+            .store(max_concurrent, Ordering::Relaxed);
+        tracing::info!(
+            max_concurrent_proofs = max_concurrent,
+            "Updated max concurrent proofs"
         );
     }
 
@@ -772,6 +899,7 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(cleared))
             });
+        request_pool_state_save(state);
     }
 
     ready_proofs(state)
@@ -803,7 +931,17 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
                 continue;
             }
             let deficit = target - ready;
-            let launches_target = deficit.min(batch_size);
+
+            let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
+            let in_flight =
+                PROOF_SEMAPHORE_CAPACITY - state.proof_semaphore.available_permits();
+            let room = max_concurrent.saturating_sub(in_flight);
+            let launches_target = deficit.min(batch_size).min(room);
+
+            if launches_target == 0 {
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
 
             let mut launched = 0usize;
             for _ in 0..launches_target {
@@ -1046,6 +1184,7 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
 
         if became_pending {
             state.ready_proofs_count.fetch_add(1, Ordering::Relaxed);
+            request_pool_state_save(state);
         }
 
         Ok(())
@@ -1105,11 +1244,15 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
 
     let mut wallets: Vec<PoolWallet> = Vec::with_capacity(state.cfg.max_proofs);
     for _ in 0..state.cfg.max_proofs {
-        let wallet = McpWalletContext::from_private_key_hex(&generate_key_hex())?;
-        let privacy_key = PrivacyKey::from_hex(generate_key_hex())?;
+        let wallet_key_hex = generate_key_hex();
+        let privacy_key_hex = generate_key_hex();
+        let wallet = McpWalletContext::from_private_key_hex(&wallet_key_hex)?;
+        let privacy_key = PrivacyKey::from_hex(&privacy_key_hex)?;
         wallets.push(PoolWallet {
             wallet,
+            wallet_private_key_hex: wallet_key_hex,
             privacy_key,
+            privacy_spend_key_hex: privacy_key_hex,
             viewer_fvk_bundle: None,
             current_note: None,
             pending: None,
@@ -1161,6 +1304,7 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         ready,
         "Startup complete"
     );
+    request_pool_state_save(&state);
 
     Ok(())
 }
@@ -1181,11 +1325,15 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
 
     let mut new_wallets: Vec<PoolWallet> = Vec::with_capacity(count);
     for _ in 0..count {
-        let wallet = McpWalletContext::from_private_key_hex(&generate_key_hex())?;
-        let privacy_key = PrivacyKey::from_hex(generate_key_hex())?;
+        let wallet_key_hex = generate_key_hex();
+        let privacy_key_hex = generate_key_hex();
+        let wallet = McpWalletContext::from_private_key_hex(&wallet_key_hex)?;
+        let privacy_key = PrivacyKey::from_hex(&privacy_key_hex)?;
         new_wallets.push(PoolWallet {
             wallet,
+            wallet_private_key_hex: wallet_key_hex,
             privacy_key,
+            privacy_spend_key_hex: privacy_key_hex,
             viewer_fvk_bundle: None,
             current_note: None,
             pending: None,
@@ -1226,6 +1374,7 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
         elapsed_ms = started.elapsed().as_millis(),
         "Wallet pool scaled up"
     );
+    request_pool_state_save(state);
     Ok(())
 }
 
@@ -1779,6 +1928,172 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
     let _ = hc.get(format!("{}/health", verifier_url)).send().await;
 
     Ok(verifier_url)
+}
+
+// ── Pool state persistence ───────────────────────────────────────────────────
+
+async fn save_pool_state(state: &Arc<ServiceState>) -> Result<()> {
+    let path = match state.cfg.pool_state_file.as_deref() {
+        Some(p) => p,
+        None => return Ok(()), // persistence not enabled
+    };
+
+    let persisted = {
+        let wallets = state.wallets.read().await;
+        PersistedPoolState {
+            wallets: wallets
+                .iter()
+                .map(|w| PersistedWallet {
+                    wallet_private_key_hex: w.wallet_private_key_hex.clone(),
+                    privacy_spend_key_hex: w.privacy_spend_key_hex.clone(),
+                    current_note: w.current_note.as_ref().map(|n| n.to_persisted()),
+                    pending: w.pending.as_ref().map(|p| PersistedPending {
+                        tx_hash: p.tx_hash.clone(),
+                        next_note: p.next_note.to_persisted(),
+                    }),
+                })
+                .collect(),
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&persisted)
+        .context("Failed to serialize pool state")?;
+
+    // Atomic write: write to temp file then rename
+    let tmp_path = format!("{}.tmp", path);
+    tokio::fs::write(&tmp_path, json.as_bytes())
+        .await
+        .with_context(|| format!("Failed to write {}", tmp_path))?;
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .with_context(|| format!("Failed to rename {} -> {}", tmp_path, path))?;
+
+    Ok(())
+}
+
+async fn load_pool_state(path: &str) -> Result<Option<PersistedPoolState>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(json) => {
+            let persisted: PersistedPoolState =
+                serde_json::from_str(&json).context("Failed to parse pool state file")?;
+            Ok(Some(persisted))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e).context("Failed to read pool state file")),
+    }
+}
+
+/// Restore wallets from a previously persisted state file.
+/// Returns `Ok(true)` if wallets were restored, `Ok(false)` if no state file found.
+async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
+    let path = match state.cfg.pool_state_file.as_deref() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    let persisted = match load_pool_state(path).await? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    if persisted.wallets.is_empty() {
+        tracing::info!("Pool state file is empty, starting fresh");
+        return Ok(false);
+    }
+
+    tracing::info!(
+        wallet_count = persisted.wallets.len(),
+        path,
+        "Restoring wallets from state file"
+    );
+
+    let mut wallets = Vec::with_capacity(persisted.wallets.len());
+    let mut ready_count = 0usize;
+
+    for (idx, pw) in persisted.wallets.iter().enumerate() {
+        let wallet = McpWalletContext::from_private_key_hex(&pw.wallet_private_key_hex)
+            .with_context(|| format!("Failed to restore wallet {}", idx))?;
+        let privacy_key = PrivacyKey::from_hex(&pw.privacy_spend_key_hex)
+            .with_context(|| format!("Failed to restore privacy key {}", idx))?;
+
+        let current_note = pw
+            .current_note
+            .as_ref()
+            .map(NoteState::from_persisted)
+            .transpose()
+            .with_context(|| format!("Failed to restore current_note for wallet {}", idx))?;
+
+        let pending = pw
+            .pending
+            .as_ref()
+            .map(|p| {
+                Ok::<_, anyhow::Error>(PendingTransfer {
+                    tx_hash: p.tx_hash.clone(),
+                    next_note: NoteState::from_persisted(&p.next_note)?,
+                })
+            })
+            .transpose()
+            .with_context(|| format!("Failed to restore pending for wallet {}", idx))?;
+
+        if pending.is_some() {
+            ready_count += 1;
+        }
+
+        wallets.push(PoolWallet {
+            wallet,
+            wallet_private_key_hex: pw.wallet_private_key_hex.clone(),
+            privacy_key,
+            privacy_spend_key_hex: pw.privacy_spend_key_hex.clone(),
+            viewer_fvk_bundle: None,
+            current_note,
+            pending,
+            generating: false,
+        });
+    }
+
+    let wallet_count = wallets.len();
+    *state.wallets.write().await = wallets;
+    state.ready_proofs_count.store(ready_count, Ordering::Relaxed);
+
+    tracing::info!(
+        wallet_count,
+        ready_count,
+        "Wallets restored from state file"
+    );
+
+    Ok(true)
+}
+
+fn spawn_state_saver(state: Arc<ServiceState>) {
+    tokio::spawn(async move {
+        if state.cfg.pool_state_file.is_none() {
+            return;
+        }
+
+        loop {
+            state.state_save_notify.notified().await;
+
+            // Debounce: coalesce rapid changes so we don't thrash disk I/O
+            // under heavy proof-generation load.
+            sleep(Duration::from_secs(2)).await;
+
+            // Drain the dirty flag – if more changes landed during the
+            // debounce window they are captured in this single save.
+            state.state_dirty.swap(false, Ordering::AcqRel);
+            if let Err(e) = save_pool_state(&state).await {
+                tracing::warn!(error = %e, "Failed to save pool state");
+            }
+        }
+    });
+}
+
+fn request_pool_state_save(state: &Arc<ServiceState>) {
+    if state.cfg.pool_state_file.is_none() {
+        return;
+    }
+
+    state.state_dirty.store(true, Ordering::Release);
+    state.state_save_notify.notify_one();
 }
 
 fn generate_key_hex() -> String {
