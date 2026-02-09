@@ -404,9 +404,9 @@ async fn tps_peak(
             if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
                 && entry.computed_up_to_ms >= window_start_ms
             {
-                // Apply multiplier with noise to cached value
+                // Apply configured multiplier to cached value.
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(apply_multiplier_with_noise(
+                    peak_tps: Some(apply_peak_tps_multiplier(
                         entry.peak_tps,
                         state.peak_tps_multiplier,
                     )),
@@ -443,9 +443,9 @@ async fn tps_peak(
         });
     }
 
-    // Apply multiplier with noise to output
+    // Apply configured multiplier to output.
     let peak_tps_output =
-        peak_tps.map(|tps| apply_multiplier_with_noise(tps, state.peak_tps_multiplier));
+        peak_tps.map(|tps| apply_peak_tps_multiplier(tps, state.peak_tps_multiplier));
 
     Json(TpsPeakResponse {
         peak_tps: peak_tps_output,
@@ -615,8 +615,8 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
             }
         };
 
-    // Apply peak TPS multiplier with noise
-    let peak_tps = apply_multiplier_with_noise(peak_tps, state.peak_tps_multiplier);
+    // Apply configured peak TPS multiplier.
+    let peak_tps = apply_peak_tps_multiplier(peak_tps, state.peak_tps_multiplier);
 
     // Round TPS values to 2 decimal places to avoid showing tiny numbers
     let tps = round_to_precision(tps.unwrap_or(0.0), 2);
@@ -642,18 +642,18 @@ fn round_to_precision(value: f64, decimals: u32) -> f64 {
     (value * multiplier).round() / multiplier
 }
 
-/// Applies the peak TPS multiplier with random noise in the range [0.95, 1.05].
-fn apply_multiplier_with_noise(value: f64, multiplier: f64) -> f64 {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let noise = rng.gen_range(0.95..=1.05);
-    value * multiplier * noise
+/// Applies the configured peak TPS multiplier deterministically.
+fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
+    value * multiplier
 }
 
-/// Query the database to find the peak TPS by counting transactions per block.
+/// Query the database to find peak TPS grouped by block.
 ///
-/// Since block time is 1 second, the transaction count per block directly equals TPS.
-/// This correlates transactions with blocks using the `block_headers` table timestamps.
+/// Strategy:
+/// - Scope to recently accepted txs using `worker_verified_transactions.created_at`.
+/// - Parse `rollup_height` from sequencer events (`NoteCreatedAtHeight`) in
+///   `worker_verified_transactions.sequencer_status`.
+/// - Group accepted txs by that explicit block height.
 async fn compute_peak_tps_from_db(
     db: &DatabaseConnection,
     from: chrono::DateTime<chrono::Utc>,
@@ -671,118 +671,124 @@ async fn compute_peak_tps_from_db(
 
     let backend = db.get_database_backend();
     let accepted = TransactionState::Accepted.to_value();
-    let rejected = TransactionState::Rejected.to_value();
 
     // Format timestamps as ISO strings for reliable parsing
     let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
     let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
 
     debug!(
-        "Computing peak TPS from blocks {} to {} (states: {}, {})",
-        from_str, to_str, accepted, rejected
+        "Computing peak TPS from accepted txs {} to {} (state: {})",
+        from_str, to_str, accepted
     );
 
-    // Query counts transactions per block by correlating with block_headers timestamps.
-    // For each block, we count transactions where created_at falls within the block's time window
-    // (from previous block's timestamp to this block's timestamp).
-    // Since block time is 1 second, tx_count directly represents TPS for that block.
-    let sql = match backend {
+    if !matches!(
+        backend,
+        sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::Sqlite
+    ) {
+        tracing::warn!(
+            backend = ?backend,
+            "Peak TPS rollup-height mapping is only supported for Postgres and Sqlite; returning 0"
+        );
+        return Ok((0.0, chrono::Utc::now().timestamp_millis()));
+    }
+
+    let block_sql = match backend {
         sea_orm::DatabaseBackend::Postgres => {
             format!(
                 r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        EXTRACT(EPOCH FROM created_at)::BIGINT * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE created_at >= '{}'::timestamp 
-                      AND created_at <= '{}'::timestamp
+                WITH tx_rollup AS (
+                    SELECT
+                        w.tx_hash,
+                        w.created_at AS tx_created_at,
+                        (
+                            SELECT (evt->'value'->'note_created_at_height'->>'rollup_height')::BIGINT
+                            FROM jsonb_array_elements(COALESCE((w.sequencer_status::jsonb)->'events', '[]'::jsonb)) AS evt
+                            WHERE evt->>'key' = 'ValueMidnightPrivacy/NoteCreatedAtHeight'
+                            LIMIT 1
+                        ) AS rollup_height
+                    FROM worker_verified_transactions w
+                    WHERE w.transaction_state = '{}'
+                      AND w.created_at >= '{}'::timestamp
+                      AND w.created_at <= '{}'::timestamp
+                      AND w.sequencer_status IS NOT NULL
+                ),
+                peak_block AS (
+                    SELECT
+                        tr.rollup_height,
+                        COUNT(DISTINCT tr.tx_hash)::BIGINT AS tx_count,
+                        EXTRACT(EPOCH FROM MAX(tr.tx_created_at))::BIGINT * 1000 AS tx_ts_ms
+                    FROM tx_rollup tr
+                    WHERE tr.rollup_height IS NOT NULL
+                    GROUP BY tr.rollup_height
+                    ORDER BY tx_count DESC, tr.rollup_height DESC
+                    LIMIT 1
                 )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON wvt.created_at > COALESCE(bw.block_start, bw.block_end - INTERVAL '1 second')
-                    AND wvt.created_at <= bw.block_end
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
+                SELECT
+                    COALESCE(
+                        EXTRACT(EPOCH FROM bh.created_at)::BIGINT * 1000,
+                        pb.tx_ts_ms
+                    ) AS block_ts_ms,
+                    pb.tx_count
+                FROM peak_block pb
+                LEFT JOIN block_headers bh
+                    ON bh.height::BIGINT = pb.rollup_height
                 LIMIT 1
                 "#,
-                from_str, to_str, accepted, rejected
+                accepted, from_str, to_str
             )
         }
         sea_orm::DatabaseBackend::Sqlite => {
-            // SQLite version using window functions
             let from_iso = from.format("%Y-%m-%dT%H:%M:%S").to_string();
             let to_iso = to.format("%Y-%m-%dT%H:%M:%S").to_string();
             format!(
                 r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        CAST(strftime('%s', substr(created_at, 1, 19)) AS INTEGER) * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE substr(created_at, 1, 19) >= '{}'
-                      AND substr(created_at, 1, 19) <= '{}'
+                WITH tx_rollup AS (
+                    SELECT
+                        w.tx_hash,
+                        w.created_at AS tx_created_at,
+                        (
+                            SELECT CAST(json_extract(evt.value, '$.value.note_created_at_height.rollup_height') AS INTEGER)
+                            FROM json_each(w.sequencer_status, '$.events') AS evt
+                            WHERE json_extract(evt.value, '$.key') = 'ValueMidnightPrivacy/NoteCreatedAtHeight'
+                            LIMIT 1
+                        ) AS rollup_height
+                    FROM worker_verified_transactions w
+                    WHERE w.transaction_state = '{}'
+                      AND substr(w.created_at, 1, 19) >= '{}'
+                      AND substr(w.created_at, 1, 19) <= '{}'
+                      AND w.sequencer_status IS NOT NULL
+                ),
+                peak_block AS (
+                    SELECT
+                        tr.rollup_height,
+                        COUNT(DISTINCT tr.tx_hash) AS tx_count,
+                        CAST(strftime('%s', substr(MAX(tr.tx_created_at), 1, 19)) AS INTEGER) * 1000 AS tx_ts_ms
+                    FROM tx_rollup tr
+                    WHERE tr.rollup_height IS NOT NULL
+                    GROUP BY tr.rollup_height
+                    ORDER BY tx_count DESC, tr.rollup_height DESC
+                    LIMIT 1
                 )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON substr(wvt.created_at, 1, 19) > COALESCE(bw.block_start, datetime(bw.block_end, '-1 second'))
-                    AND substr(wvt.created_at, 1, 19) <= substr(bw.block_end, 1, 19)
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
+                SELECT
+                    COALESCE(
+                        CAST(strftime('%s', substr(bh.created_at, 1, 19)) AS INTEGER) * 1000,
+                        pb.tx_ts_ms
+                    ) AS block_ts_ms,
+                    pb.tx_count
+                FROM peak_block pb
+                LEFT JOIN block_headers bh
+                    ON CAST(bh.height AS INTEGER) = pb.rollup_height
                 LIMIT 1
                 "#,
-                from_iso, to_iso, accepted, rejected
+                accepted, from_iso, to_iso
             )
         }
-        _ => {
-            // MySQL/MariaDB fallback
-            format!(
-                r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        UNIX_TIMESTAMP(created_at) * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE created_at >= '{}'
-                      AND created_at <= '{}'
-                )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON wvt.created_at > COALESCE(bw.block_start, DATE_SUB(bw.block_end, INTERVAL 1 SECOND))
-                    AND wvt.created_at <= bw.block_end
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
-                LIMIT 1
-                "#,
-                from_str, to_str, accepted, rejected
-            )
-        }
+        _ => unreachable!(),
     };
 
-    debug!("Peak TPS SQL (block-based): {}", sql);
+    debug!("Peak TPS SQL (rollup-height mapping): {}", block_sql);
 
-    let stmt = Statement::from_string(backend, sql);
+    let stmt = Statement::from_string(backend, block_sql);
     let result = BlockBucket::find_by_statement(stmt).one(db).await?;
 
     debug!("Peak TPS query result: {:?}", result);
@@ -796,7 +802,11 @@ async fn compute_peak_tps_from_db(
             Ok((tps, peak_at_ms))
         }
         None => {
-            debug!("No blocks found in window");
+            tracing::warn!(
+                from = %from_str,
+                to = %to_str,
+                "No accepted transactions with rollup_height mapping found in window"
+            );
             Ok((0.0, chrono::Utc::now().timestamp_millis()))
         }
     }
