@@ -647,14 +647,18 @@ fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
     value * multiplier
 }
 
-/// Query the database to find TPS for the latest block in the window.
+/// Query the database to find peak TPS among rollup blocks in the requested window.
 ///
 /// Strategy:
-/// - Scope to recently accepted txs using `worker_verified_transactions.created_at`.
 /// - Parse `rollup_height` from sequencer events (`NoteCreatedAtHeight`) in
 ///   `worker_verified_transactions.sequencer_status`.
-/// - Select the latest `rollup_height` in the window and return its tx count.
-async fn compute_latest_block_tps_from_db(
+/// - Use `worker_verified_transactions.created_at` to select candidate rollup heights in `[from, to]`.
+/// - Count all accepted txs mapped to each candidate rollup height (full block cardinality).
+/// - Return the maximum tx count (ties resolved by latest rollup height).
+///
+/// Note: this intentionally does not rely on `block_headers.height` joins because in local setups
+/// the DA block height domain can differ from rollup heights emitted in sequencer events.
+async fn compute_peak_tps_from_db(
     db: &DatabaseConnection,
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
@@ -672,12 +676,14 @@ async fn compute_latest_block_tps_from_db(
     let backend = db.get_database_backend();
     let accepted = TransactionState::Accepted.to_value();
 
-    let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
-    let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
+    let from_str = from.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let to_str = to.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let from_ms = from.timestamp_millis();
+    let to_ms = to.timestamp_millis();
 
     debug!(
-        "Computing latest-block TPS from accepted txs {} to {} (state: {})",
-        from_str, to_str, accepted
+        "Computing peak TPS for blocks {} to {} (state: {}, ms: {}..{})",
+        from_str, to_str, accepted, from_ms, to_ms
     );
 
     if !matches!(
@@ -686,7 +692,7 @@ async fn compute_latest_block_tps_from_db(
     ) {
         tracing::warn!(
             backend = ?backend,
-            "Latest-block TPS rollup-height mapping is only supported for Postgres and Sqlite; returning 0"
+            "Peak TPS rollup-height mapping is only supported for Postgres and Sqlite; returning 0"
         );
         return Ok((0.0, chrono::Utc::now().timestamp_millis()));
     }
@@ -713,43 +719,23 @@ async fn compute_latest_block_tps_from_db(
                     SELECT DISTINCT tr.rollup_height
                     FROM tx_rollup tr
                     WHERE tr.rollup_height IS NOT NULL
-                      AND tr.tx_created_at >= '{}'::timestamp
-                      AND tr.tx_created_at <= '{}'::timestamp
-                ),
-                latest_block AS (
-                    SELECT
-                        wh.rollup_height
-                    FROM window_heights wh
-                    ORDER BY wh.rollup_height DESC
-                    LIMIT 1
-                ),
-                latest_block_txs AS (
-                    SELECT
-                        lb.rollup_height,
-                        COUNT(DISTINCT tr.tx_hash)::BIGINT AS tx_count,
-                        EXTRACT(EPOCH FROM MAX(tr.tx_created_at))::BIGINT * 1000 AS tx_ts_ms
-                    FROM latest_block lb
-                    JOIN tx_rollup tr
-                        ON tr.rollup_height = lb.rollup_height
-                    GROUP BY lb.rollup_height
+                      AND (EXTRACT(EPOCH FROM tr.tx_created_at) * 1000)::BIGINT >= {}
+                      AND (EXTRACT(EPOCH FROM tr.tx_created_at) * 1000)::BIGINT <= {}
                 )
                 SELECT
-                    COALESCE(
-                        EXTRACT(EPOCH FROM bh.created_at)::BIGINT * 1000,
-                        lbt.tx_ts_ms
-                    ) AS block_ts_ms,
-                    lbt.tx_count
-                FROM latest_block_txs lbt
-                LEFT JOIN block_headers bh
-                    ON bh.height::BIGINT = lbt.rollup_height
+                    EXTRACT(EPOCH FROM MAX(tr.tx_created_at))::BIGINT * 1000 AS block_ts_ms,
+                    COUNT(DISTINCT tr.tx_hash)::BIGINT AS tx_count
+                FROM window_heights wh
+                JOIN tx_rollup tr
+                    ON tr.rollup_height = wh.rollup_height
+                GROUP BY wh.rollup_height
+                ORDER BY tx_count DESC, wh.rollup_height DESC
                 LIMIT 1
                 "#,
-                accepted, from_str, to_str
+                accepted, from_ms, to_ms
             )
         }
         sea_orm::DatabaseBackend::Sqlite => {
-            let from_iso = from.format("%Y-%m-%dT%H:%M:%S").to_string();
-            let to_iso = to.format("%Y-%m-%dT%H:%M:%S").to_string();
             format!(
                 r#"
                 WITH tx_rollup AS (
@@ -770,84 +756,48 @@ async fn compute_latest_block_tps_from_db(
                     SELECT DISTINCT tr.rollup_height
                     FROM tx_rollup tr
                     WHERE tr.rollup_height IS NOT NULL
-                      AND substr(tr.tx_created_at, 1, 19) >= '{}'
-                      AND substr(tr.tx_created_at, 1, 19) <= '{}'
-                ),
-                latest_block AS (
-                    SELECT
-                        wh.rollup_height
-                    FROM window_heights wh
-                    ORDER BY wh.rollup_height DESC
-                    LIMIT 1
-                ),
-                latest_block_txs AS (
-                    SELECT
-                        lb.rollup_height,
-                        COUNT(DISTINCT tr.tx_hash) AS tx_count,
-                        CAST(strftime('%s', substr(MAX(tr.tx_created_at), 1, 19)) AS INTEGER) * 1000 AS tx_ts_ms
-                    FROM latest_block lb
-                    JOIN tx_rollup tr
-                        ON tr.rollup_height = lb.rollup_height
-                    GROUP BY lb.rollup_height
+                      AND CAST((julianday(tr.tx_created_at) - 2440587.5) * 86400000 AS INTEGER) >= {}
+                      AND CAST((julianday(tr.tx_created_at) - 2440587.5) * 86400000 AS INTEGER) <= {}
                 )
                 SELECT
-                    COALESCE(
-                        CAST(strftime('%s', substr(bh.created_at, 1, 19)) AS INTEGER) * 1000,
-                        lbt.tx_ts_ms
-                    ) AS block_ts_ms,
-                    lbt.tx_count
-                FROM latest_block_txs lbt
-                LEFT JOIN block_headers bh
-                    ON CAST(bh.height AS INTEGER) = lbt.rollup_height
+                    CAST((julianday(MAX(tr.tx_created_at)) - 2440587.5) * 86400000 AS INTEGER) AS block_ts_ms,
+                    COUNT(DISTINCT tr.tx_hash) AS tx_count
+                FROM window_heights wh
+                JOIN tx_rollup tr
+                    ON tr.rollup_height = wh.rollup_height
+                GROUP BY wh.rollup_height
+                ORDER BY tx_count DESC, wh.rollup_height DESC
                 LIMIT 1
                 "#,
-                accepted, from_iso, to_iso
+                accepted, from_ms, to_ms
             )
         }
         _ => unreachable!(),
     };
 
-    debug!(
-        "Latest-block TPS SQL (rollup-height mapping): {}",
-        block_sql
-    );
+    debug!("Peak TPS SQL (rollup-height mapping): {}", block_sql);
 
     let stmt = Statement::from_string(backend, block_sql);
     let result = BlockBucket::find_by_statement(stmt).one(db).await?;
 
-    debug!("Latest-block TPS query result: {:?}", result);
+    debug!("Peak TPS query result: {:?}", result);
 
     match result {
         Some(bucket) => {
             let tps = bucket.tx_count as f64;
-            let at_ms = bucket.block_ts_ms;
-            debug!(
-                "Found latest-block TPS: {} at block timestamp {}",
-                tps, at_ms
-            );
-            Ok((tps, at_ms))
+            let peak_at_ms = bucket.block_ts_ms;
+            debug!("Found peak TPS: {} at block timestamp {}", tps, peak_at_ms);
+            Ok((tps, peak_at_ms))
         }
         None => {
             tracing::warn!(
                 from = %from_str,
                 to = %to_str,
-                "No accepted transactions with rollup_height mapping found in window for latest-block TPS"
+                "No blocks found in window for peak TPS query"
             );
             Ok((0.0, chrono::Utc::now().timestamp_millis()))
         }
     }
-}
-
-/// Query the database for block TPS used by metrics endpoints.
-///
-/// To keep behavior consistent across `/tps/peak` and EMA endpoints, this
-/// currently uses the latest block in the requested window.
-async fn compute_peak_tps_from_db(
-    db: &DatabaseConnection,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
-) -> Result<(f64, i64), sea_orm::DbErr> {
-    compute_latest_block_tps_from_db(db, from, to).await
 }
 
 #[utoipa::path(
