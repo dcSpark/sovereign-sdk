@@ -22,7 +22,8 @@ Clients may either:
 
 If the provided `Mcp-Session-Id` already exists, the server resumes that session. If it doesn't exist, the server creates a fresh session and binds it to that id for future requests (within the current server process).
 
-Note: the first request for a new session must be the MCP `initialize` request.
+By default, the first request for a new session must be the MCP `initialize` request.
+If `MCP_AUTO_INITIALIZE_SESSIONS=true` and `MCP_AUTO_CREATE_WALLET=true`, unknown session ids can be bootstrapped automatically (initialize + createWallet).
 
 ## Running the Server
 
@@ -56,6 +57,7 @@ Configure the following environment variables:
 - `MCP_SESSION_DB_URL` - Optional PostgreSQL connection string for MCP session persistence (e.g. `postgresql://admin:1234@localhost:5432/mcp_sessions`).
 - `MCP_SESSION_DB_ENCRYPTION_KEY` - Optional 32-byte encryption key (hex or base64) used to encrypt persisted session data. If unset, session data is stored unencrypted.
 - `MCP_AUTO_INITIALIZE_SESSIONS` - Optional boolean to auto-send `notifications/initialized` and allow resuming persisted sessions without an explicit initialize request.
+- `MCP_AUTO_CREATE_WALLET` - Optional boolean (requires `MCP_AUTO_INITIALIZE_SESSIONS=true`) that auto-runs `createWallet` for bootstrapped sessions with no wallet and for brand-new session ids that are auto-created.
 
 ### Start the Server
 

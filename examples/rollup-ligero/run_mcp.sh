@@ -29,6 +29,7 @@ else
 fi
 export MCP_SESSION_DB_ENCRYPTION_KEY="${MCP_SESSION_DB_ENCRYPTION_KEY:-7e2bdfe834ff9a47c8cdba8cf41c4dcd83410fef61b805ea9740c32335697d12}"
 export MCP_AUTO_INITIALIZE_SESSIONS="${MCP_AUTO_INITIALIZE_SESSIONS:-true}"
+export MCP_AUTO_CREATE_WALLET="${MCP_AUTO_CREATE_WALLET:-false}"
 
 # Authority API configuration for /authority/* HTTP endpoints
 # Uses MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN for protected endpoints (freeze/thaw). If not set, write endpoints are disabled.

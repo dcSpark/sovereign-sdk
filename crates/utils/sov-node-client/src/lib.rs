@@ -302,12 +302,10 @@ impl NodeClient {
     ) -> anyhow::Result<R> {
         let endpoint = url;
         let url = format!("{}{}", self.base_url, endpoint);
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send GET request to REST endpoint {}", endpoint))?;
+        let response =
+            self.http_client.get(&url).send().await.with_context(|| {
+                format!("Failed to send GET request to REST endpoint {}", endpoint)
+            })?;
         let status = response.status();
         let body = response
             .text()
