@@ -22,8 +22,8 @@ use crate::metrics::collectors::total_tokens_economy::TotalTokensEconomyPayload;
 use crate::metrics::collectors::total_transactions::TotalTransactionsPayload;
 use crate::metrics::collectors::transaction_size::TransactionSizePayload;
 use crate::metrics::{
-    compute_tokens_per_second_ema, compute_tps_ema, EmaWindow, MetricSample, MetricSeriesSnapshot,
-    MetricsStore,
+    compute_ema_from_samples, compute_tokens_per_second_ema, EmaWindow, MetricSample,
+    MetricSeriesSnapshot, MetricsStore,
 };
 
 /// Cached peak TPS value with its computation boundary.
@@ -33,8 +33,8 @@ struct TpsPeakCacheEntry {
     peak_tps: f64,
     /// Timestamp (ms) when the peak occurred.
     peak_at_ms: i64,
-    /// The end of the window used for this computation (ms).
-    computed_up_to_ms: i64,
+    /// Requested window size used for this computation.
+    window_ms: i64,
     /// When this cache entry was computed (ms).
     computed_at_ms: i64,
 }
@@ -58,10 +58,13 @@ pub struct AppState {
     pub store: MetricsStore,
     pub retention_secs: u64,
     pub tps_peak_cache: TpsPeakCache,
-    pub da_db: DatabaseConnection,
     pub indexer_db: DatabaseConnection,
     /// Multiplier applied to PeakTPS metric output.
     pub peak_tps_multiplier: f64,
+    /// Base URL for the rollup ledger API, used to query slot TPS.
+    pub ledger_api_base_url: String,
+    /// Shared HTTP client for ledger API requests.
+    pub ledger_http_client: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +134,11 @@ SELECT
     percentile_cont(0.5) WITHIN GROUP (ORDER BY windowed.amount)::double precision AS median_amount
 FROM windowed
 "#;
+
+/// Maximum number of slots to scan when reconstructing TPS windows from /ledger/tps.
+const MAX_LEDGER_TPS_SLOTS: usize = 5_000;
+/// Default lookback for /tps/historic when no explicit range is provided.
+const DEFAULT_TPS_HISTORIC_LOOKBACK_SECONDS: i64 = 300;
 
 pub fn router(state: AppState) -> Router {
     let swagger_ui =
@@ -272,10 +280,10 @@ async fn total_transactions_historic(
     get,
     path = "/tps",
     params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute TPS. Defaults to the last two samples.")
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute average slot TPS. Defaults to latest slot TPS.")
     ),
     responses(
-        (status = 200, description = "Derived TPS from transaction counters", body = TpsResponse)
+        (status = 200, description = "Slot-based TPS derived from /ledger/tps", body = TpsResponse)
     ),
     tag = "metrics"
 )]
@@ -283,16 +291,24 @@ async fn tps(
     State(state): State<AppState>,
     Query(params): Query<WindowQuery>,
 ) -> Json<TpsResponse> {
-    let series = state
-        .store
-        .snapshot("total-transactions")
-        .await
-        .map(map_total_transactions_series);
-
     let window_ms = window_ms(params.window_seconds);
-    let (tps, delta_transactions, delta_ms, latest_total) = match series.as_ref() {
-        Some(series) => compute_tps(series, window_ms),
-        None => (None, None, None, None),
+    let latest_total = latest_total_transactions(&state).await;
+
+    let (tps, delta_transactions, delta_ms) = match window_ms {
+        Some(window_ms) if window_ms > 0 => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let from_ms = now_ms.saturating_sub(window_ms);
+            let samples = fetch_slot_tps_samples(&state, Some(from_ms), Some(now_ms)).await;
+            aggregate_slot_tps(&samples)
+        }
+        _ => match fetch_latest_slot_tps(&state).await {
+            Some(sample) => (
+                Some(sample.tps),
+                Some(sample.tx_count),
+                i64::try_from(sample.block_time_ms).ok(),
+            ),
+            None => (None, None, None),
+        },
     };
 
     Json(TpsResponse {
@@ -307,12 +323,12 @@ async fn tps(
     get,
     path = "/tps/historic",
     params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute TPS per sample. Defaults to the last two samples."),
+        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute rolling average slot TPS per sample. Defaults to per-slot TPS."),
         ("from_ms" = Option<i64>, Query, description = "Start of the range (milliseconds since epoch). Requires `to_ms`."),
         ("to_ms" = Option<i64>, Query, description = "End of the range (milliseconds since epoch). Requires `from_ms`.")
     ),
     responses(
-        (status = 200, description = "Historical TPS samples", body = TpsSeriesSnapshot)
+        (status = 200, description = "Historical slot-based TPS samples", body = TpsSeriesSnapshot)
     ),
     tag = "metrics"
 )]
@@ -322,45 +338,31 @@ async fn tps_historic(
 ) -> Json<TpsSeriesSnapshot> {
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = window_ms(params.window_seconds);
-    let query_range = extend_range(range, window_ms);
+    let now_ms = chrono::Utc::now().timestamp_millis();
 
-    let series = load_series(&state.store, "total-transactions", query_range)
-        .await
-        .map(map_total_transactions_series)
-        .unwrap_or_else(|| TotalTransactionsSeriesSnapshot {
-            name: "total-transactions".to_string(),
-            interval_secs: 0,
-            latest: None,
-            samples: Vec::new(),
-        });
+    let (query_from_ms, query_to_ms) = match range {
+        Some((from_ms, to_ms)) => {
+            let padded_from_ms = match window_ms {
+                Some(window_ms) if window_ms > 0 => from_ms.saturating_sub(window_ms),
+                _ => from_ms,
+            };
+            (Some(padded_from_ms), Some(to_ms))
+        }
+        None => {
+            let lookback_ms = window_ms.unwrap_or(DEFAULT_TPS_HISTORIC_LOOKBACK_SECONDS * 1000);
+            let from_ms = now_ms.saturating_sub(lookback_ms);
+            (Some(from_ms), Some(now_ms))
+        }
+    };
 
-    let mut samples = derive_series_with_window(
-        &series.samples,
-        window_ms,
-        |sample| sample.recorded_at_ms,
-        |start, latest, delta_ms| {
-            let delta_transactions = latest
-                .payload
-                .total_transactions
-                .saturating_sub(start.payload.total_transactions);
-            let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
-
-            Some(TpsSample {
-                recorded_at_ms: latest.recorded_at_ms,
-                tps: Some(tps),
-                delta_transactions: Some(delta_transactions),
-                delta_ms: Some(delta_ms),
-                latest_total: Some(latest.payload.total_transactions),
-            })
-        },
-    );
-
+    let slot_samples = fetch_slot_tps_samples(&state, query_from_ms, query_to_ms).await;
+    let mut samples = derive_historic_tps_from_slot_samples(&slot_samples, window_ms);
     samples = filter_samples_by_range(samples, range, |sample| sample.recorded_at_ms);
     let latest = samples.last().cloned();
 
     Json(TpsSeriesSnapshot {
         name: "tps".to_string(),
-        interval_secs: series.interval_secs,
+        interval_secs: 0,
         latest,
         samples,
     })
@@ -399,14 +401,12 @@ async fn tps_peak(
         if let Some(ref entry) = *cache {
             // Cache is valid if:
             // 1. It was computed recently (within threshold)
-            // 2. The cached window covers our current request window
+            // 2. It was computed for the same requested window size
             let cache_age_ms = now_ms - entry.computed_at_ms;
-            if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
-                && entry.computed_up_to_ms >= window_start_ms
-            {
-                // Apply multiplier with noise to cached value
+            if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS && entry.window_ms == window_ms {
+                // Apply multiplier to cached value
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(apply_multiplier_with_noise(
+                    peak_tps: Some(apply_peak_tps_multiplier(
                         entry.peak_tps,
                         state.peak_tps_multiplier,
                     )),
@@ -418,19 +418,9 @@ async fn tps_peak(
         }
     }
 
-    // Cache miss or stale - query database directly for actual transaction timestamps
-    let window_start = chrono::DateTime::from_timestamp_millis(window_start_ms)
-        .unwrap_or(now - chrono::Duration::seconds(window_secs as i64));
-
-    let result = compute_peak_tps_from_db(&state.da_db, window_start, now).await;
-
-    let (peak_tps, peak_at_ms) = match result {
-        Ok((tps, at_ms)) => (Some(tps), Some(at_ms)),
-        Err(e) => {
-            warn!("Failed to compute peak TPS from database: {}", e);
-            (None, None)
-        }
-    };
+    // Cache miss or stale - query ledger /tps endpoints and find the peak in the requested window.
+    let samples = fetch_slot_tps_samples(&state, Some(window_start_ms), Some(now_ms)).await;
+    let (peak_tps, peak_at_ms) = peak_tps_from_samples(&samples);
 
     // Update cache (store raw value before multiplier)
     if let (Some(tps), Some(at_ms)) = (peak_tps, peak_at_ms) {
@@ -438,14 +428,14 @@ async fn tps_peak(
         *cache = Some(TpsPeakCacheEntry {
             peak_tps: tps,
             peak_at_ms: at_ms,
-            computed_up_to_ms: now_ms,
+            window_ms,
             computed_at_ms: now_ms,
         });
     }
 
-    // Apply multiplier with noise to output
+    // Apply multiplier to output
     let peak_tps_output =
-        peak_tps.map(|tps| apply_multiplier_with_noise(tps, state.peak_tps_multiplier));
+        peak_tps.map(|tps| apply_peak_tps_multiplier(tps, state.peak_tps_multiplier));
 
     Json(TpsPeakResponse {
         peak_tps: peak_tps_output,
@@ -532,7 +522,7 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .and_then(|s| s.latest)
         .and_then(|sample| decode_payload::<AccountsPayload>(&sample, "accounts"));
 
-    // Get total transactions data for TPS calculation
+    // Get total transactions data for cumulative totals.
     let total_tx_series = state
         .store
         .snapshot("total-transactions")
@@ -552,15 +542,23 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
             decode_payload::<TotalTokensEconomyPayload>(&sample, "total-tokens-economy")
         });
 
-    // Calculate TPS using EMA
-    let tps = total_tx_series.as_ref().and_then(|series| {
-        let samples: Vec<(i64, u64)> = series
-            .samples
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let window_ms = i64::try_from(window.seconds())
+        .ok()
+        .and_then(|secs| secs.checked_mul(1000))
+        .unwrap_or(0);
+    let window_start_ms = now_ms.saturating_sub(window_ms);
+
+    // Query slot TPS samples for the current EMA window.
+    let slot_tps_samples = fetch_slot_tps_samples(state, Some(window_start_ms), Some(now_ms)).await;
+
+    // Calculate TPS using EMA over per-slot TPS values.
+    let tps = compute_ema_from_samples(
+        slot_tps_samples
             .iter()
-            .map(|s| (s.recorded_at_ms, s.payload.total_transactions))
-            .collect();
-        compute_tps_ema(samples, window)
-    });
+            .map(|sample| (sample.timestamp_ms, sample.tps)),
+        window,
+    );
 
     // Calculate TokensPerSecond using EMA
     let tokens_per_second = token_value_series.as_ref().and_then(|series| {
@@ -601,22 +599,14 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
-    // Compute peak TPS for this EMA window (no cache used for EMA endpoints)
-    let now = chrono::Utc::now();
-    let window_secs = window.seconds() as i64;
-    let window_start = now - chrono::Duration::seconds(window_secs);
+    // Compute peak TPS for this EMA window from slot samples.
+    let (peak_tps, peak_tps_at_ms) = match peak_tps_from_samples(&slot_tps_samples) {
+        (Some(tps), peak_at_ms) => (tps, peak_at_ms),
+        (None, _) => (0.0, None),
+    };
 
-    let (peak_tps, peak_tps_at_ms) =
-        match compute_peak_tps_from_db(&state.da_db, window_start, now).await {
-            Ok((tps, at_ms)) => (tps, Some(at_ms)),
-            Err(e) => {
-                tracing::warn!("Failed to compute peak TPS for EMA endpoint: {}", e);
-                (0.0, None)
-            }
-        };
-
-    // Apply peak TPS multiplier with noise
-    let peak_tps = apply_multiplier_with_noise(peak_tps, state.peak_tps_multiplier);
+    // Apply peak TPS multiplier
+    let peak_tps = apply_peak_tps_multiplier(peak_tps, state.peak_tps_multiplier);
 
     // Round TPS values to 2 decimal places to avoid showing tiny numbers
     let tps = round_to_precision(tps.unwrap_or(0.0), 2);
@@ -642,163 +632,242 @@ fn round_to_precision(value: f64, decimals: u32) -> f64 {
     (value * multiplier).round() / multiplier
 }
 
-/// Applies the peak TPS multiplier with random noise in the range [0.95, 1.05].
-fn apply_multiplier_with_noise(value: f64, multiplier: f64) -> f64 {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let noise = rng.gen_range(0.95..=1.05);
-    value * multiplier * noise
+/// Applies the peak TPS multiplier without randomization.
+fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
+    value * multiplier
 }
 
-/// Query the database to find the peak TPS by counting transactions per block.
-///
-/// Since block time is 1 second, the transaction count per block directly equals TPS.
-/// This correlates transactions with blocks using the `block_headers` table timestamps.
-async fn compute_peak_tps_from_db(
-    db: &DatabaseConnection,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
-) -> Result<(f64, i64), sea_orm::DbErr> {
-    use sea_orm::{ActiveEnum, ConnectionTrait, FromQueryResult, Statement};
-    use sov_midnight_da::storable::worker_verified_transactions::TransactionState;
-    use tracing::debug;
+#[derive(Debug, Deserialize)]
+struct LedgerSlotTpsPayload {
+    slot_number: u64,
+    tx_count: u64,
+    block_time_ms: u64,
+    tps: f64,
+    timestamp: serde_json::Value,
+}
 
-    #[derive(Debug, FromQueryResult)]
-    struct BlockBucket {
-        block_ts_ms: i64,
-        tx_count: i64,
+#[derive(Debug, Clone)]
+struct LedgerSlotTpsSample {
+    slot_number: u64,
+    tx_count: u64,
+    block_time_ms: u64,
+    tps: f64,
+    timestamp_ms: i64,
+}
+
+fn ledger_tps_url(base_url: &str, slot_path: &str) -> String {
+    format!(
+        "{}/ledger/tps/{}",
+        base_url.trim_end_matches('/'),
+        slot_path.trim_start_matches('/')
+    )
+}
+
+fn parse_ledger_timestamp_ms(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|ts| ts.round() as i64)),
+        serde_json::Value::String(value) => value
+            .parse::<i64>()
+            .ok()
+            .or_else(|| value.parse::<f64>().ok().map(|ts| ts.round() as i64)),
+        _ => None,
     }
+}
 
-    let backend = db.get_database_backend();
-    let accepted = TransactionState::Accepted.to_value();
-    let rejected = TransactionState::Rejected.to_value();
-
-    // Format timestamps as ISO strings for reliable parsing
-    let from_str = from.format("%Y-%m-%d %H:%M:%S").to_string();
-    let to_str = to.format("%Y-%m-%d %H:%M:%S").to_string();
-
-    debug!(
-        "Computing peak TPS from blocks {} to {} (states: {}, {})",
-        from_str, to_str, accepted, rejected
-    );
-
-    // Query counts transactions per block by correlating with block_headers timestamps.
-    // For each block, we count transactions where created_at falls within the block's time window
-    // (from previous block's timestamp to this block's timestamp).
-    // Since block time is 1 second, tx_count directly represents TPS for that block.
-    let sql = match backend {
-        sea_orm::DatabaseBackend::Postgres => {
-            format!(
-                r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        EXTRACT(EPOCH FROM created_at)::BIGINT * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE created_at >= '{}'::timestamp 
-                      AND created_at <= '{}'::timestamp
-                )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON wvt.created_at > COALESCE(bw.block_start, bw.block_end - INTERVAL '1 second')
-                    AND wvt.created_at <= bw.block_end
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
-                LIMIT 1
-                "#,
-                from_str, to_str, accepted, rejected
-            )
-        }
-        sea_orm::DatabaseBackend::Sqlite => {
-            // SQLite version using window functions
-            let from_iso = from.format("%Y-%m-%dT%H:%M:%S").to_string();
-            let to_iso = to.format("%Y-%m-%dT%H:%M:%S").to_string();
-            format!(
-                r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        CAST(strftime('%s', substr(created_at, 1, 19)) AS INTEGER) * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE substr(created_at, 1, 19) >= '{}'
-                      AND substr(created_at, 1, 19) <= '{}'
-                )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON substr(wvt.created_at, 1, 19) > COALESCE(bw.block_start, datetime(bw.block_end, '-1 second'))
-                    AND substr(wvt.created_at, 1, 19) <= substr(bw.block_end, 1, 19)
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
-                LIMIT 1
-                "#,
-                from_iso, to_iso, accepted, rejected
-            )
-        }
-        _ => {
-            // MySQL/MariaDB fallback
-            format!(
-                r#"
-                WITH block_windows AS (
-                    SELECT 
-                        height,
-                        created_at as block_end,
-                        LAG(created_at) OVER (ORDER BY height) as block_start,
-                        UNIX_TIMESTAMP(created_at) * 1000 as block_ts_ms
-                    FROM block_headers
-                    WHERE created_at >= '{}'
-                      AND created_at <= '{}'
-                )
-                SELECT 
-                    bw.block_ts_ms,
-                    COUNT(wvt.id) as tx_count
-                FROM block_windows bw
-                LEFT JOIN worker_verified_transactions wvt 
-                    ON wvt.created_at > COALESCE(bw.block_start, DATE_SUB(bw.block_end, INTERVAL 1 SECOND))
-                    AND wvt.created_at <= bw.block_end
-                    AND wvt.transaction_state IN ('{}', '{}')
-                WHERE bw.block_start IS NOT NULL OR bw.height = 1
-                GROUP BY bw.height, bw.block_ts_ms
-                ORDER BY tx_count DESC
-                LIMIT 1
-                "#,
-                from_str, to_str, accepted, rejected
-            )
+async fn fetch_slot_tps_by_path(state: &AppState, slot_path: &str) -> Option<LedgerSlotTpsSample> {
+    let url = ledger_tps_url(&state.ledger_api_base_url, slot_path);
+    let response = match state.ledger_http_client.get(&url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(url, error = %error, "Failed to request ledger slot TPS");
+            return None;
         }
     };
 
-    debug!("Peak TPS SQL (block-based): {}", sql);
-
-    let stmt = Statement::from_string(backend, sql);
-    let result = BlockBucket::find_by_statement(stmt).one(db).await?;
-
-    debug!("Peak TPS query result: {:?}", result);
-
-    match result {
-        Some(bucket) => {
-            // Since block time is 1 second, tx_count directly equals TPS
-            let tps = bucket.tx_count as f64;
-            let peak_at_ms = bucket.block_ts_ms;
-            debug!("Found peak TPS: {} at block timestamp {}", tps, peak_at_ms);
-            Ok((tps, peak_at_ms))
+    if !response.status().is_success() {
+        let status = response.status();
+        if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::BAD_REQUEST {
+            warn!(url, status = %status, "Ledger slot TPS request failed");
         }
+        return None;
+    }
+
+    let payload = match response.json::<LedgerSlotTpsPayload>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(url, error = %error, "Failed to parse ledger slot TPS response");
+            return None;
+        }
+    };
+
+    let timestamp_ms = match parse_ledger_timestamp_ms(&payload.timestamp) {
+        Some(ts) => ts,
         None => {
-            debug!("No blocks found in window");
-            Ok((0.0, chrono::Utc::now().timestamp_millis()))
+            warn!(url, "Ledger slot TPS response had invalid timestamp");
+            return None;
         }
+    };
+
+    Some(LedgerSlotTpsSample {
+        slot_number: payload.slot_number,
+        tx_count: payload.tx_count,
+        block_time_ms: payload.block_time_ms,
+        tps: payload.tps,
+        timestamp_ms,
+    })
+}
+
+async fn fetch_latest_slot_tps(state: &AppState) -> Option<LedgerSlotTpsSample> {
+    fetch_slot_tps_by_path(state, "latest").await
+}
+
+async fn fetch_slot_tps_by_number(
+    state: &AppState,
+    slot_number: u64,
+) -> Option<LedgerSlotTpsSample> {
+    fetch_slot_tps_by_path(state, &slot_number.to_string()).await
+}
+
+async fn fetch_slot_tps_samples(
+    state: &AppState,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+) -> Vec<LedgerSlotTpsSample> {
+    let mut out = Vec::new();
+
+    let mut current = match fetch_latest_slot_tps(state).await {
+        Some(sample) => sample,
+        None => return out,
+    };
+
+    for _ in 0..MAX_LEDGER_TPS_SLOTS {
+        if let Some(to_ms) = to_ms {
+            if current.timestamp_ms > to_ms {
+                if current.slot_number <= 1 {
+                    break;
+                }
+                let next_slot = current.slot_number - 1;
+                current = match fetch_slot_tps_by_number(state, next_slot).await {
+                    Some(sample) => sample,
+                    None => break,
+                };
+                continue;
+            }
+        }
+
+        if let Some(from_ms) = from_ms {
+            if current.timestamp_ms < from_ms {
+                break;
+            }
+        }
+
+        out.push(current.clone());
+
+        if current.slot_number <= 1 {
+            break;
+        }
+        let next_slot = current.slot_number - 1;
+        current = match fetch_slot_tps_by_number(state, next_slot).await {
+            Some(sample) => sample,
+            None => break,
+        };
+    }
+
+    out.reverse();
+    out
+}
+
+fn aggregate_slot_tps(samples: &[LedgerSlotTpsSample]) -> (Option<f64>, Option<u64>, Option<i64>) {
+    if samples.is_empty() {
+        return (None, None, None);
+    }
+
+    let delta_transactions_u128 = samples
+        .iter()
+        .fold(0u128, |acc, sample| acc + u128::from(sample.tx_count));
+    let delta_ms_u128 = samples
+        .iter()
+        .fold(0u128, |acc, sample| acc + u128::from(sample.block_time_ms));
+    if delta_ms_u128 == 0 {
+        return (None, u64::try_from(delta_transactions_u128).ok(), Some(0));
+    }
+
+    let tps = (delta_transactions_u128 as f64) / (delta_ms_u128 as f64 / 1000.0);
+
+    (
+        Some(tps),
+        u64::try_from(delta_transactions_u128).ok(),
+        i64::try_from(delta_ms_u128).ok(),
+    )
+}
+
+fn derive_historic_tps_from_slot_samples(
+    samples: &[LedgerSlotTpsSample],
+    window_ms: Option<i64>,
+) -> Vec<TpsSample> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    match window_ms {
+        Some(window_ms) if window_ms > 0 => {
+            let mut derived = Vec::with_capacity(samples.len());
+            let mut start_idx = 0usize;
+            let mut sum_tx = 0u128;
+            let mut sum_ms = 0u128;
+
+            for (idx, sample) in samples.iter().enumerate() {
+                sum_tx += u128::from(sample.tx_count);
+                sum_ms += u128::from(sample.block_time_ms);
+
+                let cutoff = sample.timestamp_ms.saturating_sub(window_ms);
+                while start_idx <= idx && samples[start_idx].timestamp_ms < cutoff {
+                    sum_tx = sum_tx.saturating_sub(u128::from(samples[start_idx].tx_count));
+                    sum_ms = sum_ms.saturating_sub(u128::from(samples[start_idx].block_time_ms));
+                    start_idx += 1;
+                }
+
+                if sum_ms == 0 {
+                    continue;
+                }
+
+                let tps = (sum_tx as f64) / (sum_ms as f64 / 1000.0);
+                derived.push(TpsSample {
+                    recorded_at_ms: sample.timestamp_ms,
+                    tps: Some(tps),
+                    delta_transactions: u64::try_from(sum_tx).ok(),
+                    delta_ms: i64::try_from(sum_ms).ok(),
+                    latest_total: None,
+                });
+            }
+
+            derived
+        }
+        _ => samples
+            .iter()
+            .map(|sample| TpsSample {
+                recorded_at_ms: sample.timestamp_ms,
+                tps: Some(sample.tps),
+                delta_transactions: Some(sample.tx_count),
+                delta_ms: i64::try_from(sample.block_time_ms).ok(),
+                latest_total: None,
+            })
+            .collect(),
+    }
+}
+
+fn peak_tps_from_samples(samples: &[LedgerSlotTpsSample]) -> (Option<f64>, Option<i64>) {
+    let peak = samples.iter().max_by(|a, b| {
+        a.tps
+            .partial_cmp(&b.tps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    match peak {
+        Some(sample) => (Some(sample.tps), Some(sample.timestamp_ms)),
+        None => (None, None),
     }
 }
 
@@ -1560,6 +1629,16 @@ async fn load_series(
     }
 }
 
+async fn latest_total_transactions(state: &AppState) -> Option<u64> {
+    state
+        .store
+        .snapshot("total-transactions")
+        .await
+        .map(map_total_transactions_series)
+        .and_then(|series| series.latest.or_else(|| series.samples.last().cloned()))
+        .map(|sample| sample.payload.total_transactions)
+}
+
 fn filter_samples_by_range<T, F>(samples: Vec<T>, range: Option<(i64, i64)>, timestamp: F) -> Vec<T>
 where
     F: Fn(&T) -> i64,
@@ -1687,39 +1766,6 @@ fn select_window<'a, T>(
         latest,
         delta_ms,
     })
-}
-
-fn compute_tps(
-    series: &TotalTransactionsSeriesSnapshot,
-    window_ms: Option<i64>,
-) -> (Option<f64>, Option<u64>, Option<i64>, Option<u64>) {
-    let latest_total = series
-        .samples
-        .last()
-        .map(|sample| sample.payload.total_transactions);
-    let window = match select_window(&series.samples, window_ms, |sample| sample.recorded_at_ms) {
-        Some(window) => window,
-        None => return (None, None, None, latest_total),
-    };
-
-    let delta_transactions = window
-        .latest
-        .payload
-        .total_transactions
-        .saturating_sub(window.start.payload.total_transactions);
-    let delta_ms = window.delta_ms;
-    if delta_ms <= 0 {
-        return (None, Some(delta_transactions), Some(delta_ms), latest_total);
-    }
-
-    let tps = (delta_transactions as f64) / (delta_ms as f64 / 1000.0);
-
-    (
-        Some(tps),
-        Some(delta_transactions),
-        Some(delta_ms),
-        latest_total,
-    )
 }
 
 fn compute_failed_rate(

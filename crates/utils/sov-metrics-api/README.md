@@ -10,6 +10,8 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
   - Example (postgres): `postgres://user:pass@localhost:5432/da_db`
 - `INDEXER_DB_CONNECTION_STRING` (required): indexer DB connection string for `midnight_transfer`.
   - If unset, `INDEX_DB` is used as a fallback.
+- `LEDGER_API_URL` (optional): base URL for rollup ledger API.
+  - If unset, falls back to `ROLLUP_RPC_URL`, then `NODE_API_URL`, then `http://127.0.0.1:12346`.
 - `TSINK_DATA_PATH` (required): directory path for tsink on-disk storage.
 - `TSINK_RETENTION_SECONDS` (optional): tsink retention window in seconds, default 432000 (5 days).
 - `METRICS_API_BIND` (optional): listen address, default `0.0.0.0:13200`
@@ -23,9 +25,10 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `transaction-size` stores individual transfer amounts (used for median calculations).
 - `token-value-spent` samples every 5 seconds (transfer amount counter).
 - `total-tokens-economy` samples every 30 seconds (sum of deposit amounts).
-- The API derives TPS, rates, and averages from counter deltas at query time.
-- Derived endpoints accept `window_seconds` to compute deltas over a custom window; otherwise the
-  last two samples are used.
+- TPS and PeakTPS are fetched from `/ledger/tps/latest` and `/ledger/tps/{slotId}`.
+- The API derives remaining rates and averages from counter deltas at query time.
+- Counter-derived endpoints accept `window_seconds` to compute deltas over a custom window;
+  otherwise the last two samples are used.
 
 ## Architecture
 
@@ -40,7 +43,7 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `GET /health`
   - Returns `{ "status": "ok" }`
 - `GET /tps`
-  - Returns `{ tps, delta_transactions, delta_ms, latest_total }` derived from counters.
+  - Returns `{ tps, delta_transactions, delta_ms, latest_total }` using slot TPS.
   - Optional: `?window_seconds=60`.
 - `GET /total-transactions`
   - Returns `{ total_transactions, as_of_ms }` with the latest cumulative value.
@@ -62,7 +65,7 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
   - Defaults to 24 hours; optional: `?window_seconds=86400`.
   - Optional range override: `?from_ms=...&to_ms=...` (milliseconds since epoch).
   - `total_tokens` is the average supply over the range, derived from deposit totals.
-- Derived fields (`tps`, `rate_percent`, `average_amount`, `median_amount`, `value_spent`,
+- Counter-derived fields (`rate_percent`, `average_amount`, `median_amount`, `value_spent`,
   `token_velocity`, `delta_*`) are computed from the last two counter samples unless
   `window_seconds` is provided.
 - Historic endpoints return time-series samples and accept optional `from_ms`/`to_ms` query
@@ -99,6 +102,7 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 ```bash
 DA_CONNECTION_STRING=sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc \
 INDEXER_DB_CONNECTION_STRING=sqlite://wallet_index.sqlite?mode=rwc \
+LEDGER_API_URL=http://127.0.0.1:12346 \
 TSINK_DATA_PATH=./tsink-data \
 METRICS_API_BIND=0.0.0.0:13200 \
 cargo run -p sov-metrics-api

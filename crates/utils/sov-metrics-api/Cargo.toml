@@ -9,7 +9,6 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["json", "tokio", "http1", "query"] }
-rand = { workspace = true }
 dotenvy = "0.15"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -17,6 +16,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "si
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 chrono = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 tsink = { git = "https://github.com/h2337/tsink.git", rev = "412698519f0ba47c8f879cf2d25be312318464cc" }
 sea-orm = { version = "1.1", default-features = false, features = [
     "sqlx-sqlite",
