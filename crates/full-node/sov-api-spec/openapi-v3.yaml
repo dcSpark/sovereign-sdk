@@ -62,6 +62,34 @@ paths:
           $ref: "#/components/responses/Slot"
         "404":
           $ref: "#/components/responses/ApiErrorResponse"
+  /ledger/tps/latest:
+    get:
+      tags:
+        - Ledger
+      summary: Get the latest slot TPS.
+      operationId: get_latest_slot_tps
+      responses:
+        "200":
+          $ref: "#/components/responses/SlotTps"
+        "400":
+          $ref: "#/components/responses/ApiErrorResponse"
+        "404":
+          $ref: "#/components/responses/ApiErrorResponse"
+  /ledger/tps/{slotId}:
+    get:
+      tags:
+        - Ledger
+      summary: Get slot TPS by slot ID.
+      operationId: get_slot_tps_by_id
+      parameters:
+        - $ref: "#/components/parameters/slotId"
+      responses:
+        "200":
+          $ref: "#/components/responses/SlotTps"
+        "400":
+          $ref: "#/components/responses/ApiErrorResponse"
+        "404":
+          $ref: "#/components/responses/ApiErrorResponse"
   /ledger/slots/{slotId}/events:
     get:
       tags:
@@ -589,6 +617,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Slot"
+    SlotTps:
+      description: Success
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SlotTps"
     LedgerBatch:
       description: Success
       content:
@@ -738,6 +772,40 @@ components:
         - hash
         - state_root
         - batch_range
+        - finality_status
+        - timestamp
+    SlotTps:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - slotTps
+        slot_number:
+          type: integer
+          format: uint64
+        tx_count:
+          type: integer
+          format: uint64
+        block_time_ms:
+          type: integer
+          format: uint64
+        tps:
+          type: number
+          format: double
+        finality_status:
+          type: string
+          enum:
+            - pending
+            - finalized
+        timestamp:
+          $ref: "#/components/schemas/Time"
+      required:
+        - type
+        - slot_number
+        - tx_count
+        - block_time_ms
+        - tps
         - finality_status
         - timestamp
     LedgerBatch:

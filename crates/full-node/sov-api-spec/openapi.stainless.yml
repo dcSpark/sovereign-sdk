@@ -32,6 +32,10 @@ resources:
                       retrieve: >-
                         get
                         /ledger/slots/{slotId}/batches/{batchOffset}/txs/{txOffset}/events/{eventOffset}
+      tps:
+        methods:
+          latest: get /ledger/tps/latest
+          retrieve: get /ledger/tps/{slotId}
       batches:
         methods:
           retrieve: get /ledger/batches/{batchId}
@@ -68,6 +72,7 @@ resources:
       txReceipt: TxReceipt
       moduleRef: ModuleRef
       uint64Range: Uint64Range
+      slotTps: SlotTps
   sequencer:
     subresources:
       txs:

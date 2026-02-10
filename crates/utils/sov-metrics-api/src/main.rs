@@ -1,5 +1,6 @@
 use anyhow::Context;
 use sea_orm::{ConnectOptions, Database};
+use std::time::Duration;
 use tracing::info;
 
 mod api;
@@ -16,10 +17,16 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
     let da_conn = config.da_connection_string;
     let indexer_conn = config.indexer_db_connection_string;
+    let ledger_api_base_url = config.ledger_api_base_url;
     let bind_addr = config.bind_addr;
     let tsink_data_path = config.tsink_data_path;
     let tsink_retention_secs = config.tsink_retention_secs;
     let peak_tps_multiplier = config.peak_tps_multiplier;
+
+    let ledger_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to build ledger API HTTP client")?;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
     connection_options.sqlx_logging(false);
@@ -86,14 +93,15 @@ async fn main() -> anyhow::Result<()> {
         store,
         retention_secs: tsink_retention_secs,
         tps_peak_cache: api::TpsPeakCache::new(),
-        da_db: db.clone(),
         indexer_db: indexer_db.clone(),
         peak_tps_multiplier,
+        ledger_api_base_url: ledger_api_base_url.clone(),
+        ledger_http_client,
     });
 
     info!(
-        "sov-metrics-api listening on {} (peak_tps_multiplier={})",
-        bind_addr, peak_tps_multiplier
+        "sov-metrics-api listening on {} (peak_tps_multiplier={}, ledger_api_base_url={})",
+        bind_addr, peak_tps_multiplier, ledger_api_base_url
     );
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

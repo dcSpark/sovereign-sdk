@@ -11,6 +11,7 @@ const DEFAULT_PEAK_TPS_MULTIPLIER: f64 = 1.0;
 pub struct Config {
     pub da_connection_string: String,
     pub indexer_db_connection_string: String,
+    pub ledger_api_base_url: String,
     pub bind_addr: SocketAddr,
     pub tsink_data_path: PathBuf,
     pub tsink_retention_secs: u64,
@@ -38,6 +39,19 @@ impl Config {
                 "INDEXER_DB_CONNECTION_STRING (or INDEX_DB) env var is empty"
             ));
         }
+
+        let ledger_api_base_url = env::var("LEDGER_API_URL")
+            .or_else(|_| env::var("ROLLUP_RPC_URL"))
+            .or_else(|_| env::var("NODE_API_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:12346".to_string());
+        let ledger_api_base_url = ledger_api_base_url.trim().trim_end_matches('/').to_string();
+        if ledger_api_base_url.is_empty() {
+            return Err(anyhow!(
+                "LEDGER_API_URL (or ROLLUP_RPC_URL / NODE_API_URL) env var is empty"
+            ));
+        }
+        reqwest::Url::parse(&ledger_api_base_url)
+            .map_err(|_| anyhow!("LEDGER_API_URL must be a valid absolute URL"))?;
 
         let bind_addr =
             env::var("METRICS_API_BIND").unwrap_or_else(|_| "0.0.0.0:13200".to_string());
@@ -92,6 +106,7 @@ impl Config {
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
+            ledger_api_base_url,
             bind_addr,
             tsink_data_path: PathBuf::from(tsink_data_path),
             tsink_retention_secs,

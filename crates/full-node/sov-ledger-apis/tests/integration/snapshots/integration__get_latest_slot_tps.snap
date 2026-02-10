@@ -1,0 +1,13 @@
+---
+source: crates/full-node/sov-ledger-apis/tests/integration/main.rs
+expression: "&slot_tps"
+---
+{
+  "block_time_ms": 100000,
+  "finality_status": "pending",
+  "slot_number": 1,
+  "timestamp": 200000.0,
+  "tps": 2.62,
+  "tx_count": 262,
+  "type": "slotTps"
+}

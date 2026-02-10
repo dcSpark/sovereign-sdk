@@ -35,6 +35,7 @@ use sov_rollup_interface::stf::TxReceiptContents;
 use tokio::sync::watch;
 
 type PathMap = Path<HashMap<String, NumberOrHash>>;
+const TPS_BATCH_QUERY_CHUNK_SIZE: u64 = 10;
 
 /// Error to be returned when our bespoke path captures parser fails.
 fn bad_path_error(key: &str) -> Response {
@@ -145,6 +146,20 @@ where
                 )),
             )
             .nest(
+                "/tps/latest",
+                Self::router_tps().route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    Self::resolve_latest_slot,
+                )),
+            )
+            .nest(
+                "/tps/:slotId",
+                Self::router_tps().route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    Self::resolve_slot_id,
+                )),
+            )
+            .nest(
                 "/batches/:batchId",
                 Self::router_batch(state.clone()).route_layer(middleware::from_fn_with_state(
                     state.clone(),
@@ -221,6 +236,10 @@ where
         axum::Router::new().route("/", get(Self::get_event))
     }
 
+    fn router_tps() -> axum::Router<LedgerState<T>> {
+        axum::Router::new().route("/", get(Self::get_slot_tps))
+    }
+
     // HANDLERS
     // --------
     // Most of these handlers rely on "extension" values set by the
@@ -244,6 +263,133 @@ where
             Ok(None) => Err(errors::not_found_404("Slot", slot_number)),
             Err(err) => Err(errors::database_error_response_500(err)),
         }
+    }
+
+    async fn get_slot_tps(
+        State(state): State<LedgerState<T>>,
+        Extension(slot_number): Extension<SlotNumber>,
+    ) -> ApiResult<SlotTps> {
+        let slot = state
+            .ledger
+            .get_slot_by_number::<B, TxReceipt, RuntimeEventResponse<E>>(
+                slot_number,
+                QueryMode::Compact,
+            )
+            .await
+            .map_err(database_error_response_500)?
+            .ok_or_else(|| not_found_404("Slot", slot_number.get()))?;
+
+        let previous_slot_number = slot_number.checked_sub(1).ok_or_else(|| {
+            errors::bad_request_400(
+                "Cannot calculate TPS for genesis slot",
+                format!("Slot {} has no predecessor", slot_number.get()),
+            )
+        })?;
+
+        let previous_slot = state
+            .ledger
+            .get_slot_by_number::<B, TxReceipt, RuntimeEventResponse<E>>(
+                previous_slot_number,
+                QueryMode::Compact,
+            )
+            .await
+            .map_err(database_error_response_500)?
+            .ok_or_else(|| not_found_404("Slot", previous_slot_number.get()))?;
+
+        let block_time_ms = slot
+            .timestamp
+            .as_millis()
+            .checked_sub(previous_slot.timestamp.as_millis())
+            .ok_or_else(|| {
+                errors::bad_request_400(
+                    "Cannot calculate TPS when slot timestamp is earlier than its predecessor",
+                    format!(
+                        "slot_timestamp_ms={} predecessor_timestamp_ms={}",
+                        slot.timestamp.as_millis(),
+                        previous_slot.timestamp.as_millis(),
+                    ),
+                )
+            })?;
+        if block_time_ms == 0 {
+            return Err(errors::bad_request_400(
+                "Cannot calculate TPS when slot time delta is zero",
+                format!("slot_number={}", slot_number.get()),
+            ));
+        }
+        let block_time_ms = u64::try_from(block_time_ms)
+            .map_err(|_| internal_server_error_response_500("slot timestamp delta exceeded u64"))?;
+
+        let tx_count =
+            Self::count_slot_transactions(&state.ledger, slot_number, slot.batch_range.clone())
+                .await?;
+        let tps = tx_count as f64 / (block_time_ms as f64 / 1000.0);
+
+        Ok(SlotTps {
+            slot_number: slot.number,
+            tx_count,
+            block_time_ms,
+            tps,
+            finality_status: slot.finality_status,
+            timestamp: slot.timestamp,
+        }
+        .into())
+    }
+
+    async fn count_slot_transactions(
+        ledger: &T,
+        slot_number: SlotNumber,
+        batch_range: Range<u64>,
+    ) -> Result<u64, Response> {
+        let mut tx_count = 0u64;
+        let mut chunk_start = batch_range.start;
+
+        while chunk_start < batch_range.end {
+            let chunk_end = chunk_start
+                .saturating_add(TPS_BATCH_QUERY_CHUNK_SIZE)
+                .min(batch_range.end);
+            let batch_ids = (chunk_start..chunk_end)
+                .map(BatchIdentifier::Number)
+                .collect::<Vec<_>>();
+            let batches = ledger
+                .get_batches::<B, TxReceipt, RuntimeEventResponse<E>>(
+                    batch_ids.as_slice(),
+                    QueryMode::Compact,
+                )
+                .await
+                .map_err(database_error_response_500)?;
+
+            for (offset, maybe_batch) in batches.into_iter().enumerate() {
+                let batch_number = chunk_start + offset as u64;
+                let batch = maybe_batch.ok_or_else(|| {
+                    internal_server_error_response_500(format!(
+                        "Missing batch {} while calculating TPS for slot {}",
+                        batch_number,
+                        slot_number.get()
+                    ))
+                })?;
+
+                let batch_tx_count = batch
+                    .tx_range
+                    .end
+                    .checked_sub(batch.tx_range.start)
+                    .ok_or_else(|| {
+                        internal_server_error_response_500(format!(
+                            "Invalid tx range in batch {} while calculating TPS",
+                            batch_number
+                        ))
+                    })?;
+                tx_count = tx_count.checked_add(batch_tx_count).ok_or_else(|| {
+                    internal_server_error_response_500(format!(
+                        "Transaction count overflow while calculating TPS for slot {}",
+                        slot_number.get()
+                    ))
+                })?;
+            }
+
+            chunk_start = chunk_end;
+        }
+
+        Ok(tx_count)
     }
 
     async fn get_slot_events(
@@ -806,6 +952,17 @@ struct EventFilter {
 struct SlotEvents<E> {
     rollup_height: u64,
     events: Vec<RuntimeEventResponse<E>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "slotTps")]
+struct SlotTps {
+    pub slot_number: u64,
+    pub tx_count: u64,
+    pub block_time_ms: u64,
+    pub tps: f64,
+    pub finality_status: FinalityStatus,
+    pub timestamp: Time,
 }
 
 #[serde_with::serde_as]
