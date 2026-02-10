@@ -5,18 +5,20 @@ mod telemetry;
 mod wallet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "tee")]
 use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 pub use endpoints::*;
+#[cfg(feature = "tee")]
 use reqwest::Client;
 use sov_db::ledger_db::LedgerDb;
 use sov_db::schema::{DeltaReader, SchemaBatch};
+#[cfg(feature = "tee")]
 use sov_midnight_adapter::MidnightIndexerClient;
 use sov_modules_api::capabilities::{HasCapabilities, HasKernel, ProofProcessor, RollupHeight};
 use sov_modules_api::execution_mode::ExecutionMode;
-use sov_modules_api::prelude::jsonrpsee::ws_client::WsClient;
 use sov_modules_api::provable_height_tracker::MaximumProvableHeight;
 use sov_modules_api::rest::{ApiState, StateUpdateReceiver};
 use sov_modules_api::{

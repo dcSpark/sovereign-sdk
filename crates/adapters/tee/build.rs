@@ -1,3 +1,4 @@
+#[cfg(all(feature = "maa", target_os = "linux"))]
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {

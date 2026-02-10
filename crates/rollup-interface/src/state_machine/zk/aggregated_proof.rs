@@ -1,7 +1,6 @@
 //! Defines types that are related to the `AggregatedProof`.
 use core::marker::PhantomData;
 
-use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

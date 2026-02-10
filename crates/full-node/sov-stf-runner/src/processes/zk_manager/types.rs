@@ -140,7 +140,7 @@ impl<Ps: ProverService> AggregateProofMetadata<Ps> {
                 .await;
 
             match status {
-                Ok(ProofAggregationStatus::Success(agg_proof, public_data)) => {
+                Ok(ProofAggregationStatus::Success(agg_proof, _public_data)) => {
                     return Ok(agg_proof);
                 }
                 // TODO(https://github.com/Sovereign-Labs/sovereign-sdk/issues/1185): Add timeout handling.

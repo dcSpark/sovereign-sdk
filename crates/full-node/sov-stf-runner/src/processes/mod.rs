@@ -14,6 +14,7 @@ pub use tee_manager::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use op_manager::attestations::AttestationsManager;
 pub use prover_service::*;
+#[cfg(feature = "tee")]
 use sov_midnight_adapter::MidnightIndexerClient;
 use sov_rollup_interface::node::da::DaService;
 use sov_rollup_interface::optimistic::BondingProofService;
@@ -21,6 +22,7 @@ use sov_rollup_interface::stf::ProofSender;
 pub use stf_info_manager::*;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+#[cfg(feature = "tee")]
 use tracing::{info, warn};
 pub use zk_manager::*;
 
@@ -51,8 +53,6 @@ where
     if let Some(client) = midnight_bridge.as_ref() {
         let _ = client.snapshot().await;
     }
-    use hex::FromHex;
-
     let mut batch_data = 0;
     let mut prev_batch_hash = [0u8; 32];
 
