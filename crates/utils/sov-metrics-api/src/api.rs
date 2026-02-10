@@ -33,8 +33,8 @@ struct TpsPeakCacheEntry {
     peak_tps: f64,
     /// Timestamp (ms) when the peak occurred.
     peak_at_ms: i64,
-    /// The end of the window used for this computation (ms).
-    computed_up_to_ms: i64,
+    /// Window size (ms) this cache entry was computed for.
+    window_ms: i64,
     /// When this cache entry was computed (ms).
     computed_at_ms: i64,
 }
@@ -58,10 +58,13 @@ pub struct AppState {
     pub store: MetricsStore,
     pub retention_secs: u64,
     pub tps_peak_cache: TpsPeakCache,
-    pub da_db: DatabaseConnection,
     pub indexer_db: DatabaseConnection,
     /// Multiplier applied to PeakTPS metric output.
     pub peak_tps_multiplier: f64,
+    /// Sequencer ledger API base URL (for example, `http://127.0.0.1:12346`).
+    pub ledger_api_url: String,
+    /// Shared HTTP client for querying sequencer ledger endpoints.
+    pub ledger_http_client: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,7 +394,6 @@ async fn tps_peak(
 
     let now = chrono::Utc::now();
     let now_ms = now.timestamp_millis();
-    let window_start_ms = now_ms - window_ms;
 
     // Check cache first (unless no_cache is set)
     if !no_cache {
@@ -399,11 +401,9 @@ async fn tps_peak(
         if let Some(ref entry) = *cache {
             // Cache is valid if:
             // 1. It was computed recently (within threshold)
-            // 2. The cached window covers our current request window
+            // 2. It was computed for the same window size.
             let cache_age_ms = now_ms - entry.computed_at_ms;
-            if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS
-                && entry.computed_up_to_ms >= window_start_ms
-            {
+            if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS && entry.window_ms == window_ms {
                 // Apply configured multiplier to cached value.
                 return Json(TpsPeakResponse {
                     peak_tps: Some(apply_peak_tps_multiplier(
@@ -418,16 +418,15 @@ async fn tps_peak(
         }
     }
 
-    // Cache miss or stale - query database directly for actual transaction timestamps
-    let window_start = chrono::DateTime::from_timestamp_millis(window_start_ms)
-        .unwrap_or(now - chrono::Duration::seconds(window_secs as i64));
-
-    let result = compute_peak_tps_from_db(&state.da_db, window_start, now).await;
+    // Cache miss or stale - query finalized slots and compute peak over the last N slots.
+    let lookback_slots = window_secs.max(1) as u64;
+    let result = compute_peak_tps_from_recent_slots(&state, lookback_slots).await;
 
     let (peak_tps, peak_at_ms) = match result {
-        Ok((tps, at_ms)) => (Some(tps), Some(at_ms)),
+        Ok(Some((tps, at_ms))) => (Some(tps), Some(at_ms)),
+        Ok(None) => (Some(0.0), None),
         Err(e) => {
-            warn!("Failed to compute peak TPS from database: {}", e);
+            warn!("Failed to compute peak TPS from ledger slots: {}", e);
             (None, None)
         }
     };
@@ -438,7 +437,7 @@ async fn tps_peak(
         *cache = Some(TpsPeakCacheEntry {
             peak_tps: tps,
             peak_at_ms: at_ms,
-            computed_up_to_ms: now_ms,
+            window_ms,
             computed_at_ms: now_ms,
         });
     }
@@ -601,14 +600,12 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
-    // Compute peak TPS for this EMA window (no cache used for EMA endpoints)
-    let now = chrono::Utc::now();
-    let window_secs = window.seconds() as i64;
-    let window_start = now - chrono::Duration::seconds(window_secs);
-
+    // Compute peak TPS for this EMA window using finalized slots.
+    let lookback_slots = (window.seconds() as u64).max(1);
     let (peak_tps, peak_tps_at_ms) =
-        match compute_peak_tps_from_db(&state.da_db, window_start, now).await {
-            Ok((tps, at_ms)) => (tps, Some(at_ms)),
+        match compute_peak_tps_from_recent_slots(state, lookback_slots).await {
+            Ok(Some((tps, at_ms))) => (tps, Some(at_ms)),
+            Ok(None) => (0.0, None),
             Err(e) => {
                 tracing::warn!("Failed to compute peak TPS for EMA endpoint: {}", e);
                 (0.0, None)
@@ -647,157 +644,120 @@ fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
     value * multiplier
 }
 
-/// Query the database to find peak TPS among rollup blocks in the requested window.
-///
-/// Strategy:
-/// - Parse `rollup_height` from sequencer events (`NoteCreatedAtHeight`) in
-///   `worker_verified_transactions.sequencer_status`.
-/// - Use `worker_verified_transactions.created_at` to select candidate rollup heights in `[from, to]`.
-/// - Count all accepted txs mapped to each candidate rollup height (full block cardinality).
-/// - Return the maximum tx count (ties resolved by latest rollup height).
-///
-/// Note: this intentionally does not rely on `block_headers.height` joins because in local setups
-/// the DA block height domain can differ from rollup heights emitted in sequencer events.
-async fn compute_peak_tps_from_db(
-    db: &DatabaseConnection,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
-) -> Result<(f64, i64), sea_orm::DbErr> {
-    use sea_orm::{ActiveEnum, ConnectionTrait, FromQueryResult, Statement};
-    use sov_midnight_da::storable::worker_verified_transactions::TransactionState;
-    use tracing::debug;
+const MAX_LEDGER_SLOT_SCAN: u64 = 1_024;
 
-    #[derive(Debug, FromQueryResult)]
-    struct BlockBucket {
-        block_ts_ms: i64,
-        tx_count: i64,
+#[derive(Debug, Deserialize)]
+struct LedgerRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerBatchResponse {
+    tx_range: LedgerRange,
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerSlotResponse {
+    number: u64,
+    timestamp: i64,
+    #[serde(default)]
+    batch_range: Option<LedgerRange>,
+    #[serde(default)]
+    batches: Option<Vec<LedgerBatchResponse>>,
+}
+
+fn range_delta(range: &LedgerRange) -> u64 {
+    range.end.saturating_sub(range.start)
+}
+
+async fn fetch_ledger_json<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<T> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    Ok(response.json::<T>().await?)
+}
+
+async fn slot_tx_count(state: &AppState, slot: &LedgerSlotResponse) -> anyhow::Result<u64> {
+    if let Some(ref batches) = slot.batches {
+        return Ok(batches
+            .iter()
+            .map(|batch| range_delta(&batch.tx_range))
+            .sum());
     }
 
-    let backend = db.get_database_backend();
-    let accepted = TransactionState::Accepted.to_value();
-
-    let from_str = from.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-    let to_str = to.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-    let from_ms = from.timestamp_millis();
-    let to_ms = to.timestamp_millis();
-
-    debug!(
-        "Computing peak TPS for blocks {} to {} (state: {}, ms: {}..{})",
-        from_str, to_str, accepted, from_ms, to_ms
-    );
-
-    if !matches!(
-        backend,
-        sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::Sqlite
-    ) {
-        tracing::warn!(
-            backend = ?backend,
-            "Peak TPS rollup-height mapping is only supported for Postgres and Sqlite; returning 0"
-        );
-        return Ok((0.0, chrono::Utc::now().timestamp_millis()));
+    // Fallback for compact responses that only include `batch_range`.
+    if let Some(ref batch_range) = slot.batch_range {
+        let base = state.ledger_api_url.trim_end_matches('/');
+        let mut tx_count = 0_u64;
+        for batch_id in batch_range.start..batch_range.end {
+            let batch_url = format!("{base}/ledger/batches/{batch_id}");
+            let batch: LedgerBatchResponse =
+                fetch_ledger_json(&state.ledger_http_client, &batch_url).await?;
+            tx_count = tx_count.saturating_add(range_delta(&batch.tx_range));
+        }
+        return Ok(tx_count);
     }
 
-    let block_sql = match backend {
-        sea_orm::DatabaseBackend::Postgres => {
-            format!(
-                r#"
-                WITH tx_rollup AS (
-                    SELECT
-                        w.tx_hash,
-                        w.created_at AS tx_created_at,
-                        (
-                            SELECT (evt->'value'->'note_created_at_height'->>'rollup_height')::BIGINT
-                            FROM jsonb_array_elements(COALESCE((w.sequencer_status::jsonb)->'events', '[]'::jsonb)) AS evt
-                            WHERE evt->>'key' = 'ValueMidnightPrivacy/NoteCreatedAtHeight'
-                            LIMIT 1
-                        ) AS rollup_height
-                    FROM worker_verified_transactions w
-                    WHERE w.transaction_state = '{}'
-                      AND w.sequencer_status IS NOT NULL
-                ),
-                window_heights AS (
-                    SELECT DISTINCT tr.rollup_height
-                    FROM tx_rollup tr
-                    WHERE tr.rollup_height IS NOT NULL
-                      AND (EXTRACT(EPOCH FROM tr.tx_created_at) * 1000)::BIGINT >= {}
-                      AND (EXTRACT(EPOCH FROM tr.tx_created_at) * 1000)::BIGINT <= {}
-                )
-                SELECT
-                    EXTRACT(EPOCH FROM MAX(tr.tx_created_at))::BIGINT * 1000 AS block_ts_ms,
-                    COUNT(DISTINCT tr.tx_hash)::BIGINT AS tx_count
-                FROM window_heights wh
-                JOIN tx_rollup tr
-                    ON tr.rollup_height = wh.rollup_height
-                GROUP BY wh.rollup_height
-                ORDER BY tx_count DESC, wh.rollup_height DESC
-                LIMIT 1
-                "#,
-                accepted, from_ms, to_ms
-            )
+    Ok(0)
+}
+
+/// Query the most recent finalized sequencer slots and return the peak tx count.
+///
+/// The `lookback_slots` parameter defines how many latest finalized slots are scanned.
+/// This keeps PeakTPS semantics block-based and deterministic across endpoints.
+async fn compute_peak_tps_from_recent_slots(
+    state: &AppState,
+    lookback_slots: u64,
+) -> anyhow::Result<Option<(f64, i64)>> {
+    if lookback_slots == 0 {
+        return Ok(None);
+    }
+
+    let base = state.ledger_api_url.trim_end_matches('/');
+    let head_url = format!("{base}/ledger/slots/finalized");
+    let head: LedgerSlotResponse = fetch_ledger_json(&state.ledger_http_client, &head_url).await?;
+
+    let mut peak: Option<(u64, i64)> = None;
+    let mut current_slot = head.number;
+    let mut scanned = 0_u64;
+
+    loop {
+        if scanned >= lookback_slots {
+            break;
         }
-        sea_orm::DatabaseBackend::Sqlite => {
-            format!(
-                r#"
-                WITH tx_rollup AS (
-                    SELECT
-                        w.tx_hash,
-                        w.created_at AS tx_created_at,
-                        (
-                            SELECT CAST(json_extract(evt.value, '$.value.note_created_at_height.rollup_height') AS INTEGER)
-                            FROM json_each(w.sequencer_status, '$.events') AS evt
-                            WHERE json_extract(evt.value, '$.key') = 'ValueMidnightPrivacy/NoteCreatedAtHeight'
-                            LIMIT 1
-                        ) AS rollup_height
-                    FROM worker_verified_transactions w
-                    WHERE w.transaction_state = '{}'
-                      AND w.sequencer_status IS NOT NULL
-                ),
-                window_heights AS (
-                    SELECT DISTINCT tr.rollup_height
-                    FROM tx_rollup tr
-                    WHERE tr.rollup_height IS NOT NULL
-                      AND CAST((julianday(tr.tx_created_at) - 2440587.5) * 86400000 AS INTEGER) >= {}
-                      AND CAST((julianday(tr.tx_created_at) - 2440587.5) * 86400000 AS INTEGER) <= {}
-                )
-                SELECT
-                    CAST((julianday(MAX(tr.tx_created_at)) - 2440587.5) * 86400000 AS INTEGER) AS block_ts_ms,
-                    COUNT(DISTINCT tr.tx_hash) AS tx_count
-                FROM window_heights wh
-                JOIN tx_rollup tr
-                    ON tr.rollup_height = wh.rollup_height
-                GROUP BY wh.rollup_height
-                ORDER BY tx_count DESC, wh.rollup_height DESC
-                LIMIT 1
-                "#,
-                accepted, from_ms, to_ms
-            )
-        }
-        _ => unreachable!(),
-    };
-
-    debug!("Peak TPS SQL (rollup-height mapping): {}", block_sql);
-
-    let stmt = Statement::from_string(backend, block_sql);
-    let result = BlockBucket::find_by_statement(stmt).one(db).await?;
-
-    debug!("Peak TPS query result: {:?}", result);
-
-    match result {
-        Some(bucket) => {
-            let tps = bucket.tx_count as f64;
-            let peak_at_ms = bucket.block_ts_ms;
-            debug!("Found peak TPS: {} at block timestamp {}", tps, peak_at_ms);
-            Ok((tps, peak_at_ms))
-        }
-        None => {
-            tracing::warn!(
-                from = %from_str,
-                to = %to_str,
-                "No blocks found in window for peak TPS query"
+        if scanned >= MAX_LEDGER_SLOT_SCAN {
+            warn!(
+                max_scan = MAX_LEDGER_SLOT_SCAN,
+                lookback_slots, "Reached peak TPS slot scan safety limit before exhausting window"
             );
-            Ok((0.0, chrono::Utc::now().timestamp_millis()))
+            break;
         }
+        scanned += 1;
+
+        let slot_url = format!("{base}/ledger/slots/{current_slot}?children=1");
+        let slot: LedgerSlotResponse =
+            fetch_ledger_json(&state.ledger_http_client, &slot_url).await?;
+
+        let tx_count = slot_tx_count(state, &slot).await?;
+        let should_update = match peak {
+            Some((peak_count, peak_at_ms)) => {
+                tx_count > peak_count || (tx_count == peak_count && slot.timestamp > peak_at_ms)
+            }
+            None => true,
+        };
+        if should_update {
+            peak = Some((tx_count, slot.timestamp));
+        }
+
+        if current_slot == 0 {
+            break;
+        }
+        current_slot -= 1;
     }
+
+    Ok(peak.map(|(tx_count, peak_at_ms)| (tx_count as f64, peak_at_ms)))
 }
 
 #[utoipa::path(

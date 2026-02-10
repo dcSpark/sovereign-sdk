@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let tsink_data_path = config.tsink_data_path;
     let tsink_retention_secs = config.tsink_retention_secs;
     let peak_tps_multiplier = config.peak_tps_multiplier;
+    let ledger_api_url = config.ledger_api_url;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
     connection_options.sqlx_logging(false);
@@ -86,14 +87,15 @@ async fn main() -> anyhow::Result<()> {
         store,
         retention_secs: tsink_retention_secs,
         tps_peak_cache: api::TpsPeakCache::new(),
-        da_db: db.clone(),
         indexer_db: indexer_db.clone(),
         peak_tps_multiplier,
+        ledger_api_url: ledger_api_url.clone(),
+        ledger_http_client: reqwest::Client::new(),
     });
 
     info!(
-        "sov-metrics-api listening on {} (peak_tps_multiplier={})",
-        bind_addr, peak_tps_multiplier
+        "sov-metrics-api listening on {} (peak_tps_multiplier={}, ledger_api_url={})",
+        bind_addr, peak_tps_multiplier, ledger_api_url
     );
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 
 const DEFAULT_RETENTION_SECS: u64 = 5 * 24 * 60 * 60;
 const DEFAULT_PEAK_TPS_MULTIPLIER: f64 = 1.0;
+const DEFAULT_LEDGER_API_URL: &str = "http://127.0.0.1:12346";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -16,6 +17,8 @@ pub struct Config {
     pub tsink_retention_secs: u64,
     /// Multiplier applied to PeakTPS metric output on EMA endpoints and /tps/peak.
     pub peak_tps_multiplier: f64,
+    /// Sequencer ledger API base URL used for block-based PeakTPS computation.
+    pub ledger_api_url: String,
 }
 
 impl Config {
@@ -89,6 +92,15 @@ impl Config {
             Err(_) => DEFAULT_PEAK_TPS_MULTIPLIER,
         };
 
+        let ledger_api_url = env::var("LEDGER_API_URL")
+            .or_else(|_| env::var("ROLLUP_RPC_URL"))
+            .unwrap_or_else(|_| DEFAULT_LEDGER_API_URL.to_string());
+        if ledger_api_url.trim().is_empty() {
+            return Err(anyhow!(
+                "LEDGER_API_URL (or ROLLUP_RPC_URL) env var is empty"
+            ));
+        }
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
@@ -96,6 +108,7 @@ impl Config {
             tsink_data_path: PathBuf::from(tsink_data_path),
             tsink_retention_secs,
             peak_tps_multiplier,
+            ledger_api_url,
         })
     }
 }
