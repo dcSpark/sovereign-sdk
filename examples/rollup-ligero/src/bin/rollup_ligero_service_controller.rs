@@ -1141,10 +1141,15 @@ async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
     }
 }
 
-async fn ensure_services_stopped_for_clean_like_actions(app: &Arc<AppState>) -> Result<(), ApiError> {
+async fn ensure_services_stopped_for_clean_like_actions(
+    app: &Arc<AppState>,
+) -> Result<(), ApiError> {
     let mut state = app.state.lock().await;
     if state.any_running() {
-        return Err(ApiError::new(StatusCode::CONFLICT, "Services must be stopped"));
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Services must be stopped",
+        ));
     }
     Ok(())
 }
@@ -1226,15 +1231,18 @@ async fn clean_database(State(app): State<Arc<AppState>>) -> ApiResult {
                 escape_pg_identifier(table_name)
             );
 
-            sqlx::query(&drop_stmt).execute(&mut *tx).await.map_err(|err| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "Failed to drop table '{}.{}' in '{}': {err}",
-                        schema_name, table_name, database_name
-                    ),
-                )
-            })?;
+            sqlx::query(&drop_stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "Failed to drop table '{}.{}' in '{}': {err}",
+                            schema_name, table_name, database_name
+                        ),
+                    )
+                })?;
         }
 
         tx.commit().await.map_err(|err| {

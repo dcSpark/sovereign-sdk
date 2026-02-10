@@ -162,6 +162,7 @@ struct McpSessions {
     session_manager: Arc<PersistentSessionManager>,
     session_store: Option<Arc<SessionStore>>,
     auto_initialize_sessions: bool,
+    auto_create_wallet: bool,
 }
 
 impl McpSessions {
@@ -170,12 +171,14 @@ impl McpSessions {
         session_manager: Arc<PersistentSessionManager>,
         session_store: Option<Arc<SessionStore>>,
         auto_initialize_sessions: bool,
+        auto_create_wallet: bool,
     ) -> Self {
         Self {
             service,
             session_manager,
             session_store,
             auto_initialize_sessions,
+            auto_create_wallet,
         }
     }
 
@@ -192,6 +195,116 @@ impl McpSessions {
         })
         .to_string()
         .into_bytes()
+    }
+
+    fn build_create_wallet_request_body() -> Vec<u8> {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "createWallet",
+                "arguments": {}
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn snapshot_has_wallet(snapshot: &SessionSnapshot) -> bool {
+        snapshot.wallet_explicitly_loaded
+            && snapshot.wallet_private_key_hex.is_some()
+            && snapshot.privacy_spend_key_hex.is_some()
+    }
+
+    async fn auto_create_wallet_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), axum::response::Response> {
+        let create_wallet_request = match Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(HEADER_SESSION_ID, session_id)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(Self::build_create_wallet_request_body()))
+        {
+            Ok(req) => req,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build auto-create-wallet request: {err}"),
+                )
+                    .into_response());
+            }
+        };
+
+        let response = self
+            .service
+            .handle(create_wallet_request)
+            .await
+            .into_response();
+        let status = response.status();
+        let body_bytes = match to_bytes(response.into_body(), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to read auto-create-wallet response for session {session_id}: {err}"
+                    ),
+                )
+                    .into_response());
+            }
+        };
+
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&body_bytes);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to auto-create wallet for session {session_id}: HTTP {} {}",
+                    status, body
+                ),
+            )
+                .into_response());
+        }
+
+        let response_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to decode auto-create-wallet response for session {session_id}: {err}"
+                    ),
+                )
+                    .into_response());
+            }
+        };
+
+        if let Some(error_message) = response_json
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            // Session state may have changed concurrently after the snapshot check.
+            if error_message.contains("A wallet is already loaded.") {
+                tracing::info!(
+                    "[mcp] Auto-create wallet skipped for session {session_id}: wallet already loaded"
+                );
+                return Ok(());
+            }
+
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to auto-create wallet for session {session_id}: {error_message}"),
+            )
+                .into_response());
+        }
+
+        tracing::info!("[mcp] Auto-created wallet for session {session_id}");
+        Ok(())
     }
 
     async fn send_initialized_notification(&self, session_id: &str) {
@@ -319,20 +432,60 @@ impl McpSessions {
                     should_create_session = true;
                     parts.headers.remove(HEADER_SESSION_ID);
                 } else if self.auto_initialize_sessions {
-                    let store = match self.session_store.as_ref() {
-                        Some(store) => store,
-                        None => {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
-                            )
-                                .into_response();
-                        }
+                    let snapshot = match self.session_store.as_ref() {
+                        Some(store) => match store.load_session(&session_id).await {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to load session snapshot: {err}"),
+                                )
+                                    .into_response();
+                            }
+                        },
+                        None => None,
                     };
 
-                    let has_snapshot = match store.load_session(&session_id).await {
-                        Ok(Some(_)) => true,
-                        Ok(None) => false,
+                    if snapshot.is_none() && !self.auto_create_wallet {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
+                        )
+                            .into_response();
+                    }
+
+                    let bootstrapped_session_id =
+                        match self.bootstrap_session(session_id.clone()).await {
+                            Ok(id) => id,
+                            Err(response) => return response,
+                        };
+                    self.send_initialized_notification(&bootstrapped_session_id)
+                        .await;
+
+                    let should_auto_create_wallet = self.auto_create_wallet
+                        && snapshot
+                            .as_ref()
+                            .map(|s| !Self::snapshot_has_wallet(s))
+                            .unwrap_or(true);
+                    if should_auto_create_wallet {
+                        if let Err(response) = self
+                            .auto_create_wallet_for_session(&bootstrapped_session_id)
+                            .await
+                        {
+                            return response;
+                        }
+                    }
+                } else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
+                    )
+                        .into_response();
+                }
+            } else if self.auto_create_wallet && !is_initialize {
+                if let Some(store) = self.session_store.as_ref() {
+                    let snapshot = match store.load_session(&session_id).await {
+                        Ok(snapshot) => snapshot,
                         Err(err) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -342,26 +495,16 @@ impl McpSessions {
                         }
                     };
 
-                    if !has_snapshot {
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
-                        )
-                            .into_response();
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !Self::snapshot_has_wallet(snapshot))
+                    {
+                        if let Err(response) =
+                            self.auto_create_wallet_for_session(&session_id).await
+                        {
+                            return response;
+                        }
                     }
-
-                    let bootstrapped_session_id = match self.bootstrap_session(session_id).await {
-                        Ok(id) => id,
-                        Err(response) => return response,
-                    };
-                    self.send_initialized_notification(&bootstrapped_session_id)
-                        .await;
-                } else {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        "Unauthorized: Session not found. Send an MCP initialize request to create a new session.",
-                    )
-                        .into_response();
                 }
             }
         } else if parts.method == Method::POST && is_initialize {
@@ -403,6 +546,12 @@ impl McpSessions {
                     .and_then(|v| v.to_str().ok())
                 {
                     self.send_initialized_notification(session_id).await;
+                    if self.auto_create_wallet {
+                        if let Err(response) = self.auto_create_wallet_for_session(session_id).await
+                        {
+                            return response;
+                        }
+                    }
                 }
             }
 
@@ -672,8 +821,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    let auto_create_wallet = if cfg.mcp_auto_create_wallet && !cfg.mcp_auto_initialize_sessions {
+        tracing::warn!(
+            "[mcp] MCP_AUTO_CREATE_WALLET requires MCP_AUTO_INITIALIZE_SESSIONS=true; disabling auto-create wallet"
+        );
+        false
+    } else {
+        cfg.mcp_auto_create_wallet
+    };
+
     if cfg.mcp_auto_initialize_sessions {
         tracing::info!("[mcp] MCP auto-initialize sessions enabled");
+    }
+    if auto_create_wallet {
+        tracing::info!("[mcp] MCP auto-create wallet enabled");
     }
 
     tracing::info!(
@@ -775,6 +937,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_manager,
         session_store,
         cfg.mcp_auto_initialize_sessions,
+        auto_create_wallet,
     ));
 
     let app_state = AppState {

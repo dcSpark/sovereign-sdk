@@ -116,6 +116,11 @@ pub struct Config {
     /// Automatically send MCP `notifications/initialized` and bootstrap persisted sessions (env: MCP_AUTO_INITIALIZE_SESSIONS).
     #[serde(default)]
     pub mcp_auto_initialize_sessions: bool,
+
+    /// Automatically create a wallet for auto-bootstrapped/new sessions (env: MCP_AUTO_CREATE_WALLET).
+    /// Requires MCP_AUTO_INITIALIZE_SESSIONS=true.
+    #[serde(default)]
+    pub mcp_auto_create_wallet: bool,
 }
 
 fn default_server_bind_address() -> String {
