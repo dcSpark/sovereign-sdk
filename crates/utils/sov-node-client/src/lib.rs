@@ -11,6 +11,7 @@ use sov_api_spec::types;
 use sov_api_spec::types::AcceptTxBody;
 use sov_bank::utils::TokenHolder;
 use sov_bank::{Amount, Coins, TokenId};
+use sov_modules_api::prelude::serde_json;
 use sov_modules_api::prelude::tracing;
 use sov_rollup_interface::crypto::{CredentialId, PublicKey};
 use sov_rollup_interface::da::DaSpec;
