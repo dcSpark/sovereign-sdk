@@ -299,10 +299,39 @@ impl NodeClient {
         &self,
         url: &str,
     ) -> anyhow::Result<R> {
-        let url = format!("{}{}", self.base_url, url);
-        let response = self.http_client.get(url).send().await?;
-        let data = response.json::<R>().await?;
-        Ok(data)
+        let endpoint = url;
+        let url = format!("{}{}", self.base_url, endpoint);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to send GET request to REST endpoint {}", endpoint))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("Failed to read REST endpoint {} response body", endpoint))?;
+        let body_preview = response_body_preview(&body);
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "REST endpoint {} returned HTTP {} body_preview={}",
+                endpoint,
+                status,
+                body_preview
+            );
+        }
+
+        serde_json::from_str::<R>(&body).with_context(|| {
+            format!(
+                "Failed to decode REST endpoint {} response body (status={}) into {} body_preview={}",
+                endpoint,
+                status,
+                std::any::type_name::<R>(),
+                body_preview
+            )
+        })
     }
 
     /// HTTP GET to the given endpoint, returning plain text.
@@ -338,6 +367,17 @@ impl NodeClient {
             .context("Deserialization of `KnownSequencerResponse`")?;
 
         Ok(Some(response.value))
+    }
+}
+
+fn response_body_preview(body: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 512;
+    let normalized = body.trim().replace('\n', "\\n").replace('\r', "\\r");
+    let preview: String = normalized.chars().take(MAX_PREVIEW_CHARS).collect();
+    if normalized.chars().count() > MAX_PREVIEW_CHARS {
+        format!("{preview}...<truncated>")
+    } else {
+        preview
     }
 }
 
