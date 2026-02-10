@@ -552,7 +552,7 @@ struct VerifierResponse {
 struct CycleSummary {
     num_transfers: usize,
     num_included: usize,
-    batches: BTreeMap<u64, usize>,
+    slots: BTreeMap<u64, usize>,
     avg_worker_ms: f64,
     avg_sequencer_ms: f64,
     avg_worker_proof_ms: f64,
@@ -562,6 +562,33 @@ struct CycleSummary {
     avg_seq_submit_ms: f64,
     avg_seq_await_ms: f64,
     avg_seq_stf_ms: f64,
+}
+
+async fn resolve_slot_number_for_batch(
+    client: &NodeClient,
+    slot_by_batch_cache: &mut HashMap<u64, u64>,
+    batch_number: u64,
+) -> Result<u64> {
+    if let Some(slot_number) = slot_by_batch_cache.get(&batch_number).copied() {
+        return Ok(slot_number);
+    }
+
+    let batch = client
+        .query_rest_endpoint::<api_types::LedgerBatch>(&format!(
+            "/ledger/batches/{}?children=0",
+            batch_number
+        ))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to query /ledger/batches/{} while resolving slot",
+                batch_number
+            )
+        })?;
+
+    let slot_number = batch.slot_number;
+    slot_by_batch_cache.insert(batch_number, slot_number);
+    Ok(slot_number)
 }
 
 fn wait_for_c_to_continue(prompt: &str, config: &ContinuousConfig) -> Result<()> {
@@ -899,7 +926,7 @@ pub async fn run() -> Result<()> {
     let mut cycle_idx: u64 = 0;
     let mut total_transfers: usize = 0;
     let mut total_included: usize = 0;
-    let mut total_batches: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut total_slots: BTreeMap<u64, usize> = BTreeMap::new();
     let mut total_worker_ms: f64 = 0.0;
     let mut total_worker_proof_ms: f64 = 0.0;
     let mut total_worker_db_ms: f64 = 0.0;
@@ -929,7 +956,7 @@ pub async fn run() -> Result<()> {
                     cycle_idx - 1,
                     total_transfers,
                     total_included,
-                    &total_batches,
+                    &total_slots,
                     total_worker_ms,
                     total_worker_proof_ms,
                     total_worker_db_ms,
@@ -964,8 +991,8 @@ pub async fn run() -> Result<()> {
 
         total_transfers += summary.num_transfers;
         total_included += summary.num_included;
-        for (block_number, count) in summary.batches {
-            *total_batches.entry(block_number).or_insert(0) += count;
+        for (slot_number, count) in summary.slots {
+            *total_slots.entry(slot_number).or_insert(0) += count;
         }
 
         if config.detailed_wallet_logs {
@@ -1013,7 +1040,7 @@ pub async fn run() -> Result<()> {
                     cycle_idx,
                     total_transfers,
                     total_included,
-                    &total_batches,
+                    &total_slots,
                     total_worker_ms,
                     total_worker_proof_ms,
                     total_worker_db_ms,
@@ -1040,7 +1067,7 @@ pub async fn run() -> Result<()> {
                     cycle_idx,
                     total_transfers,
                     total_included,
-                    &total_batches,
+                    &total_slots,
                     total_worker_ms,
                     total_worker_proof_ms,
                     total_worker_db_ms,
@@ -1065,7 +1092,7 @@ fn log_final_summary(
     cycles: u64,
     total_transfers: usize,
     total_included: usize,
-    total_batches: &BTreeMap<u64, usize>,
+    total_slots: &BTreeMap<u64, usize>,
     total_worker_ms: f64,
     total_worker_proof_ms: f64,
     total_worker_db_ms: f64,
@@ -1147,11 +1174,11 @@ fn log_final_summary(
             global_seq_stf_avg,
         );
     }
-    eprintln!("[final-summary] Block number distribution across all cycles:");
-    for (block_number, count) in total_batches {
+    eprintln!("[final-summary] Slot number distribution across all cycles:");
+    for (slot_number, count) in total_slots {
         eprintln!(
-            "[final-summary]   Block number {:3}: {:3} transfers",
-            block_number, count
+            "[final-summary]   Slot number {:3}: {:3} transfers",
+            slot_number, count
         );
     }
     eprintln!("[final-summary] =================================\n");
@@ -1710,7 +1737,7 @@ async fn perform_transfer_cycle(
         return Ok(CycleSummary {
             num_transfers: 0,
             num_included: 0,
-            batches: BTreeMap::new(),
+            slots: BTreeMap::new(),
             avg_worker_ms: 0.0,
             avg_sequencer_ms: 0.0,
             avg_worker_proof_ms: 0.0,
@@ -2934,11 +2961,19 @@ async fn perform_transfer_cycle(
             flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
         );
     } else {
+        let avg_ms = if flush.flushed > 0 {
+            flush_elapsed_ms / flush.flushed as f64
+        } else {
+            0.0
+        };
+        let flush_tps = if flush_elapsed_ms > 0.0 {
+            flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
+        } else {
+            0.0
+        };
         eprintln!(
             "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
-            flush_elapsed_ms,
-            flush_elapsed_ms / flush.flushed as f64,
-            flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
+            flush_elapsed_ms, avg_ms, flush_tps
         );
     }
 
@@ -3004,8 +3039,9 @@ async fn perform_transfer_cycle(
         );
     }
 
-    // After flush, verify inclusion and collect per-batch statistics and timing
-    let mut batches: BTreeMap<u64, usize> = BTreeMap::new();
+    // After flush, verify inclusion and collect per-slot statistics and timing.
+    let mut slots: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut slot_by_batch_cache: HashMap<u64, u64> = HashMap::new();
     let mut num_included = 0usize;
     let num_transfers = transfer_hashes.len();
     let mut included_hashes: Vec<String> = Vec::new();
@@ -3013,8 +3049,8 @@ async fn perform_transfer_cycle(
     let mut last_included_at: Option<Instant> = None;
     let mut first_included_wall: Option<SystemTime> = None;
     let mut last_included_wall: Option<SystemTime> = None;
-    let mut first_batch_number: Option<u64> = None;
-    let mut last_batch_number: Option<u64> = None;
+    let mut first_slot_number: Option<u64> = None;
+    let mut last_slot_number: Option<u64> = None;
 
     // Aggregate worker / sequencer timing for this cycle
     let mut worker_sum_ms = 0.0f64;
@@ -3060,15 +3096,38 @@ async fn perform_transfer_cycle(
                     let now_instant = Instant::now();
                     let now_wall = SystemTime::now();
                     let batch_number = ltx.batch_number;
+                    let slot_number = match resolve_slot_number_for_batch(
+                        client,
+                        &mut slot_by_batch_cache,
+                        batch_number,
+                    )
+                    .await
+                    {
+                        Ok(slot_number) => slot_number,
+                        Err(err) => {
+                            if Instant::now() > deadline {
+                                eprintln!(
+                                    "[cycle] Timeout resolving slot for transfer {} (batch={}, {}s): {}",
+                                    hash_hex,
+                                    batch_number,
+                                    config.ledger_inclusion_timeout_secs,
+                                    err
+                                );
+                                break;
+                            }
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
                     if first_included_at.is_none() {
                         first_included_at = Some(now_instant);
                         first_included_wall = Some(now_wall);
-                        first_batch_number = Some(batch_number);
+                        first_slot_number = Some(slot_number);
                     }
                     last_included_at = Some(now_instant);
                     last_included_wall = Some(now_wall);
-                    last_batch_number = Some(batch_number);
-                    *batches.entry(batch_number).or_insert(0) += 1;
+                    last_slot_number = Some(slot_number);
+                    *slots.entry(slot_number).or_insert(0) += 1;
                     num_included += 1;
                     included_hashes.push(hash_hex.clone());
                     break;
@@ -3126,15 +3185,15 @@ async fn perform_transfer_cycle(
         Some(last_instant),
         Some(first_wall),
         Some(last_wall),
-        Some(first_block),
-        Some(last_block),
+        Some(first_slot),
+        Some(last_slot),
     ) = (
         first_included_at,
         last_included_at,
         first_included_wall,
         last_included_wall,
-        first_batch_number,
-        last_batch_number,
+        first_slot_number,
+        last_slot_number,
     ) {
         let span_ms = last_instant.duration_since(first_instant).as_secs_f64() * 1000.0;
 
@@ -3152,26 +3211,23 @@ async fn perform_transfer_cycle(
         let first_ts = format_time_hhmmss_millis(first_wall);
         let last_ts = format_time_hhmmss_millis(last_wall);
         eprintln!(
-            "[cycle] First tx included in block {} at {}",
-            first_block, first_ts
+            "[cycle] First tx included in slot {} at {}",
+            first_slot, first_ts
         );
         eprintln!(
-            "[cycle] Last tx included in block {} at {}",
-            last_block, last_ts
+            "[cycle] Last tx included in slot {} at {}",
+            last_slot, last_ts
         );
         eprintln!(
-            "[cycle] Total span: {:.2} ms, {} blocks, {} total txs",
+            "[cycle] Total span: {:.2} ms, {} slots, {} total txs",
             span_ms,
-            batches.len(),
+            slots.len(),
             num_included
         );
 
-        // Per-block statistics
-        for (block_num, tx_count) in &batches {
-            eprintln!(
-                "[cycle] Block {} generated with {} txs.",
-                block_num, tx_count
-            );
+        // Per-slot statistics.
+        for (slot_num, tx_count) in &slots {
+            eprintln!("[cycle] Slot {} included {} txs.", slot_num, tx_count);
         }
     }
 
@@ -3303,7 +3359,7 @@ async fn perform_transfer_cycle(
     Ok(CycleSummary {
         num_transfers,
         num_included,
-        batches,
+        slots,
         avg_worker_ms,
         avg_sequencer_ms,
         avg_worker_proof_ms,

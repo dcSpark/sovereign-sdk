@@ -1,0 +1,11 @@
+---
+source: crates/full-node/sov-ledger-apis/tests/integration/main.rs
+expression: error
+---
+{
+  "details": {
+    "error": "Slot 0 has no predecessor"
+  },
+  "message": "Cannot calculate TPS for genesis slot",
+  "status": 400
+}

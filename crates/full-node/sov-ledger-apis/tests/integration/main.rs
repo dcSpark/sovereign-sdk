@@ -133,6 +133,84 @@ async fn get_finalized_slot_include_children() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn get_latest_slot_tps() {
+    let slot_tps = ledger_response_body(|client| async move {
+        client.get_latest_slot_tps().await.unwrap().into_inner()
+    })
+    .await;
+
+    insta::with_settings!({sort_maps => true}, {
+        insta::assert_json_snapshot!(&slot_tps);
+    });
+
+    let slot_number = slot_tps["slot_number"].as_u64().unwrap();
+    assert_json_eq!(
+        slot_tps,
+        ledger_response_body(move |client| async move {
+            client
+                .get_slot_tps_by_id(&IntOrHash::Integer(slot_number))
+                .await
+                .unwrap()
+                .into_inner()
+        })
+        .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_slot_tps_by_hash() {
+    let latest_slot = ledger_response_body(|client| async move {
+        client.get_latest_slot(None).await.unwrap().into_inner()
+    })
+    .await;
+    let latest_tps = ledger_response_body(|client| async move {
+        client.get_latest_slot_tps().await.unwrap().into_inner()
+    })
+    .await;
+
+    let slot_hash = types::Hash::from_str(latest_slot["hash"].as_str().unwrap()).unwrap();
+    assert_json_eq!(
+        latest_tps,
+        ledger_response_body(move |client| async move {
+            client
+                .get_slot_tps_by_id(&IntOrHash::Hash(slot_hash))
+                .await
+                .unwrap()
+                .into_inner()
+        })
+        .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_slot_tps_for_genesis_returns_bad_request() {
+    let ledger_service = LedgerTestService::new(LedgerTestServiceData::Complex)
+        .await
+        .unwrap();
+    let client = ledger_service.axum_client;
+
+    let error = client
+        .get_slot_tps_by_id(&IntOrHash::Integer(0))
+        .await
+        .unwrap_err();
+
+    let error = match error {
+        sov_api_spec::Error::ErrorResponse(response) => {
+            assert_eq!(response.status().as_u16(), 400);
+            response.into_inner()
+        }
+        other => panic!(
+            "Expected ErrorResponse for genesis TPS query, got: {:?}",
+            other
+        ),
+    };
+
+    insta::with_settings!({sort_maps => true}, {
+        insta::assert_json_snapshot!(error);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn get_batch() {
     let batch = ledger_response_body(|client| async move {
         client
