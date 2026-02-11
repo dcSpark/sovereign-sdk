@@ -21,7 +21,7 @@ use mcp_external::server::{McpSpec, McpWalletContext};
 use midnight_privacy::{note_commitment, Hash32};
 use rand::RngCore;
 use reqwest::Client as HttpClient;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sov_bank::TokenId;
 use sov_modules_api::Amount;
@@ -351,11 +351,9 @@ struct FlushSummary {
     results: Vec<FlushResultEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerTxState {
-    Pending,
-    Accepted,
-    Rejected,
+#[derive(Debug, Deserialize)]
+struct PendingHashesResponse {
+    tx_hashes: Vec<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -918,97 +916,31 @@ async fn collect_pending_hashes(state: &Arc<ServiceState>, limit: usize) -> Vec<
         .collect()
 }
 
-fn missing_requested_hashes(requested_tx_hashes: &[String], flush: &FlushSummary) -> Vec<String> {
-    let seen_hashes: HashSet<&str> = flush
-        .results
-        .iter()
-        .filter_map(|entry| entry.tx_hash.as_deref())
-        .collect();
-    requested_tx_hashes
-        .iter()
-        .filter(|tx_hash| !seen_hashes.contains(tx_hash.as_str()))
-        .cloned()
-        .collect()
-}
-
-fn sqlite_db_path_from_connection_string(connection_string: &str) -> Option<String> {
-    let stripped = connection_string.strip_prefix("sqlite://")?;
-    let (db_path, _) = stripped.split_once('?').unwrap_or((stripped, ""));
-    if db_path.is_empty() {
-        return None;
-    }
-    Some(db_path.to_string())
-}
-
-fn query_worker_tx_states_sqlite_sync(
-    db_path: &str,
-    tx_hashes: Vec<String>,
-) -> Result<HashMap<String, WorkerTxState>> {
-    if tx_hashes.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("Failed to open worker tx SQLite DB {}", db_path))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT transaction_state FROM worker_verified_transactions WHERE tx_hash = ?1 LIMIT 1",
-        )
-        .with_context(|| {
-            format!(
-                "Failed to prepare worker tx state query against worker_verified_transactions in {}",
-                db_path
-            )
-        })?;
-
-    let mut states = HashMap::with_capacity(tx_hashes.len());
-    for tx_hash in tx_hashes.into_iter() {
-        let raw_state: Option<String> = stmt
-            .query_row([tx_hash.as_str()], |row| row.get(0))
-            .optional()
-            .with_context(|| {
-                format!(
-                    "Failed to query worker transaction state for {} in {}",
-                    tx_hash, db_path
-                )
-            })?;
-
-        let Some(raw_state) = raw_state else {
-            continue;
-        };
-        let state = match raw_state.trim().to_ascii_lowercase().as_str() {
-            "pending" => WorkerTxState::Pending,
-            "accepted" => WorkerTxState::Accepted,
-            "rejected" => WorkerTxState::Rejected,
-            other => {
-                tracing::warn!(
-                    tx_hash,
-                    raw_state = other,
-                    "Unknown worker transaction state found in worker_verified_transactions; skipping"
-                );
-                continue;
-            }
-        };
-        states.insert(tx_hash, state);
-    }
-
-    Ok(states)
-}
-
-async fn fetch_worker_tx_states(
-    state: &Arc<ServiceState>,
-    tx_hashes: &[String],
-) -> Result<HashMap<String, WorkerTxState>> {
-    if tx_hashes.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let db_path = sqlite_db_path_from_connection_string(&state.cfg.da_connection_string)
-        .ok_or_else(|| anyhow!("DA_CONNECTION_STRING is not a sqlite:// URL"))?;
-    let tx_hashes = tx_hashes.to_vec();
-    tokio::task::spawn_blocking(move || query_worker_tx_states_sqlite_sync(&db_path, tx_hashes))
+async fn fetch_pending_hashes_from_verifier(state: &Arc<ServiceState>) -> Result<HashSet<String>> {
+    let url = format!(
+        "{}/midnight-privacy/pending_hashes",
+        state.verifier_url.trim_end_matches('/')
+    );
+    let resp = state
+        .http
+        .get(&url)
+        .send()
         .await
-        .context("Worker transaction state query task failed to join")?
+        .with_context(|| format!("GET {}", url))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "verifier pending_hashes failed (status={}): {}",
+            status,
+            body
+        );
+    }
+
+    let parsed: PendingHashesResponse =
+        serde_json::from_str(&body).context("Failed to parse verifier pending_hashes response")?;
+    Ok(parsed.tx_hashes.into_iter().collect())
 }
 
 async fn apply_flush_results(
@@ -1016,59 +948,13 @@ async fn apply_flush_results(
     requested_tx_hashes: &[String],
     flush: &FlushSummary,
 ) -> usize {
-    let mut outcomes_by_hash: HashMap<String, bool> = HashMap::new();
+    let mut accepted_hashes: HashSet<String> = HashSet::new();
     for entry in flush.results.iter() {
         let Some(tx_hash) = entry.tx_hash.as_ref() else {
             continue;
         };
-        outcomes_by_hash.insert(tx_hash.clone(), entry.accepted);
-    }
-
-    let missing_hashes = missing_requested_hashes(requested_tx_hashes, flush);
-    if !missing_hashes.is_empty() {
-        let worker_states = match fetch_worker_tx_states(state, &missing_hashes).await {
-            Ok(states) => Some(states),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    missing_hashes = missing_hashes.len(),
-                    "Failed to reconcile missing flush hashes against worker DB; treating them as stale"
-                );
-                None
-            }
-        };
-
-        let mut synthesized_accepted = 0usize;
-        let mut synthesized_not_accepted = 0usize;
-        let mut still_pending = 0usize;
-
-        for tx_hash in missing_hashes.into_iter() {
-            let state = worker_states
-                .as_ref()
-                .and_then(|states| states.get(&tx_hash))
-                .copied();
-            match state {
-                Some(WorkerTxState::Pending) => {
-                    still_pending += 1;
-                }
-                Some(WorkerTxState::Accepted) => {
-                    outcomes_by_hash.insert(tx_hash, true);
-                    synthesized_accepted += 1;
-                }
-                Some(WorkerTxState::Rejected) | None => {
-                    outcomes_by_hash.insert(tx_hash, false);
-                    synthesized_not_accepted += 1;
-                }
-            }
-        }
-
-        if synthesized_accepted > 0 || synthesized_not_accepted > 0 || still_pending > 0 {
-            tracing::warn!(
-                synthesized_accepted,
-                synthesized_not_accepted,
-                still_pending,
-                "Reconciled missing flush hashes against worker_verified_transactions"
-            );
+        if entry.accepted {
+            accepted_hashes.insert(tx_hash.clone());
         }
     }
 
@@ -1080,9 +966,10 @@ async fn apply_flush_results(
         }
     }
 
-    let mut cleared = 0usize;
-    for (tx_hash, accepted) in outcomes_by_hash.into_iter() {
-        let Some(&wallet_idx) = by_hash.get(&tx_hash) else {
+    let mut consumed = 0usize;
+    let mut advanced = 0usize;
+    for tx_hash in requested_tx_hashes.iter() {
+        let Some(&wallet_idx) = by_hash.get(tx_hash) else {
             continue;
         };
 
@@ -1090,15 +977,16 @@ async fn apply_flush_results(
         let Some(pending) = w.pending.clone() else {
             continue;
         };
-        if pending.tx_hash != tx_hash {
+        if pending.tx_hash != *tx_hash {
             continue;
         }
 
-        if accepted {
+        if accepted_hashes.contains(tx_hash) {
             w.current_note = Some(pending.next_note);
+            advanced += 1;
         }
         w.pending = None;
-        cleared += 1;
+        consumed += 1;
     }
 
     let ready_after = wallets.iter().filter(|w| w.pending.is_some()).count();
@@ -1107,9 +995,18 @@ async fn apply_flush_results(
     state
         .ready_proofs_count
         .store(ready_after, Ordering::Relaxed);
-    if cleared > 0 {
+    if consumed > 0 {
         request_pool_state_save(state);
     }
+
+    tracing::info!(
+        requested = requested_tx_hashes.len(),
+        flushed = flush.flushed,
+        consumed,
+        advanced,
+        ready_after,
+        "Applied flush results and consumed requested pending proofs"
+    );
 
     ready_after
 }
@@ -2535,23 +2432,10 @@ async fn load_pool_state_sqlite(db_path: &str) -> Result<Option<PersistedPoolSta
 }
 
 async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) -> Result<()> {
-    let pending_hashes: Vec<String> = {
-        let wallets = state.wallets.read().await;
-        wallets
-            .iter()
-            .filter_map(|w| w.pending.as_ref().map(|p| p.tx_hash.clone()))
-            .collect()
-    };
-    if pending_hashes.is_empty() {
-        return Ok(());
-    }
+    let pending_hashes = fetch_pending_hashes_from_verifier(state).await?;
 
-    let states = fetch_worker_tx_states(state, &pending_hashes).await?;
-
-    let mut moved_to_accepted = 0usize;
-    let mut cleared_rejected = 0usize;
-    let mut cleared_missing = 0usize;
     let mut kept_pending = 0usize;
+    let mut cleared_not_pending = 0usize;
 
     let mut wallets = state.wallets.write().await;
     for wallet in wallets.iter_mut() {
@@ -2559,23 +2443,11 @@ async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) ->
             continue;
         };
 
-        match states.get(&pending.tx_hash).copied() {
-            Some(WorkerTxState::Pending) => {
-                kept_pending += 1;
-            }
-            Some(WorkerTxState::Accepted) => {
-                wallet.current_note = Some(pending.next_note);
-                wallet.pending = None;
-                moved_to_accepted += 1;
-            }
-            Some(WorkerTxState::Rejected) => {
-                wallet.pending = None;
-                cleared_rejected += 1;
-            }
-            None => {
-                wallet.pending = None;
-                cleared_missing += 1;
-            }
+        if pending_hashes.contains(&pending.tx_hash) {
+            kept_pending += 1;
+        } else {
+            wallet.pending = None;
+            cleared_not_pending += 1;
         }
     }
 
@@ -2585,15 +2457,13 @@ async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) ->
     state
         .ready_proofs_count
         .store(ready_after, Ordering::Relaxed);
-    if moved_to_accepted > 0 || cleared_rejected > 0 || cleared_missing > 0 {
+    if cleared_not_pending > 0 {
         request_pool_state_save(state);
     }
 
     tracing::info!(
-        moved_to_accepted,
-        cleared_rejected,
-        cleared_missing,
         kept_pending,
+        cleared_not_pending,
         ready_after,
         "Reconciled restored pending proofs against worker_verified_transactions"
     );
@@ -2674,15 +2544,7 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
         .ready_proofs_count
         .store(ready_count, Ordering::Relaxed);
 
-    match reconcile_restored_pending_with_worker_db(state).await {
-        Ok(()) => {}
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Failed to reconcile restored pending proofs with worker DB; keeping restored pending set"
-            );
-        }
-    }
+    reconcile_restored_pending_with_worker_db(state).await?;
 
     let ready_count_after_reconcile = ready_proofs(state);
     tracing::info!(

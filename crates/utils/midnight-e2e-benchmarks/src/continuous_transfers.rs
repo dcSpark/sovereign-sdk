@@ -52,8 +52,9 @@ type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 const TREE_DEPTH: u8 = 16;
 const TREE_REBUILD_MAX_RETRIES: usize = 5;
 const TREE_REBUILD_RETRY_DELAY_MS: u64 = 500;
-const MISSING_NOTE_RETRY_MAX: usize = 10;
-const MISSING_NOTE_RETRY_DELAY_MS: u64 = 300;
+const NOTES_PAGE_LIMIT: usize = 1000;
+const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 5;
+const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 1000;
 
@@ -121,6 +122,9 @@ struct ContinuousConfig {
     prover_service_url: Option<String>,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
+    /// When true, explicitly flush queued worker txs via verifier `/midnight-privacy/flush`.
+    /// If false, the cycle relies on immediate submission mode.
+    flush_transactions: bool,
     continuous: bool,
     managed_mode: bool,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
@@ -211,6 +215,11 @@ impl ContinuousConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let flush_transactions = std::env::var("FLUSH_TRANSACTIONS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         let continuous = std::env::var("CONTINUOUS")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -239,6 +248,7 @@ impl ContinuousConfig {
             prover_service_url,
             max_concurrent_proofs,
             detailed_wallet_logs,
+            flush_transactions,
             continuous,
             managed_mode,
             max_cycles,
@@ -458,15 +468,6 @@ async fn start_managed_stack(
 }
 
 #[derive(Deserialize, Clone)]
-struct TreeState {
-    root: Vec<u8>,
-    next_position: u64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    depth: Option<u8>,
-}
-
-#[derive(Deserialize, Clone)]
 struct NoteInfo {
     position: u64,
     commitment: Vec<u8>,
@@ -482,19 +483,228 @@ struct NotesResp {
     count: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct LedgerSlotResp {
+    number: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NotesSnapshot {
+    root: Hash32,
+    next_position: u64,
+}
+
+#[derive(Debug)]
+struct NotesFetch {
+    snapshot: NotesSnapshot,
+    notes: Vec<(u64, Hash32)>,
+}
+
+fn notes_snapshot_from_response(resp: &NotesResp, endpoint: &str) -> Result<NotesSnapshot> {
+    let root_bytes = resp.current_root.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Notes endpoint {} response missing current_root snapshot metadata",
+            endpoint
+        )
+    })?;
+    anyhow::ensure!(
+        root_bytes.len() == 32,
+        "Notes endpoint {} returned current_root with unexpected length {}",
+        endpoint,
+        root_bytes.len()
+    );
+    let mut root = [0u8; 32];
+    root.copy_from_slice(root_bytes);
+
+    let next_position = resp.count.ok_or_else(|| {
+        anyhow!(
+            "Notes endpoint {} response missing count snapshot metadata",
+            endpoint
+        )
+    })?;
+
+    Ok(NotesSnapshot {
+        root,
+        next_position,
+    })
+}
+
+fn append_slot_number_query(endpoint: &str, slot_number: u64) -> String {
+    if endpoint.contains('?') {
+        format!("{endpoint}&slot_number={slot_number}")
+    } else {
+        format!("{endpoint}?slot_number={slot_number}")
+    }
+}
+
+async fn fetch_latest_slot_number(client: &NodeClient) -> Result<u64> {
+    let latest_slot: LedgerSlotResp = client
+        .query_rest_endpoint("/ledger/slots/finalized")
+        .await
+        .context("Failed to query latest slot number from /ledger/slots/finalized")?;
+    Ok(latest_slot.number)
+}
+
+async fn fetch_notes_for_rebuild(
+    client: &NodeClient,
+    start_offset: usize,
+    target_leaves: Option<u64>,
+    expected_snapshot: Option<NotesSnapshot>,
+    slot_number: u64,
+) -> Result<NotesFetch> {
+    let mut out: Vec<(u64, Hash32)> = Vec::new();
+    let mut offset = start_offset;
+    let mut target_leaves = target_leaves.or(expected_snapshot.map(|s| s.next_position));
+    let mut snapshot = expected_snapshot;
+
+    loop {
+        if let Some(target) = target_leaves {
+            let target_usize = usize::try_from(target).with_context(|| {
+                format!(
+                    "Notes snapshot next_position {} does not fit in usize on this platform",
+                    target
+                )
+            })?;
+            if offset >= target_usize {
+                break;
+            }
+        }
+
+        let endpoint = format!(
+            "/modules/midnight-privacy/notes?limit={}&offset={}",
+            NOTES_PAGE_LIMIT, offset
+        );
+        let endpoint = append_slot_number_query(&endpoint, slot_number);
+
+        let mut empty_retries = 0usize;
+        let resp: NotesResp = loop {
+            let resp: NotesResp = client
+                .query_rest_endpoint(&endpoint)
+                .await
+                .with_context(|| format!("Failed to query notes batch at offset {}", offset))?;
+
+            let page_snapshot = notes_snapshot_from_response(&resp, &endpoint)?;
+
+            if let Some(expected) = snapshot {
+                anyhow::ensure!(
+                    page_snapshot.next_position >= expected.next_position,
+                    "Notes snapshot rewound while fetching pages at offset {}: expected_count={} got_count={}",
+                    offset,
+                    expected.next_position,
+                    page_snapshot.next_position
+                );
+                if page_snapshot != expected {
+                    eprintln!(
+                        "[cycle] Notes snapshot advanced during paged fetch at offset {} (expected_count={}, got_count={})",
+                        offset, expected.next_position, page_snapshot.next_position
+                    );
+                }
+            } else {
+                snapshot = Some(page_snapshot);
+            }
+
+            if target_leaves.is_none() {
+                target_leaves = Some(page_snapshot.next_position);
+            }
+            let target = target_leaves.expect("target_leaves is set");
+            let target_usize = usize::try_from(target).with_context(|| {
+                format!(
+                    "Notes snapshot next_position {} does not fit in usize on this platform",
+                    target
+                )
+            })?;
+
+            if !resp.notes.is_empty() || offset >= target_usize {
+                break resp;
+            }
+
+            if empty_retries >= NOTES_EMPTY_PAGE_MAX_RETRIES {
+                bail!(
+                    "Notes endpoint returned empty batch at offset {} after {} retries (target_leaves={})",
+                    offset,
+                    NOTES_EMPTY_PAGE_MAX_RETRIES,
+                    target
+                );
+            }
+
+            empty_retries += 1;
+            eprintln!(
+                "[cycle] Empty notes page at offset {} (target={}), retry {}/{} after {}ms",
+                offset,
+                target,
+                empty_retries,
+                NOTES_EMPTY_PAGE_MAX_RETRIES,
+                NOTES_EMPTY_PAGE_RETRY_DELAY_MS
+            );
+            sleep(Duration::from_millis(NOTES_EMPTY_PAGE_RETRY_DELAY_MS)).await;
+        };
+
+        let batch_len = resp.notes.len();
+        let target = target_leaves.expect("target_leaves is set");
+        for n in resp.notes {
+            if n.position >= target {
+                continue;
+            }
+            if n.commitment.len() != 32 {
+                bail!(
+                    "Note commitment has unexpected length {} at position {}",
+                    n.commitment.len(),
+                    n.position
+                );
+            }
+            let mut cm = [0u8; 32];
+            cm.copy_from_slice(&n.commitment);
+            out.push((n.position, cm));
+        }
+
+        if batch_len == 0 {
+            break;
+        }
+        offset += batch_len;
+    }
+
+    let snapshot =
+        snapshot.ok_or_else(|| anyhow!("Failed to read notes snapshot metadata from /notes"))?;
+    let target = target_leaves.unwrap_or(snapshot.next_position);
+    let expected_count_u64 = target.saturating_sub(start_offset as u64);
+    let expected_count = usize::try_from(expected_count_u64).with_context(|| {
+        format!(
+            "Expected note count {} does not fit in usize on this platform",
+            expected_count_u64
+        )
+    })?;
+    anyhow::ensure!(
+        out.len() == expected_count,
+        "Fetched {} notes but expected {} (start_offset={}, target_leaves={})",
+        out.len(),
+        expected_count,
+        start_offset,
+        target
+    );
+
+    Ok(NotesFetch {
+        snapshot,
+        notes: out,
+    })
+}
+
 async fn fetch_note_positions(
     client: &NodeClient,
     detailed_wallet_logs: bool,
+    slot_number: Option<u64>,
 ) -> Result<HashMap<[u8; 32], u64>> {
     let mut pos_by_cm: HashMap<[u8; 32], u64> = HashMap::new();
     let batch_size = 1000;
     let mut offset = 0;
 
     loop {
-        let endpoint = format!(
+        let mut endpoint = format!(
             "/modules/midnight-privacy/notes?limit={}&offset={}",
             batch_size, offset
         );
+        if let Some(slot_number) = slot_number {
+            endpoint = append_slot_number_query(&endpoint, slot_number);
+        }
         let batch_resp: NotesResp = client
             .query_rest_endpoint(&endpoint)
             .await
@@ -647,7 +857,7 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={}",
+        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={} flush_transactions={}",
         config.num_wallets,
         config.wallet_offset,
         config.resync_nonces_each_cycle,
@@ -657,7 +867,8 @@ pub async fn run() -> Result<()> {
         config.transfer_amount,
         config.per_tx_delay_ms,
         config.cycle_delay_ms,
-        config.max_concurrent_proofs
+        config.max_concurrent_proofs,
+        config.flush_transactions
     );
 
     // Log if transfer_amount differs from deposit_amount (change notes will be created)
@@ -891,6 +1102,7 @@ pub async fn run() -> Result<()> {
             config.deposit_amount,
             config.per_tx_delay_ms,
             config.detailed_wallet_logs,
+            config.flush_transactions,
         )
         .await?;
         let deposit_ms = deposit_start.elapsed().as_secs_f64() * 1000.0;
@@ -1193,6 +1405,7 @@ async fn perform_initial_deposits(
     deposit_amount: u128,
     per_tx_delay_ms: u64,
     detailed_wallet_logs: bool,
+    flush_transactions: bool,
 ) -> Result<()> {
     for (i, wallet) in wallets.iter_mut().enumerate() {
         let amount: u128 = deposit_amount;
@@ -1261,22 +1474,26 @@ async fn perform_initial_deposits(
         }
     }
 
-    // Flush any queued deposits to the sequencer to ensure inclusion before proceeding.
-    let flush_endpoint = format!(
-        "{}/midnight-privacy/flush",
-        verifier_url.trim_end_matches('/')
-    );
-    let flush_resp = http
-        .post(&flush_endpoint)
-        .send()
-        .await
-        .context("Deposit flush request failed")?;
-    let status = flush_resp.status();
-    let body = flush_resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("Deposit flush failed with status {}: {}", status, body);
+    if flush_transactions {
+        // Flush queued deposits only when explicitly requested.
+        let flush_endpoint = format!(
+            "{}/midnight-privacy/flush",
+            verifier_url.trim_end_matches('/')
+        );
+        let flush_resp = http
+            .post(&flush_endpoint)
+            .send()
+            .await
+            .context("Deposit flush request failed")?;
+        let status = flush_resp.status();
+        let body = flush_resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("Deposit flush failed with status {}: {}", status, body);
+        } else if detailed_wallet_logs {
+            eprintln!("[deposit] flushed queued deposits via {}", flush_endpoint);
+        }
     } else if detailed_wallet_logs {
-        eprintln!("[deposit] flushed queued deposits via {}", flush_endpoint);
+        eprintln!("[deposit] FLUSH_TRANSACTIONS not set; skipping deposit flush");
     }
 
     // Wait for all deposit notes to be indexed in the tree before returning.
@@ -1307,7 +1524,8 @@ async fn perform_initial_deposits(
         let mut pending: HashSet<[u8; 32]> = expected_commitments.iter().copied().collect();
 
         while !pending.is_empty() && Instant::now() < sync_deadline {
-            let fresh_positions = fetch_note_positions(client, false).await?;
+            let finalized_slot = fetch_latest_slot_number(client).await?;
+            let fresh_positions = fetch_note_positions(client, false, Some(finalized_slot)).await?;
             pending.retain(|cm| !fresh_positions.contains_key(cm));
 
             if !pending.is_empty() {
@@ -1460,137 +1678,150 @@ async fn perform_transfer_cycle(
     let mut pos_by_cm = std::mem::take(cached_pos_by_cm);
     let mut cached_root_val = *cached_root;
     let mut cached_next_pos = *cached_next_position;
-    let (_state, _state_root) = {
-        let mut attempt_result = None;
-        let mut used_fallback = false;
+    {
+        let mut rebuild_succeeded = false;
 
         for attempt in 0..TREE_REBUILD_MAX_RETRIES {
             attempts_made = attempt + 1;
+            let is_last_attempt = attempt + 1 == TREE_REBUILD_MAX_RETRIES;
 
-            // On the last attempt, use bomb-proof full rebuild
-            let force_full_rebuild = attempt == TREE_REBUILD_MAX_RETRIES - 1;
-            if force_full_rebuild && !used_fallback {
-                eprintln!(
-                    "[cycle] Incremental rebuild failed, falling back to full rebuild from scratch"
-                );
-                mt = MerkleTree::new(TREE_DEPTH);
-                pos_by_cm.clear();
-                cached_next_pos = 0;
-                cached_root_val = None;
-                used_fallback = true;
-            }
-
-            let state_attempt: TreeState = client
-                .query_rest_endpoint("/modules/midnight-privacy/tree/state")
-                .await
-                .context("Failed to query tree state")?;
-
-            anyhow::ensure!(
-                state_attempt.root.len() == 32,
-                "Tree state root has unexpected length: {}",
-                state_attempt.root.len()
-            );
-            let mut attempt_root = [0u8; 32];
-            attempt_root.copy_from_slice(&state_attempt.root);
-
-            let mut reuse_cache = false;
-            if let Some(root) = cached_root_val {
-                if root == attempt_root && cached_next_pos == state_attempt.next_position {
-                    reuse_cache = true;
-                } else if state_attempt.next_position < cached_next_pos {
-                    // Chain rewound; drop cache and rebuild from scratch.
-                    mt = MerkleTree::new(TREE_DEPTH);
-                    pos_by_cm.clear();
-                    cached_next_pos = 0;
-                }
-            }
-
-            if !reuse_cache {
-                // Grow once to the target size to amortize growth cost.
-                let target_leaves = state_attempt.next_position as usize;
-                if target_leaves > mt.len() {
-                    mt.grow_to_fit(target_leaves);
-                }
-
-                // Fetch notes and use current_root from response for atomic consistency.
-                // This avoids race conditions between separate /tree/state and /notes calls.
-                let batch_size = 1000;
-                let mut offset = cached_next_pos as usize;
-                let mut last_current_root: Option<Vec<u8>> = None;
-
-                while offset < target_leaves {
-                    let endpoint = format!(
-                        "/modules/midnight-privacy/notes?limit={}&offset={}",
-                        batch_size, offset
+            let slot_number = match fetch_latest_slot_number(client).await {
+                Ok(slot) => slot,
+                Err(err) => {
+                    if is_last_attempt {
+                        return Err(err.context("Failed to query latest slot for tree rebuild"));
+                    }
+                    eprintln!(
+                        "[cycle] Failed to fetch latest slot for tree rebuild (attempt {}/{}): {}",
+                        attempt + 1,
+                        TREE_REBUILD_MAX_RETRIES,
+                        err
                     );
-                    let batch_resp: NotesResp = client
-                        .query_rest_endpoint(&endpoint)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to query notes batch at offset {}", offset)
-                        })?;
-
-                    if batch_resp.notes.is_empty() {
-                        break;
-                    }
-
-                    // Capture current_root from the response for atomic consistency
-                    if let Some(ref root) = batch_resp.current_root {
-                        last_current_root = Some(root.clone());
-                    }
-
-                    for n in batch_resp.notes.iter() {
-                        if n.commitment.len() == 32 {
-                            let mut cm = [0u8; 32];
-                            cm.copy_from_slice(&n.commitment);
-                            if n.position as usize >= mt.len() {
-                                mt.grow_to_fit(n.position as usize + 1);
-                            }
-                            mt.set_leaf(n.position as usize, cm);
-                            pos_by_cm.insert(cm, n.position);
-                        }
-                    }
-
-                    let len = batch_resp.notes.len();
-                    offset += len;
+                    sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
+                    continue;
                 }
+            };
 
-                // Prefer using current_root from notes response (atomic with notes data)
-                // Fall back to state_attempt.root if not available
-                if let Some(ref api_root) = last_current_root {
-                    if api_root.len() == 32 {
-                        attempt_root.copy_from_slice(api_root);
+            let mut notes_fetch = match fetch_notes_for_rebuild(
+                client,
+                cached_next_pos as usize,
+                None,
+                None,
+                slot_number,
+            )
+            .await
+            {
+                Ok(fetch) => fetch,
+                Err(err) => {
+                    if is_last_attempt {
+                        return Err(err.context(format!(
+                            "Failed to fetch notes snapshot for tree rebuild at slot {}",
+                            slot_number
+                        )));
                     }
+                    eprintln!(
+                        "[cycle] Failed to fetch notes snapshot at slot {} (attempt {}/{}): {}",
+                        slot_number,
+                        attempt + 1,
+                        TREE_REBUILD_MAX_RETRIES,
+                        err
+                    );
+                    sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
+                    continue;
                 }
+            };
+
+            let snapshot = notes_fetch.snapshot;
+            let cache_matches_snapshot =
+                cached_root_val == Some(snapshot.root) && cached_next_pos == snapshot.next_position;
+            if cache_matches_snapshot {
+                rebuild_succeeded = true;
+                break;
             }
 
-            if mt.root().as_slice() == attempt_root.as_slice() {
-                // Update state_attempt.root to match attempt_root for consistency
-                let mut final_state = state_attempt.clone();
-                final_state.root = attempt_root.to_vec();
-                cached_root_val = Some(attempt_root);
-                cached_next_pos = final_state.next_position;
-                attempt_result = Some((final_state, attempt_root));
-                break;
-            } else {
-                // Roots don't match - reset cache for next attempt
+            let cache_needs_reset = snapshot.next_position < cached_next_pos
+                || (cached_next_pos == snapshot.next_position
+                    && cached_root_val != Some(snapshot.root));
+            if cache_needs_reset {
                 eprintln!(
-                    "[cycle] Tree root mismatch on attempt {}: rebuilt={} vs expected={}",
-                    attempt + 1,
-                    hex::encode(mt.root()),
-                    hex::encode(&attempt_root)
+                    "[cycle] Notes snapshot diverged from cached tree (cached_next={} snapshot_next={}); rebuilding from scratch",
+                    cached_next_pos,
+                    snapshot.next_position
                 );
                 mt = MerkleTree::new(TREE_DEPTH);
                 pos_by_cm.clear();
                 cached_next_pos = 0;
                 cached_root_val = None;
-                sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
-                continue;
+
+                notes_fetch = match fetch_notes_for_rebuild(
+                    client,
+                    0,
+                    Some(snapshot.next_position),
+                    Some(snapshot),
+                    slot_number,
+                )
+                .await
+                {
+                    Ok(fetch) => fetch,
+                    Err(err) => {
+                        if is_last_attempt {
+                            return Err(err.context(format!(
+                                "Failed to rebuild notes from scratch at slot {}",
+                                slot_number
+                            )));
+                        }
+                        eprintln!(
+                            "[cycle] Failed to rebuild notes from scratch at slot {} (attempt {}/{}): {}",
+                            slot_number,
+                            attempt + 1,
+                            TREE_REBUILD_MAX_RETRIES,
+                            err
+                        );
+                        sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
+                        continue;
+                    }
+                };
             }
+
+            let target_leaves = notes_fetch.snapshot.next_position as usize;
+            if target_leaves > mt.len() {
+                mt.grow_to_fit(target_leaves);
+            }
+            for (position, cm) in notes_fetch.notes {
+                if position as usize >= mt.len() {
+                    mt.grow_to_fit(position as usize + 1);
+                }
+                mt.set_leaf(position as usize, cm);
+                pos_by_cm.insert(cm, position);
+            }
+
+            let expected_root = notes_fetch.snapshot.root;
+            if mt.root().as_slice() == expected_root.as_slice() {
+                cached_root_val = Some(expected_root);
+                cached_next_pos = notes_fetch.snapshot.next_position;
+                rebuild_succeeded = true;
+                break;
+            }
+
+            eprintln!(
+                "[cycle] Tree root mismatch on attempt {}: rebuilt={} vs expected={}",
+                attempt + 1,
+                hex::encode(mt.root()),
+                hex::encode(expected_root)
+            );
+            mt = MerkleTree::new(TREE_DEPTH);
+            pos_by_cm.clear();
+            cached_next_pos = 0;
+            cached_root_val = None;
+            sleep(Duration::from_millis(TREE_REBUILD_RETRY_DELAY_MS)).await;
         }
 
-        attempt_result.expect("Tree rebuild attempt must succeed or bail")
-    };
+        anyhow::ensure!(
+            rebuild_succeeded,
+            "Tree rebuild failed after {} attempts",
+            TREE_REBUILD_MAX_RETRIES
+        );
+    }
     let tree_rebuild_phase_elapsed = tree_rebuild_phase_start.elapsed();
     eprintln!(
         "[cycle] tree rebuild finished in {:.2} ms after {} attempt(s)",
@@ -1668,19 +1899,8 @@ async fn perform_transfer_cycle(
             cms.push(cm);
         }
 
-        let mut positions: Vec<Option<u64>> =
+        let positions: Vec<Option<u64>> =
             cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
-        if positions.iter().any(|p| p.is_none()) {
-            // Retry with fresh note fetches and small waits; useful when the tree has just advanced.
-            for _attempt in 0..MISSING_NOTE_RETRY_MAX {
-                sleep(Duration::from_millis(MISSING_NOTE_RETRY_DELAY_MS)).await;
-                pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
-                positions = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
-                if positions.iter().all(|p| p.is_some()) {
-                    break;
-                }
-            }
-        }
 
         if positions.iter().any(|p| p.is_none()) {
             eprintln!(
@@ -2753,6 +2973,9 @@ async fn perform_transfer_cycle(
         "[cycle] Submitting {} transfers to verifier...",
         transfer_txs_b64.len()
     );
+    if !config.continuous {
+        wait_for_c_to_continue("[cycle] Ready to submit transactions to worker.", config).ok();
+    }
 
     // Track per-tx worker processing metrics (from verifier)
     let transfer_submit_start = Instant::now();
@@ -2892,27 +3115,6 @@ async fn perform_transfer_cycle(
         transfer_submit_ms,
         transfer_submit_ms / transfer_hashes.len() as f64
     );
-    // Interactive gate before flushing to the sequencer.
-    // In continuous mode, skip this pause to reduce anchor staleness.
-    if !config.continuous {
-        wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
-    }
-    let flush_start = Instant::now();
-    let resp = http
-        .post(format!("{}/midnight-privacy/flush", verifier_url))
-        .send()
-        .await
-        .context("Submit to sequencer request failed")?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "Submit to sequencer endpoint returned status {}: {}",
-            status,
-            body
-        );
-    }
-    let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
 
     #[derive(Deserialize, Clone)]
     struct SeqBreakdown {
@@ -2953,90 +3155,118 @@ async fn perform_transfer_cycle(
         results: Vec<FlushResultEntry>,
     }
 
-    let flush: FlushSummary =
-        serde_json::from_str(&body).context("Failed to parse submit to sequencer JSON response")?;
-    if config.detailed_wallet_logs {
-        eprintln!(
-            "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
-            flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
-        );
-    } else {
-        let avg_ms = if flush.flushed > 0 {
-            flush_elapsed_ms / flush.flushed as f64
-        } else {
-            0.0
-        };
-        let flush_tps = if flush_elapsed_ms > 0.0 {
-            flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
-            flush_elapsed_ms, avg_ms, flush_tps
-        );
-    }
-
-    // Track per-tx sequencer times and breakdown for this cycle
+    // Track per-tx sequencer times and breakdown for this cycle.
     let mut sequencer_times_ms: HashMap<String, f64> = HashMap::new();
     let mut sequencer_metrics_by_hash: HashMap<String, SeqBreakdown> = HashMap::new();
     let mut rejected_by_hash: HashMap<String, String> = HashMap::new();
     let mut anchor_rejects = 0usize;
-    for entry in flush.results {
-        if let Some(hash) = entry.tx_hash {
-            if !entry.accepted {
-                let reason = entry
-                    .error
-                    .clone()
-                    .or_else(|| entry.response.as_ref().map(|v| v.to_string()))
-                    .unwrap_or_else(|| "unknown rejection".to_string());
-                if reason.to_ascii_lowercase().contains("invalid anchor root") {
-                    anchor_rejects += 1;
+
+    if config.flush_transactions {
+        // Interactive gate before flushing to the sequencer.
+        // In continuous mode, skip this pause to reduce anchor staleness.
+        if !config.continuous {
+            wait_for_c_to_continue("[cycle] Ready to submit to sequencer.", config).ok();
+        }
+
+        let flush_start = Instant::now();
+        let resp = http
+            .post(format!("{}/midnight-privacy/flush", verifier_url))
+            .send()
+            .await
+            .context("Submit to sequencer request failed")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Submit to sequencer endpoint returned status {}: {}",
+                status,
+                body
+            );
+        }
+        let flush_elapsed_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
+
+        let flush: FlushSummary = serde_json::from_str(&body)
+            .context("Failed to parse submit to sequencer JSON response")?;
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "[cycle] Submit to sequencer complete. flushed={} accepted={} rejected={} latency_ms={:.2}",
+                flush.flushed, flush.accepted, flush.rejected, flush_elapsed_ms
+            );
+        } else {
+            let avg_ms = if flush.flushed > 0 {
+                flush_elapsed_ms / flush.flushed as f64
+            } else {
+                0.0
+            };
+            let flush_tps = if flush_elapsed_ms > 0.0 {
+                flush.flushed as f64 / (flush_elapsed_ms / 1000.0)
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[cycle] Submit to sequencer complete in {:.2} ms (avg {:.2} ms, {:.2} tps)",
+                flush_elapsed_ms, avg_ms, flush_tps
+            );
+        }
+
+        for entry in flush.results {
+            if let Some(hash) = entry.tx_hash {
+                if !entry.accepted {
+                    let reason = entry
+                        .error
+                        .clone()
+                        .or_else(|| entry.response.as_ref().map(|v| v.to_string()))
+                        .unwrap_or_else(|| "unknown rejection".to_string());
+                    if reason.to_ascii_lowercase().contains("invalid anchor root") {
+                        anchor_rejects += 1;
+                    }
+                    rejected_by_hash.insert(hash.clone(), reason);
                 }
-                rejected_by_hash.insert(hash.clone(), reason);
-            }
-            if let Some(b) = entry.sequencer_breakdown {
-                let total_ms = b.total_ms.unwrap_or(0.0);
-                let decode_ms = b.decode_ms.unwrap_or(0.0);
-                let wrap_ms = b.wrap_ms.unwrap_or(0.0);
-                let submit_ms = b.submit_ms.unwrap_or(0.0);
-                let await_ms = b.await_ms.unwrap_or(0.0);
-                let stf_str = b
-                    .stf_execution_ms
-                    .map(|v| format!("{:.2}", v))
-                    .unwrap_or_else(|| "n/a".to_string());
-                if config.detailed_wallet_logs {
-                    eprintln!(
-                        "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
-                        hash,
-                        total_ms,
-                        decode_ms,
-                        wrap_ms,
-                        submit_ms,
-                        await_ms,
-                        stf_str,
-                    );
+                if let Some(b) = entry.sequencer_breakdown {
+                    let total_ms = b.total_ms.unwrap_or(0.0);
+                    let decode_ms = b.decode_ms.unwrap_or(0.0);
+                    let wrap_ms = b.wrap_ms.unwrap_or(0.0);
+                    let submit_ms = b.submit_ms.unwrap_or(0.0);
+                    let await_ms = b.await_ms.unwrap_or(0.0);
+                    let stf_str = b
+                        .stf_execution_ms
+                        .map(|v| format!("{:.2}", v))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    if config.detailed_wallet_logs {
+                        eprintln!(
+                            "    [timing][sequencer] tx={} total={:.2} decode={:.2} wrap={:.2} submit={:.2} await={:.2} stf={}",
+                            hash,
+                            total_ms,
+                            decode_ms,
+                            wrap_ms,
+                            submit_ms,
+                            await_ms,
+                            stf_str,
+                        );
+                    }
+                    sequencer_times_ms.insert(hash.clone(), total_ms);
+                    sequencer_metrics_by_hash.insert(hash, b);
+                } else if let Some(ms) = entry.sequencer_ms {
+                    if config.detailed_wallet_logs {
+                        eprintln!("    [timing][sequencer] tx={} total_ms={:.2}", hash, ms);
+                    }
+                    sequencer_times_ms.insert(hash, ms);
                 }
-                sequencer_times_ms.insert(hash.clone(), total_ms);
-                sequencer_metrics_by_hash.insert(hash, b);
-            } else if let Some(ms) = entry.sequencer_ms {
-                if config.detailed_wallet_logs {
-                    eprintln!("    [timing][sequencer] tx={} total_ms={:.2}", hash, ms);
-                }
-                sequencer_times_ms.insert(hash, ms);
             }
         }
-    }
-    if !rejected_by_hash.is_empty() {
-        eprintln!(
-            "[cycle] sequencer rejected {} transfer(s) during flush{}",
-            rejected_by_hash.len(),
-            if anchor_rejects > 0 {
-                format!(" (invalid_anchor_root={})", anchor_rejects)
-            } else {
-                String::new()
-            }
-        );
+        if !rejected_by_hash.is_empty() {
+            eprintln!(
+                "[cycle] sequencer rejected {} transfer(s) during flush{}",
+                rejected_by_hash.len(),
+                if anchor_rejects > 0 {
+                    format!(" (invalid_anchor_root={})", anchor_rejects)
+                } else {
+                    String::new()
+                }
+            );
+        }
+    } else {
+        eprintln!("[cycle] FLUSH_TRANSACTIONS not set; skipping /midnight-privacy/flush");
     }
 
     // After flush, verify inclusion and collect per-slot statistics and timing.
@@ -3049,8 +3279,8 @@ async fn perform_transfer_cycle(
     let mut last_included_at: Option<Instant> = None;
     let mut first_included_wall: Option<SystemTime> = None;
     let mut last_included_wall: Option<SystemTime> = None;
-    let mut first_slot_number: Option<u64> = None;
-    let mut last_slot_number: Option<u64> = None;
+    let mut min_slot_number: Option<u64> = None;
+    let mut max_slot_number: Option<u64> = None;
 
     // Aggregate worker / sequencer timing for this cycle
     let mut worker_sum_ms = 0.0f64;
@@ -3122,11 +3352,13 @@ async fn perform_transfer_cycle(
                     if first_included_at.is_none() {
                         first_included_at = Some(now_instant);
                         first_included_wall = Some(now_wall);
-                        first_slot_number = Some(slot_number);
                     }
                     last_included_at = Some(now_instant);
                     last_included_wall = Some(now_wall);
-                    last_slot_number = Some(slot_number);
+                    min_slot_number =
+                        Some(min_slot_number.map_or(slot_number, |min| min.min(slot_number)));
+                    max_slot_number =
+                        Some(max_slot_number.map_or(slot_number, |max| max.max(slot_number)));
                     *slots.entry(slot_number).or_insert(0) += 1;
                     num_included += 1;
                     included_hashes.push(hash_hex.clone());
@@ -3185,15 +3417,15 @@ async fn perform_transfer_cycle(
         Some(last_instant),
         Some(first_wall),
         Some(last_wall),
-        Some(first_slot),
-        Some(last_slot),
+        Some(min_slot),
+        Some(max_slot),
     ) = (
         first_included_at,
         last_included_at,
         first_included_wall,
         last_included_wall,
-        first_slot_number,
-        last_slot_number,
+        min_slot_number,
+        max_slot_number,
     ) {
         let span_ms = last_instant.duration_since(first_instant).as_secs_f64() * 1000.0;
 
@@ -3210,17 +3442,13 @@ async fn perform_transfer_cycle(
 
         let first_ts = format_time_hhmmss_millis(first_wall);
         let last_ts = format_time_hhmmss_millis(last_wall);
+        eprintln!("[cycle] First inclusion observed at {}", first_ts);
+        eprintln!("[cycle] Last inclusion observed at {}", last_ts);
         eprintln!(
-            "[cycle] First tx included in slot {} at {}",
-            first_slot, first_ts
-        );
-        eprintln!(
-            "[cycle] Last tx included in slot {} at {}",
-            last_slot, last_ts
-        );
-        eprintln!(
-            "[cycle] Total span: {:.2} ms, {} slots, {} total txs",
+            "[cycle] Total span: {:.2} ms, slots {}..{} ({} slots), {} total txs",
             span_ms,
+            min_slot,
+            max_slot,
             slots.len(),
             num_included
         );
@@ -3275,7 +3503,8 @@ async fn perform_transfer_cycle(
         let mut pending: HashSet<Hash32> = expected_output_commitments.iter().copied().collect();
 
         while !pending.is_empty() && Instant::now() < sync_deadline {
-            let fresh_positions = fetch_note_positions(client, false).await?;
+            let finalized_slot = fetch_latest_slot_number(client).await?;
+            let fresh_positions = fetch_note_positions(client, false, Some(finalized_slot)).await?;
             pending.retain(|cm| !fresh_positions.contains_key(cm));
 
             if !pending.is_empty() {
@@ -3292,8 +3521,6 @@ async fn perform_transfer_cycle(
                     sync_elapsed.as_secs_f64() * 1000.0
                 );
             }
-            // Update the cached position map with fresh data
-            pos_by_cm = fetch_note_positions(client, config.detailed_wallet_logs).await?;
         } else {
             eprintln!(
                 "[cycle] WARNING: {} of {} output notes not indexed after {:.2}s timeout",
