@@ -1411,9 +1411,9 @@ fn append_slot_number_query(endpoint: &str, slot_number: u64) -> String {
 
 async fn fetch_latest_slot_number(provider: &Provider) -> Result<u64> {
     let latest_slot: LedgerSlotResp = provider
-        .query_rest_endpoint("/ledger/slots/finalized")
+        .query_rest_endpoint("/ledger/slots/latest")
         .await
-        .context("Failed to query latest slot number from /ledger/slots/finalized")?;
+        .context("Failed to query latest slot number from /ledger/slots/latest")?;
     Ok(latest_slot.number)
 }
 
