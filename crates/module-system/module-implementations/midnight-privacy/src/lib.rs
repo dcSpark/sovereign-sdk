@@ -42,7 +42,9 @@ use sov_modules_api::{
 };
 use std::collections::VecDeque;
 
-pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, PendingRootKey, RootKey};
+pub use crate::hash::{
+    Hash32, MerkleNodeKey, PendingCommitmentKey, PendingNullifierKey, PendingRootKey, RootKey,
+};
 
 /// MidnightPrivacy module: A privacy-preserving shielded pool using Ligero ZK proofs.
 ///
@@ -73,9 +75,13 @@ pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, Pending
 /// parallel transactions while maintaining security.
 ///
 /// # Module State
-/// - `commitment_tree`: Merkle tree of note commitments
+/// - `commitment_nodes`: Sparse Merkle nodes of note commitments
+/// - `commitment_tree_depth`: Current depth of the commitment tree
+/// - `commitment_root`: Current commitment tree root
 /// - `next_position`: Next available position in the commitment tree
-/// - `nullifier_tree`: Merkle tree of spent nullifiers (Aztec-style dual-tree design)
+/// - `nullifier_nodes`: Sparse Merkle nodes of spent nullifiers
+/// - `nullifier_tree_depth`: Current depth of the nullifier tree
+/// - `nullifier_root`: Current nullifier tree root
 /// - `next_nullifier_position`: Next available position in the nullifier tree
 /// - `nullifier_set`: Set of used nullifiers (prevents double-spending, O(1) lookup)
 /// - `recent_roots`: Recent Merkle roots (anchor window for fast mempool checks)
@@ -103,20 +109,36 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[id]
     pub id: ModuleId,
 
-    /// Merkle tree of note commitments.
+    /// Sparse nodes of note commitments Merkle tree.
     #[state]
-    pub commitment_tree: StateValue<MerkleTree>,
+    pub commitment_nodes: StateMap<MerkleNodeKey, Hash32>,
+
+    /// Current depth of the commitment tree.
+    #[state]
+    pub commitment_tree_depth: StateValue<u8>,
+
+    /// Current root of the commitment tree.
+    #[state]
+    pub commitment_root: StateValue<Hash32>,
 
     /// Next available position in the commitment tree.
     #[state]
     pub next_position: StateValue<u64>,
 
-    /// Merkle tree of spent nullifiers (Aztec-style dual-tree design).
+    /// Sparse nodes of spent nullifiers Merkle tree (Aztec-style dual-tree design).
     /// Append-only: each new nullifier is inserted at the next free position.
     /// This tree is maintained in parallel with `nullifier_set` for future
     /// IMT-based non-membership proofs in the circuit.
     #[state]
-    pub nullifier_tree: StateValue<MerkleTree>,
+    pub nullifier_nodes: StateMap<MerkleNodeKey, Hash32>,
+
+    /// Current depth of the nullifier tree.
+    #[state]
+    pub nullifier_tree_depth: StateValue<u8>,
+
+    /// Current root of the nullifier tree.
+    #[state]
+    pub nullifier_root: StateValue<Hash32>,
 
     /// Next available position in the nullifier tree.
     #[state]

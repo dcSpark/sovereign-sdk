@@ -1,9 +1,9 @@
 //! Defines REST queries exposed by the MidnightPrivacy module, along with the relevant types.
 
 use crate::hash::{
-    blacklist_pos_from_recipient, empty_blacklist_bucket_entries, recipient_from_pk_v2,
-    sparse_default_nodes, BlacklistNodeKey, Hash32, NullifierKey, RootKey, BLACKLIST_BUCKET_SIZE,
-    BLACKLIST_TREE_DEPTH,
+    blacklist_pos_from_recipient, empty_blacklist_bucket_entries, mt_default_nodes,
+    recipient_from_pk_v2, sparse_default_nodes, BlacklistNodeKey, Hash32, MerkleNodeKey,
+    NullifierKey, RootKey, BLACKLIST_BUCKET_SIZE, BLACKLIST_TREE_DEPTH,
 };
 use crate::types::PrivacyAddress;
 use crate::ValueMidnightPrivacy;
@@ -27,10 +27,21 @@ pub struct NullifierResponse {
 /// Response for listing all spent nullifiers
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct NullifiersListResponse {
-    /// List of all spent nullifiers
-    pub nullifiers: Vec<Hash32>,
+    /// List of spent nullifiers (by position)
+    pub nullifiers: Vec<NullifierInfoResponse>,
     /// Total count of spent nullifiers
-    pub count: usize,
+    pub count: u64,
+    /// Current nullifier tree root
+    pub current_root: Hash32,
+}
+
+/// Response item for spent nullifier listing
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct NullifierInfoResponse {
+    /// Position in the nullifier Merkle tree
+    pub position: u64,
+    /// Spent nullifier value
+    pub nullifier: Hash32,
 }
 
 /// Response for deposit/note information
@@ -224,11 +235,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         state: ApiState<S, Self>,
         mut accessor: ApiStateAccessor<S>,
     ) -> ApiResult<TreeStateResponse> {
-        let tree = state
-            .commitment_tree
+        let root = state
+            .commitment_root
             .get(&mut accessor)
             .unwrap_infallible()
-            .ok_or_else(|| errors::not_found_404("Tree", "commitment_tree"))?;
+            .ok_or_else(|| errors::not_found_404("Tree", "commitment_root"))?;
 
         let next_position = state
             .next_position
@@ -236,10 +247,16 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             .unwrap_infallible()
             .unwrap_or(0);
 
+        let depth = state
+            .commitment_tree_depth
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .ok_or_else(|| errors::not_found_404("Tree", "commitment_tree_depth"))?;
+
         Ok(TreeStateResponse {
-            root: tree.root(),
+            root,
             next_position,
-            depth: tree.depth(),
+            depth,
         }
         .into())
     }
@@ -250,11 +267,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         mut accessor: ApiStateAccessor<S>,
         params: AxumQuery<PaginationParams>,
     ) -> ApiResult<NotesListResponse> {
-        let tree = state
-            .commitment_tree
+        let root = state
+            .commitment_root
             .get(&mut accessor)
             .unwrap_infallible()
-            .ok_or_else(|| errors::not_found_404("Tree", "commitment_tree"))?;
+            .ok_or_else(|| errors::not_found_404("Tree", "commitment_root"))?;
+
+        let depth = state
+            .commitment_tree_depth
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .ok_or_else(|| errors::not_found_404("Tree", "commitment_tree_depth"))?;
+        let defaults = mt_default_nodes(depth);
+        let default_leaf = defaults[0];
 
         let next_position = state
             .next_position
@@ -279,7 +304,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 let end = start.saturating_sub(limit);
 
                 for pos in (end..start).rev() {
-                    let commitment = tree.leaf(pos);
+                    let commitment = state
+                        .commitment_nodes
+                        .get(
+                            &MerkleNodeKey {
+                                height: 0,
+                                index: pos as u64,
+                            },
+                            &mut accessor,
+                        )
+                        .unwrap_infallible()
+                        .unwrap_or(default_leaf);
                     notes.push(NoteInfoResponse {
                         position: pos as u64,
                         commitment,
@@ -290,7 +325,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             // Oldest first: iterate forwards from offset
             let end = (offset + limit).min(next_position as usize);
             for pos in offset..end {
-                let commitment = tree.leaf(pos);
+                let commitment = state
+                    .commitment_nodes
+                    .get(
+                        &MerkleNodeKey {
+                            height: 0,
+                            index: pos as u64,
+                        },
+                        &mut accessor,
+                    )
+                    .unwrap_infallible()
+                    .unwrap_or(default_leaf);
                 notes.push(NoteInfoResponse {
                     position: pos as u64,
                     commitment,
@@ -301,7 +346,95 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(NotesListResponse {
             notes,
             count: next_position,
-            current_root: tree.root(),
+            current_root: root,
+        }
+        .into())
+    }
+
+    /// Get all spent nullifiers (paginated)
+    async fn route_list_nullifiers(
+        state: ApiState<S, Self>,
+        mut accessor: ApiStateAccessor<S>,
+        params: AxumQuery<PaginationParams>,
+    ) -> ApiResult<NullifiersListResponse> {
+        let root = state
+            .nullifier_root
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .ok_or_else(|| errors::not_found_404("Tree", "nullifier_root"))?;
+
+        let depth = state
+            .nullifier_tree_depth
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .ok_or_else(|| errors::not_found_404("Tree", "nullifier_tree_depth"))?;
+        let defaults = mt_default_nodes(depth);
+        let default_leaf = defaults[0];
+
+        let next_position = state
+            .next_nullifier_position
+            .get(&mut accessor)
+            .unwrap_infallible()
+            .unwrap_or(0);
+
+        let offset: usize = params.offset.unwrap_or(0);
+        let limit: usize = params.limit.unwrap_or(100).min(1000);
+        let reverse = params.reverse.unwrap_or(false);
+
+        let mut nullifiers = Vec::new();
+
+        if reverse {
+            if next_position > 0 {
+                let start = if offset < next_position as usize {
+                    next_position as usize - offset
+                } else {
+                    0
+                };
+                let end = start.saturating_sub(limit);
+
+                for pos in (end..start).rev() {
+                    let nullifier = state
+                        .nullifier_nodes
+                        .get(
+                            &MerkleNodeKey {
+                                height: 0,
+                                index: pos as u64,
+                            },
+                            &mut accessor,
+                        )
+                        .unwrap_infallible()
+                        .unwrap_or(default_leaf);
+                    nullifiers.push(NullifierInfoResponse {
+                        position: pos as u64,
+                        nullifier,
+                    });
+                }
+            }
+        } else {
+            let end = (offset + limit).min(next_position as usize);
+            for pos in offset..end {
+                let nullifier = state
+                    .nullifier_nodes
+                    .get(
+                        &MerkleNodeKey {
+                            height: 0,
+                            index: pos as u64,
+                        },
+                        &mut accessor,
+                    )
+                    .unwrap_infallible()
+                    .unwrap_or(default_leaf);
+                nullifiers.push(NullifierInfoResponse {
+                    position: pos as u64,
+                    nullifier,
+                });
+            }
+        }
+
+        Ok(NullifiersListResponse {
+            nullifiers,
+            count: next_position,
+            current_root: root,
         }
         .into())
     }
@@ -556,6 +689,8 @@ impl<S: Spec> HasCustomRestApi for ValueMidnightPrivacy<S> {
 
     fn custom_rest_api(&self, state: ApiState<S>) -> axum::Router<()> {
         axum::Router::new()
+            // List spent nullifiers
+            .route("/nullifiers", get(Self::route_list_nullifiers))
             // Nullifier queries
             .route(
                 "/nullifiers/:nullifier_hex",

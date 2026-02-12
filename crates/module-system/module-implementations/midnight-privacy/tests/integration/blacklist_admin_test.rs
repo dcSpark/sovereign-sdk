@@ -179,7 +179,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
     .unwrap();
 
     // Build a pre-verified spend with the *default* root (mismatch).
-    let anchor_root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
+    let anchor_root = mp.commitment_root.get(&mut ws).unwrap().unwrap();
     let nullifier: Hash32 = [0x10u8; 32];
     let output: Hash32 = [0x22u8; 32];
     let public = SpendPublic {

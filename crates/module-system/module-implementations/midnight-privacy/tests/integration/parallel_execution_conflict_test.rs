@@ -12,7 +12,8 @@
 
 use midnight_privacy::{
     cache_pre_verified_spend, clear_pre_verified_spend, note_commitment, nullifier, CallMessage,
-    Hash32, MidnightPrivacyConfig, PendingCommitmentKey, SpendPublic, ValueMidnightPrivacy,
+    Hash32, MerkleNodeKey, MidnightPrivacyConfig, PendingCommitmentKey, SpendPublic,
+    ValueMidnightPrivacy,
 };
 use sov_modules_api::capabilities::mocks::MockKernel;
 use sov_modules_api::hooks::BlockHooks;
@@ -94,7 +95,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
         let gas_meter = new_test_gas_meter::<TestSpec>();
         let mut ws = WorkingSet::<TestSpec>::create_working_set(scratchpad, &tx, gas_meter);
         let pos = mp.next_position.get(&mut ws).unwrap().unwrap();
-        let root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
+        let root = mp.commitment_root.get(&mut ws).unwrap().unwrap();
         (pos, root)
     };
 
@@ -233,7 +234,6 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
 
     // Check final state
     let final_next_position = mp.next_position.get(&mut final_cp).unwrap().unwrap();
-    let final_tree = mp.commitment_tree.get(&mut final_cp).unwrap().unwrap();
 
     println!("\n=== FINAL STATE ===");
     println!("Initial next_position: {}", initial_next_position);
@@ -248,7 +248,17 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
     for (i, expected_cm) in outputs.iter().enumerate() {
         let mut found = false;
         for pos in initial_next_position..final_next_position {
-            let leaf = final_tree.leaf(pos as usize);
+            let leaf = mp
+                .commitment_nodes
+                .get(
+                    &MerkleNodeKey {
+                        height: 0,
+                        index: pos,
+                    },
+                    &mut final_cp,
+                )
+                .unwrap()
+                .unwrap_or([0u8; 32]);
             if leaf == *expected_cm {
                 found = true;
                 found_in_tree += 1;
@@ -335,7 +345,7 @@ fn sequential_execution_works_with_slot_based_storage() {
         let tx = AuthenticatedTransactionData::<TestSpec>(default_test_tx_details::<TestSpec>());
         let gas_meter = new_test_gas_meter::<TestSpec>();
         let mut ws = WorkingSet::<TestSpec>::create_working_set(scratchpad, &tx, gas_meter);
-        mp.commitment_tree.get(&mut ws).unwrap().unwrap().root()
+        mp.commitment_root.get(&mut ws).unwrap().unwrap()
     };
 
     // Prepare 3 transfers
@@ -400,7 +410,6 @@ fn sequential_execution_works_with_slot_based_storage() {
 
     // Verify all commitments are in tree
     let final_pos = mp.next_position.get(&mut final_cp).unwrap().unwrap();
-    let final_tree = mp.commitment_tree.get(&mut final_cp).unwrap().unwrap();
 
     assert_eq!(
         final_pos - initial_pos,
@@ -412,7 +421,18 @@ fn sequential_execution_works_with_slot_based_storage() {
     let mut found = 0;
     for cm in &outputs {
         for pos in initial_pos..final_pos {
-            if final_tree.leaf(pos as usize) == *cm {
+            let leaf = mp
+                .commitment_nodes
+                .get(
+                    &MerkleNodeKey {
+                        height: 0,
+                        index: pos,
+                    },
+                    &mut final_cp,
+                )
+                .unwrap()
+                .unwrap_or([0u8; 32]);
+            if leaf == *cm {
                 found += 1;
                 break;
             }

@@ -44,6 +44,52 @@ pub struct BlacklistNodeKey {
     pub index: u64,
 }
 
+/// Key for a node in the note/nullifier Merkle trees.
+///
+/// Height 0 is a leaf. Height `depth` is the root.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct MerkleNodeKey {
+    /// Node height (0 = leaf).
+    pub height: u8,
+    /// Node index at this height.
+    pub index: u64,
+}
+
+impl fmt::Display for MerkleNodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, self.index)
+    }
+}
+
+impl FromStr for MerkleNodeKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_index".to_string());
+        }
+        let height = parts[0]
+            .parse::<u8>()
+            .map_err(|e| format!("Failed to parse height: {e}"))?;
+        let index = parts[1]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse index: {e}"))?;
+        Ok(MerkleNodeKey { height, index })
+    }
+}
+
 impl fmt::Display for BlacklistNodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}_{}", self.height, self.index)
@@ -604,6 +650,27 @@ pub fn sparse_default_nodes(depth: u8) -> Vec<Hash32> {
     out
 }
 
+/// Compute the default nodes for a dense Merkle tree used by commitments/nullifiers.
+///
+/// Returns a vector of length `depth + 1` where:
+/// - `out[0]` is the default leaf (`0x00..00`)
+/// - `out[h]` is the default node at height `h`
+pub fn mt_default_nodes(depth: u8) -> Vec<Hash32> {
+    let mut out: Vec<Hash32> = Vec::with_capacity(depth as usize + 1);
+    out.push([0u8; 32]);
+    for lvl in 0..depth {
+        let prev = out[lvl as usize];
+        out.push(mt_combine(lvl, &prev, &prev));
+    }
+    out
+}
+
+/// Compute the all-default root for the note/nullifier Merkle tree.
+#[inline]
+pub fn mt_default_root(depth: u8) -> Hash32 {
+    mt_default_nodes(depth)[depth as usize]
+}
+
 /// Compute the all-zero sparse Merkle root for a given depth.
 ///
 /// Leaf default is `0x00..00` and internal nodes are computed with `mt_combine(level, left, right)`.
@@ -670,6 +737,103 @@ pub fn inv_enforce_v2(
     let mut inv = enforce_prod.clone();
     inv.inverse();
     inv.to_bytes_be()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::merkle::MerkleTree;
+
+    use super::{mt_combine, mt_default_nodes, mt_default_root, Hash32};
+
+    fn sparse_get(
+        nodes: &HashMap<(u8, u64), Hash32>,
+        height: u8,
+        index: u64,
+        defaults: &[Hash32],
+    ) -> Hash32 {
+        nodes
+            .get(&(height, index))
+            .copied()
+            .unwrap_or(defaults[height as usize])
+    }
+
+    fn sparse_set_leaf(
+        nodes: &mut HashMap<(u8, u64), Hash32>,
+        depth: u8,
+        pos: u64,
+        leaf: Hash32,
+    ) -> Hash32 {
+        let defaults = mt_default_nodes(depth);
+        if leaf == defaults[0] {
+            nodes.remove(&(0, pos));
+        } else {
+            nodes.insert((0, pos), leaf);
+        }
+
+        let mut cur = leaf;
+        let mut idx = pos;
+        for height in 0..depth {
+            let sibling = sparse_get(nodes, height, idx ^ 1, &defaults);
+            let parent = if (idx & 1) == 0 {
+                mt_combine(height, &cur, &sibling)
+            } else {
+                mt_combine(height, &sibling, &cur)
+            };
+            if parent == defaults[(height + 1) as usize] {
+                nodes.remove(&(height + 1, idx >> 1));
+            } else {
+                nodes.insert((height + 1, idx >> 1), parent);
+            }
+            cur = parent;
+            idx >>= 1;
+        }
+        cur
+    }
+
+    #[test]
+    fn mt_default_root_matches_dense_tree() {
+        for depth in [0u8, 1, 2, 8, 16] {
+            assert_eq!(mt_default_root(depth), MerkleTree::new(depth).root());
+        }
+    }
+
+    #[test]
+    fn sparse_append_roots_match_dense_tree() {
+        let mut depth = 4u8;
+        let mut sparse_root = mt_default_root(depth);
+        let mut sparse_nodes: HashMap<(u8, u64), Hash32> = HashMap::new();
+        let mut dense = MerkleTree::new(depth);
+
+        let mut seed: u64 = 0xDEADBEEFCAFEBABE;
+        for pos in 0..400u64 {
+            while (pos as u128) >= (1u128 << (depth as u32)) {
+                let defaults = mt_default_nodes(depth);
+                sparse_root = mt_combine(depth, &sparse_root, &defaults[depth as usize]);
+                depth += 1;
+            }
+
+            dense.grow_to_fit((pos + 1) as usize);
+
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut leaf = [0u8; 32];
+            leaf[..8].copy_from_slice(&seed.to_le_bytes());
+            leaf[8..16].copy_from_slice(&pos.to_le_bytes());
+
+            dense.set_leaf(pos as usize, leaf);
+            sparse_root = sparse_set_leaf(&mut sparse_nodes, depth, pos, leaf);
+
+            assert_eq!(
+                sparse_root,
+                dense.root(),
+                "root mismatch after append at position {}",
+                pos
+            );
+        }
+    }
 }
 
 // (tests live in `tests/ivk_crypto_tests.rs`)

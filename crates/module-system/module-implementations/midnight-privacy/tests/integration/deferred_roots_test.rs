@@ -105,7 +105,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
     );
 
     // Initial root is present in recent_roots
-    let initial_root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
+    let initial_root = mp.commitment_root.get(&mut ws).unwrap().unwrap();
     let recent0 = mp.recent_roots.get(&mut ws).unwrap().unwrap();
     assert_eq!(recent0.len(), 1);
     assert_eq!(recent0.front().copied().unwrap(), initial_root);
