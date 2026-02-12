@@ -97,6 +97,7 @@ members = [
     # "crates/adapters/avail",
     "crates/adapters/celestia",
     "crates/adapters/ligero",
+    "crates/adapters/nightstream",
     "crates/adapters/risc0",
     "crates/adapters/sp1",
     "crates/adapters/tee",
@@ -143,6 +144,7 @@ sov-eth-client = { path = "crates/utils/sov-eth-client", default-features = fals
 sov-blob-sender = { path = "crates/full-node/sov-blob-sender", default-features = false, version = "0.3" }
 sov-celestia-adapter = { path = "crates/adapters/celestia", default-features = false, version = "0.3" }
 sov-ligero-adapter = { path = "crates/adapters/ligero", default-features = false, version = "0.3" }
+sov-nightstream-adapter = { path = "crates/adapters/nightstream", default-features = false, version = "0.3" }
 sov-risc0-adapter = { path = "crates/adapters/risc0", default-features = false, version = "0.3" }
 sov-sp1-adapter = { path = "crates/adapters/sp1", default-features = false, version = "0.3" }
 sov-midnight-adapter = { path = "crates/adapters/midnight", default-features = false, version = "0.3" }

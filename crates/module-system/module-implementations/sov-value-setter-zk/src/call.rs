@@ -31,8 +31,8 @@ pub enum CallMessage<S: Spec> {
     SetValueWithProof {
         /// The value to set
         value: u32,
-        /// Serialized Ligetron proof package (bincode-encoded)
-        /// Note: Ligero proofs are typically 2-4MB in size
+        /// Serialized proof package (compressed bincode)
+        /// Note: Ligero proofs are typically 2-4MB, Nightstream proofs ~2-4MB after DEFLATE compression
         proof: sov_modules_api::SafeVec<u8, 5_000_000>,
         /// Gas to charge. Don't charge gas if None.
         gas: Option<S::Gas>,
@@ -99,18 +99,40 @@ impl<S: Spec> ValueSetterZk<S> {
 
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-
             let method_id_bytes = self
                 .method_id
                 .get(state)?
                 .ok_or_else(|| anyhow::anyhow!("method_id not configured in module state"))?;
 
-            let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                .map_err(|e| anyhow::anyhow!("Invalid method_id bytes in state: {}", e))?;
+            let backend = self
+                .backend
+                .get(state)?
+                .unwrap_or_else(|| "ligero".to_string());
 
-            let public: ValueProofPublic = LigeroVerifier::verify(&proof, &method_id)
-                .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?;
+            let public: ValueProofPublic = match backend.as_str() {
+                "ligero" => {
+                    use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+                    let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
+                        .map_err(|e| anyhow::anyhow!("Invalid Ligero method_id: {}", e))?;
+                    LigeroVerifier::verify(&proof, &method_id)
+                        .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?
+                }
+                #[cfg(feature = "nightstream")]
+                "nightstream" => {
+                    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
+                    let method_id = NightstreamCodeCommitment::decode(&method_id_bytes)
+                        .map_err(|e| anyhow::anyhow!("Invalid Nightstream method_id: {}", e))?;
+                    NightstreamVerifier::verify(&proof, &method_id)
+                        .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?
+                }
+                other => {
+                    anyhow::bail!(
+                        "Unknown proof backend: '{}'. Supported backends: 'ligero'{}",
+                        other,
+                        if cfg!(feature = "nightstream") { ", 'nightstream'" } else { "" }
+                    );
+                }
+            };
 
             if public.value != value {
                 return Err(SetValueZkError::<S>::ValueMismatch {
@@ -130,7 +152,7 @@ impl<S: Spec> ValueSetterZk<S> {
         {
             let _ = (value, proof);
             anyhow::bail!(
-                "Ligero proof verification is only supported in native mode. \
+                "Proof verification is only supported in native mode. \
                  The value-setter-zk module cannot be used inside a zkVM."
             );
         }

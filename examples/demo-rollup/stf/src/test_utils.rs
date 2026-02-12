@@ -68,6 +68,7 @@ where
                 initial_value: Some(0),
                 method_id: [0; 32],
                 admin: admin_address.clone(),
+                backend: "ligero".to_string(),
             },
             midnight_privacy: midnight_privacy::MidnightPrivacyConfig {
                 tree_depth: 32,

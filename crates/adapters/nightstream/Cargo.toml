@@ -1,0 +1,48 @@
+[package]
+name = "sov-nightstream-adapter"
+description = "An adapter allowing Nightstream to be used as a zkVM with the Sovereign SDK"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+borsh = { workspace = true, features = ["derive"] }
+schemars = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["alloc", "derive"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+flate2 = "1"
+p3-field = "0.4.1"
+
+sov-rollup-interface = { workspace = true }
+sov-mock-zkvm = { workspace = true }
+
+# Nightstream dependencies (path-based for development; switch to git for CI)
+neo-fold = { path = "../../../../Nightstream/crates/neo-fold" }
+neo-math = { path = "../../../../Nightstream/crates/neo-math" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+native = [
+    "sov-rollup-interface/native",
+    "sov-mock-zkvm/native",
+]
+
+[[example]]
+name = "generate_proof_tx"
+required-features = ["native"]

@@ -145,6 +145,8 @@ sov-build = { workspace = true }
 default = []
 # Used for using different encoding between host and guest
 bincode = ["risc0/bincode", "sov-risc0-adapter/bincode"]
+# Enable Nightstream proof backend in value-setter-zk module.
+nightstream = ["demo-stf/nightstream"]
 
 [[bin]]
 name = "sov-cli"

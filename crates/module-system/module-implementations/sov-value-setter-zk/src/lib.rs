@@ -17,15 +17,18 @@ use sov_modules_api::{
     TxState,
 };
 
-/// ValueSetterZk module: Sets a value only if a valid Ligetron ZK proof is provided.
+/// ValueSetterZk module: Sets a value only if a valid ZK proof is provided.
 ///
 /// The proof must demonstrate that the value meets certain constraints (enforced by the guest program).
-/// For this implementation, the guest program verifies that the value is within [0, 100].
+/// For this implementation, the guest program verifies that the value is within [0, 65535].
+///
+/// Supports multiple proof backends: "ligero" (default) and "nightstream" (via feature flag).
 ///
 /// # Module State
 /// - `value`: The current value (u32)
-/// - `method_id`: Ligetron method ID (code commitment) for proof verification
-/// - `admin`: Administrator who can update the method ID
+/// - `method_id`: Code commitment for proof verification (32 bytes, backend-specific)
+/// - `admin`: Administrator who can update the method ID and backend
+/// - `backend`: The proof backend to use ("ligero" or "nightstream")
 ///
 /// # Derives
 /// - `ModuleInfo`: Required for all modules
@@ -40,14 +43,19 @@ pub struct ValueSetterZk<S: Spec> {
     #[state]
     pub value: StateValue<u32>,
 
-    /// Code commitment (32 bytes) of the Ligetron guest program that verifies value constraints.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies value constraints.
+    /// For Ligero: SHA-256(WASM bytes || packing).
+    /// For Nightstream: SHA-256(ROM bytes).
     #[state]
     pub method_id: StateValue<[u8; 32]>,
 
-    /// Administrator address who can update the method ID.
+    /// Administrator address who can update the method ID and backend.
     #[state]
     pub admin: StateValue<S::Address>,
+
+    /// Proof backend: "ligero" (default) or "nightstream".
+    #[state]
+    pub backend: StateValue<String>,
 }
 
 impl<S: Spec> Module for ValueSetterZk<S> {

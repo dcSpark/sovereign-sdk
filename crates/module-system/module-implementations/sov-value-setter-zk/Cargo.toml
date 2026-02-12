@@ -27,6 +27,7 @@ anyhow = { workspace = true }
 sov-modules-api = { workspace = true }
 sov-rollup-interface = { workspace = true }
 sov-ligero-adapter = { workspace = true }
+sov-nightstream-adapter = { workspace = true, optional = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -36,11 +37,13 @@ bincode = { workspace = true }
 
 [features]
 default = []
+nightstream = ["sov-nightstream-adapter"]
 native = [
     "sov-modules-api/native",
     "sov-rollup-interface/native",
     "sov-state/native",
     "sov-address/native",
-    "sov-ligero-adapter/native"
+    "sov-ligero-adapter/native",
+    "sov-nightstream-adapter?/native"
 ]
 

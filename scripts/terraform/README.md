@@ -38,14 +38,14 @@ Terraform configuration for deploying Sovereign Ligero infrastructure on AWS.
    ```bash
    # Create a new key pair
    aws ec2 create-key-pair \
-     --key-name sovereign-ligero-keypair \
+     --key-name sovereign-sdk-keypair \
      --query 'KeyMaterial' \
-     --output text > ~/.ssh/sovereign-ligero-keypair.pem
-   chmod 400 ~/.ssh/sovereign-ligero-keypair.pem
+     --output text > ~/.ssh/sovereign-sdk-keypair.pem
+   chmod 400 ~/.ssh/sovereign-sdk-keypair.pem
 
    # Or import an existing public key
    aws ec2 import-key-pair \
-     --key-name sovereign-ligero-keypair \
+     --key-name sovereign-sdk-keypair \
      --public-key-material fileb://~/.ssh/id_rsa.pub
    ```
 
@@ -70,7 +70,7 @@ terraform apply
 After deployment, use the SSH command from outputs:
 ```bash
 terraform output ssh_connection_command
-# Example: ssh -i ~/.ssh/sovereign-ligero-keypair.pem ubuntu@<elastic-ip>
+# Example: ssh -i ~/.ssh/sovereign-sdk-keypair.pem ubuntu@<elastic-ip>
 ```
 
 ### Destroy Infrastructure
@@ -93,7 +93,7 @@ terraform destroy
 | `aws_region` | us-east-1 | AWS region |
 | `vpc_cidr` | 172.32.0.0/16 | VPC CIDR block |
 | `instance_type` | c7g.4xlarge | EC2 instance type |
-| `key_pair_name` | sovereign-ligero-keypair | EC2 key pair name |
+| `key_pair_name` | sovereign-sdk-keypair | EC2 key pair name |
 | `root_volume_size` | 300 | Root volume size in GB |
 
 ### Security Groups
@@ -112,7 +112,7 @@ To enable remote state storage, uncomment the backend configuration in `main.tf`
 
 ```hcl
 backend "s3" {
-  bucket         = "sovereign-ligero-terraform-state"
+  bucket         = "sovereign-sdk-terraform-state"
   key            = "infrastructure/terraform.tfstate"
   region         = "us-east-1"
   encrypt        = true
@@ -123,9 +123,9 @@ backend "s3" {
 Create the S3 bucket and DynamoDB table first:
 ```bash
 # Create S3 bucket
-aws s3 mb s3://sovereign-ligero-terraform-state --region us-east-1
+aws s3 mb s3://sovereign-sdk-terraform-state --region us-east-1
 aws s3api put-bucket-versioning \
-  --bucket sovereign-ligero-terraform-state \
+  --bucket sovereign-sdk-terraform-state \
   --versioning-configuration Status=Enabled
 
 # Create DynamoDB table for state locking
