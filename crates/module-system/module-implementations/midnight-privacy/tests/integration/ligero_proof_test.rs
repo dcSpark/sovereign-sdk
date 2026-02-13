@@ -1304,7 +1304,7 @@ fn test_note_spend_with_non_default_blacklist_root() -> Result<()> {
     let public = SpendPublic {
         anchor_root: anchor,
         blacklist_root,
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -1316,7 +1316,7 @@ fn test_note_spend_with_non_default_blacklist_root() -> Result<()> {
     let verified: SpendPublic = LigeroVerifier::verify(&proof_data, &code_commitment)?;
 
     assert_eq!(verified.anchor_root, anchor);
-    assert_eq!(verified.nullifier, nf);
+    assert_eq!(verified.nullifiers, vec![nf]);
     assert_eq!(verified.blacklist_root, blacklist_root);
     assert_eq!(verified.output_commitments, vec![cm_out]);
 
@@ -1423,7 +1423,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     let public_output = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![cm_out],
         view_attestations: None,
@@ -1436,7 +1436,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     );
     println!(
         "  - Nullifier:        {}",
-        hex::encode(public_output.nullifier)
+        hex::encode(public_output.nullifiers[0])
     );
     println!("  - Withdraw amount:  {}", public_output.withdraw_amount);
     println!(
@@ -1536,7 +1536,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
 
     // Verify the extracted public output matches what we proved
     assert_eq!(verified_output.anchor_root, anchor, "Anchor root mismatch!");
-    assert_eq!(verified_output.nullifier, nf, "Nullifier mismatch!");
+    assert_eq!(verified_output.nullifiers, vec![nf], "Nullifier mismatch!");
     assert_eq!(verified_output.withdraw_amount, withdraw_amount as u128);
     assert_eq!(verified_output.output_commitments, vec![cm_out]);
 
@@ -1547,7 +1547,7 @@ fn test_note_spend_proof_lifecycle() -> Result<()> {
     );
     println!(
         "  - Nullifier: {}",
-        hex::encode(&verified_output.nullifier[..8])
+        hex::encode(&verified_output.nullifiers[0][..8])
     );
     println!("  - Withdraw:  {}", verified_output.withdraw_amount);
     println!(
@@ -1986,8 +1986,9 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
 
     let out2_value: u64 = 400;
     let out2_rho = [20u8; 32];
-    let out2_pk_spend = [21u8; 32];
-    let out2_pk_ivk = out2_pk_spend;
+    // For n_out == 2, the v2 guest enforces output[1] as change-to-self.
+    let out2_pk_spend = pk_from_sk(&spend_sk);
+    let out2_pk_ivk = pk_ivk_owner;
     let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
     let out2_cm = note_commitment_v2(
         &domain,
@@ -2040,7 +2041,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
     let public = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -2060,7 +2061,7 @@ fn test_spend_note_rejects_value_burning() -> Result<()> {
         value, withdraw_amount, out1_value, out2_value
     );
     assert_eq!(verified.anchor_root, anchor);
-    assert_eq!(verified.nullifier, nf);
+    assert_eq!(verified.nullifiers, vec![nf]);
     assert_eq!(verified.output_commitments.len(), 2);
 
     println!("\n✓ Value-burning protection: Circuit enforces balance equation");
@@ -2120,8 +2121,9 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let withdraw_to: Hash32 = [99u8; 32];
     let change_value: u64 = 500; // Balance: 1000 = 500 withdraw + 500 change
     let change_rho: Hash32 = [50u8; 32];
-    let change_pk_spend: Hash32 = [51u8; 32];
-    let change_pk_ivk: Hash32 = [52u8; 32];
+    // For withdraw_amount > 0 with n_out == 1, the v2 guest enforces change-to-self.
+    let change_pk_spend: Hash32 = pk_from_sk(&spend_sk);
+    let change_pk_ivk: Hash32 = pk_ivk_owner;
     let change_recipient = recipient_from_pk_v2(&domain, &change_pk_spend, &change_pk_ivk);
     // Output sender_id is the spender's (owner) privacy address.
     let sender_id_out = recipient_owner;
@@ -2170,7 +2172,7 @@ fn test_spend_note_rejects_with_withdrawal() -> Result<()> {
     let public = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![change_cm],
         view_attestations: None,
@@ -2358,7 +2360,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: deposit_nf,
+        nullifiers: vec![deposit_nf],
         withdraw_amount: withdraw_amount_phase2,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -2383,7 +2385,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
         .context("Phase 2 proof verification failed")?;
     let verify_time2 = verify_start2.elapsed().as_secs_f64();
 
-    assert_eq!(verified2.nullifier, deposit_nf);
+    assert_eq!(verified2.nullifiers, vec![deposit_nf]);
     assert_eq!(verified2.output_commitments.len(), 2);
     assert_eq!(verified2.output_commitments[0], out1_cm);
     assert_eq!(verified2.output_commitments[1], out2_cm);
@@ -2495,7 +2497,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: out1_nf,
+        nullifiers: vec![out1_nf],
         withdraw_amount: withdraw_amount_phase3,
         output_commitments: vec![change_cm],
         view_attestations: None,
@@ -2520,7 +2522,7 @@ fn test_full_transaction_lifecycle_old() -> Result<()> {
         .context("Phase 3 proof verification failed")?;
     let verify_time3 = verify_start3.elapsed().as_secs_f64();
 
-    assert_eq!(verified3.nullifier, out1_nf);
+    assert_eq!(verified3.nullifiers, vec![out1_nf]);
     assert_eq!(verified3.withdraw_amount, withdraw_amount_phase3);
     assert_eq!(verified3.output_commitments.len(), 1);
     assert_eq!(verified3.output_commitments[0], change_cm);
@@ -2629,9 +2631,9 @@ fn test_full_transaction_lifecycle() -> Result<()> {
 
     let out2_value: u64 = 400;
     let out2_rho: Hash32 = [30u8; 32];
-    let out2_spend_sk: Hash32 = [31u8; 32];
-    let out2_pk_spend = pk_from_sk(&out2_spend_sk);
-    let out2_pk_ivk = out2_pk_spend;
+    // For n_out == 2, output[1] is constrained as change-to-self.
+    let out2_pk_spend = pk_from_sk(&deposit_spend_sk);
+    let out2_pk_ivk = deposit_pk_ivk_owner;
     let out2_recipient = recipient_from_pk_v2(&domain, &out2_pk_spend, &out2_pk_ivk);
 
     let sender_id_out_phase2 = deposit_recipient; // v2 guest sets sender_id = owner_addr
@@ -2687,7 +2689,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let public2 = SpendPublic {
         anchor_root: anchor_after_deposit,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: deposit_nf,
+        nullifiers: vec![deposit_nf],
         withdraw_amount: 0,
         output_commitments: vec![out1_cm, out2_cm],
         view_attestations: None,
@@ -2762,7 +2764,7 @@ fn test_full_transaction_lifecycle() -> Result<()> {
     let public3 = SpendPublic {
         anchor_root: anchor_after_split,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: out1_nf,
+        nullifiers: vec![out1_nf],
         withdraw_amount: withdraw_amount3 as u128,
         output_commitments: vec![change_cm],
         view_attestations: None,
@@ -2863,7 +2865,7 @@ fn test_rejects_over_withdrawal_attack() -> Result<()> {
     let public = SpendPublic {
         anchor_root: anchor,
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: withdraw_amount as u128,
         output_commitments: vec![],
         view_attestations: None,

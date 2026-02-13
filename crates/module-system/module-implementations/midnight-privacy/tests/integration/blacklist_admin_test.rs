@@ -185,7 +185,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
     let public = SpendPublic {
         anchor_root,
         blacklist_root: default_blacklist_root(),
-        nullifier,
+        nullifiers: vec![nullifier],
         withdraw_amount: 0,
         output_commitments: vec![output],
         view_attestations: None,
@@ -198,7 +198,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: public.anchor_root,
-                nullifier: public.nullifier,
+                nullifiers: public.nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -208,5 +208,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
         .unwrap_err();
     assert!(err.to_string().contains("Blacklist root mismatch"));
 
-    clear_pre_verified_spend(&public.nullifier);
+    for nullifier in &public.nullifiers {
+        clear_pre_verified_spend(nullifier);
+    }
 }
