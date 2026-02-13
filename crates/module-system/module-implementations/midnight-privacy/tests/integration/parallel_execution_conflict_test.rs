@@ -67,6 +67,7 @@ fn parallel_execution_preserves_all_commitments_with_new_storage() {
         pool_admins: None,
         domain,
         token_id,
+        backend: "ligero".to_string(),
     };
 
     // Run module genesis
@@ -311,6 +312,7 @@ fn sequential_execution_works_with_slot_based_storage() {
         pool_admins: None,
         domain,
         token_id,
+        backend: "ligero".to_string(),
     };
 
     // Run module genesis

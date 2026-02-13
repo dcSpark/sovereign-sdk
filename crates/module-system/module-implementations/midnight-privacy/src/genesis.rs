@@ -18,8 +18,9 @@ pub struct MidnightPrivacyConfig<S: Spec> {
     /// Size of the recent roots window (how many recent roots to keep)
     pub root_window_size: u32,
 
-    /// Ligero method ID (code commitment) of the guest program that verifies spend proofs.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies spend proofs.
+    /// For Ligero: SHA-256(WASM program bytes || packing parameter).
+    /// For Nightstream: SHA-256(ROM bytes).
     pub method_id: [u8; 32],
 
     /// Admin of the module who can update the method ID.
@@ -35,6 +36,14 @@ pub struct MidnightPrivacyConfig<S: Spec> {
 
     /// Single supported token (native)
     pub token_id: sov_bank::TokenId,
+
+    /// Proof backend to use: "ligero" (default) or "nightstream".
+    #[serde(default = "default_backend")]
+    pub backend: String,
+}
+
+fn default_backend() -> String {
+    "ligero".to_string()
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
@@ -58,6 +67,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
+
+        // Set the proof backend
+        self.proof_backend.set(&config.backend, state)?;
 
         // Initialize deny-map root (blacklist / freeze primitive).
         // The on-chain deny-map tree starts empty (all-allowed).
@@ -149,6 +161,7 @@ mod tests {
             pool_admins: None,
             domain,
             token_id,
+            backend: "ligero".to_string(),
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();

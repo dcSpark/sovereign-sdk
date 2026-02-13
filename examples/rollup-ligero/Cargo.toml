@@ -155,6 +155,8 @@ sov-build = { workspace = true }
 
 [features]
 default = ["dep:hex"]
+# Enable Nightstream proof backend in midnight-privacy module (via demo-stf).
+nightstream = ["demo-stf/nightstream"]
 arbitrary = [
   "dep:hex",
   "sov-modules-api/arbitrary",

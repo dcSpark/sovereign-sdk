@@ -2011,6 +2011,7 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
             .verifier_prover_service_url
             .clone()
             .or_else(|| Some(cfg.ligero_proof_service_url.clone())),
+        proof_backend: "ligero".to_string(),
     };
 
     let state = AppState::new(verifier_cfg)

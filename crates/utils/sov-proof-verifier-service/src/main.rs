@@ -74,6 +74,13 @@ struct Args {
     #[arg(long)]
     prover_service_url: Option<String>,
 
+    /// Proof backend: "ligero" (default) or "nightstream".
+    /// Controls which ZK backend is used for proof generation and verification.
+    /// The midnight_method_id will be auto-computed from the appropriate source
+    /// (WASM for ligero, ROM bytes for nightstream) if not provided via --midnight-method-id.
+    #[arg(long, default_value = "ligero")]
+    proof_backend: String,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -160,27 +167,32 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Parse optional midnight method ID (will be auto-computed if not provided)
+    // Parse optional midnight method ID (will be auto-computed based on proof_backend if not provided)
     let midnight_method_id = if let Some(method_id_hex) = args.midnight_method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!("No midnight method ID provided, will auto-compute from note_spend_guest.wasm");
+        info!(
+            "No midnight method ID provided, will auto-compute from {} source",
+            if args.proof_backend == "nightstream" { "Nightstream ROM" } else { "note_spend_guest.wasm" }
+        );
         None
     };
 
     info!("Note: Using /rollup/schema chain_hash for transaction signing/verification");
+    info!("Proof backend: {}", args.proof_backend);
 
     // Create service configuration
     let config = ServiceConfig {
         node_rpc_url: args.node_rpc_url,
         signing_key_path: args.signing_key_path,
         value_setter_method_id, // Will be auto-computed from value_validator_rust.wasm if None
-        midnight_method_id,     // Will be auto-computed from note_spend_guest.wasm if None
+        midnight_method_id,     // Will be auto-computed based on proof_backend if None
         chain_id: args.chain_id,
         max_concurrent_verifications: max_concurrent,
         da_connection_string,
         defer_sequencer_submission: args.defer_submission,
         prover_service_url: args.prover_service_url,
+        proof_backend: args.proof_backend,
     };
 
     if let Some(ref url) = config.prover_service_url {

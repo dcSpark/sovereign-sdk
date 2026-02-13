@@ -129,6 +129,10 @@ struct ContinuousConfig {
     managed_mode: bool,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
     max_cycles: Option<u64>,
+    /// Proof backend: "ligero" (default) or "nightstream".
+    /// When "nightstream", proofs are generated using the Nightstream zkVM locally
+    /// instead of the Ligero daemon/service.
+    proof_backend: String,
 }
 
 impl ContinuousConfig {
@@ -233,6 +237,9 @@ impl ContinuousConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        let proof_backend = std::env::var("PROOF_BACKEND")
+            .unwrap_or_else(|_| "ligero".to_string());
+
         Ok(Self {
             num_wallets,
             wallet_offset,
@@ -252,6 +259,7 @@ impl ContinuousConfig {
             continuous,
             managed_mode,
             max_cycles,
+            proof_backend,
         })
     }
 }
@@ -900,7 +908,10 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
-    if let Some(ref url) = config.prover_service_url {
+    eprintln!("[config] Proof backend: {} (set PROOF_BACKEND to change)", config.proof_backend);
+    if config.proof_backend == "nightstream" {
+        eprintln!("[config] Nightstream: proofs generated locally via NightstreamHost (no external daemon)");
+    } else if let Some(ref url) = config.prover_service_url {
         eprintln!(
             "[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)",
             url
@@ -2007,6 +2018,7 @@ async fn perform_transfer_cycle(
     let viewer_bundles = viewer_bundles.clone();
     let prover_service_url = config.prover_service_url.clone();
     let transfer_amount = config.transfer_amount;
+    let proof_backend = config.proof_backend.clone();
     for plan in plans.iter() {
         let sender_idx = plan.sender_idx;
         let dest_idx = plan.dest_idx;
@@ -2020,6 +2032,7 @@ async fn perform_transfer_cycle(
         let daemon_workers = config.max_concurrent_proofs;
         let client = client.clone();
         let prover_service_url = prover_service_url.clone();
+        let proof_backend = proof_backend.clone();
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
@@ -2452,8 +2465,31 @@ async fn perform_transfer_cycle(
                     host.set_public_output(&public)
                         .context("set public output (round 2)")?;
 
-                // Generate proof via either prover service (HTTP) or local daemon pool.
-                let proof_data = if let Some(ref service_url) = prover_service_url {
+                // Generate proof via Nightstream, prover service (HTTP), or local daemon pool.
+                let proof_data = if proof_backend == "nightstream" {
+                    // Nightstream backend: prove locally using NightstreamHost with the
+                    // placeholder note_spend circuit. SpendPublic is set as custom
+                    // public_output (pass-through — the circuit echoes a dummy word).
+                    use sov_nightstream_adapter::circuits::note_spend_rom;
+                    use sov_nightstream_adapter::NightstreamHost;
+
+                    let mut ns_host = NightstreamHost::new(
+                        &note_spend_rom::NOTE_SPEND_ROM,
+                        note_spend_rom::NOTE_SPEND_ROM_BASE,
+                    );
+                    // The placeholder circuit reads 1 u32 from input and writes it to output.
+                    ns_host.add_u32_input(1u32);
+                    ns_host.add_output_claim(0x100, 1);
+                    ns_host.set_custom_public_output(
+                        bincode::serialize(&public)
+                            .context("Failed to serialize SpendPublic for Nightstream")?,
+                    );
+                    let compressed = ns_host.run(true)
+                        .context("Nightstream proving failed")?;
+                    // run() returns DEFLATE-compressed NightstreamProofPackage bytes — ready to use
+                    // as the proof field in the Transfer transaction.
+                    compressed
+                } else if let Some(ref service_url) = prover_service_url {
                     // Use remote prover service via blocking HTTP call.
                     (|| -> anyhow::Result<Vec<u8>> {
                         let public_output = host.require_public_output()?;
@@ -2615,20 +2651,26 @@ async fn perform_transfer_cycle(
                     .context("generate transfer proof via daemon")?
                 };
 
-                let proof_data = if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
-                    if viewer_data_list.is_none() {
-                        bail!("POOL_FVK_PK is set but viewer section is missing in transfer proof args");
+                // Pool FVK signature injection (Ligero-specific: mutates args in LigeroProofPackage).
+                // Nightstream proofs don't use Ligero arg-level manipulation, so skip injection.
+                let proof_data = if proof_backend != "nightstream" {
+                    if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
+                        if viewer_data_list.is_none() {
+                            bail!("POOL_FVK_PK is set but viewer section is missing in transfer proof args");
+                        }
+                        let fvk_commitment_arg_pos = fvk_commitment_arg_pos.ok_or_else(|| {
+                            anyhow!(
+                                "POOL_FVK_PK is set but fvk_commitment_arg_pos is missing (viewer section not enabled)"
+                            )
+                        })?;
+                        inject_pool_sig_hex_into_proof_bytes(
+                            proof_data,
+                            fvk_commitment_arg_pos,
+                            pool_sig_hex.clone(),
+                        )?
+                    } else {
+                        proof_data
                     }
-                    let fvk_commitment_arg_pos = fvk_commitment_arg_pos.ok_or_else(|| {
-                        anyhow!(
-                            "POOL_FVK_PK is set but fvk_commitment_arg_pos is missing (viewer section not enabled)"
-                        )
-                    })?;
-                    inject_pool_sig_hex_into_proof_bytes(
-                        proof_data,
-                        fvk_commitment_arg_pos,
-                        pool_sig_hex.clone(),
-                    )?
                 } else {
                     proof_data
                 };

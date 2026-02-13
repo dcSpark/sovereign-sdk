@@ -82,7 +82,8 @@ pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, Pending
 /// - `root_window_size`: Size of the anchor window
 /// - `all_roots`: Persistent index of ALL historical roots (NOMT-backed, enables long-range anchors)
 /// - `root_seq`: Monotonic sequence counter for root ordering
-/// - `method_id`: Ligero method ID (code commitment) for proof verification
+/// - `method_id`: Code commitment for proof verification (Ligero or Nightstream)
+/// - `proof_backend`: Proof backend selector ("ligero" or "nightstream")
 /// - `admin`: Administrator who can update the method ID
 /// - `blacklist_root`: Deny-map Merkle root (freeze/blacklist primitive)
 /// - `blacklist_buckets`: Deny-map bucket entries (non-empty buckets)
@@ -148,10 +149,15 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     #[state]
     pub root_seq: StateValue<u64>,
 
-    /// Code commitment (32 bytes) of the Ligero guest program that verifies spend proofs.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies spend proofs.
+    /// For Ligero: SHA-256(WASM program bytes || packing parameter).
+    /// For Nightstream: SHA-256(ROM bytes).
     #[state]
     pub method_id: StateValue<[u8; 32]>,
+
+    /// Proof backend: "ligero" (default) or "nightstream".
+    #[state]
+    pub proof_backend: StateValue<String>,
 
     /// Administrator address who can update the method ID.
     #[state]

@@ -65,6 +65,7 @@ fn pending_roots_are_invisible_until_flush_and_then_become_valid_anchors() {
         pool_admins: None,
         domain,
         token_id,
+        backend: "ligero".to_string(),
     };
 
     // Run module genesis against a checkpoint, then materialize to storage

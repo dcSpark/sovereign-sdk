@@ -78,6 +78,7 @@ where
                 pool_admins: None,
                 domain: [0; 32],
                 token_id: sov_bank::TokenId::from([0; 32]),
+                backend: "ligero".to_string(),
             },
         }
     }

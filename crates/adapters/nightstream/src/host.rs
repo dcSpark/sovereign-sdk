@@ -49,6 +49,13 @@ pub struct NightstreamHost {
     chunk_size: usize,
     /// Output claims: (address, expected_value).
     output_claims: Vec<(u64, u64)>,
+    /// Optional caller-provided public output bytes.
+    ///
+    /// When set, `run()` stores these bytes as `public_output` in the proof package
+    /// instead of extracting the output from the VM's output claims. This is used
+    /// for pass-through circuits where the host pre-computes the public output
+    /// (e.g. `SpendPublic` for the placeholder note_spend circuit).
+    custom_public_output: Option<Vec<u8>>,
 }
 
 impl NightstreamHost {
@@ -62,6 +69,7 @@ impl NightstreamHost {
             ram_bytes: DEFAULT_RAM_BYTES,
             chunk_size: DEFAULT_CHUNK_SIZE,
             output_claims: Vec::new(),
+            custom_public_output: None,
         }
     }
 
@@ -89,6 +97,17 @@ impl NightstreamHost {
     /// Add an output claim (expected value at a given RAM address).
     pub fn add_output_claim(&mut self, addr: u64, expected_value: u64) {
         self.output_claims.push((addr, expected_value));
+    }
+
+    /// Set a custom public output to embed in the proof package.
+    ///
+    /// When set, `run()` uses these bytes as `public_output` in the
+    /// [`NightstreamProofPackage`] instead of extracting the output from the
+    /// VM's output claims. This is useful for pass-through circuits where the
+    /// host pre-computes the public output (e.g. a bincode-serialized
+    /// `SpendPublic` for the placeholder note_spend circuit).
+    pub fn set_custom_public_output(&mut self, output: Vec<u8>) {
+        self.custom_public_output = Some(output);
     }
 
     /// Compute the SHA-256 code commitment of the ROM bytes.
@@ -191,8 +210,12 @@ impl ZkvmHost for NightstreamHost {
                 .prove()
                 .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
 
-            // Read the output value from the proof's final boundary state
-            let output_value = self.extract_output_from_run(&run)?;
+            // Use caller-provided public output if set, otherwise extract from run.
+            let output_value = if let Some(ref custom) = self.custom_public_output {
+                custom.clone()
+            } else {
+                self.extract_output_from_run(&run)?
+            };
 
             // Extract the proof and public step instances for the package.
             // These are what the verifier needs -- no re-execution required.
@@ -248,13 +271,16 @@ impl ZkvmHost for NightstreamHost {
         } else {
             tracing::info!("Nightstream: Executing without proof generation (simulation mode)");
 
-            // In simulation mode, we still execute to get the output but skip proof generation.
-            // We do a fast execution by running the builder but catching errors gracefully.
-            let output_value = match self.try_simulate() {
-                Ok(output) => output,
-                Err(e) => {
-                    tracing::warn!("Nightstream simulation failed: {}", e);
-                    vec![]
+            // Use caller-provided public output if set, otherwise simulate to extract.
+            let output_value = if let Some(ref custom) = self.custom_public_output {
+                custom.clone()
+            } else {
+                match self.try_simulate() {
+                    Ok(output) => output,
+                    Err(e) => {
+                        tracing::warn!("Nightstream simulation failed: {}", e);
+                        vec![]
+                    }
                 }
             };
 

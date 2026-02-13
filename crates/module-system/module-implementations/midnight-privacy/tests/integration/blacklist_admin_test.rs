@@ -38,6 +38,7 @@ fn setup_mp() -> (
         pool_admins: None,
         domain,
         token_id,
+        backend: "ligero".to_string(),
     };
 
     // Run module genesis against a checkpoint, then materialize to storage.

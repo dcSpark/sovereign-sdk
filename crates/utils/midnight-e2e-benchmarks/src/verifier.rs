@@ -44,6 +44,7 @@ pub async fn start_local_verifier(
         da_connection_string: da_connection_string.to_string(),
         defer_sequencer_submission,
         prover_service_url: None, // Use local daemon pool for benchmarks
+        proof_backend: "ligero".to_string(),
     };
 
     let state = AppState::new(verifier_cfg)
