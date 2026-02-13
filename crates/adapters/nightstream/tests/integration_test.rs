@@ -23,6 +23,14 @@ mod value_validator_rom {
     ));
 }
 
+/// Note-spend (placeholder echo) ROM bytes.
+mod note_spend_rom {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/circuits/note_spend_rom.rs"
+    ));
+}
+
 /// Test that the NightstreamCodeCommitment encode/decode works.
 #[test]
 fn test_code_commitment_roundtrip() {
@@ -143,5 +151,97 @@ fn test_verify_with_wrong_commitment() {
     assert!(
         result.is_err(),
         "Verification should fail with wrong commitment"
+    );
+}
+
+/// Benchmark the note_spend echo circuit: proof generation time,
+/// verification time, and proof size breakdown.
+///
+/// Simulates a ~500 byte SpendPublic payload (typical bincode-serialized
+/// size for a 1-input / 1-output transfer).
+#[test]
+fn test_note_spend_echo_bench() {
+    use std::time::Instant;
+
+    let rom = &note_spend_rom::NOTE_SPEND_ROM;
+    let base = note_spend_rom::NOTE_SPEND_ROM_BASE;
+
+    // Simulate a small SpendPublic payload (20 bytes = 5 u32 words).
+    // Use a small payload so the test completes quickly in debug builds.
+    // In production, payloads are ~200-500 bytes; proving time scales
+    // roughly linearly with the number of output claims.
+    let fake_payload: Vec<u8> = (0..20).map(|i| (i % 256) as u8).collect();
+
+    let mut host = NightstreamHost::new(rom, base);
+    host.add_public_output_bytes(&fake_payload);
+
+    // --- Proof generation ---
+    let t_prove = Instant::now();
+    let compressed = host.run(true).expect("proving should succeed");
+    let prove_ms = t_prove.elapsed().as_millis();
+
+    // Decompress
+    let decompressed = {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        let mut decoder = DeflateDecoder::new(compressed.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).expect("decompress proof");
+        buf
+    };
+
+    let package: NightstreamProofPackage =
+        bincode::deserialize(&decompressed).expect("deserialize proof package");
+
+    // --- Verification ---
+    let t_verify = Instant::now();
+    let ok = package.verify().expect("verification should not error");
+    assert!(ok, "proof verification should return true");
+    let verify_ms = t_verify.elapsed().as_millis();
+
+    // Per-field sizes
+    let sz_proof = bincode::serialized_size(&package.proof).unwrap();
+    let sz_steps = bincode::serialized_size(&package.steps_public).unwrap();
+    let sz_rom = bincode::serialized_size(&package.rom_bytes).unwrap();
+    let sz_config = bincode::serialized_size(&package.config).unwrap();
+    let sz_output = bincode::serialized_size(&package.public_output).unwrap();
+    let total_raw = sz_proof + sz_steps + sz_rom + sz_config + sz_output;
+
+    println!("\n=============================================");
+    println!("  Note-Spend Echo Circuit Benchmark");
+    println!("=============================================");
+    println!("  Proof generation: {} ms", prove_ms);
+    println!("  Verification:     {} ms", verify_ms);
+    println!("---------------------------------------------");
+    println!("  Payload input:    {} bytes", fake_payload.len());
+    println!("  Public output:    {} bytes", package.public_output.len());
+    println!("  ROM size:         {} bytes", package.rom_bytes.len());
+    println!("  Folding steps:    {}", package.proof.steps.len());
+    println!("  Step instances:   {}", package.steps_public.len());
+    println!("---------------------------------------------");
+    println!("  proof:            {:.2} KB", sz_proof as f64 / 1024.0);
+    println!("  steps_public:     {:.2} KB", sz_steps as f64 / 1024.0);
+    println!("  rom_bytes:        {:.2} KB", sz_rom as f64 / 1024.0);
+    println!("  config:           {:.2} KB", sz_config as f64 / 1024.0);
+    println!("  public_output:    {:.2} KB", sz_output as f64 / 1024.0);
+    println!("---------------------------------------------");
+    println!("  Raw total:        {:.2} KB", total_raw as f64 / 1024.0);
+    println!("  Decompressed:     {:.2} KB", decompressed.len() as f64 / 1024.0);
+    println!("  Compressed:       {:.2} KB", compressed.len() as f64 / 1024.0);
+    println!(
+        "  Compression:      {:.0}% reduction",
+        (1.0 - compressed.len() as f64 / decompressed.len() as f64) * 100.0
+    );
+    println!("=============================================\n");
+
+    // Sanity: public_output should contain the padded payload
+    assert!(
+        package.public_output.len() >= fake_payload.len(),
+        "public_output should be at least as large as the input payload"
+    );
+    assert_eq!(
+        &package.public_output[..fake_payload.len()],
+        &fake_payload[..],
+        "public_output should start with the original payload"
     );
 }
