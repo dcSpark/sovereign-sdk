@@ -10,6 +10,7 @@ use rockbound::{
 use crate::{
     historical_state::StateChanges,
     namespaces::{KernelNamespace, UserNamespace},
+    rocks_db_config::RocksDbProfile,
     schema::{namespace::NomtStateValues, tables::StateRootHashes},
     DbOptions,
 };
@@ -65,6 +66,7 @@ impl FlatStateDb {
             name: Self::DB_NAME,
             path_suffix: Self::DB_PATH_SUFFIX,
             columns,
+            profile: RocksDbProfile::StateHeavy,
         }
     }
 

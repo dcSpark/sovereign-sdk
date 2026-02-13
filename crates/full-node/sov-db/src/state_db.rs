@@ -9,6 +9,7 @@ use rockbound::{SchemaBatch, SchemaKey};
 use sov_rollup_interface::common::SlotNumber;
 
 use crate::namespaces::{KernelNamespace, Namespace, UserNamespace};
+use crate::rocks_db_config::RocksDbProfile;
 use crate::schema::namespace::{JmtNodes, KeyHashToKey, StateValues};
 use crate::{ensure_version_is_correct, DbOptions};
 
@@ -85,6 +86,7 @@ impl StateDb {
                 .into_iter()
                 .chain(KernelNamespace::get_jmt_table_names())
                 .collect(),
+            profile: RocksDbProfile::StateHeavy,
         }
     }
 

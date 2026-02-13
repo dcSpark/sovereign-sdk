@@ -8,6 +8,7 @@ use sov_rollup_interface::common::SlotNumber;
 
 use crate::metrics::StateMaterializationMetrics;
 use crate::namespaces::{KernelNamespace, Namespace, UserNamespace};
+use crate::rocks_db_config::RocksDbProfile;
 use crate::schema::namespace::NomtStateValues;
 use crate::schema::tables::StateRootHashes;
 use crate::schema::types::StateRootHashId;
@@ -131,6 +132,7 @@ impl HistoricalStateReader {
                 .chain(KernelNamespace::get_jmt_table_names())
                 .chain(vec![StateRootHashes::table_name()])
                 .collect(),
+            profile: RocksDbProfile::StateHeavy,
         }
     }
 

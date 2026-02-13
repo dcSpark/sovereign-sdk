@@ -2,6 +2,7 @@ use rockbound::cache::delta_reader::DeltaReader;
 use rockbound::SchemaBatch;
 use sov_rollup_interface::common::SlotNumber;
 
+use crate::rocks_db_config::RocksDbProfile;
 use crate::schema::tables::{ModuleAccessoryState, ACCESSORY_TABLES};
 use crate::schema::types::{AccessoryKey, AccessoryStateValue};
 use crate::{ensure_version_is_correct, DbOptions};
@@ -26,6 +27,7 @@ impl AccessoryDb {
             name: Self::DB_NAME,
             path_suffix: Self::DB_PATH_SUFFIX,
             columns: ACCESSORY_TABLES.to_vec(),
+            profile: RocksDbProfile::Standard,
         }
     }
 

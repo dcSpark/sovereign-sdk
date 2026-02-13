@@ -10,6 +10,7 @@ use sov_rollup_interface::node::ledger_api::AggregatedProofResponse;
 use sov_rollup_interface::stf::{BatchReceipt, DiscardedBlob, StoredEvent, TxReceiptContents};
 use sov_rollup_interface::zk::aggregated_proof::SerializedAggregatedProof;
 
+use crate::rocks_db_config::RocksDbProfile;
 use crate::schema::tables::{
     BatchByHash, BatchByNumber, DiscardedBlobByHash, EventByKey, EventByNumber, FinalizedSlots,
     ProofByUniqueId, SlotByHash, SlotByNumber, StfInfoByNumber, StfInfoMetadata, TxByHash,
@@ -267,6 +268,7 @@ impl LedgerDb {
             name: Self::DB_NAME,
             path_suffix: Self::DB_PATH_SUFFIX,
             columns: LEDGER_TABLES.to_vec(),
+            profile: RocksDbProfile::Standard,
         }
     }
 

@@ -2,9 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::async_trait;
-use rockbound::{gen_rocksdb_options, SchemaBatch};
+use rockbound::SchemaBatch;
 use sov_blob_sender::BlobInternalId;
 use sov_blob_storage::SequenceNumber;
+use sov_db::rocks_db_config::{gen_tuned_rocksdb_cfds, gen_tuned_rocksdb_options, RocksDbProfile};
 use sov_modules_api::{FullyBakedTx, TxHash};
 
 use super::{DbSnapshotData, PreferredSequencerDbBackend, PreferredSequencerReadBlob, StoredBlob};
@@ -162,12 +163,15 @@ impl RocksDbBackend {
 
     /// Opens a new [`RocksDbBackend`] at the given path.
     pub async fn new(path: &Path) -> anyhow::Result<Self> {
-        let db = Arc::new(rockbound::DB::open(
+        let options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        let cf_descriptors =
+            gen_tuned_rocksdb_cfds(RocksDbProfile::Ephemeral, Self::TABLES.iter().copied());
+        let db = Arc::new(rockbound::DB::open_with_cfds(
+            &options,
             path.join(Self::DB_NAME),
             Self::DB_NAME,
-            Self::TABLES.iter().copied(),
-            &gen_rocksdb_options(&Default::default(), false),
-            0, // We don't need a cache for preferred sequencer since the table is not configured for caching anyway
+            cf_descriptors,
+            0, // We keep rockbound's key/value cache disabled for this DB.
         )?);
 
         // There's an edge case where we might have an in-progress batch but no completed blobs. In that case,

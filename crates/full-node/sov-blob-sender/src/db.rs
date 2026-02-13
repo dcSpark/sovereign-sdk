@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rockbound::{gen_rocksdb_options, SchemaBatch};
+use rockbound::SchemaBatch;
+use sov_db::rocks_db_config::{gen_tuned_rocksdb_cfds, gen_tuned_rocksdb_options, RocksDbProfile};
 use sov_modules_api::DaSpec;
 
 use crate::{BlobExecutionStatus, BlobInternalId, BlobSubmissionRequest, BlobSubmissionStatus};
@@ -17,12 +18,15 @@ impl BlobSenderDb {
         &[tables::Blobs::table_name(), tables::BlobInfos::table_name()];
 
     pub async fn new(path: &Path) -> anyhow::Result<Self> {
-        let db = rockbound::DB::open(
+        let db_options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        let cf_descriptors =
+            gen_tuned_rocksdb_cfds(RocksDbProfile::Ephemeral, Self::TABLES.iter().copied());
+        let db = rockbound::DB::open_with_cfds(
+            &db_options,
             path.join(Self::DB_NAME),
             Self::DB_NAME,
-            Self::TABLES.iter().copied(),
-            &gen_rocksdb_options(&Default::default(), false),
-            0, // We don't need a cache for blobs since the table is not configured for caching anyway
+            cf_descriptors,
+            0, // We keep rockbound's key/value cache disabled for this DB.
         )?;
 
         Ok(Self { db })
