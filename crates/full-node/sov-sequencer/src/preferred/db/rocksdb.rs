@@ -11,6 +11,8 @@ use sov_modules_api::{FullyBakedTx, TxHash};
 use super::{DbSnapshotData, PreferredSequencerDbBackend, PreferredSequencerReadBlob, StoredBlob};
 use crate::preferred::db::{BatchToStore, InProgressBatch};
 
+const ROCKSDB_STATS_DUMP_PERIOD_SEC: u32 = 10;
+
 #[derive(Debug)]
 pub struct RocksDbBackend {
     db: Arc<rockbound::DB>,
@@ -163,7 +165,9 @@ impl RocksDbBackend {
 
     /// Opens a new [`RocksDbBackend`] at the given path.
     pub async fn new(path: &Path) -> anyhow::Result<Self> {
-        let options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        let mut options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        options.enable_statistics();
+        options.set_stats_dump_period_sec(ROCKSDB_STATS_DUMP_PERIOD_SEC);
         let cf_descriptors =
             gen_tuned_rocksdb_cfds(RocksDbProfile::Ephemeral, Self::TABLES.iter().copied());
         let db = Arc::new(rockbound::DB::open_with_cfds(

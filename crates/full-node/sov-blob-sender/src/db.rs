@@ -7,6 +7,8 @@ use sov_modules_api::DaSpec;
 
 use crate::{BlobExecutionStatus, BlobInternalId, BlobSubmissionRequest, BlobSubmissionStatus};
 
+const ROCKSDB_STATS_DUMP_PERIOD_SEC: u32 = 10;
+
 #[derive(Debug)]
 pub struct BlobSenderDb {
     db: rockbound::DB,
@@ -18,7 +20,9 @@ impl BlobSenderDb {
         &[tables::Blobs::table_name(), tables::BlobInfos::table_name()];
 
     pub async fn new(path: &Path) -> anyhow::Result<Self> {
-        let db_options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        let mut db_options = gen_tuned_rocksdb_options(RocksDbProfile::Ephemeral, false);
+        db_options.enable_statistics();
+        db_options.set_stats_dump_period_sec(ROCKSDB_STATS_DUMP_PERIOD_SEC);
         let cf_descriptors =
             gen_tuned_rocksdb_cfds(RocksDbProfile::Ephemeral, Self::TABLES.iter().copied());
         let db = rockbound::DB::open_with_cfds(
