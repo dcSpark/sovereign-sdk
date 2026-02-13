@@ -29,9 +29,11 @@ p3-field = "0.4.1"
 sov-rollup-interface = { workspace = true }
 sov-mock-zkvm = { workspace = true }
 
-# Nightstream dependencies (path-based for development; switch to git for CI)
-neo-fold = { path = "../../../../Nightstream/crates/neo-fold" }
-neo-math = { path = "../../../../Nightstream/crates/neo-math" }
+# Nightstream dependencies (pinned to specific commit)
+neo-fold = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
+neo-math = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
+neo-ajtai = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
+neo-memory = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

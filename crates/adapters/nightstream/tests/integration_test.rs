@@ -15,12 +15,11 @@ use sov_nightstream_adapter::{
 };
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, ZkvmHost};
 
-/// Value-validator ROM bytes.
-/// These are included directly since the generated ROM file lives in the Nightstream repo.
+/// Value-validator ROM bytes (compiled circuit).
 mod value_validator_rom {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../../Nightstream/crates/neo-fold/riscv-tests/binaries/value_validator_rom.rs"
+        "/circuits/value_validator_rom.rs"
     ));
 }
 

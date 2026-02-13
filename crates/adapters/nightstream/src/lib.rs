@@ -33,6 +33,9 @@ use std::convert::TryInto;
 use std::fmt;
 use thiserror::Error;
 
+/// Pre-compiled RISC-V ROM bytes for Nightstream guest circuits.
+pub mod circuits;
+
 mod guest;
 pub use guest::NightstreamGuest;
 

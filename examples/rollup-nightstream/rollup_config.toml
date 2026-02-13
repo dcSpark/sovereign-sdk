@@ -1,0 +1,49 @@
+# Nightstream-compatible mock rollup configuration
+#
+# Based on examples/demo-rollup/mock_rollup_config.toml with settings
+# adjusted for Nightstream proof verification:
+#   - max_batch_size_bytes: 20MB (Nightstream proofs are ~2-4MB compressed)
+#   - block_time_ms: 2000 (extra time for verify-only circuit synthesis)
+#   - batch_execution_time_limit_millis: 5000 (Nightstream verify ~100ms release, ~2-5s debug)
+
+[da]
+connection_string = "sqlite://mock_da.sqlite?mode=rwc"
+sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
+finalization = 40
+[da.block_producing.periodic]
+block_time_ms = 2000
+
+[storage]
+path = "demo_data"
+state_cache_size = 4294967296
+
+[runner]
+genesis_height = 0
+da_polling_interval_ms = 50
+
+[runner.http_config]
+bind_host = "127.0.0.1"
+bind_port = 12346
+
+[monitoring]
+telegraf_address = "udp://127.0.0.1:8094"
+
+[proof_manager]
+aggregated_proof_block_jump = 16
+prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+max_number_of_transitions_in_db = 100
+max_number_of_transitions_in_memory = 30
+
+[sequencer]
+blob_processing_timeout_secs = 3000
+max_batch_size_bytes = 20971520
+max_concurrent_blobs = 512
+max_allowed_node_distance_behind = 10
+rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+[sequencer.preferred]
+disable_state_root_consistency_checks = true
+recovery_strategy = "TryToSave"
+batch_execution_time_limit_millis = 5000
+num_cache_warmup_workers = 5
+[sequencer.extension]
+max_log_limit = 20000

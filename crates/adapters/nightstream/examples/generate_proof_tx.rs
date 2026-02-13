@@ -18,11 +18,11 @@ use std::path::PathBuf;
 
 use sha2::Digest;
 
-// Include value-validator ROM from the Nightstream repo
+// Include value-validator ROM (compiled circuit bytes)
 mod value_validator_rom {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../../Nightstream/crates/neo-fold/riscv-tests/binaries/value_validator_rom.rs"
+        "/circuits/value_validator_rom.rs"
     ));
 }
 

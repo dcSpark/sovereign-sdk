@@ -9,7 +9,7 @@
 #   - Starting the rollup with Nightstream-friendly settings
 #
 # Usage:
-#   examples/demo-rollup/run_rollup.sh [OPTIONS]
+#   examples/rollup-nightstream/run_rollup.sh [OPTIONS]
 #
 # Options:
 #   --skip-build       Skip cargo build (reuse existing binaries)
@@ -29,8 +29,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ARTIFACTS_DIR="$REPO_ROOT/nightstream-artifacts"
+ARTIFACTS_DIR="$SCRIPT_DIR/nightstream-artifacts"
 GENESIS_TEMPLATE_DIR="$REPO_ROOT/examples/test-data/genesis/demo/mock"
+ROLLUP_CONFIG_TEMPLATE="$SCRIPT_DIR/rollup_config.toml"
 
 # Defaults
 SKIP_BUILD=0
@@ -74,9 +75,9 @@ SOV_ROLLUP="$REPO_ROOT/target/$TARGET_DIR/sov-demo-rollup"
 PROOF_GEN="$REPO_ROOT/target/$TARGET_DIR/examples/generate_proof_tx"
 SOV_CLI="$REPO_ROOT/target/$TARGET_DIR/sov-cli"
 
-# Rollup data lives next to mock_rollup_config.toml (relative path "demo_data")
-DATA_DIR="$REPO_ROOT/demo_data"
-DA_SQLITE="$REPO_ROOT/mock_da.sqlite"
+# Rollup data lives relative to where we run
+DATA_DIR="$SCRIPT_DIR/demo_data"
+DA_SQLITE="$SCRIPT_DIR/mock_da.sqlite"
 
 # ----- Helpers --------------------------------------------------------------
 
@@ -92,6 +93,7 @@ echo -e "${BOLD}Nightstream Mock Rollup${NC}"
 echo "═══════════════════════"
 echo ""
 echo "  Repo root:     $REPO_ROOT"
+echo "  Script dir:    $SCRIPT_DIR"
 echo "  Release mode:  $([ "$RELEASE_MODE" -eq 1 ] && echo yes || echo no)"
 echo "  Port:          $ROLLUP_PORT"
 echo "  Skip verify:   $([ "$SKIP_VERIFY" -eq 1 ] && echo yes || echo no)"
@@ -153,67 +155,25 @@ else
   print_info "Data dir: $DATA_DIR"
 fi
 
-# ----- Step 5: Write rollup config -------------------------------------------
+# ----- Step 5: Write rollup config with resolved paths -----------------------
 
-print_step "Writing Nightstream rollup config"
+print_step "Resolving rollup config paths"
 
-# Nightstream verify-only takes ~100ms in release, ~2-5s in debug.
-# Set batch_execution_time_limit generously for circuit synthesis overhead.
-if [ "$RELEASE_MODE" -eq 1 ]; then
-  BATCH_LIMIT=5000
-else
-  BATCH_LIMIT=120000
+# The template config uses relative paths; resolve them for this instance.
+ROLLUP_CONFIG="$ARTIFACTS_DIR/nightstream_rollup_config.toml"
+sed \
+  -e "s|mock_da.sqlite|$DA_SQLITE|g" \
+  -e "s|demo_data|$DATA_DIR|g" \
+  -e "s|bind_port = 12346|bind_port = $ROLLUP_PORT|g" \
+  "$ROLLUP_CONFIG_TEMPLATE" > "$ROLLUP_CONFIG"
+
+# Adjust batch_execution_time_limit for debug mode
+if [ "$RELEASE_MODE" -eq 0 ]; then
+  sed -i.bak "s|batch_execution_time_limit_millis = 5000|batch_execution_time_limit_millis = 120000|g" "$ROLLUP_CONFIG"
+  rm -f "$ROLLUP_CONFIG.bak"
 fi
 
-ROLLUP_CONFIG="$ARTIFACTS_DIR/nightstream_rollup_config.toml"
-cat > "$ROLLUP_CONFIG" << TOML
-# Auto-generated Nightstream-compatible rollup config
-# Based on examples/demo-rollup/mock_rollup_config.toml with adjusted limits.
-
-[da]
-connection_string = "sqlite://$DA_SQLITE?mode=rwc"
-sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
-finalization = 40
-[da.block_producing.periodic]
-block_time_ms = 2000
-
-[storage]
-path = "$DATA_DIR"
-state_cache_size = 4294967296
-
-[runner]
-genesis_height = 0
-da_polling_interval_ms = 50
-
-[runner.http_config]
-bind_host = "127.0.0.1"
-bind_port = $ROLLUP_PORT
-
-[monitoring]
-telegraf_address = "udp://127.0.0.1:8094"
-
-[proof_manager]
-aggregated_proof_block_jump = 16
-prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
-max_number_of_transitions_in_db = 100
-max_number_of_transitions_in_memory = 30
-
-[sequencer]
-blob_processing_timeout_secs = 3000
-max_batch_size_bytes = 20971520
-max_concurrent_blobs = 512
-max_allowed_node_distance_behind = 10
-rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
-[sequencer.preferred]
-disable_state_root_consistency_checks = true
-recovery_strategy = "TryToSave"
-batch_execution_time_limit_millis = $BATCH_LIMIT
-num_cache_warmup_workers = 5
-[sequencer.extension]
-max_log_limit = 20000
-TOML
-
-print_ok "Config: $ROLLUP_CONFIG (batch_limit=${BATCH_LIMIT}ms)"
+print_ok "Config: $ROLLUP_CONFIG"
 
 # ----- Step 6: Start the rollup ---------------------------------------------
 
