@@ -30,10 +30,10 @@ sov-rollup-interface = { workspace = true }
 sov-mock-zkvm = { workspace = true }
 
 # Nightstream dependencies (pinned to specific commit)
-neo-fold = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
-neo-math = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
-neo-ajtai = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
-neo-memory = { git = "https://github.com/dcSpark/Nightstream", rev = "e559fbbf285d29a919ee6d66f76df4b0f67a51f5" }
+neo-fold = { git = "https://github.com/dcSpark/Nightstream", rev = "a6b22554a69106a1119f3d326a42bd9c234c741f" }
+neo-math = { git = "https://github.com/dcSpark/Nightstream", rev = "a6b22554a69106a1119f3d326a42bd9c234c741f" }
+neo-ajtai = { git = "https://github.com/dcSpark/Nightstream", rev = "a6b22554a69106a1119f3d326a42bd9c234c741f" }
+neo-memory = { git = "https://github.com/dcSpark/Nightstream", rev = "a6b22554a69106a1119f3d326a42bd9c234c741f" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

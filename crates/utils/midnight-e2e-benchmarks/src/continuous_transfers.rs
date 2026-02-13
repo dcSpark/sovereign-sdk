@@ -2468,8 +2468,8 @@ async fn perform_transfer_cycle(
                 // Generate proof via Nightstream, prover service (HTTP), or local daemon pool.
                 let proof_data = if proof_backend == "nightstream" {
                     // Nightstream backend: prove locally using NightstreamHost with the
-                    // placeholder note_spend circuit. SpendPublic is set as custom
-                    // public_output (pass-through — the circuit echoes a dummy word).
+                    // placeholder echo circuit. SpendPublic is serialized into input
+                    // words and echoed to output via output claims.
                     use sov_nightstream_adapter::circuits::note_spend_rom;
                     use sov_nightstream_adapter::NightstreamHost;
 
@@ -2477,13 +2477,12 @@ async fn perform_transfer_cycle(
                         &note_spend_rom::NOTE_SPEND_ROM,
                         note_spend_rom::NOTE_SPEND_ROM_BASE,
                     );
-                    // The placeholder circuit reads 1 u32 from input and writes it to output.
-                    ns_host.add_u32_input(1u32);
-                    ns_host.add_output_claim(0x100, 1);
-                    ns_host.set_custom_public_output(
-                        bincode::serialize(&public)
-                            .context("Failed to serialize SpendPublic for Nightstream")?,
-                    );
+                    // Serialize SpendPublic and feed it through the echo circuit.
+                    // The circuit copies the payload to output; output claims
+                    // bind the proof to the serialized SpendPublic.
+                    let public_bytes = bincode::serialize(&public)
+                        .context("Failed to serialize SpendPublic for Nightstream")?;
+                    ns_host.add_public_output_bytes(&public_bytes);
                     let compressed = ns_host.run(true)
                         .context("Nightstream proving failed")?;
                     // run() returns DEFLATE-compressed NightstreamProofPackage bytes — ready to use

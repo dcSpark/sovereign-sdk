@@ -79,9 +79,17 @@ fn test_prove_and_verify_value_validator() {
 
     println!("Proof package size: {} bytes", proof_bytes.len());
 
-    // Deserialize the proof package
+    // Decompress (DEFLATE) then deserialize the proof package
+    let decompressed = {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).expect("decompress proof");
+        buf
+    };
     let package: NightstreamProofPackage =
-        bincode::deserialize(&proof_bytes).expect("deserialize proof package");
+        bincode::deserialize(&decompressed).expect("deserialize proof package");
 
     println!(
         "Package: public_output size={}, rom size={}",

@@ -1505,8 +1505,10 @@ async fn prove_handler(
 
     let result = match backend.as_str() {
         "nightstream" => {
-            // Nightstream proving: wrap a pre-computed SpendPublic in a
-            // NightstreamProofPackage using the placeholder note_spend circuit.
+            // Nightstream proving: run the placeholder echo circuit with the
+            // provided SpendPublic.  The host serializes SpendPublic into input
+            // words and sets matching output claims; the circuit echoes the data
+            // to the output region, binding the proof to the payload.
             let spend_public = match req.spend_public {
                 Some(sp) => sp,
                 None => {
@@ -1526,13 +1528,12 @@ async fn prove_handler(
                     &note_spend_rom::NOTE_SPEND_ROM,
                     note_spend_rom::NOTE_SPEND_ROM_BASE,
                 );
-                // Placeholder circuit reads 1 u32 input and echoes it to output.
-                host.add_u32_input(1u32);
-                host.add_output_claim(0x100, 1);
-
+                // Serialize SpendPublic and feed it through the echo circuit.
+                // The circuit copies the payload to the output region; output
+                // claims bind the proof to the serialized SpendPublic.
                 let public_bytes = bincode::serialize(&spend_public)
                     .map_err(|e| ServiceError::Internal(format!("Failed to serialize SpendPublic: {e}")))?;
-                host.set_custom_public_output(public_bytes);
+                host.add_public_output_bytes(&public_bytes);
 
                 host.run(true)
                     .map_err(|e| ServiceError::Internal(format!("Nightstream proving failed: {e}")))

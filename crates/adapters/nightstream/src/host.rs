@@ -23,10 +23,16 @@ use crate::{NightstreamCodeCommitment, NightstreamGuest};
 /// The guest reads input words starting from RAM address 0x104.
 const INPUT_ADDR: u64 = 0x104;
 
-/// Default RAM size in bytes.
-const DEFAULT_RAM_BYTES: usize = 0x800;
+/// Default RAM size in bytes (64KB).
+///
+/// Sized to accommodate large serialized SpendPublic payloads echoed through
+/// the placeholder circuit.
+const DEFAULT_RAM_BYTES: usize = 0x10000;
 
 /// Default chunk size (instructions per folding step).
+///
+/// The placeholder echo circuit executes ~10-50 instructions, so a small
+/// chunk size keeps memory usage minimal.
 const DEFAULT_CHUNK_SIZE: usize = 16;
 
 /// Host for Nightstream zkVM (Sovereign adapter).
@@ -49,13 +55,6 @@ pub struct NightstreamHost {
     chunk_size: usize,
     /// Output claims: (address, expected_value).
     output_claims: Vec<(u64, u64)>,
-    /// Optional caller-provided public output bytes.
-    ///
-    /// When set, `run()` stores these bytes as `public_output` in the proof package
-    /// instead of extracting the output from the VM's output claims. This is used
-    /// for pass-through circuits where the host pre-computes the public output
-    /// (e.g. `SpendPublic` for the placeholder note_spend circuit).
-    custom_public_output: Option<Vec<u8>>,
 }
 
 impl NightstreamHost {
@@ -69,7 +68,6 @@ impl NightstreamHost {
             ram_bytes: DEFAULT_RAM_BYTES,
             chunk_size: DEFAULT_CHUNK_SIZE,
             output_claims: Vec::new(),
-            custom_public_output: None,
         }
     }
 
@@ -99,15 +97,37 @@ impl NightstreamHost {
         self.output_claims.push((addr, expected_value));
     }
 
-    /// Set a custom public output to embed in the proof package.
+    /// Write serialized bytes as input and set matching output claims.
     ///
-    /// When set, `run()` uses these bytes as `public_output` in the
-    /// [`NightstreamProofPackage`] instead of extracting the output from the
-    /// VM's output claims. This is useful for pass-through circuits where the
-    /// host pre-computes the public output (e.g. a bincode-serialized
-    /// `SpendPublic` for the placeholder note_spend circuit).
-    pub fn set_custom_public_output(&mut self, output: Vec<u8>) {
-        self.custom_public_output = Some(output);
+    /// The placeholder echo circuit reads a length word followed by payload
+    /// words from the input region and copies them verbatim to the output
+    /// region starting at `OUTPUT_ADDR` (0x100).  This method:
+    ///
+    /// 1. Pads `data` to a 4-byte boundary.
+    /// 2. Writes `len_words` (u32) as the first input word.
+    /// 3. Writes each payload word as an input AND registers a matching
+    ///    output claim so the prover/verifier enforce the echo.
+    ///
+    /// After proving, `extract_output_from_run` reconstructs the original
+    /// bytes from the output claims.
+    pub fn add_public_output_bytes(&mut self, data: &[u8]) {
+        let mut padded = data.to_vec();
+        while padded.len() % 4 != 0 {
+            padded.push(0);
+        }
+        let len_words = (padded.len() / 4) as u32;
+
+        // First input word: number of payload words the circuit should echo.
+        self.add_u32_input(len_words);
+
+        // Write each data word as input and set a matching output claim.
+        let mut output_addr = 0x100u64; // OUTPUT_ADDR
+        for chunk in padded.chunks_exact(4) {
+            let word = u32::from_le_bytes(chunk.try_into().expect("chunk is 4 bytes"));
+            self.add_u32_input(word);
+            self.output_claims.push((output_addr, word as u64));
+            output_addr += 4;
+        }
     }
 
     /// Compute the SHA-256 code commitment of the ROM bytes.
@@ -210,12 +230,7 @@ impl ZkvmHost for NightstreamHost {
                 .prove()
                 .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
 
-            // Use caller-provided public output if set, otherwise extract from run.
-            let output_value = if let Some(ref custom) = self.custom_public_output {
-                custom.clone()
-            } else {
-                self.extract_output_from_run(&run)?
-            };
+            let output_value = self.extract_output_from_run(&run)?;
 
             // Extract the proof and public step instances for the package.
             // These are what the verifier needs -- no re-execution required.
@@ -271,16 +286,11 @@ impl ZkvmHost for NightstreamHost {
         } else {
             tracing::info!("Nightstream: Executing without proof generation (simulation mode)");
 
-            // Use caller-provided public output if set, otherwise simulate to extract.
-            let output_value = if let Some(ref custom) = self.custom_public_output {
-                custom.clone()
-            } else {
-                match self.try_simulate() {
-                    Ok(output) => output,
-                    Err(e) => {
-                        tracing::warn!("Nightstream simulation failed: {}", e);
-                        vec![]
-                    }
+            let output_value = match self.try_simulate() {
+                Ok(output) => output,
+                Err(e) => {
+                    tracing::warn!("Nightstream simulation failed: {}", e);
+                    vec![]
                 }
             };
 
@@ -321,19 +331,24 @@ fn compress_proof_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 
 impl NightstreamHost {
     /// Extract the public output from a completed Rv32B1 run.
+    ///
+    /// Reconstructs a byte buffer from all output claims, sorted by address.
+    /// Each claim contributes one little-endian u32 word to the output.
     fn extract_output_from_run(
         &self,
         _run: &neo_fold::riscv_shard::Rv32B1Run,
     ) -> Result<Vec<u8>> {
-        // The output is determined by what the guest wrote to RAM at OUTPUT_ADDR.
-        // For the Sovereign SDK integration, we serialize the expected output from
-        // the output claims that were configured.
-        if let Some(&(_, value)) = self.output_claims.first() {
-            bincode::serialize(&(value as u32))
-                .context("Failed to serialize output value")
-        } else {
-            Ok(vec![])
+        if self.output_claims.is_empty() {
+            return Ok(vec![]);
         }
+        // Sort claims by address to reconstruct bytes in order.
+        let mut sorted: Vec<_> = self.output_claims.clone();
+        sorted.sort_by_key(|&(addr, _)| addr);
+        let mut bytes = Vec::with_capacity(sorted.len() * 4);
+        for &(_, value) in &sorted {
+            bytes.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        Ok(bytes)
     }
 
     /// Try a simulation run (no proof, just execution) to extract output.
