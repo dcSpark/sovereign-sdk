@@ -30,7 +30,6 @@ use crate::hash::NullifierKey;
 ///
 /// Proof packages for `note_spend_guest` can be ~25MB (gzip), so keep headroom.
 const MAX_LIGERO_PROOF_BYTES: usize = 40_000_000;
-
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
 #[serialize(Borsh, Serde)]
@@ -1015,6 +1014,84 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(())
     }
 
+    #[cfg(feature = "native")]
+    fn user_prefix_write_stats(
+        st: &mut sov_modules_api::StateCheckpoint<S>,
+        prefix: &[u8],
+    ) -> (u64, u64, u128, u128) {
+        let mut set_entries = 0u64;
+        let mut delete_entries = 0u64;
+        let mut key_bytes = 0u128;
+        let mut value_bytes = 0u128;
+
+        for (slot_key, maybe_value) in st.iter_user_prefix_writes(prefix) {
+            key_bytes += slot_key.size() as u128;
+            if let Some(value) = maybe_value {
+                set_entries += 1;
+                value_bytes += value.size() as u128;
+            } else {
+                delete_entries += 1;
+            }
+        }
+
+        (set_entries, delete_entries, key_bytes, value_bytes)
+    }
+
+    /// Logs direct per-block tree-state write payload measured from the actual checkpoint delta.
+    ///
+    /// This is not an estimate: it scans the state writes queued in this block for the tree map
+    /// plus the tree metadata keys and reports exact key/value byte counts.
+    #[cfg(feature = "native")]
+    fn log_tree_growth_checkpoint(
+        st: &mut sov_modules_api::StateCheckpoint<S>,
+        tree: &'static str,
+        depth: u8,
+        leaves: u64,
+        node_prefix: &[u8],
+        metadata_prefixes: [&[u8]; 3],
+    ) {
+        let (node_set_entries, node_delete_entries, node_key_bytes, node_value_bytes) =
+            Self::user_prefix_write_stats(st, node_prefix);
+        let node_total_bytes = node_key_bytes + node_value_bytes;
+
+        let mut meta_set_entries = 0u64;
+        let mut meta_delete_entries = 0u64;
+        let mut meta_key_bytes = 0u128;
+        let mut meta_value_bytes = 0u128;
+        for prefix in metadata_prefixes {
+            let (sets, deletes, key_bytes, value_bytes) = Self::user_prefix_write_stats(st, prefix);
+            meta_set_entries += sets;
+            meta_delete_entries += deletes;
+            meta_key_bytes += key_bytes;
+            meta_value_bytes += value_bytes;
+        }
+        let meta_total_bytes = meta_key_bytes + meta_value_bytes;
+
+        let tree_state_write_total_bytes = node_total_bytes + meta_total_bytes;
+
+        tracing::info!(
+            tree,
+            depth,
+            milestone_leaves = leaves,
+            current_leaves = leaves,
+            node_set_entries,
+            node_delete_entries,
+            node_key_bytes = %node_key_bytes,
+            node_value_bytes = %node_value_bytes,
+            node_total_bytes = %node_total_bytes,
+            node_total_kib = (node_total_bytes as f64) / 1024.0,
+            metadata_set_entries = meta_set_entries,
+            metadata_delete_entries = meta_delete_entries,
+            metadata_key_bytes = %meta_key_bytes,
+            metadata_value_bytes = %meta_value_bytes,
+            metadata_total_bytes = %meta_total_bytes,
+            metadata_total_kib = (meta_total_bytes as f64) / 1024.0,
+            tree_state_write_total_bytes = %tree_state_write_total_bytes,
+            tree_state_write_total_kib = (tree_state_write_total_bytes as f64) / 1024.0,
+            "Sparse Merkle tree growth checkpoint"
+        );
+    }
+
     fn get_commitment_node_or_default(
         &self,
         key: &MerkleNodeKey,
@@ -1204,6 +1281,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.commitment_tree_depth.set(&depth, st)?;
             self.commitment_root.set(&root, st)?;
             self.next_position.set(&pos, st)?;
+            #[cfg(feature = "native")]
+            Self::log_tree_growth_checkpoint(
+                st,
+                "commitment",
+                depth,
+                pos,
+                self.commitment_nodes.raw_prefix_bytes(),
+                [
+                    self.commitment_tree_depth.prefix().as_ref(),
+                    self.commitment_root.prefix().as_ref(),
+                    self.next_position.prefix().as_ref(),
+                ],
+            );
 
             // Clean up processed entries
             self.pending_commitments_by_hash
@@ -1255,6 +1345,19 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             self.nullifier_tree_depth.set(&depth, st)?;
             self.nullifier_root.set(&root, st)?;
             self.next_nullifier_position.set(&pos, st)?;
+            #[cfg(feature = "native")]
+            Self::log_tree_growth_checkpoint(
+                st,
+                "nullifier",
+                depth,
+                pos,
+                self.nullifier_nodes.raw_prefix_bytes(),
+                [
+                    self.nullifier_tree_depth.prefix().as_ref(),
+                    self.nullifier_root.prefix().as_ref(),
+                    self.next_nullifier_position.prefix().as_ref(),
+                ],
+            );
 
             // Clean up processed entries
             self.pending_nullifiers_by_hash
