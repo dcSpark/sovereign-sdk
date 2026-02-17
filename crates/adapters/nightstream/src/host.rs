@@ -467,10 +467,12 @@ impl ZkvmHost for NightstreamHost {
             let timings = run.prove_timings();
             tracing::info!(
                 "Nightstream prove breakdown: \
-                 decode={}ms, ccs_build={}ms, vm_exec={}ms, fold_prove={}ms, total_engine={}ms",
+                 decode={}ms, ccs_build={}ms, vm_exec={}ms (trace={}ms, witness={}ms), fold_prove={}ms, total_engine={}ms",
                 timings.decode_and_setup.as_millis(),
                 timings.ccs_and_shared_bus.as_millis(),
                 timings.vm_execution.as_millis(),
+                timings.vm_trace.as_millis(),
+                timings.cpu_witness.as_millis(),
                 timings.fold_and_prove.as_millis(),
                 (timings.decode_and_setup
                     + timings.ccs_and_shared_bus
