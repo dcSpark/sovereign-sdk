@@ -128,7 +128,11 @@ impl NightstreamProofPackage {
         // Preload the verifier SparseCache AFTER build so the pointer-keyed
         // cache uses the final CCS address (inside the Rv32B1Verifier struct).
         if let Some(c) = cache {
-            verifier.preload_sparse_cache(c.sparse.clone())?;
+            if let Some(digest) = &c.ccs_mat_digest {
+                verifier.preload_sparse_cache_with_digest(c.sparse.clone(), digest.clone())?;
+            } else {
+                verifier.preload_sparse_cache(c.sparse.clone())?;
+            }
         }
 
         // Verify the ShardProof against the prover-supplied step instances.
