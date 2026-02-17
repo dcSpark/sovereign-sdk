@@ -50,6 +50,8 @@ const DOMAIN: Hash32 = [1u8; 32];
 pub struct RunnerConfig {
     /// Number of deposits (and transfers) to execute.
     pub num_deposits: usize,
+    /// If true, run only the deposit phase and skip transfer generation/submission.
+    pub deposits_only: bool,
     /// External node URL, if using already-running services.
     pub external_node_url: Option<String>,
     /// External verifier URL, if using already-running services.
@@ -72,6 +74,7 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             num_deposits: 100,
+            deposits_only: false,
             external_node_url: None,
             external_verifier_url: None,
             use_proof_cache: false,
@@ -92,6 +95,9 @@ impl RunnerConfig {
             if let Ok(parsed) = value.parse() {
                 cfg.num_deposits = parsed;
             }
+        }
+        if let Ok(value) = std::env::var("DEPOSITS_ONLY") {
+            cfg.deposits_only = value == "1" || value.to_lowercase() == "true";
         }
         if let Ok(value) = std::env::var("USE_PROOF_CACHE") {
             cfg.use_proof_cache = value == "1" || value.to_lowercase() == "true";
@@ -1042,6 +1048,15 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         "[ok] deposit_count advanced to >= {} (initial={}, final={})",
         stats_target, initial_stats.deposit_count, final_stats.deposit_count
     );
+
+    if config.deposits_only {
+        eprintln!(
+            "[mode] deposits_only=true: completed {} deposits and skipping transfer phase",
+            num_deposits
+        );
+        env.shutdown();
+        return Ok(());
+    }
 
     // Auto-generate transfer proofs for each deposit and submit after ALL proofs are ready
     // We already configured Ligero and computed `method_id` above.
