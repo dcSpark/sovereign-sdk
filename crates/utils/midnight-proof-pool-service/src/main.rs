@@ -59,7 +59,6 @@ struct Config {
     da_connection_string: String,
     nightstream_program_path: String,
     nightstream_proof_service_url: String,
-    verifier_prover_service_url: Option<String>,
     pool_state_file: Option<String>,
 }
 
@@ -101,10 +100,6 @@ impl Config {
             env_string("NIGHTSTREAM_PROGRAM_PATH", "note_spend_guest");
         let nightstream_proof_service_url =
             env_string("NIGHTSTREAM_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
-        let verifier_prover_service_url = env_optional_string("VERIFIER_PROVER_SERVICE_URL")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
         let pool_state_file = env_optional_string("POOL_STATE_FILE")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -126,7 +121,6 @@ impl Config {
             da_connection_string,
             nightstream_program_path,
             nightstream_proof_service_url,
-            verifier_prover_service_url,
             pool_state_file,
         })
     }
@@ -2005,11 +1999,6 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
         chain_id: 1,
         da_connection_string: cfg.da_connection_string.clone(),
         defer_sequencer_submission,
-        prover_service_url: cfg
-            .verifier_prover_service_url
-            .clone()
-            .or_else(|| Some(cfg.nightstream_proof_service_url.clone())),
-        proof_backend: std::env::var("PROOF_BACKEND").unwrap_or_else(|_| "nightstream".to_string()),
     };
 
     let state = AppState::new(verifier_cfg)

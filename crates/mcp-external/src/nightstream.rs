@@ -15,6 +15,7 @@ use serde::Serialize;
 pub struct Nightstream {
     proof_service_url: String,
     /// Circuit/program identifier (e.g. "note_spend_guest").
+    #[allow(dead_code)]
     circuit: String,
     http: HttpClient,
 }

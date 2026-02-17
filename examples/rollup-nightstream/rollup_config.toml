@@ -1,6 +1,6 @@
 # Nightstream-compatible rollup configuration
 #
-# Uses Midnight DA adapter (SQLite) so the rollup and proof-verifier-service
+# Uses Midnight DA adapter (PostgreSQL) so the rollup and proof-verifier-service
 # share the same worker_verified_transactions table.
 #
 # Settings tuned for Nightstream proofs:
@@ -9,9 +9,9 @@
 #   - batch_execution_time_limit_millis: 5000 (Nightstream verify ~100ms release, ~2-5s debug)
 
 [da]
-# SQLite DA for local development. Both the rollup and proof-verifier-service
-# will share this database (worker_verified_transactions table).
-connection_string = "sqlite://da.sqlite?mode=rwc"
+# PostgreSQL DA for local development. Both the rollup and proof-verifier-service
+# share the same database (worker_verified_transactions table).
+connection_string = "postgresql://admin:1234@localhost:5432/da"
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
 finalization_blocks = 1
 

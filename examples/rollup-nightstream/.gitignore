@@ -2,3 +2,4 @@
 mock_da.sqlite*
 da.sqlite*
 /nightstream-artifacts
+tsink-data

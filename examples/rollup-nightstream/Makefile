@@ -4,6 +4,7 @@
 
 # Paths
 SOV_CLI_REL_PATH := ../../target/release/sov-cli
+LOCAL_DA_PG_URL ?= postgresql://admin:1234@localhost:5432/da
 
 all: build
 
@@ -38,6 +39,34 @@ clean:
 	@if [ -f "$(SOV_CLI_REL_PATH)" ]; then \
 		$(SOV_CLI_REL_PATH) transactions clean || true; \
 	fi
+	@echo "Truncating local PostgreSQL DA tables (if configured)..."
+	@set -eu; \
+	if command -v psql >/dev/null 2>&1; then \
+		truncate_pg_db() { \
+			db_url="$$1"; \
+			db_name="$$2"; \
+			if [ -z "$$db_url" ]; then \
+				return 0; \
+			fi; \
+			case "$$db_url" in \
+				postgres://*|postgresql://*) ;; \
+				*) \
+					echo "  - skipping $$db_name (non-Postgres URL)"; \
+					return 0; \
+					;; \
+			esac; \
+			echo "  - truncating $$db_name"; \
+			tables="$$(psql "$$db_url" -v ON_ERROR_STOP=1 -Atqc "SELECT string_agg(quote_ident(schemaname) || '.' || quote_ident(tablename), ', ') FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null)" \
+				|| { echo "    warning: failed to query $$db_name at $$db_url"; return 0; }; \
+			if [ -n "$$tables" ]; then \
+				psql "$$db_url" -v ON_ERROR_STOP=1 -q -c "TRUNCATE TABLE $$tables RESTART IDENTITY CASCADE;" >/dev/null \
+					|| echo "    warning: failed to truncate $$db_name at $$db_url"; \
+			fi; \
+		}; \
+		truncate_pg_db "$${DA_CONNECTION_STRING:-$(LOCAL_DA_PG_URL)}" "da"; \
+	else \
+		echo "  - skipping Postgres DB cleanup (psql not found)"; \
+	fi
 	@echo "Clean complete."
 
 ## Show help
@@ -48,5 +77,5 @@ help:
 	@echo "  make build          Build the rollup binary (debug)"
 	@echo "  make build-release  Build the rollup binary (release)"
 	@echo "  make run            Run the rollup via run_rollup.sh"
-	@echo "  make clean          Clean local data (demo_data, SQLite DBs, artifacts)"
+	@echo "  make clean          Clean local data (demo_data, artifacts, Postgres tables)"
 	@echo "  make help           Show this help message"
