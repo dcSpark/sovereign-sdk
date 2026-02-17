@@ -1,0 +1,63 @@
+# Read-only replica configuration for Nightstream
+# This node syncs from the shared DA database but does not write to it.
+
+[da]
+# Shared DA database - same as the primary node (PostgreSQL)
+connection_string = "postgresql://admin:1234@localhost:5432/da"
+
+sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
+finalization_blocks = 1
+
+# Enable read-only replica mode:
+# - Skips database schema setup (CREATE TABLE, CREATE INDEX)
+# - Spawns background poller to detect new blocks from the shared database
+# Tables must already exist (created by the primary node with write access).
+readonly_mode = true
+
+# Polling interval (ms) for detecting new blocks from the shared database.
+readonly_poll_interval_ms = 500
+
+# Disable worker tx persistence for replica (read-only)
+save_incoming_worker_txs = "none"
+
+# No block_producing section = Manual mode (read-only, no DA writes)
+
+[storage]
+# IMPORTANT: Different path from primary node to avoid RocksDB conflicts
+path = "demo_data_replica"
+state_cache_size = 8589934592
+
+[runner]
+genesis_height = 0
+da_polling_interval_ms = 50
+
+[runner.http_config]
+bind_host = "0.0.0.0"
+# IMPORTANT: Different port from primary node (primary uses 12346)
+bind_port = 12347
+
+[monitoring]
+telegraf_address = "udp://127.0.0.1:8094"
+
+[proof_manager]
+aggregated_proof_block_jump = 16
+prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+max_number_of_transitions_in_db = 100
+max_number_of_transitions_in_memory = 30
+
+[sequencer]
+blob_processing_timeout_secs = 3000
+max_batch_size_bytes = 20971520
+max_concurrent_blobs = 512
+max_allowed_node_distance_behind = 10
+rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+
+[sequencer.preferred]
+is_replica = true
+disable_state_root_consistency_checks = true
+recovery_strategy = "TryToSave"
+batch_execution_time_limit_millis = 5000
+num_cache_warmup_workers = 5
+
+[sequencer.extension]
+max_log_limit = 20000

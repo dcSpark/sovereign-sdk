@@ -21,7 +21,10 @@ use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
 use sov_stf_runner::RollupConfig;
 
+use tracing::warn;
+
 use crate::eth_dev_signer;
+use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
 
 /// Rollup with [`MidnightDaSpec`] as DA, [`MockZkvm`] as both inner and outer VM.
 ///
@@ -110,17 +113,45 @@ impl FullNodeBlueprint<Native> for NightstreamRollup<Native> {
         Seq: Sequencer<Spec = Self::Spec, Rt = Self::Runtime, Da = Self::DaService>,
     {
         let eth_signer = eth_dev_signer();
+        let extension = rollup_config.extension_or_panic();
         let eth_rpc_config = EthRpcConfig {
             eth_signer,
-            extension: rollup_config.extension_or_panic(),
+            extension: extension.clone(),
             buffer_raw_txs: true,
         };
 
-        Ok(NodeEndpoints {
-            jsonrpsee_module: sov_ethereum::get_ethereum_rpc(eth_rpc_config, sequencer)
-                .remove_context(),
+        let mut endpoints = NodeEndpoints {
+            jsonrpsee_module: sov_ethereum::get_ethereum_rpc(
+                eth_rpc_config,
+                Arc::clone(&sequencer),
+            )
+            .remove_context(),
             ..Default::default()
-        })
+        };
+
+        let cursor_store = if extension.midnight_bridge.is_some() {
+            match BridgeCursorStore::open(&rollup_config.storage.path) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    warn!(
+                        error = ?err,
+                        path = %rollup_config.storage.path.display(),
+                        "Midnight bridge cursor persistence disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(handle) =
+            spawn_midnight_bridge(Arc::clone(&sequencer), &extension, cursor_store)?
+        {
+            endpoints.background_handles.push(handle);
+        }
+
+        Ok(endpoints)
     }
 
     async fn create_da_service(

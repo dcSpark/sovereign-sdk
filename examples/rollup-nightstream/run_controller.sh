@@ -228,7 +228,33 @@ for script_name in "${REQUIRED_SCRIPTS[@]}"; do
   fi
 done
 
-# ── Step 3: Launch ────────────────────────────────────────────────────────────
+# ── Step 3: Seed bridge assets ────────────────────────────────────────────────
+
+print_step "Seeding Midnight bridge assets"
+
+ROLLUP_DATA_DIR="$SCRIPT_DIR/demo_data"
+mkdir -p "$ROLLUP_DATA_DIR"
+
+ASSETS_DIR="$SCRIPT_DIR/assets"
+if [ -d "$ASSETS_DIR" ]; then
+  if [ ! -f "$ROLLUP_DATA_DIR/midnight_bridge_signer.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_signer.json" ]; then
+    cp "$ASSETS_DIR/midnight_bridge_signer.json" "$ROLLUP_DATA_DIR/"
+    print_ok "Restored $ROLLUP_DATA_DIR/midnight_bridge_signer.json"
+  else
+    print_ok "midnight_bridge_signer.json (present)"
+  fi
+
+  if [ ! -f "$ROLLUP_DATA_DIR/midnight_bridge_events.json" ] && [ -f "$ASSETS_DIR/midnight_bridge_events.json" ]; then
+    cp "$ASSETS_DIR/midnight_bridge_events.json" "$ROLLUP_DATA_DIR/"
+    print_ok "Restored $ROLLUP_DATA_DIR/midnight_bridge_events.json"
+  else
+    print_ok "midnight_bridge_events.json (present)"
+  fi
+else
+  print_info "No assets/ directory — bridge asset seeding skipped"
+fi
+
+# ── Step 4: Launch ────────────────────────────────────────────────────────────
 
 print_step "Starting service controller"
 

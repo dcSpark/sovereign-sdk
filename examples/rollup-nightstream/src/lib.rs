@@ -3,6 +3,7 @@
 
 use std::str::FromStr;
 
+mod midnight_bridge;
 mod nightstream_rollup;
 pub use nightstream_rollup::*;
 
