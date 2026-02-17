@@ -23,7 +23,7 @@ use url::Url;
 mod commitment_tree;
 mod config;
 mod fvk_service;
-mod ligero;
+mod nightstream;
 mod operations;
 mod prefunded_wallets;
 mod privacy_key;
@@ -44,7 +44,7 @@ use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
 use crate::fvk_service::ViewerFvkBundle;
-use crate::ligero::Ligero;
+use crate::nightstream::Nightstream;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::server::{CryptoServer, LocalNotes, McpWalletContext, PendingSpentNotes};
@@ -816,14 +816,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // don't all pay the sync cost on-demand.
     crate::commitment_tree::start_background_tree_sync(provider.clone());
 
-    // Initialize Ligero proof client (HTTP service)
-    tracing::info!("[mcp] Initializing Ligero proof service client");
-    tracing::info!("[mcp] Proof service URL: {}", cfg.ligero_proof_service_url);
-    tracing::info!("[mcp] Circuit: {}", cfg.ligero_program_path);
+    // Initialize Nightstream proof client (HTTP service)
+    tracing::info!("[mcp] Initializing Nightstream proof service client");
+    tracing::info!("[mcp] Proof service URL: {}", cfg.nightstream_proof_service_url);
+    tracing::info!("[mcp] Circuit: {}", cfg.nightstream_program_path);
 
-    let ligero = Arc::new(Ligero::new(
-        cfg.ligero_proof_service_url.to_string(),
-        cfg.ligero_program_path.clone(),
+    let nightstream = Arc::new(Nightstream::new(
+        cfg.nightstream_proof_service_url.to_string(),
+        cfg.nightstream_program_path.clone(),
     ));
 
     let auto_fund_deposit_amount = cfg
@@ -911,7 +911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let provider_for_service = provider.clone();
     let admin_wallet_ctx_for_service = admin_wallet_ctx.clone();
-    let ligero_for_service = ligero.clone();
+    let nightstream_for_service = nightstream.clone();
     let prefunded_wallets_for_service = prefunded_wallets.clone();
     let log_path_string = log_file_path.to_string_lossy().to_string();
     let auto_fund_deposit_amount_for_service = auto_fund_deposit_amount;
@@ -981,7 +981,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 provider_for_service.clone(),
                 wallet_ctx,
                 admin_wallet_ctx_for_service.clone(),
-                ligero_for_service.clone(),
+                nightstream_for_service.clone(),
                 viewer_fvk_bundle,
                 privacy_key,
                 prefunded_wallets_for_service.clone(),

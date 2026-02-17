@@ -2,7 +2,7 @@
 # ============================================================================
 # run_rollup.sh  --  Start a Nightstream-compatible rollup (midnight DA)
 #
-# Uses sov-rollup-ligero with the `nightstream` feature and midnight DA
+# Uses demo-rollup with Nightstream proving and midnight DA
 # (SQLite). The proof-verifier-service can share the same DA SQLite to
 # exchange worker_verified_transactions.
 #
@@ -68,7 +68,7 @@ if [ "$RELEASE_MODE" -eq 1 ]; then
   TARGET_DIR="release"
 fi
 
-SOV_ROLLUP="$REPO_ROOT/target/$TARGET_DIR/sov-rollup-ligero"
+SOV_ROLLUP="$REPO_ROOT/target/$TARGET_DIR/sov-rollup-nightstream"
 PROOF_GEN="$REPO_ROOT/target/$TARGET_DIR/examples/generate_proof_tx"
 
 # Runtime directories (relative to where the rollup runs from)
@@ -108,11 +108,11 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     2>&1 | tail -3
   print_ok "generate_proof_tx"
 
-  print_info "Building sov-rollup-ligero + sov-cli (--features nightstream)..."
+  print_info "Building rollup-nightstream..."
   SKIP_GUEST_BUILD=1 cargo build $CARGO_PROFILE \
-    -p sov-rollup-ligero --features nightstream \
+    -p sov-rollup-nightstream \
     2>&1 | tail -3
-  print_ok "sov-rollup-ligero (nightstream)"
+  print_ok "rollup-nightstream"
 else
   print_step "Build skipped (--skip-build)"
   [ -f "$SOV_ROLLUP" ] || { echo "  Missing $SOV_ROLLUP"; exit 1; }
@@ -155,14 +155,13 @@ print('[' + ', '.join(str(int(h[i:i+2], 16)) for i in range(0, len(h), 2)) + ']'
 ")
 print_ok "Nightstream method_id: 0x${NS_METHOD_ID_HEX}"
 
-# Patch midnight_privacy.json: set backend + method_id
+# Patch midnight_privacy.json: set method_id
 python3 -c "
 import json, sys
 mp = json.load(open('$GENESIS_DIR/midnight_privacy.json'))
-mp['backend'] = 'nightstream'
 mp['method_id'] = $NS_METHOD_ID_JSON
 json.dump(mp, open('$GENESIS_DIR/midnight_privacy.json', 'w'), indent=2)
-print('  Patched midnight_privacy.json: backend=nightstream')
+print('  Patched midnight_privacy.json: method_id set')
 "
 
 print_ok "Genesis ready at $GENESIS_DIR"

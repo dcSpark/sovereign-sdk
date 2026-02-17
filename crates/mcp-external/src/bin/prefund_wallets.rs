@@ -13,7 +13,7 @@ use mcp_external::wallet::WalletContext;
 use rand::RngCore;
 use sov_address::MultiAddressEvm;
 use sov_bank::{config_gas_token_id, TokenId};
-use sov_ligero_adapter::Ligero as LigeroAdapter;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
@@ -22,7 +22,7 @@ use sov_modules_api::{Amount, Spec};
 
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
 type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 

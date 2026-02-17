@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{CallMessage as MidnightCallMessage, PrivacyAddress};
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -16,7 +16,7 @@ use sov_modules_api::{Amount, Spec};
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 #[derive(Debug)]

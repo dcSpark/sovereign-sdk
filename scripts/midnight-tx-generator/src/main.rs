@@ -1,6 +1,7 @@
 #!/usr/bin/env rust-script
-//! Generate a midnight withdrawal transaction with a REAL Ligero proof
+//! Generate a midnight withdrawal transaction with a ZK proof
 //! Using exact parameters from the working integration test
+//! TODO: Migrate to Nightstream - was using Ligero proof
 //!
 //! This creates a borsh-serialized transaction that can be sent to the sequencer.
 
@@ -12,17 +13,16 @@ use midnight_privacy::{
     root_from_path, CallMessage, Hash32, MerkleTree, PrivacyAddress, SpendPublic,
 };
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_ligero_adapter::Ligero;
+// TODO: Migrate to Nightstream - was: use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::{CryptoSpec, PrivateKey, Spec};
 use sov_modules_rollup_blueprint::RollupBlueprint;
-use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+// TODO: Migrate to Nightstream - was: use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
 
 mod note_spend_guest_v2;
 mod rollup_schema;
@@ -93,11 +93,11 @@ fn main() -> Result<()> {
         .parse()
         .context("Invalid recipient address")?;
 
-    // Setup Ligero environment (discovers paths automatically)
-    println!("Setting up Ligero environment...");
-    let ligero_config = setup_ligero_env()?;
-    println!("✓ Ligero configured");
-    println!("  Program: {}", ligero_config.program);
+    // TODO: Migrate to Nightstream - was: Setup Ligero environment (discovers paths automatically)
+    println!("Setting up proof environment...");
+    let proof_config = setup_proof_env()?;
+    println!("✓ Proof environment configured");
+    println!("  Program: {}", proof_config.program);
     println!();
 
     // Use EXACT parameters from test_simple_note_spend test
@@ -229,25 +229,11 @@ fn main() -> Result<()> {
         &deny_openings,
     )?;
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&ligero_config.program)
-        .with_packing(ligero_config.packing)
-        .with_private_indices(private_indices);
-    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
+    // TODO: Migrate to Nightstream - was using Ligero as Zkvm / LigeroHost for proof generation
+    let _ = (proof_config, private_indices, args, blacklist_root, public_output);
+    let proof_bytes: Vec<u8> = todo!("TODO: Migrate to Nightstream - proof generation");
 
-    let mut public_output = public_output;
-    public_output.blacklist_root = blacklist_root;
-    host.set_public_output(&public_output)?;
-
-    println!("  Calling webgpu_prover...");
-    let proof_start = Instant::now();
-    let proof_bytes = host.run(true).context("Failed to generate proof")?;
-    let proof_time = proof_start.elapsed();
-
-    println!(
-        "✓ Proof generated: {} bytes ({:.1}s)\n",
-        proof_bytes.len(),
-        proof_time.as_secs_f64()
-    );
+    println!("✓ Proof generated: {} bytes\n", proof_bytes.len());
 
     // Load or generate private key
     let private_key = if let Ok(key_file) = std::env::var("PRIVATE_KEY_FILE") {
@@ -325,15 +311,14 @@ fn main() -> Result<()> {
 }
 
 #[derive(Debug)]
-struct LigeroConfig {
+struct ProofConfig {
     program: String,
     packing: u32,
 }
 
-fn setup_ligero_env() -> Result<LigeroConfig> {
-    let config = LigeroConfig {
-        // Pass a circuit name (or a full `.wasm` path) via LIGERO_PROGRAM_PATH.
-        // `ligero-runner` resolves the correct wasm when given a circuit name.
+// TODO: Migrate to Nightstream - was setup_ligero_env using LIGERO_PROGRAM_PATH / LIGERO_PACKING
+fn setup_proof_env() -> Result<ProofConfig> {
+    let config = ProofConfig {
         program: std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string()),
         packing: std::env::var("LIGERO_PACKING")
             .unwrap_or_else(|_| "8192".to_string())
@@ -341,7 +326,6 @@ fn setup_ligero_env() -> Result<LigeroConfig> {
             .context("Invalid LIGERO_PACKING")?,
     };
 
-    // Set environment variables for Ligero
     std::env::set_var("LIGERO_PROGRAM_PATH", &config.program);
     std::env::set_var("LIGERO_PACKING", config.packing.to_string());
 

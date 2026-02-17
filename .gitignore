@@ -90,3 +90,4 @@ logs/mcp-external.log
 midnight_fvk_service.sqlite
 scripts/__pycache__
 tsink
+.cursor

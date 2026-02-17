@@ -1,9 +1,15 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use url::Url;
 use validator::Validate;
+
+fn default_nightstream_program() -> String {
+    "note_spend_guest".to_string()
+}
+
+fn default_nightstream_proof_service_url() -> Url {
+    Url::parse("http://127.0.0.1:8080").expect("default proof service URL is valid")
+}
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct Config {
@@ -29,17 +35,15 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub indexer_url: Url,
 
-    /// Path to ZK circuit WASM program (env: ZK_PROGRAM_PATH, required)
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_program_path: PathBuf,
+    /// Nightstream proof service URL (env: NIGHTSTREAM_PROOF_SERVICE_URL).
+    #[serde(default = "default_nightstream_proof_service_url")]
+    #[validate(custom(function = "validate_http_url"))]
+    pub nightstream_proof_service_url: Url,
 
-    /// Path to Ligero prover binary (env: LIGERO_PROVER_BINARY_PATH, required)
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_prover_binary_path: PathBuf,
-
-    /// Path to Ligero shader directory (env: LIGERO_SHADER_PATH, required)
-    #[validate(custom(function = "validate_file_exists"))]
-    pub ligero_shader_path: PathBuf,
+    /// Nightstream circuit/program identifier (env: NIGHTSTREAM_PROGRAM_PATH, optional).
+    #[serde(default = "default_nightstream_program", alias = "ZK_PROGRAM_PATH")]
+    #[validate(length(min = 1))]
+    pub nightstream_program_path: String,
 
     /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required)
     /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
@@ -50,14 +54,6 @@ pub struct Config {
 
 fn default_server_bind_address() -> String {
     "127.0.0.1:3000".into()
-}
-
-fn validate_file_exists(path: &PathBuf) -> Result<(), validator::ValidationError> {
-    if !path.exists() {
-        return Err(validator::ValidationError::new("file_not_found")
-            .with_message(format!("File does not exist: {}", path.display()).into()));
-    }
-    Ok(())
 }
 
 fn validate_http_url(url: &Url) -> Result<(), validator::ValidationError> {

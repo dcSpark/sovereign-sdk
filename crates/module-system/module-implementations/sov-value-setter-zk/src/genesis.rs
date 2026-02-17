@@ -12,20 +12,11 @@ pub struct ValueSetterZkConfig<S: Spec> {
     pub initial_value: Option<u32>,
 
     /// Code commitment (32 bytes) of the guest program that verifies value constraints.
-    /// For Ligero: SHA-256(WASM bytes || packing).
-    /// For Nightstream: SHA-256(ROM bytes).
+    /// Nightstream: SHA-256(ROM bytes).
     pub method_id: [u8; 32],
 
-    /// Admin of the module who can update the method ID and backend.
+    /// Admin of the module who can update the method ID.
     pub admin: S::Address,
-
-    /// Proof backend to use: "ligero" (default) or "nightstream".
-    #[serde(default = "default_backend")]
-    pub backend: String,
-}
-
-fn default_backend() -> String {
-    "ligero".to_string()
 }
 
 impl<S: Spec> ValueSetterZk<S> {
@@ -40,9 +31,6 @@ impl<S: Spec> ValueSetterZk<S> {
 
         // Set the method ID
         self.method_id.set(&config.method_id, state)?;
-
-        // Set the proof backend
-        self.backend.set(&config.backend, state)?;
 
         // Set initial value if provided
         if let Some(initial_value) = config.initial_value {
@@ -69,7 +57,6 @@ mod tests {
             admin,
             method_id,
             initial_value: Some(42),
-            backend: "ligero".to_string(),
         };
 
         let json_str = serde_json::to_string_pretty(&config).unwrap();

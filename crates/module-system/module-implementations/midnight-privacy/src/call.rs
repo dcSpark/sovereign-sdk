@@ -31,43 +31,19 @@ use crate::hash::NullifierKey;
 /// Keep headroom for both backends.
 const MAX_PROOF_BYTES: usize = 40_000_000;
 
-/// Verify a spend proof using the configured backend and return the public output.
-///
-/// This function dispatches to the appropriate ZK verifier based on `backend`:
-/// - `"ligero"` -> `LigeroVerifier::verify`
-/// - `"nightstream"` -> `NightstreamVerifier::verify` (requires `nightstream` feature)
+/// Verify a spend proof using the Nightstream backend and return the public output.
 #[cfg(feature = "native")]
 fn verify_spend_proof<S: Spec>(
-    backend: &str,
     proof: &[u8],
     method_id_bytes: &[u8; 32],
 ) -> Result<crate::types::SpendPublic> {
+    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
     use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 
-    match backend {
-        "ligero" => {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            let method_id = LigeroCodeCommitment::decode(method_id_bytes)
-                .map_err(|e| anyhow!("Invalid Ligero method_id: {}", e))?;
-            LigeroVerifier::verify(proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()).into())
-        }
-        #[cfg(feature = "nightstream")]
-        "nightstream" => {
-            use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
-            let method_id = NightstreamCodeCommitment::decode(method_id_bytes)
-                .map_err(|e| anyhow!("Invalid Nightstream method_id: {}", e))?;
-            NightstreamVerifier::verify(proof, &method_id)
-                .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()).into())
-        }
-        other => {
-            anyhow::bail!(
-                "Unknown proof backend: '{}'. Supported backends: 'ligero'{}",
-                other,
-                if cfg!(feature = "nightstream") { ", 'nightstream'" } else { "" }
-            );
-        }
-    }
+    let method_id = NightstreamCodeCommitment::decode(method_id_bytes)
+        .map_err(|e| anyhow!("Invalid Nightstream method_id: {}", e))?;
+    NightstreamVerifier::verify(proof, &method_id)
+        .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()).into())
 }
 
 /// Available call messages for the `MidnightPrivacy` module.
@@ -553,19 +529,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 debug!("Using pre-verified path (skipping proof verification)");
                 public
             } else {
-                let backend = self
-                    .proof_backend
-                    .get(st)?
-                    .unwrap_or_else(|| "ligero".to_string());
-                info!(backend = %backend, "No pre-verified credential, performing full proof verification");
+                info!("No pre-verified credential, performing full Nightstream proof verification");
 
-                // Only load and decode method_id when we really need to verify a proof.
                 let method_id_bytes = self
                     .method_id
                     .get(st)?
                     .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
 
-                verify_spend_proof::<S>(&backend, &proof, &method_id_bytes)?
+                verify_spend_proof::<S>(&proof, &method_id_bytes)?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -792,18 +763,14 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
                 debug!("Using pre-verified path (skipping proof verification)");
                 public
             } else {
-                let backend = self
-                    .proof_backend
-                    .get(st)?
-                    .unwrap_or_else(|| "ligero".to_string());
-                info!(backend = %backend, "No pre-verified credential, performing full proof verification");
+                info!("No pre-verified credential, performing full Nightstream proof verification");
 
                 let method_id_bytes = self
                     .method_id
                     .get(st)?
                     .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
 
-                verify_spend_proof::<S>(&backend, &proof, &method_id_bytes)?
+                verify_spend_proof::<S>(&proof, &method_id_bytes)?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values

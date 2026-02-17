@@ -10,11 +10,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_ligero_adapter::{Ligero, LigeroProofPackage};
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_rollup_blueprint::RollupBlueprint;
-use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
@@ -25,33 +23,16 @@ mod rollup_schema;
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 /// Inject pool signature into the proof package at the fvk_commitment argument position.
+/// NightstreamProofPackage does not support pool sig injection; returns proof bytes as-is.
 fn inject_pool_sig_hex_into_proof_bytes(
     proof_bytes: Vec<u8>,
-    fvk_commitment_arg_pos: usize,
-    pool_sig_hex: String,
+    _fvk_commitment_arg_pos: usize,
+    _pool_sig_hex: String,
 ) -> Result<Vec<u8>> {
-    let mut package: LigeroProofPackage =
-        bincode::deserialize(&proof_bytes).context("Proof payload is not a LigeroProofPackage")?;
-
-    let mut args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json)
-        .context("LigeroProofPackage.args_json is not valid JSON")?;
-
-    let idx = fvk_commitment_arg_pos
-        .checked_sub(1)
-        .ok_or_else(|| anyhow!("fvk_commitment_arg_pos must be >= 1"))?;
-    let arg = args
-        .get_mut(idx)
-        .ok_or_else(|| anyhow!("Ligero args too short (missing arg #{fvk_commitment_arg_pos})"))?;
-    let obj = arg.as_object_mut().ok_or_else(|| {
-        anyhow!("Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})")
-    })?;
-    obj.insert(
-        "pool_sig_hex".to_string(),
-        serde_json::Value::String(pool_sig_hex),
-    );
-
-    package.args_json = serde_json::to_vec(&args).context("Failed to reserialize args_json")?;
-    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+    let _package: sov_nightstream_adapter::NightstreamProofPackage =
+        bincode::deserialize(&proof_bytes)
+            .context("Proof payload is not a NightstreamProofPackage")?;
+    Ok(proof_bytes)
 }
 
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
@@ -77,28 +58,33 @@ struct ProverServiceResponse {
     proof: Option<String>,
 }
 
-/// Generate proof using the remote prover service and wrap it in a LigeroProofPackage.
+/// Generate proof using the remote Nightstream prover service.
 fn prove_with_service(
     service_url: &str,
-    program_path: &str,
-    args: &[serde_json::Value],
-    private_indices: Vec<usize>,
-    packing: u32,
+    _program_path: &str,
+    _args: &[serde_json::Value],
+    _private_indices: Vec<usize>,
+    _packing: u32,
     public_output: &[u8],
 ) -> Result<Vec<u8>> {
-    use base64::Engine;
-    use sov_ligero_adapter::LigeroProofPackage;
+    let public: SpendPublic =
+        bincode::deserialize(public_output).context("Invalid SpendPublic for prover request")?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for proving
         .build()
         .context("Failed to create HTTP client")?;
 
-    let request = ProverServiceRequest {
-        circuit: program_path.to_string(),
-        args: serde_json::Value::Array(args.to_vec()),
-        private_indices: private_indices.clone(),
-        packing: Some(packing),
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ProveRequest<'a> {
+        spend_public: &'a SpendPublic,
+        binary: bool,
+    }
+
+    let request = ProveRequest {
+        spend_public: &public,
+        binary: true,
     };
 
     let url = format!("{}/prove", service_url.trim_end_matches('/'));
@@ -109,37 +95,22 @@ fn prove_with_service(
         .context("Failed to send request to prover service")?;
 
     let status = response.status();
-    let resp: ProverServiceResponse = response
-        .json()
-        .context("Failed to parse prover service response")?;
-
-    if !resp.success {
-        anyhow::bail!(
-            "Prover service failed (status={}, exit_code={})",
-            status,
-            resp.exit_code
-        );
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("Prover service failed (status={}): {}", status, body);
     }
 
-    let proof_b64 = resp
-        .proof
-        .ok_or_else(|| anyhow::anyhow!("Prover service returned success but no proof"))?;
+    let proof_bytes = response
+        .bytes()
+        .context("Failed to read proof bytes from response")?
+        .to_vec();
 
-    let proof_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&proof_b64)
-        .context("Failed to decode proof from base64")?;
+    anyhow::ensure!(
+        !proof_bytes.is_empty(),
+        "Prover service returned empty proof"
+    );
 
-    // Wrap the raw proof bytes in a LigeroProofPackage (same as the local prover does)
-    let args_json = serde_json::to_vec(args).context("Failed to serialize args")?;
-    let package = LigeroProofPackage::new(
-        proof_bytes,
-        public_output.to_vec(),
-        args_json,
-        private_indices,
-    )
-    .context("Failed to build LigeroProofPackage")?;
-
-    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+    Ok(proof_bytes)
 }
 
 /// Helper to create an EncryptedNote for the transaction (matching mcp-external/viewer.rs)
@@ -411,36 +382,9 @@ fn main() -> Result<()> {
         view_attestations: None,
     };
 
-    let program_path = std::env::var("LIGERO_PROGRAM_PATH")?;
-    let packing: u32 = std::env::var("LIGERO_PACKING")
-        .unwrap_or_else(|_| "8192".to_string())
-        .parse()
-        .context("Invalid LIGERO_PACKING")?;
-
-    // note_spend_guest v2 ABI builder (includes inv_enforce + deny-map section).
-    let input = note_spend_guest_v2::SpendInputV2 {
-        value: value_u64,
-        rho,
-        sender_id: in_sender_id,
-        pos: position,
-        siblings: siblings.clone(),
-        nullifier: nf,
-    };
-
-    let out1 = note_spend_guest_v2::SpendOutputV2 {
-        value: u64::try_from(out1_value).context("TRANSFER_OUT1 too large")?,
-        rho: out1_rho,
-        pk_spend: out1_pk_spend,
-        pk_ivk: out1_pk_ivk,
-        cm: cm_out1,
-    };
-    let out2 = note_spend_guest_v2::SpendOutputV2 {
-        value: u64::try_from(out2_value).context("TRANSFER_OUT2 too large")?,
-        rho: out2_rho,
-        pk_spend: out2_pk_spend,
-        pk_ivk: out2_pk_ivk,
-        cm: cm_out2,
-    };
+    let program_path = std::env::var("NIGHTSTREAM_PROGRAM_PATH")
+        .or_else(|_| std::env::var("LIGERO_PROGRAM_PATH"))
+        .unwrap_or_else(|_| "note_spend_guest".to_string());
 
     // Deny-map root + openings:
     // - always: sender_id
@@ -511,22 +455,6 @@ fn main() -> Result<()> {
         (None, None, None)
     };
 
-    let (args, private_indices) = note_spend_guest_v2::build_note_spend_args_v2_with_viewer(
-        domain,
-        spend_sk,
-        pk_ivk_owner,
-        tree_depth,
-        anchor,
-        &[input],
-        0,            // withdraw_amount
-        [0u8; 32],    // withdraw_to (unused for transfers)
-        &[out1, out2],
-        blacklist_root,
-        &deny_openings,
-        authority_fvk,
-        viewer_atts.as_deref(),
-    )?;
-
     let mut public_output = public_output;
     public_output.blacklist_root = blacklist_root;
     public_output.view_attestations = view_attestations_pub;
@@ -538,26 +466,79 @@ fn main() -> Result<()> {
     // Check if we should use the remote prover service
     let prover_service_url = std::env::var("PROVER_SERVICE_URL").ok();
 
+    // Compute inv_enforce for the enforce-product check.
+    let out1_value_u64 = u64::try_from(out1_value).context("TRANSFER_OUT1 too large for u64")?;
+    let out2_value_u64 = u64::try_from(out2_value).context("TRANSFER_OUT2 too large for u64")?;
+    let inv_enforce = midnight_privacy::inv_enforce_v2(
+        &[value_u64],
+        &[rho],
+        &[out1_value_u64, out2_value_u64],
+        &[out1_rho, out2_rho],
+    );
+
+    // Build the full circuit witness.
+    use sov_nightstream_adapter::{NoteSpendInput, NoteSpendOutput, NoteSpendWitness};
+
+    let witness = NoteSpendWitness {
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        depth: tree_depth as u32,
+        anchor,
+        inputs: vec![NoteSpendInput {
+            value: value_u64,
+            rho,
+            sender_id: in_sender_id,
+            position: position as u32,
+            siblings: siblings.clone(),
+            nullifier: nf,
+        }],
+        withdraw_amount: 0,
+        withdraw_to: [0u8; 32],
+        outputs: vec![
+            NoteSpendOutput {
+                value: out1_value_u64,
+                rho: out1_rho,
+                pk_spend: out1_pk_spend,
+                pk_ivk: out1_pk_ivk,
+                cm: cm_out1,
+            },
+            NoteSpendOutput {
+                value: out2_value_u64,
+                rho: out2_rho,
+                pk_spend: out2_pk_spend,
+                pk_ivk: out2_pk_ivk,
+                cm: cm_out2,
+            },
+        ],
+        inv_enforce,
+        blacklist_root,
+    };
+
     let mut proof_bytes = if let Some(service_url) = prover_service_url {
-        println!("Generating proof via prover service ({})...", service_url);
+        println!("Generating proof via Nightstream prover service ({})...", service_url);
         prove_with_service(
             &service_url,
             &program_path,
-            &args,
-            private_indices.clone(),
-            packing,
+            &[],
+            vec![],
+            0,
             &public_output_bytes,
         )?
     } else {
-        let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-            .with_packing(packing)
-            .with_private_indices(private_indices.clone());
-        note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
-        host.set_public_output(&public_output)?;
+        use sov_nightstream_adapter::circuits::note_spend_rom;
+        use sov_nightstream_adapter::NightstreamHost;
+        use sov_rollup_interface::zk::ZkvmHost;
 
-        println!("Generating proof (local)...");
+        let mut host = NightstreamHost::new(
+            &note_spend_rom::NOTE_SPEND_ROM,
+            note_spend_rom::NOTE_SPEND_ROM_BASE,
+        );
+        host.write_note_spend_witness(&witness, public_output_bytes.clone());
+
+        println!("Generating proof (local Nightstream)...");
         host.run(true)
-            .context("Ligero prover did not produce a valid proof")?
+            .context("Nightstream prover did not produce a valid proof")?
     };
     println!("✓ Proof generated: {} bytes", proof_bytes.len());
 

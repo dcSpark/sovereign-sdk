@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::CallMessage as MidnightCallMessage;
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
+use sov_nightstream_adapter::Nightstream;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -18,7 +18,7 @@ use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];

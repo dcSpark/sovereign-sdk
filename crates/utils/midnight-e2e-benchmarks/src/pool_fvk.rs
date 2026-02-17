@@ -89,31 +89,12 @@ pub fn decode_ligero_hash32_arg(v: &serde_json::Value, label: &str) -> Result<Ha
 
 pub fn inject_pool_sig_hex_into_proof_bytes(
     proof_bytes: Vec<u8>,
-    fvk_commitment_arg_pos: usize,
-    pool_sig_hex: String,
+    _fvk_commitment_arg_pos: usize,
+    _pool_sig_hex: String,
 ) -> Result<Vec<u8>> {
-    let mut package: sov_ligero_adapter::LigeroProofPackage =
-        bincode::deserialize(&proof_bytes).context("Proof payload is not a LigeroProofPackage")?;
-
-    let mut args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json)
-        .context("LigeroProofPackage.args_json is not valid JSON")?;
-
-    let idx = fvk_commitment_arg_pos
-        .checked_sub(1)
-        .ok_or_else(|| anyhow!("fvk_commitment_arg_pos must be >= 1"))?;
-    let arg = args
-        .get_mut(idx)
-        .ok_or_else(|| anyhow!("Ligero args too short (missing arg #{fvk_commitment_arg_pos})"))?;
-    let obj = arg.as_object_mut().ok_or_else(|| {
-        anyhow!(
-            "Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})"
-        )
-    })?;
-    obj.insert(
-        "pool_sig_hex".to_string(),
-        serde_json::Value::String(pool_sig_hex),
-    );
-
-    package.args_json = serde_json::to_vec(&args).context("Failed to reserialize args_json")?;
-    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+    // NightstreamProofPackage does not have args_json; pool sig injection is not supported.
+    // Return proof bytes as-is. TODO: Add Goldilocks-based pool sig support for Nightstream.
+    let _package: sov_nightstream_adapter::NightstreamProofPackage =
+        bincode::deserialize(&proof_bytes).context("Proof payload is not a NightstreamProofPackage")?;
+    Ok(proof_bytes)
 }

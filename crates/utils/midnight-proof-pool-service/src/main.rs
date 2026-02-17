@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router, ServiceExt};
 use mcp_external::commitment_tree::{global_tree_syncer, start_background_tree_sync};
 use mcp_external::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use mcp_external::ligero::Ligero;
+use mcp_external::nightstream::Nightstream;
 use mcp_external::operations::{deposit, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
@@ -29,7 +29,6 @@ use sov_proof_verifier_service::{
     create_router as create_verifier_router, AppState, ServiceConfig,
 };
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
-use sov_rollup_interface::zk::{CodeCommitment, Zkvm, ZkvmHost};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -58,8 +57,8 @@ struct Config {
     proof_generation_interval_ms: u64,
     max_concurrent_proofs: usize,
     da_connection_string: String,
-    ligero_program_path: String,
-    ligero_proof_service_url: String,
+    nightstream_program_path: String,
+    nightstream_proof_service_url: String,
     verifier_prover_service_url: Option<String>,
     pool_state_file: Option<String>,
 }
@@ -98,9 +97,10 @@ impl Config {
         let proof_generation_interval_ms = env_u64("PROOF_GENERATION_INTERVAL_MS", 0);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
-        let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
-        let ligero_proof_service_url =
-            env_string("LIGERO_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
+        let nightstream_program_path =
+            env_string("NIGHTSTREAM_PROGRAM_PATH", "note_spend_guest");
+        let nightstream_proof_service_url =
+            env_string("NIGHTSTREAM_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
         let verifier_prover_service_url = env_optional_string("VERIFIER_PROVER_SERVICE_URL")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -124,8 +124,8 @@ impl Config {
             proof_generation_interval_ms,
             max_concurrent_proofs,
             da_connection_string,
-            ligero_program_path,
-            ligero_proof_service_url,
+            nightstream_program_path,
+            nightstream_proof_service_url,
             verifier_prover_service_url,
             pool_state_file,
         })
@@ -228,7 +228,7 @@ struct ServiceState {
     deposit_provider: Arc<Provider>,
     http: HttpClient,
     verifier_url: String,
-    ligero: Arc<Ligero>,
+    nightstream: Arc<Nightstream>,
     admin_wallet: Arc<McpWalletContext>,
     gas_token_id: TokenId,
     wallets: RwLock<Vec<PoolWallet>>,
@@ -389,9 +389,9 @@ async fn main() -> Result<()> {
 
     let gas_token_id = provider.get_gas_token_id().await.context("gas token id")?;
 
-    let ligero = Arc::new(Ligero::new(
-        cfg.ligero_proof_service_url.clone(),
-        cfg.ligero_program_path.clone(),
+    let nightstream = Arc::new(Nightstream::new(
+        cfg.nightstream_proof_service_url.clone(),
+        cfg.nightstream_program_path.clone(),
     ));
 
     let admin_wallet = Arc::new(
@@ -425,7 +425,7 @@ async fn main() -> Result<()> {
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
         verifier_url: verifier_url.clone(),
-        ligero: ligero.clone(),
+        nightstream: nightstream.clone(),
         admin_wallet: admin_wallet.clone(),
         gas_token_id,
         wallets: RwLock::new(Vec::new()),
@@ -1219,7 +1219,7 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
         let res = loop {
             transfer_attempt += 1;
             let res = transfer(
-                state.ligero.as_ref(),
+                state.nightstream.as_ref(),
                 state.provider.as_ref(),
                 &wallet,
                 spend_sk,
@@ -1960,19 +1960,17 @@ async fn wait_for_sequencer_ready(node_url: &str, timeout: Duration) -> Result<(
     }
 }
 
-fn compute_ligero_method_id(program: &str) -> Result<[u8; 32]> {
-    let program_str = program.to_string();
-    let host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_str);
-    let code_commitment = host.code_commitment();
-    let method_id: [u8; 32] = code_commitment
-        .encode()
+fn compute_nightstream_method_id(_program: &str) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use sov_nightstream_adapter::circuits::note_spend_rom;
+    let method_id: [u8; 32] = Sha256::digest(&note_spend_rom::NOTE_SPEND_ROM)[..]
         .try_into()
-        .map_err(|_| anyhow!("code commitment should be 32 bytes"))?;
+        .map_err(|_| anyhow!("SHA-256 digest should be 32 bytes"))?;
     Ok(method_id)
 }
 
 async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool) -> Result<String> {
-    let method_id = compute_ligero_method_id(&cfg.ligero_program_path)?;
+    let method_id = compute_nightstream_method_id(&cfg.nightstream_program_path)?;
 
     type RollupSpec = sov_proof_verifier_service::RollupSpec;
     type PrivKey = <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey;
@@ -2010,8 +2008,8 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
         prover_service_url: cfg
             .verifier_prover_service_url
             .clone()
-            .or_else(|| Some(cfg.ligero_proof_service_url.clone())),
-        proof_backend: "ligero".to_string(),
+            .or_else(|| Some(cfg.nightstream_proof_service_url.clone())),
+        proof_backend: std::env::var("PROOF_BACKEND").unwrap_or_else(|_| "nightstream".to_string()),
     };
 
     let state = AppState::new(verifier_cfg)

@@ -82,8 +82,7 @@ pub use crate::hash::{Hash32, PendingCommitmentKey, PendingNullifierKey, Pending
 /// - `root_window_size`: Size of the anchor window
 /// - `all_roots`: Persistent index of ALL historical roots (NOMT-backed, enables long-range anchors)
 /// - `root_seq`: Monotonic sequence counter for root ordering
-/// - `method_id`: Code commitment for proof verification (Ligero or Nightstream)
-/// - `proof_backend`: Proof backend selector ("ligero" or "nightstream")
+/// - `method_id`: Code commitment for proof verification (Nightstream)
 /// - `admin`: Administrator who can update the method ID
 /// - `blacklist_root`: Deny-map Merkle root (freeze/blacklist primitive)
 /// - `blacklist_buckets`: Deny-map bucket entries (non-empty buckets)
@@ -154,10 +153,6 @@ pub struct ValueMidnightPrivacy<S: Spec> {
     /// For Nightstream: SHA-256(ROM bytes).
     #[state]
     pub method_id: StateValue<[u8; 32]>,
-
-    /// Proof backend: "ligero" (default) or "nightstream".
-    #[state]
-    pub proof_backend: StateValue<String>,
 
     /// Administrator address who can update the method ID.
     #[state]

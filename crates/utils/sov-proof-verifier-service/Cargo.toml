@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Sovereign Labs <info@sovereign.xyz>"]
 license = "MIT OR Apache-2.0"
-description = "Off-chain parallel proof verification service for Ligero rollup"
+description = "Off-chain parallel proof verification service for Nightstream rollup"
 
 [[bin]]
 name = "proof-verifier"
@@ -31,8 +31,6 @@ sha2 = { workspace = true }
 ed25519-dalek = { version = "2" }
 hex = { workspace = true }
 
-# Temp files (used for daemon-mode Ligero verifier, which expects a proof file path:
-# `proof_data.gz` (default) or `proof_data.bin` when gzip is disabled)
 tempfile = { workspace = true }
 
 # Logging
@@ -62,7 +60,6 @@ sea-orm = { version = "1.1", default-features = false, features = [
 # Sovereign SDK dependencies
 sov-modules-api = { workspace = true, features = ["native"] }
 sov-modules-stf-blueprint = { workspace = true, features = ["native"] }
-sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-nightstream-adapter = { workspace = true, features = ["native"] }
 sov-rollup-interface = { workspace = true }
 sov-node-client = { workspace = true }
@@ -74,20 +71,19 @@ sov-mock-zkvm = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 
-# Daemon-mode verifier pool (keeps `webgpu_verifier --daemon` workers warm)
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "7b6ac4849035fef8f108e7cadce2a601e63e5200" }
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }
 
 # CLI args
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 
 # CPU detection for default concurrency
 num_cpus = "1.16"
 
 # Futures utilities
 futures = { workspace = true }
+flate2 = "1.1.9"
 
 [dev-dependencies]
 tempfile = { workspace = true }

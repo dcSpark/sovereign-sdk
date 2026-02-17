@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::commitment_tree::global_tree_syncer;
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use crate::ligero::Ligero as LigeroProver;
+use crate::nightstream::Nightstream as NightstreamProver;
 use crate::prefunded_wallets::PrefundedWalletStore;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
@@ -31,7 +31,7 @@ use rmcp::{
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types::TxReceiptResult;
 use sov_bank::config_gas_token_id;
-use sov_ligero_adapter::Ligero;
+use sov_nightstream_adapter::Nightstream;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
@@ -39,7 +39,7 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
 use tokio::sync::{Mutex, RwLock};
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
@@ -909,7 +909,7 @@ pub struct CryptoServer {
     provider: Option<Arc<Provider>>,
     wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
     admin_wallet_context: Option<Arc<McpWalletContext>>,
-    ligero_prover: Option<Arc<LigeroProver>>,
+    nightstream_prover: Option<Arc<NightstreamProver>>,
     viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
     prefunded_wallets: Option<Arc<PrefundedWalletStore>>,
@@ -936,7 +936,7 @@ impl CryptoServer {
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<Option<McpWalletContext>>>,
         admin_wallet_context: Option<Arc<McpWalletContext>>,
-        ligero_prover: Arc<LigeroProver>,
+        nightstream_prover: Arc<NightstreamProver>,
         viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
         privacy_key: Arc<RwLock<Option<PrivacyKey>>>,
         prefunded_wallets: Option<Arc<PrefundedWalletStore>>,
@@ -954,7 +954,7 @@ impl CryptoServer {
             provider: Some(provider),
             wallet_context,
             admin_wallet_context,
-            ligero_prover: Some(ligero_prover),
+            nightstream_prover: Some(nightstream_prover),
             viewer_fvk_bundle,
             privacy_key,
             prefunded_wallets,
@@ -1439,9 +1439,9 @@ impl CryptoServer {
         let pk_ivk_owner = privacy_key.pk_ivk(&DOMAIN);
         let sender_id_out =
             midnight_privacy::recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk_owner);
-        let ligero_ref = self.ligero_prover.as_ref().ok_or_else(|| {
+        let nightstream_ref = self.nightstream_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Ligero proof service not configured; set LIGERO_PROOF_SERVICE_URL.".to_string(),
+                "Nightstream proof service not configured; set NIGHTSTREAM_PROOF_SERVICE_URL.".to_string(),
                 None,
             )
         })?;
@@ -1574,7 +1574,7 @@ impl CryptoServer {
         let transfer_result = loop {
             transfer_attempt += 1;
             let res = crate::operations::transfer(
-                ligero_ref,
+                nightstream_ref,
                 provider,
                 ctx,
                 spend_sk,
@@ -2058,7 +2058,7 @@ impl CryptoServer {
         let indexer_ws = "undefined".to_string();
         let node = provider.rpc_url().to_string();
 
-        let (proof_server, use_external_proof_server) = match self.ligero_prover.as_ref() {
+        let (proof_server, use_external_proof_server) = match self.nightstream_prover.as_ref() {
             Some(prover) => (prover.proof_service_url().to_string(), Some(true)),
             None => ("".to_string(), Some(false)),
         };

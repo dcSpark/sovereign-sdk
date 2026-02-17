@@ -5,6 +5,7 @@
 use crate::provider::Provider;
 
 pub mod ligero;
+pub mod nightstream;
 
 /// Test wallet key for use in integration tests
 ///

@@ -1,30 +1,458 @@
-//! Domain-separated Poseidon2 hash functions for privacy-preserving operations.
+//! Domain-separated Poseidon2-Goldilocks hash functions for privacy-preserving operations.
 //!
-//! This module uses Ligetron's Poseidon2, which is compatible with the ZK circuit.
-//! Using the same Poseidon2 implementation ensures hash consistency between
-//! native Rust code and the Ligero circuit.
+//! This module uses neo-ccs's Poseidon2-Goldilocks implementation, which is compatible
+//! with the Nightstream RISC-V circuit. Using the same Poseidon2 implementation ensures
+//! hash consistency between native Rust code and the ZK circuit.
 //!
-//! Domain separation is achieved by prepending unique domain tags to each input type,
-//! preventing cross-domain collisions and attacks.
+//! Domain separation is achieved by prepending unique u64 domain tags (as Goldilocks field
+//! elements) to each input type, preventing cross-domain collisions and attacks.
+//!
+//! ## Hash32 <-> GlDigest
+//!
+//! The circuit works with `GlDigest = [Goldilocks; 4]` (four 64-bit field elements).
+//! On-chain state uses `Hash32 = [u8; 32]`. The encoding is:
+//! - Each `Goldilocks` element → 8 bytes little-endian
+//! - 4 elements → 32 bytes total
+//!
+//! This bijection is implemented by `gldigest_to_hash32` and `hash32_to_gldigest`.
 
 use std::fmt;
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ligetron::poseidon2_hash_bytes as ligetron_hash_bytes;
+use neo_ccs::crypto::poseidon2_goldilocks as p2;
+use p3_field::{PrimeCharacteristicRing, PrimeField64};
+use p3_goldilocks::Goldilocks;
 use serde::{Deserialize, Serialize};
 
 /// 32-byte hash output.
 pub type Hash32 = [u8; 32];
 
-/// Key for a node in the deny-map ("blacklist") Merkle tree used by the ZK circuits.
+/// Goldilocks digest: 4 Goldilocks field elements = 32 bytes.
+pub type GlDigest = [Goldilocks; 4];
+
+// === Hash32 <-> GlDigest conversion ===
+
+/// Convert a GlDigest (4 x Goldilocks) to Hash32 (32 bytes, little-endian).
+#[inline]
+pub fn gldigest_to_hash32(digest: &GlDigest) -> Hash32 {
+    let mut out = [0u8; 32];
+    for (i, &elem) in digest.iter().enumerate() {
+        let val: u64 = elem.as_canonical_u64();
+        out[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
+/// Convert a Hash32 (32 bytes) to GlDigest (4 x Goldilocks, little-endian).
+#[inline]
+pub fn hash32_to_gldigest(h: &Hash32) -> GlDigest {
+    let mut out = [Goldilocks::ZERO; 4];
+    for i in 0..4 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&h[i * 8..(i + 1) * 8]);
+        out[i] = Goldilocks::from_u64(u64::from_le_bytes(buf));
+    }
+    out
+}
+
+// === Domain tags (must match the RISC-V circuit exactly) ===
+
+const TAG_MT_NODE: u64 = 1;
+const TAG_NOTE: u64 = 2;
+const TAG_PRF_NF: u64 = 3;
+const TAG_PK: u64 = 4;
+const TAG_ADDR: u64 = 5;
+const TAG_NFKEY: u64 = 6;
+const TAG_BL_BUCKET: u64 = 7;
+const TAG_IVK_SEED: u64 = 8;
+
+// === Core hash wrapper ===
+
+/// Domain-separated Poseidon2-Goldilocks hash.
 ///
-/// The current circuit design uses a **bucketed deny-map**:
-/// - The tree has fixed depth `BLACKLIST_TREE_DEPTH`.
-/// - Each leaf is the Poseidon2 hash of a fixed-size bucket of blacklisted IDs
-///   (see `BLACKLIST_BUCKET_SIZE` and `bl_bucket_leaf`).
+/// Hashes field elements directly using the sponge construction.
+/// Returns Hash32 (32 bytes) for on-chain storage.
+#[inline]
+fn poseidon2_gl(input: &[Goldilocks]) -> Hash32 {
+    gldigest_to_hash32(&p2::poseidon2_hash(input))
+}
+
+/// Domain-separated Poseidon2-Goldilocks hash returning raw GlDigest.
+#[inline]
+fn _poseidon2_gl_digest(input: &[Goldilocks]) -> GlDigest {
+    p2::poseidon2_hash(input)
+}
+
+// === Public hash API (matches old signatures, uses Goldilocks internally) ===
+
+/// Domain-separated 32-byte Poseidon2 hash.
 ///
-/// Height 0 is a leaf. Height `BLACKLIST_TREE_DEPTH` is the root.
+/// This is a compatibility wrapper. Prefer using the typed functions below
+/// (mt_combine, note_commitment, etc.) for domain-separated hashing.
+pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
+    // Pack tag + parts as bytes into Goldilocks field elements using packed encoding
+    let mut all_bytes =
+        Vec::with_capacity(tag.len() + parts.iter().map(|p| p.len()).sum::<usize>());
+    all_bytes.extend_from_slice(tag);
+    for part in parts {
+        all_bytes.extend_from_slice(part);
+    }
+    gldigest_to_hash32(&p2::poseidon2_hash_packed_bytes(&all_bytes))
+}
+
+/// Combine two children into a parent node in the Merkle tree.
+/// H(TAG_MT_NODE, level, left[0..4], right[0..4])
+///
+/// Input: 10 Goldilocks field elements.
+#[inline]
+pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
+    let left_gl = hash32_to_gldigest(left);
+    let right_gl = hash32_to_gldigest(right);
+    let mut input = [Goldilocks::ZERO; 10];
+    input[0] = Goldilocks::from_u64(TAG_MT_NODE);
+    input[1] = Goldilocks::from_u64(level as u64);
+    input[2..6].copy_from_slice(&left_gl);
+    input[6..10].copy_from_slice(&right_gl);
+    poseidon2_gl(&input)
+}
+
+/// Compute a note commitment.
+/// H(TAG_NOTE, domain[0..4], value, rho[0..4], recipient[0..4], sender_id[0..4])
+///
+/// Input: 18 Goldilocks field elements.
+#[inline]
+pub fn note_commitment(
+    domain: &Hash32,
+    value: u64,
+    rho: &Hash32,
+    recipient: &Hash32,
+    sender_id: &Hash32,
+) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let rho_gl = hash32_to_gldigest(rho);
+    let recip_gl = hash32_to_gldigest(recipient);
+    let sender_gl = hash32_to_gldigest(sender_id);
+
+    let mut input = [Goldilocks::ZERO; 18];
+    input[0] = Goldilocks::from_u64(TAG_NOTE);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5] = Goldilocks::from_u64(value);
+    input[6..10].copy_from_slice(&rho_gl);
+    input[10..14].copy_from_slice(&recip_gl);
+    input[14..18].copy_from_slice(&sender_gl);
+    poseidon2_gl(&input)
+}
+
+/// Compute a legacy note commitment (v1).
+///
+/// NOTE: This legacy format is kept for backward-compatible tooling and tests only.
+/// Maps to the same Goldilocks construction but without sender_id.
+#[inline]
+pub fn note_commitment_v1(
+    domain: &Hash32,
+    value: u128,
+    rho: &Hash32,
+    recipient: &Hash32,
+) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let rho_gl = hash32_to_gldigest(rho);
+    let recip_gl = hash32_to_gldigest(recipient);
+
+    // value as u64 (Goldilocks fits u64, truncate u128)
+    let value_u64 = value as u64;
+
+    let mut input = [Goldilocks::ZERO; 14];
+    input[0] = Goldilocks::from_u64(TAG_NOTE);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5] = Goldilocks::from_u64(value_u64);
+    input[6..10].copy_from_slice(&rho_gl);
+    input[10..14].copy_from_slice(&recip_gl);
+    poseidon2_gl(&input)
+}
+
+/// PRF-based nullifier.
+/// nf = H(TAG_PRF_NF, domain[0..4], nf_key[0..4], rho[0..4])
+///
+/// Input: 13 Goldilocks field elements.
+#[inline]
+pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let nf_key_gl = hash32_to_gldigest(nf_key);
+    let rho_gl = hash32_to_gldigest(rho);
+
+    let mut input = [Goldilocks::ZERO; 13];
+    input[0] = Goldilocks::from_u64(TAG_PRF_NF);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5..9].copy_from_slice(&nf_key_gl);
+    input[9..13].copy_from_slice(&rho_gl);
+    poseidon2_gl(&input)
+}
+
+// === Privacy Address Key Derivation ===
+
+/// Derive public key from spending secret key.
+/// pk = H(TAG_PK, spend_sk[0..4])
+///
+/// Input: 5 Goldilocks field elements.
+#[inline]
+pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
+    let sk_gl = hash32_to_gldigest(spend_sk);
+    let mut input = [Goldilocks::ZERO; 5];
+    input[0] = Goldilocks::from_u64(TAG_PK);
+    input[1..5].copy_from_slice(&sk_gl);
+    poseidon2_gl(&input)
+}
+
+/// Clamp a 32-byte seed into an X25519 scalar (RFC 7748).
+#[inline]
+fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    scalar
+}
+
+/// Derive incoming viewing key secret from domain and spending secret key.
+/// ivk_sk = H(TAG_IVK_SEED, domain[0..4], spend_sk[0..4])
+///
+/// Input: 9 Goldilocks field elements.
+#[inline]
+pub fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let sk_gl = hash32_to_gldigest(spend_sk);
+
+    let mut input = [Goldilocks::ZERO; 9];
+    input[0] = Goldilocks::from_u64(TAG_IVK_SEED);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5..9].copy_from_slice(&sk_gl);
+    poseidon2_gl(&input)
+}
+
+/// Derive the incoming viewing public key (pk_ivk) from spend_sk and domain.
+/// pk_ivk = X25519_BASE(clamp(ivk_sk_from_sk(domain, spend_sk)))
+#[inline]
+pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
+    let clamped = clamp_x25519_scalar(ivk_sk);
+    let secret = StaticSecret::from(clamped);
+    let public = PublicKey::from(&secret);
+    *public.as_bytes()
+}
+
+/// Derive privacy recipient address from domain and public key material.
+/// recipient = H(TAG_ADDR, domain[0..4], pk_spend[0..4], pk_ivk[0..4])
+///
+/// Input: 13 Goldilocks field elements.
+#[inline]
+pub fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32) -> Hash32 {
+    recipient_from_pk_v2(domain, pk_spend, pk_spend)
+}
+
+/// Derive recipient using both the spend pubkey and the incoming-view pubkey.
+/// recipient = H(TAG_ADDR, domain[0..4], pk_spend[0..4], pk_ivk[0..4])
+#[inline]
+pub fn recipient_from_pk_v2(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let pk_spend_gl = hash32_to_gldigest(pk_spend);
+    let pk_ivk_gl = hash32_to_gldigest(pk_ivk);
+
+    let mut input = [Goldilocks::ZERO; 13];
+    input[0] = Goldilocks::from_u64(TAG_ADDR);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5..9].copy_from_slice(&pk_spend_gl);
+    input[9..13].copy_from_slice(&pk_ivk_gl);
+    poseidon2_gl(&input)
+}
+
+/// Derive privacy recipient address from domain and spending secret key.
+#[inline]
+pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let pk = pk_from_sk(spend_sk);
+    recipient_from_pk(domain, &pk)
+}
+
+/// Derive privacy recipient address from domain, spending secret key, and an explicit incoming-view pubkey.
+#[inline]
+pub fn recipient_from_sk_v2(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
+    let pk_spend = pk_from_sk(spend_sk);
+    recipient_from_pk_v2(domain, &pk_spend, pk_ivk)
+}
+
+/// Derive nullifier key from domain and spending secret key.
+/// nf_key = H(TAG_NFKEY, domain[0..4], spend_sk[0..4])
+///
+/// Input: 9 Goldilocks field elements.
+#[inline]
+pub fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
+    let domain_gl = hash32_to_gldigest(domain);
+    let sk_gl = hash32_to_gldigest(spend_sk);
+
+    let mut input = [Goldilocks::ZERO; 9];
+    input[0] = Goldilocks::from_u64(TAG_NFKEY);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5..9].copy_from_slice(&sk_gl);
+    poseidon2_gl(&input)
+}
+
+/// Recompute the Merkle root from a leaf using its authentication path.
+pub fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Hash32 {
+    assert_eq!(siblings.len() as u8, depth);
+    let mut cur = *leaf;
+    let mut idx = pos;
+    for (lvl, sib) in (0..depth).zip(siblings.iter()) {
+        cur = if (idx & 1) == 0 {
+            mt_combine(lvl, &cur, sib)
+        } else {
+            mt_combine(lvl, sib, &cur)
+        };
+        idx >>= 1;
+    }
+    cur
+}
+
+/// Depth of the deny-map Merkle tree.
+pub const BLACKLIST_TREE_DEPTH: u8 = 16;
+
+/// Number of entries in each deny-map bucket leaf.
+pub const BLACKLIST_BUCKET_SIZE: usize = 12;
+
+/// Fixed-size bucket entries array stored per deny-map leaf.
+pub type BlacklistBucketEntries = [Hash32; BLACKLIST_BUCKET_SIZE];
+
+/// Return the canonical "empty bucket" entries array (all zeros).
+#[inline]
+pub fn empty_blacklist_bucket_entries() -> BlacklistBucketEntries {
+    [[0u8; 32]; BLACKLIST_BUCKET_SIZE]
+}
+
+/// Compute the bucket leaf hash: H(TAG_BL_BUCKET, entries[0..4], ..., entries[11][0..4]).
+///
+/// Input: 1 (tag) + 12 * 4 (entries) = 49 Goldilocks field elements.
+pub fn bl_bucket_leaf(entries: &BlacklistBucketEntries) -> Hash32 {
+    let mut input = [Goldilocks::ZERO; 1 + BLACKLIST_BUCKET_SIZE * 4];
+    input[0] = Goldilocks::from_u64(TAG_BL_BUCKET);
+    for (i, entry) in entries.iter().enumerate() {
+        let gl = hash32_to_gldigest(entry);
+        let offset = 1 + i * 4;
+        input[offset..offset + 4].copy_from_slice(&gl);
+    }
+    poseidon2_gl(&input)
+}
+
+/// Compute the leaf position (index) used by the deny-map tree from a 32-byte recipient.
+pub fn blacklist_pos_from_recipient(recipient: &Hash32) -> u64 {
+    let mut pos: u64 = 0;
+    let depth = BLACKLIST_TREE_DEPTH as usize;
+    let mut i = 0usize;
+    while i < depth {
+        let byte = recipient[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        pos |= (bit as u64) << i;
+        i += 1;
+    }
+    pos
+}
+
+/// Compute the default nodes for a sparse Merkle tree of the given depth.
+pub fn sparse_default_nodes(depth: u8) -> Vec<Hash32> {
+    let mut out: Vec<Hash32> = Vec::with_capacity(depth as usize + 1);
+    let leaf0 = bl_bucket_leaf(&empty_blacklist_bucket_entries());
+    out.push(leaf0);
+    for lvl in 0..depth {
+        let prev = out[lvl as usize];
+        out.push(mt_combine(lvl, &prev, &prev));
+    }
+    out
+}
+
+/// Compute the all-zero sparse Merkle root for a given depth.
+pub fn sparse_default_root(depth: u8) -> Hash32 {
+    let mut cur = bl_bucket_leaf(&empty_blacklist_bucket_entries());
+    for lvl in 0..depth {
+        cur = mt_combine(lvl, &cur, &cur);
+    }
+    cur
+}
+
+/// Compute the default (all-allowed) deny-map root expected by the ZK circuits.
+#[inline]
+pub fn default_blacklist_root() -> Hash32 {
+    sparse_default_root(BLACKLIST_TREE_DEPTH)
+}
+
+/// Compute the `inv_enforce` witness used by the `note_spend` circuit.
+///
+/// This value is computed off-chain by the prover and passed as a private input.
+/// It must match the circuit's computation exactly.
+///
+/// Uses Goldilocks field arithmetic: product of values * product of rho differences,
+/// then modular inverse.
+///
+/// The enforce product matches the Nightstream RISC-V circuit's
+/// `enforce_prod_digest_diff`, which multiplies ALL 4 Goldilocks elements of
+/// each rho difference (not just the first limb).
+pub fn inv_enforce_v2(
+    in_values: &[u64],
+    in_rhos: &[Hash32],
+    out_values: &[u64],
+    out_rhos: &[Hash32],
+) -> Hash32 {
+    use p3_field::Field;
+
+    /// Convert a Hash32 to a GlDigest (4 x Goldilocks, each from 8 LE bytes).
+    fn hash32_to_gl4(h: &Hash32) -> [Goldilocks; 4] {
+        let mut d = [Goldilocks::ZERO; 4];
+        for i in 0..4 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&h[i * 8..(i + 1) * 8]);
+            d[i] = Goldilocks::from_u64(u64::from_le_bytes(buf));
+        }
+        d
+    }
+
+    /// Multiply acc by all 4 element-wise differences (a[i] - b[i]).
+    /// Matches the circuit's `enforce_prod_digest_diff`.
+    fn digest_diff_prod(mut acc: Goldilocks, a: &[Goldilocks; 4], b: &[Goldilocks; 4]) -> Goldilocks {
+        for i in 0..4 {
+            acc *= a[i] - b[i];
+        }
+        acc
+    }
+
+    let mut enforce_prod = Goldilocks::ONE;
+
+    for &v in in_values {
+        enforce_prod *= Goldilocks::from_u64(v);
+    }
+    for &v in out_values {
+        enforce_prod *= Goldilocks::from_u64(v);
+    }
+
+    let out_gl: Vec<[Goldilocks; 4]> = out_rhos.iter().map(hash32_to_gl4).collect();
+    let in_gl: Vec<[Goldilocks; 4]> = in_rhos.iter().map(hash32_to_gl4).collect();
+
+    for out_d in &out_gl {
+        for in_d in &in_gl {
+            enforce_prod = digest_diff_prod(enforce_prod, out_d, in_d);
+        }
+    }
+
+    if out_gl.len() == 2 {
+        enforce_prod = digest_diff_prod(enforce_prod, &out_gl[0], &out_gl[1]);
+    }
+
+    let inv = enforce_prod.inverse();
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&inv.as_canonical_u64().to_le_bytes());
+    out
+}
+
+// === Key wrapper types (unchanged from before) ===
+
+/// Key for a node in the deny-map ("blacklist") Merkle tree.
 #[derive(
     Debug,
     Clone,
@@ -103,8 +531,7 @@ impl FromStr for NullifierKey {
     }
 }
 
-/// Wrapper for Merkle roots so we can store membership in StateMap (NOMT-backed).
-/// This enables permanent indexing of all historical roots for long-range anchor validation.
+/// Wrapper for Merkle roots for StateMap storage.
 #[derive(
     Debug,
     Clone,
@@ -140,7 +567,6 @@ impl FromStr for RootKey {
 }
 
 /// Composite key for pending roots: (rollup_height, idx).
-/// This allows O(1) append operations per root, avoiding VecDeque serialization overhead.
 #[derive(
     Debug,
     Clone,
@@ -154,9 +580,9 @@ impl FromStr for RootKey {
     Deserialize,
 )]
 pub struct PendingRootKey {
-    /// Rollup height this root was created in
+    /// The slot height at which this root was submitted.
     pub height: u64,
-    /// Sequential index within the block
+    /// Index within the slot.
     pub idx: u32,
 }
 
@@ -185,8 +611,6 @@ impl FromStr for PendingRootKey {
 }
 
 /// Composite key for pending commitments: (rollup_height, commitment).
-/// Uses the commitment hash itself as the unique identifier to avoid conflicts
-/// during parallel execution. Each commitment is unique, so each key is unique.
 #[derive(
     Debug,
     Clone,
@@ -202,9 +626,9 @@ impl FromStr for PendingRootKey {
     Deserialize,
 )]
 pub struct PendingCommitmentKey {
-    /// Rollup height this commitment was created in
+    /// The slot height at which this commitment was submitted.
     pub height: u64,
-    /// The commitment hash (unique identifier)
+    /// The commitment hash.
     pub commitment: Hash32,
 }
 
@@ -237,8 +661,6 @@ impl FromStr for PendingCommitmentKey {
 }
 
 /// Composite key for pending nullifiers: (rollup_height, nullifier).
-/// Uses the nullifier hash itself as the unique identifier to avoid conflicts
-/// during parallel execution.
 #[derive(
     Debug,
     Clone,
@@ -254,9 +676,9 @@ impl FromStr for PendingCommitmentKey {
     Deserialize,
 )]
 pub struct PendingNullifierKey {
-    /// Rollup height this nullifier was spent in
+    /// The slot height at which this nullifier was submitted.
     pub height: u64,
-    /// The nullifier hash (unique identifier)
+    /// The nullifier hash.
     pub nullifier: Hash32,
 }
 
@@ -289,387 +711,17 @@ impl FromStr for PendingNullifierKey {
 }
 
 /// Prefix type for iterating pending commitments by height.
-/// When Borsh-serialized, this produces the prefix bytes of PendingCommitmentKey.
-/// Used with StateMap::iter_prefix to enumerate all commitments for a given height.
 #[derive(Debug, Clone, Copy, BorshSerialize)]
 pub struct PendingCommitmentPrefix {
-    /// Rollup height to iterate
+    /// The slot height to query pending commitments for.
     pub height: u64,
 }
 
 /// Prefix type for iterating pending nullifiers by height.
-/// When Borsh-serialized, this produces the prefix bytes of PendingNullifierKey.
-/// Used with StateMap::iter_prefix to enumerate all nullifiers for a given height.
 #[derive(Debug, Clone, Copy, BorshSerialize)]
 pub struct PendingNullifierPrefix {
-    /// Rollup height to iterate
+    /// The slot height to query pending nullifiers for.
     pub height: u64,
-}
-
-/// Domain-separated 32-byte Poseidon2 hash using Ligetron's implementation.
-/// `tag` must be unique per domain (e.g., "MT_NODE_V1", "NOTE_V2", "PRF_NF_V1").
-/// This provides collision resistance between different hash use cases.
-///
-/// Uses Ligetron's native Poseidon2 to ensure consistency with the ZK circuit.
-pub fn poseidon2_hash(tag: &[u8], parts: &[&[u8]]) -> Hash32 {
-    // Concatenate tag and all parts
-    let mut input = Vec::with_capacity(tag.len() + parts.iter().map(|p| p.len()).sum::<usize>());
-    input.extend_from_slice(tag);
-    for part in parts {
-        input.extend_from_slice(part);
-    }
-
-    // Use Ligetron's native Poseidon2 (consistent with the circuit)
-    ligetron_hash_bytes(&input).to_bytes_be()
-}
-
-/// Domain tags as fixed-size arrays (avoids const evaluation issues)
-const MT_TAG: &[u8; 10] = b"MT_NODE_V1";
-const NOTE_TAG: &[u8; 7] = b"NOTE_V2";
-const NOTE_V1_TAG: &[u8; 7] = b"NOTE_V1";
-const NF_TAG: &[u8; 9] = b"PRF_NF_V1";
-
-/// Combine two children into a parent node in the Merkle tree.
-/// Uses domain tag "MT_NODE_V1" with level to prevent cross-level collisions.
-/// Optimized to avoid heap allocations by using a fixed-size buffer.
-#[inline]
-pub fn mt_combine(level: u8, left: &Hash32, right: &Hash32) -> Hash32 {
-    // Fixed-size buffer: tag (10 bytes) + level (1 byte) + left (32 bytes) + right (32 bytes) = 75 bytes
-    let mut buf = [0u8; 10 + 1 + 32 + 32];
-    buf[..10].copy_from_slice(MT_TAG);
-    buf[10] = level;
-    buf[11..43].copy_from_slice(left);
-    buf[43..].copy_from_slice(right);
-
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Compute a note commitment.
-/// Commits to: domain tag, value, rho, recipient binding, and `sender_id`.
-/// Uses domain tag "NOTE_V2" for domain separation.
-/// Optimized to avoid heap allocations by using a fixed-size buffer.
-#[inline]
-pub fn note_commitment(
-    domain: &Hash32,
-    value: u64,
-    rho: &Hash32,
-    recipient: &Hash32,
-    sender_id: &Hash32,
-) -> Hash32 {
-    // Fixed-size buffer:
-    // tag (7) + domain (32) + value_le_16 (16) + rho (32) + recipient (32) + sender_id (32) = 151 bytes
-    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32 + 32];
-    buf[..7].copy_from_slice(NOTE_TAG);
-    buf[7..39].copy_from_slice(domain);
-    // Encode value as 16-byte LE, zero-extended from u64.
-    buf[39..47].copy_from_slice(&value.to_le_bytes());
-    // buf[47..55] are already zero-initialized.
-    buf[55..87].copy_from_slice(rho);
-    buf[87..119].copy_from_slice(recipient);
-    buf[119..151].copy_from_slice(sender_id);
-
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Compute a legacy note commitment (v1).
-///
-/// NOTE: This legacy format is kept for backward-compatible tooling and tests only.
-/// The current `note_spend_guest` circuit uses `NOTE_V2`.
-#[inline]
-pub fn note_commitment_v1(
-    domain: &Hash32,
-    value: u128,
-    rho: &Hash32,
-    recipient: &Hash32,
-) -> Hash32 {
-    let v = value.to_le_bytes();
-    // tag (7) + domain (32) + value_le_16 (16) + rho (32) + recipient (32) = 119 bytes
-    let mut buf = [0u8; 7 + 32 + 16 + 32 + 32];
-    buf[..7].copy_from_slice(NOTE_V1_TAG);
-    buf[7..39].copy_from_slice(domain);
-    buf[39..55].copy_from_slice(&v);
-    buf[55..87].copy_from_slice(rho);
-    buf[87..].copy_from_slice(recipient);
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// PRF-based nullifier (position removed, follows Zcash/ZK standard pattern).
-/// nf = Poseidon2("PRF_NF_V1" || domain || nf_key || rho)
-///
-/// - `nf_key` is derived from the spender's secret
-/// - `rho` is the note's randomness (part of the note opening)
-///
-/// This makes nullifiers position-agnostic: spending the same note across different
-/// anchors yields the same `nf`, enabling reliable double-spend detection across forks.
-/// Optimized to avoid heap allocations by using a fixed-size buffer.
-#[inline]
-pub fn nullifier(domain: &Hash32, nf_key: &Hash32, rho: &Hash32) -> Hash32 {
-    // Fixed-size buffer: tag (9 bytes) + domain (32 bytes) + nf_key (32 bytes) + rho (32 bytes) = 105 bytes
-    let mut buf = [0u8; 9 + 32 + 32 + 32];
-    buf[..9].copy_from_slice(NF_TAG);
-    buf[9..41].copy_from_slice(domain);
-    buf[41..73].copy_from_slice(nf_key);
-    buf[73..].copy_from_slice(rho);
-
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-// === Privacy Address Key Derivation ===
-// These functions derive public key (pk) and recipient from spend_sk.
-// The circuit uses these to bind spending authorization to note ownership.
-
-const PK_TAG: &[u8; 5] = b"PK_V1";
-const ADDR_TAG: &[u8; 7] = b"ADDR_V2";
-const NFKEY_TAG: &[u8; 8] = b"NFKEY_V1";
-const IVK_SEED_TAG: &[u8; 11] = b"IVK_SEED_V1";
-
-/// Derive public key from spending secret key.
-/// pk = H("PK_V1" || spend_sk)
-#[inline]
-pub fn pk_from_sk(spend_sk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 5 + 32];
-    buf[..5].copy_from_slice(PK_TAG);
-    buf[5..].copy_from_slice(spend_sk);
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Clamp a 32-byte seed into an X25519 scalar (RFC 7748).
-#[inline]
-fn clamp_x25519_scalar(mut scalar: Hash32) -> [u8; 32] {
-    scalar[0] &= 248;
-    scalar[31] &= 127;
-    scalar[31] |= 64;
-    scalar
-}
-
-/// Derive incoming viewing key secret from domain and spending secret key.
-/// ivk_sk = H("IVK_SEED_V1" || domain || spend_sk)
-///
-/// The receiver uses this to decrypt notes sent to them.
-#[inline]
-pub fn ivk_sk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 11 + 32 + 32];
-    buf[..11].copy_from_slice(IVK_SEED_TAG);
-    buf[11..43].copy_from_slice(domain);
-    buf[43..].copy_from_slice(spend_sk);
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Derive the incoming viewing public key (pk_ivk) from spend_sk and domain.
-/// pk_ivk = X25519_BASE(clamp(ivk_sk_from_sk(domain, spend_sk)))
-#[inline]
-pub fn pk_ivk_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    use x25519_dalek::{PublicKey, StaticSecret};
-
-    let ivk_sk = ivk_sk_from_sk(domain, spend_sk);
-    let clamped = clamp_x25519_scalar(ivk_sk);
-    let secret = StaticSecret::from(clamped);
-    let public = PublicKey::from(&secret);
-    *public.as_bytes()
-}
-
-/// Derive privacy recipient address from domain and public key material.
-/// recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk)
-///
-/// This is the internal 32-byte "recipient" value used in note commitments.
-/// For the user-facing bech32 address, use PrivacyAddress::from_pk(pk).
-#[inline]
-pub fn recipient_from_pk(domain: &Hash32, pk_spend: &Hash32) -> Hash32 {
-    // Backward-compatible default: if callers only have one key, treat `pk_ivk == pk_spend`.
-    recipient_from_pk_v2(domain, pk_spend, pk_spend)
-}
-
-/// Derive recipient using both the spend pubkey and the incoming-view pubkey.
-#[inline]
-pub fn recipient_from_pk_v2(domain: &Hash32, pk_spend: &Hash32, pk_ivk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 7 + 32 + 32 + 32];
-    buf[..7].copy_from_slice(ADDR_TAG);
-    buf[7..39].copy_from_slice(domain);
-    buf[39..71].copy_from_slice(pk_spend);
-    buf[71..103].copy_from_slice(pk_ivk);
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Derive privacy recipient address from domain and spending secret key.
-/// This is a convenience function: recipient = H("ADDR_V2" || domain || pk_spend || pk_ivk),
-/// with the backward-compatible default `pk_ivk == pk_spend`.
-#[inline]
-pub fn recipient_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    let pk = pk_from_sk(spend_sk);
-    recipient_from_pk(domain, &pk)
-}
-
-/// Derive privacy recipient address from domain, spending secret key, and an explicit incoming-view pubkey.
-#[inline]
-pub fn recipient_from_sk_v2(domain: &Hash32, spend_sk: &Hash32, pk_ivk: &Hash32) -> Hash32 {
-    let pk_spend = pk_from_sk(spend_sk);
-    recipient_from_pk_v2(domain, &pk_spend, pk_ivk)
-}
-
-/// Derive nullifier key from domain and spending secret key.
-/// nf_key = H("NFKEY_V1" || domain || spend_sk)
-#[inline]
-pub fn nf_key_from_sk(domain: &Hash32, spend_sk: &Hash32) -> Hash32 {
-    let mut buf = [0u8; 8 + 32 + 32];
-    buf[..8].copy_from_slice(NFKEY_TAG);
-    buf[8..40].copy_from_slice(domain);
-    buf[40..].copy_from_slice(spend_sk);
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Recompute the Merkle root from a leaf using its authentication path.
-/// Verifies that a leaf with given siblings can produce the claimed root.
-pub fn root_from_path(leaf: &Hash32, pos: u64, siblings: &[Hash32], depth: u8) -> Hash32 {
-    assert_eq!(siblings.len() as u8, depth);
-    let mut cur = *leaf;
-    let mut idx = pos;
-    for (lvl, sib) in (0..depth).zip(siblings.iter()) {
-        cur = if (idx & 1) == 0 {
-            mt_combine(lvl, &cur, sib)
-        } else {
-            mt_combine(lvl, sib, &cur)
-        };
-        idx >>= 1;
-    }
-    cur
-}
-
-/// Depth of the deny-map Merkle tree used by the ZK circuits.
-///
-/// The circuits derive the bucket position from the low `BLACKLIST_TREE_DEPTH` bits of the
-/// 32-byte recipient (LSB-first from the last byte).
-pub const BLACKLIST_TREE_DEPTH: u8 = 16;
-
-/// Number of entries in each deny-map bucket leaf.
-///
-/// Matches the guest program constant `BL_BUCKET_SIZE`.
-pub const BLACKLIST_BUCKET_SIZE: usize = 12;
-
-const BL_BUCKET_TAG: &[u8; 12] = b"BL_BUCKET_V1";
-
-/// Fixed-size bucket entries array stored per deny-map leaf.
-pub type BlacklistBucketEntries = [Hash32; BLACKLIST_BUCKET_SIZE];
-
-/// Return the canonical "empty bucket" entries array (all zeros).
-#[inline]
-pub fn empty_blacklist_bucket_entries() -> BlacklistBucketEntries {
-    [[0u8; 32]; BLACKLIST_BUCKET_SIZE]
-}
-
-/// Compute the bucket leaf hash: H("BL_BUCKET_V1" || entries[0] || ... || entries[11]).
-///
-/// This matches the guest's `bl_bucket_leaf_fr` construction (Poseidon2 over bytes).
-pub fn bl_bucket_leaf(entries: &BlacklistBucketEntries) -> Hash32 {
-    // 12(tag) + 32*12(entries) = 396 bytes
-    let mut buf = [0u8; 12 + 32 * BLACKLIST_BUCKET_SIZE];
-    buf[..12].copy_from_slice(BL_BUCKET_TAG);
-    for (i, e) in entries.iter().enumerate() {
-        let start = 12 + 32 * i;
-        buf[start..start + 32].copy_from_slice(e);
-    }
-    ligetron_hash_bytes(&buf).to_bytes_be()
-}
-
-/// Compute the leaf position (index) used by the deny-map tree from a 32-byte recipient.
-///
-/// Matches the guest program's derivation:
-/// - Take the low `BLACKLIST_TREE_DEPTH` bits of the recipient bytes
-/// - Bits are LSB-first starting from the last byte
-pub fn blacklist_pos_from_recipient(recipient: &Hash32) -> u64 {
-    let mut pos: u64 = 0;
-    let depth = BLACKLIST_TREE_DEPTH as usize;
-    let mut i = 0usize;
-    while i < depth {
-        let byte = recipient[31 - (i / 8)];
-        let bit = (byte >> (i % 8)) & 1;
-        pos |= (bit as u64) << i;
-        i += 1;
-    }
-    pos
-}
-
-/// Compute the default nodes for a sparse Merkle tree of the given depth.
-///
-/// Returns a vector of length `depth + 1` where:
-/// - `out[0]` is the default leaf (height 0)
-/// - `out[h]` is the default node at height `h`
-pub fn sparse_default_nodes(depth: u8) -> Vec<Hash32> {
-    let mut out: Vec<Hash32> = Vec::with_capacity(depth as usize + 1);
-    let leaf0 = bl_bucket_leaf(&empty_blacklist_bucket_entries());
-    out.push(leaf0);
-    for lvl in 0..depth {
-        let prev = out[lvl as usize];
-        out.push(mt_combine(lvl, &prev, &prev));
-    }
-    out
-}
-
-/// Compute the all-zero sparse Merkle root for a given depth.
-///
-/// Leaf default is `0x00..00` and internal nodes are computed with `mt_combine(level, left, right)`.
-pub fn sparse_default_root(depth: u8) -> Hash32 {
-    let mut cur = bl_bucket_leaf(&empty_blacklist_bucket_entries());
-    for lvl in 0..depth {
-        cur = mt_combine(lvl, &cur, &cur);
-    }
-    cur
-}
-
-/// Compute the default (all-allowed) deny-map root expected by the ZK circuits.
-#[inline]
-pub fn default_blacklist_root() -> Hash32 {
-    sparse_default_root(BLACKLIST_TREE_DEPTH)
-}
-
-/// Compute the `inv_enforce` witness used by the `note_spend_guest` v2 circuit.
-///
-/// This value is computed off-chain by the prover and passed as a private input. It must match
-/// the guest's computation exactly.
-pub fn inv_enforce_v2(
-    in_values: &[u64],
-    in_rhos: &[Hash32],
-    out_values: &[u64],
-    out_rhos: &[Hash32],
-) -> Hash32 {
-    use ligetron::bn254fr_native::submod_checked;
-    use ligetron::Bn254Fr;
-
-    fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
-        let mut out = Bn254Fr::new();
-        out.set_bytes_big(h);
-        out
-    }
-
-    let mut enforce_prod = Bn254Fr::from_u32(1);
-
-    for v in in_values {
-        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-    }
-    for v in out_values {
-        enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-    }
-
-    let mut delta = Bn254Fr::new();
-    for out_rho in out_rhos {
-        let out_fr = bn254fr_from_hash32_be(out_rho);
-        for in_rho in in_rhos {
-            let in_fr = bn254fr_from_hash32_be(in_rho);
-            submod_checked(&mut delta, &out_fr, &in_fr);
-            enforce_prod.mulmod_checked(&delta);
-        }
-    }
-
-    // When there are exactly two output rhos, include their mutual difference once more.
-    if out_rhos.len() == 2 {
-        let a = bn254fr_from_hash32_be(&out_rhos[0]);
-        let b = bn254fr_from_hash32_be(&out_rhos[1]);
-        submod_checked(&mut delta, &a, &b);
-        enforce_prod.mulmod_checked(&delta);
-    }
-
-    let mut inv = enforce_prod.clone();
-    inv.inverse();
-    inv.to_bytes_be()
 }
 
 // (tests live in `tests/ivk_crypto_tests.rs`)

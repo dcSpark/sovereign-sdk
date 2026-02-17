@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use sov_address::MultiAddressEvm;
 use sov_bank::{Coins, TokenId};
-use sov_ligero_adapter::Ligero as LigeroAdapter;
+use sov_nightstream_adapter::Nightstream;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -18,7 +18,7 @@ use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 #[derive(Debug)]

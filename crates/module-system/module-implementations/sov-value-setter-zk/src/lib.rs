@@ -22,13 +22,12 @@ use sov_modules_api::{
 /// The proof must demonstrate that the value meets certain constraints (enforced by the guest program).
 /// For this implementation, the guest program verifies that the value is within [0, 65535].
 ///
-/// Supports multiple proof backends: "ligero" (default) and "nightstream" (via feature flag).
+/// Uses the Nightstream proof backend for verification.
 ///
 /// # Module State
 /// - `value`: The current value (u32)
-/// - `method_id`: Code commitment for proof verification (32 bytes, backend-specific)
-/// - `admin`: Administrator who can update the method ID and backend
-/// - `backend`: The proof backend to use ("ligero" or "nightstream")
+/// - `method_id`: Code commitment for proof verification (32 bytes, Nightstream)
+/// - `admin`: Administrator who can update the method ID
 ///
 /// # Derives
 /// - `ModuleInfo`: Required for all modules
@@ -49,13 +48,9 @@ pub struct ValueSetterZk<S: Spec> {
     #[state]
     pub method_id: StateValue<[u8; 32]>,
 
-    /// Administrator address who can update the method ID and backend.
+    /// Administrator address who can update the method ID.
     #[state]
     pub admin: StateValue<S::Address>,
-
-    /// Proof backend: "ligero" (default) or "nightstream".
-    #[state]
-    pub backend: StateValue<String>,
 }
 
 impl<S: Spec> Module for ValueSetterZk<S> {

@@ -17,21 +17,21 @@ use rmcp::{
     ServerHandler,
 };
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::Spec;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 use tokio::sync::RwLock;
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use crate::ligero::Ligero as LigeroProver;
+use crate::nightstream::Nightstream as NightstreamProver;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 
@@ -429,7 +429,7 @@ pub struct CryptoServer {
     tool_router: ToolRouter<Self>,
     provider: Option<Arc<Provider>>,
     wallet_context: Option<Arc<RwLock<McpWalletContext>>>,
-    ligero_prover: Option<Arc<LigeroProver>>,
+    nightstream_prover: Option<Arc<NightstreamProver>>,
     viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
     privacy_key: Arc<RwLock<PrivacyKey>>,
 }
@@ -440,7 +440,7 @@ impl CryptoServer {
     pub fn new(
         provider: Arc<Provider>,
         wallet_context: Arc<RwLock<McpWalletContext>>,
-        ligero_prover: Arc<LigeroProver>,
+        nightstream_prover: Arc<NightstreamProver>,
         viewer_fvk_bundle: Arc<RwLock<Option<ViewerFvkBundle>>>,
         privacy_key: Arc<RwLock<PrivacyKey>>,
     ) -> Self {
@@ -448,7 +448,7 @@ impl CryptoServer {
             tool_router: Self::tool_router(),
             provider: Some(provider),
             wallet_context: Some(wallet_context),
-            ligero_prover: Some(ligero_prover),
+            nightstream_prover: Some(nightstream_prover),
             viewer_fvk_bundle,
             privacy_key,
         }
@@ -846,9 +846,9 @@ impl CryptoServer {
             )
         })?;
 
-        let ligero = self.ligero_prover.as_ref().ok_or_else(|| {
+        let nightstream = self.nightstream_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Ligero prover not configured. Please set LIGERO_PROVER_BINARY_PATH and LIGERO_SHADER_PATH environment variables.",
+                "Nightstream proof service not configured. Please set NIGHTSTREAM_PROOF_SERVICE_URL.",
                 None,
             )
         })?;
@@ -1009,7 +1009,7 @@ impl CryptoServer {
         );
 
         let transfer_result = crate::operations::transfer(
-            ligero,
+            nightstream,
             provider,
             &*ctx,
             spend_sk,

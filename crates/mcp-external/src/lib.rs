@@ -1,7 +1,7 @@
 pub mod commitment_tree;
 pub mod config;
 pub mod fvk_service;
-pub mod ligero;
+pub mod nightstream;
 pub mod operations;
 pub mod prefunded_wallets;
 pub mod privacy_key;

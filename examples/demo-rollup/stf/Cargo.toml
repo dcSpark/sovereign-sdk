@@ -73,9 +73,6 @@ native = [
     "sov-test-modules/native"
 ]
 
-# Enable Nightstream proof backend in value-setter-zk and midnight-privacy modules.
-nightstream = ["sov-value-setter-zk/nightstream", "midnight-privacy/nightstream"]
-
 # We only activate test-utils if we also have native since all our test-code use native by default.
 test-utils = [
     "native",

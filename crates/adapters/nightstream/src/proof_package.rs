@@ -5,7 +5,7 @@
 //! in the Nightstream crate is needed.
 
 use neo_ajtai::Commitment as Cmt;
-use neo_fold::riscv_shard::Rv32B1;
+use neo_fold::riscv_shard::{Rv32B1, Rv32B1CcsCache};
 use neo_fold::shard::ShardProof;
 use neo_fold::PiCcsError;
 use neo_math::{F, K};
@@ -13,6 +13,7 @@ use neo_memory::witness::StepInstanceBundle;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Configuration needed to reconstruct verification context from ROM bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,11 +89,30 @@ impl NightstreamProofPackage {
     /// **No RISC-V execution or re-proving is performed.**  The cost is circuit
     /// synthesis (~ms) plus the IOP verification check.
     pub fn verify(&self) -> Result<bool, PiCcsError> {
+        self.verify_inner(None)
+    }
+
+    /// Verify using a pre-built CCS cache (skips expensive CCS synthesis).
+    ///
+    /// The cache must have been built from a builder with the same ROM,
+    /// `ram_bytes`, and `chunk_size` as this package's config.
+    ///
+    /// Build one via [`crate::NightstreamHost::build_ccs_cache`], then share
+    /// across all verification calls.
+    pub fn verify_with_cache(&self, cache: &Arc<Rv32B1CcsCache>) -> Result<bool, PiCcsError> {
+        self.verify_inner(Some(cache))
+    }
+
+    fn verify_inner(&self, cache: Option<&Arc<Rv32B1CcsCache>>) -> Result<bool, PiCcsError> {
         let mut builder = Rv32B1::from_rom(self.config.program_base, &self.rom_bytes)
             .xlen(self.config.xlen)
             .ram_bytes(self.config.ram_bytes)
             .chunk_size(self.config.chunk_size)
             .shout_auto_minimal();
+
+        if let Some(c) = cache {
+            builder = builder.with_ccs_cache((*c).clone());
+        }
 
         for (&addr, &value) in &self.config.ram_init {
             builder = builder.ram_init_u32(addr, value as u32);
@@ -103,7 +123,13 @@ impl NightstreamProofPackage {
         }
 
         // Build verify-only context (CCS + session, no execution).
-        let verifier = builder.build_verifier()?;
+        let mut verifier = builder.build_verifier()?;
+
+        // Preload the verifier SparseCache AFTER build so the pointer-keyed
+        // cache uses the final CCS address (inside the Rv32B1Verifier struct).
+        if let Some(c) = cache {
+            verifier.preload_sparse_cache(c.sparse.clone())?;
+        }
 
         // Verify the ShardProof against the prover-supplied step instances.
         verifier.verify(&self.proof, &self.steps_public)

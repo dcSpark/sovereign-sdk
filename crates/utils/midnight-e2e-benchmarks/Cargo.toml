@@ -9,7 +9,6 @@ anyhow = { workspace = true }
 axum = { workspace = true, default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = false }
-sov-ligero-adapter = { workspace = true, features = ["native"] }
 sov-nightstream-adapter = { workspace = true, features = ["native"] }
 sov-modules-api = { workspace = true, features = ["native"] }
 sov-modules-rollup-blueprint = { workspace = true }
@@ -17,18 +16,16 @@ sov-node-client = { workspace = true }
 sov-proof-verifier-service = { path = "../sov-proof-verifier-service" }
 sov-rollup-interface = { workspace = true }
 demo-stf = { workspace = true, features = ["native"] }
+sov-rollup-nightstream = { path = "../../../examples/rollup-nightstream" }
 midnight-privacy = { workspace = true, features = ["native"] }
-ligetron = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "7b6ac4849035fef8f108e7cadce2a601e63e5200", features = ["native"] }
 sov-api-spec = { workspace = true }
 sov-cli = { workspace = true }
 sov-test-utils = { workspace = true }
-sov-rollup-ligero = { path = "../../../examples/rollup-ligero" }
-# Daemon-mode Ligero prover support
-ligero-runner = { git = "https://github.com/dcSpark/ligero-prover.git", rev = "7b6ac4849035fef8f108e7cadce2a601e63e5200" }
 borsh = { workspace = true, features = ["bytes", "derive"] }
 bincode = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 ed25519-dalek = { version = "2" }
 num_cpus = "1.16"
 rand = { workspace = true }

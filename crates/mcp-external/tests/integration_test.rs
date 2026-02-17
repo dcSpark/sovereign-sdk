@@ -1,43 +1,45 @@
 //! Integration tests for the MCP server
 //!
 //! These tests require a running rollup node, verifier service, and (for proof flows) the
-//! Ligero proof service.
+//! Nightstream proof service.
 //! Make sure all services are running before executing these tests.
 //! Environment variables (WALLET_PRIVATE_KEY, ROLLUP_RPC_URL, VERIFIER_URL, PRIVPOOL_SPEND_KEY)
 //! should be set in .env (INDEXER_URL is optional, defaults to http://localhost:13100).
-//! Proof tests also require LIGERO_PROOF_SERVICE_URL (defaults to http://127.0.0.1:8080).
+//! Proof tests also require NIGHTSTREAM_PROOF_SERVICE_URL (defaults to http://127.0.0.1:8080).
 
 use anyhow::Result;
 use demo_stf::runtime::Runtime;
-use mcp_external::ligero::Ligero;
+use mcp_external::nightstream::Nightstream;
 use mcp_external::operations::{deposit, transfer, TransferInputNote};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
 use sov_bank::{config_gas_token_id, TokenId};
-use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 
-type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
 const DOMAIN: [u8; 32] = [1u8; 32];
 
-/// Helper to create test Ligero proof client (skips if env is missing).
-fn create_test_ligero() -> Option<Ligero> {
-    let program =
-        std::env::var("LIGERO_PROGRAM_PATH").unwrap_or_else(|_| "note_spend_guest".to_string());
-    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+/// Helper to create test Nightstream proof client (skips if env is missing).
+fn create_test_nightstream() -> Option<Nightstream> {
+    let program = std::env::var("NIGHTSTREAM_PROGRAM_PATH")
+        .or_else(|_| std::env::var("LIGERO_PROGRAM_PATH"))
+        .unwrap_or_else(|_| "note_spend_guest".to_string());
+    let proof_service_url = std::env::var("NIGHTSTREAM_PROOF_SERVICE_URL")
+        .or_else(|_| std::env::var("LIGERO_PROOF_SERVICE_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
     if program.trim().is_empty() || proof_service_url.trim().is_empty() {
         return None;
     }
 
-    Some(Ligero::new(proof_service_url, program))
+    Some(Nightstream::new(proof_service_url, program))
 }
 
 /// Helper to check if services are available
@@ -82,7 +84,7 @@ async fn check_services_available(
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero proof service"]
+#[ignore = "requires running rollup/verifier/indexer services and Nightstream proof service"]
 async fn test_deposit_and_transfer_flow() -> Result<()> {
     // Load .env file
     let _ = dotenvy::dotenv();
@@ -97,20 +99,21 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
-    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+    let proof_service_url = std::env::var("NIGHTSTREAM_PROOF_SERVICE_URL")
+        .or_else(|_| std::env::var("LIGERO_PROOF_SERVICE_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let privpool_spend_key = std::env::var("PRIVPOOL_SPEND_KEY")
         .expect("PRIVPOOL_SPEND_KEY must be set in .env (hex or privpool1... address)");
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url, &proof_service_url).await,
-        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and LIGERO_PROOF_SERVICE_URL"
+        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and NIGHTSTREAM_PROOF_SERVICE_URL"
     );
 
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
-    tracing::info!("Using LIGERO_PROOF_SERVICE_URL: {}", proof_service_url);
+    tracing::info!("Using NIGHTSTREAM_PROOF_SERVICE_URL: {}", proof_service_url);
 
     // Parse privacy key from either raw spend key hex or bech32m address
     let privacy_key = if privpool_spend_key.starts_with("privpool1") {
@@ -189,13 +192,13 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     tracing::info!("✓ Wait completed");
 
-    // Step 6: Initialize Ligero proof client for transfer
-    tracing::info!("Step 6: Initializing Ligero proof client");
-    let Some(ligero) = create_test_ligero() else {
-        eprintln!("⚠️  Skipping integration test: Ligero proof service not configured");
+    // Step 6: Initialize Nightstream proof client for transfer
+    tracing::info!("Step 6: Initializing Nightstream proof client");
+    let Some(nightstream) = create_test_nightstream() else {
+        eprintln!("⚠️  Skipping integration test: Nightstream proof service not configured");
         return Ok(());
     };
-    tracing::info!("✓ Ligero proof client initialized");
+    tracing::info!("✓ Nightstream proof client initialized");
 
     // Step 7: Perform transfer using deposit outputs
     tracing::info!("Step 7: Performing transfer using deposit outputs");
@@ -208,7 +211,7 @@ async fn test_deposit_and_transfer_flow() -> Result<()> {
         sender_id: deposit_result.recipient,
     }];
     let transfer_result = transfer(
-        &ligero,
+        &nightstream,
         &provider,
         &wallet,
         *privacy_key
@@ -343,7 +346,7 @@ async fn test_balance_check() -> Result<()> {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero proof service"]
+#[ignore = "requires running rollup/verifier/indexer services and Nightstream proof service"]
 async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     use midnight_privacy::FullViewingKey;
     use rand::RngCore;
@@ -360,19 +363,20 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     let verifier_url = std::env::var("VERIFIER_URL").expect("VERIFIER_URL must be set in .env");
     let indexer_url =
         std::env::var("INDEXER_URL").unwrap_or_else(|_| "http://localhost:13100".to_string());
-    let proof_service_url = std::env::var("LIGERO_PROOF_SERVICE_URL")
+    let proof_service_url = std::env::var("NIGHTSTREAM_PROOF_SERVICE_URL")
+        .or_else(|_| std::env::var("LIGERO_PROOF_SERVICE_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let startup_deposit_amount = 1000u128; // Test deposit amount
 
     assert!(
         check_services_available(&rpc_url, &verifier_url, &indexer_url, &proof_service_url).await,
-        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and LIGERO_PROOF_SERVICE_URL"
+        "Required services must be running at ROLLUP_RPC_URL, VERIFIER_URL, and NIGHTSTREAM_PROOF_SERVICE_URL"
     );
 
     tracing::info!("Using ROLLUP_RPC_URL: {}", rpc_url);
     tracing::info!("Using VERIFIER_URL: {}", verifier_url);
     tracing::info!("Using INDEXER_URL: {}", indexer_url);
-    tracing::info!("Using LIGERO_PROOF_SERVICE_URL: {}", proof_service_url);
+    tracing::info!("Using NIGHTSTREAM_PROOF_SERVICE_URL: {}", proof_service_url);
     tracing::info!("Test deposit amount: {}", startup_deposit_amount);
 
     // Step 1: Create funding wallet from private key
@@ -447,9 +451,9 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
     tracing::info!("Step 8: Sending 50 tokens");
     let send_amount = 50u128;
 
-    // Initialize Ligero proof client
-    let Some(ligero) = create_test_ligero() else {
-        eprintln!("⚠️  Skipping integration test: Ligero proof service not configured");
+    // Initialize Nightstream proof client
+    let Some(nightstream) = create_test_nightstream() else {
+        eprintln!("⚠️  Skipping integration test: Nightstream proof service not configured");
         return Ok(());
     };
 
@@ -474,7 +478,7 @@ async fn test_wallet_creation_deposit_and_send_flow() -> Result<()> {
         sender_id: input_recipient,
     }];
     let transfer_result = transfer(
-        &ligero,
+        &nightstream,
         &provider,
         &funding_wallet,
         *new_privacy_key

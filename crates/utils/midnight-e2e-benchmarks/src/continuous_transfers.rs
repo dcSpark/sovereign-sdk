@@ -14,10 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use midnight_privacy::{
-    inv_enforce_v2, nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk,
     recipient_from_pk_v2, recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote,
     Hash32, MerkleTree, PrivacyAddress, SpendPublic,
 };
@@ -32,7 +30,7 @@ use sov_modules_api::transaction::Transaction;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
-use sov_rollup_ligero::MockDemoRollup;
+use sov_rollup_nightstream::NightstreamRollup;
 use sov_test_utils::default_test_signed_transaction;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -41,13 +39,13 @@ use tokio::time::sleep;
 use toml::Value as TomlValue;
 
 use crate::fvk_service::{fetch_viewer_fvk_bundle, ViewerFvkBundle};
-use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
+use crate::pool_fvk::ensure_pool_fvk_pk_env;
 use crate::{
     find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
     ChildGuard, LigeroEnv,
 };
 
-type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
+type DemoRollupSpec = <NightstreamRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 const TREE_DEPTH: u8 = 16;
 const TREE_REBUILD_MAX_RETRIES: usize = 5;
@@ -58,44 +56,77 @@ const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 1000;
 
-fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
-    static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
-        OnceLock::new();
-    let lock = POOL.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = lock.lock().unwrap();
-    if let Some(p) = guard.as_ref() {
-        return Ok(p.clone());
+/// Call the Nightstream prover service `/prove` endpoint and return DEFLATE-compressed
+/// NightstreamProofPackage bytes.
+fn call_prover_service(
+    service_url: &str,
+    witness: &sov_nightstream_adapter::NoteSpendWitness,
+    public_output: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let blocking_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .expect("failed to build reqwest client");
+    let url = format!("{}/prove", service_url.trim_end_matches('/'));
+
+    #[derive(serde::Serialize)]
+    struct ProveRequest<'a> {
+        witness: &'a sov_nightstream_adapter::NoteSpendWitness,
+        public_output: String,
+        binary: bool,
+    }
+    let request = ProveRequest {
+        witness,
+        public_output: base64::engine::general_purpose::STANDARD.encode(public_output),
+        binary: true,
+    };
+
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 2000;
+
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match blocking_client.post(&url).json(&request).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_body = resp
+                        .text()
+                        .unwrap_or_else(|_| "<failed to read error body>".to_string());
+                    return Err(anyhow::anyhow!(
+                        "Prover service returned error (status={}): {}",
+                        status,
+                        err_body
+                    ));
+                }
+                match resp.bytes() {
+                    Ok(bytes) => return Ok(bytes.to_vec()),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to read binary prover service response: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Failed to send request to prover service: {}",
+                    e
+                ));
+                if attempt < MAX_RETRIES {
+                    eprintln!(
+                        "[warn] Prover service request failed (attempt {}/{}): {}. Retrying in {}ms...",
+                        attempt, MAX_RETRIES, e, RETRY_DELAY_MS
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                }
+            }
+        }
     }
 
-    let paths = ligero_runner::LigeroPaths::discover()
-        .or_else(|_| Ok::<_, anyhow::Error>(ligero_runner::LigeroPaths::fallback()))?;
-    let workers = workers.max(1);
-    eprintln!(
-        "[prover-daemon] starting webgpu_prover --daemon pool: workers={} prover_bin={} shader_dir={}",
-        workers,
-        paths.prover_bin.display(),
-        paths.shader_dir.display()
-    );
-    let pool = ligero_runner::daemon::DaemonPool::new_prover(&paths, workers)?;
-    *guard = Some(pool.clone());
-    Ok(pool)
-}
-
-/// Request body for prover service `/prove` endpoint.
-#[derive(Clone, serde::Serialize)]
-struct ProverServiceRequest {
-    circuit: String,
-    args: Vec<ligero_runner::LigeroArg>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    proof: Option<String>,
-    #[serde(rename = "privateIndices")]
-    private_indices: Vec<usize>,
-    /// Optional packing size (defaults to 8192 on server)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    packing: Option<u32>,
-    /// Request binary proof response (`application/octet-stream`) from /prove.
-    #[serde(default)]
-    binary: bool,
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No response from prover service after retries")))
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +149,7 @@ struct ContinuousConfig {
     external_verifier_url: Option<String>,
     /// Optional URL of the prover service (e.g., http://127.0.0.1:8080).
     /// When set, proofs are generated via HTTP calls to this service instead of
-    /// the local daemon pool. This allows offloading proving to a remote GPU server.
+    /// local Nightstream proving.
     prover_service_url: Option<String>,
     max_concurrent_proofs: usize,
     detailed_wallet_logs: bool,
@@ -129,10 +160,6 @@ struct ContinuousConfig {
     managed_mode: bool,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
     max_cycles: Option<u64>,
-    /// Proof backend: "ligero" (default) or "nightstream".
-    /// When "nightstream", proofs are generated using the Nightstream zkVM locally
-    /// instead of the Ligero daemon/service.
-    proof_backend: String,
 }
 
 impl ContinuousConfig {
@@ -237,9 +264,6 @@ impl ContinuousConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
-        let proof_backend = std::env::var("PROOF_BACKEND")
-            .unwrap_or_else(|_| "ligero".to_string());
-
         Ok(Self {
             num_wallets,
             wallet_offset,
@@ -259,7 +283,6 @@ impl ContinuousConfig {
             continuous,
             managed_mode,
             max_cycles,
-            proof_backend,
         })
     }
 }
@@ -411,7 +434,7 @@ async fn start_managed_stack(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn sov-rollup-ligero")?;
+        .context("Failed to spawn rollup-nightstream")?;
 
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
@@ -908,16 +931,10 @@ pub async fn run() -> Result<()> {
             .unwrap_or("<managed (local)>"),
         config.managed_mode
     );
-    eprintln!("[config] Proof backend: {} (set PROOF_BACKEND to change)", config.proof_backend);
-    if config.proof_backend == "nightstream" {
-        eprintln!("[config] Nightstream: proofs generated locally via NightstreamHost (no external daemon)");
-    } else if let Some(ref url) = config.prover_service_url {
-        eprintln!(
-            "[config] Prover service: {} (set PROVER_SERVICE_URL=\"\" to use local daemon)",
-            url
-        );
+    if let Some(ref url) = config.prover_service_url {
+        eprintln!("[config] Prover service: {}", url);
     } else {
-        eprintln!("[config] Prover: local daemon pool (PROVER_SERVICE_URL=\"\")");
+        eprintln!("[config] Nightstream: proofs generated locally via NightstreamHost");
     }
 
     // If `MIDNIGHT_FVK_SERVICE_SIGNING_PK_HEX` is set, export it as `POOL_FVK_PK` so the in-process
@@ -933,7 +950,7 @@ pub async fn run() -> Result<()> {
     }
     let http = HttpClient::new();
 
-    // Setup Ligero environment (program path, prover/verifier bins, shaders, method id)
+    // Setup environment (program path, method id for Nightstream)
     let ligero_env = setup_ligero_env()?;
     let program_path = ligero_env.program_path.clone();
 
@@ -1000,7 +1017,7 @@ pub async fn run() -> Result<()> {
 
     if !keypairs_path.exists() {
         bail!(
-            "Generated keypairs file not found at {}. Run: cargo run -p sov-rollup-ligero --bin generate-genesis-keys",
+            "Generated keypairs file not found at {}. Run: cargo run -p sov-rollup-nightstream --bin generate-genesis-keys",
             keypairs_path.display()
         );
     }
@@ -2018,7 +2035,6 @@ async fn perform_transfer_cycle(
     let viewer_bundles = viewer_bundles.clone();
     let prover_service_url = config.prover_service_url.clone();
     let transfer_amount = config.transfer_amount;
-    let proof_backend = config.proof_backend.clone();
     for plan in plans.iter() {
         let sender_idx = plan.sender_idx;
         let dest_idx = plan.dest_idx;
@@ -2029,10 +2045,8 @@ async fn perform_transfer_cycle(
         let program_path = program_path.to_string();
         let sem = semaphore.clone();
         let viewer_bundles = viewer_bundles.clone();
-        let daemon_workers = config.max_concurrent_proofs;
         let client = client.clone();
         let prover_service_url = prover_service_url.clone();
-        let proof_backend = proof_backend.clone();
         proof_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
@@ -2125,7 +2139,7 @@ async fn perform_transfer_cycle(
 
             tokio::task::spawn_blocking(
                 move || -> anyhow::Result<ProofResult> {
-                    let (viewer_fvk, pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
+                    let (viewer_fvk, _pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
                         let b = bundles.get(sender_idx).ok_or_else(|| {
                             anyhow!(
                                 "missing viewer bundle for wallet {sender_idx} (have {} bundles)",
@@ -2214,7 +2228,7 @@ async fn perform_transfer_cycle(
                     // The circuit expects: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output.
                     // So view_attestations should include attestations for ALL outputs (pay + change if applicable).
                     let n_out: usize = if has_change { 2 } else { 1 };
-                    let (view_attestations, viewer_data_list) = if let Some(fvk) = viewer_fvk {
+                    let (view_attestations, _viewer_data_list) = if let Some(fvk) = viewer_fvk {
                         let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
                             [[0u8; 32]; crate::viewer::MAX_INS];
                         for (i, cm) in input_cms.iter().enumerate().take(crate::viewer::MAX_INS) {
@@ -2269,207 +2283,74 @@ async fn perform_transfer_cycle(
                     view_attestations,
                 };
 
-                // LigeroConfig private indices are 1-based (by argument position).
-                let mut private_indices: Vec<usize> = Vec::new();
-                private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
-
-                let per_in = 5usize + depth_usize;
-                let withdraw_idx = 7usize + n_in * per_in;
-                let outs_base = withdraw_idx + 3;
-
-                // Input private args (per input: value, rho, sender_id, pos, siblings[depth])
-                for in_idx in 0..n_in {
-                    let base = 7usize + in_idx * per_in;
-                    private_indices.extend_from_slice(&[
-                        base,         // value_in
-                        base + 1,     // rho_in
-                        base + 2,     // sender_id_in
-                        base + 3,     // pos
-                    ]);
-                    // siblings start at base+4
-                    for j in 0..depth_usize {
-                        private_indices.push(base + 4 + j);
-                    }
-                }
-
-                // Output private args (5 args per output: value, rho, pk_spend, pk_ivk, commitment)
-                // value_out, rho_out, pk_spend_out, pk_ivk_out are private; commitment is public
-                for out_idx in 0..n_out {
-                    let out_base = outs_base + out_idx * 5;
-                    private_indices.extend_from_slice(&[
-                        out_base,         // value_out
-                        out_base + 1,     // rho_out
-                        out_base + 2,     // pk_spend_out
-                        out_base + 3,     // pk_ivk_out
-                    ]);
-                }
-                // inv_enforce (private)
-                let inv_enforce_idx = outs_base + 5 * n_out;
-                private_indices.push(inv_enforce_idx);
-
-                // Deny-map (blacklist) section:
-                // - blacklist_root is PUBLIC (comes right after inv_enforce)
-                // - for each checked id: bucket_entries[BLACKLIST_BUCKET_SIZE] + bucket_inv + siblings[BLACKLIST_TREE_DEPTH]
-                // Note: Only 2 checks (sender + pay recipient). Change outputs are enforced to be self in-circuit.
-                let bl_root_idx = inv_enforce_idx + 1;
-                let bl_args_start = bl_root_idx + 1;
-                let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-                let bl_per_check =
-                    midnight_privacy::BLACKLIST_BUCKET_SIZE + 1usize + bl_depth;
-                let bl_checks = 2usize; // sender_id + pay recipient (change is enforced to be self in-circuit)
-                for j in 0..(bl_checks * bl_per_check) {
-                    private_indices.push(bl_args_start + j);
-                }
-
-                // Viewer section (Level B): n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for each output
-                let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
-                let fvk_commitment_arg_pos = if viewer_data_list.is_some() {
-                    Some(n_viewers_idx + 1)
-                } else {
-                    None
-                };
-                if viewer_data_list.is_some() {
-                    // FVK is private (at position n_viewers_idx + 2)
-                    private_indices.push(n_viewers_idx + 2);
-                }
-
-                    let mut host =
-                        <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
-                            .with_private_indices(private_indices);
-
-                // Typed binary ABI for zkVM performance (matches note_spend_guest argument layout)
-                host.add_hex_arg(hex::encode(DOMAIN)); // 1: domain (PUBLIC)
-                host.add_hex_arg(hex::encode(in_spend_sk)); // 2: spend_sk (PRIVATE)
-                host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3: pk_ivk_owner (PRIVATE)
-                host.add_u64_arg(tree_depth as u64); // 4: depth (PUBLIC)
-                host.add_hex_arg(hex::encode(anchor)); // 5: anchor (PUBLIC)
-                host.add_u64_arg(n_in as u64); // 6: n_in (PUBLIC)
-
-                for i in 0..n_in {
-                    host.add_u64_arg(in_values_u64[i]); // value_in_i (PRIVATE)
-                    host.add_hex_arg(hex::encode(in_rhos[i])); // rho_in_i (PRIVATE)
-                    host.add_hex_arg(hex::encode(in_sender_ids[i])); // sender_id_in_i (PRIVATE)
-                    host.add_u64_arg(positions[i] as u64); // pos_i (PRIVATE)
-                    for s in siblings_by_input[i].iter() {
-                        host.add_hex_arg(hex::encode(s));
-                    }
-                    host.add_hex_arg(hex::encode(nullifiers[i])); // nullifier_i (PUBLIC)
-                }
-
-                host.add_u64_arg(0); // withdraw_amount (PUBLIC)
-                host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
-                host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
-
-                // Pay output (output 0)
-                host.add_u64_arg(pay_value_u64);
-                host.add_hex_arg(hex::encode(pay_rho));
-                host.add_hex_arg(hex::encode(pay_pk_spend));
-                host.add_hex_arg(hex::encode(pay_pk_ivk));
-                host.add_hex_arg(hex::encode(cm_pay));
-
-                // Change output (output 1) if applicable
+                // Collect output values and rhos for inv_enforce computation.
+                let mut out_values_u64: Vec<u64> = vec![pay_value_u64];
+                let mut out_rhos_vec: Vec<Hash32> = vec![pay_rho];
                 if has_change {
-                    host.add_u64_arg(change_value_u64);
-                    host.add_hex_arg(hex::encode(change_rho));
-                    host.add_hex_arg(hex::encode(change_pk_spend));
-                    host.add_hex_arg(hex::encode(change_pk_ivk));
-                    host.add_hex_arg(hex::encode(cm_change));
+                    out_values_u64.push(change_value_u64);
+                    out_rhos_vec.push(change_rho);
                 }
 
-                // inv_enforce (PRIVATE) - use the canonical formula from midnight_privacy
-                // Formula: Π(in_values) * Π(out_values) * Π(out_rho - in_rho)
-                let (out_values, out_rhos): (Vec<u64>, Vec<Hash32>) = if has_change {
-                    (vec![pay_value_u64, change_value_u64], vec![pay_rho, change_rho])
-                } else {
-                    (vec![pay_value_u64], vec![pay_rho])
-                };
-                let inv_enforce = inv_enforce_v2(
-                    &in_values_u64, // in_values
-                    &in_rhos,       // in_rhos
-                    &out_values,    // out_values
-                    &out_rhos,      // out_rhos
+                // Compute inv_enforce for the enforce-product check.
+                let inv_enforce = midnight_privacy::inv_enforce_v2(
+                    &in_values_u64, &in_rhos, &out_values_u64, &out_rhos_vec,
                 );
-                host.add_hex_arg(hex::encode(inv_enforce));
 
-                // Deny-map (blacklist) args:
-                //   blacklist_root (PUBLIC)
-                //   sender check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
-                //   pay recipient check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
-                //   change recipient check (if applicable): bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
-                let bucket_inv_for_id =
-                    |id: &Hash32, bucket_entries: &[Hash32]| -> anyhow::Result<Hash32> {
-                        anyhow::ensure!(
-                            bucket_entries.len() == midnight_privacy::BLACKLIST_BUCKET_SIZE,
-                            "bucket_entries length mismatch: got {}, expected {}",
-                            bucket_entries.len(),
-                            midnight_privacy::BLACKLIST_BUCKET_SIZE
-                        );
-                        let mut id_fr = Bn254Fr::new();
-                        id_fr.set_bytes_big(id);
-                        let mut prod = Bn254Fr::from_u32(1);
-                        let mut delta = Bn254Fr::new();
-                        for e in bucket_entries {
-                            let mut e_fr = Bn254Fr::new();
-                            e_fr.set_bytes_big(e);
-                            submod_checked(&mut delta, &id_fr, &e_fr);
-                            prod.mulmod_checked(&delta);
-                        }
-                        anyhow::ensure!(
-                            !prod.is_zero(),
-                            "bucket_inv undefined: id appears blacklisted or invalid bucket"
-                        );
-                        let mut inv = prod.clone();
-                        inv.inverse();
-                        Ok(inv.to_bytes_be())
-                    };
+                // Build the full circuit witness.
+                use sov_nightstream_adapter::{
+                    NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+                };
 
-                host.add_hex_arg(hex::encode(blacklist_root));
-                // Sender check
-                for e in &sender_bl_bucket_entries {
-                    host.add_hex_arg(hex::encode(e));
-                }
-                let sender_bucket_inv =
-                    bucket_inv_for_id(&sender_id_out, &sender_bl_bucket_entries)?;
-                host.add_hex_arg(hex::encode(sender_bucket_inv));
-                for sib in sender_bl_siblings.iter().take(bl_depth) {
-                    host.add_hex_arg(hex::encode(sib));
-                }
-                // Pay recipient check
-                for e in &pay_bl_bucket_entries {
-                    host.add_hex_arg(hex::encode(e));
-                }
-                let pay_bucket_inv = bucket_inv_for_id(&pay_recipient, &pay_bl_bucket_entries)?;
-                host.add_hex_arg(hex::encode(pay_bucket_inv));
-                for sib in pay_bl_siblings.iter().take(bl_depth) {
-                    host.add_hex_arg(hex::encode(sib));
-                }
-                // Note: Change recipient blacklist check is NOT needed - the circuit enforces
-                // that change outputs go back to the sender (self) in-circuit.
+                let witness_inputs: Vec<NoteSpendInput> = (0..n_in)
+                    .map(|i| NoteSpendInput {
+                        value: in_values_u64[i],
+                        rho: in_rhos[i],
+                        sender_id: in_sender_ids[i],
+                        position: positions[i] as u32,
+                        siblings: siblings_by_input[i].clone(),
+                        nullifier: nullifiers[i],
+                    })
+                    .collect();
 
-                // Viewer section (Level-B)
-                // Structure: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output
-                if let Some(ref data_list) = viewer_data_list {
-                    host.add_u64_arg(1u64); // n_viewers = 1 (number of distinct FVKs)
-                    // Use the first attestation for fvk_commitment and fvk
-                    if let Some((fvk, att)) = data_list.first() {
-                        host.add_hex_arg(hex::encode(att.fvk_commitment));
-                        host.add_hex_arg(hex::encode(fvk));
-                    }
-                    // Add ct_hash + mac for EACH output
-                    for (_fvk, att) in data_list.iter().take(n_out) {
-                        host.add_hex_arg(hex::encode(att.ct_hash));
-                        host.add_hex_arg(hex::encode(att.mac));
-                    }
+                let mut witness_outputs: Vec<NoteSpendOutput> = Vec::new();
+                witness_outputs.push(NoteSpendOutput {
+                    value: pay_value_u64,
+                    rho: pay_rho,
+                    pk_spend: pay_pk_spend,
+                    pk_ivk: pay_pk_ivk,
+                    cm: cm_pay,
+                });
+                if has_change {
+                    witness_outputs.push(NoteSpendOutput {
+                        value: change_value_u64,
+                        rho: change_rho,
+                        pk_spend: change_pk_spend,
+                        pk_ivk: change_pk_ivk,
+                        cm: cm_change,
+                    });
                 }
 
-                    host.set_public_output(&public)
-                        .context("set public output (round 2)")?;
+                let witness = NoteSpendWitness {
+                    domain: DOMAIN,
+                    spend_sk: in_spend_sk,
+                    pk_ivk_owner,
+                    depth: tree_depth as u32,
+                    anchor,
+                    inputs: witness_inputs,
+                    withdraw_amount: 0,
+                    withdraw_to: [0u8; 32],
+                    outputs: witness_outputs,
+                    inv_enforce,
+                    blacklist_root,
+                };
 
-                // Generate proof via Nightstream, prover service (HTTP), or local daemon pool.
-                let proof_data = if proof_backend == "nightstream" {
-                    // Nightstream backend: prove locally using NightstreamHost with the
-                    // placeholder echo circuit. SpendPublic is serialized into input
-                    // words and echoed to output via output claims.
+                let public_bytes = bincode::serialize(&public)
+                    .context("Failed to serialize SpendPublic for Nightstream")?;
+
+                // Generate proof using Nightstream.
+                let proof_data = if let Some(ref service_url) = prover_service_url {
+                    call_prover_service(service_url, &witness, &public_bytes)?
+                } else {
                     use sov_nightstream_adapter::circuits::note_spend_rom;
                     use sov_nightstream_adapter::NightstreamHost;
 
@@ -2477,201 +2358,9 @@ async fn perform_transfer_cycle(
                         &note_spend_rom::NOTE_SPEND_ROM,
                         note_spend_rom::NOTE_SPEND_ROM_BASE,
                     );
-                    // Serialize SpendPublic and feed it through the echo circuit.
-                    // The circuit copies the payload to output; output claims
-                    // bind the proof to the serialized SpendPublic.
-                    let public_bytes = bincode::serialize(&public)
-                        .context("Failed to serialize SpendPublic for Nightstream")?;
-                    ns_host.add_public_output_bytes(&public_bytes);
-                    let compressed = ns_host.run(true)
-                        .context("Nightstream proving failed")?;
-                    // run() returns DEFLATE-compressed NightstreamProofPackage bytes — ready to use
-                    // as the proof field in the Transfer transaction.
-                    compressed
-                } else if let Some(ref service_url) = prover_service_url {
-                    // Use remote prover service via blocking HTTP call.
-                    (|| -> anyhow::Result<Vec<u8>> {
-                        let public_output = host.require_public_output()?;
-                        let cfg = host.runner().config().clone();
-                        let args = cfg.args.clone();
-                        let private_indices = cfg.private_indices.clone();
-
-                        // Resolve program path to ensure consistency with what the HTTP server expects.
-                        // The server's resolve_circuit handles names like "note_spend_guest".
-                        let circuit_name = cfg.program.clone();
-
-                        // Create blocking HTTP client for the prover service call.
-                        let blocking_client = reqwest::blocking::Client::new();
-                        let url = format!("{}/prove", service_url.trim_end_matches('/'));
-
-                        let request = ProverServiceRequest {
-                            circuit: circuit_name,
-                            args: args.clone(),
-                            proof: None,
-                            private_indices: private_indices.clone(),
-                            packing: Some(cfg.packing),
-                            binary: true,
-                        };
-
-                        // Retry logic for transient failures (timeouts, connection errors)
-                        const MAX_RETRIES: u32 = 3;
-                        const RETRY_DELAY_MS: u64 = 2000;
-
-                        let mut last_error: Option<anyhow::Error> = None;
-                        let mut proof_bytes: Option<Vec<u8>> = None;
-
-                        for attempt in 1..=MAX_RETRIES {
-                            match blocking_client.post(&url).json(&request).send() {
-                                Ok(resp) => {
-                                    let status = resp.status();
-                                    if !status.is_success() {
-                                        let err_body = resp
-                                            .text()
-                                            .unwrap_or_else(|_| "<failed to read error body>".to_string());
-                                        last_error = Some(anyhow::anyhow!(
-                                            "Prover service returned error (status={}): {}",
-                                            status,
-                                            err_body
-                                        ));
-                                        // Don't retry on application-level errors
-                                        break;
-                                    }
-                                    match resp.bytes() {
-                                        Ok(bytes) => {
-                                            proof_bytes = Some(bytes.to_vec());
-                                            last_error = None;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            last_error = Some(anyhow::anyhow!(
-                                                "Failed to read binary prover service response: {}",
-                                                e
-                                            ));
-                                            // Don't retry parse/read errors
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    last_error = Some(anyhow::anyhow!("Failed to send request to prover service: {}", e));
-                                    if attempt < MAX_RETRIES {
-                                        eprintln!(
-                                            "[warn] Prover service request failed (attempt {}/{}): {}. Retrying in {}ms...",
-                                            attempt,
-                                            MAX_RETRIES,
-                                            e,
-                                            RETRY_DELAY_MS
-                                        );
-                                        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(err) = last_error {
-                            return Err(err);
-                        }
-
-                        let proof_bytes = proof_bytes
-                            .ok_or_else(|| anyhow::anyhow!("No response from prover service after retries"))?;
-
-                        let args_json = serde_json::to_vec(&args)?;
-                        let pkg = ligero_runner::LigeroProofPackage::new(
-                            proof_bytes,
-                            public_output,
-                            args_json,
-                            private_indices,
-                        )?;
-                        Ok(bincode::serialize(&pkg)?)
-                    })()
-                    .context("generate transfer proof via prover service")?
-                } else {
-                    // Daemon-mode prover ONLY: keep webgpu_prover warm and avoid respawning for each proof.
-                    (|| -> anyhow::Result<Vec<u8>> {
-                        let public_output = host.require_public_output()?;
-                        let cfg = host.runner().config().clone();
-                        let mut cfg_json = serde_json::to_value(&cfg)?;
-
-                        // Daemon-mode prover expects `program` to be a real `.wasm` path, not a circuit name.
-                        // `LigeroHost`/`LigeroRunner` can accept circuit names, so resolve here before sending.
-                        if let serde_json::Value::Object(ref mut map) = cfg_json {
-                            if let Some(serde_json::Value::String(program)) =
-                                map.get("program").cloned()
-                            {
-                                let resolved = ligero_runner::resolve_program(&program)
-                                    .with_context(|| format!("Failed to resolve program '{program}'"))?;
-                                map.insert(
-                                    "program".to_string(),
-                                    serde_json::Value::String(resolved.to_string_lossy().to_string()),
-                                );
-                            }
-                        }
-
-                        // Provide an explicit, unique proof output path to the daemon.
-                        // Relying on the daemon's internal temp-path generator can collide across
-                        // multiple daemon processes started at the same time (same timestamp + per-process counter).
-                        let tmp = tempfile::tempdir()?;
-                        let proof_path = tmp.path().join("proof_data.bin");
-                        if let serde_json::Value::Object(ref mut map) = cfg_json {
-                            map.insert(
-                                "proof-path".to_string(),
-                                serde_json::Value::String(proof_path.to_string_lossy().to_string()),
-                            );
-                            // Request uncompressed proofs: this significantly reduces CPU overhead
-                            // (gzip compress/decompress) while keeping proving/verifying correctness.
-                            map.insert("gzip-proof".to_string(), serde_json::Value::Bool(false));
-                        }
-
-                        let pool = prover_daemon_pool(daemon_workers)
-                            .context("initialize ligero prover daemon pool")?;
-
-                        let resp = pool.prove(cfg_json).context("daemon prove request failed")?;
-                        if !resp.ok {
-                            anyhow::bail!(
-                                "prover daemon returned ok=false (exit_code={:?}): {}",
-                                resp.exit_code,
-                                resp.error.unwrap_or_else(|| "unknown error".to_string())
-                            );
-                        }
-
-                        let proof_bytes = std::fs::read(&proof_path)
-                            .with_context(|| format!("failed to read proof at {}", proof_path.display()))?;
-                        drop(tmp);
-
-                        let args_json = serde_json::to_vec(&cfg.args)?;
-                        let pkg = ligero_runner::LigeroProofPackage::new(
-                            proof_bytes,
-                            public_output,
-                            args_json,
-                            cfg.private_indices.clone(),
-                        )?;
-                        Ok(bincode::serialize(&pkg)?)
-                    })()
-                    .context("generate transfer proof via daemon")?
-                };
-
-                // Pool FVK signature injection (Ligero-specific: mutates args in LigeroProofPackage).
-                // Nightstream proofs don't use Ligero arg-level manipulation, so skip injection.
-                let proof_data = if proof_backend != "nightstream" {
-                    if let Some(pool_sig_hex) = pool_sig_hex.as_ref() {
-                        if viewer_data_list.is_none() {
-                            bail!("POOL_FVK_PK is set but viewer section is missing in transfer proof args");
-                        }
-                        let fvk_commitment_arg_pos = fvk_commitment_arg_pos.ok_or_else(|| {
-                            anyhow!(
-                                "POOL_FVK_PK is set but fvk_commitment_arg_pos is missing (viewer section not enabled)"
-                            )
-                        })?;
-                        inject_pool_sig_hex_into_proof_bytes(
-                            proof_data,
-                            fvk_commitment_arg_pos,
-                            pool_sig_hex.clone(),
-                        )?
-                    } else {
-                        proof_data
-                    }
-                } else {
-                    proof_data
+                    ns_host.write_note_spend_witness(&witness, public_bytes);
+                    ns_host.run(true)
+                        .context("Nightstream proving failed")?
                 };
                 Ok(ProofResult {
                     sender_idx,

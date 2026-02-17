@@ -5,8 +5,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sov_modules_api::macros::{serialize, UniversalWallet};
 use sov_modules_api::{Context, EventEmitter, Gas, Spec, TxState};
-#[cfg(feature = "native")]
-use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
 use thiserror::Error;
 
 use super::ValueSetterZk;
@@ -104,34 +102,13 @@ impl<S: Spec> ValueSetterZk<S> {
                 .get(state)?
                 .ok_or_else(|| anyhow::anyhow!("method_id not configured in module state"))?;
 
-            let backend = self
-                .backend
-                .get(state)?
-                .unwrap_or_else(|| "ligero".to_string());
-
-            let public: ValueProofPublic = match backend.as_str() {
-                "ligero" => {
-                    use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-                    let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                        .map_err(|e| anyhow::anyhow!("Invalid Ligero method_id: {}", e))?;
-                    LigeroVerifier::verify(&proof, &method_id)
-                        .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?
-                }
-                #[cfg(feature = "nightstream")]
-                "nightstream" => {
-                    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
-                    let method_id = NightstreamCodeCommitment::decode(&method_id_bytes)
-                        .map_err(|e| anyhow::anyhow!("Invalid Nightstream method_id: {}", e))?;
-                    NightstreamVerifier::verify(&proof, &method_id)
-                        .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?
-                }
-                other => {
-                    anyhow::bail!(
-                        "Unknown proof backend: '{}'. Supported backends: 'ligero'{}",
-                        other,
-                        if cfg!(feature = "nightstream") { ", 'nightstream'" } else { "" }
-                    );
-                }
+            let public: ValueProofPublic = {
+                use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
+                use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+                let method_id = NightstreamCodeCommitment::decode(&method_id_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid Nightstream method_id: {}", e))?;
+                NightstreamVerifier::verify(&proof, &method_id)
+                    .map_err(|e| SetValueZkError::<S>::ProofVerificationFailed(e.to_string()))?
             };
 
             if public.value != value {

@@ -8,13 +8,13 @@ use mcp::privacy_key::PrivacyKey;
 use mcp::provider::Provider;
 use mcp::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 
-type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
 
 const TEST_PRIVATE_KEY_HEX: &str =

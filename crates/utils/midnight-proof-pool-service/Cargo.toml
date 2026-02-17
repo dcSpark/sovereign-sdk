@@ -21,10 +21,11 @@ rusqlite = { version = "0.32.1" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = false }
 sov-bank = { workspace = true }
-sov-ligero-adapter = { workspace = true }
 sov-modules-api = { workspace = true, features = ["native"] }
+sov-nightstream-adapter = { workspace = true }
 sov-proof-verifier-service = { path = "../sov-proof-verifier-service" }
 sov-rollup-interface = { workspace = true }
+sha2 = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing.workspace = true

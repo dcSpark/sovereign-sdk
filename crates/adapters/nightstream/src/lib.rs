@@ -36,16 +36,25 @@ use thiserror::Error;
 /// Pre-compiled RISC-V ROM bytes for Nightstream guest circuits.
 pub mod circuits;
 
+/// Utilities for converting circuit output (raw GlDigest) to SpendPublic.
+pub mod circuit_output;
+
 mod guest;
 pub use guest::NightstreamGuest;
 
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
-pub use host::{NightstreamHost, NightstreamHostArgs};
+pub use host::{
+    NightstreamHost, NightstreamHostArgs, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+};
 
 mod proof_package;
 pub use proof_package::NightstreamProofPackage;
+
+/// Re-export the CCS cache type for direct use by callers.
+#[cfg(feature = "native")]
+pub use neo_fold::riscv_shard::Rv32B1CcsCache;
 
 /// The cryptographic primitives used by Nightstream (reuses mock-zkvm crypto).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy, schemars::JsonSchema)]
@@ -273,8 +282,10 @@ impl ZkVerifier for NightstreamVerifier {
                 "Nightstream: starting proof verification (verify-only, {} step instances)...",
                 package.steps_public.len(),
             );
+            let verify_start = std::time::Instant::now();
             native::verify_proof_package(&package)?;
-            tracing::info!("Nightstream: proof verification PASSED");
+            let verify_ms = verify_start.elapsed().as_millis();
+            tracing::info!("Nightstream: proof verification PASSED in {}ms", verify_ms);
         }
 
         #[cfg(not(feature = "native"))]
@@ -287,6 +298,25 @@ impl ZkVerifier for NightstreamVerifier {
         }
 
         Ok(public)
+    }
+}
+
+#[cfg(feature = "native")]
+impl NightstreamVerifier {
+    /// Ensure that the ROM bytes match the expected code commitment.
+    pub fn ensure_code_commitment(
+        rom_bytes: &[u8],
+        expected: &[u8; 32],
+    ) -> Result<(), anyhow::Error> {
+        native::ensure_code_commitment(rom_bytes, expected)
+    }
+
+    /// Verify a proof package with a pre-built CCS cache.
+    pub fn verify_proof_package_with_cache(
+        package: &NightstreamProofPackage,
+        cache: &std::sync::Arc<Rv32B1CcsCache>,
+    ) -> Result<(), anyhow::Error> {
+        native::verify_proof_package_with_cache(package, cache)
     }
 }
 
@@ -326,7 +356,27 @@ mod native {
     ///
     /// **No RISC-V execution or re-proving is performed.**
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
-        let ok = package.verify().map_err(|e| {
+        verify_proof_package_inner(package, None)
+    }
+
+    /// Like [`verify_proof_package`] but uses a pre-built CCS cache for faster verification.
+    pub fn verify_proof_package_with_cache(
+        package: &NightstreamProofPackage,
+        cache: &std::sync::Arc<Rv32B1CcsCache>,
+    ) -> Result<(), anyhow::Error> {
+        verify_proof_package_inner(package, Some(cache))
+    }
+
+    fn verify_proof_package_inner(
+        package: &NightstreamProofPackage,
+        cache: Option<&std::sync::Arc<Rv32B1CcsCache>>,
+    ) -> Result<(), anyhow::Error> {
+        let ok = if let Some(c) = cache {
+            package.verify_with_cache(c)
+        } else {
+            package.verify()
+        }
+        .map_err(|e| {
             anyhow::anyhow!("Nightstream proof verification failed: {:?}", e)
         })?;
 

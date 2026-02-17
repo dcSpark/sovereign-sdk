@@ -164,5 +164,4 @@ exec "$VERIFIER_BIN" \
   --chain-id "$CHAIN_ID" \
   --log-level "$LOG_LEVEL" \
   --rollup-config-path "$ROLLUP_CONFIG" \
-  --proof-backend nightstream \
   $DEFER_FLAG

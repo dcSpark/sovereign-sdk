@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod fvk_service;
 mod ligero;
+mod nightstream;
 mod operations;
 mod privacy_key;
 mod provider;
@@ -21,7 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use crate::ligero::Ligero;
+use crate::nightstream::Nightstream;
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::server::CryptoServer;
@@ -58,19 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Connected to rollup RPC, verifier service, and indexer successfully");
     let provider = Arc::new(provider);
 
-    // Initialize Ligero prover
-    tracing::info!("[mcp] Initializing Ligero prover");
+    tracing::info!("[mcp] Initializing Nightstream proof service");
     tracing::info!(
-        "[mcp] Prover binary: {}",
-        cfg.ligero_prover_binary_path.display()
+        "[mcp] Proof service URL: {}",
+        cfg.nightstream_proof_service_url
     );
-    tracing::info!("[mcp] Shader path: {}", cfg.ligero_shader_path.display());
-    tracing::info!("[mcp] Program path: {}", cfg.ligero_program_path.display());
+    tracing::info!("[mcp] Circuit: {}", cfg.nightstream_program_path);
 
-    let ligero = Arc::new(Ligero::new(
-        Some(cfg.ligero_prover_binary_path.clone()),
-        Some(cfg.ligero_shader_path.clone()),
-        Some(cfg.ligero_program_path.clone()),
+    let nightstream = Arc::new(Nightstream::new(
+        cfg.nightstream_proof_service_url.to_string(),
+        cfg.nightstream_program_path.clone(),
     ));
 
     let pool_fvk_pk = std::env::var("POOL_FVK_PK")
@@ -115,10 +113,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[mcp] Privacy address: {}",
         privacy_key.privacy_address(&DOMAIN)
     );
-    tracing::info!(
-        "[mcp] All deposits will be made to this privacy address: {}",
-        privacy_key.privacy_address(&DOMAIN)
-    );
 
     let privacy_key = Arc::new(RwLock::new(privacy_key));
 
@@ -131,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(CryptoServer::new(
                 provider.clone(),
                 wallet_ctx.clone(),
-                ligero.clone(),
+                nightstream.clone(),
                 viewer_fvk_bundle.clone(),
                 privacy_key.clone(),
             ))

@@ -20,11 +20,6 @@
         }
       ]
     },
-    "backend": {
-      "description": "Proof backend to use: \"ligero\" (default) or \"nightstream\".",
-      "default": "ligero",
-      "type": "string"
-    },
     "domain": {
       "description": "Domain tag used in all note/hash derivations",
       "type": "array",
