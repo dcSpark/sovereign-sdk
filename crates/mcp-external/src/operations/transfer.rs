@@ -3,9 +3,13 @@
 use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    inv_enforce_v2, nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
     PrivacyAddress, SpendPublic,
+};
+use sov_nightstream_adapter::{
+    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
 };
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
@@ -504,7 +508,90 @@ pub async fn transfer(
         anyhow::bail!("Destination privacy address is frozen (blacklisted)");
     }
 
-    // Step 5: Build SpendPublic and generate Nightstream proof
+    // Step 5: Build NoteSpendWitness, SpendPublic, and generate Nightstream proof
+    let witness_inputs: Vec<NoteSpendInput> = (0..in_values_u64.len())
+        .map(|i| NoteSpendInput {
+            value: in_values_u64[i],
+            rho: in_rhos[i],
+            sender_id: in_sender_ids[i],
+            position: positions[i] as u32,
+            siblings: siblings_by_input[i].clone(),
+            nullifier: nullifiers[i],
+        })
+        .collect();
+
+    let mut witness_outputs = vec![NoteSpendOutput {
+        value: send_amount_u64,
+        rho: out_rho_0,
+        pk_spend: destination_pk_spend,
+        pk_ivk: destination_pk_ivk,
+        cm: cm_out_0,
+    }];
+    if has_change {
+        witness_outputs.push(NoteSpendOutput {
+            value: change_amount_u64,
+            rho: out_rho_1.unwrap(),
+            pk_spend: pk_spend_owner,
+            pk_ivk: pk_ivk_owner,
+            cm: cm_out_1.unwrap(),
+        });
+    }
+
+    let mut out_values_for_inv = vec![send_amount_u64];
+    let mut out_rhos_for_inv = vec![out_rho_0];
+    if has_change {
+        out_values_for_inv.push(change_amount_u64);
+        out_rhos_for_inv.push(out_rho_1.unwrap());
+    }
+    let inv_enforce = inv_enforce_v2(&in_values_u64, &in_rhos, &out_values_for_inv, &out_rhos_for_inv);
+
+    let mut blacklist_proofs = vec![BlacklistProof::from_opening(
+        &sender_opening.recipient,
+        sender_opening.bucket_entries,
+        sender_opening.siblings.clone(),
+    )];
+    blacklist_proofs.push(BlacklistProof::from_opening(
+        &dest_opening.recipient,
+        dest_opening.bucket_entries,
+        dest_opening.siblings.clone(),
+    ));
+
+    let viewer_witnesses: Vec<ViewerWitness> = if let Some(ref atts) = view_attestations {
+        if let Some(ref bundle) = viewer_fvk_bundle {
+            vec![ViewerWitness {
+                fvk_commitment: atts[0].fvk_commitment,
+                fvk: bundle.fvk,
+                per_output: atts
+                    .iter()
+                    .map(|a| ViewerOutputWitness {
+                        ct_hash: a.ct_hash,
+                        mac: a.mac,
+                    })
+                    .collect(),
+            }]
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    let witness = NoteSpendWitness {
+        domain: DOMAIN,
+        spend_sk,
+        pk_ivk_owner,
+        depth: depth as u32,
+        anchor: anchor_root,
+        inputs: witness_inputs,
+        withdraw_amount: 0,
+        withdraw_to: [0u8; 32],
+        outputs: witness_outputs,
+        inv_enforce,
+        blacklist_root,
+        blacklist_proofs,
+        viewers: viewer_witnesses,
+    };
+
     let mut output_commitments = vec![cm_out_0];
     if has_change {
         output_commitments.push(cm_out_1.unwrap());
@@ -513,7 +600,7 @@ pub async fn transfer(
         anchor_root,
         blacklist_root,
         nullifiers: nullifiers.clone(),
-        withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
+        withdraw_amount: 0,
         output_commitments,
         view_attestations,
     };
@@ -521,7 +608,7 @@ pub async fn transfer(
     tracing::debug!("Generating Nightstream ZK proof with {} output(s)...", num_outputs);
     let proof_start = StdInstant::now();
     let proof_bytes = nightstream
-        .generate_proof(&public)
+        .generate_proof(&witness, &public)
         .await
         .inspect_err(|e| tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e))
         .context("Failed to generate Nightstream proof for transfer")?;
@@ -532,6 +619,19 @@ pub async fn transfer(
         proof_bytes_len = proof_bytes.len(),
         "Generated Nightstream proof"
     );
+
+    // Step 5b: Inject pool viewer signature into proof package if FVK is configured
+    let proof_bytes = if let Some(ref bundle) = viewer_fvk_bundle {
+        tracing::debug!("Injecting pool viewer signature into proof package");
+        crate::nightstream::inject_pool_viewer_sig(
+            proof_bytes,
+            bundle.fvk_commitment,
+            &bundle.pool_sig_hex,
+        )
+        .context("Failed to inject pool viewer signature into proof package")?
+    } else {
+        proof_bytes
+    };
 
     // Step 6: Create and sign transaction
     let unsigned_tx_start = StdInstant::now();

@@ -46,6 +46,7 @@ midnight-privacy = { workspace = true }
 rand = { workspace = true }
 sov-api-spec = { workspace = true }
 sov-nightstream-adapter = { workspace = true, features = ["native"] }
+flate2 = "1"
 
 [dev-dependencies]
 dirs = "6.0.0"

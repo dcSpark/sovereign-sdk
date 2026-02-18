@@ -81,6 +81,169 @@ pub struct NoteSpendOutput {
     pub cm: [u8; 32],
 }
 
+/// Blacklist non-membership proof for a single identity.
+///
+/// Contains the bucket entries, inverse witness, and Merkle siblings needed
+/// by the circuit's `assert_not_blacklisted` function.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlacklistProof {
+    /// The 12 entries in the deny-map bucket (BL_BUCKET_SIZE = 12).
+    pub bucket_entries: [[u8; 32]; 12],
+    /// Multiplicative inverse of product(id - entry) over all bucket entries.
+    /// Stored as a 32-byte field; the circuit reads only the first 8 bytes as u64.
+    pub bucket_inv: [u8; 32],
+    /// Merkle path siblings from the bucket leaf to the blacklist root (BL_DEPTH = 16).
+    pub siblings: Vec<[u8; 32]>,
+}
+
+/// Blacklist tree constants (must match the circuit).
+const BL_DEPTH: u8 = 16;
+const BL_BUCKET_SIZE: usize = 12;
+const TAG_BL_BUCKET: u64 = 7;
+const TAG_MT_NODE_BL: u64 = 1;
+
+impl BlacklistProof {
+    /// Build a non-membership proof from on-chain deny-map opening data.
+    ///
+    /// `id` is the 32-byte recipient identity (the deny-map key).
+    /// `bucket_entries` and `siblings` come from `BlacklistOpeningResponse`.
+    /// The inverse witness is computed from the identity and bucket entries.
+    pub fn from_opening(
+        id: &[u8; 32],
+        bucket_entries: [[u8; 32]; BL_BUCKET_SIZE],
+        siblings: Vec<[u8; 32]>,
+    ) -> Self {
+        let bucket_inv = compute_bucket_inv(id, &bucket_entries);
+        Self {
+            bucket_entries,
+            bucket_inv,
+            siblings,
+        }
+    }
+
+    /// Build a non-membership proof for `id` against the default (all-empty) deny-map.
+    ///
+    /// Use this when the blacklist root is [`default_blacklist_root()`].
+    pub fn default_for_identity(id: &[u8; 32]) -> Self {
+        let bucket_entries = [[0u8; 32]; BL_BUCKET_SIZE];
+        let bucket_inv = compute_bucket_inv(id, &bucket_entries);
+
+        let default_nodes = compute_default_bl_nodes();
+        let siblings: Vec<[u8; 32]> = default_nodes[..BL_DEPTH as usize]
+            .iter()
+            .map(gl_digest_to_hash32)
+            .collect();
+
+        Self {
+            bucket_entries,
+            bucket_inv,
+            siblings,
+        }
+    }
+}
+
+/// Compute the bucket inverse witness: `1 / product(id - entry)` for all entries.
+///
+/// This matches the circuit's `enforce_prod_digest_diff` logic:
+/// for each entry, multiply `prod *= (id[0]-e[0]) * (id[1]-e[1]) * (id[2]-e[2]) * (id[3]-e[3])`.
+fn compute_bucket_inv(id: &[u8; 32], bucket_entries: &[[u8; 32]; BL_BUCKET_SIZE]) -> [u8; 32] {
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+    use p3_goldilocks::Goldilocks;
+
+    let id_gl = hash32_to_gl(id);
+
+    let mut prod = Goldilocks::ONE;
+    for entry in bucket_entries {
+        let e_gl = hash32_to_gl(entry);
+        for i in 0..4 {
+            prod *= id_gl[i] - e_gl[i];
+        }
+    }
+
+    let inv = prod.inverse();
+    let mut bucket_inv = [0u8; 32];
+    bucket_inv[..8].copy_from_slice(&inv.as_canonical_u64().to_le_bytes());
+    bucket_inv
+}
+
+/// Convert a Hash32 (32 bytes LE) to 4 Goldilocks field elements.
+fn hash32_to_gl(h: &[u8; 32]) -> [p3_goldilocks::Goldilocks; 4] {
+    use p3_field::PrimeCharacteristicRing;
+    use p3_goldilocks::Goldilocks;
+
+    let mut d = [Goldilocks::ZERO; 4];
+    for i in 0..4 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&h[i * 8..(i + 1) * 8]);
+        d[i] = Goldilocks::from_u64(u64::from_le_bytes(buf));
+    }
+    d
+}
+
+/// Compute the default (all-allowed) deny-map Merkle root.
+///
+/// This matches `midnight_privacy::hash::default_blacklist_root()` exactly.
+pub fn default_blacklist_root() -> [u8; 32] {
+    let nodes = compute_default_bl_nodes();
+    gl_digest_to_hash32(&nodes[BL_DEPTH as usize])
+}
+
+/// Build the default sparse Merkle tree nodes for an empty blacklist.
+fn compute_default_bl_nodes() -> Vec<[p3_goldilocks::Goldilocks; 4]> {
+    use neo_ccs::crypto::poseidon2_goldilocks as p2;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_goldilocks::Goldilocks;
+
+    let empty_leaf = {
+        let mut input = [Goldilocks::ZERO; 1 + BL_BUCKET_SIZE * 4];
+        input[0] = Goldilocks::from_u64(TAG_BL_BUCKET);
+        p2::poseidon2_hash(&input)
+    };
+
+    let mut nodes: Vec<[Goldilocks; 4]> = Vec::with_capacity(BL_DEPTH as usize + 1);
+    nodes.push(empty_leaf);
+    for lvl in 0..BL_DEPTH {
+        let prev = nodes[lvl as usize];
+        let mut mt_input = [Goldilocks::ZERO; 10];
+        mt_input[0] = Goldilocks::from_u64(TAG_MT_NODE_BL);
+        mt_input[1] = Goldilocks::from_u64(lvl as u64);
+        mt_input[2..6].copy_from_slice(&prev);
+        mt_input[6..10].copy_from_slice(&prev);
+        nodes.push(p2::poseidon2_hash(&mt_input));
+    }
+    nodes
+}
+
+/// Convert a Goldilocks digest (4 x Goldilocks) to a Hash32 (32 bytes LE).
+fn gl_digest_to_hash32(digest: &[p3_goldilocks::Goldilocks; 4]) -> [u8; 32] {
+    use p3_field::PrimeField64;
+    let mut h = [0u8; 32];
+    for (i, &elem) in digest.iter().enumerate() {
+        h[i * 8..(i + 1) * 8].copy_from_slice(&elem.as_canonical_u64().to_le_bytes());
+    }
+    h
+}
+
+/// Per-output viewer attestation data (public values the circuit will verify).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewerOutputWitness {
+    /// Hash of the deterministic ciphertext (public).
+    pub ct_hash: [u8; 32],
+    /// MAC over (k, cm, ct_hash) (public).
+    pub mac: [u8; 32],
+}
+
+/// Viewer witness data for one Level-B viewer authority.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewerWitness {
+    /// FVK commitment (public): H("FVK_COMMIT_V1" || fvk).
+    pub fvk_commitment: [u8; 32],
+    /// Full viewing key (private).
+    pub fvk: [u8; 32],
+    /// Per-output attestation data (one per output note).
+    pub per_output: Vec<ViewerOutputWitness>,
+}
+
 /// Full witness for the note-spend circuit.
 ///
 /// Contains all data (public + private) the RISC-V guest needs.
@@ -107,8 +270,15 @@ pub struct NoteSpendWitness {
     pub outputs: Vec<NoteSpendOutput>,
     /// Multiplicative inverse of the enforce-product (private).
     pub inv_enforce: [u8; 32],
-    /// Deny-map (blacklist) root (public, binding only).
+    /// Deny-map (blacklist) root (public).
     pub blacklist_root: [u8; 32],
+    /// Blacklist non-membership proofs.
+    ///
+    /// Always contains 1 proof (sender). For transfers (withdraw_amount == 0),
+    /// contains 2 proofs (sender + pay recipient).
+    pub blacklist_proofs: Vec<BlacklistProof>,
+    /// Level-B viewer attestation witnesses (empty when no viewer is configured).
+    pub viewers: Vec<ViewerWitness>,
 }
 
 // ============================================================================
@@ -318,21 +488,38 @@ impl NightstreamHost {
         };
         self.write_ram_u64(inv_enforce_u64);
 
-        // Blacklist root
+        // Blacklist root (public)
         self.write_ram_digest(&witness.blacklist_root);
 
-        // NOTE: Output claims (output binding) are intentionally not set here.
-        //
-        // The circuit's internal assertions already verify all critical properties:
-        //   - Merkle membership, nullifier derivation, commitment correctness,
-        //   - balance equation, enforce-product check.
-        //
-        // The public output in the proof package is derived from the witness data
-        // that was verified by the circuit. This matches the Ligero-era approach
-        // where no output binding was used.
-        //
-        // TODO: Investigate Nightstream output binding with many claims (>1) and
-        // re-enable once the mechanism is confirmed to work for dense output regions.
+        // Blacklist non-membership proofs.
+        // The circuit reads: for each proof { entries[12] (digest), inv (u64), siblings[16] (digest) }
+        for bl_proof in &witness.blacklist_proofs {
+            for entry in &bl_proof.bucket_entries {
+                self.write_ram_digest(entry);
+            }
+            let inv_u64 = {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bl_proof.bucket_inv[..8]);
+                u64::from_le_bytes(buf)
+            };
+            self.write_ram_u64(inv_u64);
+            for sib in &bl_proof.siblings {
+                self.write_ram_digest(sib);
+            }
+        }
+
+        // Viewer attestation witnesses.
+        // The circuit reads: n_viewers, then per-viewer { fvk_commitment, fvk, per-output { ct_hash, mac } }
+        let n_viewers = witness.viewers.len() as u32;
+        self.add_u32_input(n_viewers);
+        for viewer in &witness.viewers {
+            self.write_ram_digest(&viewer.fvk_commitment);
+            self.write_ram_digest(&viewer.fvk);
+            for out_w in &viewer.per_output {
+                self.write_ram_digest(&out_w.ct_hash);
+                self.write_ram_digest(&out_w.mac);
+            }
+        }
 
         // Store the pre-built public output for the proof package.
         self.stored_public_output = Some(public_output);
@@ -501,6 +688,7 @@ impl ZkvmHost for NightstreamHost {
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
                 config: self.build_config(),
+                pool_viewer_sig: None,
             };
 
             // Log per-field size breakdown for diagnostics
@@ -561,6 +749,7 @@ impl ZkvmHost for NightstreamHost {
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
                 config: self.build_config(),
+                pool_viewer_sig: None,
             };
 
             let raw = bincode::serialize(&package)

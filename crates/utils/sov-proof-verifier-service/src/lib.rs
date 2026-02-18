@@ -4,6 +4,7 @@
 //! and transforms them into non-ZK transactions for the rollup node.
 
 use anyhow::{Context, Result};
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
@@ -14,7 +15,6 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
-use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use futures::future::join_all;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
@@ -436,9 +436,6 @@ struct ProveVerifyRequest {
     /// Base64-encoded bincode SpendPublic bytes for the proof package's public_output.
     #[serde(default)]
     public_output: Option<String>,
-    /// DEPRECATED: Pre-computed SpendPublic (ignored; use `witness` + `public_output`).
-    #[serde(default)]
-    spend_public: Option<SpendPublic>,
 }
 
 /// Response body for the local `/prove` and `/verify` endpoints.
@@ -1472,6 +1469,7 @@ async fn verify_and_record_midnight_handler(
                 anchor_root,
                 &nullifiers,
                 0u128,
+                state.pool_fvk_pk.clone(),
             )
             .await?;
             metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
@@ -1584,6 +1582,7 @@ async fn verify_and_record_midnight_handler(
                 anchor_root,
                 std::slice::from_ref(&nullifier),
                 withdraw_amount,
+                state.pool_fvk_pk.clone(),
             )
             .await?;
             metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
@@ -2236,6 +2235,7 @@ pub async fn verify_midnight_withdraw_proof(
     expected_anchor_root: MidnightHash32,
     expected_nullifiers: &[MidnightHash32],
     expected_withdraw_amount: u128,
+    pool_fvk_pk: Option<Ed25519VerifyingKey>,
 ) -> Result<SpendPublic, ServiceError> {
     let public: SpendPublic =
         verify_midnight_proof_nightstream(method_id_opt, &proof).await?;
@@ -2267,6 +2267,99 @@ pub async fn verify_midnight_withdraw_proof(
             "Withdraw amount mismatch: expected {}, proof {}",
             expected_withdraw_amount, public.withdraw_amount
         )));
+    }
+
+    // Enforce pool-signed viewer FVK commitment when POOL_FVK_PK is configured
+    if let Some(ref pool_pk) = pool_fvk_pk {
+        use ed25519_dalek::Verifier;
+        use sov_nightstream_adapter::NightstreamProofPackage;
+
+        // Decompress and deserialize the proof package to extract pool_viewer_sig
+        let decompressed = {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+            let mut decoder = DeflateDecoder::new(proof.as_slice());
+            let mut buf = Vec::new();
+            decoder.read_to_end(&mut buf).map_err(|e| {
+                ServiceError::ParseError(format!(
+                    "Failed to decompress proof for pool FVK check: {e}"
+                ))
+            })?;
+            buf
+        };
+
+        let package: NightstreamProofPackage =
+            bincode::deserialize(&decompressed).map_err(|e| {
+                ServiceError::ParseError(format!(
+                    "Failed to deserialize NightstreamProofPackage for pool FVK check: {e}"
+                ))
+            })?;
+
+        let pool_sig = package.pool_viewer_sig.ok_or_else(|| {
+            ServiceError::ProofError(
+                "POOL_FVK_PK is set: proof package must include pool_viewer_sig \
+                 (pool-signed viewer FVK commitment)"
+                    .to_string(),
+            )
+        })?;
+
+        // Verify Ed25519 signature over the FVK commitment
+        let signature = ed25519_dalek::Signature::from_slice(&pool_sig.signature)
+            .map_err(|e| {
+                ServiceError::ProofError(format!(
+                    "Invalid Ed25519 signature in pool_viewer_sig: {e}"
+                ))
+            })?;
+
+        pool_pk
+            .verify(&pool_sig.fvk_commitment, &signature)
+            .map_err(|e| {
+                ServiceError::ProofError(format!(
+                    "Pool signature verification failed over fvk_commitment 0x{}: {e}",
+                    hex::encode(pool_sig.fvk_commitment)
+                ))
+            })?;
+
+        // Check that view_attestations are present and use the signed FVK commitment
+        let attestations = public.view_attestations.as_ref().ok_or_else(|| {
+            ServiceError::ProofError(
+                "POOL_FVK_PK is set: SpendPublic must include view_attestations".to_string(),
+            )
+        })?;
+
+        if attestations.is_empty() {
+            return Err(ServiceError::ProofError(
+                "POOL_FVK_PK is set: view_attestations must be non-empty".to_string(),
+            ));
+        }
+
+        // Every attestation must use the pool-signed FVK commitment
+        for (idx, att) in attestations.iter().enumerate() {
+            if att.fvk_commitment != pool_sig.fvk_commitment {
+                return Err(ServiceError::ProofError(format!(
+                    "POOL_FVK_PK: view_attestations[{idx}].fvk_commitment (0x{}) \
+                     != signed fvk_commitment (0x{})",
+                    hex::encode(att.fvk_commitment),
+                    hex::encode(pool_sig.fvk_commitment),
+                )));
+            }
+        }
+
+        // Every output commitment must have a corresponding attestation
+        for cm in &public.output_commitments {
+            if !attestations.iter().any(|a| a.cm == *cm) {
+                return Err(ServiceError::ProofError(format!(
+                    "POOL_FVK_PK: output commitment 0x{} has no matching view_attestation",
+                    hex::encode(cm),
+                )));
+            }
+        }
+
+        debug!(
+            "✓ Pool FVK verification passed: fvk_commitment=0x{}, {} attestation(s)",
+            hex::encode(pool_sig.fvk_commitment),
+            attestations.len()
+        );
     }
 
     Ok(public)

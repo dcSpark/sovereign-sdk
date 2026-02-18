@@ -35,10 +35,10 @@ neo-fold = { path = "../../../../Nightstream/crates/neo-fold" }
 neo-math = { path = "../../../../Nightstream/crates/neo-math" }
 neo-ajtai = { path = "../../../../Nightstream/crates/neo-ajtai" }
 neo-memory = { path = "../../../../Nightstream/crates/neo-memory" }
+neo-ccs = { path = "../../../../Nightstream/crates/neo-ccs" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-neo-ccs = { path = "../../../../Nightstream/crates/neo-ccs" }
 p3-goldilocks = "0.4.1"
 
 [features]

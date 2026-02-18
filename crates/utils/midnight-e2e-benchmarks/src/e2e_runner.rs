@@ -1279,7 +1279,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     };
 
     // Check cache and generate proofs in parallel (with concurrency limit)
-    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+    use sov_rollup_interface::zk::ZkvmHost;
     let depth_usize = TREE_DEPTH as usize;
     let viewer_fvk_commitment_arg_pos: Option<usize> = if expected_viewer_fvk_commitment.is_some() {
         // note_spend_guest v2 fixed layout:
@@ -1402,7 +1402,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
         let sem = semaphore.clone();
-        let program_path_for_host = program_path_for_host.clone();
+        let _program_path_for_host = program_path_for_host.clone();
         let viewer_fvk = viewer_fvk; // Option<Hash32>, Copy
         let pool_sig_hex = pool_sig_hex.clone();
         let client = client.clone();
@@ -1470,8 +1470,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 bl_depth
             );
 
+            let sender_bl_recipient = sender_opening.recipient;
             let sender_bl_bucket_entries = sender_opening.bucket_entries;
             let sender_bl_siblings = sender_opening.siblings;
+            let out_bl_recipient = out_opening.recipient;
             let out_bl_bucket_entries = out_opening.bucket_entries;
             let out_bl_siblings = out_opening.siblings;
 
@@ -1563,7 +1565,8 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
                 use sov_nightstream_adapter::circuits::note_spend_rom;
                 use sov_nightstream_adapter::{
-                    NightstreamHost, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+                    BlacklistProof, NightstreamHost, NoteSpendInput, NoteSpendOutput,
+                    NoteSpendWitness, ViewerOutputWitness, ViewerWitness,
                 };
 
                 let witness = NoteSpendWitness {
@@ -1591,6 +1594,30 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     }],
                     inv_enforce,
                     blacklist_root,
+                    blacklist_proofs: vec![
+                        BlacklistProof::from_opening(
+                            &sender_bl_recipient,
+                            sender_bl_bucket_entries,
+                            sender_bl_siblings,
+                        ),
+                        BlacklistProof::from_opening(
+                            &out_bl_recipient,
+                            out_bl_bucket_entries,
+                            out_bl_siblings,
+                        ),
+                    ],
+                    viewers: if let Some((fvk, ref att)) = viewer_data {
+                        vec![ViewerWitness {
+                            fvk_commitment: att.fvk_commitment,
+                            fvk,
+                            per_output: vec![ViewerOutputWitness {
+                                ct_hash: att.ct_hash,
+                                mac: att.mac,
+                            }],
+                        }]
+                    } else {
+                        vec![]
+                    },
                 };
 
                 let public_bytes = bincode::serialize(&public)

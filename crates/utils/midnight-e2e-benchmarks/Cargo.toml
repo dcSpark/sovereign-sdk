@@ -27,6 +27,7 @@ base64 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { version = "2" }
+flate2 = "1"
 num_cpus = "1.16"
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json", "blocking"] }

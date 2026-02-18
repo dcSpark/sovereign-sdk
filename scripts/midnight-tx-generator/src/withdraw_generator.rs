@@ -25,14 +25,53 @@ mod rollup_schema;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
-/// Inject pool signature into the proof package at the fvk_commitment argument position.
-// TODO: Migrate to Nightstream - was using LigeroProofPackage
+/// Inject pool signature into the Nightstream proof package.
 fn inject_pool_sig_hex_into_proof_bytes(
-    _proof_bytes: Vec<u8>,
+    proof_bytes: Vec<u8>,
     _fvk_commitment_arg_pos: usize,
-    _pool_sig_hex: String,
+    pool_sig_hex: String,
 ) -> Result<Vec<u8>> {
-    todo!("TODO: Migrate to Nightstream - was using LigeroProofPackage for pool sig injection")
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
+
+    let sig_bytes = hex::decode(pool_sig_hex.trim())
+        .context("pool_sig_hex is not valid hex")?;
+    anyhow::ensure!(sig_bytes.len() == 64, "pool_sig_hex must be 64 bytes (got {})", sig_bytes.len());
+
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).context("Failed to decompress proof bytes")?;
+        buf
+    };
+
+    let mut package: NightstreamProofPackage =
+        bincode::deserialize(&decompressed).context("Failed to deserialize NightstreamProofPackage")?;
+
+    let public: midnight_privacy::SpendPublic =
+        bincode::deserialize(&package.public_output)
+            .context("Failed to deserialize SpendPublic from package.public_output")?;
+
+    let fvk_commitment = public
+        .view_attestations
+        .as_ref()
+        .and_then(|atts| atts.first())
+        .map(|att| att.fvk_commitment)
+        .ok_or_else(|| anyhow::anyhow!("Cannot inject pool sig: no view_attestations in SpendPublic"))?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature: sig_bytes,
+    });
+
+    let raw = bincode::serialize(&package).context("Failed to re-serialize NightstreamProofPackage")?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw).context("Failed to write to deflate encoder")?;
+    encoder.finish().context("Failed to finish deflate compression")
 }
 
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)

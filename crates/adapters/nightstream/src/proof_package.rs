@@ -32,6 +32,19 @@ pub struct Rv32B1RunConfig {
     pub output_claims: Vec<(u64, u64)>,
 }
 
+/// Pool-operator Ed25519 signature over a viewer FVK commitment.
+///
+/// When `POOL_FVK_PK` is configured, the proof verifier service requires this
+/// to be present in the proof package so it can verify that the viewer
+/// attestations use a pool-authorized FVK.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolViewerSig {
+    /// The viewer FVK commitment that was signed (`H("FVK_COMMIT_V1" || fvk)`).
+    pub fvk_commitment: [u8; 32],
+    /// Ed25519 signature bytes (64 bytes) over `fvk_commitment` by the pool operator key.
+    pub signature: Vec<u8>,
+}
+
 /// A self-contained proof package for Nightstream RV32 proofs.
 ///
 /// Contains everything needed for an external verifier to check the proof
@@ -65,6 +78,14 @@ pub struct NightstreamProofPackage {
 
     /// Run configuration needed to reconstruct verification context.
     pub config: Rv32B1RunConfig,
+
+    /// Optional pool-operator signature over the viewer FVK commitment.
+    ///
+    /// When the pool operator requires Level-B viewer enforcement, this carries
+    /// the Ed25519 signature that the proof verifier service checks before
+    /// accepting the proof.
+    #[serde(default)]
+    pub pool_viewer_sig: Option<PoolViewerSig>,
 }
 
 impl NightstreamProofPackage {

@@ -122,12 +122,6 @@ export MIDNIGHT_FVK_SERVICE_DB="${MIDNIGHT_FVK_SERVICE_DB:-postgresql://admin:12
 export ORACLE_SIGNING_KEY_HEX="${ORACLE_SIGNING_KEY_HEX:-0x26515ce9a1569fd28569e82a6aef29049d7197a79913d27f871a6ade48563354}"
 export TEE_ORACLE_PUBKEY_HEX="${TEE_ORACLE_PUBKEY_HEX:-0x2e7a268b5b68ef23fd64ebfcfcf3b41b6ab74643051dcac82d724dac2091cf4d}"
 
-# ── Disabled services (API mismatch with Nightstream /prove endpoint) ─────────
-# Proof pool and MCP require witness-based /prove API updates before they can
-# work with the Nightstream backend. Mark them as remote to skip auto-start.
-export SERVICE_PROOF_POOL_REMOTE="${SERVICE_PROOF_POOL_REMOTE:-1}"
-export SERVICE_MCP_REMOTE="${SERVICE_MCP_REMOTE:-1}"
-
 # ── Service controller ────────────────────────────────────────────────────────
 export SERVICE_CONTROLLER_BIND="$CONTROLLER_BIND"
 if [ "$AUTO_START" -eq 1 ]; then

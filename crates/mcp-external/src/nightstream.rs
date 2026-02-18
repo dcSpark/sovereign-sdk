@@ -1,12 +1,14 @@
 //! Nightstream proof generation for Midnight Privacy transfers.
 //!
 //! Delegates proof generation to an external Nightstream prover service that
-//! accepts SpendPublic and returns serialized proof bytes.
+//! accepts a full NoteSpendWitness and returns serialized proof bytes.
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use midnight_privacy::SpendPublic;
 use reqwest::Client as HttpClient;
 use serde::Serialize;
+use sov_nightstream_adapter::NoteSpendWitness;
 
 /// Minimal wrapper used by MCP to generate Nightstream proofs.
 ///
@@ -34,8 +36,13 @@ impl Nightstream {
         &self.proof_service_url
     }
 
-    /// Generate a proof by sending SpendPublic to the Nightstream prover service.
-    pub async fn generate_proof(&self, public: &SpendPublic) -> Result<Vec<u8>> {
+    /// Generate a proof by sending a full NoteSpendWitness + SpendPublic to
+    /// the Nightstream prover service.
+    pub async fn generate_proof(
+        &self,
+        witness: &NoteSpendWitness,
+        public: &SpendPublic,
+    ) -> Result<Vec<u8>> {
         let base_url = self.proof_service_url.trim();
         anyhow::ensure!(
             !base_url.is_empty(),
@@ -48,15 +55,21 @@ impl Nightstream {
             format!("{}/prove", base_url)
         };
 
+        let public_output_bytes =
+            bincode::serialize(public).context("Failed to bincode-serialize SpendPublic")?;
+        let public_output =
+            base64::engine::general_purpose::STANDARD.encode(&public_output_bytes);
+
         #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
         struct ProveRequest<'a> {
-            spend_public: &'a SpendPublic,
+            witness: &'a NoteSpendWitness,
+            public_output: String,
             binary: bool,
         }
 
         let request = ProveRequest {
-            spend_public: public,
+            witness,
+            public_output,
             binary: true,
         };
 
@@ -87,4 +100,56 @@ impl Nightstream {
 
 fn normalize_base_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
+}
+
+/// Inject a pre-computed pool viewer signature into DEFLATE-compressed proof
+/// package bytes. The `pool_sig_hex` is the hex-encoded Ed25519 signature (64
+/// bytes) and `fvk_commitment` is the 32-byte FVK commitment it covers.
+pub fn inject_pool_viewer_sig(
+    proof_bytes: Vec<u8>,
+    fvk_commitment: [u8; 32],
+    pool_sig_hex: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
+
+    let sig_bytes = hex::decode(pool_sig_hex.trim())
+        .context("pool_sig_hex is not valid hex")?;
+    anyhow::ensure!(
+        sig_bytes.len() == 64,
+        "pool_sig_hex must decode to 64 bytes (got {})",
+        sig_bytes.len()
+    );
+
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder
+            .read_to_end(&mut buf)
+            .context("Failed to decompress proof bytes")?;
+        buf
+    };
+
+    let mut package: NightstreamProofPackage =
+        bincode::deserialize(&decompressed)
+            .context("Failed to deserialize NightstreamProofPackage")?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature: sig_bytes,
+    });
+
+    let raw = bincode::serialize(&package)
+        .context("Failed to re-serialize NightstreamProofPackage")?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&raw)
+        .context("Failed to write to deflate encoder")?;
+    encoder
+        .finish()
+        .context("Failed to finish deflate compression")
 }

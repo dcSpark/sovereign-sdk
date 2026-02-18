@@ -22,17 +22,57 @@ mod rollup_schema;
 
 type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
-/// Inject pool signature into the proof package at the fvk_commitment argument position.
-/// NightstreamProofPackage does not support pool sig injection; returns proof bytes as-is.
+/// Inject pool signature into the Nightstream proof package.
+///
+/// Decompresses the DEFLATE-compressed proof, deserializes the package,
+/// extracts the FVK commitment from SpendPublic.view_attestations, sets
+/// the pool_viewer_sig field, and re-serializes + recompresses.
 fn inject_pool_sig_hex_into_proof_bytes(
     proof_bytes: Vec<u8>,
     _fvk_commitment_arg_pos: usize,
-    _pool_sig_hex: String,
+    pool_sig_hex: String,
 ) -> Result<Vec<u8>> {
-    let _package: sov_nightstream_adapter::NightstreamProofPackage =
-        bincode::deserialize(&proof_bytes)
-            .context("Proof payload is not a NightstreamProofPackage")?;
-    Ok(proof_bytes)
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
+
+    let sig_bytes = hex::decode(pool_sig_hex.trim())
+        .context("pool_sig_hex is not valid hex")?;
+    anyhow::ensure!(sig_bytes.len() == 64, "pool_sig_hex must be 64 bytes (got {})", sig_bytes.len());
+
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).context("Failed to decompress proof bytes")?;
+        buf
+    };
+
+    let mut package: NightstreamProofPackage =
+        bincode::deserialize(&decompressed).context("Failed to deserialize NightstreamProofPackage")?;
+
+    let public: midnight_privacy::SpendPublic =
+        bincode::deserialize(&package.public_output)
+            .context("Failed to deserialize SpendPublic from package.public_output")?;
+
+    let fvk_commitment = public
+        .view_attestations
+        .as_ref()
+        .and_then(|atts| atts.first())
+        .map(|att| att.fvk_commitment)
+        .ok_or_else(|| anyhow::anyhow!("Cannot inject pool sig: no view_attestations in SpendPublic"))?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature: sig_bytes,
+    });
+
+    let raw = bincode::serialize(&package).context("Failed to re-serialize NightstreamProofPackage")?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw).context("Failed to write to deflate encoder")?;
+    encoder.finish().context("Failed to finish deflate compression")
 }
 
 /// Length of note plaintext for transfers: 32(domain) + 16(value) + 32(rho) + 32(recipient) + 32(sender_id)
@@ -398,7 +438,7 @@ fn main() -> Result<()> {
     // Check for FVK bundle (new: POOL_FVK_PK + FVK service) or authority FVK (deprecated)
     let fvk_bundle = note_spend_guest_v2::load_fvk_bundle();
     let authority_fvk = fvk_bundle.as_ref().map(|b| b.fvk).or_else(note_spend_guest_v2::load_authority_fvk);
-    let (viewer_atts, view_attestations_pub, view_ciphertexts) = if let Some(fvk) = authority_fvk {
+    let (viewer_atts, view_attestations_pub, view_ciphertexts, viewer_fvk_for_circuit) = if let Some(fvk) = authority_fvk {
         if fvk_bundle.is_some() {
             println!("POOL_FVK_PK configured: generating viewer attestations for 2 output(s) (with pool signature)");
         } else {
@@ -449,10 +489,11 @@ fn main() -> Result<()> {
             Some(vec![att1, att2]),
             Some(vec![va1, va2]),
             Some(vec![enc1, enc2]),
+            Some(fvk),
         )
     } else {
         println!("No FVK configured (set POOL_FVK_PK or AUTHORITY_FVK): transfer will not include viewer attestation");
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let mut public_output = public_output;
@@ -477,7 +518,10 @@ fn main() -> Result<()> {
     );
 
     // Build the full circuit witness.
-    use sov_nightstream_adapter::{NoteSpendInput, NoteSpendOutput, NoteSpendWitness};
+    use sov_nightstream_adapter::{
+        BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+        ViewerOutputWitness, ViewerWitness,
+    };
 
     let witness = NoteSpendWitness {
         domain,
@@ -513,6 +557,33 @@ fn main() -> Result<()> {
         ],
         inv_enforce,
         blacklist_root,
+        blacklist_proofs: vec![
+            BlacklistProof::from_opening(
+                &in_recipient,
+                deny_openings[0].bucket_entries,
+                deny_openings[0].siblings.clone(),
+            ),
+            BlacklistProof::from_opening(
+                &out1_recipient,
+                deny_openings[1].bucket_entries,
+                deny_openings[1].siblings.clone(),
+            ),
+        ],
+        viewers: if let (Some(ref atts), Some(fvk)) = (&viewer_atts, viewer_fvk_for_circuit) {
+            vec![ViewerWitness {
+                fvk_commitment: atts[0].fvk_commitment,
+                fvk,
+                per_output: atts
+                    .iter()
+                    .map(|a| ViewerOutputWitness {
+                        ct_hash: a.ct_hash,
+                        mac: a.mac,
+                    })
+                    .collect(),
+            }]
+        } else {
+            vec![]
+        },
     };
 
     let mut proof_bytes = if let Some(service_url) = prover_service_url {

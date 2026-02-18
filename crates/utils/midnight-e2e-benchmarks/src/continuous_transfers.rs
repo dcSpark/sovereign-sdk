@@ -5,7 +5,6 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
@@ -2005,7 +2004,7 @@ async fn perform_transfer_cycle(
     );
     let proof_generation_start = Instant::now();
 
-    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+    use sov_rollup_interface::zk::ZkvmHost;
 
     /// Result from proof generation task containing note secrets for wallet update.
     #[derive(Clone)]
@@ -2042,7 +2041,7 @@ async fn perform_transfer_cycle(
         let input_notes = plan.inputs.clone();
         let dest_spend_sk = wallets[dest_idx].spend_sk;
         let anchor = anchor_root;
-        let program_path = program_path.to_string();
+        let _program_path = program_path.to_string();
         let sem = semaphore.clone();
         let viewer_bundles = viewer_bundles.clone();
         let client = client.clone();
@@ -2132,14 +2131,16 @@ async fn perform_transfer_cycle(
                 pay_opening.siblings.len(),
                 bl_depth
             );
+            let sender_bl_recipient = sender_opening.recipient;
             let sender_bl_bucket_entries = sender_opening.bucket_entries;
             let sender_bl_siblings = sender_opening.siblings;
+            let pay_bl_recipient = pay_opening.recipient;
             let pay_bl_bucket_entries = pay_opening.bucket_entries;
             let pay_bl_siblings = pay_opening.siblings;
 
             tokio::task::spawn_blocking(
                 move || -> anyhow::Result<ProofResult> {
-                    let (viewer_fvk, _pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
+                    let (viewer_fvk, pool_sig_hex) = if let Some(ref bundles) = viewer_bundles {
                         let b = bundles.get(sender_idx).ok_or_else(|| {
                             anyhow!(
                                 "missing viewer bundle for wallet {sender_idx} (have {} bundles)",
@@ -2227,8 +2228,8 @@ async fn perform_transfer_cycle(
                     // Build viewer attestations if pool viewer is configured.
                     // The circuit expects: n_viewers=1, fvk_commitment, fvk, then ct_hash+mac for EACH output.
                     // So view_attestations should include attestations for ALL outputs (pay + change if applicable).
-                    let n_out: usize = if has_change { 2 } else { 1 };
-                    let (view_attestations, _viewer_data_list) = if let Some(fvk) = viewer_fvk {
+                    let _n_out: usize = if has_change { 2 } else { 1 };
+                    let (view_attestations, viewer_data_list) = if let Some(fvk) = viewer_fvk {
                         let mut cm_ins: [Hash32; crate::viewer::MAX_INS] =
                             [[0u8; 32]; crate::viewer::MAX_INS];
                         for (i, cm) in input_cms.iter().enumerate().take(crate::viewer::MAX_INS) {
@@ -2298,7 +2299,8 @@ async fn perform_transfer_cycle(
 
                 // Build the full circuit witness.
                 use sov_nightstream_adapter::{
-                    NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+                    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+                    ViewerOutputWitness, ViewerWitness,
                 };
 
                 let witness_inputs: Vec<NoteSpendInput> = (0..n_in)
@@ -2342,6 +2344,35 @@ async fn perform_transfer_cycle(
                     outputs: witness_outputs,
                     inv_enforce,
                     blacklist_root,
+                    blacklist_proofs: vec![
+                        BlacklistProof::from_opening(
+                            &sender_bl_recipient,
+                            sender_bl_bucket_entries,
+                            sender_bl_siblings,
+                        ),
+                        BlacklistProof::from_opening(
+                            &pay_bl_recipient,
+                            pay_bl_bucket_entries,
+                            pay_bl_siblings,
+                        ),
+                    ],
+                    viewers: if let Some(ref data_list) = viewer_data_list {
+                        let fvk = data_list[0].0;
+                        let fvk_commitment = data_list[0].1.fvk_commitment;
+                        vec![ViewerWitness {
+                            fvk_commitment,
+                            fvk,
+                            per_output: data_list
+                                .iter()
+                                .map(|(_fvk, att)| ViewerOutputWitness {
+                                    ct_hash: att.ct_hash,
+                                    mac: att.mac,
+                                })
+                                .collect(),
+                        }]
+                    } else {
+                        vec![]
+                    },
                 };
 
                 let public_bytes = bincode::serialize(&public)
@@ -2362,6 +2393,16 @@ async fn perform_transfer_cycle(
                     ns_host.run(true)
                         .context("Nightstream proving failed")?
                 };
+                let proof_data = if let Some(ref sig_hex) = pool_sig_hex {
+                    crate::pool_fvk::inject_pool_sig_hex_into_proof_bytes(
+                        proof_data,
+                        0,
+                        sig_hex.clone(),
+                    )?
+                } else {
+                    proof_data
+                };
+
                 Ok(ProofResult {
                     sender_idx,
                     dest_idx,

@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! anchor(4xu64), n_in(u32), nullifiers[](4xu64 each), withdraw_amount(u64),
-//! withdraw_to(4xu64), n_out(u32), output_cms[](4xu64 each), blacklist_root(4xu64)
+//! withdraw_to(4xu64), n_out(u32), output_cms[](4xu64 each), blacklist_root(4xu64),
+//! n_viewers(u32), [per-viewer per-output: cm(4xu64), fvk_commitment(4xu64), ct_hash(4xu64), mac(4xu64)]
 //! ```
 //!
 //! This module provides `parse_circuit_output` to decode this layout into `SpendPublic`.
@@ -74,6 +75,19 @@ fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+/// A single viewer attestation tuple parsed from the circuit output.
+#[derive(Debug, Clone)]
+pub struct CircuitViewAttestation {
+    /// Output commitment this attestation is bound to.
+    pub cm: [u8; 32],
+    /// FVK commitment.
+    pub fvk_commitment: [u8; 32],
+    /// Ciphertext hash.
+    pub ct_hash: [u8; 32],
+    /// MAC.
+    pub mac: [u8; 32],
+}
+
 /// Parsed circuit output before conversion to SpendPublic.
 ///
 /// This is the raw data extracted from the circuit's public output.
@@ -92,6 +106,8 @@ pub struct CircuitOutput {
     pub output_commitments: Vec<[u8; 32]>,
     /// Blacklist root.
     pub blacklist_root: [u8; 32],
+    /// Viewer attestations (empty when n_viewers == 0).
+    pub view_attestations: Vec<CircuitViewAttestation>,
 }
 
 /// Parse the raw circuit output bytes into a `CircuitOutput`.
@@ -100,7 +116,8 @@ pub struct CircuitOutput {
 /// ```text
 /// anchor(4xu64=32B), n_in(u32=4B), nullifiers[n_in](32B each),
 /// withdraw_amount(u64=8B), withdraw_to(32B),
-/// n_out(u32=4B), output_cms[n_out](32B each), blacklist_root(32B)
+/// n_out(u32=4B), output_cms[n_out](32B each), blacklist_root(32B),
+/// n_viewers(u32=4B), [per-viewer per-output: cm(32B), fvk_commitment(32B), ct_hash(32B), mac(32B)]
 /// ```
 pub fn parse_circuit_output(data: &[u8]) -> Result<CircuitOutput> {
     let mut offset = 0;
@@ -130,6 +147,26 @@ pub fn parse_circuit_output(data: &[u8]) -> Result<CircuitOutput> {
     let bl_root_digest = read_gldigest(data, &mut offset)?;
     let blacklist_root = gldigest_to_hash32(&bl_root_digest);
 
+    // Viewer attestations (may be absent if output was written by an older circuit)
+    let mut view_attestations = Vec::new();
+    if offset < data.len() {
+        let n_viewers = read_u32(data, &mut offset)?;
+        for _v in 0..n_viewers {
+            for _j in 0..n_out {
+                let cm = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+                let fvk_commitment = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+                let ct_hash = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+                let mac = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+                view_attestations.push(CircuitViewAttestation {
+                    cm,
+                    fvk_commitment,
+                    ct_hash,
+                    mac,
+                });
+            }
+        }
+    }
+
     Ok(CircuitOutput {
         anchor_root,
         nullifiers,
@@ -137,5 +174,6 @@ pub fn parse_circuit_output(data: &[u8]) -> Result<CircuitOutput> {
         withdraw_to,
         output_commitments,
         blacklist_root,
+        view_attestations,
     })
 }

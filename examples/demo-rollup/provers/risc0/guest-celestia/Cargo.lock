@@ -6061,6 +6061,7 @@ dependencies = [
  "flate2",
  "hex",
  "neo-ajtai",
+ "neo-ccs",
  "neo-fold",
  "neo-math",
  "neo-memory",

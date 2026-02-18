@@ -46,11 +46,12 @@ pub use guest::NightstreamGuest;
 mod host;
 #[cfg(feature = "native")]
 pub use host::{
-    NightstreamHost, NightstreamHostArgs, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+    default_blacklist_root, BlacklistProof, NightstreamHost, NightstreamHostArgs, NoteSpendInput,
+    NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness, ViewerWitness,
 };
 
 mod proof_package;
-pub use proof_package::NightstreamProofPackage;
+pub use proof_package::{NightstreamProofPackage, PoolViewerSig};
 
 /// Re-export the CCS cache type for direct use by callers.
 #[cfg(feature = "native")]

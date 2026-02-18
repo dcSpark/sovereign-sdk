@@ -165,7 +165,10 @@ fn test_note_spend_prove_verify_with_witness() {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
     use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
-    use sov_nightstream_adapter::{NoteSpendInput, NoteSpendOutput, NoteSpendWitness};
+    use sov_nightstream_adapter::{
+        BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+        default_blacklist_root,
+    };
     use std::time::Instant;
 
     type GlDigest = [Goldilocks; 4];
@@ -339,7 +342,7 @@ fn test_note_spend_prove_verify_with_witness() {
     let mut inv_enforce = [0u8; 32];
     inv_enforce[..8].copy_from_slice(&inv_enforce_gl.as_canonical_u64().to_le_bytes());
 
-    let blacklist_root = [0u8; 32];
+    let blacklist_root = default_blacklist_root();
 
     // --- Build the witness ---
     let witness = NoteSpendWitness {
@@ -367,6 +370,8 @@ fn test_note_spend_prove_verify_with_witness() {
         }],
         inv_enforce,
         blacklist_root,
+        blacklist_proofs: vec![BlacklistProof::default_for_identity(&sender_id), BlacklistProof::default_for_identity(&sender_id)],
+        viewers: vec![],
     };
 
     // Construct a minimal "SpendPublic" equivalent for public_output.
