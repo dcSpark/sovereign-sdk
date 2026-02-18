@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::warn;
 
 use crate::metrics::collector::{MetricCollector, MetricSpec};
@@ -42,6 +42,7 @@ impl MetricsManager {
             let collector = registered.collector.clone();
             tokio::spawn(async move {
                 let mut ticker = interval(spec.interval);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;

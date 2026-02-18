@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use sea_orm::sqlx::{self, Row};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement};
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 pub const INDEXER_TRANSFER_TOTALS_VIEW: &str = "mv_metrics_transfer_totals";
@@ -214,7 +214,7 @@ async fn setup_and_start_for_db(
     for spec in specs {
         ensure_view_schema(&db, *spec, db_label).await?;
         if is_view_stale(&db, *spec).await? {
-            refresh_materialized_view(&db, *spec, db_label)
+            refresh_materialized_view(&db, *spec, db_label, true)
                 .await
                 .with_context(|| {
                     format!(
@@ -369,12 +369,26 @@ async fn is_view_stale(db: &DatabaseConnection, spec: ViewSpec) -> Result<bool> 
 fn spawn_refresh_task(db: DatabaseConnection, spec: ViewSpec, db_label: &'static str) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(spec.refresh_interval_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await;
 
         loop {
             ticker.tick().await;
 
-            if let Err(error) = refresh_materialized_view(&db, spec, db_label).await {
+            match is_view_stale(&db, spec).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    warn!(
+                        view = spec.view_name,
+                        db = db_label,
+                        error = %error,
+                        "Failed to check MV staleness; forcing refresh"
+                    );
+                }
+            }
+
+            if let Err(error) = refresh_materialized_view(&db, spec, db_label, false).await {
                 warn!(
                     view = spec.view_name,
                     db = db_label,
@@ -390,6 +404,7 @@ async fn refresh_materialized_view(
     db: &DatabaseConnection,
     spec: ViewSpec,
     db_label: &str,
+    allow_blocking_fallback: bool,
 ) -> Result<()> {
     let mut refresh_conn = db
         .get_postgres_connection_pool()
@@ -412,7 +427,8 @@ async fn refresh_materialized_view(
         return Ok(());
     }
 
-    let refresh_result = try_refresh_materialized_view(&mut refresh_conn, spec).await;
+    let refresh_result =
+        try_refresh_materialized_view(&mut refresh_conn, spec, allow_blocking_fallback).await;
 
     if let Err(error) = release_advisory_lock(&mut refresh_conn, spec.advisory_lock_key).await {
         warn!(
@@ -436,6 +452,7 @@ async fn refresh_materialized_view(
 async fn try_refresh_materialized_view(
     refresh_conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     spec: ViewSpec,
+    allow_blocking_fallback: bool,
 ) -> Result<()> {
     let concurrent_sql = format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {}", spec.view_name);
 
@@ -445,11 +462,23 @@ async fn try_refresh_materialized_view(
     {
         Ok(_) => Ok(()),
         Err(error) => {
+            let fallback_allowed =
+                allow_blocking_fallback && should_use_blocking_refresh_fallback(&error);
+
             warn!(
                 view = spec.view_name,
                 error = %error,
-                "Concurrent MV refresh failed; retrying without CONCURRENTLY"
+                allow_blocking_fallback,
+                fallback_allowed,
+                "Concurrent MV refresh failed"
             );
+
+            if !fallback_allowed {
+                return Err(anyhow!(error).context(format!(
+                    "Failed to refresh materialized view {}",
+                    spec.view_name
+                )));
+            }
 
             let fallback_sql = format!("REFRESH MATERIALIZED VIEW {}", spec.view_name);
 
@@ -462,6 +491,17 @@ async fn try_refresh_materialized_view(
 
             Ok(())
         }
+    }
+}
+
+fn should_use_blocking_refresh_fallback(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db_error) => {
+            // Restrict blocking fallback to PostgreSQL prerequisite/unsupported states.
+            // This avoids turning transient concurrent-refresh failures into heavier locks.
+            matches!(db_error.code().as_deref(), Some("55000") | Some("0A000"))
+        }
+        _ => false,
     }
 }
 
