@@ -15,4 +15,4 @@ path = "src/main.rs"
 panic = "abort"
 
 [dependencies]
-nightstream-sdk = { path = "../../../../../../Nightstream/crates/nightstream-sdk", default-features = false }
+nightstream-sdk = { git = "https://github.com/dcSpark/Nightstream", rev = "cca6616a2702091e67e271aca2b8dc21bb4b798b", default-features = false }

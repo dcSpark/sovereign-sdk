@@ -3280,6 +3280,7 @@ version = "0.3.0"
 [[package]]
 name = "neo-ajtai"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "neo-ccs",
  "neo-math",
@@ -3299,6 +3300,7 @@ dependencies = [
 [[package]]
 name = "neo-ccs"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "neo-math",
  "neo-params",
@@ -3319,6 +3321,7 @@ dependencies = [
 [[package]]
 name = "neo-fold"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
@@ -3344,6 +3347,7 @@ dependencies = [
 [[package]]
 name = "neo-math"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "p3-field",
  "p3-goldilocks",
@@ -3357,6 +3361,7 @@ dependencies = [
 [[package]]
 name = "neo-memory"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "neo-ajtai",
  "neo-ccs",
@@ -3375,6 +3380,7 @@ dependencies = [
 [[package]]
 name = "neo-params"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3383,6 +3389,7 @@ dependencies = [
 [[package]]
 name = "neo-reductions"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "bincode",
  "blake3",
@@ -3407,6 +3414,7 @@ dependencies = [
 [[package]]
 name = "neo-transcript"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "neo-ccs",
  "neo-math",
@@ -3422,6 +3430,7 @@ dependencies = [
 [[package]]
 name = "neo-vm-trace"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
  "serde",
  "thiserror 2.0.18",

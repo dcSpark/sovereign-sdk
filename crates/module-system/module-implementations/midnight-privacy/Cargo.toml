@@ -42,7 +42,7 @@ bincode = { workspace = true }
 hex = { workspace = true }
 bech32 = { workspace = true }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-neo-ccs = { path = "../../../../../Nightstream/crates/neo-ccs" }
+neo-ccs = { git = "https://github.com/dcSpark/Nightstream", rev = "cca6616a2702091e67e271aca2b8dc21bb4b798b" }
 p3-goldilocks = "0.4.1"
 p3-field = "0.4.1"
 sov-bank = { workspace = true }
