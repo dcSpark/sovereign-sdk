@@ -14,7 +14,21 @@ type S = sov_modules_api::configurable_spec::ConfigurableSpec<
 >;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SKIP_GUEST_BUILD");
     println!("cargo:rerun-if-changed=../../../../crates/module-system/sov-modules-api");
+
+    let mut out_file = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).to_path_buf();
+    out_file.push("codegen.rs");
+
+    if matches!(
+        std::env::var("SKIP_GUEST_BUILD").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        println!("cargo:warning=Skipping demo-stf-json-client codegen");
+        std::fs::write(out_file, "// codegen skipped\n").unwrap();
+        return;
+    }
+
     let runtime = Runtime::<S>::default();
 
     let spec = runtime.openapi_spec().unwrap();
@@ -26,9 +40,6 @@ fn main() {
     let tokens = generator.generate_tokens(&spec).unwrap();
     let ast = syn::parse2(tokens).unwrap();
     let content = prettyplease::unparse(&ast);
-
-    let mut out_file = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).to_path_buf();
-    out_file.push("codegen.rs");
 
     std::fs::write(out_file, content).unwrap();
 }

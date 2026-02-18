@@ -1,11 +1,11 @@
 //! Proof package for Nightstream proofs.
 //!
-//! Defines `NightstreamProofPackage` and `Rv32B1RunConfig` locally so the
+//! Defines `NightstreamProofPackage` and `Rv32TraceWiringRunConfig` locally so the
 //! sovereign-ligero adapter is self-contained -- no `sovereign_bridge` module
 //! in the Nightstream crate is needed.
 
 use neo_ajtai::Commitment as Cmt;
-use neo_fold::riscv_shard::{Rv32B1, Rv32B1CcsCache};
+use neo_fold::riscv_trace_shard::Rv32TraceWiring;
 use neo_fold::shard::ShardProof;
 use neo_fold::PiCcsError;
 use neo_math::{F, K};
@@ -13,21 +13,24 @@ use neo_memory::witness::StepInstanceBundle;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Configuration needed to reconstruct verification context from ROM bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Rv32B1RunConfig {
+pub struct Rv32TraceWiringRunConfig {
     /// Program base address (must be 0 for current Nightstream).
     pub program_base: u64,
     /// Word size (must be 32).
     pub xlen: usize,
-    /// RAM size in bytes.
-    pub ram_bytes: usize,
-    /// Instructions per folding chunk.
-    pub chunk_size: usize,
+    /// Rows per trace step (chunk rows) as used during proving.
+    pub step_rows: usize,
+    /// RAM address width (bits) as determined during proving.
+    pub ram_d: usize,
+    /// Width-lookup address bits (0 when absent).
+    pub width_lookup_addr_d: usize,
     /// Initial RAM values: address -> value.
     pub ram_init: HashMap<u64, u64>,
+    /// Initial register values: register index -> value.
+    pub reg_init: HashMap<u64, u64>,
     /// Output claims: (address, expected_value_as_u64).
     pub output_claims: Vec<(u64, u64)>,
 }
@@ -65,7 +68,7 @@ pub struct NightstreamProofPackage {
     /// Public step instance bundles produced during proving.
     ///
     /// These carry per-step MCS commitments + public inputs, plus memory and
-    /// lookup instances.  They are produced by `Rv32B1Run::steps_public()`
+    /// lookup instances.  They are produced by `Rv32TraceWiringRun::steps_public()`
     /// after a successful `prove()`.
     pub steps_public: Vec<StepInstanceBundle<Cmt, F, K>>,
 
@@ -77,7 +80,7 @@ pub struct NightstreamProofPackage {
     pub rom_bytes: Vec<u8>,
 
     /// Run configuration needed to reconstruct verification context.
-    pub config: Rv32B1RunConfig,
+    pub config: Rv32TraceWiringRunConfig,
 
     /// Optional pool-operator signature over the viewer FVK commitment.
     ///
@@ -103,60 +106,35 @@ impl NightstreamProofPackage {
 
     /// Verify this proof package (verify-only, no re-execution).
     ///
-    /// Reconstructs the RV32 B1 verification context (CCS + session) from the
-    /// ROM and config, then verifies the embedded `ShardProof` against the
-    /// provided `steps_public` instances.
+    /// Reconstructs the RV32 trace-wiring verification context (CCS + session)
+    /// from the ROM and config, then verifies the embedded `ShardProof` against
+    /// the provided `steps_public` instances.
     ///
     /// **No RISC-V execution or re-proving is performed.**  The cost is circuit
     /// synthesis (~ms) plus the IOP verification check.
     pub fn verify(&self) -> Result<bool, PiCcsError> {
-        self.verify_inner(None)
-    }
-
-    /// Verify using a pre-built CCS cache (skips expensive CCS synthesis).
-    ///
-    /// The cache must have been built from a builder with the same ROM,
-    /// `ram_bytes`, and `chunk_size` as this package's config.
-    ///
-    /// Build one via [`crate::NightstreamHost::build_ccs_cache`], then share
-    /// across all verification calls.
-    pub fn verify_with_cache(&self, cache: &Arc<Rv32B1CcsCache>) -> Result<bool, PiCcsError> {
-        self.verify_inner(Some(cache))
-    }
-
-    fn verify_inner(&self, cache: Option<&Arc<Rv32B1CcsCache>>) -> Result<bool, PiCcsError> {
-        let mut builder = Rv32B1::from_rom(self.config.program_base, &self.rom_bytes)
+        let mut builder = Rv32TraceWiring::from_rom(self.config.program_base, &self.rom_bytes)
             .xlen(self.config.xlen)
-            .ram_bytes(self.config.ram_bytes)
-            .chunk_size(self.config.chunk_size)
             .shout_auto_minimal();
-
-        if let Some(c) = cache {
-            builder = builder.with_ccs_cache((*c).clone());
-        }
 
         for (&addr, &value) in &self.config.ram_init {
             builder = builder.ram_init_u32(addr, value as u32);
+        }
+
+        for (&reg, &value) in &self.config.reg_init {
+            builder = builder.reg_init_u32(reg, value as u32);
         }
 
         for &(addr, value) in &self.config.output_claims {
             builder = builder.output_claim(addr, F::from_u64(value));
         }
 
-        // Build verify-only context (CCS + session, no execution).
-        let mut verifier = builder.build_verifier()?;
+        let verifier = builder.build_verifier(
+            self.config.step_rows,
+            self.config.ram_d,
+            self.config.width_lookup_addr_d,
+        )?;
 
-        // Preload the verifier SparseCache AFTER build so the pointer-keyed
-        // cache uses the final CCS address (inside the Rv32B1Verifier struct).
-        if let Some(c) = cache {
-            if let Some(digest) = &c.ccs_mat_digest {
-                verifier.preload_sparse_cache_with_digest(c.sparse.clone(), digest.clone())?;
-            } else {
-                verifier.preload_sparse_cache(c.sparse.clone())?;
-            }
-        }
-
-        // Verify the ShardProof against the prover-supplied step instances.
         verifier.verify(&self.proof, &self.steps_public)
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! The host loads a RISC-V ROM (extracted from a compiled `nightstream-sdk` guest),
 //! accepts inputs via RAM initialization, and produces proofs using Nightstream's
-//! `Rv32B1` builder.
+//! `Rv32TraceWiring` builder (time-in-rows trace CCS).
 //!
 //! For the note-spend circuit, use [`NightstreamHost::write_note_spend_witness`]
 //! which writes structured cryptographic inputs in the exact binary layout the
@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
-use neo_fold::riscv_shard::{Rv32B1, Rv32B1CcsCache};
+use neo_fold::riscv_trace_shard::{Rv32TraceWiring, Rv32TraceWiringRun};
 use neo_math::F;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,8 @@ use sha2::Digest;
 use sov_rollup_interface::zk::ZkvmHost;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 
-use crate::proof_package::{NightstreamProofPackage, Rv32B1RunConfig};
+use crate::proof_package::{NightstreamProofPackage, Rv32TraceWiringRunConfig};
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
 /// Default input address for the Nightstream guest ABI.
@@ -33,13 +32,8 @@ const INPUT_ADDR: u64 = 0x104;
 #[allow(dead_code)]
 const OUTPUT_ADDR: u64 = 0x100;
 
-/// Default RAM size in bytes (64KB).
-///
-/// Sized to accommodate the full note-spend witness including Merkle siblings.
-const DEFAULT_RAM_BYTES: usize = 0x10000;
-
-/// Default chunk size (instructions per folding step).
-const DEFAULT_CHUNK_SIZE: usize = 768;
+/// Default chunk rows (rows per trace-wiring folding step).
+const DEFAULT_CHUNK_ROWS: usize = 1 << 16;
 
 // ============================================================================
 // Note-Spend Witness Types
@@ -287,8 +281,8 @@ pub struct NoteSpendWitness {
 
 /// Host for Nightstream zkVM (Sovereign adapter).
 ///
-/// Wraps the Nightstream `Rv32B1` builder, translating between the Sovereign SDK
-/// `ZkvmHost` interface and Nightstream's RISC-V proving pipeline.
+/// Wraps the Nightstream `Rv32TraceWiring` builder, translating between the
+/// Sovereign SDK `ZkvmHost` interface and Nightstream's RISC-V proving pipeline.
 #[derive(Clone, Debug)]
 pub struct NightstreamHost {
     /// ROM bytes from the `.neo_start` ELF section.
@@ -299,10 +293,8 @@ pub struct NightstreamHost {
     ram_init: HashMap<u64, u64>,
     /// Current write offset for `add_hint` (tracks next free RAM address for inputs).
     input_offset: u64,
-    /// RAM size in bytes.
-    ram_bytes: usize,
-    /// Chunk size for folding.
-    chunk_size: usize,
+    /// Chunk rows (rows per trace-wiring folding step).
+    chunk_rows: usize,
     /// Output claims: (address, expected_value).
     output_claims: Vec<(u64, u64)>,
     /// Pre-built public output bytes (bincode-serialized SpendPublic).
@@ -311,12 +303,6 @@ pub struct NightstreamHost {
     /// return the correct `public_output` without needing the `SpendPublic` type.
     /// The output claims enforce that the circuit actually wrote these values.
     stored_public_output: Option<Vec<u8>>,
-    /// Cached CCS preprocessing (SparseCache + matrix digest).
-    ///
-    /// When set, [`build_runner`] injects this cache into the `Rv32B1` builder
-    /// to skip the expensive CCS synthesis and SparseCache build on repeated
-    /// prove/verify calls with the same ROM.
-    ccs_cache: Option<Arc<Rv32B1CcsCache>>,
 }
 
 impl NightstreamHost {
@@ -327,52 +313,16 @@ impl NightstreamHost {
             program_base,
             ram_init: HashMap::new(),
             input_offset: INPUT_ADDR,
-            ram_bytes: DEFAULT_RAM_BYTES,
-            chunk_size: DEFAULT_CHUNK_SIZE,
+            chunk_rows: DEFAULT_CHUNK_ROWS,
             output_claims: Vec::new(),
             stored_public_output: None,
-            ccs_cache: None,
         }
     }
 
-    /// Set the RAM size in bytes.
-    pub fn with_ram_bytes(mut self, ram_bytes: usize) -> Self {
-        self.ram_bytes = ram_bytes;
+    /// Set the chunk rows (rows per trace-wiring folding step).
+    pub fn with_chunk_rows(mut self, chunk_rows: usize) -> Self {
+        self.chunk_rows = chunk_rows;
         self
-    }
-
-    /// Set the chunk size (instructions per folding step).
-    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.chunk_size = chunk_size;
-        self
-    }
-
-    /// Attach a pre-built CCS cache for faster proving/verification.
-    ///
-    /// Build once via [`NightstreamHost::build_ccs_cache`], then share via `Arc`.
-    pub fn set_ccs_cache(&mut self, cache: Arc<Rv32B1CcsCache>) {
-        self.ccs_cache = Some(cache);
-    }
-
-    /// Build the CCS preprocessing cache from the current ROM + config.
-    ///
-    /// The returned cache can be shared (`Arc`) across multiple `NightstreamHost`
-    /// instances that use the same ROM, `ram_bytes`, and `chunk_size`.
-    ///
-    /// This performs the expensive CCS structure synthesis and SparseCache build
-    /// once, so that subsequent calls to [`run`] and
-    /// [`NightstreamProofPackage::verify_with_cache`] skip that work.
-    pub fn build_ccs_cache(&self) -> Result<Arc<Rv32B1CcsCache>> {
-        let builder = Rv32B1::from_rom(self.program_base, &self.rom_bytes)
-            .xlen(32)
-            .ram_bytes(self.ram_bytes)
-            .chunk_size(self.chunk_size)
-            .shout_auto_minimal();
-
-        let cache = builder
-            .build_ccs_cache()
-            .map_err(|e| anyhow::anyhow!("Failed to build CCS cache: {:?}", e))?;
-        Ok(Arc::new(cache))
     }
 
     /// Add a u32 input value at the next available input address.
@@ -532,17 +482,12 @@ impl NightstreamHost {
         hasher.finalize().into()
     }
 
-    /// Build the `Rv32B1` runner from the current configuration.
-    fn build_runner(&self) -> Rv32B1 {
-        let mut builder = Rv32B1::from_rom(self.program_base, &self.rom_bytes)
+    /// Build the `Rv32TraceWiring` runner from the current configuration.
+    fn build_runner(&self) -> Rv32TraceWiring {
+        let mut builder = Rv32TraceWiring::from_rom(self.program_base, &self.rom_bytes)
             .xlen(32)
-            .ram_bytes(self.ram_bytes)
-            .chunk_size(self.chunk_size)
+            .chunk_rows(self.chunk_rows)
             .shout_auto_minimal();
-
-        if let Some(ref cache) = self.ccs_cache {
-            builder = builder.with_ccs_cache(cache.clone());
-        }
 
         for (&addr, &value) in &self.ram_init {
             builder = builder.ram_init_u32(addr, value as u32);
@@ -556,13 +501,18 @@ impl NightstreamHost {
     }
 
     /// Build the run configuration for proof packaging.
-    fn build_config(&self) -> Rv32B1RunConfig {
-        Rv32B1RunConfig {
+    ///
+    /// Requires the completed run to extract execution-dependent sizing values
+    /// (`step_rows`, `ram_d`, `width_lookup_addr_d`).
+    fn build_config(&self, run: &Rv32TraceWiringRun) -> Rv32TraceWiringRunConfig {
+        Rv32TraceWiringRunConfig {
             program_base: self.program_base,
             xlen: 32,
-            ram_bytes: self.ram_bytes,
-            chunk_size: self.chunk_size,
+            step_rows: run.step_rows(),
+            ram_d: run.ram_d(),
+            width_lookup_addr_d: run.width_lookup_addr_d(),
             ram_init: self.ram_init.clone(),
+            reg_init: HashMap::new(),
             output_claims: self.output_claims.clone(),
         }
     }
@@ -623,8 +573,8 @@ impl ZkvmHost for NightstreamHost {
     fn run(&mut self, with_proof: bool) -> Result<Vec<u8>> {
         if with_proof {
             tracing::info!(
-                "Nightstream: Generating proof with Rv32B1 folding (chunk_size={})",
-                self.chunk_size,
+                "Nightstream: Generating proof with Rv32TraceWiring (chunk_rows={})",
+                self.chunk_rows,
             );
 
             let prove_start = std::time::Instant::now();
@@ -634,44 +584,30 @@ impl ZkvmHost for NightstreamHost {
                 .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
             let prove_ms = prove_start.elapsed().as_millis();
 
-            // Log RISC-V instruction count and CCS dimensions for profiling.
-            match run.riscv_trace_len() {
-                Ok(trace_len) => tracing::info!(
-                    "Nightstream: {} RISC-V instructions executed (chunk_size={}, folding_steps={})",
-                    trace_len,
-                    self.chunk_size,
-                    run.fold_count(),
-                ),
-                Err(e) => tracing::warn!("Nightstream: could not get trace len: {:?}", e),
-            }
+            tracing::info!(
+                "Nightstream: {} RISC-V instructions executed (chunk_rows={}, folding_steps={})",
+                run.trace_len(),
+                run.step_rows(),
+                run.fold_count(),
+            );
             tracing::info!(
                 "Nightstream CCS: {} constraints x {} variables",
                 run.ccs_num_constraints(),
                 run.ccs_num_variables(),
             );
 
-            // Log per-phase timing breakdown from Nightstream engine.
-            let timings = run.prove_timings();
+            let timings = run.prove_phase_durations();
             tracing::info!(
                 "Nightstream prove breakdown: \
-                 decode={}ms, ccs_build={}ms, vm_exec={}ms (trace={}ms, witness={}ms), fold_prove={}ms, total_engine={}ms",
-                timings.decode_and_setup.as_millis(),
-                timings.ccs_and_shared_bus.as_millis(),
-                timings.vm_execution.as_millis(),
-                timings.vm_trace.as_millis(),
-                timings.cpu_witness.as_millis(),
+                 setup={}ms, chunk_build_commit={}ms, fold_prove={}ms, total={}ms",
+                timings.setup.as_millis(),
+                timings.chunk_build_commit.as_millis(),
                 timings.fold_and_prove.as_millis(),
-                (timings.decode_and_setup
-                    + timings.ccs_and_shared_bus
-                    + timings.vm_execution
-                    + timings.fold_and_prove)
-                    .as_millis(),
+                run.prove_duration().as_millis(),
             );
 
             let output_value = self.extract_output_from_run(&run)?;
 
-            // Extract the proof and public step instances for the package.
-            // These are what the verifier needs -- no re-execution required.
             let proof = run.proof().clone();
             let steps_public = run.steps_public();
 
@@ -687,11 +623,10 @@ impl ZkvmHost for NightstreamHost {
                 steps_public,
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
-                config: self.build_config(),
+                config: self.build_config(&run),
                 pool_viewer_sig: None,
             };
 
-            // Log per-field size breakdown for diagnostics
             if let (Ok(sz_proof), Ok(sz_steps), Ok(sz_rom), Ok(sz_config), Ok(sz_output)) = (
                 bincode::serialized_size(&package.proof),
                 bincode::serialized_size(&package.steps_public),
@@ -734,8 +669,6 @@ impl ZkvmHost for NightstreamHost {
                 }
             };
 
-            // For simulation mode, run the prover to get a valid package structure.
-            // In the future, this could use a lighter-weight execution path.
             let builder = self.build_runner();
             let run = builder
                 .prove()
@@ -748,7 +681,7 @@ impl ZkvmHost for NightstreamHost {
                 steps_public,
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
-                config: self.build_config(),
+                config: self.build_config(&run),
                 pool_viewer_sig: None,
             };
 
@@ -779,7 +712,7 @@ impl NightstreamHost {
     /// Otherwise, falls back to reconstructing raw bytes from output claims.
     fn extract_output_from_run(
         &self,
-        _run: &neo_fold::riscv_shard::Rv32B1Run,
+        _run: &Rv32TraceWiringRun,
     ) -> Result<Vec<u8>> {
         if let Some(ref stored) = self.stored_public_output {
             return Ok(stored.clone());

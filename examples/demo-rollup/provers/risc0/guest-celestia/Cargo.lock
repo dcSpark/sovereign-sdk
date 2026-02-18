@@ -3154,7 +3154,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
- "neo-ccs",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b)",
  "once_cell",
  "p3-field",
  "p3-goldilocks",
@@ -3280,11 +3280,11 @@ version = "0.3.0"
 [[package]]
 name = "neo-ajtai"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
- "neo-ccs",
- "neo-math",
- "neo-params",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "p3-field",
  "p3-goldilocks",
  "p3-matrix",
@@ -3300,10 +3300,31 @@ dependencies = [
 [[package]]
 name = "neo-ccs"
 version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
+dependencies = [
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "once_cell",
+ "p3-field",
+ "p3-goldilocks",
+ "p3-matrix",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rayon",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "neo-ccs"
+version = "0.1.0"
 source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
 dependencies = [
- "neo-math",
- "neo-params",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b)",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b)",
  "once_cell",
  "p3-field",
  "p3-goldilocks",
@@ -3321,15 +3342,15 @@ dependencies = [
 [[package]]
 name = "neo-fold"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "neo-ajtai",
- "neo-ccs",
- "neo-math",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-memory",
- "neo-params",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-reductions",
  "neo-transcript",
  "neo-vm-trace",
@@ -3342,6 +3363,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "neo-math"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
+dependencies = [
+ "p3-field",
+ "p3-goldilocks",
+ "p3-matrix",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "subtle",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3361,18 +3396,27 @@ dependencies = [
 [[package]]
 name = "neo-memory"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
  "neo-ajtai",
- "neo-ccs",
- "neo-math",
- "neo-params",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-reductions",
  "neo-transcript",
  "neo-vm-trace",
  "p3-field",
  "p3-goldilocks",
  "p3-matrix",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "neo-params"
+version = "0.1.0"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
+dependencies = [
  "serde",
  "thiserror 2.0.18",
 ]
@@ -3389,14 +3433,14 @@ dependencies = [
 [[package]]
 name = "neo-reductions"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
  "bincode",
  "blake3",
  "neo-ajtai",
- "neo-ccs",
- "neo-math",
- "neo-params",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-params 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-transcript",
  "p3-challenger",
  "p3-field",
@@ -3414,10 +3458,10 @@ dependencies = [
 [[package]]
 name = "neo-transcript"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
- "neo-ccs",
- "neo-math",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "once_cell",
  "p3-field",
  "p3-goldilocks",
@@ -3430,7 +3474,7 @@ dependencies = [
 [[package]]
 name = "neo-vm-trace"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476#c7d9b3128c8d6fd627727e01bed2a12a44318476"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6070,9 +6114,9 @@ dependencies = [
  "flate2",
  "hex",
  "neo-ajtai",
- "neo-ccs",
+ "neo-ccs 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-fold",
- "neo-math",
+ "neo-math 0.1.0 (git+https://github.com/dcSpark/Nightstream?rev=c7d9b3128c8d6fd627727e01bed2a12a44318476)",
  "neo-memory",
  "p3-field",
  "p3-goldilocks",

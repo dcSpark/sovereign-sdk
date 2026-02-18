@@ -442,26 +442,16 @@ fn test_note_spend_prove_verify_with_witness() {
     println!("=============================================\n");
 }
 
-/// Test CCS caching: build the cache once, then prove + verify twice,
-/// confirming that the second run skips CCS synthesis.
+/// Test prove+verify cycle twice with different inputs using trace wiring.
 ///
 /// Uses the value-validator circuit for speed.
 #[test]
-fn test_ccs_caching_prove_and_verify() {
+fn test_prove_and_verify_trace_wiring() {
     let rom_bytes = &value_validator_rom::VALUE_VALIDATOR_ROM;
     let program_base = value_validator_rom::VALUE_VALIDATOR_ROM_BASE;
 
-    // 1. Build the CCS cache from a template host (one-time cost).
-    let t_cache = Instant::now();
-    let template = NightstreamHost::new(rom_bytes, program_base);
-    let cache = template
-        .build_ccs_cache()
-        .expect("CCS cache build should succeed");
-    let cache_ms = t_cache.elapsed().as_millis();
-
-    // --- First prove+verify (with cache) ---
+    // --- First prove+verify ---
     let mut host1 = NightstreamHost::new(rom_bytes, program_base);
-    host1.set_ccs_cache(cache.clone());
     host1.add_u32_input(42);
     host1.add_u32_input(42);
     host1.add_output_claim(0x100, 42);
@@ -473,15 +463,12 @@ fn test_ccs_caching_prove_and_verify() {
     let package1 = decompress_package(&compressed1);
 
     let t1_verify = Instant::now();
-    let ok1 = package1
-        .verify_with_cache(&cache)
-        .expect("first cached verify should not error");
-    assert!(ok1, "first cached verification should pass");
+    let ok1 = package1.verify().expect("first verify should not error");
+    assert!(ok1, "first verification should pass");
     let verify1_ms = t1_verify.elapsed().as_millis();
 
-    // --- Second prove+verify (with same cache, different input) ---
+    // --- Second prove+verify (different input) ---
     let mut host2 = NightstreamHost::new(rom_bytes, program_base);
-    host2.set_ccs_cache(cache.clone());
     host2.add_u32_input(99);
     host2.add_u32_input(99);
     host2.add_output_claim(0x100, 99);
@@ -493,24 +480,17 @@ fn test_ccs_caching_prove_and_verify() {
     let package2 = decompress_package(&compressed2);
 
     let t2_verify = Instant::now();
-    let ok2 = package2
-        .verify_with_cache(&cache)
-        .expect("second cached verify should not error");
-    assert!(ok2, "second cached verification should pass");
+    let ok2 = package2.verify().expect("second verify should not error");
+    assert!(ok2, "second verification should pass");
     let verify2_ms = t2_verify.elapsed().as_millis();
 
-    // Also verify without cache to confirm they still work.
-    let ok2_uncached = package2.verify().expect("uncached verify should not error");
-    assert!(ok2_uncached, "uncached verification should pass");
-
     println!("\n=============================================");
-    println!("  CCS Caching Test (value-validator)");
+    println!("  Trace Wiring Test (value-validator)");
     println!("=============================================");
-    println!("  Cache build:       {} ms", cache_ms);
-    println!("  1st prove (cache): {} ms", prove1_ms);
-    println!("  1st verify (cache):{} ms", verify1_ms);
-    println!("  2nd prove (cache): {} ms", prove2_ms);
-    println!("  2nd verify (cache):{} ms", verify2_ms);
+    println!("  1st prove:  {} ms", prove1_ms);
+    println!("  1st verify: {} ms", verify1_ms);
+    println!("  2nd prove:  {} ms", prove2_ms);
+    println!("  2nd verify: {} ms", verify2_ms);
     println!("=============================================\n");
 }
 

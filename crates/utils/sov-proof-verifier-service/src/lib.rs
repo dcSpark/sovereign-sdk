@@ -51,7 +51,6 @@ use sov_midnight_da::storable::{
 };
 use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
-use sov_nightstream_adapter::Rv32B1CcsCache;
 
 /// The rollup's Spec type (must match rollup-nightstream configuration)
 pub type RollupSpec = ConfigurableSpec<MidnightDaSpec, sov_nightstream_adapter::Nightstream, MockZkvm, MultiAddressEvm, Native>;
@@ -103,9 +102,6 @@ pub struct AppState {
     incoming_worker_tx_saver: IncomingWorkerTxSaver,
     /// Optional pool public key used to authenticate signed viewer commitments (FVK commitments).
     pool_fvk_pk: Option<Ed25519VerifyingKey>,
-    /// Cached CCS preprocessing for Nightstream proving/verification.
-    /// Built once at startup, shared across all prove/verify requests.
-    ccs_cache: Arc<Rv32B1CcsCache>,
 }
 
 #[derive(Deserialize)]
@@ -388,22 +384,6 @@ impl AppState {
              NOTE: The sequencer must be configured to use the SAME database for worker_verified_transactions lookups."
         );
 
-        // Build the CCS preprocessing cache once at startup (expensive, ~1-3s).
-        // Subsequent prove/verify calls reuse this cache, saving ~1-2s per call.
-        info!("Building CCS preprocessing cache for Nightstream...");
-        let ccs_cache = {
-            use sov_nightstream_adapter::circuits::note_spend_rom;
-            use sov_nightstream_adapter::NightstreamHost;
-
-            let host = NightstreamHost::new(
-                &note_spend_rom::NOTE_SPEND_ROM,
-                note_spend_rom::NOTE_SPEND_ROM_BASE,
-            );
-            host.build_ccs_cache()
-                .context("Failed to build CCS preprocessing cache at startup")?
-        };
-        info!("CCS preprocessing cache built successfully");
-
         Ok(Self {
             config: Arc::new(config),
             node_client,
@@ -415,7 +395,6 @@ impl AppState {
             da_conn: Arc::new(da_conn),
             incoming_worker_tx_saver,
             pool_fvk_pk,
-            ccs_cache,
         })
     }
 }
@@ -788,7 +767,6 @@ async fn prove_handler(
         }
     };
 
-    let ccs_cache = state.ccs_cache.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServiceError> {
         use sov_nightstream_adapter::circuits::note_spend_rom;
         use sov_nightstream_adapter::NightstreamHost;
@@ -797,7 +775,6 @@ async fn prove_handler(
             &note_spend_rom::NOTE_SPEND_ROM,
             note_spend_rom::NOTE_SPEND_ROM_BASE,
         );
-        host.set_ccs_cache(ccs_cache);
         host.write_note_spend_witness(&witness, public_output_bytes);
 
         host.run(true)
@@ -881,7 +858,6 @@ async fn verify_handler(
         }
     };
 
-    let ccs_cache = state.ccs_cache.clone();
     let result = tokio::task::spawn_blocking(move || {
         use flate2::read::DeflateDecoder;
         use sov_nightstream_adapter::{
@@ -896,7 +872,6 @@ async fn verify_handler(
         let commitment = NightstreamCodeCommitment::decode(&method_id_bytes)
             .map_err(|e| ServiceError::Internal(format!("Invalid method_id: {}", e)))?;
 
-        // Decompress + deserialize
         let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
         let mut decompressed = Vec::new();
         decoder
@@ -905,12 +880,10 @@ async fn verify_handler(
         let package: NightstreamProofPackage = bincode::deserialize(&decompressed)
             .map_err(|e| ServiceError::Internal(format!("Failed to deserialize: {e}")))?;
 
-        // Verify code commitment
         NightstreamVerifier::ensure_code_commitment(&package.rom_bytes, &commitment.0)
             .map_err(|e| ServiceError::ProofError(format!("Code commitment mismatch: {e}")))?;
 
-        // Verify proof with cached SparseCache
-        NightstreamVerifier::verify_proof_package_with_cache(&package, &ccs_cache)
+        NightstreamVerifier::verify_proof_package(&package)
             .map_err(|e| ServiceError::ProofError(format!("Verification failed: {e}")))?;
 
         // Deserialize public output

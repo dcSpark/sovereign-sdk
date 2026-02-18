@@ -53,10 +53,6 @@ pub use host::{
 mod proof_package;
 pub use proof_package::{NightstreamProofPackage, PoolViewerSig};
 
-/// Re-export the CCS cache type for direct use by callers.
-#[cfg(feature = "native")]
-pub use neo_fold::riscv_shard::Rv32B1CcsCache;
-
 /// The cryptographic primitives used by Nightstream (reuses mock-zkvm crypto).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy, schemars::JsonSchema)]
 pub struct NightstreamCryptoSpec;
@@ -312,12 +308,11 @@ impl NightstreamVerifier {
         native::ensure_code_commitment(rom_bytes, expected)
     }
 
-    /// Verify a proof package with a pre-built CCS cache.
-    pub fn verify_proof_package_with_cache(
+    /// Verify a proof package (verify-only, no re-execution).
+    pub fn verify_proof_package(
         package: &NightstreamProofPackage,
-        cache: &std::sync::Arc<Rv32B1CcsCache>,
     ) -> Result<(), anyhow::Error> {
-        native::verify_proof_package_with_cache(package, cache)
+        native::verify_proof_package(package)
     }
 }
 
@@ -353,31 +348,11 @@ mod native {
     ///
     /// This delegates to `NightstreamProofPackage::verify()` which:
     /// 1. Reconstructs the CCS structure from the ROM + config (circuit synthesis only, ~ms).
-    /// 2. Verifies the `ShardProof` against the provided `mcss_public` instances.
+    /// 2. Verifies the `ShardProof` against the provided `steps_public` instances.
     ///
     /// **No RISC-V execution or re-proving is performed.**
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
-        verify_proof_package_inner(package, None)
-    }
-
-    /// Like [`verify_proof_package`] but uses a pre-built CCS cache for faster verification.
-    pub fn verify_proof_package_with_cache(
-        package: &NightstreamProofPackage,
-        cache: &std::sync::Arc<Rv32B1CcsCache>,
-    ) -> Result<(), anyhow::Error> {
-        verify_proof_package_inner(package, Some(cache))
-    }
-
-    fn verify_proof_package_inner(
-        package: &NightstreamProofPackage,
-        cache: Option<&std::sync::Arc<Rv32B1CcsCache>>,
-    ) -> Result<(), anyhow::Error> {
-        let ok = if let Some(c) = cache {
-            package.verify_with_cache(c)
-        } else {
-            package.verify()
-        }
-        .map_err(|e| {
+        let ok = package.verify().map_err(|e| {
             anyhow::anyhow!("Nightstream proof verification failed: {:?}", e)
         })?;
 

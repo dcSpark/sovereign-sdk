@@ -172,6 +172,26 @@ if [ "$KEEP_STATE" -eq 0 ]; then
   print_step "Cleaning previous rollup state"
   rm -rf "$DATA_DIR" "$DA_SQLITE" "${DA_SQLITE}-wal" "${DA_SQLITE}-shm"
   print_ok "Cleaned demo_data/ and da.sqlite"
+
+  if command -v psql >/dev/null 2>&1; then
+    PG_BASE_URL=$(grep -m1 'connection_string' "$ROLLUP_CONFIG_TEMPLATE" \
+      | sed 's/.*"\(.*\)"/\1/' | sed 's|/[^/]*$||')
+    PG_DATABASES=("da" "indexer" "fvk" "mcp_sessions")
+    for db in "${PG_DATABASES[@]}"; do
+      db_url="${PG_BASE_URL}/${db}"
+      tables=$(psql "$db_url" -v ON_ERROR_STOP=1 -Atqc \
+        "SELECT string_agg(quote_ident(schemaname) || '.' || quote_ident(tablename), ', ') \
+         FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null) || continue
+      if [ -n "$tables" ]; then
+        psql "$db_url" -v ON_ERROR_STOP=1 -q -c \
+          "TRUNCATE TABLE $tables RESTART IDENTITY CASCADE;" >/dev/null 2>&1 \
+          && print_ok "Truncated Postgres tables in '$db'" \
+          || print_info "Could not truncate '$db' (may not exist yet)"
+      fi
+    done
+  else
+    print_info "psql not found — skipping Postgres cleanup"
+  fi
 else
   print_step "Keeping previous state (--keep-state)"
   print_info "Data dir: $DATA_DIR"
