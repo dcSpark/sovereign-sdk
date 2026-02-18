@@ -27,7 +27,7 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `total-tokens-economy` samples every 30 seconds (sum of deposit amounts).
 - TPS and PeakTPS are fetched from `/ledger/tps/latest` and `/ledger/tps/{slotId}`.
 - The API derives remaining rates and averages from counter deltas at query time.
-- Counter-derived endpoints accept `window_seconds` to compute deltas over a custom window;
+- Some counter-derived endpoints accept `window_seconds` to compute deltas over a custom window;
   otherwise the last two samples are used.
 
 ## Architecture
@@ -52,11 +52,11 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
   - Optional: `?window_seconds=60`.
 - `GET /average-transaction-size`
   - Returns `{ average_amount, delta_amount, delta_transactions, delta_ms, retention_seconds }`.
-  - Defaults to 24 hours; optional: `?window_seconds=86400`.
+  - Fixed 24-hour window (custom `window_seconds` is not supported on this endpoint).
   - Computed as `token-value-spent / number of transactions` over the same window.
 - `GET /median-transaction-size`
   - Returns `{ median_amount }`.
-  - Defaults to 24 hours; optional: `?window_seconds=86400`.
+  - Fixed 24-hour window (custom `window_seconds` is not supported on this endpoint).
 - `GET /token-value-spent`
   - Returns `{ value_spent }`.
   - Defaults to 24 hours; optional: `?window_seconds=86400`.
@@ -65,9 +65,8 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
   - Defaults to 24 hours; optional: `?window_seconds=86400`.
   - Optional range override: `?from_ms=...&to_ms=...` (milliseconds since epoch).
   - `total_tokens` is the average supply over the range, derived from deposit totals.
-- Counter-derived fields (`rate_percent`, `average_amount`, `median_amount`, `value_spent`,
-  `token_velocity`, `delta_*`) are computed from the last two counter samples unless
-  `window_seconds` is provided.
+- Counter-derived fields (`rate_percent`, `value_spent`, `token_velocity`, `delta_*`) are
+  computed from the last two counter samples unless `window_seconds` is provided.
 - Historic endpoints return time-series samples and accept optional `from_ms`/`to_ms` query
   parameters (milliseconds since epoch). When provided, both must be set.
 - Swagger UI: `GET /swagger-ui/`

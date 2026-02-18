@@ -14,6 +14,7 @@ use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::materialized_views::INDEXER_TRANSFER_STATS_24H_VIEW;
 use crate::metrics::collectors::accounts::AccountsPayload;
 use crate::metrics::collectors::average_transaction_size::AverageTransactionSizePayload;
 use crate::metrics::collectors::failed_transactions::FailedTransactionsPayload;
@@ -99,41 +100,8 @@ struct HistoricWindowQuery {
     to_ms: Option<i64>,
 }
 
-const POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL: &str = r#"
-WITH windowed AS (
-    SELECT
-        mt.event_id,
-        CAST(mt.amount AS numeric) AS amount
-    FROM midnight_transfer mt
-    INNER JOIN events ev ON ev.id = mt.event_id
-    WHERE mt.amount IS NOT NULL
-      AND mt.amount ~ '^[0-9]+$'
-      AND ev.created_at >= $1
-      AND ev.created_at <= $2
-)
-SELECT
-    AVG(windowed.amount)::double precision AS average_amount,
-    COALESCE(SUM(windowed.amount), 0)::text AS delta_amount,
-    COUNT(*)::bigint AS delta_transactions
-FROM windowed
-"#;
-
-const POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL: &str = r#"
-WITH windowed AS (
-    SELECT
-        mt.event_id,
-        CAST(mt.amount AS numeric) AS amount
-    FROM midnight_transfer mt
-    INNER JOIN events ev ON ev.id = mt.event_id
-    WHERE mt.amount IS NOT NULL
-      AND mt.amount ~ '^[0-9]+$'
-      AND ev.created_at >= $1
-      AND ev.created_at <= $2
-)
-SELECT
-    percentile_cont(0.5) WITHIN GROUP (ORDER BY windowed.amount)::double precision AS median_amount
-FROM windowed
-"#;
+const DEFAULT_METRICS_WINDOW_SECONDS: u64 = 86_400;
+const DEFAULT_METRICS_WINDOW_MS: i64 = 86_400_000;
 
 /// Maximum number of slots to scan when reconstructing TPS windows from /ledger/tps.
 const MAX_LEDGER_TPS_SLOTS: usize = 5_000;
@@ -983,9 +951,6 @@ async fn failed_transactions_rate_historic(
 #[utoipa::path(
     get,
     path = "/average-transaction-size",
-    params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the average amount. Defaults to 24 hours.")
-    ),
     responses(
         (status = 200, description = "Average transfer amount", body = AverageTransactionSizeResponse)
     ),
@@ -993,42 +958,38 @@ async fn failed_transactions_rate_historic(
 )]
 async fn average_transaction_size(
     State(state): State<AppState>,
-    Query(params): Query<WindowQuery>,
 ) -> Json<AverageTransactionSizeResponse> {
-    let window_ms = match params.window_seconds {
-        Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
-    };
+    let window_ms = Some(DEFAULT_METRICS_WINDOW_MS);
 
     let backend = {
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_average_from_indexer(backend, window_ms) {
+    if should_query_average_from_mv(backend) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
-        struct AverageRow {
+        struct AverageMvRow {
             average_amount: Option<f64>,
             delta_amount: String,
             delta_transactions: i64,
         }
 
-        let now = chrono::Utc::now();
-        let now_ms = now.timestamp_millis();
-        let start_ms = window_ms
-            .and_then(|window_ms| now_ms.checked_sub(window_ms))
-            .unwrap_or(now_ms);
-        let delta_ms = now_ms.saturating_sub(start_ms);
-        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let start_ms = now_ms.saturating_sub(DEFAULT_METRICS_WINDOW_MS);
 
-        let stmt = Statement::from_sql_and_values(
+        let stmt = Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL,
-            [start.into(), now.into()],
+            format!(
+                "
+                SELECT average_amount, delta_amount, delta_transactions
+                FROM {INDEXER_TRANSFER_STATS_24H_VIEW}
+                WHERE id = 1
+                "
+            ),
         );
 
-        match AverageRow::find_by_statement(stmt)
+        match AverageMvRow::find_by_statement(stmt)
             .one(&state.indexer_db)
             .await
         {
@@ -1038,26 +999,30 @@ async fn average_transaction_size(
                     average_amount: row.average_amount,
                     delta_amount: Some(row.delta_amount),
                     delta_transactions,
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
             Ok(None) => {
+                warn!("Average transaction size materialized view returned no rows");
                 return Json(AverageTransactionSizeResponse {
                     average_amount: None,
                     delta_amount: Some("0".to_string()),
                     delta_transactions: Some(0),
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
             Err(error) => {
-                warn!(error = %error, "Failed to query average transaction size from indexer DB");
+                warn!(
+                    error = %error,
+                    "Failed to query average transaction size from materialized view"
+                );
                 return Json(AverageTransactionSizeResponse {
                     average_amount: None,
                     delta_amount: Some("0".to_string()),
                     delta_transactions: Some(0),
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
@@ -1104,7 +1069,7 @@ async fn average_transaction_size_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1160,9 +1125,6 @@ async fn average_transaction_size_historic(
 #[utoipa::path(
     get,
     path = "/median-transaction-size",
-    params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the median amount. Defaults to 24 hours.")
-    ),
     responses(
         (status = 200, description = "Median transaction size", body = MedianTransactionSizeResponse)
     ),
@@ -1170,12 +1132,8 @@ async fn average_transaction_size_historic(
 )]
 async fn median_transaction_size(
     State(state): State<AppState>,
-    Query(params): Query<WindowQuery>,
 ) -> Json<MedianTransactionSizeResponse> {
-    let window_ms = match params.window_seconds {
-        Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
-    };
+    let window_ms = Some(DEFAULT_METRICS_WINDOW_MS);
 
     let now = chrono::Utc::now();
     let now_ms = now.timestamp_millis();
@@ -1187,32 +1145,45 @@ async fn median_transaction_size(
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_median_from_indexer(backend) {
+    if should_query_median_from_mv(backend) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
-        struct MedianRow {
+        struct MedianMvRow {
             median_amount: Option<f64>,
         }
 
-        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
-        let stmt = Statement::from_sql_and_values(
+        let stmt = Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL,
-            [start.into(), now.into()],
+            format!(
+                "
+                SELECT median_amount
+                FROM {INDEXER_TRANSFER_STATS_24H_VIEW}
+                WHERE id = 1
+                "
+            ),
         );
 
-        match MedianRow::find_by_statement(stmt)
+        match MedianMvRow::find_by_statement(stmt)
             .one(&state.indexer_db)
             .await
         {
-            Ok(row) => {
+            Ok(Some(row)) => {
                 return Json(MedianTransactionSizeResponse {
-                    median_amount: row.and_then(|row| row.median_amount),
+                    median_amount: row.median_amount,
+                });
+            }
+            Ok(None) => {
+                warn!("Median transaction size materialized view returned no rows");
+                return Json(MedianTransactionSizeResponse {
+                    median_amount: None,
                 });
             }
             Err(error) => {
-                warn!(error = %error, "Failed to query median transaction size from indexer DB");
+                warn!(
+                    error = %error,
+                    "Failed to query median transaction size from materialized view"
+                );
                 return Json(MedianTransactionSizeResponse {
                     median_amount: None,
                 });
@@ -1340,7 +1311,7 @@ async fn token_value_spent(
     let series = state.store.snapshot("token-value-spent").await;
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let value_spent = series
         .as_ref()
@@ -1369,7 +1340,7 @@ async fn token_value_spent_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1452,7 +1423,7 @@ async fn token_velocity(
                 None => {
                     let window_ms = match params.window_seconds {
                         Some(window_seconds) => window_ms(Some(window_seconds)),
-                        None => window_ms(Some(86_400)),
+                        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
                     };
                     compute_token_value_spent(&series, window_ms)
                 }
@@ -1467,7 +1438,7 @@ async fn token_velocity(
             None => {
                 let window_ms = match params.window_seconds {
                     Some(window_seconds) => window_ms(Some(window_seconds)),
-                    None => window_ms(Some(86_400)),
+                    None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
                 };
                 compute_total_tokens_average_window(&series, window_ms)
             }
@@ -1514,7 +1485,7 @@ async fn token_velocity_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1580,14 +1551,11 @@ fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
     }
 }
 
-fn should_query_average_from_indexer(
-    backend: sea_orm::DatabaseBackend,
-    window_ms: Option<i64>,
-) -> bool {
-    backend == sea_orm::DatabaseBackend::Postgres && window_ms.is_some()
+fn should_query_average_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
+    backend == sea_orm::DatabaseBackend::Postgres
 }
 
-fn should_query_median_from_indexer(backend: sea_orm::DatabaseBackend) -> bool {
+fn should_query_median_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
     backend == sea_orm::DatabaseBackend::Postgres
 }
 
@@ -1714,8 +1682,8 @@ where
 }
 
 fn median_bucket_ms(window_seconds: Option<u64>) -> (i64, u64) {
-    let default_seconds = 86_400;
-    let default_ms = window_ms(Some(default_seconds)).unwrap_or(86_400_000);
+    let default_seconds = DEFAULT_METRICS_WINDOW_SECONDS;
+    let default_ms = window_ms(Some(default_seconds)).unwrap_or(DEFAULT_METRICS_WINDOW_MS);
 
     match window_seconds {
         Some(seconds) => match window_ms(Some(seconds)) {
@@ -2482,61 +2450,19 @@ struct ApiDoc;
 mod tests {
     use super::*;
 
-    fn assert_common_transfer_filters(sql: &str) {
-        let required_filters = [
-            "FROM midnight_transfer mt",
-            "JOIN events ev ON ev.id = mt.event_id",
-            "mt.amount IS NOT NULL",
-            "mt.amount ~ '^[0-9]+$'",
-            "ev.created_at >= $1",
-            "ev.created_at <= $2",
-        ];
-
-        for filter in required_filters {
-            assert!(
-                sql.contains(filter),
-                "expected SQL to contain filter: {filter}"
-            );
-        }
-    }
-
     #[test]
-    fn postgres_average_sql_keeps_expected_filters() {
-        assert_common_transfer_filters(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL);
-        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("AVG(windowed.amount)"));
-        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("COUNT(*)::bigint"));
-    }
-
-    #[test]
-    fn postgres_median_sql_keeps_expected_filters() {
-        assert_common_transfer_filters(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL);
-        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("ORDER BY windowed.amount"));
-        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("percentile_cont(0.5) WITHIN GROUP"));
-    }
-
-    #[test]
-    fn average_indexer_query_gate_requires_postgres_and_window() {
+    fn average_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_average_from_indexer(
-            DatabaseBackend::Postgres,
-            Some(60_000)
-        ));
-        assert!(!should_query_average_from_indexer(
-            DatabaseBackend::Postgres,
-            None
-        ));
-        assert!(!should_query_average_from_indexer(
-            DatabaseBackend::Sqlite,
-            Some(60_000)
-        ));
+        assert!(should_query_average_from_mv(DatabaseBackend::Postgres));
+        assert!(!should_query_average_from_mv(DatabaseBackend::Sqlite));
     }
 
     #[test]
-    fn median_indexer_query_gate_requires_postgres() {
+    fn median_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_median_from_indexer(DatabaseBackend::Postgres));
-        assert!(!should_query_median_from_indexer(DatabaseBackend::Sqlite));
+        assert!(should_query_median_from_mv(DatabaseBackend::Postgres));
+        assert!(!should_query_median_from_mv(DatabaseBackend::Sqlite));
     }
 }

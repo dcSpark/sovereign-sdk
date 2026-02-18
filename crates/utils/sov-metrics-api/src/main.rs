@@ -6,6 +6,7 @@ use tracing::info;
 mod api;
 mod config;
 mod indexer_db;
+mod materialized_views;
 mod metrics;
 
 #[tokio::main]
@@ -39,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
     let indexer_db = Database::connect(indexer_options)
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
+
+    materialized_views::initialize_materialized_views(indexer_db.clone(), db.clone())
+        .await
+        .context("Failed to initialize metrics materialized views")?;
 
     let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());

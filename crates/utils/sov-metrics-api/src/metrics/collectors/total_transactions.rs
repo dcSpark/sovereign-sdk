@@ -2,10 +2,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, Statement,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::materialized_views::DA_WORKER_TX_TOTALS_VIEW;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
@@ -39,14 +43,19 @@ impl MetricCollector for TotalTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let total_transactions = Entity::find()
-                .filter(
-                    Column::TransactionState
-                        .is_in([TransactionState::Accepted, TransactionState::Rejected]),
-                )
-                .count(&self.db)
-                .await
-                .with_context(|| "Failed to count completed transactions")?;
+            let total_transactions = if self.db.get_database_backend() == DatabaseBackend::Postgres
+            {
+                load_total_transactions_from_mv(&self.db).await?
+            } else {
+                Entity::find()
+                    .filter(
+                        Column::TransactionState
+                            .is_in([TransactionState::Accepted, TransactionState::Rejected]),
+                    )
+                    .count(&self.db)
+                    .await
+                    .with_context(|| "Failed to count completed transactions")?
+            };
 
             let payload = TotalTransactionsPayload { total_transactions };
 
@@ -57,4 +66,35 @@ impl MetricCollector for TotalTransactionsCollector {
             }])
         })
     }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct WorkerTotalTransactionsRow {
+    total_transactions: i64,
+}
+
+async fn load_total_transactions_from_mv(db: &DatabaseConnection) -> Result<u64> {
+    let stmt = Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "
+            SELECT total_transactions
+            FROM {DA_WORKER_TX_TOTALS_VIEW}
+            WHERE id = 1
+            "
+        ),
+    );
+
+    let row = WorkerTotalTransactionsRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query worker tx totals materialized view")?
+        .context("Missing worker tx totals row in materialized view")?;
+
+    u64::try_from(row.total_transactions).with_context(|| {
+        format!(
+            "Negative total_transactions in worker tx totals materialized view: {}",
+            row.total_transactions
+        )
+    })
 }

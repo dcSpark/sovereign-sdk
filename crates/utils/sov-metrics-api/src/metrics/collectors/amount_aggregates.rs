@@ -5,6 +5,7 @@ use sea_orm::{
 };
 
 use crate::indexer_db::{midnight_deposit, midnight_transfer};
+use crate::materialized_views::{INDEXER_DEPOSIT_TOTALS_VIEW, INDEXER_TRANSFER_TOTALS_VIEW};
 
 #[derive(Debug, FromQueryResult)]
 struct TransferAmountAggregateRow {
@@ -19,24 +20,9 @@ struct TotalAmountAggregateRow {
 
 pub(crate) async fn transfer_amount_totals(db: &DatabaseConnection) -> Result<(u128, u64)> {
     if db.get_database_backend() == DatabaseBackend::Postgres {
-        let stmt = Statement::from_string(
-            DatabaseBackend::Postgres,
-            r#"
-            SELECT
-                COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::text AS total_amount,
-                COUNT(*)::bigint AS total_transactions
-            FROM midnight_transfer
-            WHERE amount IS NOT NULL
-            "#
-            .to_owned(),
-        );
-
-        let row = TransferAmountAggregateRow::find_by_statement(stmt)
-            .one(db)
-            .await
-            .context("Failed to aggregate midnight_transfer totals")?
-            .context("Missing aggregate row for midnight_transfer totals")?;
-
+        let row = transfer_amount_totals_from_mv(db)
+            .await?
+            .context("Missing row in transfer totals materialized view")?;
         return parse_transfer_aggregate(row);
     }
 
@@ -45,27 +31,53 @@ pub(crate) async fn transfer_amount_totals(db: &DatabaseConnection) -> Result<(u
 
 pub(crate) async fn deposit_total_amount(db: &DatabaseConnection) -> Result<u128> {
     if db.get_database_backend() == DatabaseBackend::Postgres {
-        let stmt = Statement::from_string(
-            DatabaseBackend::Postgres,
-            r#"
-            SELECT
-                COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::text AS total_amount
-            FROM midnight_deposit
-            WHERE amount IS NOT NULL
-            "#
-            .to_owned(),
-        );
-
-        let row = TotalAmountAggregateRow::find_by_statement(stmt)
-            .one(db)
-            .await
-            .context("Failed to aggregate midnight_deposit totals")?
-            .context("Missing aggregate row for midnight_deposit totals")?;
-
+        let row = deposit_total_amount_from_mv(db)
+            .await?
+            .context("Missing row in deposit totals materialized view")?;
         return parse_total_amount(row.total_amount, "deposit");
     }
 
     deposit_total_amount_fallback(db).await
+}
+
+async fn transfer_amount_totals_from_mv(
+    db: &DatabaseConnection,
+) -> Result<Option<TransferAmountAggregateRow>> {
+    let stmt = Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "
+            SELECT total_amount, total_transactions
+            FROM {INDEXER_TRANSFER_TOTALS_VIEW}
+            WHERE id = 1
+            "
+        ),
+    );
+
+    TransferAmountAggregateRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query transfer totals materialized view")
+}
+
+async fn deposit_total_amount_from_mv(
+    db: &DatabaseConnection,
+) -> Result<Option<TotalAmountAggregateRow>> {
+    let stmt = Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "
+            SELECT total_amount
+            FROM {INDEXER_DEPOSIT_TOTALS_VIEW}
+            WHERE id = 1
+            "
+        ),
+    );
+
+    TotalAmountAggregateRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query deposit totals materialized view")
 }
 
 fn parse_transfer_aggregate(row: TransferAmountAggregateRow) -> Result<(u128, u64)> {
