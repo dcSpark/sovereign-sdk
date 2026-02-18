@@ -13,9 +13,11 @@ use super::ValueMidnightPrivacy;
 use crate::event::Event;
 use crate::hash::{
     bl_bucket_leaf, blacklist_pos_from_recipient, empty_blacklist_bucket_entries, mt_combine,
-    note_commitment, recipient_from_pk_v2, sparse_default_nodes, BlacklistNodeKey, Hash32,
-    PendingRootKey, RootKey, BLACKLIST_BUCKET_SIZE, BLACKLIST_TREE_DEPTH,
+    mt_default_nodes, note_commitment, recipient_from_pk_v2, sparse_default_nodes,
+    BlacklistNodeKey, Hash32, MerkleNodeKey, PendingRootKey, RootKey, BLACKLIST_BUCKET_SIZE,
+    BLACKLIST_TREE_DEPTH,
 };
+use crate::merkle::MAX_TREE_DEPTH;
 use crate::types::{EncryptedNote, FullViewingKey, PrivacyAddress};
 
 #[cfg(feature = "native")]
@@ -28,7 +30,6 @@ use crate::hash::NullifierKey;
 ///
 /// Proof packages for `note_spend_guest` can be ~25MB (gzip), so keep headroom.
 const MAX_LIGERO_PROOF_BYTES: usize = 40_000_000;
-
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
 #[serialize(Borsh, Serde)]
@@ -312,7 +313,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// Internal helper: Queue a single commitment for end-of-block processing.
     /// Used by deposit() and transfer() to append note commitments.
     ///
-    /// BLOCK-DEFERRED DESIGN: The commitment_tree is NOT updated here. Instead:
+    /// BLOCK-DEFERRED DESIGN: The commitment tree state is NOT updated here. Instead:
     /// 1. Commitment is queued for this block (per tx, unique key)
     /// 2. Positions and roots are assigned in end_block_flush (once per block)
     ///
@@ -321,7 +322,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
     /// Queue a commitment for end-of-block processing.
     ///
-    /// This function does NOT update the tree or assign positions. It only enqueues
+    /// This function does NOT update sparse tree nodes or assign positions. It only enqueues
     /// the commitment. All tree updates and position assignments happen in `end_block_flush`,
     /// which runs single-threaded after all transactions complete.
     ///
@@ -992,6 +993,231 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         Ok(self.all_roots.get(&RootKey(*anchor), state)?.is_some())
     }
 
+    fn ensure_capacity_for_position(
+        &self,
+        depth: &mut u8,
+        root: &mut Hash32,
+        position: u64,
+    ) -> Result<()> {
+        while (position as u128) >= (1u128 << (*depth as u32)) {
+            let old_depth = *depth;
+            anyhow::ensure!(
+                old_depth < MAX_TREE_DEPTH,
+                "Merkle tree cannot grow beyond depth {}",
+                MAX_TREE_DEPTH
+            );
+            let defaults = mt_default_nodes(old_depth);
+            let right_default = defaults[old_depth as usize];
+            *root = mt_combine(old_depth, root, &right_default);
+            *depth = old_depth + 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    fn user_prefix_write_stats(
+        st: &mut sov_modules_api::StateCheckpoint<S>,
+        prefix: &[u8],
+    ) -> (u64, u64, u128, u128) {
+        let mut set_entries = 0u64;
+        let mut delete_entries = 0u64;
+        let mut key_bytes = 0u128;
+        let mut value_bytes = 0u128;
+
+        for (slot_key, maybe_value) in st.iter_user_prefix_writes(prefix) {
+            key_bytes += slot_key.size() as u128;
+            if let Some(value) = maybe_value {
+                set_entries += 1;
+                value_bytes += value.size() as u128;
+            } else {
+                delete_entries += 1;
+            }
+        }
+
+        (set_entries, delete_entries, key_bytes, value_bytes)
+    }
+
+    /// Logs direct per-block tree-state write payload measured from the actual checkpoint delta.
+    ///
+    /// This is not an estimate: it scans the state writes queued in this block for the tree map
+    /// plus the tree metadata keys and reports exact key/value byte counts.
+    #[cfg(feature = "native")]
+    fn log_tree_growth_checkpoint(
+        st: &mut sov_modules_api::StateCheckpoint<S>,
+        tree: &'static str,
+        depth: u8,
+        leaves: u64,
+        node_prefix: &[u8],
+        metadata_prefixes: [&[u8]; 3],
+    ) {
+        let (node_set_entries, node_delete_entries, node_key_bytes, node_value_bytes) =
+            Self::user_prefix_write_stats(st, node_prefix);
+        let node_total_bytes = node_key_bytes + node_value_bytes;
+
+        let mut meta_set_entries = 0u64;
+        let mut meta_delete_entries = 0u64;
+        let mut meta_key_bytes = 0u128;
+        let mut meta_value_bytes = 0u128;
+        for prefix in metadata_prefixes {
+            let (sets, deletes, key_bytes, value_bytes) = Self::user_prefix_write_stats(st, prefix);
+            meta_set_entries += sets;
+            meta_delete_entries += deletes;
+            meta_key_bytes += key_bytes;
+            meta_value_bytes += value_bytes;
+        }
+        let meta_total_bytes = meta_key_bytes + meta_value_bytes;
+
+        let tree_state_write_total_bytes = node_total_bytes + meta_total_bytes;
+
+        tracing::info!(
+            tree,
+            depth,
+            milestone_leaves = leaves,
+            current_leaves = leaves,
+            node_set_entries,
+            node_delete_entries,
+            node_key_bytes = %node_key_bytes,
+            node_value_bytes = %node_value_bytes,
+            node_total_bytes = %node_total_bytes,
+            node_total_kib = (node_total_bytes as f64) / 1024.0,
+            metadata_set_entries = meta_set_entries,
+            metadata_delete_entries = meta_delete_entries,
+            metadata_key_bytes = %meta_key_bytes,
+            metadata_value_bytes = %meta_value_bytes,
+            metadata_total_bytes = %meta_total_bytes,
+            metadata_total_kib = (meta_total_bytes as f64) / 1024.0,
+            tree_state_write_total_bytes = %tree_state_write_total_bytes,
+            tree_state_write_total_kib = (tree_state_write_total_bytes as f64) / 1024.0,
+            "Sparse Merkle tree growth checkpoint"
+        );
+    }
+
+    fn get_commitment_node_or_default(
+        &self,
+        key: &MerkleNodeKey,
+        defaults: &[Hash32],
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<Hash32> {
+        Ok(self
+            .commitment_nodes
+            .get(key, state)?
+            .unwrap_or(defaults[key.height as usize]))
+    }
+
+    fn get_nullifier_node_or_default(
+        &self,
+        key: &MerkleNodeKey,
+        defaults: &[Hash32],
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<Hash32> {
+        Ok(self
+            .nullifier_nodes
+            .get(key, state)?
+            .unwrap_or(defaults[key.height as usize]))
+    }
+
+    fn set_commitment_leaf_sparse(
+        &mut self,
+        depth: u8,
+        pos: u64,
+        leaf: Hash32,
+        defaults: &[Hash32],
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<Hash32> {
+        let leaf_key = MerkleNodeKey {
+            height: 0,
+            index: pos,
+        };
+        let mut cur = if leaf == defaults[0] {
+            self.commitment_nodes.delete(&leaf_key, state)?;
+            defaults[0]
+        } else {
+            self.commitment_nodes.set(&leaf_key, &leaf, state)?;
+            leaf
+        };
+
+        let mut idx = pos;
+        for height in 0..depth {
+            let sibling_key = MerkleNodeKey {
+                height,
+                index: idx ^ 1,
+            };
+            let sibling = self.get_commitment_node_or_default(&sibling_key, defaults, state)?;
+
+            let parent = if (idx & 1) == 0 {
+                mt_combine(height, &cur, &sibling)
+            } else {
+                mt_combine(height, &sibling, &cur)
+            };
+
+            let parent_key = MerkleNodeKey {
+                height: height + 1,
+                index: idx >> 1,
+            };
+            if parent == defaults[(height + 1) as usize] {
+                self.commitment_nodes.delete(&parent_key, state)?;
+            } else {
+                self.commitment_nodes.set(&parent_key, &parent, state)?;
+            }
+
+            cur = parent;
+            idx >>= 1;
+        }
+
+        Ok(cur)
+    }
+
+    fn set_nullifier_leaf_sparse(
+        &mut self,
+        depth: u8,
+        pos: u64,
+        leaf: Hash32,
+        defaults: &[Hash32],
+        state: &mut sov_modules_api::StateCheckpoint<S>,
+    ) -> Result<Hash32> {
+        let leaf_key = MerkleNodeKey {
+            height: 0,
+            index: pos,
+        };
+        let mut cur = if leaf == defaults[0] {
+            self.nullifier_nodes.delete(&leaf_key, state)?;
+            defaults[0]
+        } else {
+            self.nullifier_nodes.set(&leaf_key, &leaf, state)?;
+            leaf
+        };
+
+        let mut idx = pos;
+        for height in 0..depth {
+            let sibling_key = MerkleNodeKey {
+                height,
+                index: idx ^ 1,
+            };
+            let sibling = self.get_nullifier_node_or_default(&sibling_key, defaults, state)?;
+
+            let parent = if (idx & 1) == 0 {
+                mt_combine(height, &cur, &sibling)
+            } else {
+                mt_combine(height, &sibling, &cur)
+            };
+
+            let parent_key = MerkleNodeKey {
+                height: height + 1,
+                index: idx >> 1,
+            };
+            if parent == defaults[(height + 1) as usize] {
+                self.nullifier_nodes.delete(&parent_key, state)?;
+            } else {
+                self.nullifier_nodes.set(&parent_key, &parent, state)?;
+            }
+
+            cur = parent;
+            idx >>= 1;
+        }
+
+        Ok(cur)
+    }
+
     /// End-of-block flush: Replay all pending commitments/nullifiers into their trees.
     /// Called automatically by BlockHooks at the end of each block after all transactions.
     ///
@@ -1000,9 +1226,9 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     /// This reduces per-tx cache memory from ~4MB to ~100 bytes.
     ///
     /// Process:
-    /// 1. Load commitment_tree, replay all pending commitments, record each root
-    /// 2. Load nullifier_tree, replay all pending nullifiers
-    /// 3. Save both trees once
+    /// 1. Replay all pending commitments into sparse commitment tree nodes, recording each root
+    /// 2. Replay all pending nullifiers into sparse nullifier tree nodes
+    /// 3. Save metadata (depth/root/next positions)
     ///
     /// SCOPE: Flushes only current block's pending items. Other heights ignored.
     ///
@@ -1035,22 +1261,39 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         commitments.sort();
 
         if !commitments.is_empty() {
-            let mut tree = self.commitment_tree.get_or_err(st)??;
+            let mut depth = self.commitment_tree_depth.get_or_err(st)??;
+            let mut root = self.commitment_root.get_or_err(st)??;
             let mut pos = self.next_position.get_or_err(st)??;
+            let mut defaults = mt_default_nodes(depth);
 
             for cm in &commitments {
-                if pos >= tree.len() as u64 {
-                    tree.grow_to_fit((pos + 1) as usize);
+                let old_depth = depth;
+                self.ensure_capacity_for_position(&mut depth, &mut root, pos)?;
+                if depth != old_depth {
+                    defaults = mt_default_nodes(depth);
                 }
-                tree.set_leaf(pos as usize, *cm);
-                let root = tree.root();
+                root = self.set_commitment_leaf_sparse(depth, pos, *cm, &defaults, st)?;
                 self.add_recent_root_direct(root, st)?;
                 self.record_root_forever_direct(root, st)?;
                 pos += 1;
             }
 
+            self.commitment_tree_depth.set(&depth, st)?;
+            self.commitment_root.set(&root, st)?;
             self.next_position.set(&pos, st)?;
-            self.commitment_tree.set(&tree, st)?;
+            #[cfg(feature = "native")]
+            Self::log_tree_growth_checkpoint(
+                st,
+                "commitment",
+                depth,
+                pos,
+                self.commitment_nodes.raw_prefix_bytes(),
+                [
+                    self.commitment_tree_depth.prefix().as_ref(),
+                    self.commitment_root.prefix().as_ref(),
+                    self.next_position.prefix().as_ref(),
+                ],
+            );
 
             // Clean up processed entries
             self.pending_commitments_by_hash
@@ -1084,19 +1327,37 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         nullifiers.sort();
 
         if !nullifiers.is_empty() {
-            let mut tree = self.nullifier_tree.get_or_err(st)??;
+            let mut depth = self.nullifier_tree_depth.get_or_err(st)??;
+            let mut root = self.nullifier_root.get_or_err(st)??;
             let mut pos = self.next_nullifier_position.get_or_err(st)??;
+            let mut defaults = mt_default_nodes(depth);
 
             for nf in &nullifiers {
-                if pos >= tree.len() as u64 {
-                    tree.grow_to_fit((pos + 1) as usize);
+                let old_depth = depth;
+                self.ensure_capacity_for_position(&mut depth, &mut root, pos)?;
+                if depth != old_depth {
+                    defaults = mt_default_nodes(depth);
                 }
-                tree.set_leaf(pos as usize, *nf);
+                root = self.set_nullifier_leaf_sparse(depth, pos, *nf, &defaults, st)?;
                 pos += 1;
             }
 
+            self.nullifier_tree_depth.set(&depth, st)?;
+            self.nullifier_root.set(&root, st)?;
             self.next_nullifier_position.set(&pos, st)?;
-            self.nullifier_tree.set(&tree, st)?;
+            #[cfg(feature = "native")]
+            Self::log_tree_growth_checkpoint(
+                st,
+                "nullifier",
+                depth,
+                pos,
+                self.nullifier_nodes.raw_prefix_bytes(),
+                [
+                    self.nullifier_tree_depth.prefix().as_ref(),
+                    self.nullifier_root.prefix().as_ref(),
+                    self.next_nullifier_position.prefix().as_ref(),
+                ],
+            );
 
             // Clean up processed entries
             self.pending_nullifiers_by_hash

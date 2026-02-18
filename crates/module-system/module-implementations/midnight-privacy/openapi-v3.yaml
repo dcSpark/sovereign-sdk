@@ -41,6 +41,56 @@ tags:
     description: Module statistics
 
 paths:
+  /modules/midnight-privacy/nullifiers:
+    get:
+      tags:
+        - nullifiers
+      summary: List spent nullifiers
+      description: |
+        Returns a paginated list of spent nullifiers in append order.
+        By default, returns oldest first. Use `reverse=true` for latest first.
+      operationId: listNullifiers
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results to return (max 1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of nullifiers to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: reverse
+          in: query
+          required: false
+          description: Return most recent nullifiers first
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Spent nullifiers retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullifiersListResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Nullifier tree not initialized
+
   /modules/midnight-privacy/nullifiers/{nullifier_hex}:
     get:
       tags:
@@ -283,6 +333,61 @@ components:
       example:
         nullifier: [203, 210, 170, 163, 142, 56, 210, 83, 18, 52, 86, 120, 144, 171, 205, 239, 18, 52, 86, 120, 144, 171, 205, 239, 18, 52, 86, 120, 144, 171, 205, 239]
         is_spent: true
+
+    NullifierInfoResponse:
+      type: object
+      required:
+        - position
+        - nullifier
+      properties:
+        position:
+          type: integer
+          format: uint64
+          description: Position in the nullifier Merkle tree
+        nullifier:
+          type: array
+          description: Spent nullifier (32-byte hash)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+      example:
+        position: 5
+        nullifier: [101, 141, 5, 92, 76, 211, 42, 11, 144, 2, 17, 230, 60, 77, 82, 141, 33, 44, 18, 9, 166, 177, 22, 74, 121, 200, 3, 201, 91, 5, 61, 240]
+
+    NullifiersListResponse:
+      type: object
+      required:
+        - nullifiers
+        - count
+        - current_root
+      properties:
+        nullifiers:
+          type: array
+          description: List of spent nullifiers
+          items:
+            $ref: '#/components/schemas/NullifierInfoResponse'
+        count:
+          type: integer
+          format: uint64
+          description: Total number of spent nullifiers in the tree
+        current_root:
+          type: array
+          description: Current nullifier tree root (32 bytes)
+          items:
+            type: integer
+            format: uint8
+          minItems: 32
+          maxItems: 32
+      example:
+        nullifiers:
+          - position: 0
+            nullifier: [101, 141, 5, 92, 76, 211, 42, 11, 144, 2, 17, 230, 60, 77, 82, 141, 33, 44, 18, 9, 166, 177, 22, 74, 121, 200, 3, 201, 91, 5, 61, 240]
+          - position: 1
+            nullifier: [18, 77, 211, 99, 5, 143, 61, 200, 17, 233, 128, 121, 99, 44, 71, 11, 191, 2, 3, 66, 91, 233, 75, 103, 122, 221, 14, 33, 10, 8, 55, 99]
+        count: 12
+        current_root: [100, 164, 103, 104, 197, 95, 135, 91, 122, 86, 140, 88, 29, 21, 235, 210, 209, 77, 56, 168, 1, 247, 255, 9, 56, 103, 211, 66, 59, 168, 230, 13]
 
     TreeStateResponse:
       type: object

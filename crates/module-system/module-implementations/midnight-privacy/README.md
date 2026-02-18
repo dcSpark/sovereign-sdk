@@ -182,8 +182,13 @@ This prevents:
 
 ## Module State
 
-- `commitment_tree`: Merkle tree of note commitments (Poseidon2-based)
+- `commitment_nodes`: Sparse Merkle nodes of note commitments (Poseidon2-based)
+- `commitment_tree_depth`: Current depth of commitment tree
+- `commitment_root`: Current commitment tree root
 - `next_position`: Next available tree position
+- `nullifier_nodes`: Sparse Merkle nodes of spent nullifiers
+- `nullifier_tree_depth`: Current depth of nullifier tree
+- `nullifier_root`: Current nullifier tree root
 - `nullifier_set`: Set of consumed nullifiers
 - `recent_roots`: Circular buffer of recent Merkle roots (fast mempool checks)
 - `root_window_size`: Size of recent roots window

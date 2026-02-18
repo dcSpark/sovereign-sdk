@@ -1066,7 +1066,12 @@ fn spawn_refill_loop(state: Arc<ServiceState>) {
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = generate_pending_for_wallet(&st, wallet_idx).await {
-                        tracing::warn!(wallet_idx, error = %e, "Failed to generate pending proof");
+                        tracing::warn!(
+                            wallet_idx,
+                            error = %e,
+                            error_chain = %format!("{:#}", e),
+                            "Failed to generate pending proof"
+                        );
                     }
                 });
                 launched += 1;
@@ -1931,7 +1936,12 @@ async fn wait_for_note_in_tree(
     let (_root, _pos, _sib) = global_tree_syncer()
         .resolve_positions_and_openings(provider, &[cm])
         .await
-        .context("waiting for note commitment position")?;
+        .with_context(|| {
+            format!(
+                "waiting for note commitment position cm={}",
+                hex::encode(cm)
+            )
+        })?;
     Ok(())
 }
 

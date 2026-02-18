@@ -15,6 +15,9 @@ struct Cli {
     /// Number of deposits/transfers to submit.
     #[arg(long)]
     num_deposits: Option<usize>,
+    /// Run only the deposit phase and skip transfer generation/submission.
+    #[arg(long)]
+    deposits_only: bool,
     /// Enable proof caching (disabled by default)
     #[arg(long)]
     cache: bool,
@@ -41,6 +44,9 @@ async fn main() -> Result<()> {
     let mut config = RunnerConfig::from_env();
     if let Some(n) = cli.num_deposits {
         config.num_deposits = n;
+    }
+    if cli.deposits_only {
+        config.deposits_only = true;
     }
     if let Some(node) = cli.node_url {
         config.external_node_url = Some(node);

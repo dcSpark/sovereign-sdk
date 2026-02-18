@@ -98,9 +98,10 @@ fast_ack_after_executor = true
 # The sequencer optimistically pre-executes transactions across multiple worker threads.
 # This warms up caches so the main transaction executor can run with ready-to-use data.
 # This variable determines the number of worker threads.
-num_cache_warmup_workers = 10
+# Keep this conservative for local/dev setups to reduce DB/CPU contention.
+num_cache_warmup_workers = 4
 # Parallel workers for Midnight Privacy Transactions
-num_parallel_tx_workers = 10
+num_parallel_tx_workers = 4
 [sequencer.extension]
 max_log_limit = 20000
 # Example Midnight bridge configuration (disabled)
