@@ -217,6 +217,61 @@ impl McpSessions {
             && snapshot.privacy_spend_key_hex.is_some()
     }
 
+    fn parse_first_sse_json_data(body: &str) -> Result<serde_json::Value, String> {
+        let mut last_error: Option<serde_json::Error> = None;
+        let normalized = body.replace("\r\n", "\n");
+
+        for event in normalized.split("\n\n") {
+            let mut data_lines = Vec::new();
+
+            for raw_line in event.lines() {
+                let line = raw_line.trim_end_matches('\r');
+                if let Some(data) = line.strip_prefix("data:") {
+                    data_lines.push(data.trim_start());
+                }
+            }
+
+            if data_lines.is_empty() {
+                continue;
+            }
+
+            let payload = data_lines.join("\n");
+            match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(value) => return Ok(value),
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        if let Some(err) = last_error {
+            Err(format!("failed to parse JSON from SSE data event: {err}"))
+        } else {
+            Err("SSE body did not contain a JSON data event".to_string())
+        }
+    }
+
+    fn parse_auto_create_wallet_response(
+        body_bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        if body_bytes.is_empty() {
+            return Err("empty response body".to_string());
+        }
+
+        if content_type.is_some_and(|ct| ct.starts_with("text/event-stream")) {
+            let body = std::str::from_utf8(body_bytes)
+                .map_err(|err| format!("SSE response was not UTF-8: {err}"))?;
+            return Self::parse_first_sse_json_data(body);
+        }
+
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+            return Ok(value);
+        }
+
+        let body = std::str::from_utf8(body_bytes)
+            .map_err(|err| format!("response body was not UTF-8: {err}"))?;
+        Self::parse_first_sse_json_data(body)
+    }
+
     async fn auto_create_wallet_for_session(
         &self,
         session_id: &str,
@@ -225,7 +280,7 @@ impl McpSessions {
             .method(Method::POST)
             .uri("/")
             .header(HEADER_SESSION_ID, session_id)
-            .header(ACCEPT, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(Self::build_create_wallet_request_body()))
         {
@@ -245,6 +300,11 @@ impl McpSessions {
             .await
             .into_response();
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body_bytes = match to_bytes(response.into_body(), usize::MAX).await {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -270,13 +330,20 @@ impl McpSessions {
                 .into_response());
         }
 
-        let response_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        let response_json: serde_json::Value = match Self::parse_auto_create_wallet_response(
+            &body_bytes,
+            content_type.as_deref(),
+        ) {
             Ok(v) => v,
             Err(err) => {
+                let body_preview = String::from_utf8_lossy(&body_bytes);
+                let body_preview = body_preview.chars().take(240).collect::<String>();
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!(
-                        "Failed to decode auto-create-wallet response for session {session_id}: {err}"
+                        "Failed to decode auto-create-wallet response for session {session_id}: {err} (content-type: {}, body preview: {:?})",
+                        content_type.as_deref().unwrap_or("<missing>"),
+                        body_preview
                     ),
                 )
                     .into_response());

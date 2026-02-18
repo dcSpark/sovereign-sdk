@@ -1337,6 +1337,10 @@ pub fn create_router(state: AppState) -> Router {
             "/midnight-privacy/pending_count",
             get(pending_count_handler),
         )
+        .route(
+            "/midnight-privacy/pending_hashes",
+            get(pending_hashes_handler),
+        )
         .route("/prove", post(prove_handler))
         .route("/verify", post(verify_handler))
         .route("/health", axum::routing::get(health_check))
@@ -1371,6 +1375,16 @@ struct PendingCountResponse {
     pending: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PendingHashesQuery {
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingHashesResponse {
+    tx_hashes: Vec<String>,
+}
+
 async fn pending_count_handler(
     State(state): State<AppState>,
 ) -> Result<Json<PendingCountResponse>, ServiceError> {
@@ -1390,6 +1404,38 @@ async fn pending_count_handler(
         })?;
 
     Ok(Json(PendingCountResponse { pending }))
+}
+
+async fn pending_hashes_handler(
+    State(state): State<AppState>,
+    Query(query): Query<PendingHashesQuery>,
+) -> Result<Json<PendingHashesResponse>, ServiceError> {
+    use sea_orm::{QueryOrder, QuerySelect};
+    use worker_verified_transactions::{
+        Column as VerifiedColumn, Entity as VerifiedEntity, TransactionState,
+    };
+
+    let mut pending_query = VerifiedEntity::find()
+        .select_only()
+        .column(VerifiedColumn::TxHash)
+        .filter(VerifiedColumn::TransactionState.eq(TransactionState::Pending))
+        .order_by_asc(VerifiedColumn::Id);
+    if let Some(limit) = query.limit {
+        pending_query = pending_query.limit(limit);
+    }
+
+    let tx_hashes = pending_query
+        .into_tuple::<(String,)>()
+        .all(state.da_conn.as_ref())
+        .await
+        .map_err(|err| {
+            ServiceError::Internal(format!("Failed to list pending worker transactions: {err}"))
+        })?
+        .into_iter()
+        .map(|(tx_hash,)| tx_hash)
+        .collect();
+
+    Ok(Json(PendingHashesResponse { tx_hashes }))
 }
 
 fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: String) -> Response {

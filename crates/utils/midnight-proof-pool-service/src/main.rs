@@ -351,6 +351,11 @@ struct FlushSummary {
     results: Vec<FlushResultEntry>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PendingHashesResponse {
+    tx_hashes: Vec<String>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     init_tracing();
@@ -803,7 +808,7 @@ async fn send_impl(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    let ready = apply_flush_results(&state, &flush).await;
+    let ready = apply_flush_results(&state, &tx_hashes, &flush).await;
 
     Ok(Json(SendResponse {
         requested,
@@ -857,7 +862,7 @@ async fn burst_impl(
                 .await
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-            let ready = apply_flush_results(&state, &flush).await;
+            let ready = apply_flush_results(&state, &tx_hashes, &flush).await;
 
             steps.push(BurstStep {
                 requested,
@@ -911,7 +916,48 @@ async fn collect_pending_hashes(state: &Arc<ServiceState>, limit: usize) -> Vec<
         .collect()
 }
 
-async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) -> usize {
+async fn fetch_pending_hashes_from_verifier(state: &Arc<ServiceState>) -> Result<HashSet<String>> {
+    let url = format!(
+        "{}/midnight-privacy/pending_hashes",
+        state.verifier_url.trim_end_matches('/')
+    );
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "verifier pending_hashes failed (status={}): {}",
+            status,
+            body
+        );
+    }
+
+    let parsed: PendingHashesResponse =
+        serde_json::from_str(&body).context("Failed to parse verifier pending_hashes response")?;
+    Ok(parsed.tx_hashes.into_iter().collect())
+}
+
+async fn apply_flush_results(
+    state: &Arc<ServiceState>,
+    requested_tx_hashes: &[String],
+    flush: &FlushSummary,
+) -> usize {
+    let mut accepted_hashes: HashSet<String> = HashSet::new();
+    for entry in flush.results.iter() {
+        let Some(tx_hash) = entry.tx_hash.as_ref() else {
+            continue;
+        };
+        if entry.accepted {
+            accepted_hashes.insert(tx_hash.clone());
+        }
+    }
+
     let mut wallets = state.wallets.write().await;
     let mut by_hash: HashMap<String, usize> = HashMap::new();
     for (idx, w) in wallets.iter().enumerate() {
@@ -920,11 +966,9 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
         }
     }
 
-    let mut cleared = 0usize;
-    for entry in flush.results.iter() {
-        let Some(ref tx_hash) = entry.tx_hash else {
-            continue;
-        };
+    let mut consumed = 0usize;
+    let mut advanced = 0usize;
+    for tx_hash in requested_tx_hashes.iter() {
         let Some(&wallet_idx) = by_hash.get(tx_hash) else {
             continue;
         };
@@ -937,24 +981,34 @@ async fn apply_flush_results(state: &Arc<ServiceState>, flush: &FlushSummary) ->
             continue;
         }
 
-        if entry.accepted {
+        if accepted_hashes.contains(tx_hash) {
             w.current_note = Some(pending.next_note);
+            advanced += 1;
         }
         w.pending = None;
-        cleared += 1;
+        consumed += 1;
     }
 
+    let ready_after = wallets.iter().filter(|w| w.pending.is_some()).count();
     drop(wallets);
-    if cleared > 0 {
-        let _ = state
-            .ready_proofs_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(cleared))
-            });
+
+    state
+        .ready_proofs_count
+        .store(ready_after, Ordering::Relaxed);
+    if consumed > 0 {
         request_pool_state_save(state);
     }
 
-    ready_proofs(state)
+    tracing::info!(
+        requested = requested_tx_hashes.len(),
+        flushed = flush.flushed,
+        consumed,
+        advanced,
+        ready_after,
+        "Applied flush results and consumed requested pending proofs"
+    );
+
+    ready_after
 }
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
@@ -2377,6 +2431,46 @@ async fn load_pool_state_sqlite(db_path: &str) -> Result<Option<PersistedPoolSta
         .context("Pool state SQLite load task failed to join")?
 }
 
+async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) -> Result<()> {
+    let pending_hashes = fetch_pending_hashes_from_verifier(state).await?;
+
+    let mut kept_pending = 0usize;
+    let mut cleared_not_pending = 0usize;
+
+    let mut wallets = state.wallets.write().await;
+    for wallet in wallets.iter_mut() {
+        let Some(pending) = wallet.pending.clone() else {
+            continue;
+        };
+
+        if pending_hashes.contains(&pending.tx_hash) {
+            kept_pending += 1;
+        } else {
+            wallet.pending = None;
+            cleared_not_pending += 1;
+        }
+    }
+
+    let ready_after = wallets.iter().filter(|w| w.pending.is_some()).count();
+    drop(wallets);
+
+    state
+        .ready_proofs_count
+        .store(ready_after, Ordering::Relaxed);
+    if cleared_not_pending > 0 {
+        request_pool_state_save(state);
+    }
+
+    tracing::info!(
+        kept_pending,
+        cleared_not_pending,
+        ready_after,
+        "Reconciled restored pending proofs against worker_verified_transactions"
+    );
+
+    Ok(())
+}
+
 /// Restore wallets from a persisted SQLite DB.
 /// Returns `Ok(true)` if wallets were restored, `Ok(false)` if no state DB found.
 async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
@@ -2450,7 +2544,14 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
         .ready_proofs_count
         .store(ready_count, Ordering::Relaxed);
 
-    tracing::info!(wallet_count, ready_count, "Wallets restored from state DB");
+    reconcile_restored_pending_with_worker_db(state).await?;
+
+    let ready_count_after_reconcile = ready_proofs(state);
+    tracing::info!(
+        wallet_count,
+        ready_count = ready_count_after_reconcile,
+        "Wallets restored from state DB"
+    );
 
     Ok(true)
 }

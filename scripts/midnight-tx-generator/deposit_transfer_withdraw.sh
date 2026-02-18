@@ -71,12 +71,8 @@ REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   export CARGO_TARGET_DIR="$REPO_ROOT/target"
 fi
-BUILD_PROFILE="${BUILD_PROFILE:-debug}"
-BIN_DIR="$CARGO_TARGET_DIR/$BUILD_PROFILE"
-CARGO_BUILD_FLAGS=()
-if [ "$BUILD_PROFILE" = "release" ]; then
-  CARGO_BUILD_FLAGS+=(--release)
-fi
+BIN_DIR="$CARGO_TARGET_DIR/release"
+CARGO_BUILD_FLAGS=(--release)
 
 PRIVATE_KEY_FILE="${PRIVATE_KEY_FILE:-$REPO_ROOT/examples/test-data/keys/tx_signer_private_key.json}"
 RECIPIENT="${RECIPIENT:-sov1v870parxhssv5wyz634wqlt9yflrrnawlwzjhj8409q4yevcj3s}"

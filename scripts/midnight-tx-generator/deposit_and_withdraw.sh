@@ -71,12 +71,8 @@ REPO_ROOT="$(cd "$GENERATOR_DIR/../.." && pwd)"
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   export CARGO_TARGET_DIR="$REPO_ROOT/target"
 fi
-BUILD_PROFILE="${BUILD_PROFILE:-debug}"
-BIN_DIR="$CARGO_TARGET_DIR/$BUILD_PROFILE"
-CARGO_BUILD_FLAGS=()
-if [ "$BUILD_PROFILE" = "release" ]; then
-  CARGO_BUILD_FLAGS+=(--release)
-fi
+BIN_DIR="$CARGO_TARGET_DIR/release"
+CARGO_BUILD_FLAGS=(--release)
 
 # Determine a base nonce: prefer node-reported latest nonce + 1, fallback to local monotonic .last_nonce, then time
 # Note: Chain generation numbers use milliseconds, so we use $(date +%s)000 as fallback

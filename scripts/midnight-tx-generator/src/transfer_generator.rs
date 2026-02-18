@@ -405,7 +405,7 @@ fn main() -> Result<()> {
         anchor_root: anchor,
         // Filled after fetching deny-map openings.
         blacklist_root: midnight_privacy::default_blacklist_root(),
-        nullifier: nf,
+        nullifiers: vec![nf],
         withdraw_amount: 0, // Pure shielded transfer
         output_commitments: vec![cm_out1, cm_out2],
         view_attestations: None,
@@ -601,7 +601,7 @@ fn main() -> Result<()> {
     let msg = RuntimeCall::<DemoRollupSpec>::MidnightPrivacy(CallMessage::Transfer {
         proof: proof_safe,
         anchor_root: anchor,
-        nullifier: nf,
+        nullifiers: vec![nf],
         gas: None,
         view_ciphertexts,
     });
