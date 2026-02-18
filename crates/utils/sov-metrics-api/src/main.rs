@@ -23,6 +23,13 @@ async fn main() -> anyhow::Result<()> {
     let tsink_data_path = config.tsink_data_path;
     let tsink_retention_secs = config.tsink_retention_secs;
     let peak_tps_multiplier = config.peak_tps_multiplier;
+    let da_postgres_max_connections = config.da_postgres_max_connections;
+    let da_postgres_min_connections = config.da_postgres_min_connections;
+    let indexer_postgres_max_connections = config.indexer_postgres_max_connections;
+    let indexer_postgres_min_connections = config.indexer_postgres_min_connections;
+    let postgres_acquire_timeout_secs = config.postgres_acquire_timeout_secs;
+    let postgres_idle_timeout_secs = config.postgres_idle_timeout_secs;
+    let postgres_max_lifetime_secs = config.postgres_max_lifetime_secs;
 
     let ledger_http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -30,12 +37,32 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to build ledger API HTTP client")?;
 
     let mut connection_options = ConnectOptions::new(da_conn.clone());
+    if is_postgres_connection_string(&da_conn) {
+        apply_postgres_pool_options(
+            &mut connection_options,
+            da_postgres_max_connections,
+            da_postgres_min_connections,
+            postgres_acquire_timeout_secs,
+            postgres_idle_timeout_secs,
+            postgres_max_lifetime_secs,
+        );
+    }
     connection_options.sqlx_logging(false);
     let db = Database::connect(connection_options)
         .await
         .with_context(|| format!("Failed to connect DB {da_conn}"))?;
 
     let mut indexer_options = ConnectOptions::new(indexer_conn.clone());
+    if is_postgres_connection_string(&indexer_conn) {
+        apply_postgres_pool_options(
+            &mut indexer_options,
+            indexer_postgres_max_connections,
+            indexer_postgres_min_connections,
+            postgres_acquire_timeout_secs,
+            postgres_idle_timeout_secs,
+            postgres_max_lifetime_secs,
+        );
+    }
     indexer_options.sqlx_logging(false);
     let indexer_db = Database::connect(indexer_options)
         .await
@@ -47,13 +74,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());
-    manager
-        .register(
-            metrics::collectors::average_transaction_size::AverageTransactionSizeCollector::new(
-                indexer_db.clone(),
-            ),
-        )
-        .await;
+    // Intentionally no "average-transaction-size" collector:
+    // this metric is derived at read time from MV/tsink to avoid duplicate DB polling.
     manager
         .register(
             metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
@@ -113,4 +135,24 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn is_postgres_connection_string(connection_string: &str) -> bool {
+    connection_string.starts_with("postgres://") || connection_string.starts_with("postgresql://")
+}
+
+fn apply_postgres_pool_options(
+    options: &mut ConnectOptions,
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout_secs: u64,
+    idle_timeout_secs: u64,
+    max_lifetime_secs: u64,
+) {
+    options
+        .max_connections(max_connections)
+        .min_connections(min_connections.min(max_connections))
+        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+        .idle_timeout(Duration::from_secs(idle_timeout_secs))
+        .max_lifetime(Duration::from_secs(max_lifetime_secs));
 }

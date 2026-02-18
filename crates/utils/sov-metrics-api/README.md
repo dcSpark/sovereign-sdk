@@ -15,6 +15,13 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `TSINK_DATA_PATH` (required): directory path for tsink on-disk storage.
 - `TSINK_RETENTION_SECONDS` (optional): tsink retention window in seconds, default 432000 (5 days).
 - `METRICS_API_BIND` (optional): listen address, default `0.0.0.0:13200`
+- `SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS` (optional): max Postgres pool size for DA DB, default `10`.
+- `SOV_METRICS_API_DA_POSTGRES_MIN_CONNECTIONS` (optional): min Postgres pool size for DA DB, default `0`.
+- `SOV_METRICS_API_INDEXER_POSTGRES_MAX_CONNECTIONS` (optional): max Postgres pool size for indexer DB, default `10`.
+- `SOV_METRICS_API_INDEXER_POSTGRES_MIN_CONNECTIONS` (optional): min Postgres pool size for indexer DB, default `0`.
+- `SOV_METRICS_API_POSTGRES_ACQUIRE_TIMEOUT_SECS` (optional): pool acquire timeout seconds, default `30`.
+- `SOV_METRICS_API_POSTGRES_IDLE_TIMEOUT_SECS` (optional): pool idle timeout seconds, default `600`.
+- `SOV_METRICS_API_POSTGRES_MAX_LIFETIME_SECS` (optional): pool max lifetime seconds, default `1800`.
 
 ## Behavior
 
