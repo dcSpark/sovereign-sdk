@@ -472,6 +472,52 @@ pub struct BlacklistNodeKey {
     pub index: u64,
 }
 
+/// Key for a node in the note/nullifier Merkle trees.
+///
+/// Height 0 is a leaf. Height `depth` is the root.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
+pub struct MerkleNodeKey {
+    /// Node height (0 = leaf).
+    pub height: u8,
+    /// Node index at this height.
+    pub index: u64,
+}
+
+impl fmt::Display for MerkleNodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.height, self.index)
+    }
+}
+
+impl FromStr for MerkleNodeKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('_').collect();
+        if parts.len() != 2 {
+            return Err("Invalid format: expected height_index".to_string());
+        }
+        let height = parts[0]
+            .parse::<u8>()
+            .map_err(|e| format!("Failed to parse height: {e}"))?;
+        let index = parts[1]
+            .parse::<u64>()
+            .map_err(|e| format!("Failed to parse index: {e}"))?;
+        Ok(MerkleNodeKey { height, index })
+    }
+}
+
 impl fmt::Display for BlacklistNodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}_{}", self.height, self.index)
@@ -724,4 +770,24 @@ pub struct PendingNullifierPrefix {
     pub height: u64,
 }
 
+/// Compute the default nodes for a dense Merkle tree used by commitments/nullifiers.
+///
+/// Returns a vector of length `depth + 1` where:
+/// - `out[0]` is the default leaf (`0x00..00`)
+/// - `out[h]` is the default node at height `h`
+pub fn mt_default_nodes(depth: u8) -> Vec<Hash32> {
+    let mut out: Vec<Hash32> = Vec::with_capacity(depth as usize + 1);
+    out.push([0u8; 32]);
+    for lvl in 0..depth {
+        let prev = out[lvl as usize];
+        out.push(mt_combine(lvl, &prev, &prev));
+    }
+    out
+}
+
+/// Compute the all-default root for the note/nullifier Merkle tree.
+#[inline]
+pub fn mt_default_root(depth: u8) -> Hash32 {
+    mt_default_nodes(depth)[depth as usize]
+}
 // (tests live in `tests/ivk_crypto_tests.rs`)

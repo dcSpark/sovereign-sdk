@@ -1705,6 +1705,13 @@ async fn perform_transfer_cycle(
     let mut pos_by_cm = std::mem::take(cached_pos_by_cm);
     let mut cached_root_val = *cached_root;
     let mut cached_next_pos = *cached_next_position;
+    let mut slot_fetch_ms_total = 0.0f64;
+    let mut notes_fetch_ms_total = 0.0f64;
+    let mut apply_ms_total = 0.0f64;
+    let mut root_check_ms_total = 0.0f64;
+    let mut notes_applied_total = 0usize;
+    let mut contiguous_apply_batches = 0usize;
+    let mut fallback_apply_batches = 0usize;
     {
         let mut rebuild_succeeded = false;
 
@@ -1712,6 +1719,7 @@ async fn perform_transfer_cycle(
             attempts_made = attempt + 1;
             let is_last_attempt = attempt + 1 == TREE_REBUILD_MAX_RETRIES;
 
+            let slot_fetch_started = Instant::now();
             let slot_number = match fetch_latest_slot_number(client).await {
                 Ok(slot) => slot,
                 Err(err) => {
@@ -1728,7 +1736,9 @@ async fn perform_transfer_cycle(
                     continue;
                 }
             };
+            slot_fetch_ms_total += slot_fetch_started.elapsed().as_secs_f64() * 1000.0;
 
+            let notes_fetch_started = Instant::now();
             let mut notes_fetch = match fetch_notes_for_rebuild(
                 client,
                 cached_next_pos as usize,
@@ -1757,6 +1767,7 @@ async fn perform_transfer_cycle(
                     continue;
                 }
             };
+            notes_fetch_ms_total += notes_fetch_started.elapsed().as_secs_f64() * 1000.0;
 
             let snapshot = notes_fetch.snapshot;
             let cache_matches_snapshot =
@@ -1780,6 +1791,7 @@ async fn perform_transfer_cycle(
                 cached_next_pos = 0;
                 cached_root_val = None;
 
+                let notes_fetch_started = Instant::now();
                 notes_fetch = match fetch_notes_for_rebuild(
                     client,
                     0,
@@ -1808,24 +1820,66 @@ async fn perform_transfer_cycle(
                         continue;
                     }
                 };
+                notes_fetch_ms_total += notes_fetch_started.elapsed().as_secs_f64() * 1000.0;
             }
 
+            let expected_root = notes_fetch.snapshot.root;
+            let expected_next_position = notes_fetch.snapshot.next_position;
+            let notes = notes_fetch.notes;
+            let notes_len = notes.len();
+            notes_applied_total += notes_len;
+
+            let apply_started = Instant::now();
             let target_leaves = notes_fetch.snapshot.next_position as usize;
             if target_leaves > mt.len() {
                 mt.grow_to_fit(target_leaves);
             }
-            for (position, cm) in notes_fetch.notes {
-                if position as usize >= mt.len() {
-                    mt.grow_to_fit(position as usize + 1);
-                }
-                mt.set_leaf(position as usize, cm);
-                pos_by_cm.insert(cm, position);
-            }
 
-            let expected_root = notes_fetch.snapshot.root;
-            if mt.root().as_slice() == expected_root.as_slice() {
+            if !notes.is_empty() {
+                let mut contiguous_start = 0usize;
+                let mut is_contiguous = true;
+                for (idx, (position, _)) in notes.iter().enumerate() {
+                    let pos = *position as usize;
+                    if idx == 0 {
+                        contiguous_start = pos;
+                        continue;
+                    }
+                    if pos != contiguous_start + idx {
+                        is_contiguous = false;
+                        break;
+                    }
+                }
+
+                if is_contiguous {
+                    let mut values = Vec::with_capacity(notes_len);
+                    for (_, cm) in notes {
+                        values.push(cm);
+                    }
+                    mt.set_leaves_contiguous(contiguous_start, &values);
+                    for (idx, cm) in values.into_iter().enumerate() {
+                        pos_by_cm.insert(cm, (contiguous_start + idx) as u64);
+                    }
+                    contiguous_apply_batches += 1;
+                } else {
+                    for (position, cm) in notes {
+                        if position as usize >= mt.len() {
+                            mt.grow_to_fit(position as usize + 1);
+                        }
+                        mt.set_leaf(position as usize, cm);
+                        pos_by_cm.insert(cm, position);
+                    }
+                    fallback_apply_batches += 1;
+                }
+            }
+            apply_ms_total += apply_started.elapsed().as_secs_f64() * 1000.0;
+
+            let root_check_started = Instant::now();
+            let rebuilt_root = mt.root();
+            let root_matches = rebuilt_root.as_slice() == expected_root.as_slice();
+            root_check_ms_total += root_check_started.elapsed().as_secs_f64() * 1000.0;
+            if root_matches {
                 cached_root_val = Some(expected_root);
-                cached_next_pos = notes_fetch.snapshot.next_position;
+                cached_next_pos = expected_next_position;
                 rebuild_succeeded = true;
                 break;
             }
@@ -1833,7 +1887,7 @@ async fn perform_transfer_cycle(
             eprintln!(
                 "[cycle] Tree root mismatch on attempt {}: rebuilt={} vs expected={}",
                 attempt + 1,
-                hex::encode(mt.root()),
+                hex::encode(rebuilt_root),
                 hex::encode(expected_root)
             );
             mt = MerkleTree::new(TREE_DEPTH);
@@ -1851,9 +1905,16 @@ async fn perform_transfer_cycle(
     }
     let tree_rebuild_phase_elapsed = tree_rebuild_phase_start.elapsed();
     eprintln!(
-        "[cycle] tree rebuild finished in {:.2} ms after {} attempt(s)",
+        "[cycle] tree rebuild finished in {:.2} ms after {} attempt(s) [slot_fetch={:.2} ms, notes_fetch={:.2} ms, apply={:.2} ms, root_check={:.2} ms, notes_applied={}, contiguous_batches={}, fallback_batches={}]",
         tree_rebuild_phase_elapsed.as_secs_f64() * 1000.0,
-        attempts_made
+        attempts_made,
+        slot_fetch_ms_total,
+        notes_fetch_ms_total,
+        apply_ms_total,
+        root_check_ms_total,
+        notes_applied_total,
+        contiguous_apply_batches,
+        fallback_apply_batches
     );
 
     // Use the verified tree root as anchor. Previously we fetched /roots/recent and picked

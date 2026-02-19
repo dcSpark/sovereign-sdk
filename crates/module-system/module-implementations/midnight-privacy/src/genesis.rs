@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use sov_modules_api::{GenesisState, Spec};
 
 use super::ValueMidnightPrivacy;
-use crate::hash::{default_blacklist_root, Hash32, RootKey};
-use crate::merkle::{MerkleTree, MAX_TREE_DEPTH};
+use crate::hash::{default_blacklist_root, mt_default_root, Hash32, RootKey};
+use crate::merkle::MAX_TREE_DEPTH;
 
 /// Initial configuration for midnight-privacy module.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, PartialEq, JsonSchema)]
@@ -86,24 +86,25 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
         self.domain.set(&config.domain, state)?;
         self.token_id.set(&config.token_id, state)?;
 
-        // Initialize the commitment tree
-        let tree = MerkleTree::new(config.tree_depth);
-        self.commitment_tree.set(&tree, state)?;
+        // Initialize commitment tree sparse metadata
+        self.commitment_tree_depth.set(&config.tree_depth, state)?;
+        let commitment_root = mt_default_root(config.tree_depth);
+        self.commitment_root.set(&commitment_root, state)?;
 
         // Initialize the next position to 0
         self.next_position.set(&0u64, state)?;
 
-        // Initialize the nullifier tree (Aztec-style dual-tree design)
+        // Initialize nullifier tree sparse metadata (Aztec-style dual-tree design)
         // Uses the same initial depth as commitment tree; both can grow dynamically.
-        let nf_tree = MerkleTree::new(config.tree_depth);
-        self.nullifier_tree.set(&nf_tree, state)?;
+        self.nullifier_tree_depth.set(&config.tree_depth, state)?;
+        self.nullifier_root.set(&commitment_root, state)?;
         self.next_nullifier_position.set(&0u64, state)?;
 
         // Set the root window size
         self.root_window_size.set(&config.root_window_size, state)?;
 
         // Initialize recent roots with the initial (empty) tree root
-        let initial_root = tree.root();
+        let initial_root = commitment_root;
         let mut roots_deque = VecDeque::new();
         roots_deque.push_back(initial_root);
         self.recent_roots.set(&roots_deque, state)?;

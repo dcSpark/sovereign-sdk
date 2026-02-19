@@ -611,6 +611,16 @@ where
             data_to_commit.add_batch(receipt);
         }
 
+        if transaction_count > 0 {
+            info!(
+                da_height = filtered_block_header.height(),
+                rollup_height = %slot_result.rollup_height,
+                batches_in_block = batch_count,
+                txs_in_block = transaction_count,
+                "Block transactions included"
+            );
+        }
+
         let transition_data: StateTransitionWitness<Stf::StateRoot, Stf::Witness, Da::Spec> =
             StateTransitionWitness {
                 initial_state_root: self.get_state_root().clone(),

@@ -179,13 +179,13 @@ fn transfer_rejects_blacklist_root_mismatch() {
     .unwrap();
 
     // Build a pre-verified spend with the *default* root (mismatch).
-    let anchor_root = mp.commitment_tree.get(&mut ws).unwrap().unwrap().root();
+    let anchor_root = mp.commitment_root.get(&mut ws).unwrap().unwrap();
     let nullifier: Hash32 = [0x10u8; 32];
     let output: Hash32 = [0x22u8; 32];
     let public = SpendPublic {
         anchor_root,
         blacklist_root: default_blacklist_root(),
-        nullifier,
+        nullifiers: vec![nullifier],
         withdraw_amount: 0,
         output_commitments: vec![output],
         view_attestations: None,
@@ -198,7 +198,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
             CallMessage::Transfer {
                 proof: Default::default(),
                 anchor_root: public.anchor_root,
-                nullifier: public.nullifier,
+                nullifiers: public.nullifiers.clone(),
                 view_ciphertexts: None,
                 gas: Some(<TestSpec as Spec>::Gas::zero()),
             },
@@ -208,5 +208,7 @@ fn transfer_rejects_blacklist_root_mismatch() {
         .unwrap_err();
     assert!(err.to_string().contains("Blacklist root mismatch"));
 
-    clear_pre_verified_spend(&public.nullifier);
+    for nullifier in &public.nullifiers {
+        clear_pre_verified_spend(nullifier);
+    }
 }

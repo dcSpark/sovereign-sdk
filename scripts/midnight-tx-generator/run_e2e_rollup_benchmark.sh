@@ -19,6 +19,7 @@ Options:
   --node-url <url>         Sequencer REST URL (default: http://127.0.0.1:12346)
   --verifier-url <url>     Proof verifier endpoint (default: http://127.0.0.1:8080)
   --num-deposits <n>       Number of deposits/transfers to submit (default: 10)
+  --deposits-only          Submit deposits only (skip transfer phase)
   --threads <n>            Tokio worker + blocking threads to use (default: detected CPU count)
   --cache                  Enable proof caching (disabled by default)
   --verify                 Enable local proof verification (disabled by default)
@@ -33,6 +34,7 @@ VERIFIER_URL="$VERIFIER_URL_DEFAULT"
 NUM_DEPOSITS="$NUM_DEPOSITS_DEFAULT"
 USE_CACHE=0
 USE_VERIFY=0
+DEPOSITS_ONLY=0
 
 while (($#)); do
     case "$1" in
@@ -42,6 +44,8 @@ while (($#)); do
             VERIFIER_URL="$2"; shift 2;;
         --num-deposits)
             NUM_DEPOSITS="$2"; shift 2;;
+        --deposits-only)
+            DEPOSITS_ONLY=1; shift;;
         --threads)
             TOKIO_THREADS="$2"; shift 2;;
         --cache)
@@ -80,6 +84,7 @@ echo "Running e2e benchmark with:"
 echo "  Node URL:      $NODE_URL"
 echo "  Verifier URL:  $VERIFIER_URL"
 echo "  Deposits:      $NUM_DEPOSITS"
+echo "  Deposits only: $(if [[ "$DEPOSITS_ONLY" -eq 1 ]]; then echo "yes"; else echo "no"; fi)"
 echo "  Tokio threads: $TOKIO_THREADS"
 echo "  Proof cache:   $(if [[ "$USE_CACHE" -eq 1 ]]; then echo "enabled"; else echo "disabled"; fi)"
 echo "  Verification:  $(if [[ "$USE_VERIFY" -eq 1 ]]; then echo "enabled"; else echo "disabled"; fi)"
@@ -87,7 +92,7 @@ echo ""
 
 cd "$REPO_ROOT"
 
-CARGO_CMD=(cargo run -p sov-rollup-ligero --bin e2e_runner_cli)
+CARGO_CMD=(cargo run -p midnight-e2e-benchmarks --bin e2e_runner_cli)
 if [[ "$RUN_RELEASE" -eq 1 ]]; then
     CARGO_CMD+=(--release)
 fi
@@ -98,7 +103,12 @@ fi
 if [[ "$USE_VERIFY" -eq 1 ]]; then
     CLI_ARGS+=(--verify)
 fi
-CLI_ARGS+=("${EXTRA_RUN_ARGS[@]}")
+if [[ "$DEPOSITS_ONLY" -eq 1 ]]; then
+    CLI_ARGS+=(--deposits-only)
+fi
+if [[ "${#EXTRA_RUN_ARGS[@]}" -gt 0 ]]; then
+    CLI_ARGS+=("${EXTRA_RUN_ARGS[@]}")
+fi
 CARGO_CMD+=(--)
 CARGO_CMD+=("${CLI_ARGS[@]}")
 
