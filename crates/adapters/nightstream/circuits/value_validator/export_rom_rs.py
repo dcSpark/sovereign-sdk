@@ -102,10 +102,10 @@ def main() -> int:
     skip_build = "--skip-build" in sys.argv
 
     if not skip_build:
-        print("Building value_validator guest (riscv32im-unknown-none-elf)...")
+        print("Building value_validator guest (riscv32i-unknown-none-elf)...")
         subprocess.run(["cargo", "build", "--release"], cwd=guest_dir, check=True)
 
-    elf = guest_dir / "target/riscv32im-unknown-none-elf/release/value_validator"
+    elf = guest_dir / "target/riscv32i-unknown-none-elf/release/value_validator"
     if not elf.exists():
         raise FileNotFoundError(f"missing expected ELF: {elf}")
 
