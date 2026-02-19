@@ -523,7 +523,30 @@ async fn release_advisory_lock(
     refresh_conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     lock_key: i64,
 ) -> Result<()> {
-    let row = sqlx::query("SELECT pg_advisory_unlock($1) AS locked")
+    // Avoid calling pg_advisory_unlock when the session no longer owns this lock key.
+    // Calling unlock without ownership emits a PostgreSQL notice:
+    // "you don't own a lock of type ExclusiveLock".
+    let row = sqlx::query(
+        r#"
+WITH key_parts AS (
+    SELECT
+        (($1::bigint >> 32) & 4294967295)::oid AS classid,
+        ($1::bigint & 4294967295)::oid AS objid
+)
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1
+        FROM pg_locks l
+        JOIN key_parts k ON l.classid = k.classid AND l.objid = k.objid
+        WHERE l.locktype = 'advisory'
+          AND l.pid = pg_backend_pid()
+          AND l.objsubid = 1
+    )
+    THEN pg_advisory_unlock($1::bigint)
+    ELSE TRUE
+END AS locked
+"#,
+    )
         .bind(lock_key)
         .fetch_one(&mut **refresh_conn)
         .await

@@ -120,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         retention_secs: tsink_retention_secs,
         tps_peak_cache: api::TpsPeakCache::new(),
+        ema_metrics_cache: api::EmaMetricsCache::new(),
         indexer_db: indexer_db.clone(),
         peak_tps_multiplier,
         ledger_api_base_url: ledger_api_base_url.clone(),

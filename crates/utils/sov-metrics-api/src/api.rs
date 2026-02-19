@@ -9,7 +9,7 @@ use sea_orm::DatabaseConnection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -54,11 +54,36 @@ impl TpsPeakCache {
     }
 }
 
+/// Cached EMA metrics response for a specific window.
+#[derive(Clone, Debug)]
+struct EmaMetricsCacheEntry {
+    response: EmaMetricsResponse,
+    computed_at_ms: i64,
+}
+
+/// Thread-safe cache for EMA metrics endpoints.
+#[derive(Clone, Default)]
+pub struct EmaMetricsCache {
+    inner: Arc<RwLock<BTreeMap<&'static str, EmaMetricsCacheEntry>>>,
+    /// Single-flight lock to avoid stampedes when cache entries expire.
+    compute_lock: Arc<Mutex<()>>,
+}
+
+impl EmaMetricsCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            compute_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: MetricsStore,
     pub retention_secs: u64,
     pub tps_peak_cache: TpsPeakCache,
+    pub ema_metrics_cache: EmaMetricsCache,
     pub indexer_db: DatabaseConnection,
     /// Multiplier applied to PeakTPS metric output.
     pub peak_tps_multiplier: f64,
@@ -339,6 +364,16 @@ async fn tps_historic(
 /// Cache is valid if computed within this threshold (30 seconds).
 const TPS_PEAK_CACHE_THRESHOLD_MS: i64 = 30 * 1000;
 
+fn ema_metrics_cache_ttl_ms(window: EmaWindow) -> i64 {
+    match window {
+        EmaWindow::S2 => 250,
+        EmaWindow::S5 => 500,
+        EmaWindow::M1 => 1_000,
+        EmaWindow::M5 => 2_000,
+        EmaWindow::M15 => 2_000,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/tps/peak",
@@ -482,6 +517,53 @@ async fn metrics_m15(State(state): State<AppState>) -> Json<EmaMetricsResponse> 
 /// This aggregates data from multiple metric series to produce the MockMCP-compatible
 /// response format.
 async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsResponse {
+    let key = window.path_suffix();
+    let ttl_ms = ema_metrics_cache_ttl_ms(window);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    if let Some(response) = load_cached_ema_metrics(state, key, now_ms, ttl_ms).await {
+        return response;
+    }
+
+    // Single-flight recomputation to avoid cache-expiry stampedes under load.
+    let _guard = state.ema_metrics_cache.compute_lock.lock().await;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(response) = load_cached_ema_metrics(state, key, now_ms, ttl_ms).await {
+        return response;
+    }
+
+    let response = compute_ema_metrics_uncached(state, window).await;
+    {
+        let mut cache = state.ema_metrics_cache.inner.write().await;
+        cache.insert(
+            key,
+            EmaMetricsCacheEntry {
+                response: response.clone(),
+                computed_at_ms: now_ms,
+            },
+        );
+    }
+
+    response
+}
+
+async fn load_cached_ema_metrics(
+    state: &AppState,
+    key: &'static str,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Option<EmaMetricsResponse> {
+    let cache = state.ema_metrics_cache.inner.read().await;
+    let entry = cache.get(key)?;
+    if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+        return Some(entry.response.clone());
+    }
+    None
+}
+
+/// Computes EMA metrics for a given window without cache lookups.
+async fn compute_ema_metrics_uncached(state: &AppState, window: EmaWindow) -> EmaMetricsResponse {
     // Get accounts data (latest snapshot)
     let accounts_data = state
         .store
@@ -2151,7 +2233,7 @@ fn map_average_transaction_size_sample(
 /// - `m1`: 1-minute window - good for short-term monitoring
 /// - `m5`: 5-minute window - balanced view for medium-term simulations
 /// - `m15`: 15-minute window - smoothest view for long-term trends
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 struct EmaMetricsResponse {
     /// Total number of created accounts.
