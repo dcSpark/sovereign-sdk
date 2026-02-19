@@ -264,12 +264,23 @@ fn assert_not_blacklisted(
 }
 
 // --- Level-B Viewer Attestation primitives ---
+//
+// Domain separation uses field-element tags (u64 constants) instead of byte
+// strings, avoiding the digest→bytes→u64 roundtrip for data already in field
+// elements. The ct_hash function still packs raw ciphertext bytes.
 
 /// Maximum plaintext length for viewer encryption:
 /// 32(domain) + 16(value LE) + 32(rho) + 32(recipient) + 32(sender_id) + 128(cm_ins[4]) = 272 bytes.
 const NOTE_PLAIN_LEN: usize = 272;
 
+const TAG_FVK_COMMIT: u64 = 100;
+const TAG_VIEW_KDF: u64 = 101;
+const TAG_VIEW_STREAM: u64 = 102;
+const TAG_CT_HASH: u64 = 103;
+const TAG_VIEW_MAC: u64 = 104;
+
 /// Convert a GlDigest to 32 bytes (LE encoding).
+/// Only needed for XOR encryption (byte-level operations).
 fn digest_to_bytes(d: &GlDigest) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..4 {
@@ -284,13 +295,9 @@ fn u64_to_le_bytes(v: u64) -> [u8; 8] {
     v.to_le_bytes()
 }
 
-/// Poseidon2 hash over packed bytes, matching neo-ccs `poseidon2_hash_packed_bytes`.
-///
-/// Encoding: 8 bytes per Goldilocks element (LE u64), length suffix for framing.
-/// Max supported: 504 bytes (63 data elements + 1 length = 64 total).
-fn poseidon2_hash_packed_bytes(bytes: &[u8], len: usize) -> GlDigest {
+/// Pack raw bytes into Goldilocks field elements (8 bytes per element, LE).
+fn pack_bytes_to_felts(bytes: &[u8], len: usize, out: &mut [u64]) -> usize {
     let n_elems = (len + 7) / 8;
-    let mut felts = [0u64; 64];
     let mut i = 0;
     while i < n_elems {
         let off = i * 8;
@@ -301,57 +308,55 @@ fn poseidon2_hash_packed_bytes(bytes: &[u8], len: usize) -> GlDigest {
             buf[j] = bytes[off + j];
             j += 1;
         }
-        felts[i] = u64::from_le_bytes(buf);
+        out[i] = u64::from_le_bytes(buf);
         i += 1;
     }
-    felts[n_elems] = len as u64;
-    poseidon2_hash(&felts[..n_elems + 1])
+    n_elems
 }
 
-/// FVK commitment: H(b"FVK_COMMIT_V1" || fvk_bytes)
+/// FVK commitment: H(TAG_FVK_COMMIT, fvk[0..4])
 fn view_fvk_commitment(fvk: &GlDigest) -> GlDigest {
-    let mut buf = [0u8; 13 + 32]; // tag(13) + fvk(32)
-    buf[..13].copy_from_slice(b"FVK_COMMIT_V1");
-    buf[13..45].copy_from_slice(&digest_to_bytes(fvk));
-    poseidon2_hash_packed_bytes(&buf, 45)
+    let mut input = [0u64; 5];
+    input[0] = TAG_FVK_COMMIT;
+    input[1..5].copy_from_slice(fvk);
+    poseidon2_hash(&input)
 }
 
-/// View KDF: H(b"VIEW_KDF_V1" || fvk_bytes || cm_bytes)
+/// View KDF: H(TAG_VIEW_KDF, fvk[0..4], cm[0..4])
 fn view_kdf(fvk: &GlDigest, cm: &GlDigest) -> GlDigest {
-    let mut buf = [0u8; 11 + 32 + 32]; // tag(11) + fvk(32) + cm(32)
-    buf[..11].copy_from_slice(b"VIEW_KDF_V1");
-    buf[11..43].copy_from_slice(&digest_to_bytes(fvk));
-    buf[43..75].copy_from_slice(&digest_to_bytes(cm));
-    poseidon2_hash_packed_bytes(&buf, 75)
+    let mut input = [0u64; 9];
+    input[0] = TAG_VIEW_KDF;
+    input[1..5].copy_from_slice(fvk);
+    input[5..9].copy_from_slice(cm);
+    poseidon2_hash(&input)
 }
 
-/// Stream block: H(b"VIEW_STREAM_V1" || k_bytes || ctr_le_4)
+/// Stream block: H(TAG_VIEW_STREAM, k[0..4], ctr)
 fn view_stream_block(k: &GlDigest, ctr: u32) -> GlDigest {
-    let mut buf = [0u8; 14 + 32 + 4]; // tag(14) + k(32) + ctr(4)
-    buf[..14].copy_from_slice(b"VIEW_STREAM_V1");
-    buf[14..46].copy_from_slice(&digest_to_bytes(k));
-    buf[46..50].copy_from_slice(&ctr.to_le_bytes());
-    poseidon2_hash_packed_bytes(&buf, 50)
+    let mut input = [0u64; 6];
+    input[0] = TAG_VIEW_STREAM;
+    input[1..5].copy_from_slice(k);
+    input[5] = ctr as u64;
+    poseidon2_hash(&input)
 }
 
-/// Ciphertext hash: H(b"CT_HASH_V1" || ct_bytes)
+/// Ciphertext hash: H(TAG_CT_HASH, packed_ct_bytes..., byte_len)
 fn view_ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> GlDigest {
-    let tag = b"CT_HASH_V1";
-    let total = tag.len() + NOTE_PLAIN_LEN; // 10 + 272 = 282
-    let mut buf = [0u8; 10 + NOTE_PLAIN_LEN];
-    buf[..10].copy_from_slice(tag);
-    buf[10..10 + NOTE_PLAIN_LEN].copy_from_slice(ct);
-    poseidon2_hash_packed_bytes(&buf, total)
+    let mut felts = [0u64; 1 + 34 + 1]; // tag + ceil(272/8) + length
+    felts[0] = TAG_CT_HASH;
+    let n = pack_bytes_to_felts(ct, NOTE_PLAIN_LEN, &mut felts[1..]);
+    felts[1 + n] = NOTE_PLAIN_LEN as u64;
+    poseidon2_hash(&felts[..1 + n + 1])
 }
 
-/// View MAC: H(b"VIEW_MAC_V1" || k_bytes || cm_bytes || ct_hash_bytes)
+/// View MAC: H(TAG_VIEW_MAC, k[0..4], cm[0..4], ct_h[0..4])
 fn view_mac(k: &GlDigest, cm: &GlDigest, ct_h: &GlDigest) -> GlDigest {
-    let mut buf = [0u8; 11 + 32 + 32 + 32]; // tag(11) + k(32) + cm(32) + ct_h(32)
-    buf[..11].copy_from_slice(b"VIEW_MAC_V1");
-    buf[11..43].copy_from_slice(&digest_to_bytes(k));
-    buf[43..75].copy_from_slice(&digest_to_bytes(cm));
-    buf[75..107].copy_from_slice(&digest_to_bytes(ct_h));
-    poseidon2_hash_packed_bytes(&buf, 107)
+    let mut input = [0u64; 13];
+    input[0] = TAG_VIEW_MAC;
+    input[1..5].copy_from_slice(k);
+    input[5..9].copy_from_slice(cm);
+    input[9..13].copy_from_slice(ct_h);
+    poseidon2_hash(&input)
 }
 
 /// XOR-encrypt plaintext with Poseidon2-based keystream.

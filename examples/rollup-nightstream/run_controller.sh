@@ -16,6 +16,7 @@
 #   --release          Build in release mode (default)
 #   --debug            Build in debug mode
 #   --no-auto-start    Don't auto-start services on launch
+#   --no-dashboard     Don't launch the controller dashboard
 #   --bind <ADDR>      Controller bind address (default: 127.0.0.1:9090)
 #   -h, --help         Show this help
 #
@@ -43,6 +44,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SKIP_BUILD=0
 RELEASE_MODE=1
 AUTO_START=1
+LAUNCH_DASHBOARD=1
 CONTROLLER_BIND="127.0.0.1:9090"
 
 while [ $# -gt 0 ]; do
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --release)       RELEASE_MODE=1 ;;
     --debug)         RELEASE_MODE=0 ;;
     --no-auto-start) AUTO_START=0 ;;
+    --no-dashboard)  LAUNCH_DASHBOARD=0 ;;
     --bind)          CONTROLLER_BIND="$2"; shift ;;
     -h|--help)
       sed -n '2,/^# =====/{/^# =====/d;s/^# \?//;p}' "$0"
@@ -139,6 +142,35 @@ print_step() { step=$((step+1)); echo ""; echo -e "${CYAN}${BOLD}[$step] $1${NC}
 print_ok()   { echo -e "  ${GREEN}OK${NC} $1"; }
 print_info() { echo -e "  ${YELLOW}INFO${NC} $1"; }
 
+KNOWN_BINARIES=(
+  rollup-nightstream-service-controller
+  sov-rollup-nightstream
+  proof-verifier
+  sov-indexer
+  midnight-proof-pool-service
+  mcp-external
+  sov-metrics-api
+  oracle
+  midnight-fvk-service
+)
+
+kill_known_processes() {
+  local signal="${1:-TERM}"
+  KILLED_COUNT=0
+  for name in "${KNOWN_BINARIES[@]}"; do
+    if pgrep -x "$name" >/dev/null 2>&1; then
+      pkill "-${signal}" -x "$name" 2>/dev/null || true
+      print_ok "Sent SIG${signal} to $name"
+      KILLED_COUNT=$((KILLED_COUNT+1))
+    fi
+  done
+  if pgrep -f "vite.*rollup-dashboard" >/dev/null 2>&1; then
+    pkill "-${signal}" -f "vite.*rollup-dashboard" 2>/dev/null || true
+    print_ok "Sent SIG${signal} to dashboard (vite)"
+    KILLED_COUNT=$((KILLED_COUNT+1))
+  fi
+}
+
 echo ""
 echo -e "${BOLD}Nightstream Service Controller${NC}"
 echo "═══════════════════════════════"
@@ -146,6 +178,7 @@ echo ""
 echo "  Repo root:          $REPO_ROOT"
 echo "  Controller bind:    $CONTROLLER_BIND"
 echo "  Auto-start:         $([ "$AUTO_START" -eq 1 ] && echo yes || echo no)"
+echo "  Dashboard:          $([ "$LAUNCH_DASHBOARD" -eq 1 ] && echo yes || echo no)"
 echo "  Release mode:       $([ "$RELEASE_MODE" -eq 1 ] && echo yes || echo no)"
 echo "  DA connection:      $DA_CONNECTION_STRING"
 echo "  Rollup RPC:         $ROLLUP_RPC_URL"
@@ -155,7 +188,28 @@ echo "  Proof pool bind:    $PROOF_POOL_BIND_ADDR"
 echo "  MCP bind:           $MCP_SERVER_BIND_ADDRESS"
 echo "  Metrics bind:       $METRICS_API_BIND"
 
-# ── Step 1: Build ─────────────────────────────────────────────────────────────
+# ── Step 1: Kill stale processes ──────────────────────────────────────────────
+
+print_step "Killing stale processes from previous runs"
+
+kill_known_processes TERM
+if [ "$KILLED_COUNT" -gt 0 ]; then
+  sleep 1
+  still_alive=0
+  for name in "${KNOWN_BINARIES[@]}"; do
+    if pgrep -x "$name" >/dev/null 2>&1; then still_alive=1; break; fi
+  done
+  if [ "$still_alive" -eq 1 ]; then
+    print_info "Some processes didn't exit, sending SIGKILL..."
+    kill_known_processes KILL
+    sleep 0.5
+  fi
+  print_ok "Stale processes cleaned up"
+else
+  print_ok "No stale processes found"
+fi
+
+# ── Step 2: Build ─────────────────────────────────────────────────────────────
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   print_step "Building service controller and dependencies"
@@ -197,7 +251,7 @@ else
   print_ok "Binary present"
 fi
 
-# ── Step 2: Verify service scripts ────────────────────────────────────────────
+# ── Step 3: Verify service scripts ────────────────────────────────────────────
 
 print_step "Checking service scripts"
 
@@ -222,7 +276,7 @@ for script_name in "${REQUIRED_SCRIPTS[@]}"; do
   fi
 done
 
-# ── Step 3: Seed bridge assets ────────────────────────────────────────────────
+# ── Step 4: Seed bridge assets ────────────────────────────────────────────────
 
 print_step "Seeding Midnight bridge assets"
 
@@ -248,7 +302,68 @@ else
   print_info "No assets/ directory — bridge asset seeding skipped"
 fi
 
-# ── Step 4: Launch ────────────────────────────────────────────────────────────
+# ── Exit trap: kill everything on shutdown ────────────────────────────────────
+
+DASHBOARD_DIR="$SCRIPT_DIR/utils/rollup-dashboard"
+DASHBOARD_PID=""
+
+cleanup() {
+  trap - EXIT INT TERM
+  echo ""
+  echo -e "${CYAN}${BOLD}Shutting down...${NC}"
+
+  if [ -n "$DASHBOARD_PID" ] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+    echo -e "  ${YELLOW}INFO${NC} Stopping dashboard (PID $DASHBOARD_PID)..."
+    kill "$DASHBOARD_PID" 2>/dev/null || true
+    wait "$DASHBOARD_PID" 2>/dev/null || true
+  fi
+
+  kill_known_processes TERM
+  if [ "$KILLED_COUNT" -gt 0 ]; then
+    sleep 1
+    still_alive=0
+    for name in "${KNOWN_BINARIES[@]}"; do
+      if pgrep -x "$name" >/dev/null 2>&1; then still_alive=1; break; fi
+    done
+    if [ "$still_alive" -eq 1 ]; then
+      echo -e "  ${YELLOW}INFO${NC} Force-killing remaining processes..."
+      kill_known_processes KILL
+    fi
+  fi
+
+  echo -e "  ${GREEN}OK${NC} All processes stopped"
+}
+trap cleanup EXIT INT TERM
+
+# ── Step 5: Dashboard ────────────────────────────────────────────────────────
+
+if [ "$LAUNCH_DASHBOARD" -eq 1 ]; then
+  print_step "Starting controller dashboard"
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}WARN${NC} node not found — skipping dashboard"
+    LAUNCH_DASHBOARD=0
+  elif ! command -v npm >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}WARN${NC} npm not found — skipping dashboard"
+    LAUNCH_DASHBOARD=0
+  fi
+fi
+
+if [ "$LAUNCH_DASHBOARD" -eq 1 ]; then
+  if [ ! -d "$DASHBOARD_DIR/node_modules" ]; then
+    print_info "Installing dashboard dependencies..."
+    (cd "$DASHBOARD_DIR" && npm install --no-fund --no-audit) 2>&1 | tail -3
+    print_ok "npm install"
+  else
+    print_ok "node_modules present"
+  fi
+
+  VITE_API_TARGET="http://$CONTROLLER_BIND" npm run dev --prefix "$DASHBOARD_DIR" &
+  DASHBOARD_PID=$!
+  print_ok "Dashboard running (PID $DASHBOARD_PID) — http://localhost:3333"
+fi
+
+# ── Step 6: Launch controller ────────────────────────────────────────────────
 
 print_step "Starting service controller"
 
@@ -261,8 +376,12 @@ echo "    http://$CONTROLLER_BIND/stop          — stop all"
 echo "    http://$CONTROLLER_BIND/restart       — restart all"
 echo "    http://$CONTROLLER_BIND/clean-database — truncate Postgres tables"
 echo "    ws://$CONTROLLER_BIND/logs            — live log stream"
+if [ "$LAUNCH_DASHBOARD" -eq 1 ]; then
+echo -e "  ${BOLD}Dashboard:${NC}"
+echo "    http://localhost:3333"
+fi
 echo ""
 echo "────────────────────────────────────────────────────"
 echo ""
 
-exec "$CONTROLLER_BIN"
+"$CONTROLLER_BIN"

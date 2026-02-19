@@ -31,11 +31,11 @@ sov-rollup-interface = { workspace = true }
 sov-mock-zkvm = { workspace = true }
 
 # Nightstream dependencies
-neo-fold = { git = "https://github.com/dcSpark/Nightstream", rev = "c7d9b3128c8d6fd627727e01bed2a12a44318476" }
-neo-math = { git = "https://github.com/dcSpark/Nightstream", rev = "c7d9b3128c8d6fd627727e01bed2a12a44318476" }
-neo-ajtai = { git = "https://github.com/dcSpark/Nightstream", rev = "c7d9b3128c8d6fd627727e01bed2a12a44318476" }
-neo-memory = { git = "https://github.com/dcSpark/Nightstream", rev = "c7d9b3128c8d6fd627727e01bed2a12a44318476" }
-neo-ccs = { git = "https://github.com/dcSpark/Nightstream", rev = "c7d9b3128c8d6fd627727e01bed2a12a44318476" }
+neo-fold = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458" }
+neo-math = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458" }
+neo-ajtai = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458" }
+neo-memory = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458" }
+neo-ccs = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

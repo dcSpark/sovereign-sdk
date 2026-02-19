@@ -7,7 +7,7 @@ target = "riscv32i-unknown-none-elf"
 # The linker symbols (_STACK_PTR, _NEO_HEAP_START, etc.) define the guest's *view* of
 # memory layout but the actual RAM size is set by the host.
 rustflags = [
-    "-C", "link-arg=-T../riscv32im-unknown-none-elf.ld",
+    "-C", "link-arg=-T../riscv32i-unknown-none-elf.ld",
     "-C", "target-feature=-c",
     # Place stack near top of 64KB RAM (host sets ram_bytes = 0x10000)
     "-C", "link-arg=--defsym=_STACK_PTR=0xFE00",

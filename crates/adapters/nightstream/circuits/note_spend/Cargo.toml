@@ -17,4 +17,4 @@ opt-level = "s"       # Optimize for code size (smaller ROM)
 lto = true            # Link-time optimization for smaller binaries
 
 [dependencies]
-nightstream-sdk = { git = "https://github.com/dcSpark/Nightstream", rev = "cca6616a2702091e67e271aca2b8dc21bb4b798b", default-features = false }
+nightstream-sdk = { git = "https://github.com/dcSpark/Nightstream", rev = "f63c84e587e525bcdae7551c02f464959a4d3458", default-features = false }

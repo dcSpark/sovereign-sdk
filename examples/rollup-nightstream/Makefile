@@ -4,7 +4,9 @@
 
 # Paths
 SOV_CLI_REL_PATH := ../../target/release/sov-cli
-LOCAL_DA_PG_URL ?= postgresql://admin:1234@localhost:5432/da
+LOCAL_DA_PG_URL      ?= postgresql://admin:1234@localhost:5432/da
+LOCAL_INDEXER_PG_URL ?= postgresql://admin:1234@localhost:5432/indexer
+LOCAL_FVK_PG_URL     ?= postgresql://admin:1234@localhost:5432/fvk
 
 all: build
 
@@ -39,7 +41,7 @@ clean:
 	@if [ -f "$(SOV_CLI_REL_PATH)" ]; then \
 		$(SOV_CLI_REL_PATH) transactions clean || true; \
 	fi
-	@echo "Truncating local PostgreSQL DA tables (if configured)..."
+	@echo "Truncating local PostgreSQL tables (if configured)..."
 	@set -eu; \
 	if command -v psql >/dev/null 2>&1; then \
 		truncate_pg_db() { \
@@ -64,6 +66,8 @@ clean:
 			fi; \
 		}; \
 		truncate_pg_db "$${DA_CONNECTION_STRING:-$(LOCAL_DA_PG_URL)}" "da"; \
+		truncate_pg_db "$${INDEX_DB:-$(LOCAL_INDEXER_PG_URL)}" "indexer"; \
+		truncate_pg_db "$${MIDNIGHT_FVK_SERVICE_DB:-$(LOCAL_FVK_PG_URL)}" "fvk"; \
 	else \
 		echo "  - skipping Postgres DB cleanup (psql not found)"; \
 	fi

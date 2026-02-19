@@ -1,4 +1,4 @@
-/* Nightstream guest linker script for riscv32im-unknown-none-elf.
+/* Nightstream guest linker script for riscv32i-unknown-none-elf.
  *
  * Vendored from: https://github.com/dcSpark/Nightstream
  *   crates/nightstream-sdk/guest/riscv32im-unknown-none-elf.ld
