@@ -547,10 +547,10 @@ SELECT CASE
 END AS locked
 "#,
     )
-        .bind(lock_key)
-        .fetch_one(&mut **refresh_conn)
-        .await
-        .context("Failed to release MV advisory lock")?;
+    .bind(lock_key)
+    .fetch_one(&mut **refresh_conn)
+    .await
+    .context("Failed to release MV advisory lock")?;
 
     let unlocked = row
         .try_get::<bool, _>("locked")

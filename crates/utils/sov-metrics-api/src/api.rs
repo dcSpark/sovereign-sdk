@@ -8,7 +8,10 @@ use axum::{
 use sea_orm::DatabaseConnection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
@@ -67,6 +70,8 @@ pub struct EmaMetricsCache {
     inner: Arc<RwLock<BTreeMap<&'static str, EmaMetricsCacheEntry>>>,
     /// Single-flight lock to avoid stampedes when cache entries expire.
     compute_lock: Arc<Mutex<()>>,
+    /// Ensures only one stale-cache refresh task runs at a time.
+    refresh_task_running: Arc<AtomicBool>,
 }
 
 impl EmaMetricsCache {
@@ -74,6 +79,7 @@ impl EmaMetricsCache {
         Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             compute_lock: Arc::new(Mutex::new(())),
+            refresh_task_running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -521,45 +527,99 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
     let ttl_ms = ema_metrics_cache_ttl_ms(window);
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    if let Some(response) = load_cached_ema_metrics(state, key, now_ms, ttl_ms).await {
-        return response;
+    if let Some(entry) = load_cached_ema_entry(state, key).await {
+        if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+            return entry.response;
+        }
+
+        // Serve stale response immediately and refresh in the background.
+        spawn_stale_ema_refresh_if_needed(state.clone(), window, key, ttl_ms);
+        return entry.response;
     }
 
-    // Single-flight recomputation to avoid cache-expiry stampedes under load.
+    // Cold cache path: block one request to populate cache so response shape remains unchanged.
     let _guard = state.ema_metrics_cache.compute_lock.lock().await;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    if let Some(response) = load_cached_ema_metrics(state, key, now_ms, ttl_ms).await {
-        return response;
+    if let Some(entry) = load_cached_ema_entry(state, key).await {
+        if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+            return entry.response;
+        }
     }
 
     let response = compute_ema_metrics_uncached(state, window).await;
-    {
-        let mut cache = state.ema_metrics_cache.inner.write().await;
-        cache.insert(
-            key,
-            EmaMetricsCacheEntry {
-                response: response.clone(),
-                computed_at_ms: now_ms,
-            },
-        );
-    }
+    store_ema_metrics_cache_entry(state, key, response.clone(), now_ms).await;
 
     response
 }
 
-async fn load_cached_ema_metrics(
+async fn load_cached_ema_entry(
     state: &AppState,
     key: &'static str,
-    now_ms: i64,
-    ttl_ms: i64,
-) -> Option<EmaMetricsResponse> {
+) -> Option<EmaMetricsCacheEntry> {
     let cache = state.ema_metrics_cache.inner.read().await;
-    let entry = cache.get(key)?;
-    if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
-        return Some(entry.response.clone());
+    cache.get(key).cloned()
+}
+
+async fn store_ema_metrics_cache_entry(
+    state: &AppState,
+    key: &'static str,
+    response: EmaMetricsResponse,
+    computed_at_ms: i64,
+) {
+    let mut cache = state.ema_metrics_cache.inner.write().await;
+    cache.insert(
+        key,
+        EmaMetricsCacheEntry {
+            response,
+            computed_at_ms,
+        },
+    );
+}
+
+struct EmaRefreshTaskGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for EmaRefreshTaskGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
-    None
+}
+
+fn spawn_stale_ema_refresh_if_needed(
+    state: AppState,
+    window: EmaWindow,
+    key: &'static str,
+    ttl_ms: i64,
+) {
+    if state
+        .ema_metrics_cache
+        .refresh_task_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let _refresh_guard = EmaRefreshTaskGuard {
+            flag: state.ema_metrics_cache.refresh_task_running.clone(),
+        };
+        let _compute_guard = state.ema_metrics_cache.compute_lock.lock().await;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(entry) = load_cached_ema_entry(&state, key).await {
+            // Another request may have already refreshed this window while this task was queued.
+            if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+                return;
+            }
+        }
+
+        let response = compute_ema_metrics_uncached(&state, window).await;
+        let computed_at_ms = chrono::Utc::now().timestamp_millis();
+        store_ema_metrics_cache_entry(&state, key, response, computed_at_ms).await;
+    });
 }
 
 /// Computes EMA metrics for a given window without cache lookups.
