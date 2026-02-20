@@ -54,10 +54,7 @@ where
                 TxReceiptContents<B::Spec>,
                 <B::Runtime as RuntimeEventProcessor>::RuntimeEvent,
             >::axum_router(ledger_db.clone(), shutdown_receiver.clone());
-        let ledger_state = LedgerState {
-            ledger: ledger_db.clone(),
-            shutdown_receiver,
-        };
+        let ledger_state = LedgerState::new(ledger_db.clone(), shutdown_receiver);
         endpoints.axum_router = endpoints
             .axum_router
             .merge(ledger_axum_router.with_state(ledger_state));

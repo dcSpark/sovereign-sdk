@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::Arc;
 
 use anyhow::Context;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State, WebSocketUpgrade};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -32,10 +37,11 @@ use sov_rollup_interface::node::ledger_api::{
     SlotIdentifier, SlotResponse, TxIdAndOffset, TxIdentifier, TxResponse,
 };
 use sov_rollup_interface::stf::TxReceiptContents;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 type PathMap = Path<HashMap<String, NumberOrHash>>;
 const TPS_BATCH_QUERY_CHUNK_SIZE: u64 = 10;
+const LEDGER_CACHE_CAPACITY: usize = 1024;
 
 /// Error to be returned when our bespoke path captures parser fails.
 fn bad_path_error(key: &str) -> Response {
@@ -83,6 +89,20 @@ pub struct LedgerRoutes<T, B, Tx, E> {
 pub struct LedgerState<T: LedgerStateProvider + Clone + Send + Sync + 'static> {
     pub ledger: T,
     pub shutdown_receiver: watch::Receiver<()>,
+    response_cache: Arc<Mutex<ResponseLruCache>>,
+}
+
+impl<T> LedgerState<T>
+where
+    T: LedgerStateProvider + Clone + Send + Sync + 'static,
+{
+    pub fn new(ledger: T, shutdown_receiver: watch::Receiver<()>) -> Self {
+        Self {
+            ledger,
+            shutdown_receiver,
+            response_cache: Arc::new(Mutex::new(ResponseLruCache::new(LEDGER_CACHE_CAPACITY))),
+        }
+    }
 }
 
 impl<T, B, TxReceipt, E> LedgerRoutes<T, B, TxReceipt, E>
@@ -105,10 +125,112 @@ where
         ledger: T,
         shutdown_receiver: watch::Receiver<()>,
     ) -> axum::Router<LedgerState<T>> {
-        let state = LedgerState {
-            ledger,
-            shutdown_receiver,
-        };
+        let state = LedgerState::new(ledger, shutdown_receiver);
+        let cache_layer = middleware::from_fn_with_state(
+            state.response_cache.clone(),
+            Self::cache_response_middleware,
+        );
+
+        let slot_cache_routes = axum::Router::new()
+            .route(
+                "/cache",
+                get(Self::get_slot).route_layer(cache_layer.clone()),
+            )
+            .route(
+                "/events/cache",
+                get(Self::get_slot_events).route_layer(cache_layer.clone()),
+            )
+            .nest(
+                "/batches/:batchOffset",
+                axum::Router::new()
+                    .route(
+                        "/cache",
+                        get(Self::get_batch).route_layer(cache_layer.clone()),
+                    )
+                    .nest(
+                        "/txs/:txOffset",
+                        axum::Router::new()
+                            .route("/cache", get(Self::get_tx).route_layer(cache_layer.clone()))
+                            .route(
+                                "/events/cache",
+                                get(Self::get_tx_events).route_layer(cache_layer.clone()),
+                            )
+                            .nest(
+                                "/events/:eventOffset",
+                                axum::Router::new()
+                                    .route(
+                                        "/cache",
+                                        get(Self::get_event).route_layer(cache_layer.clone()),
+                                    )
+                                    .route_layer(middleware::from_fn_with_state(
+                                        state.clone(),
+                                        Self::resolve_event_offset,
+                                    )),
+                            )
+                            .route_layer(middleware::from_fn_with_state(
+                                state.clone(),
+                                Self::resolve_tx_offset,
+                            )),
+                    )
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_batch_offset,
+                    )),
+            );
+
+        let batch_cache_routes = axum::Router::new()
+            .route(
+                "/cache",
+                get(Self::get_batch).route_layer(cache_layer.clone()),
+            )
+            .nest(
+                "/txs/:txOffset",
+                axum::Router::new()
+                    .route("/cache", get(Self::get_tx).route_layer(cache_layer.clone()))
+                    .route(
+                        "/events/cache",
+                        get(Self::get_tx_events).route_layer(cache_layer.clone()),
+                    )
+                    .nest(
+                        "/events/:eventOffset",
+                        axum::Router::new()
+                            .route(
+                                "/cache",
+                                get(Self::get_event).route_layer(cache_layer.clone()),
+                            )
+                            .route_layer(middleware::from_fn_with_state(
+                                state.clone(),
+                                Self::resolve_event_offset,
+                            )),
+                    )
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_tx_offset,
+                    )),
+            );
+
+        let tx_cache_routes = axum::Router::new()
+            .route("/cache", get(Self::get_tx).route_layer(cache_layer.clone()))
+            .route(
+                "/events/cache",
+                get(Self::get_tx_events).route_layer(cache_layer.clone()),
+            )
+            .nest(
+                "/events/:eventOffset",
+                axum::Router::new()
+                    .route(
+                        "/cache",
+                        get(Self::get_event).route_layer(cache_layer.clone()),
+                    )
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_event_offset,
+                    )),
+            );
+
+        let event_cache_routes =
+            axum::Router::new().route("/cache", get(Self::get_event).route_layer(cache_layer));
+
         let routes = axum::Router::<LedgerState<T>>::new()
             .route(
                 "/aggregated-proofs/latest",
@@ -140,10 +262,12 @@ where
             )
             .nest(
                 "/slots/:slotId",
-                Self::router_slot(state.clone()).route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    Self::resolve_slot_id,
-                )),
+                Self::router_slot(state.clone())
+                    .merge(slot_cache_routes)
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_slot_id,
+                    )),
             )
             .nest(
                 "/tps/latest",
@@ -161,26 +285,29 @@ where
             )
             .nest(
                 "/batches/:batchId",
-                Self::router_batch(state.clone()).route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    Self::resolve_batch_id,
-                )),
+                Self::router_batch(state.clone())
+                    .merge(batch_cache_routes)
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_batch_id,
+                    )),
             )
             .nest(
                 "/txs/:txId",
-                Self::router_tx(state.clone()).route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    Self::resolve_tx_id,
-                )),
+                Self::router_tx(state.clone())
+                    .merge(tx_cache_routes)
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        Self::resolve_tx_id,
+                    )),
             )
             .route("/events", get(Self::list_events))
             .route("/events/latest", get(Self::get_latest_event))
             .nest(
                 "/events/:eventId",
-                Self::router_event().route_layer(middleware::from_fn_with_state(
-                    state,
-                    Self::resolve_event_id,
-                )),
+                Self::router_event().merge(event_cache_routes).route_layer(
+                    middleware::from_fn_with_state(state, Self::resolve_event_id),
+                ),
             );
         preconfigured_router_layers(axum::Router::<LedgerState<T>>::new().nest("/ledger", routes))
     }
@@ -226,7 +353,7 @@ where
             .nest(
                 "/events/:eventOffset",
                 Self::router_event().layer(middleware::from_fn_with_state(
-                    state,
+                    state.clone(),
                     Self::resolve_event_offset,
                 )),
             )
@@ -238,6 +365,56 @@ where
 
     fn router_tps() -> axum::Router<LedgerState<T>> {
         axum::Router::new().route("/", get(Self::get_slot_tps))
+    }
+
+    async fn cache_response_middleware(
+        State(cache): State<Arc<Mutex<ResponseLruCache>>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let key = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_owned())
+            .unwrap_or_else(|| request.uri().path().to_owned());
+
+        if let Some(cached_response) = cache.lock().await.get(&key) {
+            return cached_response.into_response();
+        }
+
+        let response = next.run(request).await;
+        if !response.status().is_success() {
+            return response;
+        }
+
+        let (parts, body) = response.into_parts();
+        let status = parts.status;
+        let content_type = parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body_bytes = match to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(err) => {
+                tracing::warn!(error = %err, "Skipping cache write due to unreadable response body");
+                return internal_server_error_response_500(
+                    "Failed to read response body for cache",
+                );
+            }
+        };
+
+        let response_to_return = CachedResponse {
+            status,
+            content_type,
+            body: body_bytes,
+        };
+
+        if should_cache_response_body(&response_to_return.body) {
+            cache.lock().await.insert(key, response_to_return.clone());
+        }
+
+        response_to_return.into_response()
     }
 
     // HANDLERS
@@ -1127,6 +1304,97 @@ struct AggregatedProof {
     pub proof: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedResponse {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+impl CachedResponse {
+    fn into_response(self) -> Response {
+        let mut response = Response::new(Body::from(self.body));
+        *response.status_mut() = self.status;
+        if let Some(content_type) = self.content_type {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                response.headers_mut().insert(CONTENT_TYPE, value);
+            }
+        }
+        response
+    }
+}
+
+fn should_cache_response_body(body: &[u8]) -> bool {
+    // Guard against caching placeholder success payloads that might become real data later.
+    let mut start = 0usize;
+    while start < body.len() && body[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    if start == body.len() {
+        return false;
+    }
+
+    let mut end = body.len();
+    while end > start && body[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    let trimmed = &body[start..end];
+    !trimmed.eq_ignore_ascii_case(b"null")
+}
+
+#[derive(Debug)]
+struct ResponseLruCache {
+    capacity: usize,
+    entries: HashMap<String, CachedResponse>,
+    access_order: VecDeque<String>,
+}
+
+impl ResponseLruCache {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "cache capacity must be greater than zero");
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            access_order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<CachedResponse> {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, response: CachedResponse) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), response);
+            self.touch(&key);
+            return;
+        }
+
+        if self.entries.len() >= self.capacity {
+            if let Some(evicted_key) = self.access_order.pop_front() {
+                self.entries.remove(&evicted_key);
+            }
+        }
+
+        self.access_order.push_back(key.clone());
+        self.entries.insert(key, response);
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self
+            .access_order
+            .iter()
+            .position(|existing| existing == key)
+        {
+            self.access_order.remove(pos);
+        }
+        self.access_order.push_back(key.to_owned());
+    }
+}
+
 impl TryFrom<AggregatedProofResponse> for AggregatedProof {
     type Error = anyhow::Error;
 
@@ -1147,5 +1415,41 @@ mod tests {
             NumberOrHash::Hash(HexHash::new([0; 32])).to_string(),
             "0x0000000000000000000000000000000000000000000000000000000000000000",
         );
+    }
+
+    #[test]
+    fn response_lru_cache_evicts_least_recently_used() {
+        let mut cache = ResponseLruCache::new(2);
+
+        let first_key = "first".to_owned();
+        let second_key = "second".to_owned();
+        let third_key = "third".to_owned();
+        let make_response = |body: u8| CachedResponse {
+            status: StatusCode::OK,
+            content_type: None,
+            body: vec![body],
+        };
+
+        cache.insert(first_key.clone(), make_response(1));
+        cache.insert(second_key.clone(), make_response(2));
+
+        // Touch "first" so "second" becomes LRU.
+        assert!(cache.get(&first_key).is_some());
+
+        cache.insert(third_key.clone(), make_response(3));
+
+        assert!(cache.get(&first_key).is_some());
+        assert!(cache.get(&second_key).is_none());
+        assert!(cache.get(&third_key).is_some());
+    }
+
+    #[test]
+    fn cache_guard_rejects_empty_and_null_payloads() {
+        assert!(!should_cache_response_body(b""));
+        assert!(!should_cache_response_body(b"   \n\t"));
+        assert!(!should_cache_response_body(b"null"));
+        assert!(!should_cache_response_body(b"  null  "));
+        assert!(should_cache_response_body(br#"{"number":1}"#));
+        assert!(should_cache_response_body(b"[]"));
     }
 }
