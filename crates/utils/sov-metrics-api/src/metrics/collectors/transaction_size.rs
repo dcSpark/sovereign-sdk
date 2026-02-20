@@ -1,23 +1,28 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect,
-    RelationTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 use utoipa::ToSchema;
 
-use crate::indexer_db::{self, midnight_transfer};
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
+const MAX_ROWS_PER_COLLECT: i64 = 2_000;
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct TransactionSizePayload {
     pub amount: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct TransactionSizeRow {
+    event_id: i32,
+    amount: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct TransactionSizeCollector {
@@ -47,43 +52,32 @@ impl MetricCollector for TransactionSizeCollector {
             let mut guard = self.last_seen_event_id.lock().await;
             let last_seen = *guard;
 
-            let rows = midnight_transfer::Entity::find()
-                .filter(midnight_transfer::Column::EventId.gt(last_seen))
-                .filter(midnight_transfer::Column::Amount.is_not_null())
-                .join(
-                    JoinType::InnerJoin,
-                    midnight_transfer::Relation::Events.def(),
-                )
-                .order_by_asc(midnight_transfer::Column::EventId)
-                .select_also(indexer_db::Entity)
-                .all(&self.db)
+            let rows = load_transaction_size_rows(&self.db, last_seen, MAX_ROWS_PER_COLLECT)
                 .await
                 .with_context(|| "Failed to load midnight_transfer rows")?;
+
+            if rows.len() as i64 == MAX_ROWS_PER_COLLECT {
+                debug!(
+                    batch_size = MAX_ROWS_PER_COLLECT,
+                    last_seen_event_id = last_seen,
+                    "Transaction size collector reached batch limit; backlog remains"
+                );
+            }
 
             let mut samples = Vec::with_capacity(rows.len());
             let mut latest_seen = last_seen;
 
-            for (transfer, event) in rows {
-                if transfer.event_id > latest_seen {
-                    latest_seen = transfer.event_id;
+            for row in rows {
+                if row.event_id > latest_seen {
+                    latest_seen = row.event_id;
                 }
-                let event = match event {
-                    Some(event) => event,
-                    None => {
-                        warn!(event_id = transfer.event_id, "Missing event for transfer");
-                        continue;
-                    }
-                };
 
-                let amount = match transfer.amount.as_ref() {
+                let amount = match row.amount.as_ref() {
                     Some(amount) => amount,
                     None => continue,
                 };
                 if amount.parse::<u128>().is_err() {
-                    warn!(
-                        event_id = transfer.event_id,
-                        amount, "Invalid transfer amount"
-                    );
+                    warn!(event_id = row.event_id, amount, "Invalid transfer amount");
                     continue;
                 }
 
@@ -92,7 +86,7 @@ impl MetricCollector for TransactionSizeCollector {
                 };
 
                 samples.push(MetricSample {
-                    recorded_at_ms: event.created_at.timestamp_millis(),
+                    recorded_at_ms: row.created_at.timestamp_millis(),
                     payload: serde_json::to_value(payload)
                         .context("Failed to serialize transaction size payload")?,
                 });
@@ -103,4 +97,58 @@ impl MetricCollector for TransactionSizeCollector {
             Ok(samples)
         })
     }
+}
+
+async fn load_transaction_size_rows(
+    db: &DatabaseConnection,
+    last_seen: i32,
+    batch_size: i64,
+) -> Result<Vec<TransactionSizeRow>> {
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DatabaseBackend::Postgres => {
+            r#"
+            SELECT t.event_id, t.amount, e.created_at
+            FROM midnight_transfer t
+            INNER JOIN events e ON e.id = t.event_id
+            WHERE t.event_id > $1
+              AND t.amount IS NOT NULL
+            ORDER BY t.event_id ASC
+            LIMIT $2
+            "#
+        }
+        DatabaseBackend::Sqlite => {
+            r#"
+            SELECT t.event_id, t.amount, e.created_at
+            FROM midnight_transfer t
+            INNER JOIN events e ON e.id = t.event_id
+            WHERE t.event_id > ?1
+              AND t.amount IS NOT NULL
+            ORDER BY t.event_id ASC
+            LIMIT ?2
+            "#
+        }
+        _ => {
+            r#"
+            SELECT t.event_id, t.amount, e.created_at
+            FROM midnight_transfer t
+            INNER JOIN events e ON e.id = t.event_id
+            WHERE t.event_id > ?1
+              AND t.amount IS NOT NULL
+            ORDER BY t.event_id ASC
+            LIMIT ?2
+            "#
+        }
+    };
+
+    let stmt = Statement::from_sql_and_values(
+        backend,
+        sql.to_owned(),
+        vec![last_seen.into(), batch_size.into()],
+    );
+
+    TransactionSizeRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .context("Failed to query transaction size rows")
 }
