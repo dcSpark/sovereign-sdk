@@ -293,10 +293,7 @@ impl LedgerTestService {
         let shutdown = shutdown_receiver.clone();
         tokio::spawn(async move {
             let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
-            let state = LedgerState {
-                ledger: ledger_db1.clone(),
-                shutdown_receiver: shutdown_receiver.clone(),
-            };
+            let state = LedgerState::new(ledger_db1.clone(), shutdown_receiver.clone());
             axum_server::Server::bind(addr)
                 .handle(axum_handle1)
                 .serve(
