@@ -96,6 +96,7 @@ check_postgres_connection_budget() {
   # - Preferred sequencer DB: 10
   # - Proof verifier DB: 12
   # - Indexer Postgres DB: 20
+  # - Metrics API Postgres DB: 10 (DA + indexer pools)
   local da_pool_max
   da_pool_max="$(env_nonneg_int_or_default "SOV_MIDNIGHT_DA_POSTGRES_MAX_CONNECTIONS" "20")"
   local worker_db_pool_max
@@ -106,6 +107,10 @@ check_postgres_connection_budget() {
   verifier_pool_max="$(env_nonneg_int_or_default "SOV_PROOF_VERIFIER_POSTGRES_MAX_CONNECTIONS" "12")"
   local indexer_pool_max
   indexer_pool_max="$(env_nonneg_int_or_default "SOV_INDEXER_POSTGRES_MAX_CONNECTIONS" "20")"
+  local metrics_da_pool_max
+  metrics_da_pool_max="$(env_nonneg_int_or_default "SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS" "10")"
+  local metrics_indexer_pool_max
+  metrics_indexer_pool_max="$(env_nonneg_int_or_default "SOV_METRICS_API_INDEXER_POSTGRES_MAX_CONNECTIONS" "10")"
 
   # run_all.sh starts:
   # - 1 standalone verifier service
@@ -127,12 +132,23 @@ check_postgres_connection_budget() {
     fi
   fi
 
-  # Optional manual buffer for other pools on the same DB (e.g. metrics API, MCP session DB).
+  # Metrics API has two independent pools (DA + indexer).
+  local metrics_index_db_url="${INDEXER_DB_CONNECTION_STRING:-$index_db_url}"
+  local metrics_index_pool_in_budget=0
+  if is_postgres_url "$metrics_index_db_url"; then
+    local metrics_index_db_hostport
+    metrics_index_db_hostport="$(postgres_hostport_from_url "$metrics_index_db_url" 2>/dev/null || true)"
+    if [[ -n "$da_hostport" && -n "$metrics_index_db_hostport" && "$metrics_index_db_hostport" == "$da_hostport" ]]; then
+      metrics_index_pool_in_budget="$metrics_indexer_pool_max"
+    fi
+  fi
+
+  # Optional manual buffer for other pools on the same DB (e.g. MCP session DB).
   local extra_pool_max
   extra_pool_max="$(env_nonneg_int_or_default "SOV_POSTGRES_POOL_BUDGET_EXTRA_CONNECTIONS" "0")"
 
   local estimated_total
-  estimated_total=$((da_pool_max + worker_db_pool_max + preferred_db_pool_max + verifier_total + indexer_pool_max + index_db_pool_max + extra_pool_max))
+  estimated_total=$((da_pool_max + worker_db_pool_max + preferred_db_pool_max + verifier_total + indexer_pool_max + index_db_pool_max + metrics_da_pool_max + metrics_index_pool_in_budget + extra_pool_max))
 
   echo ""
   echo "Postgres pool budget (estimated for DA DB host)"
@@ -144,6 +160,10 @@ check_postgres_connection_budget() {
   echo "  indexer.da_pool:              $indexer_pool_max (SOV_INDEXER_POSTGRES_MAX_CONNECTIONS)"
   if [[ "$index_db_pool_max" -gt 0 ]]; then
     echo "  indexer.index_pool:           $index_db_pool_max (INDEX_DB points to same Postgres host)"
+  fi
+  echo "  metrics.da_pool:              $metrics_da_pool_max (SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS)"
+  if [[ "$metrics_index_pool_in_budget" -gt 0 ]]; then
+    echo "  metrics.index_pool:           $metrics_index_pool_in_budget (SOV_METRICS_API_INDEXER_POSTGRES_MAX_CONNECTIONS)"
   fi
   if [[ "$extra_pool_max" -gt 0 ]]; then
     echo "  extra_manual_pools:           $extra_pool_max (SOV_POSTGRES_POOL_BUDGET_EXTRA_CONNECTIONS)"
