@@ -38,15 +38,12 @@ If `MCP_AUTO_INITIALIZE_SESSIONS=true` and `MCP_AUTO_CREATE_WALLET=true`, unknow
 Configure the following environment variables:
 
 - `MCP_SERVER_BIND_ADDRESS` - Server bind address (default: `127.0.0.1:3000`)
-- `START_WITH_NEW_WALLET` - Deprecated/ignored (sessions start empty)
-- `WALLET_PRIVATE_KEY` - Deprecated/ignored (use `restoreWallet` per session)
 - `ADMIN_WALLET_PRIVATE_KEY` - Optional admin wallet private key used only to auto-fund newly created wallets
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
 - `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:8080`)
 - `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
-- `PRIVPOOL_SPEND_KEY` - Deprecated/ignored (use `restoreWallet` per session)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
@@ -80,7 +77,7 @@ The server exposes the following MCP tools:
 - `createWallet` / `restoreWallet` - Manage wallet keys
 - `removeWallet` - Clear loaded wallet (enables create/restore again)
 
-If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool. When `START_WITH_NEW_WALLET=true`, the same auto-fund flow runs during startup.
+If `AUTO_FUND_DEPOSIT_AMOUNT` is set (or the legacy `STARTUP_DEPOSIT_AMOUNT`) and `ADMIN_WALLET_PRIVATE_KEY` is provided, calling `createWallet` triggers a best-effort auto-fund sequence: the admin wallet sends L2 tokens to the new wallet (deposit amount + gas reserve), then the new wallet deposits the configured amount into the privacy pool.
 
 ### Authority (HTTP)
 
@@ -157,7 +154,7 @@ cargo test --all-targets -- --ignored
 Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be reported as "filtered out". To run everything, execute both commands above. The integration suite expects these env vars/files to exist:
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
-- `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY`
+- `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY` (used by integration test wallet setup, not runtime server config)
 - `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:8080`)
 - `LIGERO_PROGRAM_PATH` (defaults to `note_spend_guest`)
 
