@@ -109,6 +109,45 @@ Arguments are forwarded to `run_rollup.sh`:
 ./run_all.sh -- --stop-at-rollup-height 1300
 ```
 
+### Rotate Admin Address (Genesis/Config)
+
+The demo setup uses a known admin address. Before production-like deployments, rotate it across genesis/config:
+
+```bash
+cd examples/rollup-ligero
+./rotate_admin_wallet.sh --new-address <sov1...> --dry-run
+./rotate_admin_wallet.sh --new-address <sov1...>
+```
+
+Or provide a new admin private key directly (recommended):
+
+```bash
+./rotate_admin_wallet.sh --new-key <64-hex-chars> --dry-run
+./rotate_admin_wallet.sh --new-key <64-hex-chars> --key-out /secure/path/admin_wallet.json
+```
+
+Or generate a fresh admin private key + address automatically:
+
+```bash
+./rotate_admin_wallet.sh --dry-run
+./rotate_admin_wallet.sh --key-out /secure/path/admin_wallet.json
+```
+
+Optional: also update the celestia demo genesis set:
+
+```bash
+./rotate_admin_wallet.sh --new-address <sov1...> --include-celestia
+```
+
+Important:
+- If `--new-key` is used, address is derived from the key and key files are synced.
+- If `--new-address` is omitted (and `--new-key` is not set), the script generates a key and prints `GENERATED_ADMIN_WALLET_PRIVATE_KEY=<hex>`.
+- In `--new-key` and generated-key modes, it syncs `examples/test-data/keys/token_deployer_private_key.json`.
+- In `--new-address` mode, only address references are updated (key files are unchanged).
+- Save that key securely and inject it as `ADMIN_WALLET_PRIVATE_KEY` at runtime.
+- `run_mcp.sh` and `run_proof_pool.sh` require `ADMIN_WALLET_PRIVATE_KEY` from environment.
+- `run_mcp.sh` uses `WALLET_PRIVATE_KEY` when set, otherwise it reuses `ADMIN_WALLET_PRIVATE_KEY`.
+
 ### Service Controller API
 
 The controller now manages each service script independently (`run_rollup.sh`, `run_verifier_service.sh`, etc.), and supports both global and per-service actions:
