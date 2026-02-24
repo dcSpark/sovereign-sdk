@@ -147,6 +147,42 @@ Important:
 - Save that key securely and inject it as `ADMIN_WALLET_PRIVATE_KEY` at runtime.
 - `run_mcp.sh` and `run_proof_pool.sh` require `ADMIN_WALLET_PRIVATE_KEY` from environment.
 - `run_mcp.sh` uses `WALLET_PRIVATE_KEY` when set, otherwise it reuses `ADMIN_WALLET_PRIVATE_KEY`.
+### Prepare Production Genesis (No 5k Test Wallets)
+
+Generate dedicated operator wallets first:
+
+```bash
+cd examples/rollup-ligero
+./generate_operator_wallets.sh --output ./operator-wallets-prod.json
+```
+
+Build a production genesis directory from `demo/mock` using those addresses:
+
+```bash
+./prepare_production_genesis.sh \
+  --wallets-json ./operator-wallets-prod.json \
+  --output-genesis-dir ../test-data/genesis/production/mock
+```
+
+Dry-run before writing:
+
+```bash
+./prepare_production_genesis.sh \
+  --wallets-json ./operator-wallets-prod.json \
+  --output-genesis-dir ../test-data/genesis/production/mock \
+  --dry-run
+```
+
+What this does:
+- Rewrites genesis admin/operator addresses (`admin`, sequencer, paymaster, prover, attester, reward).
+- Rewrites `bank.json` to a minimal role-based funded set (EVM prefunds are excluded by default).
+- Removes `generated_keypairs.json` from the output genesis.
+
+Then run the node against the production genesis path:
+
+```bash
+./run_rollup.sh -- --genesis-config-dir ../test-data/genesis/production/mock
+```
 
 ### Service Controller API
 
