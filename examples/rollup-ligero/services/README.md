@@ -81,6 +81,7 @@ background services on Linux.
   - `SERVICE_CONTROLLER_AUTO_START`: Set to `1` to auto-start all services when the controller starts
   - `ROLLUP_GENESIS_CONFIG_DIR`: Optional rollup genesis directory override used by `run_rollup.sh`
     (example: `/home/<user>/sovereign-sdk/examples/test-data/genesis/production/mock`)
+  - `ADMIN_WALLET_PRIVATE_KEY`: Required by `run_mcp.sh` and `run_proof_pool.sh` for wallet funding operations
   - `DA_CONNECTION_STRING`: PostgreSQL base connection string used by `/clean-database`
   - `TEE_RESET_URL`: TEE reset endpoint URL (default: `http://74.235.106.62:9898/reset`)
   - `TEE_RESET_BEARER_TOKEN`: Bearer token for `TEE_RESET_URL` (`TEE_RESET_TOKEN` alias also supported)
