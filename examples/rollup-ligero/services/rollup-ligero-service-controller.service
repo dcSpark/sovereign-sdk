@@ -15,6 +15,7 @@ Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bi
 
 # Auto-start all services on controller start
 #Environment="SERVICE_CONTROLLER_AUTO_START=1"
+#Environment="ROLLUP_GENESIS_CONFIG_DIR=/home/replace_for_linux_user/sovereign-sdk/examples/test-data/genesis/production/mock"
 
 # Service endpoint URLs (used for health checks)
 Environment="ROLLUP_RPC_URL=http://127.0.0.1:12346"
