@@ -7609,6 +7609,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sov-api-spec",
+ "sov-bank",
  "sov-cli",
  "sov-ligero-adapter",
  "sov-modules-api",

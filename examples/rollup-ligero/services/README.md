@@ -62,6 +62,10 @@ background services on Linux.
   Update the `Environment=` entries inside the unit file to control the number
   of wallets (`CONTINUOUS_NUM_WALLETS`) and the verifier/sequencer endpoints
   (`E2E_ROLLUP_EXTERNAL_VERIFIER_URL` and `E2E_ROLLUP_EXTERNAL_NODE_URL`).
+  Wallet bootstrap modes:
+  - `CONTINUOUS_WALLET_SOURCE=genesis` (default): load wallets from demo `generated_keypairs.json`
+  - `CONTINUOUS_WALLET_SOURCE=dynamic`: generate wallets at runtime and fund from `ADMIN_WALLET_PRIVATE_KEY`
+    (optional `DYNAMIC_FUND_GAS_RESERVE`, default `1000000`)
 - The MCP external service wraps `crates/mcp-external/run_mcp.sh`. It loads
   environment from `crates/mcp-external/.env` (or inline `Environment=` overrides)
   for MCP address, rollup/verifier/indexer endpoints, keys, and Ligero paths.
