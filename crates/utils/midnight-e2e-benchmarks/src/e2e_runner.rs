@@ -19,13 +19,19 @@ use num_cpus;
 use reqwest::Client as HttpClient;
 use serde_json::Value as JsonValue;
 use sov_api_spec::types as api_types;
+use sov_bank::{
+    config_gas_token_id, Amount as BankAmount, CallMessage as BankCallMessage, Coins as BankCoins,
+    TokenId,
+};
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::gas::UnlimitedGasMeter;
 use sov_modules_api::transaction::Transaction;
+use sov_modules_api::CryptoSpec;
 use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
+use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
 use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
@@ -44,6 +50,22 @@ type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 /// Must match the domain used by the MidnightPrivacy module (genesis config).
 const DOMAIN: Hash32 = [1u8; 32];
+const E2E_DEPOSIT_AMOUNT: u128 = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletSource {
+    Genesis,
+    Dynamic,
+}
+
+impl WalletSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Genesis => "genesis",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
 
 /// Configuration for running the E2E benchmark.
 #[derive(Clone, Debug)]
@@ -68,6 +90,10 @@ pub struct RunnerConfig {
     pub defer_sequencer_submission: bool,
     /// Optional delay (ms) between submitting transfer requests to the verifier to avoid OS/socket overloads.
     pub transfer_submit_delay_ms: u64,
+    /// Source of wallets used for deposits/transfers.
+    pub wallet_source: WalletSource,
+    /// Extra L2 amount to include when dynamically funding wallets.
+    pub dynamic_fund_gas_reserve: u128,
 }
 
 impl Default for RunnerConfig {
@@ -83,6 +109,8 @@ impl Default for RunnerConfig {
             max_concurrent_proofs: 5,
             defer_sequencer_submission: true,
             transfer_submit_delay_ms: 10,
+            wallet_source: WalletSource::Genesis,
+            dynamic_fund_gas_reserve: 1_000_000,
         }
     }
 }
@@ -122,6 +150,28 @@ impl RunnerConfig {
                 cfg.transfer_submit_delay_ms = parsed;
             }
         }
+        if let Ok(value) = std::env::var("E2E_WALLET_SOURCE")
+            .or_else(|_| std::env::var("CONTINUOUS_WALLET_SOURCE"))
+        {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "" | "genesis" => cfg.wallet_source = WalletSource::Genesis,
+                "dynamic" => cfg.wallet_source = WalletSource::Dynamic,
+                other => {
+                    eprintln!(
+                        "[config] Unsupported E2E_WALLET_SOURCE='{}'. Falling back to genesis.",
+                        other
+                    );
+                }
+            }
+        }
+        if let Ok(value) = std::env::var("E2E_DYNAMIC_FUND_GAS_RESERVE")
+            .or_else(|_| std::env::var("DYNAMIC_FUND_GAS_RESERVE"))
+            .or_else(|_| std::env::var("AUTO_FUND_GAS_RESERVE"))
+        {
+            if let Ok(parsed) = value.parse::<u128>() {
+                cfg.dynamic_fund_gas_reserve = parsed;
+            }
+        }
         cfg.external_node_url = std::env::var("E2E_ROLLUP_EXTERNAL_NODE_URL").ok();
         cfg.external_verifier_url = std::env::var("E2E_ROLLUP_EXTERNAL_VERIFIER_URL").ok();
         cfg
@@ -137,6 +187,284 @@ fn rollup_crate_dir() -> Result<PathBuf> {
         .find(|p| p.join("Cargo.toml").exists() && p.join("examples/rollup-ligero").exists())
         .ok_or_else(|| anyhow!("Could not find repository root"))?;
     Ok(repo_root.join("examples/rollup-ligero"))
+}
+
+fn private_key_from_hex(
+    private_key_hex: &str,
+) -> Result<<<DemoRollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey> {
+    let normalized = private_key_hex.trim().trim_start_matches("0x");
+    let private_key_bytes = hex::decode(normalized).context("Failed to decode private key hex")?;
+    anyhow::ensure!(
+        private_key_bytes.len() == 32,
+        "Private key must be 32 bytes (got {} bytes)",
+        private_key_bytes.len()
+    );
+
+    let key_json = serde_json::json!({
+        "key_pair": private_key_bytes,
+    });
+
+    let private_key = serde_json::from_value(key_json)
+        .context("Failed to deserialize private key from hex bytes")?;
+    Ok(private_key)
+}
+
+#[derive(serde::Deserialize)]
+struct DedupResponse {
+    #[allow(dead_code)]
+    nonce: Option<u64>,
+    generation: Option<u64>,
+}
+
+async fn fetch_initial_nonce(
+    http: &HttpClient,
+    node_url: &str,
+    account: &PrivateKeyAndAddress<DemoRollupSpec>,
+) -> Result<u64> {
+    let pub_key = account.private_key.pub_key();
+    let cred = pub_key.credential_id();
+    let base = node_url.trim_end_matches('/');
+    let url = format!("{}/rollup/addresses/{}/dedup?select=generation", base, cred);
+
+    let resp = http.get(&url).send().await;
+    let status = match &resp {
+        Ok(r) => r.status(),
+        Err(_) => return Ok(0),
+    };
+    if !status.is_success() {
+        return Ok(0);
+    }
+
+    let body: DedupResponse = match resp.unwrap().json::<DedupResponse>().await {
+        Ok(b) => b,
+        Err(_) => return Ok(0),
+    };
+
+    Ok(body.generation.unwrap_or(0))
+}
+
+fn load_accounts_from_genesis(
+    crate_dir: &Path,
+    num_deposits: usize,
+) -> Result<Vec<PrivateKeyAndAddress<DemoRollupSpec>>> {
+    let keypairs_path = crate_dir
+        .parent()
+        .unwrap() // examples/
+        .join("test-data/genesis/demo/mock/generated_keypairs.json");
+
+    if !keypairs_path.exists() {
+        anyhow::bail!(
+            "Generated keypairs file not found at {}. Run generate-genesis-keys or switch to dynamic mode with E2E_WALLET_SOURCE=dynamic and ADMIN_WALLET_PRIVATE_KEY set.",
+            keypairs_path.display()
+        );
+    }
+
+    let keypairs_json = std::fs::read_to_string(&keypairs_path).with_context(|| {
+        format!(
+            "Failed to read keypairs file at {}",
+            keypairs_path.display()
+        )
+    })?;
+
+    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        serde_json::from_str(&keypairs_json).with_context(|| {
+            format!(
+                "Failed to parse keypairs file at {}",
+                keypairs_path.display()
+            )
+        })?;
+
+    if all_keypairs.len() < num_deposits {
+        anyhow::bail!(
+            "Not enough keypairs in genesis file. Need {}, but only {} available. Please regenerate with more accounts.",
+            num_deposits,
+            all_keypairs.len()
+        );
+    }
+
+    Ok(all_keypairs.into_iter().take(num_deposits).collect())
+}
+
+async fn wait_for_l2_balance(
+    client: &NodeClient,
+    wallet: &PrivateKeyAndAddress<DemoRollupSpec>,
+    token_id: &TokenId,
+    min_balance: u128,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<u128> {
+    let started = std::time::Instant::now();
+    loop {
+        match client
+            .get_balance::<DemoRollupSpec>(&wallet.address, token_id, None)
+            .await
+        {
+            Ok(balance) => {
+                let balance_u128: u128 = balance.0;
+                if balance_u128 >= min_balance {
+                    return Ok(balance_u128);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[setup] failed to query L2 balance while waiting for funding (wallet={}): {}",
+                    wallet.address, e
+                );
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "Timed out waiting for wallet {} to reach L2 balance >= {}",
+                wallet.address,
+                min_balance
+            );
+        }
+
+        sleep(poll).await;
+    }
+}
+
+async fn load_accounts_dynamic(
+    client: &NodeClient,
+    http: &HttpClient,
+    node_base_url: &str,
+    chain_hash: &[u8; 32],
+    num_deposits: usize,
+    deposit_amount: u128,
+    dynamic_fund_gas_reserve: u128,
+) -> Result<Vec<PrivateKeyAndAddress<DemoRollupSpec>>> {
+    let admin_wallet_private_key_hex = std::env::var("ADMIN_WALLET_PRIVATE_KEY")
+        .context("ADMIN_WALLET_PRIVATE_KEY is required when E2E_WALLET_SOURCE=dynamic")?;
+    let admin_private_key = private_key_from_hex(&admin_wallet_private_key_hex)?;
+    let admin_account = PrivateKeyAndAddress::<DemoRollupSpec>::from_key(admin_private_key);
+    let gas_token_id = config_gas_token_id();
+    let l2_funding_amount = deposit_amount
+        .checked_add(dynamic_fund_gas_reserve)
+        .ok_or_else(|| {
+            anyhow!(
+                "Overflow while computing dynamic L2 funding amount: deposit_amount={} + dynamic_fund_gas_reserve={}",
+                deposit_amount,
+                dynamic_fund_gas_reserve
+            )
+        })?;
+
+    let mut admin_nonce = fetch_initial_nonce(http, node_base_url, &admin_account)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to fetch latest nonce/generation for admin wallet {}",
+                admin_account.address
+            )
+        })?;
+
+    eprintln!(
+        "[setup] Dynamic wallet bootstrap enabled. admin_address={} wallets={} funding_per_wallet={} (deposit_amount={} + gas_reserve={}) token_id={}",
+        admin_account.address,
+        num_deposits,
+        l2_funding_amount,
+        deposit_amount,
+        dynamic_fund_gas_reserve,
+        gas_token_id
+    );
+
+    let mut accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = Vec::with_capacity(num_deposits);
+
+    for i in 0..num_deposits {
+        let account = PrivateKeyAndAddress::<DemoRollupSpec>::generate();
+
+        let latest_admin_nonce = fetch_initial_nonce(http, node_base_url, &admin_account)
+            .await
+            .unwrap_or(admin_nonce);
+        if latest_admin_nonce > admin_nonce {
+            admin_nonce = latest_admin_nonce;
+        }
+
+        let mut submitted = false;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 0..3usize {
+            let bank_transfer_call =
+                RuntimeCall::<DemoRollupSpec>::Bank(BankCallMessage::Transfer {
+                    to: account.address.clone(),
+                    coins: BankCoins {
+                        amount: BankAmount::from(l2_funding_amount),
+                        token_id: gas_token_id.clone(),
+                    },
+                });
+            let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
+                default_test_signed_transaction(
+                    &admin_account.private_key,
+                    &bank_transfer_call,
+                    admin_nonce,
+                    chain_hash,
+                );
+            let mut meter = UnlimitedGasMeter::<DemoRollupSpec>::default();
+            tx.verify(chain_hash, &mut meter)
+                .context("Dynamic funding tx signature verification failed")?;
+
+            let tx_bytes = borsh::to_vec(&tx)?;
+            match client
+                .send_transactions_to_sequencer(vec![tx_bytes], true)
+                .await
+            {
+                Ok(_) => {
+                    submitted = true;
+                    admin_nonce = admin_nonce
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("admin nonce overflow"))?;
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(anyhow!(e));
+                    if attempt < 2 {
+                        let refreshed_nonce =
+                            fetch_initial_nonce(http, node_base_url, &admin_account)
+                                .await
+                                .unwrap_or(admin_nonce);
+                        admin_nonce = refreshed_nonce;
+                        sleep(Duration::from_millis(300)).await;
+                    }
+                }
+            }
+        }
+
+        if !submitted {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow!(
+                    "Failed funding dynamic wallet {} after retries (address={})",
+                    i,
+                    account.address
+                )
+            }));
+        }
+
+        let _ = wait_for_l2_balance(
+            client,
+            &account,
+            &gas_token_id,
+            l2_funding_amount,
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed waiting for dynamic wallet {} funding (address={})",
+                i, account.address
+            )
+        })?;
+
+        if i < 5 || i + 1 == num_deposits {
+            eprintln!(
+                "[setup] funded dynamic account {} address={} with {} gas tokens",
+                i, account.address, l2_funding_amount
+            );
+        }
+
+        accounts.push(account);
+    }
+
+    Ok(accounts)
 }
 
 fn make_temp_config(base_config: &str, data_dir: &std::path::Path, http_port: u16) -> String {
@@ -388,56 +716,38 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
 
     // Number of deposits (default 10)
     let num_deposits = config.num_deposits;
+    let deposit_amount: u128 = E2E_DEPOSIT_AMOUNT;
 
-    // Load accounts from pre-generated genesis keypairs
-    eprintln!(
-        "[setup] Loading {} pre-funded accounts from genesis",
-        num_deposits
-    );
-
-    // Load the generated keypairs file
-    let keypairs_path = crate_dir
-        .parent()
-        .unwrap() // examples/
-        .join("test-data/genesis/demo/mock/generated_keypairs.json");
-
-    if !keypairs_path.exists() {
-        anyhow::bail!(
-            "Generated keypairs file not found at {}. Please run: cargo run --bin generate-genesis-keys",
-            keypairs_path.display()
-        );
-    }
-
-    let keypairs_json = std::fs::read_to_string(&keypairs_path).with_context(|| {
-        format!(
-            "Failed to read keypairs file at {}",
-            keypairs_path.display()
-        )
-    })?;
-
-    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
-        serde_json::from_str(&keypairs_json).with_context(|| {
-            format!(
-                "Failed to parse keypairs file at {}",
-                keypairs_path.display()
+    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> = match config.wallet_source {
+        WalletSource::Genesis => {
+            eprintln!(
+                "[setup] Wallet source=genesis. Loading {} pre-funded accounts from generated_keypairs.json",
+                num_deposits
+            );
+            load_accounts_from_genesis(&crate_dir, num_deposits)?
+        }
+        WalletSource::Dynamic => {
+            eprintln!(
+                "[setup] Wallet source=dynamic. Generating {} accounts and prefunding from ADMIN_WALLET_PRIVATE_KEY",
+                num_deposits
+            );
+            load_accounts_dynamic(
+                client.as_ref(),
+                &http,
+                &api_url,
+                &chain_hash,
+                num_deposits,
+                deposit_amount,
+                config.dynamic_fund_gas_reserve,
             )
-        })?;
-
-    if all_keypairs.len() < num_deposits {
-        anyhow::bail!(
-            "Not enough keypairs in genesis file. Need {}, but only {} available. Please regenerate with more accounts.",
-            num_deposits,
-            all_keypairs.len()
-        );
-    }
-
-    // Take the first num_deposits accounts
-    let accounts: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
-        all_keypairs.into_iter().take(num_deposits).collect();
+            .await?
+        }
+    };
 
     eprintln!(
-        "\n✅✅✅ [setup] Loaded {} pre-funded accounts from genesis! ✅✅✅",
-        accounts.len()
+        "\n✅✅✅ [setup] Prepared {} accounts from {} wallet source ✅✅✅",
+        accounts.len(),
+        config.wallet_source.as_str()
     );
 
     // Capture initial module state for robust delta checks
@@ -722,6 +1032,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     let mut transfer_stf_execution_ms: Vec<f64> = Vec::new();
     let mut transfer_http_timings: Vec<f64> = Vec::new();
     let mut transfer_node_submit_timings: Vec<f64> = Vec::new();
+    let mut deposit_nonce_by_account: Vec<u64> = vec![0; num_deposits];
 
     eprintln!("\n\n #### Step 2 ####");
     eprintln!(
@@ -732,7 +1043,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let account = &accounts[i]; // Each deposit uses a different account
 
         // Build a midnight deposit tx for demo runtime
-        let amount: u128 = 100;
+        let amount: u128 = deposit_amount;
         let rho: Hash32 = rand::random();
         let spend_sk: Hash32 = rand::random();
         let pk_ivk = pk_ivk_from_sk(&DOMAIN, &spend_sk);
@@ -745,13 +1056,15 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             view_fvks: None,
         });
 
-        // Each account uses nonce 0 for its deposit (except account 0 which sent funding txs first)
-        // Account 0 sent (num_deposits - 1) funding transactions, so its next nonce is (num_deposits - 1)
-        let deposit_nonce = if i == 0 {
-            (num_deposits.saturating_sub(1)) as u64
-        } else {
-            0u64
-        };
+        let deposit_nonce = fetch_initial_nonce(&http, &api_url, account)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to fetch latest nonce/generation for deposit account {} ({})",
+                    i, account.address
+                )
+            })?;
+        deposit_nonce_by_account[i] = deposit_nonce;
 
         let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
             default_test_signed_transaction(
@@ -1896,8 +2209,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     use std::io::Write;
     let _ = std::io::stderr().flush();
 
-    // Sign all transfer transactions (only after ALL proofs are generated)
-    // Each account uses nonce 1 for its transfer (nonce 0 was for deposit, or deposit_nonce for account 0)
+    // Sign all transfer transactions (only after ALL proofs are generated).
 
     eprintln!(
         "\n[transfers] Signing {} transfer transactions (one per account)...",
@@ -1912,14 +2224,12 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
             .with_context(|| format!("Missing DepInput for account {}", account_idx))?;
         let account = &accounts[account_idx];
 
-        // Each account uses the next nonce after its deposit
-        // Account 0: sent (num_deposits-1) funding txs, then 1 deposit, so next nonce is num_deposits
-        // Other accounts: sent 1 deposit (nonce 0), so next nonce is 1
-        let transfer_nonce = if account_idx == 0 {
-            num_deposits as u64
-        } else {
-            1u64
-        };
+        let transfer_nonce = deposit_nonce_by_account
+            .get(account_idx)
+            .copied()
+            .ok_or_else(|| anyhow!("Missing deposit nonce for account {}", account_idx))?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Transfer nonce overflow for account {}", account_idx))?;
 
         // Same nullifier as before
         let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
@@ -2360,11 +2670,11 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         num_deposits
     );
     eprintln!(
-        "  Deposits: {} (one per account with nonce 0)",
+        "  Deposits: {} (one per account with live chain nonce)",
         num_deposits
     );
     eprintln!(
-        "  Transfers: {} (one per account with nonce 1)",
+        "  Transfers: {} (one per account using next nonce after deposit)",
         ok_transfers
     );
     eprintln!("═══════════════════════════════════════════════════════════════\n");

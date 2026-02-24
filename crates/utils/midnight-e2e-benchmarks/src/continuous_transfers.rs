@@ -31,9 +31,9 @@ use sov_bank::{
     TokenId,
 };
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_modules_api::CryptoSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
+use sov_modules_api::CryptoSpec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
@@ -553,9 +553,10 @@ async fn load_wallets_dynamic(
                 Err(e) => {
                     last_error = Some(anyhow!(e));
                     if attempt < 2 {
-                        let refreshed_nonce = fetch_initial_nonce(http, node_base_url, &admin_account)
-                            .await
-                            .unwrap_or(admin_nonce);
+                        let refreshed_nonce =
+                            fetch_initial_nonce(http, node_base_url, &admin_account)
+                                .await
+                                .unwrap_or(admin_nonce);
                         admin_nonce = refreshed_nonce;
                         sleep(Duration::from_millis(300)).await;
                     }
@@ -2238,8 +2239,7 @@ async fn perform_transfer_cycle(
             cms.push(cm);
         }
 
-        let positions: Vec<Option<u64>> =
-            cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+        let positions: Vec<Option<u64>> = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
 
         if positions.iter().any(|p| p.is_none()) {
             eprintln!(
