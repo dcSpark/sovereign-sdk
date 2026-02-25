@@ -926,9 +926,22 @@ async fn verify_with_prover_service(
     })?;
 
     if !resp.success {
+        error!(
+            circuit,
+            exit_code = resp.exit_code,
+            prover_url = url,
+            proof_bytes = package.proof.len(),
+            public_output_bytes = package.public_output.len(),
+            args_json_bytes = package.args_json.len(),
+            n_private_indices = package.private_indices.len(),
+            error = resp.error.as_deref().unwrap_or("(none)"),
+            raw_response_body = %body,
+            "Prover service verification FAILED"
+        );
         return Err(ServiceError::ProofError(format!(
-            "Prover service verification failed (exit_code={}): {}",
+            "Prover service verification failed (exit_code={}, circuit={}): {}",
             resp.exit_code,
+            circuit,
             resp.error.unwrap_or_else(|| "unknown error".to_string())
         )));
     }
@@ -1038,6 +1051,15 @@ fn verify_with_ligero_verifier_daemon(
         })?;
 
     if !resp.ok {
+        error!(
+            ok = resp.ok,
+            exit_code = ?resp.exit_code,
+            verify_ok = ?resp.verify_ok,
+            error = resp.error.as_deref().unwrap_or("(none)"),
+            workers,
+            proof_path = %proof_path.display(),
+            "Ligero verifier daemon returned ok=false"
+        );
         return Err(ServiceError::ProofError(format!(
             "Ligero verifier daemon returned ok=false (exit_code={:?}): {}",
             resp.exit_code,
@@ -1046,6 +1068,14 @@ fn verify_with_ligero_verifier_daemon(
     }
 
     if resp.verify_ok != Some(true) {
+        error!(
+            ok = resp.ok,
+            exit_code = ?resp.exit_code,
+            verify_ok = ?resp.verify_ok,
+            workers,
+            proof_path = %proof_path.display(),
+            "Ligero verifier daemon did not confirm proof validity"
+        );
         return Err(ServiceError::ProofError(format!(
             "Ligero verifier daemon did not confirm proof validity (verify_ok={:?})",
             resp.verify_ok
@@ -1092,8 +1122,21 @@ fn prove_with_ligero_daemon(
         .map_err(|e| ServiceError::ProofError(format!("Prover daemon request failed: {e}")))?;
 
     if !resp.ok {
+        error!(
+            circuit = %req.circuit,
+            ok = resp.ok,
+            exit_code = ?resp.exit_code,
+            error = resp.error.as_deref().unwrap_or("(none)"),
+            packing,
+            use_gzip,
+            n_args = req.args.len(),
+            n_private_indices = req.private_indices.len(),
+            proof_path = %proof_path.display(),
+            "Prover daemon returned ok=false for /prove-and-verify"
+        );
         return Err(ServiceError::ProofError(format!(
-            "Prover daemon returned ok=false (exit_code={:?}): {}",
+            "Prover daemon returned ok=false (circuit={}, exit_code={:?}): {}",
+            req.circuit,
             resp.exit_code,
             resp.error.unwrap_or_else(|| "unknown error".to_string())
         )));
@@ -1155,8 +1198,22 @@ fn verify_with_ligero_daemon_api(
         .map_err(|e| ServiceError::ProofError(format!("Verifier daemon request failed: {e}")))?;
 
     if !resp.ok || resp.verify_ok != Some(true) {
+        error!(
+            circuit = %req.circuit,
+            ok = resp.ok,
+            exit_code = ?resp.exit_code,
+            verify_ok = ?resp.verify_ok,
+            error = resp.error.as_deref().unwrap_or("(none)"),
+            proof_bytes = proof_bytes.len(),
+            is_gzip,
+            packing = req.packing.unwrap_or(8192),
+            n_args = req.args.len(),
+            n_private_indices = req.private_indices.len(),
+            "Ligero daemon verification FAILED for /verify API"
+        );
         return Err(ServiceError::ProofError(format!(
-            "Verification failed (exit_code={:?}, verify_ok={:?}): {}",
+            "Verification failed (circuit={}, exit_code={:?}, verify_ok={:?}): {}",
+            req.circuit,
             resp.exit_code,
             resp.verify_ok,
             resp.error.unwrap_or_else(|| "unknown error".to_string())
@@ -1298,7 +1355,7 @@ impl IntoResponse for ServiceError {
                 (StatusCode::UNAUTHORIZED, msg.clone())
             }
             ServiceError::ProofError(msg) => {
-                error!("Proof verification error: {}", msg);
+                error!(details = %msg, "Proof verification failed");
                 (StatusCode::UNPROCESSABLE_ENTITY, msg.clone())
             }
             ServiceError::SubmissionError(msg) => {
@@ -1315,8 +1372,18 @@ impl IntoResponse for ServiceError {
             }
         };
 
+        let error_kind = match &self {
+            ServiceError::DecodeError(_) => "decode_error",
+            ServiceError::ParseError(_) => "parse_error",
+            ServiceError::SignatureError(_) => "signature_error",
+            ServiceError::ProofError(_) => "proof_error",
+            ServiceError::SubmissionError(_) => "submission_error",
+            ServiceError::UnsupportedCall(_) => "unsupported_call",
+            ServiceError::Internal(_) => "internal_error",
+        };
         let body = Json(serde_json::json!({
             "error": message,
+            "error_kind": error_kind,
             "status": status.as_u16(),
         }));
 
@@ -2916,25 +2983,50 @@ pub async fn verify_midnight_withdraw_proof(
         None => None,
     };
 
+    let nullifiers_hex: Vec<String> = expected_nullifiers
+        .iter()
+        .map(|n| format!("0x{}", hex::encode(n)))
+        .collect();
+    let anchor_hex = format!("0x{}", hex::encode(expected_anchor_root));
+
     // Perform ZK proof verification
-    if ligero_skip_verify_enabled() {
-        // Skip verification
+    let verify_result = if ligero_skip_verify_enabled() {
+        Ok(())
     } else if let (Some(url), Some(client)) = (prover_service_url, http_client) {
-        // Use remote prover service
         debug!(
             "Using remote prover service at {} for midnight verification",
             url
         );
-        verify_with_prover_service(client, url, "note_spend_guest", &package).await?;
+        verify_with_prover_service(client, url, "note_spend_guest", &package).await
     } else {
-        // Fall back to local daemon pool
         debug!("Using local daemon pool for midnight verification");
         let package_clone = package.clone();
         tokio::task::spawn_blocking(move || {
             verify_with_ligero_verifier_daemon(&method_id.0, &package_clone, workers)
         })
         .await
-        .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))??;
+        .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+    };
+
+    if let Err(e) = verify_result {
+        let backend = if prover_service_url.is_some() {
+            "remote_prover_service"
+        } else {
+            "local_daemon_pool"
+        };
+        error!(
+            backend,
+            anchor_root = %anchor_hex,
+            nullifiers = ?nullifiers_hex,
+            withdraw_amount = expected_withdraw_amount,
+            proof_bytes = proof_vec.len(),
+            package_proof_bytes = package.proof.len(),
+            package_public_output_bytes = package.public_output.len(),
+            package_args_json_bytes = package.args_json.len(),
+            package_private_indices = ?package.private_indices,
+            "Midnight ZK proof verification FAILED"
+        );
+        return Err(e);
     }
 
     // Decode and verify public output

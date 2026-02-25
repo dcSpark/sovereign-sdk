@@ -95,7 +95,7 @@ pub async fn fetch_viewer_fvk_bundle(
     let base_url = fvk_service_base_url_from_env();
     let endpoint = format!("{}/v1/fvk", base_url);
 
-    let resp: IssueFvkResponse = http
+    let response = http
         .post(&endpoint)
         .json(&IssueFvkRequest {
             shielded_address: shielded_address.map(|s| s.to_string()),
@@ -103,9 +103,24 @@ pub async fn fetch_viewer_fvk_bundle(
         })
         .send()
         .await
-        .with_context(|| format!("POST {endpoint}"))?
-        .error_for_status()
-        .with_context(|| format!("POST {endpoint} returned error status"))?
+        .with_context(|| format!("POST {endpoint}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("(failed to read response body: {e})"));
+        tracing::error!(
+            %endpoint,
+            %status,
+            response_body = %error_body,
+            "midnight-fvk-service returned error status"
+        );
+        bail!("POST {endpoint} returned {status}: {error_body}");
+    }
+
+    let resp: IssueFvkResponse = response
         .json()
         .await
         .context("Failed to deserialize midnight-fvk-service response")?;
