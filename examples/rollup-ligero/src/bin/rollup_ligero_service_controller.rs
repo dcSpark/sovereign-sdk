@@ -54,16 +54,16 @@ struct ManagedServiceDefinition {
 
 const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
     ManagedServiceDefinition {
-        id: "oracle",
-        display_name: "oracle",
-        script: "run_oracle.sh",
-        start_mode: StartMode::WhenEnvFlag("START_ORACLE"),
-    },
-    ManagedServiceDefinition {
         id: "rollup",
         display_name: "rollup",
         script: "run_rollup.sh",
         start_mode: StartMode::Always,
+    },
+    ManagedServiceDefinition {
+        id: "oracle",
+        display_name: "oracle",
+        script: "run_oracle.sh",
+        start_mode: StartMode::WhenEnvFlag("START_ORACLE"),
     },
     ManagedServiceDefinition {
         id: "worker",
