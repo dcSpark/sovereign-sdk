@@ -56,6 +56,14 @@ pub struct Config {
     /// If not set, attestations will not be persisted.
     #[serde(default)]
     pub oracle_db_connection_string: Option<String>,
+
+    /// Max entries per attestation LRU cache (env: ORACLE_CACHE_SIZE, default: 5000).
+    #[serde(default = "default_cache_size")]
+    pub oracle_cache_size: usize,
+}
+
+fn default_cache_size() -> usize {
+    5000
 }
 
 fn default_server_bind_address() -> String {

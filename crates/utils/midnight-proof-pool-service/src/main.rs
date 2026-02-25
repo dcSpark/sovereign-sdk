@@ -41,6 +41,7 @@ const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
 const POOL_STATE_TABLE: &str = "pool_wallets";
+const POOL_CONFIG_TABLE: &str = "pool_config";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -433,6 +434,39 @@ async fn main() -> Result<()> {
     });
     spawn_state_saver(state.clone());
 
+    if let Some(db_path) = configured_pool_state_sqlite_path(&cfg) {
+        match load_pool_config(db_path).await {
+            Ok(Some(pc)) => {
+                tracing::info!(
+                    env_max_proofs = cfg.max_proofs,
+                    persisted_max_proofs = pc.max_proofs,
+                    env_proof_generation_interval_ms = cfg.proof_generation_interval_ms,
+                    persisted_proof_generation_interval_ms = pc.proof_generation_interval_ms,
+                    env_max_concurrent_proofs = cfg.max_concurrent_proofs,
+                    persisted_max_concurrent_proofs = pc.max_concurrent_proofs,
+                    persisted_proof_generation_active = pc.proof_generation_active,
+                    "Overriding startup config with persisted pool_config"
+                );
+                state.target_max_proofs.store(pc.max_proofs, Ordering::Relaxed);
+                state
+                    .proof_generation_enabled
+                    .store(pc.proof_generation_active, Ordering::Relaxed);
+                state
+                    .proof_generation_interval_ms
+                    .store(pc.proof_generation_interval_ms, Ordering::Relaxed);
+                state
+                    .max_concurrent_proofs
+                    .store(pc.max_concurrent_proofs, Ordering::Relaxed);
+            }
+            Ok(None) => {
+                tracing::info!("No persisted pool_config found, using env/defaults");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load persisted pool_config, using env/defaults");
+            }
+        }
+    }
+
     // Start the HTTP server immediately; perform wallet setup + initial pool fill in the background.
     // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
     let setup_state = state.clone();
@@ -490,11 +524,16 @@ async fn main() -> Result<()> {
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Shutdown signal received, saving pool state…");
+        tracing::info!("Shutdown signal received, saving pool state and config…");
         if let Err(e) = save_pool_state(&shutdown_state).await {
             tracing::error!(error = %e, "Failed to save pool state on shutdown");
         } else {
             tracing::info!("Pool state saved successfully");
+        }
+        if let Err(e) = save_pool_config(&shutdown_state).await {
+            tracing::error!(error = %e, "Failed to save pool config on shutdown");
+        } else {
+            tracing::info!("Pool config saved successfully");
         }
     };
 
@@ -678,6 +717,7 @@ async fn max_proofs_impl(
             batch_delay_ms = state.cfg.wallet_setup_backoff_ms,
             "Updated MAX_PROOFS target (wallet scale-up is paced)"
         );
+        spawn_save_pool_config(&state);
     }
 
     Ok(Json(status_snapshot(&state).await))
@@ -715,6 +755,8 @@ async fn proof_generation_impl(
         (None, None) => None,
     };
 
+    let mut config_changed = false;
+
     if let Some(enabled) = requested_state {
         state
             .proof_generation_enabled
@@ -724,6 +766,7 @@ async fn proof_generation_impl(
             proof_generation_state = proof_generation_state_label(enabled),
             "Updated proof generation state"
         );
+        config_changed = true;
     }
 
     let body_requested_interval_ms = body
@@ -756,6 +799,7 @@ async fn proof_generation_impl(
             proof_generation_interval_ms = interval_ms,
             "Updated proof generation throttle interval"
         );
+        config_changed = true;
     }
 
     let requested_max_concurrent = body
@@ -773,6 +817,11 @@ async fn proof_generation_impl(
             max_concurrent_proofs = max_concurrent,
             "Updated max concurrent proofs"
         );
+        config_changed = true;
+    }
+
+    if config_changed {
+        spawn_save_pool_config(&state);
     }
 
     Ok(Json(status_snapshot(&state).await))
@@ -2085,6 +2134,13 @@ CREATE TABLE IF NOT EXISTS {POOL_STATE_TABLE} (\
     pending_next_note_value TEXT,\
     pending_next_note_rho_hex TEXT,\
     pending_next_note_sender_id_hex TEXT\
+);\
+CREATE TABLE IF NOT EXISTS {POOL_CONFIG_TABLE} (\
+    id INTEGER PRIMARY KEY CHECK (id = 1),\
+    max_proofs INTEGER,\
+    proof_generation_active INTEGER,\
+    proof_generation_interval_ms INTEGER,\
+    max_concurrent_proofs INTEGER\
 );"
     ))
     .with_context(|| {
@@ -2439,6 +2495,104 @@ async fn load_pool_state_sqlite(db_path: &str) -> Result<Option<PersistedPoolSta
     tokio::task::spawn_blocking(move || load_pool_state_sqlite_sync(&db_path))
         .await
         .context("Pool state SQLite load task failed to join")?
+}
+
+// ── Pool config persistence ──────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct PersistedConfig {
+    max_proofs: usize,
+    proof_generation_active: bool,
+    proof_generation_interval_ms: u64,
+    max_concurrent_proofs: usize,
+}
+
+fn load_pool_config_sync(db_path: &str) -> Result<Option<PersistedConfig>> {
+    if !Path::new(db_path).exists() {
+        return Ok(None);
+    }
+    let conn = open_pool_state_sqlite(db_path)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT max_proofs, proof_generation_active, proof_generation_interval_ms, max_concurrent_proofs FROM {POOL_CONFIG_TABLE} WHERE id = 1"
+        ))
+        .with_context(|| format!("Failed to prepare pool config SELECT in {}", db_path))?;
+
+    let mut rows = stmt
+        .query([])
+        .with_context(|| format!("Failed to query pool config in {}", db_path))?;
+
+    let Some(row) = rows
+        .next()
+        .with_context(|| format!("Failed to read pool config row in {}", db_path))?
+    else {
+        return Ok(None);
+    };
+
+    let max_proofs: Option<i64> = row.get(0)?;
+    let proof_generation_active: Option<i64> = row.get(1)?;
+    let proof_generation_interval_ms: Option<i64> = row.get(2)?;
+    let max_concurrent_proofs: Option<i64> = row.get(3)?;
+
+    let Some(max_proofs) = max_proofs else {
+        return Ok(None);
+    };
+
+    Ok(Some(PersistedConfig {
+        max_proofs: max_proofs as usize,
+        proof_generation_active: proof_generation_active.unwrap_or(1) != 0,
+        proof_generation_interval_ms: proof_generation_interval_ms.unwrap_or(0) as u64,
+        max_concurrent_proofs: max_concurrent_proofs.unwrap_or(5) as usize,
+    }))
+}
+
+async fn load_pool_config(db_path: &str) -> Result<Option<PersistedConfig>> {
+    let db_path = db_path.to_string();
+    tokio::task::spawn_blocking(move || load_pool_config_sync(&db_path))
+        .await
+        .context("Pool config SQLite load task failed to join")?
+}
+
+fn save_pool_config_sync(db_path: &str, cfg: &PersistedConfig) -> Result<()> {
+    let conn = open_pool_state_sqlite(db_path)?;
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {POOL_CONFIG_TABLE} (id, max_proofs, proof_generation_active, proof_generation_interval_ms, max_concurrent_proofs) VALUES (1, ?1, ?2, ?3, ?4)"
+        ),
+        rusqlite::params![
+            cfg.max_proofs as i64,
+            cfg.proof_generation_active as i64,
+            cfg.proof_generation_interval_ms as i64,
+            cfg.max_concurrent_proofs as i64,
+        ],
+    )
+    .with_context(|| format!("Failed to upsert pool config in {}", db_path))?;
+    Ok(())
+}
+
+async fn save_pool_config(state: &Arc<ServiceState>) -> Result<()> {
+    let db_path = match configured_pool_state_sqlite_path(&state.cfg) {
+        Some(path) => path.to_string(),
+        None => return Ok(()),
+    };
+    let cfg = PersistedConfig {
+        max_proofs: state.target_max_proofs.load(Ordering::Relaxed),
+        proof_generation_active: state.proof_generation_enabled.load(Ordering::Relaxed),
+        proof_generation_interval_ms: state.proof_generation_interval_ms.load(Ordering::Relaxed),
+        max_concurrent_proofs: state.max_concurrent_proofs.load(Ordering::Relaxed),
+    };
+    tokio::task::spawn_blocking(move || save_pool_config_sync(&db_path, &cfg))
+        .await
+        .context("Pool config SQLite save task failed to join")?
+}
+
+fn spawn_save_pool_config(state: &Arc<ServiceState>) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = save_pool_config(&state).await {
+            tracing::warn!(error = %e, "Failed to persist pool config");
+        }
+    });
 }
 
 async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) -> Result<()> {
