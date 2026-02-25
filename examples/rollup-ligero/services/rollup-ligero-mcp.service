@@ -15,6 +15,8 @@ Environment="PATH=/home/replace_for_linux_user/.cargo/bin:/usr/local/bin:/usr/bi
 #Environment="ROLLUP_RPC_URL=http://127.0.0.1:12346"
 #Environment="VERIFIER_URL=http://127.0.0.1:8080"
 #Environment="INDEXER_URL=http://127.0.0.1:13100"
+# Required when AUTO_FUND_DEPOSIT_AMOUNT is set in run_mcp.sh
+#Environment="ADMIN_WALLET_PRIVATE_KEY=REPLACE_WITH_FUNDED_ADMIN_PRIVATE_KEY"
 # Pool FVK public key for privacy pool operations
 Environment="POOL_FVK_PK=replace_with_pool_fvk_public_key_hex"
 

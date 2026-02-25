@@ -19,16 +19,6 @@ pub struct Config {
     #[validate(length(min = 1))]
     pub mcp_server_bind_address: String,
 
-    /// Start with a new randomly generated wallet and privacy key (env: START_WITH_NEW_WALLET, optional)
-    /// When true, WALLET_PRIVATE_KEY and PRIVPOOL_SPEND_KEY are ignored.
-    #[serde(default)]
-    pub start_with_new_wallet: bool,
-
-    /// Wallet private key as hex string (env: WALLET_PRIVATE_KEY, required unless START_WITH_NEW_WALLET=true)
-    /// No files needed! Just provide the private key hex string.
-    #[serde(default)]
-    pub wallet_private_key: Option<String>,
-
     /// Admin wallet private key used for auto-funding newly created wallets (env: ADMIN_WALLET_PRIVATE_KEY, optional)
     /// This key remains immutable and is not affected by restoreWallet.
     #[serde(default)]
@@ -61,12 +51,6 @@ pub struct Config {
     #[serde(default = "default_ligero_proof_service_url")]
     #[validate(custom(function = "validate_http_url"))]
     pub ligero_proof_service_url: Url,
-
-    /// Privacy pool spending secret key for deriving recipient addresses and spending notes (env: PRIVPOOL_SPEND_KEY, required unless START_WITH_NEW_WALLET=true)
-    /// 32-byte hex string with or without 0x prefix, or bech32m privacy address (e.g., "privpool1...")
-    /// Required to start the MCP server unless START_WITH_NEW_WALLET=true.
-    #[serde(default)]
-    pub privpool_spend_key: Option<String>,
 
     /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
     /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
@@ -158,18 +142,6 @@ impl Config {
         let mut cfg: Self =
             envy::from_env().context("Failed to load configuration from environment variables")?;
 
-        cfg.wallet_private_key = cfg
-            .wallet_private_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        cfg.privpool_spend_key = cfg
-            .privpool_spend_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
         cfg.midnight_fvk_service_admin_token = cfg
             .midnight_fvk_service_admin_token
             .as_deref()

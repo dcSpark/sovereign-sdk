@@ -26,9 +26,14 @@ use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::json;
 use sov_api_spec::types as api_types;
+use sov_bank::{
+    config_gas_token_id, Amount as BankAmount, CallMessage as BankCallMessage, Coins as BankCoins,
+    TokenId,
+};
 use sov_cli::wallet_state::PrivateKeyAndAddress;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
+use sov_modules_api::CryptoSpec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_node_client::NodeClient;
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
@@ -57,6 +62,37 @@ const NOTES_EMPTY_PAGE_MAX_RETRIES: usize = 5;
 const NOTES_EMPTY_PAGE_RETRY_DELAY_MS: u64 = 100;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const INITIAL_DEPOSIT_AMOUNT: u128 = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalletSource {
+    Genesis,
+    Dynamic,
+}
+
+impl WalletSource {
+    fn from_env() -> Result<Self> {
+        let raw = std::env::var("CONTINUOUS_WALLET_SOURCE")
+            .ok()
+            .unwrap_or_else(|| "genesis".to_string());
+        let normalized = raw.trim().to_ascii_lowercase();
+
+        match normalized.as_str() {
+            "" | "genesis" => Ok(Self::Genesis),
+            "dynamic" => Ok(Self::Dynamic),
+            other => bail!(
+                "Unsupported CONTINUOUS_WALLET_SOURCE='{}'. Expected one of: genesis, dynamic",
+                other
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Genesis => "genesis",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
 
 fn prover_daemon_pool(workers: usize) -> anyhow::Result<ligero_runner::daemon::DaemonPool> {
     static POOL: OnceLock<std::sync::Mutex<Option<ligero_runner::daemon::DaemonPool>>> =
@@ -100,6 +136,7 @@ struct ProverServiceRequest {
 
 #[derive(Clone, Debug)]
 struct ContinuousConfig {
+    wallet_source: WalletSource,
     num_wallets: usize,
     /// Start loading wallets from this genesis keypair index (defaults to 0).
     wallet_offset: usize,
@@ -129,10 +166,14 @@ struct ContinuousConfig {
     managed_mode: bool,
     /// Maximum number of transfer cycles to run. None means run indefinitely.
     max_cycles: Option<u64>,
+    /// Extra L2 amount added when dynamically funding a wallet so it can pay fees.
+    dynamic_fund_gas_reserve: u128,
 }
 
 impl ContinuousConfig {
     fn from_env() -> Result<Self> {
+        let wallet_source = WalletSource::from_env()?;
+
         // Number of wallets defaults to interactive prompt unless provided via env.
         let num_wallets = std::env::var("CONTINUOUS_NUM_WALLETS")
             .ok()
@@ -233,7 +274,14 @@ impl ContinuousConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        let dynamic_fund_gas_reserve = std::env::var("DYNAMIC_FUND_GAS_RESERVE")
+            .ok()
+            .or_else(|| std::env::var("AUTO_FUND_GAS_RESERVE").ok())
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(1_000_000);
+
         Ok(Self {
+            wallet_source,
             num_wallets,
             wallet_offset,
             resync_nonces_each_cycle,
@@ -252,6 +300,7 @@ impl ContinuousConfig {
             continuous,
             managed_mode,
             max_cycles,
+            dynamic_fund_gas_reserve,
         })
     }
 }
@@ -269,6 +318,294 @@ struct NoteState {
     value: u128,
     rho: Hash32,
     sender_id: Hash32,
+}
+
+fn private_key_from_hex(
+    private_key_hex: &str,
+) -> Result<<<DemoRollupSpec as sov_modules_api::Spec>::CryptoSpec as CryptoSpec>::PrivateKey> {
+    let normalized = private_key_hex.trim().trim_start_matches("0x");
+    let private_key_bytes = hex::decode(normalized).context("Failed to decode private key hex")?;
+    anyhow::ensure!(
+        private_key_bytes.len() == 32,
+        "Private key must be 32 bytes (got {} bytes)",
+        private_key_bytes.len()
+    );
+
+    let key_json = serde_json::json!({
+        "key_pair": private_key_bytes,
+    });
+
+    let private_key = serde_json::from_value(key_json)
+        .context("Failed to deserialize private key from hex bytes")?;
+    Ok(private_key)
+}
+
+async fn load_wallets_from_genesis(
+    config: &ContinuousConfig,
+    http: &HttpClient,
+    node_base_url: &str,
+) -> Result<Vec<WalletState>> {
+    let crate_dir = rollup_crate_dir()?;
+    let keypairs_path = crate_dir
+        .parent()
+        .unwrap()
+        .join("test-data/genesis/demo/mock/generated_keypairs.json");
+
+    if !keypairs_path.exists() {
+        bail!(
+            "Generated keypairs file not found at {}. Run: cargo run -p sov-rollup-ligero --bin generate-genesis-keys",
+            keypairs_path.display()
+        );
+    }
+
+    let keypairs_json = std::fs::read_to_string(&keypairs_path)
+        .with_context(|| format!("Failed to read keypairs at {}", keypairs_path.display()))?;
+    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
+        serde_json::from_str(&keypairs_json)
+            .with_context(|| "Failed to parse generated_keypairs.json")?;
+
+    let required_keypairs = config
+        .wallet_offset
+        .checked_add(config.num_wallets)
+        .ok_or_else(|| anyhow!("wallet_offset + num_wallets overflowed usize"))?;
+
+    if all_keypairs.len() < required_keypairs {
+        bail!(
+            "Not enough keypairs in genesis file. Need {} keypairs to satisfy WALLET_OFFSET={} and CONTINUOUS_NUM_WALLETS={}, but only {} available.",
+            required_keypairs,
+            config.wallet_offset,
+            config.num_wallets,
+            all_keypairs.len()
+        );
+    }
+    eprintln!(
+        "[config] keypair_index_range=[{}..{})",
+        config.wallet_offset, required_keypairs
+    );
+
+    let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
+    for i in 0..config.num_wallets {
+        let keypair_idx = config.wallet_offset + i;
+        let account = all_keypairs[keypair_idx].clone();
+        let nonce = fetch_initial_nonce(http, node_base_url, &account)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to fetch latest nonce/generation for wallet {} (keypair_idx={}, address={})",
+                    i, keypair_idx, account.address
+                )
+            })?;
+
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "[setup] wallet {} (keypair_idx={}) address={} starting_nonce={}",
+                i, keypair_idx, account.address, nonce
+            );
+        }
+
+        wallets.push(WalletState {
+            account,
+            nonce,
+            spend_sk: [0u8; 32],
+            notes: Vec::new(),
+        });
+    }
+
+    Ok(wallets)
+}
+
+async fn wait_for_l2_balance(
+    client: &NodeClient,
+    wallet: &PrivateKeyAndAddress<DemoRollupSpec>,
+    token_id: &TokenId,
+    min_balance: u128,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<u128> {
+    let started = Instant::now();
+    loop {
+        match client
+            .get_balance::<DemoRollupSpec>(&wallet.address, token_id, None)
+            .await
+        {
+            Ok(balance) => {
+                let balance_u128: u128 = balance.0;
+                if balance_u128 >= min_balance {
+                    return Ok(balance_u128);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[setup] failed to query L2 balance while waiting for funding (wallet={}): {}",
+                    wallet.address, e
+                );
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            bail!(
+                "Timed out waiting for wallet {} to reach L2 balance >= {}",
+                wallet.address,
+                min_balance
+            );
+        }
+
+        sleep(poll).await;
+    }
+}
+
+async fn load_wallets_dynamic(
+    client: &NodeClient,
+    http: &HttpClient,
+    node_base_url: &str,
+    chain_hash: &[u8; 32],
+    config: &ContinuousConfig,
+) -> Result<Vec<WalletState>> {
+    let admin_wallet_private_key_hex = std::env::var("ADMIN_WALLET_PRIVATE_KEY")
+        .context("ADMIN_WALLET_PRIVATE_KEY is required when CONTINUOUS_WALLET_SOURCE=dynamic")?;
+    let admin_private_key = private_key_from_hex(&admin_wallet_private_key_hex)?;
+    let admin_account = PrivateKeyAndAddress::<DemoRollupSpec>::from_key(admin_private_key);
+    let gas_token_id = config_gas_token_id();
+
+    let l2_funding_amount = config
+        .deposit_amount
+        .checked_add(config.dynamic_fund_gas_reserve)
+        .ok_or_else(|| {
+            anyhow!(
+                "Overflow while computing dynamic L2 funding amount: deposit_amount={} + dynamic_fund_gas_reserve={}",
+                config.deposit_amount,
+                config.dynamic_fund_gas_reserve
+            )
+        })?;
+
+    let mut admin_nonce = fetch_initial_nonce(http, node_base_url, &admin_account)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to fetch latest nonce/generation for admin wallet {}",
+                admin_account.address
+            )
+        })?;
+
+    eprintln!(
+        "[setup] Dynamic wallet bootstrap enabled. admin_address={} funding_per_wallet={} (deposit_amount={} + gas_reserve={}) token_id={}",
+        admin_account.address,
+        l2_funding_amount,
+        config.deposit_amount,
+        config.dynamic_fund_gas_reserve,
+        gas_token_id
+    );
+
+    let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
+    for i in 0..config.num_wallets {
+        let account = PrivateKeyAndAddress::<DemoRollupSpec>::generate();
+        let nonce = fetch_initial_nonce(http, node_base_url, &account)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to fetch latest nonce/generation for dynamic wallet {} (address={})",
+                    i, account.address
+                )
+            })?;
+
+        let latest_admin_nonce = fetch_initial_nonce(http, node_base_url, &admin_account)
+            .await
+            .unwrap_or(admin_nonce);
+        if latest_admin_nonce > admin_nonce {
+            admin_nonce = latest_admin_nonce;
+        }
+
+        let mut submitted = false;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 0..3usize {
+            let bank_transfer_call =
+                RuntimeCall::<DemoRollupSpec>::Bank(BankCallMessage::Transfer {
+                    to: account.address.clone(),
+                    coins: BankCoins {
+                        amount: BankAmount::from(l2_funding_amount),
+                        token_id: gas_token_id.clone(),
+                    },
+                });
+
+            let tx: Transaction<Runtime<DemoRollupSpec>, DemoRollupSpec> =
+                default_test_signed_transaction(
+                    &admin_account.private_key,
+                    &bank_transfer_call,
+                    admin_nonce,
+                    chain_hash,
+                );
+            let mut meter = sov_modules_api::gas::UnlimitedGasMeter::<DemoRollupSpec>::default();
+            tx.verify(chain_hash, &mut meter)
+                .context("Dynamic funding tx signature verification failed")?;
+
+            let tx_bytes = borsh::to_vec(&tx)?;
+            match client
+                .send_transactions_to_sequencer(vec![tx_bytes], true)
+                .await
+            {
+                Ok(_) => {
+                    submitted = true;
+                    admin_nonce = admin_nonce
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("admin nonce overflow"))?;
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(anyhow!(e));
+                    if attempt < 2 {
+                        let refreshed_nonce =
+                            fetch_initial_nonce(http, node_base_url, &admin_account)
+                                .await
+                                .unwrap_or(admin_nonce);
+                        admin_nonce = refreshed_nonce;
+                        sleep(Duration::from_millis(300)).await;
+                    }
+                }
+            }
+        }
+
+        if !submitted {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow!(
+                    "Failed funding dynamic wallet {} after retries (address={})",
+                    i,
+                    account.address
+                )
+            }));
+        }
+
+        let _ = wait_for_l2_balance(
+            client,
+            &account,
+            &gas_token_id,
+            l2_funding_amount,
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed waiting for dynamic wallet {} funding (address={})",
+                i, account.address
+            )
+        })?;
+
+        if config.detailed_wallet_logs {
+            eprintln!(
+                "[setup] wallet {} (dynamic) address={} starting_nonce={} funded_l2={}",
+                i, account.address, nonce, l2_funding_amount
+            );
+        }
+
+        wallets.push(WalletState {
+            account,
+            nonce,
+            spend_sk: [0u8; 32],
+            notes: Vec::new(),
+        });
+    }
+
+    Ok(wallets)
 }
 
 fn rollup_crate_dir() -> Result<PathBuf> {
@@ -857,7 +1194,8 @@ pub async fn run() -> Result<()> {
     }
 
     eprintln!(
-        "[config] wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={} flush_transactions={}",
+        "[config] wallet_source={} wallets={} wallet_offset={} resync_nonces_each_cycle={} ledger_inclusion_timeout_secs={} initial_deposit={} deposit_amount={} transfer_amount={} per_tx_delay_ms={} cycle_delay_ms={} max_concurrent_proofs={} flush_transactions={} dynamic_fund_gas_reserve={}",
+        config.wallet_source.as_str(),
         config.num_wallets,
         config.wallet_offset,
         config.resync_nonces_each_cycle,
@@ -868,7 +1206,8 @@ pub async fn run() -> Result<()> {
         config.per_tx_delay_ms,
         config.cycle_delay_ms,
         config.max_concurrent_proofs,
-        config.flush_transactions
+        config.flush_transactions,
+        config.dynamic_fund_gas_reserve
     );
 
     // Log if transfer_amount differs from deposit_amount (change notes will be created)
@@ -980,74 +1319,14 @@ pub async fn run() -> Result<()> {
     // Ensure the node is serving /health and the sequencer is ready before sending deposits.
     wait_for_sequencer_ready(&http, &node_url, Duration::from_secs(60)).await?;
 
-    // Load genesis keypairs
-    let crate_dir = rollup_crate_dir()?;
-    let keypairs_path = crate_dir
-        .parent()
-        .unwrap()
-        .join("test-data/genesis/demo/mock/generated_keypairs.json");
-
-    if !keypairs_path.exists() {
-        bail!(
-            "Generated keypairs file not found at {}. Run: cargo run -p sov-rollup-ligero --bin generate-genesis-keys",
-            keypairs_path.display()
-        );
-    }
-
-    let keypairs_json = std::fs::read_to_string(&keypairs_path)
-        .with_context(|| format!("Failed to read keypairs at {}", keypairs_path.display()))?;
-    let all_keypairs: Vec<PrivateKeyAndAddress<DemoRollupSpec>> =
-        serde_json::from_str(&keypairs_json)
-            .with_context(|| "Failed to parse generated_keypairs.json")?;
-
-    let required_keypairs = config
-        .wallet_offset
-        .checked_add(config.num_wallets)
-        .ok_or_else(|| anyhow!("wallet_offset + num_wallets overflowed usize"))?;
-
-    if all_keypairs.len() < required_keypairs {
-        bail!(
-            "Not enough keypairs in genesis file. Need {} keypairs to satisfy WALLET_OFFSET={} and CONTINUOUS_NUM_WALLETS={}, but only {} available.",
-            required_keypairs,
-            config.wallet_offset,
-            config.num_wallets,
-            all_keypairs.len()
-        );
-    }
-    eprintln!(
-        "[config] keypair_index_range=[{}..{})",
-        config.wallet_offset, required_keypairs
-    );
-
     let node_base_url = node_url.clone();
     let wallet_setup_start = Instant::now();
-    let mut wallets: Vec<WalletState> = Vec::with_capacity(config.num_wallets);
-    for i in 0..config.num_wallets {
-        let keypair_idx = config.wallet_offset + i;
-        let account = all_keypairs[keypair_idx].clone();
-        let nonce = fetch_initial_nonce(&http, &node_base_url, &account)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to fetch latest nonce/generation for wallet {} (keypair_idx={}, address={})",
-                    i, keypair_idx, account.address
-                )
-            })?;
-
-        if config.detailed_wallet_logs {
-            eprintln!(
-                "[setup] wallet {} (keypair_idx={}) address={} starting_nonce={}",
-                i, keypair_idx, account.address, nonce
-            );
+    let mut wallets: Vec<WalletState> = match config.wallet_source {
+        WalletSource::Genesis => load_wallets_from_genesis(&config, &http, &node_base_url).await?,
+        WalletSource::Dynamic => {
+            load_wallets_dynamic(&client, &http, &node_base_url, &chain_hash, &config).await?
         }
-
-        wallets.push(WalletState {
-            account,
-            nonce,
-            spend_sk: [0u8; 32],
-            notes: Vec::new(),
-        });
-    }
+    };
     let wallet_setup_ms = wallet_setup_start.elapsed().as_secs_f64() * 1000.0;
 
     // If pool enforcement is enabled, fetch one viewer FVK per wallet from midnight-fvk-service.
@@ -1960,8 +2239,7 @@ async fn perform_transfer_cycle(
             cms.push(cm);
         }
 
-        let positions: Vec<Option<u64>> =
-            cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+        let positions: Vec<Option<u64>> = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
 
         if positions.iter().any(|p| p.is_none()) {
             eprintln!(

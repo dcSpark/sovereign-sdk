@@ -1,6 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
-use midnight_e2e_benchmarks::e2e_runner::{run, RunnerConfig};
+use midnight_e2e_benchmarks::e2e_runner::{run, RunnerConfig, WalletSource};
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum WalletSourceArg {
+    Genesis,
+    Dynamic,
+}
 
 /// CLI wrapper around the E2E benchmark runner.
 #[derive(Parser, Debug)]
@@ -36,6 +42,12 @@ struct Cli {
     /// Base URL for `midnight-fvk-service` (used when POOL_FVK_PK enforcement is enabled).
     #[arg(long, env = "MIDNIGHT_FVK_SERVICE_URL")]
     fvk_service_url: Option<String>,
+    /// Wallet source used for deposits/transfers.
+    #[arg(long, value_enum)]
+    wallet_source: Option<WalletSourceArg>,
+    /// Extra gas-token reserve added per dynamic account funding transfer.
+    #[arg(long)]
+    dynamic_fund_gas_reserve: Option<u128>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -71,6 +83,15 @@ async fn main() -> Result<()> {
     }
     if let Some(url) = cli.fvk_service_url {
         std::env::set_var("MIDNIGHT_FVK_SERVICE_URL", url);
+    }
+    if let Some(source) = cli.wallet_source {
+        config.wallet_source = match source {
+            WalletSourceArg::Genesis => WalletSource::Genesis,
+            WalletSourceArg::Dynamic => WalletSource::Dynamic,
+        };
+    }
+    if let Some(reserve) = cli.dynamic_fund_gas_reserve {
+        config.dynamic_fund_gas_reserve = reserve;
     }
     run(config).await
 }

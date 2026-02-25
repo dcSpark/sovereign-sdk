@@ -745,11 +745,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("[mcp] Rollup RPC URL: {}", cfg.rollup_rpc_url);
     tracing::info!("[mcp] Verifier URL: {}", cfg.verifier_url);
     tracing::info!("[mcp] Indexer URL: {}", cfg.indexer_url);
-    if cfg.start_with_new_wallet {
-        tracing::warn!(
-            "[mcp] START_WITH_NEW_WALLET is deprecated/ignored: sessions start empty. Use createWallet per MCP session."
-        );
-    }
 
     let admin_wallet_ctx = cfg
         .admin_wallet_private_key

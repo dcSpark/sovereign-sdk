@@ -50,6 +50,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Optional genesis directory override for service-manager environments (e.g. systemd + service-controller).
+# If CLI args already include --genesis-config-dir, CLI takes precedence.
+if [[ -n "${ROLLUP_GENESIS_CONFIG_DIR:-}" ]]; then
+    has_genesis_arg=0
+    i=0
+    while (( i < ${#ROLLUP_ARGS[@]} )); do
+        case "${ROLLUP_ARGS[$i]}" in
+            --genesis-config-dir)
+                has_genesis_arg=1
+                break
+                ;;
+            --genesis-config-dir=*)
+                has_genesis_arg=1
+                break
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    if [[ "$has_genesis_arg" -eq 0 ]]; then
+        ROLLUP_ARGS+=(--genesis-config-dir "$ROLLUP_GENESIS_CONFIG_DIR")
+    fi
+fi
+
 # Get the workspace root (assuming this script is in examples/rollup-ligero/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

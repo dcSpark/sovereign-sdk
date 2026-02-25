@@ -90,3 +90,6 @@ logs/mcp-external.log
 midnight_fvk_service.sqlite
 scripts/__pycache__
 tsink
+examples/rollup-ligero/midnight-l2-prod.json
+examples/rollup-ligero/operator-wallets-prod.json
+examples/test-data/genesis/production/mock
