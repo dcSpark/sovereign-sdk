@@ -14,7 +14,9 @@ use axum::{Json, Router, ServiceExt};
 use mcp_external::commitment_tree::{global_tree_syncer, start_background_tree_sync};
 use mcp_external::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
 use mcp_external::ligero::Ligero;
-use mcp_external::operations::{deposit, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE};
+use mcp_external::operations::{
+    deposit, get_privacy_notes, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE,
+};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::server::{McpSpec, McpWalletContext};
@@ -341,6 +343,10 @@ struct BurstResponse {
 struct FlushResultEntry {
     tx_hash: Option<String>,
     accepted: bool,
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,12 +955,17 @@ async fn apply_flush_results(
     flush: &FlushSummary,
 ) -> usize {
     let mut accepted_hashes: HashSet<String> = HashSet::new();
+    let mut nullifier_spent_hashes: HashSet<String> = HashSet::new();
     for entry in flush.results.iter() {
         let Some(tx_hash) = entry.tx_hash.as_ref() else {
             continue;
         };
         if entry.accepted {
             accepted_hashes.insert(tx_hash.clone());
+            continue;
+        }
+        if flush_entry_has_nullifier_already_spent(entry) {
+            nullifier_spent_hashes.insert(tx_hash.clone());
         }
     }
 
@@ -968,6 +979,8 @@ async fn apply_flush_results(
 
     let mut consumed = 0usize;
     let mut advanced = 0usize;
+    let mut stale_current_note_cleared = 0usize;
+    let mut wallets_needing_recovery: HashMap<usize, Option<Hash32>> = HashMap::new();
     for tx_hash in requested_tx_hashes.iter() {
         let Some(&wallet_idx) = by_hash.get(tx_hash) else {
             continue;
@@ -984,6 +997,14 @@ async fn apply_flush_results(
         if accepted_hashes.contains(tx_hash) {
             w.current_note = Some(pending.next_note);
             advanced += 1;
+        } else if nullifier_spent_hashes.contains(tx_hash) {
+            let stale_rho = w.current_note.as_ref().map(|note| note.rho);
+            if w.current_note.take().is_some() {
+                stale_current_note_cleared += 1;
+            }
+            wallets_needing_recovery
+                .entry(wallet_idx)
+                .or_insert(stale_rho);
         }
         w.pending = None;
         consumed += 1;
@@ -1004,11 +1025,202 @@ async fn apply_flush_results(
         flushed = flush.flushed,
         consumed,
         advanced,
+        stale_current_note_cleared,
+        nullifier_spent_rejections = nullifier_spent_hashes.len(),
         ready_after,
         "Applied flush results and consumed requested pending proofs"
     );
 
+    if !wallets_needing_recovery.is_empty() {
+        for (wallet_idx, stale_rho) in wallets_needing_recovery.into_iter() {
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    recover_wallet_after_nullifier_spent(&state, wallet_idx, stale_rho).await
+                {
+                    tracing::error!(
+                        wallet_idx,
+                        error = %error,
+                        "Failed to recover wallet after nullifier-spent rejection"
+                    );
+                }
+            });
+        }
+    }
+
     ready_after
+}
+
+fn flush_entry_has_nullifier_already_spent(entry: &FlushResultEntry) -> bool {
+    const NEEDLE: &str = "nullifier already spent";
+
+    if let Some(error) = entry.error.as_deref() {
+        if contains_ascii_case_insensitive(error, NEEDLE) {
+            return true;
+        }
+    }
+
+    if let Some(response) = entry.response.as_ref() {
+        if contains_ascii_case_insensitive(&response.to_string(), NEEDLE) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+async fn recover_wallet_after_nullifier_spent(
+    state: &Arc<ServiceState>,
+    wallet_idx: usize,
+    stale_rho: Option<Hash32>,
+) -> Result<()> {
+    let (wallet, privacy_key) = {
+        let wallets = state.wallets.read().await;
+        let wallet = wallets
+            .get(wallet_idx)
+            .ok_or_else(|| anyhow!("wallet idx {} out of range", wallet_idx))?;
+        (wallet.wallet.clone(), wallet.privacy_key.clone())
+    };
+
+    match try_restore_wallet_note_from_indexer(state, wallet_idx, &privacy_key, stale_rho).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                wallet_idx,
+                error = %error,
+                "Indexer-based wallet recovery failed; falling back to fresh deposit"
+            );
+        }
+    }
+
+    tracing::warn!(
+        wallet_idx,
+        "No recoverable unspent note found in indexer after nullifier-spent rejection; reseeding with a fresh deposit"
+    );
+    reseed_wallet_with_fresh_deposit(state, wallet_idx, wallet, privacy_key).await
+}
+
+async fn try_restore_wallet_note_from_indexer(
+    state: &Arc<ServiceState>,
+    wallet_idx: usize,
+    privacy_key: &PrivacyKey,
+    stale_rho: Option<Hash32>,
+) -> Result<bool> {
+    let notes = get_privacy_notes(state.provider.as_ref(), privacy_key, None)
+        .await
+        .with_context(|| {
+            format!(
+                "fetching unspent notes for wallet {} while recovering from nullifier-spent rejection",
+                wallet_idx
+            )
+        })?;
+
+    let mut skipped_stale = 0usize;
+    let mut parse_errors = 0usize;
+    for note in notes.into_iter() {
+        let rho = match parse_hash32(&note.rho) {
+            Ok(rho) => rho,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        if stale_rho.is_some() && stale_rho == Some(rho) {
+            skipped_stale += 1;
+            continue;
+        }
+        let sender_id = match parse_hash32(&note.sender_id) {
+            Ok(sender_id) => sender_id,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        let recovered_note = NoteState {
+            value: note.value,
+            rho,
+            sender_id,
+        };
+
+        if let Err(error) =
+            wait_for_note_in_tree(state.provider.as_ref(), privacy_key, &recovered_note).await
+        {
+            tracing::warn!(
+                wallet_idx,
+                note_rho = %note.rho,
+                error = %error,
+                "Candidate recovery note from indexer is not yet tree-visible; trying next candidate"
+            );
+            continue;
+        }
+        return set_wallet_current_note_if_unset(state, wallet_idx, recovered_note).await;
+    }
+
+    if skipped_stale > 0 || parse_errors > 0 {
+        tracing::warn!(
+            wallet_idx,
+            skipped_stale,
+            parse_errors,
+            "Skipped stale or malformed unspent notes while attempting indexer-based recovery"
+        );
+    }
+
+    Ok(false)
+}
+
+async fn reseed_wallet_with_fresh_deposit(
+    state: &Arc<ServiceState>,
+    wallet_idx: usize,
+    wallet: McpWalletContext,
+    privacy_key: PrivacyKey,
+) -> Result<()> {
+    ensure_wallet_gas_reserve(state, &wallet).await?;
+    let deposit_result =
+        deposit(state.deposit_provider.as_ref(), &wallet, state.cfg.deposit_amount, &privacy_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "depositing fresh note for wallet {} after nullifier-spent rejection",
+                    wallet_idx
+                )
+            })?;
+    let fresh_note = NoteState {
+        value: state.cfg.deposit_amount,
+        rho: deposit_result.rho,
+        sender_id: privacy_key.recipient(&DOMAIN),
+    };
+    wait_for_note_in_tree(state.provider.as_ref(), &privacy_key, &fresh_note).await?;
+    set_wallet_current_note_if_unset(state, wallet_idx, fresh_note).await?;
+    Ok(())
+}
+
+async fn set_wallet_current_note_if_unset(
+    state: &Arc<ServiceState>,
+    wallet_idx: usize,
+    note: NoteState,
+) -> Result<bool> {
+    let mut wallets = state.wallets.write().await;
+    let wallet = wallets
+        .get_mut(wallet_idx)
+        .ok_or_else(|| anyhow!("wallet idx {} out of range", wallet_idx))?;
+    if wallet.pending.is_some() || wallet.current_note.is_some() {
+        return Ok(true);
+    }
+
+    wallet.current_note = Some(note);
+    wallet.generating = false;
+    drop(wallets);
+
+    request_pool_state_save(state);
+    tracing::info!(wallet_idx, "Recovered wallet note after nullifier-spent rejection");
+    Ok(true)
 }
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
