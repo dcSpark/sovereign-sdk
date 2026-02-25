@@ -83,6 +83,7 @@ impl Ligero {
         };
 
         let num_args = args.len();
+        let n_private = private_indices.len();
         let request = ProveRequest {
             circuit: circuit.to_string(),
             args,
@@ -98,10 +99,29 @@ impl Ligero {
             .json(&request)
             .send()
             .await
-            .with_context(|| format!("POST {endpoint}"))?
-            .error_for_status()
-            .with_context(|| format!("POST {endpoint} returned error status"))?;
+            .with_context(|| format!("POST {endpoint}"))?;
         let http_ms = request_start.elapsed().as_millis();
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read response body: {e})"));
+            tracing::error!(
+                %endpoint,
+                %status,
+                circuit,
+                num_args,
+                n_private,
+                http_ms,
+                response_body = %error_body,
+                "Ligero proof service returned error status"
+            );
+            anyhow::bail!(
+                "POST {endpoint} returned {status} (circuit={circuit}, num_args={num_args}): {error_body}"
+            );
+        }
 
         let read_start = Instant::now();
         let proof_bytes = response

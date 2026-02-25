@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{AnyPool, Row};
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use tee::common::Engine;
 use tee::common::TEEPayload;
@@ -40,12 +43,26 @@ enum DbType {
     Sqlite,
 }
 
+struct SlotCacheEntry {
+    response: serde_json::Value,
+    status: StatusCode,
+    generation: u64,
+}
+
+struct ListCacheEntry {
+    response: serde_json::Value,
+    generation: u64,
+}
+
 #[derive(Clone)]
 struct AppState {
     signing_key: SigningKey,
     dev_accept_all: bool,
     db_pool: Option<Arc<AnyPool>>,
     db_type: Option<DbType>,
+    cache_generation: Arc<AtomicU64>,
+    slot_cache: Arc<Mutex<lru::LruCache<i64, SlotCacheEntry>>>,
+    list_cache: Arc<Mutex<lru::LruCache<(i64, i64), ListCacheEntry>>>,
 }
 
 pub fn load_policies_from_dir(dir: &String) -> Result<usize> {
@@ -332,6 +349,7 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
         {
             error!(error = ?e, "Failed to store TEE attestation in database");
         } else {
+            state.cache_generation.fetch_add(1, Ordering::Relaxed);
             info!(
                 batch_index = batch_idx,
                 da_start_height = da_start,
@@ -425,6 +443,18 @@ async fn list_attestations(
     let offset = params.offset.unwrap_or(0);
     info!(limit = limit, offset = offset, "GET /attestations");
 
+    let current_gen = state.cache_generation.load(Ordering::Relaxed);
+
+    // Cache lookup
+    {
+        let mut cache = state.list_cache.lock().unwrap();
+        if let Some(entry) = cache.get(&(limit, offset)) {
+            if entry.generation == current_gen {
+                return (StatusCode::OK, Json(entry.response.clone())).into_response();
+            }
+        }
+    }
+
     let Some(pool) = &state.db_pool else {
         warn!("GET /attestations - database not configured");
         return (
@@ -497,16 +527,25 @@ async fn list_attestations(
         "GET /attestations - returning results"
     );
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "attestations": attestations,
-            "count": attestations.len(),
-            "limit": limit,
-            "offset": offset,
-        })),
-    )
-        .into_response()
+    let resp_json = serde_json::json!({
+        "attestations": attestations,
+        "count": attestations.len(),
+        "limit": limit,
+        "offset": offset,
+    });
+
+    {
+        let mut cache = state.list_cache.lock().unwrap();
+        cache.put(
+            (limit, offset),
+            ListCacheEntry {
+                response: resp_json.clone(),
+                generation: current_gen,
+            },
+        );
+    }
+
+    (StatusCode::OK, Json(resp_json)).into_response()
 }
 
 /// GET /attestations/slot/:slot_id - Get attestation for a specific DA slot height
@@ -515,6 +554,21 @@ async fn get_attestation_by_slot(
     Path(slot_id): Path<i64>,
 ) -> Response {
     info!(slot_id = slot_id, "GET /attestations/slot/{}", slot_id);
+
+    let current_gen = state.cache_generation.load(Ordering::Relaxed);
+
+    // Cache lookup
+    {
+        let mut cache = state.slot_cache.lock().unwrap();
+        if let Some(entry) = cache.get(&slot_id) {
+            if entry.status == StatusCode::OK {
+                return (entry.status, Json(entry.response.clone())).into_response();
+            }
+            if entry.generation == current_gen {
+                return (entry.status, Json(entry.response.clone())).into_response();
+            }
+        }
+    }
 
     let Some(pool) = &state.db_pool else {
         warn!(
@@ -583,31 +637,52 @@ async fn get_attestation_by_slot(
                 "GET /attestations/slot - found attestation"
             );
 
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "found": true,
-                    "slot_id": slot_id,
-                    "batch_index": batch_index,
-                    "da_start_height": da_start_height,
-                    "da_end_height": da_end_height,
-                    "created_at": created_at,
-                    "attestation": attestation,
-                })),
-            )
-                .into_response()
+            let resp_json = serde_json::json!({
+                "found": true,
+                "slot_id": slot_id,
+                "batch_index": batch_index,
+                "da_start_height": da_start_height,
+                "da_end_height": da_end_height,
+                "created_at": created_at,
+                "attestation": attestation,
+            });
+
+            {
+                let mut cache = state.slot_cache.lock().unwrap();
+                cache.put(
+                    slot_id,
+                    SlotCacheEntry {
+                        response: resp_json.clone(),
+                        status: StatusCode::OK,
+                        generation: current_gen,
+                    },
+                );
+            }
+
+            (StatusCode::OK, Json(resp_json)).into_response()
         }
         None => {
             info!(slot_id = slot_id, "GET /attestations/slot - not found");
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "found": false,
-                    "slot_id": slot_id,
-                    "message": format!("No attestation found for DA height {}", slot_id),
-                })),
-            )
-                .into_response()
+
+            let resp_json = serde_json::json!({
+                "found": false,
+                "slot_id": slot_id,
+                "message": format!("No attestation found for DA height {}", slot_id),
+            });
+
+            {
+                let mut cache = state.slot_cache.lock().unwrap();
+                cache.put(
+                    slot_id,
+                    SlotCacheEntry {
+                        response: resp_json.clone(),
+                        status: StatusCode::NOT_FOUND,
+                        generation: current_gen,
+                    },
+                );
+            }
+
+            (StatusCode::NOT_FOUND, Json(resp_json)).into_response()
         }
     }
 }
@@ -711,11 +786,18 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    let cache_cap =
+        NonZeroUsize::new(cfg.oracle_cache_size).unwrap_or(NonZeroUsize::new(5000).unwrap());
+    info!(cache_size = cfg.oracle_cache_size, "Attestation LRU cache configured");
+
     let state = AppState {
         signing_key,
         dev_accept_all: cfg.oracle_dev_accept_all,
         db_pool,
         db_type,
+        cache_generation: Arc::new(AtomicU64::new(0)),
+        slot_cache: Arc::new(Mutex::new(lru::LruCache::new(cache_cap))),
+        list_cache: Arc::new(Mutex::new(lru::LruCache::new(cache_cap))),
     };
 
     let app = Router::new()
