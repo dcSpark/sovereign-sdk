@@ -531,7 +531,11 @@ struct ServiceDefinition {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let demo_data_dir = script_dir.join("demo_data");
+    let demo_data_dir = if is_replica_mode() {
+        script_dir.join("demo_data_replica")
+    } else {
+        script_dir.join("demo_data")
+    };
 
     let bind_addr =
         std::env::var("SERVICE_CONTROLLER_BIND").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
