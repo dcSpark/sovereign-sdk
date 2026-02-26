@@ -15,9 +15,10 @@ export interface HealthResponse {
   status: string;
   services: ServiceHealth[];
   checkedAt: string;
+  replicaMode?: boolean;
 }
 
-export type ActionType = 'start' | 'stop' | 'restart' | 'clean' | 'clean-database' | 'reset-tee';
+export type ActionType = 'start' | 'stop' | 'restart' | 'clean' | 'clean-database' | 'reset-tee' | 'reset-replica';
 
 export interface ActionResult {
   success: boolean;
