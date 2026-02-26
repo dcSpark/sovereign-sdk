@@ -39,6 +39,12 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::EnvFilter;
 
+mod progress;
+use progress::{
+    ScaleUpCounter, ScaleUpProgressResponse, ScaleUpProgressTracker, ScaleUpStage, StartupCounter,
+    StartupProgressResponse, StartupProgressTracker, StartupStage,
+};
+
 const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
@@ -227,6 +233,8 @@ struct ServiceState {
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
     max_concurrent_proofs: AtomicUsize,
+    startup_progress: StartupProgressTracker,
+    scale_up_progress: ScaleUpProgressTracker,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
     http: HttpClient,
@@ -313,6 +321,8 @@ struct StatusResponse {
     proof_generation_state: &'static str,
     proof_generation_interval_ms: u64,
     max_concurrent_proofs: usize,
+    startup_progress: StartupProgressResponse,
+    scale_up_progress: ScaleUpProgressResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +438,8 @@ async fn main() -> Result<()> {
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
         max_concurrent_proofs: AtomicUsize::new(cfg.max_concurrent_proofs),
+        startup_progress: StartupProgressTracker::new(cfg.max_proofs),
+        scale_up_progress: ScaleUpProgressTracker::new(cfg.max_proofs),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
@@ -453,7 +465,9 @@ async fn main() -> Result<()> {
                     persisted_proof_generation_active = pc.proof_generation_active,
                     "Overriding startup config with persisted pool_config"
                 );
-                state.target_max_proofs.store(pc.max_proofs, Ordering::Relaxed);
+                state
+                    .target_max_proofs
+                    .store(pc.max_proofs, Ordering::Relaxed);
                 state
                     .proof_generation_enabled
                     .store(pc.proof_generation_active, Ordering::Relaxed);
@@ -477,13 +491,28 @@ async fn main() -> Result<()> {
     // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
     let setup_state = state.clone();
     tokio::spawn(async move {
+        let startup_target = setup_state.target_max_proofs.load(Ordering::Relaxed);
+        setup_state
+            .startup_progress
+            .begin(startup_target, StartupStage::RestoringState);
+
         // Try to restore from a previous state DB first.
         let restored = match restore_wallets_from_state(&setup_state).await {
             Ok(true) => {
+                let restored_wallet_count = setup_state.wallets.read().await.len();
+                setup_state
+                    .startup_progress
+                    .seed_restored_wallet_progress(restored_wallet_count);
+
                 // Re-fetch viewer FVK bundles (not persisted; cheap to re-fetch).
+                setup_state
+                    .startup_progress
+                    .set_stage(StartupStage::FetchingViewerFvkBundles);
                 if let Err(e) = maybe_fetch_viewer_fvk_bundles(&setup_state).await {
                     tracing::warn!(error = %e, "Failed to re-fetch viewer FVK bundles after restore");
                 }
+
+                setup_state.startup_progress.mark_complete();
                 true
             }
             Ok(false) => false,
@@ -492,6 +521,7 @@ async fn main() -> Result<()> {
                     error = %e,
                     "Failed to restore pool state; refusing to start fresh to prevent data loss"
                 );
+                setup_state.startup_progress.mark_failed();
                 return;
             }
         };
@@ -499,6 +529,7 @@ async fn main() -> Result<()> {
         if !restored {
             if let Err(e) = setup_wallets_and_fill_pool(setup_state.clone()).await {
                 tracing::error!(error = %e, "Startup setup failed; proof pool will not generate proofs");
+                setup_state.startup_progress.mark_failed();
                 return;
             }
         }
@@ -622,6 +653,9 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
     let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
+    let current_wallets = state.wallets.read().await.len();
+    let startup_progress = state.startup_progress.snapshot();
+    let scale_up_progress = state.scale_up_progress.snapshot(current_wallets);
     StatusResponse {
         max_proofs,
         ready_proofs: ready,
@@ -629,6 +663,8 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
         proof_generation_state: proof_generation_state_label(active),
         proof_generation_interval_ms: interval_ms,
         max_concurrent_proofs: max_concurrent,
+        startup_progress,
+        scale_up_progress,
     }
 }
 
@@ -717,6 +753,11 @@ async fn max_proofs_impl(
             return Err(StatusCode::BAD_REQUEST);
         }
         state.target_max_proofs.store(max_proofs, Ordering::Relaxed);
+        state.scale_up_progress.set_target_wallets(max_proofs);
+        if !state.scale_up_progress.is_in_progress() {
+            let current_wallets = state.wallets.read().await.len();
+            state.scale_up_progress.reset_when_idle(current_wallets);
+        }
         tracing::info!(
             max_proofs,
             wallet_setup_parallelism = state.max_concurrent_proofs.load(Ordering::Relaxed),
@@ -1231,15 +1272,19 @@ async fn reseed_wallet_with_fresh_deposit(
     privacy_key: PrivacyKey,
 ) -> Result<()> {
     ensure_wallet_gas_reserve(state, &wallet).await?;
-    let deposit_result =
-        deposit(state.deposit_provider.as_ref(), &wallet, state.cfg.deposit_amount, &privacy_key)
-            .await
-            .with_context(|| {
-                format!(
-                    "depositing fresh note for wallet {} after nullifier-spent rejection",
-                    wallet_idx
-                )
-            })?;
+    let deposit_result = deposit(
+        state.deposit_provider.as_ref(),
+        &wallet,
+        state.cfg.deposit_amount,
+        &privacy_key,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "depositing fresh note for wallet {} after nullifier-spent rejection",
+            wallet_idx
+        )
+    })?;
     let fresh_note = NoteState {
         value: state.cfg.deposit_amount,
         rho: deposit_result.rho,
@@ -1268,7 +1313,10 @@ async fn set_wallet_current_note_if_unset(
     drop(wallets);
 
     request_pool_state_save(state);
-    tracing::info!(wallet_idx, "Recovered wallet note after nullifier-spent rejection");
+    tracing::info!(
+        wallet_idx,
+        "Recovered wallet note after nullifier-spent rejection"
+    );
     Ok(true)
 }
 
@@ -1363,6 +1411,15 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
             let target = state.target_max_proofs.load(Ordering::Relaxed);
             let current = state.wallets.read().await.len();
             if current < target {
+                if !state.scale_up_progress.is_in_progress() {
+                    state.scale_up_progress.begin(current, target);
+                } else {
+                    state.scale_up_progress.update_target(target);
+                }
+
+                state
+                    .scale_up_progress
+                    .set_stage(ScaleUpStage::WaitingForSequencerReady);
                 if !sequencer_ready_for_wallet_setup(&state).await {
                     tracing::warn!(
                         current,
@@ -1376,6 +1433,7 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
 
                 let missing = target - current;
                 let to_add = missing.min(wallet_setup_parallelism(&state));
+                state.scale_up_progress.set_batch_size(to_add);
                 tracing::info!(
                     current,
                     target,
@@ -1385,13 +1443,23 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
                     "Scaling wallet pool up in batch"
                 );
                 if let Err(e) = setup_and_append_wallets(&state, to_add).await {
+                    state.scale_up_progress.mark_failed();
                     tracing::error!(error = %e, "Failed to scale wallet pool");
                     sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
                 } else {
+                    let current_after = state.wallets.read().await.len();
+                    let target_after = state.target_max_proofs.load(Ordering::Relaxed);
+                    if current_after >= target_after {
+                        state.scale_up_progress.mark_complete(current_after);
+                    }
                     // Smooth large max_proofs increases by pacing successful scale-up batches.
                     sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
                 }
                 continue;
+            }
+
+            if state.scale_up_progress.is_in_progress() {
+                state.scale_up_progress.mark_complete(current);
             }
             sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
         }
@@ -1615,10 +1683,16 @@ async fn ensure_wallet_gas_reserve(
 async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
     let started = Instant::now();
 
+    let total_wallets = state.cfg.max_proofs;
+    state.startup_progress.set_total_wallets(total_wallets);
+    state
+        .startup_progress
+        .set_stage(StartupStage::CreatingWallets);
+
     let l2_funding_amount = state.cfg.deposit_amount + state.cfg.auto_fund_gas_reserve;
 
-    let mut wallets: Vec<PoolWallet> = Vec::with_capacity(state.cfg.max_proofs);
-    for _ in 0..state.cfg.max_proofs {
+    let mut wallets: Vec<PoolWallet> = Vec::with_capacity(total_wallets);
+    for wallet_idx in 0..total_wallets {
         let wallet_key_hex = generate_key_hex();
         let privacy_key_hex = generate_key_hex();
         let wallet = McpWalletContext::from_private_key_hex(&wallet_key_hex)?;
@@ -1633,25 +1707,46 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
             pending: None,
             generating: false,
         });
+        state.startup_progress.set_progress(
+            StartupStage::CreatingWallets,
+            StartupCounter::WalletsCreated,
+            wallet_idx + 1,
+        );
     }
     *state.wallets.write().await = wallets;
 
+    state
+        .startup_progress
+        .set_stage(StartupStage::FetchingViewerFvkBundles);
     maybe_fetch_viewer_fvk_bundles(&state).await?;
 
+    state
+        .startup_progress
+        .set_stage(StartupStage::FundingWallets);
     tracing::info!(
-        max_proofs = state.cfg.max_proofs,
+        max_proofs = total_wallets,
         l2_funding_amount,
         "Funding wallets from admin"
     );
     fund_wallets(&state, l2_funding_amount).await?;
+
+    state
+        .startup_progress
+        .set_stage(StartupStage::WaitingForWalletBalances);
     wait_for_wallet_balances(&state, l2_funding_amount).await?;
 
+    state
+        .startup_progress
+        .set_stage(StartupStage::SubmittingDeposits);
     tracing::info!(
         deposit_amount = state.cfg.deposit_amount,
         "Submitting deposits"
     );
     let deposit_notes = submit_deposits(&state).await?;
 
+    state
+        .startup_progress
+        .set_stage(StartupStage::WaitingForDepositNotes);
     tracing::info!("Waiting for deposit notes to be indexed");
     let privacy_keys: Vec<PrivacyKey> = {
         let wallets = state.wallets.read().await;
@@ -1662,6 +1757,10 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
             .get(wallet_idx)
             .ok_or_else(|| anyhow!("wallet idx out of range"))?;
         wait_for_note_in_tree(state.provider.as_ref(), privacy_key, note).await?;
+        state.startup_progress.increment_progress(
+            StartupStage::WaitingForDepositNotes,
+            StartupCounter::DepositNotesIndexed,
+        );
     }
 
     {
@@ -1679,6 +1778,7 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         ready,
         "Startup complete"
     );
+    state.startup_progress.mark_complete();
     request_pool_state_save(&state);
 
     Ok(())
@@ -1689,6 +1789,9 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
         return Ok(());
     }
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::CreatingWallets);
     let started = Instant::now();
     let l2_funding_amount = state.cfg.deposit_amount + state.cfg.auto_fund_gas_reserve;
     tracing::info!(
@@ -1714,34 +1817,66 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
             pending: None,
             generating: false,
         });
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::CreatingWallets,
+            ScaleUpCounter::WalletsCreated,
+        );
     }
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::FetchingViewerFvkBundles);
     maybe_fetch_viewer_fvk_bundles_for_wallets(state, &mut new_wallets).await?;
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::FundingWallets);
     fund_wallets_list(state, &new_wallets, l2_funding_amount).await?;
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::WaitingForWalletBalances);
     wait_for_wallet_balances_list(state, &new_wallets, l2_funding_amount).await?;
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::SubmittingDeposits);
     tracing::info!("Submitting new deposits");
     let deposit_notes = submit_deposits_list(state, &new_wallets).await?;
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::WaitingForDepositNotes);
     tracing::info!("Waiting for new deposit notes to be indexed");
     for (wallet_idx, note) in deposit_notes.iter().enumerate() {
         let w = new_wallets
             .get(wallet_idx)
             .ok_or_else(|| anyhow!("wallet idx out of range"))?;
         wait_for_note_in_tree(state.provider.as_ref(), &w.privacy_key, note).await?;
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::WaitingForDepositNotes,
+            ScaleUpCounter::DepositNotesIndexed,
+        );
     }
 
     for (w, note) in new_wallets.iter_mut().zip(deposit_notes.into_iter()) {
         w.current_note = Some(note);
     }
 
+    state
+        .scale_up_progress
+        .set_stage(ScaleUpStage::AppendingWallets);
     let (start_idx, total) = {
         let mut wallets = state.wallets.write().await;
         let start_idx = wallets.len();
         wallets.extend(new_wallets);
         (start_idx, wallets.len())
     };
+    for _ in 0..count {
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::AppendingWallets,
+            ScaleUpCounter::WalletsAppended,
+        );
+    }
 
     tracing::info!(
         start_idx,
@@ -1760,9 +1895,21 @@ async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
     let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
     let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
     let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
+        for _ in 0..wallets.len() {
+            state.scale_up_progress.increment_progress(
+                ScaleUpStage::FetchingViewerFvkBundles,
+                ScaleUpCounter::ViewerFvkBundlesReady,
+            );
+        }
         return Ok(());
     };
     if pool_fvk_pk_raw.is_empty() {
+        for _ in 0..wallets.len() {
+            state.scale_up_progress.increment_progress(
+                ScaleUpStage::FetchingViewerFvkBundles,
+                ScaleUpCounter::ViewerFvkBundlesReady,
+            );
+        }
         return Ok(());
     }
 
@@ -1798,6 +1945,10 @@ async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
     while let Some(res) = join_set.join_next().await {
         let (idx, bundle) = res??;
         out[idx] = Some(bundle);
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::FetchingViewerFvkBundles,
+            ScaleUpCounter::ViewerFvkBundlesReady,
+        );
     }
 
     for (idx, bundle) in out.into_iter().enumerate() {
@@ -1840,6 +1991,9 @@ async fn fund_wallets_list(
 
     while let Some(res) = join_set.join_next().await {
         res??;
+        state
+            .scale_up_progress
+            .increment_progress(ScaleUpStage::FundingWallets, ScaleUpCounter::WalletsFunded);
     }
 
     Ok(())
@@ -1902,6 +2056,10 @@ async fn wait_for_wallet_balances_list(
 
     while let Some(res) = join_set.join_next().await {
         res??;
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::WaitingForWalletBalances,
+            ScaleUpCounter::WalletsBalanceReady,
+        );
     }
 
     Ok(())
@@ -1938,6 +2096,10 @@ async fn submit_deposits_list(
     while let Some(res) = join_set.join_next().await {
         let (idx, note) = res??;
         out[idx] = Some(note);
+        state.scale_up_progress.increment_progress(
+            ScaleUpStage::SubmittingDeposits,
+            ScaleUpCounter::DepositsSubmitted,
+        );
     }
 
     out.into_iter()
@@ -1946,23 +2108,41 @@ async fn submit_deposits_list(
 }
 
 async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()> {
+    let startup_total_wallets = state.startup_progress.total_wallets();
     let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
     let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
     let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
+        state.startup_progress.set_progress(
+            StartupStage::FetchingViewerFvkBundles,
+            StartupCounter::ViewerFvkBundlesReady,
+            startup_total_wallets,
+        );
+        if state.startup_progress.is_in_progress() {
+            tracing::info!(
+                stage = StartupStage::FetchingViewerFvkBundles.label(),
+                total_wallets = startup_total_wallets,
+                "Startup viewer FVK fetch skipped because POOL_FVK_PK is not set"
+            );
+        }
         return Ok(());
     };
     if pool_fvk_pk_raw.is_empty() {
+        state.startup_progress.set_progress(
+            StartupStage::FetchingViewerFvkBundles,
+            StartupCounter::ViewerFvkBundlesReady,
+            startup_total_wallets,
+        );
+        if state.startup_progress.is_in_progress() {
+            tracing::info!(
+                stage = StartupStage::FetchingViewerFvkBundles.label(),
+                total_wallets = startup_total_wallets,
+                "Startup viewer FVK fetch skipped because POOL_FVK_PK is empty"
+            );
+        }
         return Ok(());
     }
 
     let pool_fvk_pk = parse_hex_32("POOL_FVK_PK", &pool_fvk_pk_raw)?;
-    tracing::info!(
-        wallets = state.cfg.max_proofs,
-        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
-    );
-
-    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
-    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
     let wallet_targets: Vec<(usize, String, String)> = {
         let wallets = state.wallets.read().await;
         wallets
@@ -1977,6 +2157,15 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
             })
             .collect()
     };
+    let total_wallets = wallet_targets.len();
+
+    tracing::info!(
+        wallets = total_wallets,
+        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
+    );
+
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
+    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
 
     for (idx, wallet_address, shielded_address) in wallet_targets.iter().cloned() {
         let http = state.http.clone();
@@ -1999,6 +2188,10 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
     while let Some(res) = join_set.join_next().await {
         let (idx, bundle) = res??;
         out[idx] = Some(bundle);
+        state.startup_progress.increment_progress(
+            StartupStage::FetchingViewerFvkBundles,
+            StartupCounter::ViewerFvkBundlesReady,
+        );
     }
 
     let mut wallets = state.wallets.write().await;
@@ -2044,6 +2237,9 @@ async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
 
     while let Some(res) = join_set.join_next().await {
         res??;
+        state
+            .startup_progress
+            .increment_progress(StartupStage::FundingWallets, StartupCounter::WalletsFunded);
     }
 
     Ok(())
@@ -2108,6 +2304,10 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
 
     while let Some(res) = join_set.join_next().await {
         res??;
+        state.startup_progress.increment_progress(
+            StartupStage::WaitingForWalletBalances,
+            StartupCounter::WalletsBalanceReady,
+        );
     }
 
     Ok(())
@@ -2148,6 +2348,10 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     while let Some(res) = join_set.join_next().await {
         let (idx, note) = res??;
         out[idx] = Some(note);
+        state.startup_progress.increment_progress(
+            StartupStage::SubmittingDeposits,
+            StartupCounter::DepositsSubmitted,
+        );
     }
 
     out.into_iter()
@@ -2870,7 +3074,13 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
         "Restoring wallets from persisted state"
     );
 
-    let mut wallets = Vec::with_capacity(persisted.wallets.len());
+    let total_wallets = persisted.wallets.len();
+    state.startup_progress.set_total_wallets(total_wallets);
+    state
+        .startup_progress
+        .set_stage(StartupStage::RestoringState);
+
+    let mut wallets = Vec::with_capacity(total_wallets);
     let mut ready_count = 0usize;
 
     for (idx, pw) in persisted.wallets.iter().enumerate() {
@@ -2912,6 +3122,11 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
             pending,
             generating: false,
         });
+        state.startup_progress.set_progress(
+            StartupStage::RestoringState,
+            StartupCounter::WalletsCreated,
+            idx + 1,
+        );
     }
 
     let wallet_count = wallets.len();
