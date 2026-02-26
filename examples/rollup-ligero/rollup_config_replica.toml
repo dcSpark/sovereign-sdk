@@ -2,8 +2,8 @@
 # This node syncs from the shared DA database but does not write to it.
 
 [da]
-# Shared DA database - same as the primary node
-connection_string = "sqlite://demo_data/da.sqlite?mode=rwc"
+# Shared DA database - must match the primary node's DA connection
+connection_string = "postgresql://admin:1234@localhost:5432/da"
 
 # Sequencer address (can be different from primary, but doesn't matter in replica mode)
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
