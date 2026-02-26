@@ -348,4 +348,8 @@ echo ""
 echo "────────────────────────────────────────────────────"
 echo ""
 
-exec "$CONTROLLER_BIN"
+if [ -n "$DASHBOARD_PID" ]; then
+  "$CONTROLLER_BIN"
+else
+  exec "$CONTROLLER_BIN"
+fi
