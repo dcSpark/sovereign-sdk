@@ -274,9 +274,9 @@ impl ZkVerifier for NightstreamVerifier {
             native::ensure_code_commitment(&package.rom_bytes, &code_commitment.0)?;
             tracing::info!("Nightstream: code commitment OK");
 
-            // Verify the proof (verify-only, no re-execution)
+            // Verify the proof package (reconstruct run + compare canonical proof bytes).
             tracing::info!(
-                "Nightstream: starting proof verification (verify-only, {} step instances)...",
+                "Nightstream: starting proof verification (replay mode, {} step instances)...",
                 package.steps_public.len(),
             );
             let verify_start = std::time::Instant::now();
@@ -308,7 +308,7 @@ impl NightstreamVerifier {
         native::ensure_code_commitment(rom_bytes, expected)
     }
 
-    /// Verify a proof package (verify-only, no re-execution).
+    /// Verify a proof package.
     pub fn verify_proof_package(
         package: &NightstreamProofPackage,
     ) -> Result<(), anyhow::Error> {
@@ -344,13 +344,11 @@ mod native {
         Ok(())
     }
 
-    /// Verify a Nightstream proof package (verify-only, no re-execution).
+    /// Verify a Nightstream proof package.
     ///
     /// This delegates to `NightstreamProofPackage::verify()` which:
-    /// 1. Reconstructs the CCS structure from the ROM + config (circuit synthesis only, ~ms).
-    /// 2. Verifies the `ShardProof` against the provided `steps_public` instances.
-    ///
-    /// **No RISC-V execution or re-proving is performed.**
+    /// 1. Reconstructs and runs the trace wiring from ROM + config.
+    /// 2. Canonically re-encodes the generated proof and compares it to the packaged proof bytes.
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
         let ok = package.verify().map_err(|e| {
             anyhow::anyhow!("Nightstream proof verification failed: {:?}", e)

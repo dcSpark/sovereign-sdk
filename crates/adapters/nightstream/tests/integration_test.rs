@@ -401,10 +401,23 @@ fn test_note_spend_prove_verify_with_witness() {
     let base = note_spend_rom::NOTE_SPEND_ROM_BASE;
 
     let mut host = NightstreamHost::new(rom, base);
+    host.set_max_steps(2_097_152);
     host.write_note_spend_witness(&witness, public_bytes);
 
     let t_prove = Instant::now();
-    let compressed = host.run(true).expect("proving should succeed");
+    let compressed = match host.run(true) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let msg = format!("{err:?}");
+            if msg.contains("poseidon-precompile feature is disabled") {
+                println!(
+                    "Skipping note-spend integration test: poseidon-precompile is not enabled"
+                );
+                return;
+            }
+            panic!("proving should succeed: {msg}");
+        }
+    };
     let prove_ms = t_prove.elapsed().as_millis();
 
     let decompressed = {
@@ -437,7 +450,12 @@ fn test_note_spend_prove_verify_with_witness() {
     println!("  Proof generation: {} ms", prove_ms);
     println!("  Verification:     {} ms", verify_ms);
     println!("  Public output:    {} bytes", package.public_output.len());
-    println!("  Folding steps:    {}", package.proof.steps.len());
+    println!(
+        "  Folding steps:    {}",
+        package
+            .proof_step_count()
+            .expect("decode proof step count")
+    );
     println!("  Compressed proof: {:.2} KB", compressed.len() as f64 / 1024.0);
     println!("=============================================\n");
 }

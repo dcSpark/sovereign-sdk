@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "nightstream-sdk"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=93d09ad5023b8e7b6002da6756d2086ef6a8e634#93d09ad5023b8e7b6002da6756d2086ef6a8e634"
 dependencies = [
  "nightstream-sdk-macros",
 ]
@@ -13,7 +13,7 @@ dependencies = [
 [[package]]
 name = "nightstream-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/dcSpark/Nightstream?rev=cca6616a2702091e67e271aca2b8dc21bb4b798b#cca6616a2702091e67e271aca2b8dc21bb4b798b"
+source = "git+https://github.com/dcSpark/Nightstream?rev=93d09ad5023b8e7b6002da6756d2086ef6a8e634#93d09ad5023b8e7b6002da6756d2086ef6a8e634"
 dependencies = [
  "proc-macro2",
  "quote",

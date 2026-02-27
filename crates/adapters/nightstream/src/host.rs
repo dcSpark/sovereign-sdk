@@ -20,7 +20,9 @@ use sov_rollup_interface::zk::ZkvmHost;
 use std::collections::HashMap;
 use std::io::Write;
 
-use crate::proof_package::{NightstreamProofPackage, Rv32TraceWiringRunConfig};
+use crate::proof_package::{
+    encode_shard_proof_bytes, NightstreamProofPackage, Rv32TraceWiringRunConfig,
+};
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
 /// Default input address for the Nightstream guest ABI.
@@ -295,6 +297,8 @@ pub struct NightstreamHost {
     input_offset: u64,
     /// Chunk rows (rows per trace-wiring folding step).
     chunk_rows: usize,
+    /// Optional max architectural instruction bound for execution.
+    max_steps: Option<usize>,
     /// Output claims: (address, expected_value).
     output_claims: Vec<(u64, u64)>,
     /// Pre-built public output bytes (bincode-serialized SpendPublic).
@@ -314,6 +318,7 @@ impl NightstreamHost {
             ram_init: HashMap::new(),
             input_offset: INPUT_ADDR,
             chunk_rows: DEFAULT_CHUNK_ROWS,
+            max_steps: None,
             output_claims: Vec::new(),
             stored_public_output: None,
         }
@@ -323,6 +328,19 @@ impl NightstreamHost {
     pub fn with_chunk_rows(mut self, chunk_rows: usize) -> Self {
         self.chunk_rows = chunk_rows;
         self
+    }
+
+    /// Set an explicit max architectural instruction bound.
+    ///
+    /// This is forwarded to `Rv32TraceWiring::max_steps`.
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = Some(max_steps);
+        self
+    }
+
+    /// Set an explicit max architectural instruction bound on an existing host.
+    pub fn set_max_steps(&mut self, max_steps: usize) {
+        self.max_steps = Some(max_steps);
     }
 
     /// Add a u32 input value at the next available input address.
@@ -489,6 +507,10 @@ impl NightstreamHost {
             .chunk_rows(self.chunk_rows)
             .shout_auto_minimal();
 
+        if let Some(max_steps) = self.max_steps {
+            builder = builder.max_steps(max_steps);
+        }
+
         for (&addr, &value) in &self.ram_init {
             builder = builder.ram_init_u32(addr, value as u32);
         }
@@ -501,16 +523,13 @@ impl NightstreamHost {
     }
 
     /// Build the run configuration for proof packaging.
-    ///
-    /// Requires the completed run to extract execution-dependent sizing values
-    /// (`step_rows`, `ram_d`, `width_lookup_addr_d`).
     fn build_config(&self, run: &Rv32TraceWiringRun) -> Rv32TraceWiringRunConfig {
         Rv32TraceWiringRunConfig {
             program_base: self.program_base,
             xlen: 32,
-            step_rows: run.step_rows(),
-            ram_d: run.ram_d(),
-            width_lookup_addr_d: run.width_lookup_addr_d(),
+            chunk_rows: self.chunk_rows,
+            max_steps: self.max_steps,
+            trace_len: Some(run.trace_len()),
             ram_init: self.ram_init.clone(),
             reg_init: HashMap::new(),
             output_claims: self.output_claims.clone(),
@@ -525,6 +544,8 @@ pub struct NightstreamHostArgs {
     pub rom_bytes: Vec<u8>,
     /// Program base address (from .neo_start section header).
     pub program_base: u64,
+    /// Optional max architectural instruction bound.
+    pub max_steps: Option<usize>,
 }
 
 impl NightstreamHostArgs {
@@ -533,6 +554,7 @@ impl NightstreamHostArgs {
         Self {
             rom_bytes,
             program_base,
+            max_steps: None,
         }
     }
 }
@@ -542,7 +564,11 @@ impl ZkvmHost for NightstreamHost {
     type HostArgs = NightstreamHostArgs;
 
     fn from_args(args: &Self::HostArgs) -> Self {
-        Self::new(&args.rom_bytes, args.program_base)
+        let mut host = Self::new(&args.rom_bytes, args.program_base);
+        if let Some(max_steps) = args.max_steps {
+            host = host.with_max_steps(max_steps);
+        }
+        host
     }
 
     fn add_hint<T: Serialize>(&mut self, item: T) {
@@ -573,8 +599,9 @@ impl ZkvmHost for NightstreamHost {
     fn run(&mut self, with_proof: bool) -> Result<Vec<u8>> {
         if with_proof {
             tracing::info!(
-                "Nightstream: Generating proof with Rv32TraceWiring (chunk_rows={})",
+                "Nightstream: Generating proof with Rv32TraceWiring (chunk_rows={}, max_steps={:?})",
                 self.chunk_rows,
+                self.max_steps,
             );
 
             let prove_start = std::time::Instant::now();
@@ -587,7 +614,7 @@ impl ZkvmHost for NightstreamHost {
             tracing::info!(
                 "Nightstream: {} RISC-V instructions executed (chunk_rows={}, folding_steps={})",
                 run.trace_len(),
-                run.step_rows(),
+                run.layout().t,
                 run.fold_count(),
             );
             tracing::info!(
@@ -608,13 +635,15 @@ impl ZkvmHost for NightstreamHost {
 
             let output_value = self.extract_output_from_run(&run)?;
 
-            let proof = run.proof().clone();
+            let proof_steps = run.proof().steps.len();
+            let proof = encode_shard_proof_bytes(run.proof())
+                .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
             let steps_public = run.steps_public();
 
             tracing::info!(
                 "Nightstream: proof generated in {}ms, {} folding steps, {} step instances",
                 prove_ms,
-                proof.steps.len(),
+                proof_steps,
                 steps_public.len(),
             );
 
@@ -673,7 +702,8 @@ impl ZkvmHost for NightstreamHost {
             let run = builder
                 .prove()
                 .map_err(|e| anyhow::anyhow!("Nightstream simulation prove failed: {:?}", e))?;
-            let proof = run.proof().clone();
+            let proof = encode_shard_proof_bytes(run.proof())
+                .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
             let steps_public = run.steps_public();
 
             let package = NightstreamProofPackage {

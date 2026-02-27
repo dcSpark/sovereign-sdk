@@ -15,4 +15,4 @@ path = "src/main.rs"
 panic = "abort"
 
 [dependencies]
-nightstream-sdk = { git = "https://github.com/dcSpark/Nightstream", rev = "cca6616a2702091e67e271aca2b8dc21bb4b798b", default-features = false }
+nightstream-sdk = { git = "https://github.com/dcSpark/Nightstream", rev = "93d09ad5023b8e7b6002da6756d2086ef6a8e634", default-features = false }
