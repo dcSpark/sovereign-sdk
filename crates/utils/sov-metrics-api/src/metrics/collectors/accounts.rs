@@ -15,6 +15,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::materialized_views::INDEXER_ACCOUNT_TOTALS_VIEW;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
 use crate::metrics::store::MetricSample;
 
@@ -71,6 +72,15 @@ impl MetricCollector for AccountsCollector {
 
     fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
+            if self.indexer_db.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+                let payload = load_account_totals_from_mv(&self.indexer_db).await?;
+                return Ok(vec![MetricSample {
+                    recorded_at_ms: Utc::now().timestamp_millis(),
+                    payload: serde_json::to_value(payload)
+                        .context("Failed to serialize accounts payload")?,
+                }]);
+            }
+
             // Count total accounts from fvk_registry
             let total_accounts = count_fvk_registry_entries(&self.indexer_db).await?;
 
@@ -216,4 +226,52 @@ async fn count_disclosure_events(db: &DatabaseConnection) -> Result<u64> {
         .context("Failed to count withdraw disclosures")?;
 
     Ok(transfer_disclosures + withdraw_disclosures)
+}
+
+#[derive(Debug, FromQueryResult)]
+struct AccountTotalsMvRow {
+    total_accounts: i64,
+    sending_accounts_5m: i64,
+    total_disclosure_events: i64,
+}
+
+async fn load_account_totals_from_mv(db: &DatabaseConnection) -> Result<AccountsPayload> {
+    let stmt = Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "
+            SELECT total_accounts, sending_accounts_5m, total_disclosure_events
+            FROM {INDEXER_ACCOUNT_TOTALS_VIEW}
+            WHERE id = 1
+            "
+        ),
+    );
+
+    let row = AccountTotalsMvRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query account totals materialized view")?
+        .context("Missing account totals row in materialized view")?;
+
+    let total_accounts = u64::try_from(row.total_accounts)
+        .with_context(|| format!("Negative total_accounts in MV: {}", row.total_accounts))?;
+    let sending_accounts = u64::try_from(row.sending_accounts_5m).with_context(|| {
+        format!(
+            "Negative sending_accounts_5m in MV: {}",
+            row.sending_accounts_5m
+        )
+    })?;
+    let total_disclosure_events =
+        u64::try_from(row.total_disclosure_events).with_context(|| {
+            format!(
+                "Negative total_disclosure_events in MV: {}",
+                row.total_disclosure_events
+            )
+        })?;
+
+    Ok(AccountsPayload {
+        total_accounts,
+        sending_accounts,
+        total_disclosure_events,
+    })
 }

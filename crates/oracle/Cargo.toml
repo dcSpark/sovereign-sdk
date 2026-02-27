@@ -31,6 +31,7 @@ midnight-privacy = { workspace = true, features = ["native"] }
 tee = { workspace = true, features = ["maa"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"] }
 chrono = { workspace = true }
+lru = "0.12"
 
 [lints]
 workspace = true

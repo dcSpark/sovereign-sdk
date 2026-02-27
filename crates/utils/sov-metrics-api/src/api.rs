@@ -8,12 +8,16 @@ use axum::{
 use sea_orm::DatabaseConnection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::materialized_views::INDEXER_TRANSFER_STATS_24H_VIEW;
 use crate::metrics::collectors::accounts::AccountsPayload;
 use crate::metrics::collectors::average_transaction_size::AverageTransactionSizePayload;
 use crate::metrics::collectors::failed_transactions::FailedTransactionsPayload;
@@ -53,14 +57,42 @@ impl TpsPeakCache {
     }
 }
 
+/// Cached EMA metrics response for a specific window.
+#[derive(Clone, Debug)]
+struct EmaMetricsCacheEntry {
+    response: EmaMetricsResponse,
+    computed_at_ms: i64,
+}
+
+/// Thread-safe cache for EMA metrics endpoints.
+#[derive(Clone, Default)]
+pub struct EmaMetricsCache {
+    inner: Arc<RwLock<BTreeMap<&'static str, EmaMetricsCacheEntry>>>,
+    /// Single-flight lock to avoid stampedes when cache entries expire.
+    compute_lock: Arc<Mutex<()>>,
+    /// Ensures only one stale-cache refresh task runs at a time.
+    refresh_task_running: Arc<AtomicBool>,
+}
+
+impl EmaMetricsCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            compute_lock: Arc::new(Mutex::new(())),
+            refresh_task_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: MetricsStore,
     pub retention_secs: u64,
     pub tps_peak_cache: TpsPeakCache,
+    pub ema_metrics_cache: EmaMetricsCache,
     pub indexer_db: DatabaseConnection,
-    /// Multiplier applied to PeakTPS metric output.
-    pub peak_tps_multiplier: f64,
+    /// Number of decimal places for TPS, PeakTPS, and TokensPerSecond on EMA endpoints.
+    pub tps_rounding_decimals: u32,
     /// Base URL for the rollup ledger API, used to query slot TPS.
     pub ledger_api_base_url: String,
     /// Shared HTTP client for ledger API requests.
@@ -99,41 +131,8 @@ struct HistoricWindowQuery {
     to_ms: Option<i64>,
 }
 
-const POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL: &str = r#"
-WITH windowed AS (
-    SELECT
-        mt.event_id,
-        CAST(mt.amount AS numeric) AS amount
-    FROM midnight_transfer mt
-    INNER JOIN events ev ON ev.id = mt.event_id
-    WHERE mt.amount IS NOT NULL
-      AND mt.amount ~ '^[0-9]+$'
-      AND ev.created_at >= $1
-      AND ev.created_at <= $2
-)
-SELECT
-    AVG(windowed.amount)::double precision AS average_amount,
-    COALESCE(SUM(windowed.amount), 0)::text AS delta_amount,
-    COUNT(*)::bigint AS delta_transactions
-FROM windowed
-"#;
-
-const POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL: &str = r#"
-WITH windowed AS (
-    SELECT
-        mt.event_id,
-        CAST(mt.amount AS numeric) AS amount
-    FROM midnight_transfer mt
-    INNER JOIN events ev ON ev.id = mt.event_id
-    WHERE mt.amount IS NOT NULL
-      AND mt.amount ~ '^[0-9]+$'
-      AND ev.created_at >= $1
-      AND ev.created_at <= $2
-)
-SELECT
-    percentile_cont(0.5) WITHIN GROUP (ORDER BY windowed.amount)::double precision AS median_amount
-FROM windowed
-"#;
+const DEFAULT_METRICS_WINDOW_SECONDS: u64 = 86_400;
+const DEFAULT_METRICS_WINDOW_MS: i64 = 86_400_000;
 
 /// Maximum number of slots to scan when reconstructing TPS windows from /ledger/tps.
 const MAX_LEDGER_TPS_SLOTS: usize = 5_000;
@@ -371,6 +370,16 @@ async fn tps_historic(
 /// Cache is valid if computed within this threshold (30 seconds).
 const TPS_PEAK_CACHE_THRESHOLD_MS: i64 = 30 * 1000;
 
+fn ema_metrics_cache_ttl_ms(window: EmaWindow) -> i64 {
+    match window {
+        EmaWindow::S2 => 250,
+        EmaWindow::S5 => 500,
+        EmaWindow::M1 => 1_000,
+        EmaWindow::M5 => 2_000,
+        EmaWindow::M15 => 2_000,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/tps/peak",
@@ -404,12 +413,8 @@ async fn tps_peak(
             // 2. It was computed for the same requested window size
             let cache_age_ms = now_ms - entry.computed_at_ms;
             if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS && entry.window_ms == window_ms {
-                // Apply multiplier to cached value
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(apply_peak_tps_multiplier(
-                        entry.peak_tps,
-                        state.peak_tps_multiplier,
-                    )),
+                    peak_tps: Some(entry.peak_tps),
                     peak_at_ms: Some(entry.peak_at_ms),
                     window_ms,
                     from_cache: true,
@@ -422,7 +427,6 @@ async fn tps_peak(
     let samples = fetch_slot_tps_samples(&state, Some(window_start_ms), Some(now_ms)).await;
     let (peak_tps, peak_at_ms) = peak_tps_from_samples(&samples);
 
-    // Update cache (store raw value before multiplier)
     if let (Some(tps), Some(at_ms)) = (peak_tps, peak_at_ms) {
         let mut cache = state.tps_peak_cache.inner.write().await;
         *cache = Some(TpsPeakCacheEntry {
@@ -433,12 +437,8 @@ async fn tps_peak(
         });
     }
 
-    // Apply multiplier to output
-    let peak_tps_output =
-        peak_tps.map(|tps| apply_peak_tps_multiplier(tps, state.peak_tps_multiplier));
-
     Json(TpsPeakResponse {
-        peak_tps: peak_tps_output,
+        peak_tps,
         peak_at_ms,
         window_ms,
         from_cache: false,
@@ -514,6 +514,107 @@ async fn metrics_m15(State(state): State<AppState>) -> Json<EmaMetricsResponse> 
 /// This aggregates data from multiple metric series to produce the MockMCP-compatible
 /// response format.
 async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsResponse {
+    let key = window.path_suffix();
+    let ttl_ms = ema_metrics_cache_ttl_ms(window);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    if let Some(entry) = load_cached_ema_entry(state, key).await {
+        if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+            return entry.response;
+        }
+
+        // Serve stale response immediately and refresh in the background.
+        spawn_stale_ema_refresh_if_needed(state.clone(), window, key, ttl_ms);
+        return entry.response;
+    }
+
+    // Cold cache path: block one request to populate cache so response shape remains unchanged.
+    let _guard = state.ema_metrics_cache.compute_lock.lock().await;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(entry) = load_cached_ema_entry(state, key).await {
+        if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+            return entry.response;
+        }
+    }
+
+    let response = compute_ema_metrics_uncached(state, window).await;
+    store_ema_metrics_cache_entry(state, key, response.clone(), now_ms).await;
+
+    response
+}
+
+async fn load_cached_ema_entry(
+    state: &AppState,
+    key: &'static str,
+) -> Option<EmaMetricsCacheEntry> {
+    let cache = state.ema_metrics_cache.inner.read().await;
+    cache.get(key).cloned()
+}
+
+async fn store_ema_metrics_cache_entry(
+    state: &AppState,
+    key: &'static str,
+    response: EmaMetricsResponse,
+    computed_at_ms: i64,
+) {
+    let mut cache = state.ema_metrics_cache.inner.write().await;
+    cache.insert(
+        key,
+        EmaMetricsCacheEntry {
+            response,
+            computed_at_ms,
+        },
+    );
+}
+
+struct EmaRefreshTaskGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for EmaRefreshTaskGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+fn spawn_stale_ema_refresh_if_needed(
+    state: AppState,
+    window: EmaWindow,
+    key: &'static str,
+    ttl_ms: i64,
+) {
+    if state
+        .ema_metrics_cache
+        .refresh_task_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let _refresh_guard = EmaRefreshTaskGuard {
+            flag: state.ema_metrics_cache.refresh_task_running.clone(),
+        };
+        let _compute_guard = state.ema_metrics_cache.compute_lock.lock().await;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(entry) = load_cached_ema_entry(&state, key).await {
+            // Another request may have already refreshed this window while this task was queued.
+            if now_ms.saturating_sub(entry.computed_at_ms) <= ttl_ms {
+                return;
+            }
+        }
+
+        let response = compute_ema_metrics_uncached(&state, window).await;
+        let computed_at_ms = chrono::Utc::now().timestamp_millis();
+        store_ema_metrics_cache_entry(&state, key, response, computed_at_ms).await;
+    });
+}
+
+/// Computes EMA metrics for a given window without cache lookups.
+async fn compute_ema_metrics_uncached(state: &AppState, window: EmaWindow) -> EmaMetricsResponse {
     // Get accounts data (latest snapshot)
     let accounts_data = state
         .store
@@ -599,19 +700,15 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
-    // Compute peak TPS for this EMA window from slot samples.
     let (peak_tps, peak_tps_at_ms) = match peak_tps_from_samples(&slot_tps_samples) {
         (Some(tps), peak_at_ms) => (tps, peak_at_ms),
         (None, _) => (0.0, None),
     };
 
-    // Apply peak TPS multiplier
-    let peak_tps = apply_peak_tps_multiplier(peak_tps, state.peak_tps_multiplier);
-
-    // Round TPS values to 2 decimal places to avoid showing tiny numbers
-    let tps = round_to_precision(tps.unwrap_or(0.0), 2);
-    let peak_tps = round_to_precision(peak_tps, 2);
-    let tokens_per_second = round_to_precision(tokens_per_second.unwrap_or(0.0), 2);
+    let decimals = state.tps_rounding_decimals;
+    let tps = round_to_precision(tps.unwrap_or(0.0), decimals);
+    let peak_tps = round_to_precision(peak_tps, decimals);
+    let tokens_per_second = round_to_precision(tokens_per_second.unwrap_or(0.0), decimals);
 
     EmaMetricsResponse {
         accounts,
@@ -630,11 +727,6 @@ async fn compute_ema_metrics(state: &AppState, window: EmaWindow) -> EmaMetricsR
 fn round_to_precision(value: f64, decimals: u32) -> f64 {
     let multiplier = 10_f64.powi(decimals as i32);
     (value * multiplier).round() / multiplier
-}
-
-/// Applies the peak TPS multiplier without randomization.
-fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
-    value * multiplier
 }
 
 #[derive(Debug, Deserialize)]
@@ -983,9 +1075,6 @@ async fn failed_transactions_rate_historic(
 #[utoipa::path(
     get,
     path = "/average-transaction-size",
-    params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the average amount. Defaults to 24 hours.")
-    ),
     responses(
         (status = 200, description = "Average transfer amount", body = AverageTransactionSizeResponse)
     ),
@@ -993,42 +1082,38 @@ async fn failed_transactions_rate_historic(
 )]
 async fn average_transaction_size(
     State(state): State<AppState>,
-    Query(params): Query<WindowQuery>,
 ) -> Json<AverageTransactionSizeResponse> {
-    let window_ms = match params.window_seconds {
-        Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
-    };
+    let window_ms = Some(DEFAULT_METRICS_WINDOW_MS);
 
     let backend = {
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_average_from_indexer(backend, window_ms) {
+    if should_query_average_from_mv(backend) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
-        struct AverageRow {
+        struct AverageMvRow {
             average_amount: Option<f64>,
             delta_amount: String,
             delta_transactions: i64,
         }
 
-        let now = chrono::Utc::now();
-        let now_ms = now.timestamp_millis();
-        let start_ms = window_ms
-            .and_then(|window_ms| now_ms.checked_sub(window_ms))
-            .unwrap_or(now_ms);
-        let delta_ms = now_ms.saturating_sub(start_ms);
-        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let start_ms = now_ms.saturating_sub(DEFAULT_METRICS_WINDOW_MS);
 
-        let stmt = Statement::from_sql_and_values(
+        let stmt = Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL,
-            [start.into(), now.into()],
+            format!(
+                "
+                SELECT average_amount, delta_amount, delta_transactions
+                FROM {INDEXER_TRANSFER_STATS_24H_VIEW}
+                WHERE id = 1
+                "
+            ),
         );
 
-        match AverageRow::find_by_statement(stmt)
+        match AverageMvRow::find_by_statement(stmt)
             .one(&state.indexer_db)
             .await
         {
@@ -1038,26 +1123,30 @@ async fn average_transaction_size(
                     average_amount: row.average_amount,
                     delta_amount: Some(row.delta_amount),
                     delta_transactions,
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
             Ok(None) => {
+                warn!("Average transaction size materialized view returned no rows");
                 return Json(AverageTransactionSizeResponse {
                     average_amount: None,
                     delta_amount: Some("0".to_string()),
                     delta_transactions: Some(0),
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
             Err(error) => {
-                warn!(error = %error, "Failed to query average transaction size from indexer DB");
+                warn!(
+                    error = %error,
+                    "Failed to query average transaction size from materialized view"
+                );
                 return Json(AverageTransactionSizeResponse {
                     average_amount: None,
                     delta_amount: Some("0".to_string()),
                     delta_transactions: Some(0),
-                    delta_ms: Some(delta_ms),
+                    delta_ms: Some(now_ms.saturating_sub(start_ms)),
                     retention_seconds: state.retention_secs,
                 });
             }
@@ -1104,7 +1193,7 @@ async fn average_transaction_size_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1160,9 +1249,6 @@ async fn average_transaction_size_historic(
 #[utoipa::path(
     get,
     path = "/median-transaction-size",
-    params(
-        ("window_seconds" = Option<u64>, Query, description = "Window size in seconds used to compute the median amount. Defaults to 24 hours.")
-    ),
     responses(
         (status = 200, description = "Median transaction size", body = MedianTransactionSizeResponse)
     ),
@@ -1170,12 +1256,8 @@ async fn average_transaction_size_historic(
 )]
 async fn median_transaction_size(
     State(state): State<AppState>,
-    Query(params): Query<WindowQuery>,
 ) -> Json<MedianTransactionSizeResponse> {
-    let window_ms = match params.window_seconds {
-        Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
-    };
+    let window_ms = Some(DEFAULT_METRICS_WINDOW_MS);
 
     let now = chrono::Utc::now();
     let now_ms = now.timestamp_millis();
@@ -1187,32 +1269,45 @@ async fn median_transaction_size(
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_median_from_indexer(backend) {
+    if should_query_median_from_mv(backend) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
-        struct MedianRow {
+        struct MedianMvRow {
             median_amount: Option<f64>,
         }
 
-        let start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ms).unwrap_or(now);
-        let stmt = Statement::from_sql_and_values(
+        let stmt = Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL,
-            [start.into(), now.into()],
+            format!(
+                "
+                SELECT median_amount
+                FROM {INDEXER_TRANSFER_STATS_24H_VIEW}
+                WHERE id = 1
+                "
+            ),
         );
 
-        match MedianRow::find_by_statement(stmt)
+        match MedianMvRow::find_by_statement(stmt)
             .one(&state.indexer_db)
             .await
         {
-            Ok(row) => {
+            Ok(Some(row)) => {
                 return Json(MedianTransactionSizeResponse {
-                    median_amount: row.and_then(|row| row.median_amount),
+                    median_amount: row.median_amount,
+                });
+            }
+            Ok(None) => {
+                warn!("Median transaction size materialized view returned no rows");
+                return Json(MedianTransactionSizeResponse {
+                    median_amount: None,
                 });
             }
             Err(error) => {
-                warn!(error = %error, "Failed to query median transaction size from indexer DB");
+                warn!(
+                    error = %error,
+                    "Failed to query median transaction size from materialized view"
+                );
                 return Json(MedianTransactionSizeResponse {
                     median_amount: None,
                 });
@@ -1340,7 +1435,7 @@ async fn token_value_spent(
     let series = state.store.snapshot("token-value-spent").await;
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let value_spent = series
         .as_ref()
@@ -1369,7 +1464,7 @@ async fn token_value_spent_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1452,7 +1547,7 @@ async fn token_velocity(
                 None => {
                     let window_ms = match params.window_seconds {
                         Some(window_seconds) => window_ms(Some(window_seconds)),
-                        None => window_ms(Some(86_400)),
+                        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
                     };
                     compute_token_value_spent(&series, window_ms)
                 }
@@ -1467,7 +1562,7 @@ async fn token_velocity(
             None => {
                 let window_ms = match params.window_seconds {
                     Some(window_seconds) => window_ms(Some(window_seconds)),
-                    None => window_ms(Some(86_400)),
+                    None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
                 };
                 compute_total_tokens_average_window(&series, window_ms)
             }
@@ -1514,7 +1609,7 @@ async fn token_velocity_historic(
     let range = resolve_range(params.from_ms, params.to_ms);
     let window_ms = match params.window_seconds {
         Some(window_seconds) => window_ms(Some(window_seconds)),
-        None => window_ms(Some(86_400)),
+        None => window_ms(Some(DEFAULT_METRICS_WINDOW_SECONDS)),
     };
     let query_range = extend_range(range, window_ms);
 
@@ -1580,14 +1675,11 @@ fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
     }
 }
 
-fn should_query_average_from_indexer(
-    backend: sea_orm::DatabaseBackend,
-    window_ms: Option<i64>,
-) -> bool {
-    backend == sea_orm::DatabaseBackend::Postgres && window_ms.is_some()
+fn should_query_average_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
+    backend == sea_orm::DatabaseBackend::Postgres
 }
 
-fn should_query_median_from_indexer(backend: sea_orm::DatabaseBackend) -> bool {
+fn should_query_median_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
     backend == sea_orm::DatabaseBackend::Postgres
 }
 
@@ -1714,8 +1806,8 @@ where
 }
 
 fn median_bucket_ms(window_seconds: Option<u64>) -> (i64, u64) {
-    let default_seconds = 86_400;
-    let default_ms = window_ms(Some(default_seconds)).unwrap_or(86_400_000);
+    let default_seconds = DEFAULT_METRICS_WINDOW_SECONDS;
+    let default_ms = window_ms(Some(default_seconds)).unwrap_or(DEFAULT_METRICS_WINDOW_MS);
 
     match window_seconds {
         Some(seconds) => match window_ms(Some(seconds)) {
@@ -2183,7 +2275,7 @@ fn map_average_transaction_size_sample(
 /// - `m1`: 1-minute window - good for short-term monitoring
 /// - `m5`: 5-minute window - balanced view for medium-term simulations
 /// - `m15`: 15-minute window - smoothest view for long-term trends
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 struct EmaMetricsResponse {
     /// Total number of created accounts.
@@ -2482,61 +2574,19 @@ struct ApiDoc;
 mod tests {
     use super::*;
 
-    fn assert_common_transfer_filters(sql: &str) {
-        let required_filters = [
-            "FROM midnight_transfer mt",
-            "JOIN events ev ON ev.id = mt.event_id",
-            "mt.amount IS NOT NULL",
-            "mt.amount ~ '^[0-9]+$'",
-            "ev.created_at >= $1",
-            "ev.created_at <= $2",
-        ];
-
-        for filter in required_filters {
-            assert!(
-                sql.contains(filter),
-                "expected SQL to contain filter: {filter}"
-            );
-        }
-    }
-
     #[test]
-    fn postgres_average_sql_keeps_expected_filters() {
-        assert_common_transfer_filters(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL);
-        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("AVG(windowed.amount)"));
-        assert!(POSTGRES_AVERAGE_TRANSACTION_SIZE_SQL.contains("COUNT(*)::bigint"));
-    }
-
-    #[test]
-    fn postgres_median_sql_keeps_expected_filters() {
-        assert_common_transfer_filters(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL);
-        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("ORDER BY windowed.amount"));
-        assert!(POSTGRES_MEDIAN_TRANSACTION_SIZE_SQL.contains("percentile_cont(0.5) WITHIN GROUP"));
-    }
-
-    #[test]
-    fn average_indexer_query_gate_requires_postgres_and_window() {
+    fn average_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_average_from_indexer(
-            DatabaseBackend::Postgres,
-            Some(60_000)
-        ));
-        assert!(!should_query_average_from_indexer(
-            DatabaseBackend::Postgres,
-            None
-        ));
-        assert!(!should_query_average_from_indexer(
-            DatabaseBackend::Sqlite,
-            Some(60_000)
-        ));
+        assert!(should_query_average_from_mv(DatabaseBackend::Postgres));
+        assert!(!should_query_average_from_mv(DatabaseBackend::Sqlite));
     }
 
     #[test]
-    fn median_indexer_query_gate_requires_postgres() {
+    fn median_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_median_from_indexer(DatabaseBackend::Postgres));
-        assert!(!should_query_median_from_indexer(DatabaseBackend::Sqlite));
+        assert!(should_query_median_from_mv(DatabaseBackend::Postgres));
+        assert!(!should_query_median_from_mv(DatabaseBackend::Sqlite));
     }
 }

@@ -470,13 +470,21 @@ impl Provider {
             let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
             // The verifier response may nest the error under `body.details.error`
             // (when the sequencer rejects the tx) or directly under `details.error`.
+            let error_kind = parsed
+                .as_ref()
+                .and_then(|v| v.get("error_kind").and_then(|k| k.as_str()))
+                .unwrap_or("unknown");
             let reason = parsed
                 .as_ref()
                 .and_then(|v| {
-                    v.get("body")
-                        .and_then(|b| b.get("details"))
-                        .and_then(|d| d.get("error"))
+                    v.get("error")
                         .and_then(|e| e.as_str())
+                        .or_else(|| {
+                            v.get("body")
+                                .and_then(|b| b.get("details"))
+                                .and_then(|d| d.get("error"))
+                                .and_then(|e| e.as_str())
+                        })
                         .or_else(|| {
                             v.get("details")
                                 .and_then(|d| d.get("error"))
@@ -491,21 +499,20 @@ impl Provider {
                 })
                 .map(str::to_string);
             tracing::error!(
-                "Verifier service error - URL: {}, Status: {}, Body: {}",
-                endpoint,
-                status,
-                body
+                %endpoint,
+                %status,
+                error_kind,
+                reason = reason.as_deref().unwrap_or("(none)"),
+                raw_body = %body,
+                tx_bytes_len = raw_tx.len(),
+                "Verifier service returned error"
             );
             match reason {
                 Some(reason) => anyhow::bail!(
-                    "Verifier service returned error status {}: {}",
-                    status,
-                    reason
+                    "Verifier service error ({status}, {error_kind}): {reason}"
                 ),
                 None => anyhow::bail!(
-                    "Verifier service returned error status {}: {}",
-                    status,
-                    body
+                    "Verifier service error ({status}, {error_kind}): {body}"
                 ),
             }
         }
