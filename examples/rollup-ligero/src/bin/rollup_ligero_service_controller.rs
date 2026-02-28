@@ -44,12 +44,23 @@ enum StartMode {
     WhenEnvPresent(&'static str),
 }
 
+/// Cargo build specification for a managed service.
+#[derive(Clone, Copy)]
+struct CargoBuild {
+    package: &'static str,
+    /// Extra features to pass via `--features`.
+    features: Option<&'static str>,
+    /// Extra env vars to set during the build (e.g. SKIP_GUEST_BUILD=1).
+    env: Option<(&'static str, &'static str)>,
+}
+
 #[derive(Clone, Copy)]
 struct ManagedServiceDefinition {
     id: &'static str,
     display_name: &'static str,
     script: &'static str,
     start_mode: StartMode,
+    build: Option<CargoBuild>,
 }
 
 const MANAGED_SERVICES: [ManagedServiceDefinition; 9] = [
@@ -58,54 +69,99 @@ const MANAGED_SERVICES: [ManagedServiceDefinition; 9] = [
         display_name: "rollup",
         script: "run_rollup.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-rollup-ligero",
+            features: None,
+            env: Some(("SKIP_GUEST_BUILD", "1")),
+        }),
     },
     ManagedServiceDefinition {
         id: "oracle",
         display_name: "oracle",
         script: "run_oracle.sh",
         start_mode: StartMode::WhenEnvFlag("START_ORACLE"),
+        build: Some(CargoBuild {
+            package: "oracle",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "worker",
         display_name: "worker",
         script: "run_verifier_service.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-proof-verifier-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "fvk",
         display_name: "fvk",
         script: "run_fvk_service.sh",
         start_mode: StartMode::WhenEnvPresent("POOL_FVK_PK"),
+        build: Some(CargoBuild {
+            package: "midnight-fvk-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "indexer",
         display_name: "indexer",
         script: "run_indexer.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-indexer",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "proof-pool",
         display_name: "proof pool",
         script: "run_proof_pool.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "midnight-proof-pool-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "mcp",
         display_name: "mcp",
         script: "run_mcp.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "mcp-external",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "metrics",
         display_name: "metrics",
         script: "run_metrics.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-metrics-api",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "replica",
         display_name: "replica",
         script: "run_replica.sh",
         start_mode: StartMode::WhenEnvFlag("START_REPLICA"),
+        build: Some(CargoBuild {
+            package: "sov-rollup-ligero",
+            features: Some("sov-modules-rollup-blueprint/tee"),
+            env: Some(("SKIP_GUEST_BUILD", "1")),
+        }),
     },
 ];
 
@@ -403,7 +459,10 @@ impl LogBuffer {
 struct AppState {
     script_dir: PathBuf,
     demo_data_dir: PathBuf,
+    workspace_root: PathBuf,
     state: Mutex<ServiceState>,
+    /// Guards concurrent builds. Holds the label of the current build (service id or "all").
+    building: Mutex<Option<String>>,
     log_tx: broadcast::Sender<LogLine>,
     log_buffer: Arc<Mutex<LogBuffer>>,
     sys_info: RwLock<System>,
@@ -557,10 +616,18 @@ async fn main() -> anyhow::Result<()> {
     let mut sys = System::new_all();
     sys.refresh_all();
 
+    let workspace_root = script_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| script_dir.clone());
+
     let app_state = Arc::new(AppState {
         script_dir,
         demo_data_dir,
+        workspace_root,
         state: Mutex::new(ServiceState::default()),
+        building: Mutex::new(None),
         log_tx,
         log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
         sys_info: RwLock::new(sys),
@@ -583,6 +650,8 @@ async fn main() -> anyhow::Result<()> {
             "/reset-replica",
             post(reset_replica).get(reset_replica),
         )
+        .route("/build", post(build_all).get(build_all))
+        .route("/build/:service", post(build_service).get(build_service))
         .route("/services", get(services))
         .route("/health", get(health_check))
         .route("/stats", get(system_stats))
@@ -1173,6 +1242,179 @@ async fn restart_service(
     }
 
     guarded_start_single_service(&app, service, false).await
+}
+
+async fn build_single(
+    app: &Arc<AppState>,
+    service: &'static ManagedServiceDefinition,
+) -> ApiResult {
+    let build_spec = service.build.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Service '{}' has no build configuration", service.id),
+        )
+    })?;
+
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--release")
+        .arg("-p")
+        .arg(build_spec.package);
+
+    if let Some(features) = build_spec.features {
+        command.arg("--features").arg(features);
+    }
+
+    if let Some((key, value)) = build_spec.env {
+        command.env(key, value);
+    }
+
+    command
+        .current_dir(&app.workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|err| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to start build for '{}': {err}",
+                service.id
+            ),
+        )
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    if let Some(stdout) = stdout {
+        spawn_log_reader(
+            stdout,
+            "stdout",
+            "build",
+            app.log_tx.clone(),
+            Arc::clone(&app.log_buffer),
+        );
+    }
+    if let Some(stderr) = stderr {
+        spawn_log_reader(
+            stderr,
+            "stderr",
+            "build",
+            app.log_tx.clone(),
+            Arc::clone(&app.log_buffer),
+        );
+    }
+
+    let status = child.wait().await.map_err(|err| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Build process for '{}' failed: {err}", service.id),
+        )
+    })?;
+
+    if status.success() {
+        Ok(format!(
+            "Build successful for '{}' (package: {})",
+            service.id, build_spec.package
+        ))
+    } else {
+        Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Build failed for '{}' (package: {}, exit code: {})",
+                service.id,
+                build_spec.package,
+                status.code().unwrap_or(-1)
+            ),
+        ))
+    }
+}
+
+async fn build_all(State(app): State<Arc<AppState>>) -> ApiResult {
+    {
+        let mut building = app.building.lock().await;
+        if let Some(label) = building.as_ref() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("A build is already in progress: {label}"),
+            ));
+        }
+        *building = Some("all".to_string());
+    }
+
+    let result = build_all_inner(&app).await;
+
+    {
+        let mut building = app.building.lock().await;
+        *building = None;
+    }
+
+    result
+}
+
+async fn build_all_inner(app: &Arc<AppState>) -> ApiResult {
+    let services_to_build: Vec<_> = MANAGED_SERVICES
+        .iter()
+        .filter(|s| s.build.is_some() && !service_is_remote(s.id))
+        .collect();
+
+    let mut built = Vec::new();
+    let mut failures = Vec::new();
+
+    for service in services_to_build {
+        match build_single(app, service).await {
+            Ok(_) => built.push(service.id),
+            Err(err) => {
+                failures.push(format!("{}: {}", service.id, err.message));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(format!("Built all services: {}", built.join(", ")))
+    } else {
+        Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Built: {}. Failures: {}",
+                if built.is_empty() {
+                    "none".to_string()
+                } else {
+                    built.join(", ")
+                },
+                failures.join(" | ")
+            ),
+        ))
+    }
+}
+
+async fn build_service(
+    Path(service): Path<String>,
+    State(app): State<Arc<AppState>>,
+) -> ApiResult {
+    let service = resolve_managed_service(&service)?;
+
+    {
+        let mut building = app.building.lock().await;
+        if let Some(label) = building.as_ref() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("A build is already in progress: {label}"),
+            ));
+        }
+        *building = Some(service.id.to_string());
+    }
+
+    let result = build_single(&app, service).await;
+
+    {
+        let mut building = app.building.lock().await;
+        *building = None;
+    }
+
+    result
 }
 
 async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {

@@ -238,6 +238,14 @@ function App() {
                     <span className="btn-icon">↻</span>
                     {actionLoadingKey === actionKey('restart') ? 'Restarting...' : 'Restart All'}
                   </button>
+                  <button
+                    className="control-btn build"
+                    onClick={() => handleAction('build')}
+                    disabled={actionLoadingKey !== null}
+                  >
+                    <span className="btn-icon">⚒</span>
+                    {actionLoadingKey === actionKey('build') ? 'Building...' : 'Build All'}
+                  </button>
                   {!replicaMode && (
                     <button
                       className="control-btn clean"
@@ -403,6 +411,13 @@ function App() {
                                 disabled={actionLoadingKey !== null}
                               >
                                 {actionLoadingKey === actionKey('restart', service.id) ? '...' : 'Restart'}
+                              </button>
+                              <button
+                                className="service-action-btn build"
+                                onClick={() => handleAction('build', service.id)}
+                                disabled={actionLoadingKey !== null}
+                              >
+                                {actionLoadingKey === actionKey('build', service.id) ? '...' : 'Build'}
                               </button>
                             </div>
                           ) : (

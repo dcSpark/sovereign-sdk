@@ -178,15 +178,20 @@ export RUST_LOG="${RUST_LOG:-info}"
 # TEE mock attestation - enables mock mode for TEE verification
 export SOV_TEE_MOCK_ATTESTATION="${SOV_TEE_MOCK_ATTESTATION:-1}"
 
-# Build with TEE feature
-echo "Building replica rollup with TEE support..."
-cd "$WORKSPACE_ROOT"
-cargo build --release -p sov-rollup-ligero --features sov-modules-rollup-blueprint/tee
+ROLLUP_BIN="$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
+ORACLE_BIN="$WORKSPACE_ROOT/target/release/oracle"
 
-# Build and start Oracle
-echo ""
-echo "Building oracle..."
-cargo build --release -p oracle
+if [[ ! -f "$ROLLUP_BIN" ]]; then
+  echo "ERROR: Rollup binary not found at $ROLLUP_BIN"
+  echo "Run: cargo build --release -p sov-rollup-ligero --features sov-modules-rollup-blueprint/tee"
+  exit 1
+fi
+
+if [[ ! -f "$ORACLE_BIN" ]]; then
+  echo "ERROR: Oracle binary not found at $ORACLE_BIN"
+  echo "Run: cargo build --release -p oracle"
+  exit 1
+fi
 
 # Configure oracle
 export ORACLE_SERVER_BIND_ADDRESS="$REPLICA_ORACLE_BIND"
@@ -198,7 +203,7 @@ echo ""
 echo "Starting oracle for replica..."
 echo "  Oracle Bind: $REPLICA_ORACLE_BIND"
 
-"$WORKSPACE_ROOT/target/release/oracle" &
+"$ORACLE_BIN" &
 ORACLE_PID=$!
 PIDS+=("$ORACLE_PID")
 
@@ -223,7 +228,7 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
 # Use different Prometheus port than primary (13200) to allow running both on same machine
 # Note: We use a regular command (not exec) so the cleanup trap can stop the oracle
-"$WORKSPACE_ROOT/target/release/sov-rollup-ligero" \
+"$ROLLUP_BIN" \
     --rollup-config-path rollup_config_replica.toml \
     --prometheus-exporter-bind "0.0.0.0:13201" \
     --genesis-config-dir "$REPLICA_GENESIS_DIR_REL" \
