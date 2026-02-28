@@ -74,12 +74,13 @@ if [ -n "$DEFER_SEQUENCER_SUBMISSION" ]; then
     esac
 fi
 
-# Build the verifier service
-echo "Building proof verifier service..."
-cd "$WORKSPACE_ROOT"
-cargo build --release -p sov-proof-verifier-service
+BIN="$WORKSPACE_ROOT/target/release/proof-verifier"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p sov-proof-verifier-service"
+  exit 1
+fi
 
-echo ""
 echo "🚀 Starting proof verifier service..."
 echo "   Bind address: $BIND_ADDR"
 echo "   Node RPC: $NODE_RPC_URL"
@@ -115,7 +116,7 @@ if [ -n "$LIGERO_PROOF_SERVICE_URL" ]; then
     PROVER_SERVICE_ARGS+=(--prover-service-url "$LIGERO_PROOF_SERVICE_URL")
 fi
 
-exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
+exec "$BIN" \
     "${METHOD_ID_ARGS[@]}" \
     "${MAX_CONCURRENT_ARGS[@]}" \
     "${PROVER_SERVICE_ARGS[@]}" \

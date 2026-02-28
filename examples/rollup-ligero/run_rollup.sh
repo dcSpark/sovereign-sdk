@@ -121,24 +121,27 @@ if [[ -n "$ROLLUP_CARGO_FEATURES" ]]; then
     echo ""
 fi
 
-# Build ligero rollup
-cd "$WORKSPACE_ROOT"
+BIN="$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
 
 if [ "$MEMORY_PROFILE" -eq 1 ]; then
+    # Memory profiling requires a special build with debug symbols and frame pointers.
+    # This is the only case where the run script builds -- normal starts use pre-built binaries.
     echo "Building ligero rollup with debug symbols for profiling..."
-    # Build with full debug symbols and frame pointers for proper stack traces
+    cd "$WORKSPACE_ROOT"
     CARGO_PROFILE_RELEASE_DEBUG=2 \
     CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
     RUSTFLAGS="-C force-frame-pointers=yes" \
     cargo build --release -p sov-rollup-ligero "${BUILD_FEATURE_ARGS[@]}"
-    
+
     echo "Generating dSYM for Instruments symbolication..."
-    # Generate dSYM bundle that Instruments uses for symbol resolution
-    dsymutil "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" -o "$WORKSPACE_ROOT/target/release/sov-rollup-ligero.dSYM"
+    dsymutil "$BIN" -o "${BIN}.dSYM"
     echo "   ✓ dSYM generated at target/release/sov-rollup-ligero.dSYM"
 else
-    echo "Building ligero rollup..."
-    cargo build --release -p sov-rollup-ligero "${BUILD_FEATURE_ARGS[@]}"
+    if [[ ! -f "$BIN" ]]; then
+        echo "ERROR: Binary not found at $BIN"
+        echo "Run: cargo build --release -p sov-rollup-ligero"
+        exit 1
+    fi
 fi
 
 echo ""
@@ -186,7 +189,7 @@ if [ "$MEMORY_PROFILE" -eq 1 ]; then
     
     # Codesign the binary with get-task-allow entitlement for Instruments attachment
     echo "   Codesigning binary for Instruments attachment..."
-    codesign -s - -f --entitlements /dev/stdin "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" << 'ENTITLEMENTS' 2>/dev/null
+    codesign -s - -f --entitlements /dev/stdin "$BIN" << 'ENTITLEMENTS' 2>/dev/null
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -223,7 +226,7 @@ fi
 # Run without capturing output - ensures eprintln! and all stderr/stdout are shown
 if [ "$MEMORY_PROFILE" -eq 1 ]; then
     # Run in background briefly to get PID, then wait
-    "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" "${ROLLUP_ARGS[@]}" 2>&1 &
+    "$BIN" "${ROLLUP_ARGS[@]}" 2>&1 &
     ROLLUP_PID=$!
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "   📍 Process started with PID: $ROLLUP_PID"
@@ -232,5 +235,5 @@ if [ "$MEMORY_PROFILE" -eq 1 ]; then
     echo ""
     wait $ROLLUP_PID
 else
-    exec "$WORKSPACE_ROOT/target/release/sov-rollup-ligero" "${ROLLUP_ARGS[@]}" 2>&1
+    exec "$BIN" "${ROLLUP_ARGS[@]}" 2>&1
 fi

@@ -99,5 +99,12 @@ echo "  GET  http://${PROOF_POOL_BIND_ADDR}/send?auth_token=$AUTH_TOKEN&proof_qu
 echo "  GET  http://${PROOF_POOL_BIND_ADDR}/burst?auth_token=$AUTH_TOKEN&proof_quantities=2,5,10"
 echo ""
 
+BIN="$WORKSPACE_ROOT/target/release/midnight-proof-pool-service"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p midnight-proof-pool-service"
+  exit 1
+fi
+
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
-exec cargo run -p midnight-proof-pool-service --release
+exec "$BIN"

@@ -62,5 +62,12 @@ if [[ -n "${LIGERO_SHADER_PATH:-}" && ! -d "$LIGERO_SHADER_PATH" ]]; then
   exit 1
 fi
 
+BIN="$WORKSPACE_ROOT/target/release/mcp-external"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p mcp-external"
+  exit 1
+fi
+
 cd "$WORKSPACE_ROOT"
-exec cargo run -p mcp-external --bin mcp-external --release
+exec "$BIN"

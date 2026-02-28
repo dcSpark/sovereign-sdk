@@ -18,7 +18,7 @@ export interface HealthResponse {
   replicaMode?: boolean;
 }
 
-export type ActionType = 'start' | 'stop' | 'restart' | 'clean' | 'clean-database' | 'reset-tee' | 'reset-replica';
+export type ActionType = 'start' | 'stop' | 'restart' | 'clean' | 'clean-database' | 'reset-tee' | 'reset-replica' | 'build';
 
 export interface ActionResult {
   success: boolean;
