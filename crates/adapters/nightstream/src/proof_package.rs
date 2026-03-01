@@ -4,7 +4,9 @@
 //! sovereign-ligero adapter is self-contained -- no `sovereign_bridge` module
 //! in the Nightstream crate is needed.
 
-use crate::circuit_output::spend_public_bytes_from_output_claims;
+use crate::circuit_output::{
+    deposit_public_bytes_from_output_claims, spend_public_bytes_from_output_claims,
+};
 use neo_ajtai::Commitment as Cmt;
 use neo_ccs::{matrix::Mat, CeClaim};
 use neo_fold::pi_ccs::rot_rhos_to_mats;
@@ -29,6 +31,12 @@ pub enum PublicOutputFormat {
     /// as note-spend circuit output, and requires `public_output` bytes to match
     /// the canonical SpendPublic wire encoding.
     NoteSpendV1,
+    /// Nightstream note-deposit output format written at `OUTPUT_ADDR`.
+    ///
+    /// Verification reconstructs raw output bytes from output-claims, parses them
+    /// as note-deposit circuit output, and requires `public_output` bytes to match
+    /// the canonical note-deposit wire encoding.
+    NoteDepositV1,
 }
 
 /// Configuration needed to reconstruct a run from ROM bytes.
@@ -159,16 +167,27 @@ impl NightstreamProofPackage {
             return Ok(false);
         }
 
-        if matches!(
-            self.config.public_output_format,
-            Some(PublicOutputFormat::NoteSpendV1)
-        ) {
-            let certified = spend_public_bytes_from_output_claims(&self.config.output_claims)
-                .map_err(|e| {
-                    PiCcsError::InvalidInput(format!(
-                        "failed to derive certified note-spend public output from output claims: {e}"
-                    ))
-                })?;
+        if let Some(format) = &self.config.public_output_format {
+            let certified = match format {
+                PublicOutputFormat::NoteSpendV1 => {
+                    spend_public_bytes_from_output_claims(&self.config.output_claims).map_err(
+                        |e| {
+                            PiCcsError::InvalidInput(format!(
+                                "failed to derive certified note-spend public output from output claims: {e}"
+                            ))
+                        },
+                    )?
+                }
+                PublicOutputFormat::NoteDepositV1 => {
+                    deposit_public_bytes_from_output_claims(&self.config.output_claims).map_err(
+                        |e| {
+                            PiCcsError::InvalidInput(format!(
+                                "failed to derive certified note-deposit public output from output claims: {e}"
+                            ))
+                        },
+                    )?
+                }
+            };
 
             if certified != self.public_output {
                 return Err(PiCcsError::InvalidInput(

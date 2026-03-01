@@ -46,8 +46,9 @@ pub use guest::NightstreamGuest;
 mod host;
 #[cfg(feature = "native")]
 pub use host::{
-    default_blacklist_root, BlacklistProof, NightstreamHost, NightstreamHostArgs, NoteSpendInput,
-    NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness, ViewerWitness,
+    default_blacklist_root, BlacklistProof, NightstreamHost, NightstreamHostArgs,
+    NoteDepositWitness, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
 };
 
 mod proof_package;

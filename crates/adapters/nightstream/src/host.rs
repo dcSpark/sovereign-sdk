@@ -21,8 +21,9 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::circuit_output::{
-    output_claims_to_bytes, spend_public_bytes_from_circuit_output, CircuitOutput,
-    CircuitViewAttestation,
+    deposit_public_bytes_from_circuit_output, output_claims_to_bytes,
+    spend_public_bytes_from_circuit_output, CircuitOutput, CircuitViewAttestation,
+    DepositCircuitOutput,
 };
 use crate::proof_package::{
     encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv32TraceWiringRunConfig,
@@ -99,6 +100,7 @@ const BL_DEPTH: u8 = 16;
 const BL_BUCKET_SIZE: usize = 12;
 const TAG_BL_BUCKET: u64 = 7;
 const TAG_MT_NODE_BL: u64 = 1;
+const TAG_ADDR: u64 = 5;
 
 impl BlacklistProof {
     /// Build a non-membership proof from on-chain deny-map opening data.
@@ -222,6 +224,25 @@ fn gl_digest_to_hash32(digest: &[p3_goldilocks::Goldilocks; 4]) -> [u8; 32] {
     h
 }
 
+/// Derive recipient address: `H(TAG_ADDR, domain, pk_spend, pk_ivk)`.
+fn derive_address_v2(domain: &[u8; 32], pk_spend: &[u8; 32], pk_ivk: &[u8; 32]) -> [u8; 32] {
+    use neo_ccs::crypto::poseidon2_goldilocks as p2;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_goldilocks::Goldilocks;
+
+    let domain_gl = hash32_to_gl(domain);
+    let pk_spend_gl = hash32_to_gl(pk_spend);
+    let pk_ivk_gl = hash32_to_gl(pk_ivk);
+
+    let mut input = [Goldilocks::ZERO; 13];
+    input[0] = Goldilocks::from_u64(TAG_ADDR);
+    input[1..5].copy_from_slice(&domain_gl);
+    input[5..9].copy_from_slice(&pk_spend_gl);
+    input[9..13].copy_from_slice(&pk_ivk_gl);
+    let recipient = p2::poseidon2_hash(&input);
+    gl_digest_to_hash32(&recipient)
+}
+
 /// Per-output viewer attestation data (public values the circuit will verify).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewerOutputWitness {
@@ -277,6 +298,30 @@ pub struct NoteSpendWitness {
     pub blacklist_proofs: Vec<BlacklistProof>,
     /// Level-B viewer attestation witnesses (empty when no viewer is configured).
     pub viewers: Vec<ViewerWitness>,
+}
+
+/// Full witness for the note-deposit circuit.
+///
+/// Deposits mint exactly one NOTE commitment to a derived recipient address:
+/// `recipient = H(TAG_ADDR, domain, pk_spend_recipient, pk_ivk_recipient)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NoteDepositWitness {
+    /// Domain separation tag (4 x u64 = 32 bytes).
+    pub domain: [u8; 32],
+    /// Public deposit amount (must be > 0 in-circuit).
+    pub value: u64,
+    /// Note randomness.
+    pub rho: [u8; 32],
+    /// Recipient spend key (private).
+    pub pk_spend_recipient: [u8; 32],
+    /// Recipient incoming viewing key (private).
+    pub pk_ivk_recipient: [u8; 32],
+    /// Public output commitment, verified in-circuit.
+    pub cm_out: [u8; 32],
+    /// Deny-map root (public).
+    pub blacklist_root: [u8; 32],
+    /// Blacklist non-membership proof for the recipient.
+    pub blacklist_proof: BlacklistProof,
 }
 
 // ============================================================================
@@ -493,6 +538,39 @@ impl NightstreamHost {
         }
     }
 
+    /// Populate output claims for the note-deposit circuit's `RamWriter` output layout.
+    fn set_note_deposit_output_claims(&mut self, witness: &NoteDepositWitness) {
+        self.output_claims.clear();
+        let mut addr = OUTPUT_ADDR;
+        let recipient = derive_address_v2(
+            &witness.domain,
+            &witness.pk_spend_recipient,
+            &witness.pk_ivk_recipient,
+        );
+        self.write_output_claim_digest_at(&mut addr, &witness.domain);
+        self.write_output_claim_u64_at(&mut addr, witness.value);
+        self.write_output_claim_digest_at(&mut addr, &recipient);
+        self.write_output_claim_digest_at(&mut addr, &witness.cm_out);
+        self.write_output_claim_digest_at(&mut addr, &witness.blacklist_root);
+    }
+
+    /// Build circuit-output fields directly from a note-deposit witness.
+    fn build_note_deposit_circuit_output(witness: &NoteDepositWitness) -> DepositCircuitOutput {
+        let recipient = derive_address_v2(
+            &witness.domain,
+            &witness.pk_spend_recipient,
+            &witness.pk_ivk_recipient,
+        );
+
+        DepositCircuitOutput {
+            domain: witness.domain,
+            value: witness.value,
+            recipient,
+            output_commitment: witness.cm_out,
+            blacklist_root: witness.blacklist_root,
+        }
+    }
+
     // ----------------------------------------------------------------
     // ----------------------------------------------------------------
     // Note-Spend Witness Writer
@@ -616,6 +694,47 @@ impl NightstreamHost {
         }
 
         self.stored_public_output = Some(certified_public_output);
+    }
+
+    /// Write the full note-deposit witness to RAM and set output claims.
+    ///
+    /// The note-deposit circuit has no inputs/nullifiers; it proves:
+    /// 1. value > 0
+    /// 2. cm_out matches NOTE(domain, value, rho, recipient, recipient)
+    /// 3. recipient is not blacklisted under blacklist_root
+    pub fn write_note_deposit_witness(&mut self, witness: &NoteDepositWitness) {
+        // Header + note fields
+        self.write_ram_digest(&witness.domain);
+        self.write_ram_u64(witness.value);
+        self.write_ram_digest(&witness.rho);
+        self.write_ram_digest(&witness.pk_spend_recipient);
+        self.write_ram_digest(&witness.pk_ivk_recipient);
+        self.write_ram_digest(&witness.cm_out);
+        self.write_ram_digest(&witness.blacklist_root);
+
+        // Blacklist proof for recipient
+        for entry in &witness.blacklist_proof.bucket_entries {
+            self.write_ram_digest(entry);
+        }
+        let inv_u64 = {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&witness.blacklist_proof.bucket_inv[..8]);
+            u64::from_le_bytes(buf)
+        };
+        self.write_ram_u64(inv_u64);
+        for sib in &witness.blacklist_proof.siblings {
+            self.write_ram_digest(sib);
+        }
+
+        self.set_note_deposit_output_claims(witness);
+
+        // Bind package public output to proof-visible output claims.
+        self.public_output_format = Some(PublicOutputFormat::NoteDepositV1);
+        let circuit_output = Self::build_note_deposit_circuit_output(witness);
+        self.stored_public_output = Some(
+            deposit_public_bytes_from_circuit_output(&circuit_output)
+                .expect("failed to serialize certified note-deposit public output"),
+        );
     }
 
     /// Compute the SHA-256 code commitment of the ROM bytes.

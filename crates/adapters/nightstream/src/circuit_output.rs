@@ -105,6 +105,24 @@ pub struct CircuitOutput {
     pub view_attestations: Vec<CircuitViewAttestation>,
 }
 
+/// Parsed note-deposit circuit output.
+///
+/// Layout:
+/// `domain(32B), value(u64), recipient(32B), cm_out(32B), blacklist_root(32B)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepositCircuitOutput {
+    /// Domain separation tag used by the circuit.
+    pub domain: [u8; 32],
+    /// Public deposit amount (u64 in-circuit; zero-extend to u128 at the wire layer).
+    pub value: u64,
+    /// Derived recipient identity.
+    pub recipient: [u8; 32],
+    /// Output commitment.
+    pub output_commitment: [u8; 32],
+    /// Deny-map root.
+    pub blacklist_root: [u8; 32],
+}
+
 /// Bincode/Serde-compatible view attestation shape used by `midnight_privacy::SpendPublic`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendPublicViewAttestation {
@@ -136,6 +154,21 @@ pub struct SpendPublicWire {
     pub output_commitments: Vec<[u8; 32]>,
     /// Optional viewer attestations.
     pub view_attestations: Option<Vec<SpendPublicViewAttestation>>,
+}
+
+/// Bincode/Serde-compatible note-deposit public output shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositPublicWire {
+    /// Domain separation tag.
+    pub domain: [u8; 32],
+    /// Transparent deposit amount.
+    pub amount: u128,
+    /// Recipient identity.
+    pub recipient: [u8; 32],
+    /// Produced note commitment.
+    pub output_commitment: [u8; 32],
+    /// Deny-map root used by blacklist checks.
+    pub blacklist_root: [u8; 32],
 }
 
 /// Parse the raw circuit output bytes into a `CircuitOutput`.
@@ -277,6 +310,60 @@ pub fn spend_public_bytes_from_output_claims(output_claims: &[(u64, u64)]) -> Re
     spend_public_bytes_from_circuit_output(&parsed)
 }
 
+/// Parse raw note-deposit output bytes.
+///
+/// Layout:
+/// `domain(32B), value(u64=8B), recipient(32B), cm_out(32B), blacklist_root(32B)`.
+pub fn parse_note_deposit_output(data: &[u8]) -> Result<DepositCircuitOutput> {
+    let mut offset = 0;
+
+    let domain = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+    let value = read_u64(data, &mut offset)?;
+    let recipient = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+    let output_commitment = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+    let blacklist_root = gldigest_to_hash32(&read_gldigest(data, &mut offset)?);
+
+    if offset != data.len() {
+        return Err(anyhow!(
+            "Trailing bytes after parsing note-deposit output: offset={}, len={}",
+            offset,
+            data.len()
+        ));
+    }
+
+    Ok(DepositCircuitOutput {
+        domain,
+        value,
+        recipient,
+        output_commitment,
+        blacklist_root,
+    })
+}
+
+/// Convert parsed note-deposit output into a bincode-compatible wire shape.
+pub fn deposit_public_wire_from_circuit_output(output: &DepositCircuitOutput) -> DepositPublicWire {
+    DepositPublicWire {
+        domain: output.domain,
+        amount: output.value as u128,
+        recipient: output.recipient,
+        output_commitment: output.output_commitment,
+        blacklist_root: output.blacklist_root,
+    }
+}
+
+/// Serialize parsed note-deposit output into bincode bytes.
+pub fn deposit_public_bytes_from_circuit_output(output: &DepositCircuitOutput) -> Result<Vec<u8>> {
+    let wire = deposit_public_wire_from_circuit_output(output);
+    bincode::serialize(&wire).map_err(|e| anyhow!("Failed to serialize DepositPublicWire: {}", e))
+}
+
+/// Derive certified note-deposit public bytes from output claims.
+pub fn deposit_public_bytes_from_output_claims(output_claims: &[(u64, u64)]) -> Result<Vec<u8>> {
+    let raw = output_claims_to_bytes(output_claims)?;
+    let parsed = parse_note_deposit_output(&raw)?;
+    deposit_public_bytes_from_circuit_output(&parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +440,31 @@ mod tests {
 
         let err = parse_circuit_output(&raw).expect_err("must reject trailing bytes");
         assert!(err.to_string().contains("Trailing bytes"));
+    }
+
+    #[test]
+    fn output_claims_note_deposit_to_deposit_public_wire() {
+        let domain = [1u8; 32];
+        let recipient = [2u8; 32];
+        let cm_out = [3u8; 32];
+        let blacklist_root = [4u8; 32];
+        let amount = 77u64;
+
+        let mut claims = Vec::new();
+        let mut addr = OUTPUT_ADDR;
+        push_digest_claim(&mut claims, &mut addr, &domain);
+        push_u64_claim(&mut claims, &mut addr, amount);
+        push_digest_claim(&mut claims, &mut addr, &recipient);
+        push_digest_claim(&mut claims, &mut addr, &cm_out);
+        push_digest_claim(&mut claims, &mut addr, &blacklist_root);
+
+        let bytes = deposit_public_bytes_from_output_claims(&claims).expect("convert claims");
+        let wire: DepositPublicWire = bincode::deserialize(&bytes).expect("deserialize wire");
+
+        assert_eq!(wire.domain, domain);
+        assert_eq!(wire.amount, amount as u128);
+        assert_eq!(wire.recipient, recipient);
+        assert_eq!(wire.output_commitment, cm_out);
+        assert_eq!(wire.blacklist_root, blacklist_root);
     }
 }

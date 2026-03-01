@@ -32,6 +32,14 @@ mod note_spend_rom {
     ));
 }
 
+/// Note-deposit ROM bytes.
+mod note_deposit_rom {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/circuits/note_deposit_rom.rs"
+    ));
+}
+
 /// Test that the NightstreamCodeCommitment encode/decode works.
 #[test]
 fn test_code_commitment_roundtrip() {
@@ -452,23 +460,52 @@ fn test_note_spend_prove_verify_with_witness() {
     let chunk_rows = executed_steps.min(MAX_SAFE_CHUNK_ROWS).max(1);
     host.set_chunk_rows(chunk_rows);
     host.set_max_steps(executed_steps);
+    let no_output_binding = std::env::var_os("NS_PERF_NO_OUTPUT_BINDING").is_some();
     println!(
-        "selected_chunk_rows={} selected_max_steps={}",
-        chunk_rows, executed_steps
+        "selected_chunk_rows={} selected_max_steps={} no_output_binding={}",
+        chunk_rows, executed_steps, no_output_binding
     );
 
     let t_prove = Instant::now();
-    let mut run = match host.prove_run() {
-        Ok(run) => run,
-        Err(err) => {
-            let msg = format!("{err:?}");
-            if msg.contains("poseidon-precompile feature is disabled") {
-                println!(
-                    "Skipping note-spend integration test: poseidon-precompile is not enabled"
-                );
-                return;
+    let mut run = if no_output_binding {
+        use neo_fold::riscv_trace_shard::Rv32TraceWiring;
+        let mut wiring = Rv32TraceWiring::from_rom(
+            note_spend_rom::NOTE_SPEND_ROM_BASE,
+            &note_spend_rom::NOTE_SPEND_ROM,
+        )
+        .xlen(32)
+        .chunk_rows(chunk_rows)
+        .max_steps(executed_steps)
+        .shout_auto_minimal();
+        for &(addr, val) in &ram_pairs {
+            wiring = wiring.ram_init_u32(addr, val);
+        }
+        match wiring.prove() {
+            Ok(run) => run,
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("poseidon-precompile feature is disabled") {
+                    println!(
+                        "Skipping note-spend integration test: poseidon-precompile is not enabled"
+                    );
+                    return;
+                }
+                panic!("proving should succeed: {msg}");
             }
-            panic!("proving should succeed: {msg}");
+        }
+    } else {
+        match host.prove_run() {
+            Ok(run) => run,
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("poseidon-precompile feature is disabled") {
+                    println!(
+                        "Skipping note-spend integration test: poseidon-precompile is not enabled"
+                    );
+                    return;
+                }
+                panic!("proving should succeed: {msg}");
+            }
         }
     };
     let prove_ms = t_prove.elapsed().as_millis();
@@ -490,11 +527,250 @@ fn test_note_spend_prove_verify_with_witness() {
         "  Requires Poseidon stage: {}",
         run.requires_poseidon_stage()
     );
+    if std::env::var_os("NS_MEASURE_PROOF_SIZE").is_some() {
+        if no_output_binding {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let raw =
+                bincode::serialize(run.proof()).expect("serialize shard proof for size measurement");
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&raw)
+                .expect("write raw proof bytes for deflate");
+            let compressed = encoder.finish().expect("finish deflate proof payload");
+            println!(
+                "  Proof payload:    {} bytes ({:.2} KB) [raw shard proof]",
+                raw.len(),
+                raw.len() as f64 / 1024.0
+            );
+            println!(
+                "  Proof payload(z): {} bytes ({:.2} KB) [deflate shard proof]",
+                compressed.len(),
+                compressed.len() as f64 / 1024.0
+            );
+        } else {
+            let t_pkg = Instant::now();
+            let proof_bytes = host.run(true).expect("packaged proving should succeed");
+            let pkg_ms = t_pkg.elapsed().as_millis();
+            println!(
+                "  Proof package:    {} bytes ({:.2} KB) [prove+package={} ms]",
+                proof_bytes.len(),
+                proof_bytes.len() as f64 / 1024.0,
+                pkg_ms
+            );
+        }
+    }
     assert_eq!(anchor, test_public.anchor_root);
     assert_eq!(vec![nullifier], test_public.nullifiers);
     assert_eq!(vec![out_cm], test_public.output_commitments);
     assert_eq!(blacklist_root, test_public.blacklist_root);
     println!("=============================================\n");
+}
+
+/// Full prove+verify cycle for the note-deposit circuit with a valid witness.
+#[test]
+#[ignore = "requires lower t_len/chunk tuning for poseidon-precompile split cap"]
+fn test_note_deposit_prove_verify_with_witness() {
+    use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
+    use neo_memory::riscv::lookups::{
+        decode_program, RiscvCpu, RiscvMemory, RiscvShoutTables, PROG_ID, RAM_ID,
+    };
+    use neo_vm_trace::{trace_program, Twist};
+    use p3_field::{PrimeCharacteristicRing, PrimeField64};
+    use p3_goldilocks::Goldilocks;
+    use sov_nightstream_adapter::{default_blacklist_root, BlacklistProof, NoteDepositWitness};
+
+    type GlDigest = [Goldilocks; 4];
+
+    const TAG_NOTE: u64 = 2;
+    const TAG_ADDR: u64 = 5;
+
+    fn gl_digest_to_bytes(d: &GlDigest) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, elem) in d.iter().enumerate() {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&elem.as_canonical_u64().to_le_bytes());
+        }
+        out
+    }
+
+    // Domain + recipient keys
+    let domain_gl = [Goldilocks::from_u64(1); 4];
+    let domain = gl_digest_to_bytes(&domain_gl);
+    let value: u64 = 777;
+
+    let rho_gl = [
+        Goldilocks::from_u64(200),
+        Goldilocks::from_u64(201),
+        Goldilocks::from_u64(202),
+        Goldilocks::from_u64(203),
+    ];
+    let rho = gl_digest_to_bytes(&rho_gl);
+
+    let pk_spend_gl = [
+        Goldilocks::from_u64(42),
+        Goldilocks::from_u64(43),
+        Goldilocks::from_u64(44),
+        Goldilocks::from_u64(45),
+    ];
+    let pk_spend_recipient = gl_digest_to_bytes(&pk_spend_gl);
+
+    let pk_ivk_gl = [
+        Goldilocks::from_u64(100),
+        Goldilocks::from_u64(101),
+        Goldilocks::from_u64(102),
+        Goldilocks::from_u64(103),
+    ];
+    let pk_ivk_recipient = gl_digest_to_bytes(&pk_ivk_gl);
+
+    // recipient = H(TAG_ADDR, domain, pk_spend, pk_ivk)
+    let recipient_gl = {
+        let mut inp = [Goldilocks::ZERO; 13];
+        inp[0] = Goldilocks::from_u64(TAG_ADDR);
+        inp[1..5].copy_from_slice(&domain_gl);
+        inp[5..9].copy_from_slice(&pk_spend_gl);
+        inp[9..13].copy_from_slice(&pk_ivk_gl);
+        poseidon2_hash(&inp)
+    };
+    let recipient = gl_digest_to_bytes(&recipient_gl);
+
+    // cm_out = H(TAG_NOTE, domain, value, rho, recipient, recipient)
+    let cm_out_gl = {
+        let mut inp = [Goldilocks::ZERO; 18];
+        inp[0] = Goldilocks::from_u64(TAG_NOTE);
+        inp[1..5].copy_from_slice(&domain_gl);
+        inp[5] = Goldilocks::from_u64(value);
+        inp[6..10].copy_from_slice(&rho_gl);
+        inp[10..14].copy_from_slice(&recipient_gl);
+        inp[14..18].copy_from_slice(&recipient_gl);
+        poseidon2_hash(&inp)
+    };
+    let cm_out = gl_digest_to_bytes(&cm_out_gl);
+
+    let blacklist_root = default_blacklist_root();
+    let blacklist_proof = BlacklistProof::default_for_identity(&recipient);
+
+    let witness = NoteDepositWitness {
+        domain,
+        value,
+        rho,
+        pk_spend_recipient,
+        pk_ivk_recipient,
+        cm_out,
+        blacklist_root,
+        blacklist_proof,
+    };
+
+    let mut host = NightstreamHost::new(
+        &note_deposit_rom::NOTE_DEPOSIT_ROM,
+        note_deposit_rom::NOTE_DEPOSIT_ROM_BASE,
+    );
+    host.write_note_deposit_witness(&witness);
+
+    let ram_pairs = host.ram_init_pairs();
+    let executed_steps = {
+        let decoded = decode_program(&note_deposit_rom::NOTE_DEPOSIT_ROM).expect("decode ROM");
+        let mut cpu = RiscvCpu::new(32);
+        cpu.load_program(note_deposit_rom::NOTE_DEPOSIT_ROM_BASE, decoded);
+        let mut twist = RiscvMemory::with_program_in_twist(
+            32,
+            PROG_ID,
+            note_deposit_rom::NOTE_DEPOSIT_ROM_BASE,
+            &note_deposit_rom::NOTE_DEPOSIT_ROM,
+        );
+        for &(addr, val) in &ram_pairs {
+            twist.store(RAM_ID, addr, val as u64);
+        }
+        let shout = RiscvShoutTables::new(32);
+        let sim = trace_program(cpu, twist, shout, 200_000).expect("simulation trace");
+        assert!(sim.did_halt(), "note-deposit circuit did not halt");
+        sim.steps.len()
+    };
+
+    // Poseidon split requires t_len <= (ccs_m - m_in). This circuit's t_len is ~4x chunk rows.
+    // Empirically, 114 is the best stable point in this harness: fewer folds than 110/112,
+    // while 116+ can violate the split cap.
+    const MAX_SAFE_CHUNK_ROWS: usize = 114;
+    let chunk_rows = std::env::var("NS_DEPOSIT_CHUNK_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(executed_steps).max(1))
+        .unwrap_or_else(|| executed_steps.min(MAX_SAFE_CHUNK_ROWS).max(1));
+    host.set_chunk_rows(chunk_rows);
+    host.set_max_steps(executed_steps);
+    let no_output_binding = std::env::var_os("NS_PERF_NO_OUTPUT_BINDING").is_some();
+
+    let t_prove = Instant::now();
+    let mut run = if no_output_binding {
+        use neo_fold::riscv_trace_shard::Rv32TraceWiring;
+        let mut wiring = Rv32TraceWiring::from_rom(
+            note_deposit_rom::NOTE_DEPOSIT_ROM_BASE,
+            &note_deposit_rom::NOTE_DEPOSIT_ROM,
+        )
+        .xlen(32)
+        .chunk_rows(chunk_rows)
+        .max_steps(executed_steps)
+        .shout_auto_minimal();
+        for &(addr, val) in &ram_pairs {
+            wiring = wiring.ram_init_u32(addr, val);
+        }
+        wiring.prove().expect("note-deposit proving should succeed")
+    } else {
+        host.prove_run()
+            .expect("note-deposit proving should succeed")
+    };
+    let prove_ms = t_prove.elapsed().as_millis();
+
+    let t_verify = Instant::now();
+    run.verify()
+        .expect("note-deposit verification should not error");
+    let verify_ms = t_verify.elapsed().as_millis();
+
+    println!(
+        "note_deposit: prove_ms={} verify_ms={} steps={} folds={} chunk_rows={} no_output_binding={}",
+        prove_ms,
+        verify_ms,
+        run.trace_len(),
+        run.fold_count(),
+        chunk_rows,
+        no_output_binding
+    );
+    if std::env::var_os("NS_MEASURE_PROOF_SIZE").is_some() {
+        if no_output_binding {
+            use flate2::write::DeflateEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let raw =
+                bincode::serialize(run.proof()).expect("serialize shard proof for size measurement");
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&raw)
+                .expect("write raw proof bytes for deflate");
+            let compressed = encoder.finish().expect("finish deflate proof payload");
+            println!(
+                "note_deposit: proof_payload_bytes={} proof_payload_kb={:.2}",
+                raw.len(),
+                raw.len() as f64 / 1024.0
+            );
+            println!(
+                "note_deposit: proof_payload_deflate_bytes={} proof_payload_deflate_kb={:.2}",
+                compressed.len(),
+                compressed.len() as f64 / 1024.0
+            );
+        } else {
+            let t_pkg = Instant::now();
+            let proof_bytes = host.run(true).expect("packaged proving should succeed");
+            let pkg_ms = t_pkg.elapsed().as_millis();
+            println!(
+                "note_deposit: proof_package_bytes={} proof_package_kb={:.2} prove_plus_package_ms={}",
+                proof_bytes.len(),
+                proof_bytes.len() as f64 / 1024.0,
+                pkg_ms
+            );
+        }
+    }
+
+    assert!(run.trace_len() > 0);
 }
 
 /// Test prove+verify cycle twice with different inputs using trace wiring.

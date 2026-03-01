@@ -15,3 +15,9 @@ pub mod value_validator_rom {
 pub mod note_spend_rom {
     include!("../circuits/note_spend_rom.rs");
 }
+
+/// Note deposit circuit ROM bytes (midnight-privacy deposit).
+#[allow(missing_docs)]
+pub mod note_deposit_rom {
+    include!("../circuits/note_deposit_rom.rs");
+}
