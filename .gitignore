@@ -91,3 +91,4 @@ midnight_fvk_service.sqlite
 scripts/__pycache__
 tsink
 .cursor
+examples/rollup-ligero/tsink-data
