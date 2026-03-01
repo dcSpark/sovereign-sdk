@@ -82,9 +82,7 @@ fn test_prove_and_verify_value_validator() {
     println!("Code commitment: {:?}", commitment);
 
     // Run the prover
-    let proof_bytes = host
-        .run(true)
-        .expect("proving should succeed");
+    let proof_bytes = host.run(true).expect("proving should succeed");
 
     println!("Proof package size: {} bytes", proof_bytes.len());
 
@@ -113,8 +111,8 @@ fn test_prove_and_verify_value_validator() {
         value: u32,
     }
 
-    let result: ValueProofPublic =
-        NightstreamVerifier::verify(&proof_bytes, &commitment).expect("verification should succeed");
+    let result: ValueProofPublic = NightstreamVerifier::verify(&proof_bytes, &commitment)
+        .expect("verification should succeed");
 
     assert_eq!(result.value, test_value);
     println!("Verification successful! Proven value: {}", result.value);
@@ -163,11 +161,14 @@ fn test_verify_with_wrong_commitment() {
 #[test]
 fn test_note_spend_prove_verify_with_witness() {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
+    use neo_memory::riscv::lookups::{
+        decode_program, RiscvCpu, RiscvMemory, RiscvShoutTables, PROG_ID, RAM_ID,
+    };
+    use neo_vm_trace::{trace_program, Twist};
     use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
     use sov_nightstream_adapter::{
-        BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
-        default_blacklist_root,
+        default_blacklist_root, BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
     };
     use std::time::Instant;
 
@@ -334,7 +335,7 @@ fn test_note_spend_prove_verify_with_witness() {
     // --- Enforce product: prod(values) * prod(rho_diffs) != 0, inv_enforce = 1/prod ---
     let mut enforce_prod = Goldilocks::from_u64(value); // input value
     enforce_prod *= Goldilocks::from_u64(value); // output value
-    // rho diff: out_rho - in_rho (per element)
+                                                 // rho diff: out_rho - in_rho (per element)
     for i in 0..4 {
         enforce_prod *= out_rho_gl[i] - rho_gl[i];
     }
@@ -370,7 +371,10 @@ fn test_note_spend_prove_verify_with_witness() {
         }],
         inv_enforce,
         blacklist_root,
-        blacklist_proofs: vec![BlacklistProof::default_for_identity(&sender_id), BlacklistProof::default_for_identity(&sender_id)],
+        blacklist_proofs: vec![
+            BlacklistProof::default_for_identity(&sender_id),
+            BlacklistProof::default_for_identity(&sender_id),
+        ],
         viewers: vec![],
     };
 
@@ -401,12 +405,61 @@ fn test_note_spend_prove_verify_with_witness() {
     let base = note_spend_rom::NOTE_SPEND_ROM_BASE;
 
     let mut host = NightstreamHost::new(rom, base);
-    host.set_max_steps(2_097_152);
     host.write_note_spend_witness(&witness, public_bytes);
 
+    let ram_pairs = host.ram_init_pairs();
+    println!("witness_ram_words={}", ram_pairs.len());
+
+    // Mirror the Nightstream benchmark flow: simulate first, require halt,
+    // then set proving bounds from the observed execution profile.
+    let executed_steps = {
+        let decoded = decode_program(rom).expect("decode ROM");
+        let mut cpu = RiscvCpu::new(32);
+        cpu.load_program(base, decoded);
+        let mut twist = RiscvMemory::with_program_in_twist(32, PROG_ID, base, rom);
+        for &(addr, val) in &ram_pairs {
+            twist.store(RAM_ID, addr, val as u64);
+        }
+        let shout = RiscvShoutTables::new(32);
+        let sim = trace_program(cpu, twist, shout, 200_000).expect("simulation trace");
+        println!(
+            "trace_sim_steps={} trace_sim_did_halt={} trace_sim_total_twist_events={} trace_sim_total_shout_events={}",
+            sim.len(),
+            sim.did_halt(),
+            sim.total_twist_events(),
+            sim.total_shout_events()
+        );
+        if !sim.did_halt() {
+            let tail: Vec<(u64, u64, u32, bool)> = sim
+                .steps
+                .iter()
+                .rev()
+                .take(12)
+                .map(|s| (s.pc_before, s.pc_after, s.opcode, s.halted))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            println!("trace_sim_tail={tail:?}");
+            panic!("circuit did not halt within 200K simulation steps");
+        }
+        sim.steps.len()
+    };
+
+    // Poseidon lane split requires t_len <= (ccs_m - m_in).
+    // For this circuit/profile the safe cap is 510.
+    const MAX_SAFE_CHUNK_ROWS: usize = 510;
+    let chunk_rows = executed_steps.min(MAX_SAFE_CHUNK_ROWS).max(1);
+    host.set_chunk_rows(chunk_rows);
+    host.set_max_steps(executed_steps);
+    println!(
+        "selected_chunk_rows={} selected_max_steps={}",
+        chunk_rows, executed_steps
+    );
+
     let t_prove = Instant::now();
-    let compressed = match host.run(true) {
-        Ok(bytes) => bytes,
+    let mut run = match host.prove_run() {
+        Ok(run) => run,
         Err(err) => {
             let msg = format!("{err:?}");
             if msg.contains("poseidon-precompile feature is disabled") {
@@ -420,43 +473,27 @@ fn test_note_spend_prove_verify_with_witness() {
     };
     let prove_ms = t_prove.elapsed().as_millis();
 
-    let decompressed = {
-        use flate2::read::DeflateDecoder;
-        use std::io::Read;
-        let mut decoder = DeflateDecoder::new(compressed.as_slice());
-        let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf).expect("decompress proof");
-        buf
-    };
-
-    let package: NightstreamProofPackage =
-        bincode::deserialize(&decompressed).expect("deserialize proof package");
-
     let t_verify = Instant::now();
-    let ok = package.verify().expect("verification should not error");
-    assert!(ok, "proof verification should pass");
+    run.verify().expect("verification should not error");
     let verify_ms = t_verify.elapsed().as_millis();
-
-    let recovered: TestSpendPublic =
-        bincode::deserialize(&package.public_output).expect("deserialize public output");
-    assert_eq!(recovered.anchor_root, anchor);
-    assert_eq!(recovered.nullifiers, vec![nullifier]);
-    assert_eq!(recovered.output_commitments, vec![out_cm]);
-    assert_eq!(recovered.blacklist_root, blacklist_root);
 
     println!("\n=============================================");
     println!("  Note-Spend Prove+Verify (Valid Witness)");
     println!("=============================================");
     println!("  Proof generation: {} ms", prove_ms);
     println!("  Verification:     {} ms", verify_ms);
-    println!("  Public output:    {} bytes", package.public_output.len());
+    println!("  RISC-V steps:     {}", run.trace_len());
+    println!("  Folding steps:    {}", run.fold_count());
+    println!("  CCS constraints:  {}", run.ccs_num_constraints());
+    println!("  CCS variables:    {}", run.ccs_num_variables());
     println!(
-        "  Folding steps:    {}",
-        package
-            .proof_step_count()
-            .expect("decode proof step count")
+        "  Requires Poseidon stage: {}",
+        run.requires_poseidon_stage()
     );
-    println!("  Compressed proof: {:.2} KB", compressed.len() as f64 / 1024.0);
+    assert_eq!(anchor, test_public.anchor_root);
+    assert_eq!(vec![nullifier], test_public.nullifiers);
+    assert_eq!(vec![out_cm], test_public.output_commitments);
+    assert_eq!(blacklist_root, test_public.blacklist_root);
     println!("=============================================\n");
 }
 

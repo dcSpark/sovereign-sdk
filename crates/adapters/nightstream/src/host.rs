@@ -20,8 +20,12 @@ use sov_rollup_interface::zk::ZkvmHost;
 use std::collections::HashMap;
 use std::io::Write;
 
+use crate::circuit_output::{
+    output_claims_to_bytes, spend_public_bytes_from_circuit_output, CircuitOutput,
+    CircuitViewAttestation,
+};
 use crate::proof_package::{
-    encode_shard_proof_bytes, NightstreamProofPackage, Rv32TraceWiringRunConfig,
+    encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv32TraceWiringRunConfig,
 };
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
@@ -30,8 +34,6 @@ use crate::{NightstreamCodeCommitment, NightstreamGuest};
 const INPUT_ADDR: u64 = 0x104;
 
 /// Output address where the circuit writes its public output.
-/// Currently unused because output claims are not set (see write_note_spend_witness).
-#[allow(dead_code)]
 const OUTPUT_ADDR: u64 = 0x100;
 
 /// Default chunk rows (rows per trace-wiring folding step).
@@ -307,6 +309,8 @@ pub struct NightstreamHost {
     /// return the correct `public_output` without needing the `SpendPublic` type.
     /// The output claims enforce that the circuit actually wrote these values.
     stored_public_output: Option<Vec<u8>>,
+    /// Declares how `stored_public_output` is bound to output claims.
+    public_output_format: Option<PublicOutputFormat>,
 }
 
 impl NightstreamHost {
@@ -321,6 +325,7 @@ impl NightstreamHost {
             max_steps: None,
             output_claims: Vec::new(),
             stored_public_output: None,
+            public_output_format: None,
         }
     }
 
@@ -343,17 +348,37 @@ impl NightstreamHost {
         self.max_steps = Some(max_steps);
     }
 
+    /// Set chunk rows on an existing host.
+    pub fn set_chunk_rows(&mut self, chunk_rows: usize) {
+        self.chunk_rows = chunk_rows;
+    }
+
+    /// Return RAM init words as sorted `(addr, value)` pairs.
+    ///
+    /// Useful for simulation/debug flows that need to run the same witness
+    /// outside the proving path.
+    pub fn ram_init_pairs(&self) -> Vec<(u64, u32)> {
+        let mut pairs: Vec<(u64, u32)> = self
+            .ram_init
+            .iter()
+            .map(|(&addr, &value)| (addr, value as u32))
+            .collect();
+        pairs.sort_unstable_by_key(|(addr, _)| *addr);
+        pairs
+    }
+
     /// Add a u32 input value at the next available input address.
     ///
     /// This directly maps to the guest's `RamReader::read_u32`.
     pub fn add_u32_input(&mut self, value: u32) {
-        self.ram_init
-            .insert(self.input_offset, value as u64);
+        self.ram_init.insert(self.input_offset, value as u64);
         self.input_offset += 4;
     }
 
     /// Add an output claim (expected value at a given RAM address).
     pub fn add_output_claim(&mut self, addr: u64, expected_value: u64) {
+        // Manual output claims imply generic/raw output format unless explicitly overridden.
+        self.public_output_format = None;
         self.output_claims.push((addr, expected_value));
     }
 
@@ -377,6 +402,97 @@ impl NightstreamHost {
         }
     }
 
+    /// Add a u32 output claim at `addr` and advance by 4 bytes.
+    fn write_output_claim_u32_at(&mut self, addr: &mut u64, val: u32) {
+        self.add_output_claim(*addr, val as u64);
+        *addr += 4;
+    }
+
+    /// Add a u64 output claim at `addr` as two u32 words (lo, hi).
+    fn write_output_claim_u64_at(&mut self, addr: &mut u64, val: u64) {
+        self.write_output_claim_u32_at(addr, val as u32);
+        self.write_output_claim_u32_at(addr, (val >> 32) as u32);
+    }
+
+    /// Add a digest output claim at `addr` as 4 x u64 (each split into 2 x u32).
+    fn write_output_claim_digest_at(&mut self, addr: &mut u64, hash32: &[u8; 32]) {
+        for i in 0..4 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&hash32[i * 8..(i + 1) * 8]);
+            let val = u64::from_le_bytes(buf);
+            self.write_output_claim_u64_at(addr, val);
+        }
+    }
+
+    /// Build circuit-output fields directly from the witness.
+    fn build_note_spend_circuit_output(witness: &NoteSpendWitness) -> CircuitOutput {
+        let n_out = witness.outputs.len();
+        let mut view_attestations = Vec::new();
+        for viewer in &witness.viewers {
+            assert_eq!(
+                viewer.per_output.len(),
+                n_out,
+                "viewer.per_output length must equal n_out"
+            );
+            for (out_w, output) in viewer.per_output.iter().zip(&witness.outputs) {
+                view_attestations.push(CircuitViewAttestation {
+                    cm: output.cm,
+                    fvk_commitment: viewer.fvk_commitment,
+                    ct_hash: out_w.ct_hash,
+                    mac: out_w.mac,
+                });
+            }
+        }
+
+        CircuitOutput {
+            anchor_root: witness.anchor,
+            nullifiers: witness.inputs.iter().map(|input| input.nullifier).collect(),
+            withdraw_amount: witness.withdraw_amount,
+            withdraw_to: witness.withdraw_to,
+            output_commitments: witness.outputs.iter().map(|output| output.cm).collect(),
+            blacklist_root: witness.blacklist_root,
+            view_attestations,
+        }
+    }
+
+    /// Populate output claims for the note-spend circuit's `RamWriter` output layout.
+    fn set_note_spend_output_claims(&mut self, witness: &NoteSpendWitness) {
+        self.output_claims.clear();
+        let mut addr = OUTPUT_ADDR;
+
+        let n_in = witness.inputs.len() as u32;
+        let n_out = witness.outputs.len() as u32;
+        let n_viewers = witness.viewers.len() as u32;
+
+        self.write_output_claim_digest_at(&mut addr, &witness.anchor);
+        self.write_output_claim_u32_at(&mut addr, n_in);
+        for input in &witness.inputs {
+            self.write_output_claim_digest_at(&mut addr, &input.nullifier);
+        }
+        self.write_output_claim_u64_at(&mut addr, witness.withdraw_amount);
+        self.write_output_claim_digest_at(&mut addr, &witness.withdraw_to);
+        self.write_output_claim_u32_at(&mut addr, n_out);
+        for output in &witness.outputs {
+            self.write_output_claim_digest_at(&mut addr, &output.cm);
+        }
+        self.write_output_claim_digest_at(&mut addr, &witness.blacklist_root);
+        self.write_output_claim_u32_at(&mut addr, n_viewers);
+
+        for viewer in &witness.viewers {
+            assert_eq!(
+                viewer.per_output.len(),
+                n_out as usize,
+                "viewer.per_output length must equal n_out"
+            );
+            for (out_w, output) in viewer.per_output.iter().zip(&witness.outputs) {
+                self.write_output_claim_digest_at(&mut addr, &output.cm);
+                self.write_output_claim_digest_at(&mut addr, &viewer.fvk_commitment);
+                self.write_output_claim_digest_at(&mut addr, &out_w.ct_hash);
+                self.write_output_claim_digest_at(&mut addr, &out_w.mac);
+            }
+        }
+    }
+
     // ----------------------------------------------------------------
     // ----------------------------------------------------------------
     // Note-Spend Witness Writer
@@ -391,14 +507,10 @@ impl NightstreamHost {
     /// # Arguments
     ///
     /// * `witness` - All circuit inputs (public + private).
-    /// * `public_output` - Pre-serialized public output bytes (bincode SpendPublic).
-    ///   The output claims enforce that the circuit wrote the correct values;
-    ///   this blob is stored in the proof package for the verifier to deserialize.
-    pub fn write_note_spend_witness(
-        &mut self,
-        witness: &NoteSpendWitness,
-        public_output: Vec<u8>,
-    ) {
+    /// * `public_output` - Caller-provided public output bytes (bincode SpendPublic).
+    ///   The host recomputes canonical bytes from witness/output claims and stores
+    ///   those for the proof package.
+    pub fn write_note_spend_witness(&mut self, witness: &NoteSpendWitness, public_output: Vec<u8>) {
         let n_in = witness.inputs.len() as u32;
         let n_out = witness.outputs.len() as u32;
 
@@ -489,8 +601,21 @@ impl NightstreamHost {
             }
         }
 
-        // Store the pre-built public output for the proof package.
-        self.stored_public_output = Some(public_output);
+        // Bind package public output to proof-visible output claims.
+        self.set_note_spend_output_claims(witness);
+        self.public_output_format = Some(PublicOutputFormat::NoteSpendV1);
+
+        let circuit_output = Self::build_note_spend_circuit_output(witness);
+        let certified_public_output = spend_public_bytes_from_circuit_output(&circuit_output)
+            .expect("failed to serialize certified note-spend public output");
+
+        if public_output != certified_public_output {
+            tracing::warn!(
+                "Caller-provided note-spend public_output does not match certified output; using certified output bytes"
+            );
+        }
+
+        self.stored_public_output = Some(certified_public_output);
     }
 
     /// Compute the SHA-256 code commitment of the ROM bytes.
@@ -522,6 +647,17 @@ impl NightstreamHost {
         builder
     }
 
+    /// Build and prove a trace run, returning the in-memory run handle.
+    ///
+    /// This is useful for tests/benchmarks that want to call `run.verify()`
+    /// without replaying proving from a serialized proof package.
+    pub fn prove_run(&self) -> Result<Rv32TraceWiringRun> {
+        let builder = self.build_runner();
+        builder
+            .prove()
+            .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))
+    }
+
     /// Build the run configuration for proof packaging.
     fn build_config(&self, run: &Rv32TraceWiringRun) -> Rv32TraceWiringRunConfig {
         Rv32TraceWiringRunConfig {
@@ -533,6 +669,7 @@ impl NightstreamHost {
             ram_init: self.ram_init.clone(),
             reg_init: HashMap::new(),
             output_claims: self.output_claims.clone(),
+            public_output_format: self.public_output_format.clone(),
         }
     }
 }
@@ -583,8 +720,7 @@ impl ZkvmHost for NightstreamHost {
 
         for chunk in padded.chunks_exact(4) {
             let word = u32::from_le_bytes(chunk.try_into().expect("chunk is 4 bytes"));
-            self.ram_init
-                .insert(self.input_offset, word as u64);
+            self.ram_init.insert(self.input_offset, word as u64);
             self.input_offset += 4;
         }
     }
@@ -740,10 +876,7 @@ impl NightstreamHost {
     /// those bytes directly (the output claims enforce correctness at the ZK level).
     ///
     /// Otherwise, falls back to reconstructing raw bytes from output claims.
-    fn extract_output_from_run(
-        &self,
-        _run: &Rv32TraceWiringRun,
-    ) -> Result<Vec<u8>> {
+    fn extract_output_from_run(&self, _run: &Rv32TraceWiringRun) -> Result<Vec<u8>> {
         if let Some(ref stored) = self.stored_public_output {
             return Ok(stored.clone());
         }
@@ -751,13 +884,7 @@ impl NightstreamHost {
         if self.output_claims.is_empty() {
             return Ok(vec![]);
         }
-        let mut sorted: Vec<_> = self.output_claims.clone();
-        sorted.sort_by_key(|&(addr, _)| addr);
-        let mut bytes = Vec::with_capacity(sorted.len() * 4);
-        for &(_, value) in &sorted {
-            bytes.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        Ok(bytes)
+        output_claims_to_bytes(&self.output_claims)
     }
 
     /// Try a simulation run (no proof, just execution) to extract output.

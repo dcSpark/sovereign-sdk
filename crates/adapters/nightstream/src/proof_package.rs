@@ -4,14 +4,14 @@
 //! sovereign-ligero adapter is self-contained -- no `sovereign_bridge` module
 //! in the Nightstream crate is needed.
 
+use crate::circuit_output::spend_public_bytes_from_output_claims;
 use neo_ajtai::Commitment as Cmt;
 use neo_ccs::{matrix::Mat, CeClaim};
+use neo_fold::pi_ccs::rot_rhos_to_mats;
 use neo_fold::riscv_trace_shard::Rv32TraceWiring;
 use neo_fold::shard::{
-    BatchedTimeProof, FoldStep, MemOrLutProof, MemSidecarProof, RlcDecProof, ShardProof,
-    StepProof,
+    BatchedTimeProof, FoldStep, MemOrLutProof, MemSidecarProof, RlcDecProof, ShardProof, StepProof,
 };
-use neo_fold::pi_ccs::rot_rhos_to_mats;
 use neo_fold::{PiCcsError, PiCcsProof};
 use neo_math::{F, K};
 use neo_memory::output_check::OutputBindingProof;
@@ -19,6 +19,17 @@ use neo_memory::witness::StepInstanceBundle;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Declares how `public_output` must be interpreted and bound to proof-visible data.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PublicOutputFormat {
+    /// Nightstream note-spend output format written at `OUTPUT_ADDR`.
+    ///
+    /// Verification reconstructs raw output bytes from output-claims, parses them
+    /// as note-spend circuit output, and requires `public_output` bytes to match
+    /// the canonical SpendPublic wire encoding.
+    NoteSpendV1,
+}
 
 /// Configuration needed to reconstruct a run from ROM bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +53,9 @@ pub struct Rv32TraceWiringRunConfig {
     pub reg_init: HashMap<u64, u64>,
     /// Output claims: (address, expected_value_as_u64).
     pub output_claims: Vec<(u64, u64)>,
+    /// Optional format used to bind `public_output` to proof-visible outputs.
+    #[serde(default)]
+    pub public_output_format: Option<PublicOutputFormat>,
 }
 
 /// Pool-operator Ed25519 signature over a viewer FVK commitment.
@@ -91,14 +105,16 @@ pub struct NightstreamProofPackage {
 impl NightstreamProofPackage {
     /// Serialize this package to bytes (using bincode).
     pub fn to_bytes(&self) -> Result<Vec<u8>, PiCcsError> {
-        bincode::serialize(self)
-            .map_err(|e| PiCcsError::InvalidInput(format!("proof package serialization failed: {e}")))
+        bincode::serialize(self).map_err(|e| {
+            PiCcsError::InvalidInput(format!("proof package serialization failed: {e}"))
+        })
     }
 
     /// Deserialize a package from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PiCcsError> {
-        bincode::deserialize(bytes)
-            .map_err(|e| PiCcsError::InvalidInput(format!("proof package deserialization failed: {e}")))
+        bincode::deserialize(bytes).map_err(|e| {
+            PiCcsError::InvalidInput(format!("proof package deserialization failed: {e}"))
+        })
     }
 
     /// Returns the number of folding steps encoded in `proof`.
@@ -139,7 +155,29 @@ impl NightstreamProofPackage {
         run.verify_proof(run.proof())?;
 
         let regenerated = encode_shard_proof_bytes(run.proof())?;
-        Ok(regenerated == self.proof)
+        if regenerated != self.proof {
+            return Ok(false);
+        }
+
+        if matches!(
+            self.config.public_output_format,
+            Some(PublicOutputFormat::NoteSpendV1)
+        ) {
+            let certified = spend_public_bytes_from_output_claims(&self.config.output_claims)
+                .map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "failed to derive certified note-spend public output from output claims: {e}"
+                    ))
+                })?;
+
+            if certified != self.public_output {
+                return Err(PiCcsError::InvalidInput(
+                    "public_output does not match proof-certified output claims".to_string(),
+                ));
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -381,15 +419,31 @@ impl StepProofWire {
                 .iter()
                 .map(RlcDecProofWire::from_native)
                 .collect(),
-            val_fold: step.val_fold.iter().map(RlcDecProofWire::from_native).collect(),
-            wb_fold: step.wb_fold.iter().map(RlcDecProofWire::from_native).collect(),
-            wp_fold: step.wp_fold.iter().map(RlcDecProofWire::from_native).collect(),
+            val_fold: step
+                .val_fold
+                .iter()
+                .map(RlcDecProofWire::from_native)
+                .collect(),
+            wb_fold: step
+                .wb_fold
+                .iter()
+                .map(RlcDecProofWire::from_native)
+                .collect(),
+            wp_fold: step
+                .wp_fold
+                .iter()
+                .map(RlcDecProofWire::from_native)
+                .collect(),
             compressed_substeps: step.compressed_substeps.as_ref().map(|sub| {
                 sub.iter()
                     .map(StepProofWire::from_native)
                     .collect::<Vec<_>>()
             }),
-            stage8_fold: step.stage8_fold.iter().map(RlcDecProofWire::from_native).collect(),
+            stage8_fold: step
+                .stage8_fold
+                .iter()
+                .map(RlcDecProofWire::from_native)
+                .collect(),
         }
     }
 }
@@ -491,11 +545,8 @@ impl FoldStepWire {
                         opening_ccs_proof: group.opening_ccs_proof.clone(),
                     })
                     .collect(),
-                unified_fold: step
-                    .joint_opening_lane
-                    .unified_fold
-                    .as_ref()
-                    .map(|group| JointOpeningGroupProofWire {
+                unified_fold: step.joint_opening_lane.unified_fold.as_ref().map(|group| {
+                    JointOpeningGroupProofWire {
                         point: group.point.clone(),
                         domain: format!("{:?}", group.domain),
                         claim_indices: group.claim_indices.clone(),
@@ -504,7 +555,8 @@ impl FoldStepWire {
                         joint_claim: group.joint_claim,
                         joint_commitment: group.joint_commitment.clone(),
                         opening_ccs_proof: group.opening_ccs_proof.clone(),
-                    }),
+                    }
+                }),
             },
             folding_lanes: FoldingLanesWire {
                 main_children: step.folding_lanes.main_children,

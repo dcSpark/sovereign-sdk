@@ -166,7 +166,10 @@ fn main() -> anyhow::Result<()> {
     println!("  Genesis:     {}", genesis_path.display());
     println!();
     println!("Next steps:");
-    println!("  1. Copy {} to the genesis config directory", genesis_path.display());
+    println!(
+        "  1. Copy {} to the genesis config directory",
+        genesis_path.display()
+    );
     println!("  2. Start the rollup with --nightstream feature");
     println!("  3. Use sov-cli to import and submit:");
     println!("     sov-cli transactions import from-file value-setter-zk \\");

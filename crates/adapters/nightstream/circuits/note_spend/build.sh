@@ -2,7 +2,7 @@
 # Build the note_spend RISC-V guest and export its ROM as a Rust constant.
 #
 # Prerequisites:
-#   rustup target add riscv32i-unknown-none-elf
+#   rustup target add riscv32im-unknown-none-elf
 #
 # The nightstream-sdk dependency is fetched from GitHub automatically via Cargo.
 #
@@ -19,10 +19,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# Ensure riscv32i target is installed.
-if ! rustup target list --installed | grep -q riscv32i-unknown-none-elf; then
-    echo -e "${YELLOW}Installing riscv32i-unknown-none-elf target...${NC}"
-    rustup target add riscv32i-unknown-none-elf
+# Ensure riscv32im target is installed.
+if ! rustup target list --installed | grep -q riscv32im-unknown-none-elf; then
+    echo -e "${YELLOW}Installing riscv32im-unknown-none-elf target...${NC}"
+    rustup target add riscv32im-unknown-none-elf
 fi
 
 EXTRA_ARGS=()

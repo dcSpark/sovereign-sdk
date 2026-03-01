@@ -110,14 +110,15 @@ def main() -> int:
     guest_dir = Path(__file__).resolve().parent
     circuits_dir = guest_dir.parent
     out_rs = circuits_dir / "note_spend_rom.rs"
+    target_triple = "riscv32im-unknown-none-elf"
 
     skip_build = "--skip-build" in sys.argv
 
     if not skip_build:
-        print("Building note_spend guest (riscv32i-unknown-none-elf)...")
+        print(f"Building note_spend guest ({target_triple})...")
         subprocess.run(["cargo", "build", "--release"], cwd=guest_dir, check=True)
 
-    elf = guest_dir / "target/riscv32i-unknown-none-elf/release/note_spend"
+    elf = guest_dir / f"target/{target_triple}/release/note_spend"
     if not elf.exists():
         raise FileNotFoundError(f"missing expected ELF: {elf}")
 

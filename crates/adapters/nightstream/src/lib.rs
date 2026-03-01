@@ -98,9 +98,7 @@ impl sov_rollup_interface::zk::CodeCommitment for NightstreamCodeCommitment {
 
     fn decode(value: &[u8]) -> Result<Self, Self::DecodeError> {
         if value.len() != 32 {
-            return Err(NightstreamCodeCommitmentError::InvalidLength {
-                found: value.len(),
-            });
+            return Err(NightstreamCodeCommitmentError::InvalidLength { found: value.len() });
         }
         let mut contents = [0u8; 32];
         contents.copy_from_slice(value);
@@ -112,7 +110,9 @@ impl sov_rollup_interface::zk::CodeCommitment for NightstreamCodeCommitment {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum NightstreamCodeCommitmentError {
     /// The input was not 32 bytes long.
-    #[error("NightstreamCodeCommitment must be 32 bytes long, but the input was {found} bytes long")]
+    #[error(
+        "NightstreamCodeCommitment must be 32 bytes long, but the input was {found} bytes long"
+    )]
     InvalidLength {
         /// The size of the input.
         found: usize,
@@ -236,9 +236,9 @@ impl ZkVerifier for NightstreamVerifier {
             use std::io::Read;
             let mut decoder = DeflateDecoder::new(serialized_proof);
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf).map_err(|e| {
-                anyhow::anyhow!("Failed to decompress Nightstream proof: {}", e)
-            })?;
+            decoder
+                .read_to_end(&mut buf)
+                .map_err(|e| anyhow::anyhow!("Failed to decompress Nightstream proof: {}", e))?;
             buf
         };
 
@@ -309,9 +309,7 @@ impl NightstreamVerifier {
     }
 
     /// Verify a proof package.
-    pub fn verify_proof_package(
-        package: &NightstreamProofPackage,
-    ) -> Result<(), anyhow::Error> {
+    pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
         native::verify_proof_package(package)
     }
 }
@@ -350,9 +348,9 @@ mod native {
     /// 1. Reconstructs and runs the trace wiring from ROM + config.
     /// 2. Canonically re-encodes the generated proof and compares it to the packaged proof bytes.
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
-        let ok = package.verify().map_err(|e| {
-            anyhow::anyhow!("Nightstream proof verification failed: {:?}", e)
-        })?;
+        let ok = package
+            .verify()
+            .map_err(|e| anyhow::anyhow!("Nightstream proof verification failed: {:?}", e))?;
 
         if !ok {
             anyhow::bail!("Nightstream proof verification returned false");

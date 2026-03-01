@@ -14210,6 +14210,7 @@ dependencies = [
  "neo-fold",
  "neo-math 0.1.0 (git+https://github.com/LFDT-Nightstream/Nightstream?rev=d4b8df4121ca15902dbe4f29f75761f64898a8d7)",
  "neo-memory",
+ "neo-vm-trace",
  "p3-field 0.4.2",
  "p3-goldilocks",
  "schemars 0.8.22",

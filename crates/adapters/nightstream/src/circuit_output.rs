@@ -13,6 +13,7 @@
 use anyhow::{anyhow, Result};
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
+use serde::{Deserialize, Serialize};
 
 /// A 4-element Goldilocks digest (32 bytes as 4 x u64 LE).
 pub type GlDigest = [Goldilocks; 4];
@@ -50,10 +51,7 @@ fn read_gldigest(data: &[u8], offset: &mut usize) -> Result<GlDigest> {
 /// Read a u32 from a byte slice at a given offset (LE). Advances offset by 4.
 fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
     if *offset + 4 > data.len() {
-        return Err(anyhow!(
-            "Not enough bytes for u32 at offset {}",
-            offset
-        ));
+        return Err(anyhow!("Not enough bytes for u32 at offset {}", offset));
     }
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&data[*offset..*offset + 4]);
@@ -64,10 +62,7 @@ fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
 /// Read a u64 from a byte slice at a given offset (LE). Advances offset by 8.
 fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
     if *offset + 8 > data.len() {
-        return Err(anyhow!(
-            "Not enough bytes for u64 at offset {}",
-            offset
-        ));
+        return Err(anyhow!("Not enough bytes for u64 at offset {}", offset));
     }
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&data[*offset..*offset + 8]);
@@ -108,6 +103,39 @@ pub struct CircuitOutput {
     pub blacklist_root: [u8; 32],
     /// Viewer attestations (empty when n_viewers == 0).
     pub view_attestations: Vec<CircuitViewAttestation>,
+}
+
+/// Bincode/Serde-compatible view attestation shape used by `midnight_privacy::SpendPublic`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendPublicViewAttestation {
+    /// Output commitment this attestation is bound to.
+    pub cm: [u8; 32],
+    /// FVK commitment.
+    pub fvk_commitment: [u8; 32],
+    /// Ciphertext hash.
+    pub ct_hash: [u8; 32],
+    /// MAC over `(k, cm, ct_hash)`.
+    pub mac: [u8; 32],
+}
+
+/// Bincode/Serde-compatible SpendPublic shape used by `midnight_privacy`.
+///
+/// This keeps the adapter independent from the midnight-privacy crate while
+/// still producing byte-identical bincode output for the same logical values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendPublicWire {
+    /// Anchor root used for membership checks.
+    pub anchor_root: [u8; 32],
+    /// Deny-map root used for blacklist checks.
+    pub blacklist_root: [u8; 32],
+    /// Nullifiers of consumed notes.
+    pub nullifiers: Vec<[u8; 32]>,
+    /// Transparent withdrawal amount.
+    pub withdraw_amount: u128,
+    /// Commitments of newly created notes.
+    pub output_commitments: Vec<[u8; 32]>,
+    /// Optional viewer attestations.
+    pub view_attestations: Option<Vec<SpendPublicViewAttestation>>,
 }
 
 /// Parse the raw circuit output bytes into a `CircuitOutput`.
@@ -167,6 +195,14 @@ pub fn parse_circuit_output(data: &[u8]) -> Result<CircuitOutput> {
         }
     }
 
+    if offset != data.len() {
+        return Err(anyhow!(
+            "Trailing bytes after parsing circuit output: offset={}, len={}",
+            offset,
+            data.len()
+        ));
+    }
+
     Ok(CircuitOutput {
         anchor_root,
         nullifiers,
@@ -176,4 +212,146 @@ pub fn parse_circuit_output(data: &[u8]) -> Result<CircuitOutput> {
         blacklist_root,
         view_attestations,
     })
+}
+
+/// Convert output claims `(address, value)` into raw output bytes (sorted by address).
+///
+/// Each claim value must fit in `u32`, since the guest writes output as 32-bit words.
+pub fn output_claims_to_bytes(output_claims: &[(u64, u64)]) -> Result<Vec<u8>> {
+    let mut sorted: Vec<_> = output_claims.to_vec();
+    sorted.sort_by_key(|&(addr, _)| addr);
+
+    let mut bytes = Vec::with_capacity(sorted.len() * 4);
+    for (addr, value) in sorted {
+        let word = u32::try_from(value).map_err(|_| {
+            anyhow!(
+                "Output claim value does not fit in u32 at addr {:#x}: {}",
+                addr,
+                value
+            )
+        })?;
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// Convert parsed circuit output into a bincode-compatible SpendPublic wire shape.
+pub fn spend_public_wire_from_circuit_output(output: &CircuitOutput) -> SpendPublicWire {
+    let view_attestations = if output.view_attestations.is_empty() {
+        None
+    } else {
+        Some(
+            output
+                .view_attestations
+                .iter()
+                .map(|att| SpendPublicViewAttestation {
+                    cm: att.cm,
+                    fvk_commitment: att.fvk_commitment,
+                    ct_hash: att.ct_hash,
+                    mac: att.mac,
+                })
+                .collect(),
+        )
+    };
+
+    SpendPublicWire {
+        anchor_root: output.anchor_root,
+        blacklist_root: output.blacklist_root,
+        nullifiers: output.nullifiers.clone(),
+        withdraw_amount: output.withdraw_amount as u128,
+        output_commitments: output.output_commitments.clone(),
+        view_attestations,
+    }
+}
+
+/// Serialize parsed circuit output into bincode bytes compatible with SpendPublic.
+pub fn spend_public_bytes_from_circuit_output(output: &CircuitOutput) -> Result<Vec<u8>> {
+    let wire = spend_public_wire_from_circuit_output(output);
+    bincode::serialize(&wire).map_err(|e| anyhow!("Failed to serialize SpendPublicWire: {}", e))
+}
+
+/// Derive certified SpendPublic bytes from output claims.
+pub fn spend_public_bytes_from_output_claims(output_claims: &[(u64, u64)]) -> Result<Vec<u8>> {
+    let raw = output_claims_to_bytes(output_claims)?;
+    let parsed = parse_circuit_output(&raw)?;
+    spend_public_bytes_from_circuit_output(&parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OUTPUT_ADDR: u64 = 0x100;
+
+    fn push_u32_claim(claims: &mut Vec<(u64, u64)>, addr: &mut u64, v: u32) {
+        claims.push((*addr, v as u64));
+        *addr += 4;
+    }
+
+    fn push_u64_claim(claims: &mut Vec<(u64, u64)>, addr: &mut u64, v: u64) {
+        push_u32_claim(claims, addr, v as u32);
+        push_u32_claim(claims, addr, (v >> 32) as u32);
+    }
+
+    fn push_digest_claim(claims: &mut Vec<(u64, u64)>, addr: &mut u64, d: &[u8; 32]) {
+        for i in 0..4 {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&d[i * 8..(i + 1) * 8]);
+            push_u64_claim(claims, addr, u64::from_le_bytes(word));
+        }
+    }
+
+    #[test]
+    fn output_claims_note_spend_to_spend_public_wire() {
+        let anchor = [1u8; 32];
+        let nullifier = [2u8; 32];
+        let withdraw_to = [3u8; 32];
+        let cm = [4u8; 32];
+        let blacklist_root = [5u8; 32];
+
+        let mut claims = Vec::new();
+        let mut addr = OUTPUT_ADDR;
+        push_digest_claim(&mut claims, &mut addr, &anchor);
+        push_u32_claim(&mut claims, &mut addr, 1); // n_in
+        push_digest_claim(&mut claims, &mut addr, &nullifier);
+        push_u64_claim(&mut claims, &mut addr, 9); // withdraw_amount
+        push_digest_claim(&mut claims, &mut addr, &withdraw_to);
+        push_u32_claim(&mut claims, &mut addr, 1); // n_out
+        push_digest_claim(&mut claims, &mut addr, &cm);
+        push_digest_claim(&mut claims, &mut addr, &blacklist_root);
+        push_u32_claim(&mut claims, &mut addr, 0); // n_viewers
+
+        let bytes = spend_public_bytes_from_output_claims(&claims).expect("convert claims");
+        let wire: SpendPublicWire = bincode::deserialize(&bytes).expect("deserialize wire");
+
+        assert_eq!(wire.anchor_root, anchor);
+        assert_eq!(wire.blacklist_root, blacklist_root);
+        assert_eq!(wire.nullifiers, vec![nullifier]);
+        assert_eq!(wire.withdraw_amount, 9);
+        assert_eq!(wire.output_commitments, vec![cm]);
+        assert!(wire.view_attestations.is_none());
+    }
+
+    #[test]
+    fn parse_circuit_output_rejects_trailing_bytes() {
+        let anchor = [7u8; 32];
+        let withdraw_to = [8u8; 32];
+        let blacklist_root = [9u8; 32];
+
+        let mut claims = Vec::new();
+        let mut addr = OUTPUT_ADDR;
+        push_digest_claim(&mut claims, &mut addr, &anchor);
+        push_u32_claim(&mut claims, &mut addr, 0); // n_in
+        push_u64_claim(&mut claims, &mut addr, 0); // withdraw_amount
+        push_digest_claim(&mut claims, &mut addr, &withdraw_to);
+        push_u32_claim(&mut claims, &mut addr, 0); // n_out
+        push_digest_claim(&mut claims, &mut addr, &blacklist_root);
+        push_u32_claim(&mut claims, &mut addr, 0); // n_viewers
+
+        let mut raw = output_claims_to_bytes(&claims).expect("claims bytes");
+        raw.push(0xAA); // trailing byte
+
+        let err = parse_circuit_output(&raw).expect_err("must reject trailing bytes");
+        assert!(err.to_string().contains("Trailing bytes"));
+    }
 }

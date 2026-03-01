@@ -1,35 +1,42 @@
-/*
- * RISC-V Guest Program: Note Spend (Goldilocks / Poseidon2)
- *
- * Implements the join-split spend verifier from the Midnight privacy protocol,
- * ported from the Ligero BN254-based circuit to use Goldilocks field arithmetic
- * and Poseidon2-Goldilocks hashing via the Nightstream ECALL precompile.
- *
- * The circuit proves:
- *   1. Ownership: all inputs belong to the same spend key
- *   2. Merkle membership: each input commitment is in the state tree
- *   3. Nullifiers: correctly derived, match public values, pairwise distinct
- *   4. Shape validation: n_out / withdraw_amount / withdraw_to consistency
- *   5. Output commitments: correctly formed
- *   6. Balance: sum(inputs) == withdraw_amount + sum(outputs)
- *   7. Enforce product: values non-zero, rhos distinct
- *   8. Blacklist non-membership: sender (and pay recipient) not in deny-map
- *   9. Viewer attestations (Level-B): FVK commitment, ct_hash, MAC binding
- */
-
 #![no_std]
 #![no_main]
 
-use nightstream_sdk::goldilocks::*;
-use nightstream_sdk::poseidon2::poseidon2_hash;
+type GlDigest = [u64; 4];
 
-// --- Constants ---
+const GL_ZERO: u64 = 0;
+const GL_ONE: u64 = 1;
+const ZERO_DIGEST: GlDigest = [0, 0, 0, 0];
+
+#[inline]
+fn gl_add(a: u64, b: u64) -> u64 {
+    a.wrapping_add(b)
+}
+
+#[inline]
+fn gl_sub(a: u64, b: u64) -> u64 {
+    a.wrapping_sub(b)
+}
+
+#[inline]
+fn gl_mul(a: u64, b: u64) -> u64 {
+    a.wrapping_mul(b)
+}
+
+#[inline]
+fn digest_eq(a: &GlDigest, b: &GlDigest) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+}
+
+#[inline]
+fn poseidon2_hash(input: &[u64]) -> GlDigest {
+    nightstream_sdk::poseidon2::poseidon2_hash(input)
+}
 
 const MAX_INS: usize = 4;
 const MAX_OUTS: usize = 2;
+#[allow(dead_code)]
 const MAX_DEPTH: usize = 63;
 
-// Domain separation tags (Goldilocks constants).
 const TAG_MT_NODE: u64 = 1;
 const TAG_NOTE: u64 = 2;
 const TAG_PRF_NF: u64 = 3;
@@ -38,11 +45,8 @@ const TAG_ADDR: u64 = 5;
 const TAG_NFKEY: u64 = 6;
 const TAG_BL_BUCKET: u64 = 7;
 
-// Blacklist (deny-map) tree parameters.
 const BL_DEPTH: u32 = 16;
 const BL_BUCKET_SIZE: usize = 12;
-
-// --- RAM I/O helpers ---
 
 const INPUT_ADDR: u32 = 0x104;
 const OUTPUT_ADDR: u32 = 0x100;
@@ -99,9 +103,6 @@ impl RamWriter {
     }
 }
 
-// --- Cryptographic primitives ---
-
-/// Hash domain: pk_spend = H(TAG_PK, spend_sk)
 fn derive_pk_spend(spend_sk: &GlDigest) -> GlDigest {
     let mut input = [0u64; 5];
     input[0] = TAG_PK;
@@ -109,7 +110,6 @@ fn derive_pk_spend(spend_sk: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Hash domain: nf_key = H(TAG_NFKEY, domain, spend_sk)
 fn derive_nf_key(domain: &GlDigest, spend_sk: &GlDigest) -> GlDigest {
     let mut input = [0u64; 9];
     input[0] = TAG_NFKEY;
@@ -118,7 +118,6 @@ fn derive_nf_key(domain: &GlDigest, spend_sk: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Hash domain: address = H(TAG_ADDR, domain, pk_spend, pk_ivk)
 fn derive_address(domain: &GlDigest, pk_spend: &GlDigest, pk_ivk: &GlDigest) -> GlDigest {
     let mut input = [0u64; 13];
     input[0] = TAG_ADDR;
@@ -128,7 +127,6 @@ fn derive_address(domain: &GlDigest, pk_spend: &GlDigest, pk_ivk: &GlDigest) -> 
     poseidon2_hash(&input)
 }
 
-/// Hash domain: note commitment = H(TAG_NOTE, domain, value, rho, recipient, sender_id)
 fn note_commitment(
     domain: &GlDigest,
     value: u64,
@@ -146,7 +144,6 @@ fn note_commitment(
     poseidon2_hash(&input)
 }
 
-/// Hash domain: nullifier = H(TAG_PRF_NF, domain, nf_key, rho)
 fn derive_nullifier(domain: &GlDigest, nf_key: &GlDigest, rho: &GlDigest) -> GlDigest {
     let mut input = [0u64; 13];
     input[0] = TAG_PRF_NF;
@@ -156,7 +153,6 @@ fn derive_nullifier(domain: &GlDigest, nf_key: &GlDigest, rho: &GlDigest) -> GlD
     poseidon2_hash(&input)
 }
 
-/// Merkle tree node: H(TAG_MT_NODE, level, left, right)
 fn mt_node(level: u64, left: &GlDigest, right: &GlDigest) -> GlDigest {
     let mut input = [0u64; 10];
     input[0] = TAG_MT_NODE;
@@ -166,55 +162,44 @@ fn mt_node(level: u64, left: &GlDigest, right: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Verify a Merkle path and return the computed root.
-///
-/// Uses arithmetic MUX (no branching) for constant-time path selection:
-///   delta[i] = bit * (sib[i] - cur[i])
-///   left[i]  = cur[i] + delta[i]
-///   right[i] = sib[i] - delta[i]
-fn merkle_root(
-    leaf: &GlDigest,
-    pos: u32,
-    reader: &mut RamReader,
-    depth: u32,
-) -> GlDigest {
+fn merkle_root(leaf: &GlDigest, pos: u32, reader: &mut RamReader, depth: u32) -> GlDigest {
     let mut cur = *leaf;
     let mut p = pos;
 
-    for lvl in 0..depth {
+    let mut lvl = 0u32;
+    while lvl < depth {
         let sib = reader.read_digest();
         let bit = (p & 1) as u64;
 
         let mut left = [0u64; 4];
         let mut right = [0u64; 4];
-        for i in 0..4 {
+        let mut i = 0usize;
+        while i < 4 {
             let delta = gl_mul(bit, gl_sub(sib[i], cur[i]));
             left[i] = gl_add(cur[i], delta);
             right[i] = gl_sub(sib[i], delta);
+            i += 1;
         }
 
         cur = mt_node(lvl as u64, &left, &right);
         p >>= 1;
+        lvl += 1;
     }
 
     cur
 }
 
-/// Compute the "enforce product" contribution for a digest difference.
-/// Returns product of (a[i] - b[i]) for i in 0..4, accumulated into `acc`.
 fn enforce_prod_digest_diff(acc: u64, a: &GlDigest, b: &GlDigest) -> u64 {
     let mut result = acc;
-    for i in 0..4 {
+    let mut i = 0usize;
+    while i < 4 {
         let diff = gl_sub(a[i], b[i]);
         result = gl_mul(result, diff);
+        i += 1;
     }
     result
 }
 
-// --- Blacklist (deny-map) primitives ---
-
-/// Compute the bucket leaf hash: H(TAG_BL_BUCKET, entries[0..4], ..., entries[11][0..4])
-/// Input: 1 (tag) + 12 * 4 (entries) = 49 Goldilocks field elements.
 fn bl_bucket_leaf(entries: &[GlDigest; BL_BUCKET_SIZE]) -> GlDigest {
     let mut input = [0u64; 1 + BL_BUCKET_SIZE * 4];
     input[0] = TAG_BL_BUCKET;
@@ -225,26 +210,11 @@ fn bl_bucket_leaf(entries: &[GlDigest; BL_BUCKET_SIZE]) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Extract bucket position (low BL_DEPTH bits) from a GlDigest identifier.
-/// id[0] holds the least-significant 64 bits in LE encoding.
 fn bl_bucket_pos(id: &GlDigest) -> u32 {
     (id[0] as u32) & ((1u32 << BL_DEPTH) - 1)
 }
 
-/// Assert that `id` is NOT in the blacklist rooted at `blacklist_root`.
-///
-/// Reads from RAM:
-///   - BL_BUCKET_SIZE bucket entries (GlDigest each)
-///   - 1 inverse witness (u64)
-///   - BL_DEPTH Merkle siblings (GlDigest each)
-///
-/// Proves non-membership via: product(id - entry_i) * inv == 1.
-/// Then verifies the bucket leaf hashes to `blacklist_root` via Merkle path.
-fn assert_not_blacklisted(
-    id: &GlDigest,
-    blacklist_root: &GlDigest,
-    reader: &mut RamReader,
-) {
+fn assert_not_blacklisted(id: &GlDigest, blacklist_root: &GlDigest, reader: &mut RamReader) {
     let mut entries = [ZERO_DIGEST; BL_BUCKET_SIZE];
     for e in entries.iter_mut() {
         *e = reader.read_digest();
@@ -263,14 +233,6 @@ fn assert_not_blacklisted(
     assert!(digest_eq(&root, blacklist_root));
 }
 
-// --- Level-B Viewer Attestation primitives ---
-//
-// Domain separation uses field-element tags (u64 constants) instead of byte
-// strings, avoiding the digest→bytes→u64 roundtrip for data already in field
-// elements. The ct_hash function still packs raw ciphertext bytes.
-
-/// Maximum plaintext length for viewer encryption:
-/// 32(domain) + 16(value LE) + 32(rho) + 32(recipient) + 32(sender_id) + 128(cm_ins[4]) = 272 bytes.
 const NOTE_PLAIN_LEN: usize = 272;
 
 const TAG_FVK_COMMIT: u64 = 100;
@@ -279,23 +241,21 @@ const TAG_VIEW_STREAM: u64 = 102;
 const TAG_CT_HASH: u64 = 103;
 const TAG_VIEW_MAC: u64 = 104;
 
-/// Convert a GlDigest to 32 bytes (LE encoding).
-/// Only needed for XOR encryption (byte-level operations).
 fn digest_to_bytes(d: &GlDigest) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for i in 0..4 {
+    let mut i = 0usize;
+    while i < 4 {
         let b = d[i].to_le_bytes();
         out[i * 8..(i + 1) * 8].copy_from_slice(&b);
+        i += 1;
     }
     out
 }
 
-/// Convert a u64 to LE bytes.
 fn u64_to_le_bytes(v: u64) -> [u8; 8] {
     v.to_le_bytes()
 }
 
-/// Pack raw bytes into Goldilocks field elements (8 bytes per element, LE).
 fn pack_bytes_to_felts(bytes: &[u8], len: usize, out: &mut [u64]) -> usize {
     let n_elems = (len + 7) / 8;
     let mut i = 0;
@@ -314,7 +274,6 @@ fn pack_bytes_to_felts(bytes: &[u8], len: usize, out: &mut [u64]) -> usize {
     n_elems
 }
 
-/// FVK commitment: H(TAG_FVK_COMMIT, fvk[0..4])
 fn view_fvk_commitment(fvk: &GlDigest) -> GlDigest {
     let mut input = [0u64; 5];
     input[0] = TAG_FVK_COMMIT;
@@ -322,7 +281,6 @@ fn view_fvk_commitment(fvk: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// View KDF: H(TAG_VIEW_KDF, fvk[0..4], cm[0..4])
 fn view_kdf(fvk: &GlDigest, cm: &GlDigest) -> GlDigest {
     let mut input = [0u64; 9];
     input[0] = TAG_VIEW_KDF;
@@ -331,7 +289,6 @@ fn view_kdf(fvk: &GlDigest, cm: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Stream block: H(TAG_VIEW_STREAM, k[0..4], ctr)
 fn view_stream_block(k: &GlDigest, ctr: u32) -> GlDigest {
     let mut input = [0u64; 6];
     input[0] = TAG_VIEW_STREAM;
@@ -340,16 +297,14 @@ fn view_stream_block(k: &GlDigest, ctr: u32) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// Ciphertext hash: H(TAG_CT_HASH, packed_ct_bytes..., byte_len)
 fn view_ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> GlDigest {
-    let mut felts = [0u64; 1 + 34 + 1]; // tag + ceil(272/8) + length
+    let mut felts = [0u64; 1 + 34 + 1];
     felts[0] = TAG_CT_HASH;
     let n = pack_bytes_to_felts(ct, NOTE_PLAIN_LEN, &mut felts[1..]);
     felts[1 + n] = NOTE_PLAIN_LEN as u64;
     poseidon2_hash(&felts[..1 + n + 1])
 }
 
-/// View MAC: H(TAG_VIEW_MAC, k[0..4], cm[0..4], ct_h[0..4])
 fn view_mac(k: &GlDigest, cm: &GlDigest, ct_h: &GlDigest) -> GlDigest {
     let mut input = [0u64; 13];
     input[0] = TAG_VIEW_MAC;
@@ -359,7 +314,6 @@ fn view_mac(k: &GlDigest, cm: &GlDigest, ct_h: &GlDigest) -> GlDigest {
     poseidon2_hash(&input)
 }
 
-/// XOR-encrypt plaintext with Poseidon2-based keystream.
 fn view_stream_xor_encrypt(k: &GlDigest, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
     let mut ct = [0u8; NOTE_PLAIN_LEN];
     let mut ctr: u32 = 0;
@@ -368,8 +322,12 @@ fn view_stream_xor_encrypt(k: &GlDigest, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE
         let ks = view_stream_block(k, ctr);
         let ks_bytes = digest_to_bytes(&ks);
         ctr += 1;
-        let take = if off + 32 <= NOTE_PLAIN_LEN { 32 } else { NOTE_PLAIN_LEN - off };
-        let mut j = 0;
+        let take = if off + 32 <= NOTE_PLAIN_LEN {
+            32
+        } else {
+            NOTE_PLAIN_LEN - off
+        };
+        let mut j = 0usize;
         while j < take {
             ct[off + j] = pt[off + j] ^ ks_bytes[j];
             j += 1;
@@ -379,9 +337,6 @@ fn view_stream_xor_encrypt(k: &GlDigest, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE
     ct
 }
 
-/// Encode a note plaintext for viewer encryption (272 bytes).
-///
-/// Layout: [domain(32) | value_le_16 | rho(32) | recipient(32) | sender_id(32) | cm_ins[4](128)]
 fn encode_note_plain(
     domain: &GlDigest,
     value: u64,
@@ -394,30 +349,26 @@ fn encode_note_plain(
     let mut pt = [0u8; NOTE_PLAIN_LEN];
     let dom = digest_to_bytes(domain);
     pt[..32].copy_from_slice(&dom);
-    // value as 16-byte LE (u64 zero-extended)
     pt[32..40].copy_from_slice(&u64_to_le_bytes(value));
-    // bytes 40..48 already zero (padding)
     pt[48..80].copy_from_slice(&digest_to_bytes(rho));
     pt[80..112].copy_from_slice(&digest_to_bytes(recipient));
     pt[112..144].copy_from_slice(&digest_to_bytes(sender_id));
-    for i in 0..MAX_INS {
+    let mut i = 0usize;
+    while i < MAX_INS {
         let off = 144 + i * 32;
         if (i as u32) < n_in {
             pt[off..off + 32].copy_from_slice(&digest_to_bytes(&cm_ins[i]));
         }
-        // else: already zero (unused inputs are zero-padded)
+        i += 1;
     }
     pt
 }
-
-// --- Main circuit ---
 
 #[nightstream_sdk::provable]
 fn note_spend() -> ! {
     let mut r = RamReader::new(INPUT_ADDR);
     let mut w = RamWriter::new(OUTPUT_ADDR);
 
-    // 1. Parse header
     let domain = r.read_digest();
     let spend_sk = r.read_digest();
     let pk_ivk_owner = r.read_digest();
@@ -425,13 +376,13 @@ fn note_spend() -> ! {
     let anchor = r.read_digest();
     let n_in = r.read_u32();
 
-    // 2. Derive owner identity
+    assert!(n_in <= MAX_INS as u32);
+
     let pk_spend_owner = derive_pk_spend(&spend_sk);
     let nf_key = derive_nf_key(&domain, &spend_sk);
     let recipient_owner = derive_address(&domain, &pk_spend_owner, &pk_ivk_owner);
     let sender_id = recipient_owner;
 
-    // 3. Process inputs: commitments, Merkle paths, nullifiers
     let mut sum_in: u64 = GL_ZERO;
     let mut enforce_prod: u64 = GL_ONE;
     let mut input_rhos: [GlDigest; MAX_INS] = [ZERO_DIGEST; MAX_INS];
@@ -451,12 +402,9 @@ fn note_spend() -> ! {
         input_rhos[i] = rho_in;
 
         let root = merkle_root(&cm, pos, &mut r, depth);
-
-        // Assert root == anchor
         assert!(digest_eq(&root, &anchor));
     }
 
-    // Read public nullifiers and verify
     let mut nullifiers: [GlDigest; MAX_INS] = [ZERO_DIGEST; MAX_INS];
     for i in 0..n_in as usize {
         let nullifier_pub = r.read_digest();
@@ -465,21 +413,18 @@ fn note_spend() -> ! {
         nullifiers[i] = nullifier_pub;
     }
 
-    // 4. Nullifiers must be pairwise distinct within the transaction.
     for i in 0..n_in as usize {
         for j in (i + 1)..n_in as usize {
             assert!(!digest_eq(&nullifiers[i], &nullifiers[j]));
         }
     }
 
-    // 5. Read withdraw info
     let withdraw_amount = r.read_u64();
     let withdraw_to = r.read_digest();
     let n_out = r.read_u32();
 
-    // 6. Shape validation rules (matching Ligero circuit):
-    //    - Transfer (withdraw_amount == 0): n_out in {1, 2}, withdraw_to must be zero
-    //    - Withdraw (withdraw_amount > 0):  n_out in {0, 1}, withdraw_to must be non-zero
+    assert!(n_out <= MAX_OUTS as u32);
+
     if withdraw_amount == 0 {
         assert!(n_out >= 1);
         assert!(digest_eq(&withdraw_to, &ZERO_DIGEST));
@@ -488,7 +433,6 @@ fn note_spend() -> ! {
         assert!(!digest_eq(&withdraw_to, &ZERO_DIGEST));
     }
 
-    // 7. Process outputs: commitments
     let mut out_sum: u64 = GL_ZERO;
     let mut output_values: [u64; MAX_OUTS] = [0; MAX_OUTS];
     let mut output_rhos: [GlDigest; MAX_OUTS] = [ZERO_DIGEST; MAX_OUTS];
@@ -513,7 +457,6 @@ fn note_spend() -> ! {
         output_rcps[j] = rcp;
     }
 
-    // Read public output commitments and verify
     let mut cm_outs_pub: [GlDigest; MAX_OUTS] = [ZERO_DIGEST; MAX_OUTS];
     for j in 0..n_out as usize {
         let cm_pub = r.read_digest();
@@ -521,11 +464,9 @@ fn note_spend() -> ! {
         cm_outs_pub[j] = cm_pub;
     }
 
-    // 8. Balance check: sum_in == withdraw_amount + out_sum
     let rhs = gl_add(withdraw_amount, out_sum);
     assert!(sum_in == rhs);
 
-    // 9. Change output rules
     if withdraw_amount > 0 && n_out == 1 {
         assert!(digest_eq(&output_rcps[0], &sender_id));
     }
@@ -533,7 +474,6 @@ fn note_spend() -> ! {
         assert!(digest_eq(&output_rcps[1], &sender_id));
     }
 
-    // 10. Enforce product: values non-zero, output rhos distinct from input rhos
     for j in 0..n_out as usize {
         for i in 0..n_in as usize {
             enforce_prod = enforce_prod_digest_diff(enforce_prod, &output_rhos[j], &input_rhos[i]);
@@ -547,22 +487,15 @@ fn note_spend() -> ! {
     let check = gl_mul(enforce_prod, inv_enforce);
     assert!(check == GL_ONE);
 
-    // 11. Blacklist checks (bucketed non-membership + Merkle membership)
     let blacklist_root = r.read_digest();
-
-    // Sender (current owner) must not be blacklisted.
     assert_not_blacklisted(&sender_id, &blacklist_root, &mut r);
 
-    // For transfers, also check the pay recipient (first output).
-    // Withdrawals only produce change-to-self outputs, already enforced above.
     if withdraw_amount == 0 {
         assert_not_blacklisted(&output_rcps[0], &blacklist_root, &mut r);
     }
 
-    // 12. Viewer attestations (Level-B compliance)
     let n_viewers = r.read_u32();
 
-    // Write SpendPublic output (step 13 -- starts output before viewer loop for layout)
     w.write_digest(&anchor);
     w.write_u32(n_in);
     for i in 0..n_in as usize {
@@ -576,27 +509,21 @@ fn note_spend() -> ! {
     }
     w.write_digest(&blacklist_root);
 
-    // Viewer attestation output: n_viewers, then per-viewer per-output (cm, fvk_commitment, ct_hash, mac)
     w.write_u32(n_viewers);
 
     for _v in 0..n_viewers as usize {
-        // Read viewer private data from witness
         let fvk_commitment_pub = r.read_digest();
         let fvk = r.read_digest();
 
-        // Verify FVK commitment
         let computed_fvk_cm = view_fvk_commitment(&fvk);
         assert!(digest_eq(&computed_fvk_cm, &fvk_commitment_pub));
 
         for j in 0..n_out as usize {
-            // Read public viewer outputs from witness
             let ct_hash_pub = r.read_digest();
             let mac_pub = r.read_digest();
 
-            // Derive keystream key from FVK and output commitment
             let k = view_kdf(&fvk, &output_cms[j]);
 
-            // Encode note plaintext (272 bytes)
             let pt = encode_note_plain(
                 &domain,
                 output_values[j],
@@ -607,16 +534,13 @@ fn note_spend() -> ! {
                 n_in,
             );
 
-            // Encrypt and hash
             let ct = view_stream_xor_encrypt(&k, &pt);
             let ct_h = view_ct_hash(&ct);
             assert!(digest_eq(&ct_h, &ct_hash_pub));
 
-            // Verify MAC
             let mac = view_mac(&k, &output_cms[j], &ct_h);
             assert!(digest_eq(&mac, &mac_pub));
 
-            // Write attestation tuple: (cm, fvk_commitment, ct_hash, mac)
             w.write_digest(&output_cms[j]);
             w.write_digest(&fvk_commitment_pub);
             w.write_digest(&ct_hash_pub);

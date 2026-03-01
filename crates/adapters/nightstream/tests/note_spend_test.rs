@@ -64,11 +64,7 @@ fn reference_derive_nf_key(domain: &GlDigest, spend_sk: &GlDigest) -> GlDigest {
 }
 
 /// Derive address = H(TAG_ADDR, domain, pk_spend, pk_ivk).
-fn reference_derive_address(
-    domain: &GlDigest,
-    pk_spend: &GlDigest,
-    pk_ivk: &GlDigest,
-) -> GlDigest {
+fn reference_derive_address(domain: &GlDigest, pk_spend: &GlDigest, pk_ivk: &GlDigest) -> GlDigest {
     let mut input = [Goldilocks::ZERO; 13];
     input[0] = Goldilocks::from_u64(TAG_ADDR);
     input[1..5].copy_from_slice(domain);
@@ -116,21 +112,13 @@ fn reference_mt_node(level: u64, left: &GlDigest, right: &GlDigest) -> GlDigest 
 }
 
 /// Compute Merkle root from a leaf, position, and siblings.
-fn reference_merkle_root(
-    leaf: &GlDigest,
-    pos: u32,
-    siblings: &[GlDigest],
-) -> GlDigest {
+fn reference_merkle_root(leaf: &GlDigest, pos: u32, siblings: &[GlDigest]) -> GlDigest {
     let mut cur = *leaf;
     let mut p = pos;
 
     for (lvl, sib) in siblings.iter().enumerate() {
         let bit = p & 1;
-        let (left, right) = if bit == 0 {
-            (&cur, sib)
-        } else {
-            (sib, &cur)
-        };
+        let (left, right) = if bit == 0 { (&cur, sib) } else { (sib, &cur) };
         cur = reference_mt_node(lvl as u64, left, right);
         p >>= 1;
     }
@@ -215,7 +203,13 @@ fn reference_note_spend(
     for (value_in, rho_in, sender_id_in, pos, siblings) in inputs {
         sum_in += Goldilocks::from_u64(*value_in);
 
-        let cm = reference_note_commitment(domain, Goldilocks::from_u64(*value_in), rho_in, &recipient_owner, sender_id_in);
+        let cm = reference_note_commitment(
+            domain,
+            Goldilocks::from_u64(*value_in),
+            rho_in,
+            &recipient_owner,
+            sender_id_in,
+        );
         let root = reference_merkle_root(&cm, *pos, &siblings[..depth]);
         assert_eq!(root, *anchor, "Merkle root mismatch for input");
 
@@ -230,7 +224,13 @@ fn reference_note_spend(
     for (value_out, rho_out, pk_spend_out, pk_ivk_out) in outputs {
         out_sum += Goldilocks::from_u64(*value_out);
         let rcp = reference_derive_address(domain, pk_spend_out, pk_ivk_out);
-        let cm = reference_note_commitment(domain, Goldilocks::from_u64(*value_out), rho_out, &rcp, &sender_id);
+        let cm = reference_note_commitment(
+            domain,
+            Goldilocks::from_u64(*value_out),
+            rho_out,
+            &rcp,
+            &sender_id,
+        );
         output_commitments.push(cm);
     }
 
@@ -278,9 +278,18 @@ fn test_poseidon2_domain_separation() {
         poseidon2_hash(&input)
     };
 
-    assert_ne!(h1, h2, "TAG_PK and TAG_NOTE should produce different hashes");
-    assert_ne!(h1, h3, "TAG_PK and TAG_PRF_NF should produce different hashes");
-    assert_ne!(h2, h3, "TAG_NOTE and TAG_PRF_NF should produce different hashes");
+    assert_ne!(
+        h1, h2,
+        "TAG_PK and TAG_NOTE should produce different hashes"
+    );
+    assert_ne!(
+        h1, h3,
+        "TAG_PK and TAG_PRF_NF should produce different hashes"
+    );
+    assert_ne!(
+        h2, h3,
+        "TAG_NOTE and TAG_PRF_NF should produce different hashes"
+    );
 }
 
 #[test]
@@ -541,19 +550,41 @@ fn test_reference_consistency_multiple_runs() {
     let tree_leaves = vec![input_cm, ZERO_DIGEST];
     let (anchor, all_siblings) = build_merkle_tree(&tree_leaves);
 
-    let inputs = vec![(50u64, input_rho, recipient_owner, 0u32, all_siblings[0].clone())];
+    let inputs = vec![(
+        50u64,
+        input_rho,
+        recipient_owner,
+        0u32,
+        all_siblings[0].clone(),
+    )];
     let output_rho = digest_from_u64s([30, 31, 32, 33]);
     let pk_spend_out = digest_from_u64s([40, 41, 42, 43]);
     let pk_ivk_out = digest_from_u64s([50, 51, 52, 53]);
     let outputs = vec![(50u64, output_rho, pk_spend_out, pk_ivk_out)];
 
     let sp1 = reference_note_spend(
-        &domain, &spend_sk, &pk_ivk_owner, &anchor, 1,
-        &inputs, 0, &ZERO_DIGEST, &outputs, &blacklist_root,
+        &domain,
+        &spend_sk,
+        &pk_ivk_owner,
+        &anchor,
+        1,
+        &inputs,
+        0,
+        &ZERO_DIGEST,
+        &outputs,
+        &blacklist_root,
     );
     let sp2 = reference_note_spend(
-        &domain, &spend_sk, &pk_ivk_owner, &anchor, 1,
-        &inputs, 0, &ZERO_DIGEST, &outputs, &blacklist_root,
+        &domain,
+        &spend_sk,
+        &pk_ivk_owner,
+        &anchor,
+        1,
+        &inputs,
+        0,
+        &ZERO_DIGEST,
+        &outputs,
+        &blacklist_root,
     );
 
     assert_eq!(sp1, sp2, "Reference implementation must be deterministic");
