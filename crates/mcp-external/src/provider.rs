@@ -202,12 +202,25 @@ fn verifier_submit_retry_delay_ms() -> u64 {
         .unwrap_or(DEFAULT_VERIFIER_SUBMIT_RETRY_DELAY_MS)
 }
 
+/// Returns the indexer DB URL only if it is a Postgres URL. SQLite URLs are ignored
+/// because this provider uses PgPool; when the URL is SQLite we leave the pool None
+/// and commitment-tree sync falls back to rollup REST endpoints.
 fn optional_index_db_url() -> Option<String> {
-    std::env::var("MCP_INDEX_DB_URL")
+    let url = std::env::var("MCP_INDEX_DB_URL")
         .ok()
-        .or_else(|| std::env::var("INDEX_DB").ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("INDEX_DB").ok())?;
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    if url.starts_with("sqlite:") || url.starts_with("sqlite3:") {
+        tracing::info!(
+            "[mcp] INDEX_DB is SQLite ({}); commitment-tree sync will use rollup REST endpoints",
+            url.split('?').next().unwrap_or(url)
+        );
+        return None;
+    }
+    Some(url.to_string())
 }
 
 fn parse_hash32_hex(value: &str) -> Result<[u8; 32]> {
