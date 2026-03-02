@@ -25,6 +25,13 @@ impl Default for SequencerKindConfig {
 pub struct TEEConfiguration {
     /// URL of the TEE attestation oracle.
     pub tee_attestation_oracle_url: String,
+    /// Optional base URL of the Bridge executor service (HTTP). When set, the TEE manager will call
+    /// POST /commit-batch and POST /build-signatures, POST /finalize-batch to submit L1 batch lifecycle.
+    #[serde(default)]
+    pub executor_url: Option<String>,
+    /// Optional rollup ID (64 hex chars) for BatchPublicDataV1Full. Required when executor_url is set.
+    #[serde(default)]
+    pub rollup_id_hex: Option<String>,
 }
 
 /// Configuration data used by sequencer extensions, such as EVM endpoints.

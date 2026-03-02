@@ -1,7 +1,7 @@
 use crate::common::BatchPublicDataV1;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use borsh::{from_slice, to_vec};
+use borsh::to_vec;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{

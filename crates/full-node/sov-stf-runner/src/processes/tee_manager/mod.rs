@@ -17,9 +17,11 @@ use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
+use crate::processes::executor_client::{batch_public_data_to_executor_json, ExecutorClient};
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
 use crate::processes::TEEBatchData;
 use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
+use tracing::info;
 
 mod types;
 
@@ -94,6 +96,8 @@ pub struct TeeProofManager<Ps: ProverService> {
     http_client: reqwest::Client,
     oracle_url: String,
     midnight_bridge: Option<MidnightIndexerClient>,
+    executor_client: Option<ExecutorClient>,
+    rollup_id: Option<[u8; 32]>,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -114,6 +118,8 @@ where
         http_client: reqwest::Client,
         oracle_url: String,
         midnight_bridge: Option<MidnightIndexerClient>,
+        executor_client: Option<ExecutorClient>,
+        rollup_id: Option<[u8; 32]>,
     ) -> Self {
         Self {
             prover_service,
@@ -132,6 +138,8 @@ where
             http_client,
             oracle_url,
             midnight_bridge,
+            executor_client,
+            rollup_id,
         }
     }
 
@@ -321,6 +329,31 @@ where
                 da_end_height,
             );
 
+            // Commit batch on L1 via executor service (if configured)
+            if self.executor_client.is_none() {
+                tracing::debug!(
+                    batch_index = self.batch_index,
+                    "Executor not configured; skipping L1 commit/finalize (set executor_url and rollup_id_hex in tee_configuration to enable)"
+                );
+            }
+            if let Some(ref executor) = self.executor_client {
+                if let Err(e) = executor
+                    .commit_batch(&self.prev_batch_hash, &batch_hash)
+                    .await
+                {
+                    warn!(
+                        batch_index = self.batch_index,
+                        error = %e,
+                        "Executor commit_batch failed; continuing without L1 commit"
+                    );
+                } else {
+                    info!(
+                        batch_index = self.batch_index,
+                        "L1 commitBatch submitted via executor"
+                    );
+                }
+            }
+
             tracing::debug!("Generating TEE attestation...");
 
             let batch = BatchPublicDataV1 {
@@ -410,7 +443,7 @@ where
             let attestation = sov_modules_api::TEEAttestation {
                 attestation: borsh::to_vec(&signed_attestation)?,
                 raw_aggregated_proof: agg_proof.raw_aggregated_proof,
-                batch_data: batch,
+                batch_data: batch.clone(),
                 attestation_type: sov_modules_api::TEEAttestationType::MAA,
             };
 
@@ -429,6 +462,61 @@ where
             self.proof_sender
                 .publish_tee_attestation_blob_with_metadata(attestation)
                 .await?;
+
+            // Finalize batch on L1 via executor service (if configured)
+            if let (Some(ref executor), Some(rollup_id)) =
+                (self.executor_client.as_ref(), self.rollup_id.as_ref())
+            {
+                match batch_public_data_to_executor_json(&batch, rollup_id) {
+                    Ok(batch_public_data_json) => {
+                        const SIGNATURE_MAX_NONCE: u64 = 256;
+                        const SIGNER_BITMAP: u8 = 0b111; // three signers
+                        const FINALIZE_TIMESTAMP: u64 = 0;
+
+                        match executor
+                            .build_signatures(&batch_public_data_json, SIGNATURE_MAX_NONCE)
+                            .await
+                        {
+                            Ok(signatures_json) => {
+                                if let Err(e) = executor
+                                    .finalize_batch(
+                                        &batch_public_data_json,
+                                        &signatures_json,
+                                        SIGNER_BITMAP,
+                                        FINALIZE_TIMESTAMP,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        batch_index = self.batch_index,
+                                        error = %e,
+                                        "Executor finalize_batch failed"
+                                    );
+                                } else {
+                                    info!(
+                                        batch_index = self.batch_index,
+                                        "L1 finalizeBatch submitted via executor"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    batch_index = self.batch_index,
+                                    error = %e,
+                                    "Executor build_signatures failed"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            batch_index = self.batch_index,
+                            error = %e,
+                            "Failed to serialize batch public data for executor"
+                        );
+                    }
+                }
+            }
 
             // Update the next height to receive
             self.stf_info_receiver

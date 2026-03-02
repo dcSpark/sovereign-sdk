@@ -6,8 +6,12 @@ mod zk_manager;
 use std::num::NonZero;
 
 #[cfg(feature = "tee")]
+mod executor_client;
+#[cfg(feature = "tee")]
 mod tee_manager;
 
+#[cfg(feature = "tee")]
+pub use executor_client::{ExecutorClient, batch_public_data_to_executor_json};
 #[cfg(feature = "tee")]
 pub use tee_manager::*;
 
@@ -43,6 +47,8 @@ pub async fn start_tee_workflow_in_background<Ps>(
     shutdown_receiver: tokio::sync::watch::Receiver<()>,
     oracle_url: String,
     midnight_bridge: Option<MidnightIndexerClient>,
+    executor_client: Option<ExecutorClient>,
+    rollup_id: Option<[u8; 32]>,
 ) -> anyhow::Result<JoinHandle<()>>
 where
     Ps: ProverService,
@@ -88,6 +94,8 @@ where
         reqwest::Client::new(),
         oracle_url,
         midnight_bridge,
+        executor_client,
+        rollup_id,
     )
     .post_aggregated_proof_to_da_in_background()
     .await)

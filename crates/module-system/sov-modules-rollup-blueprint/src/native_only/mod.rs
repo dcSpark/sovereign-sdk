@@ -57,7 +57,7 @@ pub const GIT_COMMIT_HASH: &str = env!("GIT_COMMIT_HASH");
 use crate::RollupBlueprint;
 
 #[cfg(feature = "tee")]
-use sov_stf_runner::processes::start_tee_workflow_in_background;
+use sov_stf_runner::processes::{start_tee_workflow_in_background, ExecutorClient};
 
 /// This trait defines how to create all the necessary dependencies required by a rollup.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -559,6 +559,34 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                             }
                         };
 
+                        let executor_client = if let Some(tee) = ext.and_then(|e| e.tee_configuration.as_ref()) {
+                            tee.executor_url
+                                .as_ref()
+                                .filter(|s| !s.is_empty())
+                                .map(|url| -> anyhow::Result<_> {
+                                    let client = Client::builder()
+                                        .build()
+                                        .context("Failed to build executor HTTP client")?;
+                                    Ok(ExecutorClient::new(client, url.clone()))
+                                })
+                                .transpose()?
+                        } else {
+                            None
+                        };
+                        let rollup_id = ext
+                            .and_then(|e| e.tee_configuration.as_ref())
+                            .and_then(|tee| {
+                                let hex_str = tee.rollup_id_hex.as_ref()?;
+                                let s = hex_str.strip_prefix("0x").unwrap_or(hex_str).trim();
+                                if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                                    return None;
+                                }
+                                let bytes = hex::decode(s).ok()?;
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(bytes.get(..32)?);
+                                Some(arr)
+                            });
+
                         start_tee_workflow_in_background(
                             prover_service,
                             rollup_config.proof_manager.aggregated_proof_block_jump,
@@ -568,6 +596,8 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                             secondary_shutdown_receiver,
                             oracle_url,
                             indexer,
+                            executor_client,
+                            rollup_id,
                         )
                         .await?
                     }
