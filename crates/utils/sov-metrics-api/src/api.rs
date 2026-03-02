@@ -91,8 +91,8 @@ pub struct AppState {
     pub tps_peak_cache: TpsPeakCache,
     pub ema_metrics_cache: EmaMetricsCache,
     pub indexer_db: DatabaseConnection,
-    /// Multiplier applied to PeakTPS metric output.
-    pub peak_tps_multiplier: f64,
+    /// Number of decimal places for TPS, PeakTPS, and TokensPerSecond on EMA endpoints.
+    pub tps_rounding_decimals: u32,
     /// Base URL for the rollup ledger API, used to query slot TPS.
     pub ledger_api_base_url: String,
     /// Shared HTTP client for ledger API requests.
@@ -413,12 +413,8 @@ async fn tps_peak(
             // 2. It was computed for the same requested window size
             let cache_age_ms = now_ms - entry.computed_at_ms;
             if cache_age_ms < TPS_PEAK_CACHE_THRESHOLD_MS && entry.window_ms == window_ms {
-                // Apply multiplier to cached value
                 return Json(TpsPeakResponse {
-                    peak_tps: Some(apply_peak_tps_multiplier(
-                        entry.peak_tps,
-                        state.peak_tps_multiplier,
-                    )),
+                    peak_tps: Some(entry.peak_tps),
                     peak_at_ms: Some(entry.peak_at_ms),
                     window_ms,
                     from_cache: true,
@@ -431,7 +427,6 @@ async fn tps_peak(
     let samples = fetch_slot_tps_samples(&state, Some(window_start_ms), Some(now_ms)).await;
     let (peak_tps, peak_at_ms) = peak_tps_from_samples(&samples);
 
-    // Update cache (store raw value before multiplier)
     if let (Some(tps), Some(at_ms)) = (peak_tps, peak_at_ms) {
         let mut cache = state.tps_peak_cache.inner.write().await;
         *cache = Some(TpsPeakCacheEntry {
@@ -442,12 +437,8 @@ async fn tps_peak(
         });
     }
 
-    // Apply multiplier to output
-    let peak_tps_output =
-        peak_tps.map(|tps| apply_peak_tps_multiplier(tps, state.peak_tps_multiplier));
-
     Json(TpsPeakResponse {
-        peak_tps: peak_tps_output,
+        peak_tps,
         peak_at_ms,
         window_ms,
         from_cache: false,
@@ -709,19 +700,15 @@ async fn compute_ema_metrics_uncached(state: &AppState, window: EmaWindow) -> Em
         .map(|p| p.total_disclosure_events)
         .unwrap_or(0);
 
-    // Compute peak TPS for this EMA window from slot samples.
     let (peak_tps, peak_tps_at_ms) = match peak_tps_from_samples(&slot_tps_samples) {
         (Some(tps), peak_at_ms) => (tps, peak_at_ms),
         (None, _) => (0.0, None),
     };
 
-    // Apply peak TPS multiplier
-    let peak_tps = apply_peak_tps_multiplier(peak_tps, state.peak_tps_multiplier);
-
-    // Round TPS values to 2 decimal places to avoid showing tiny numbers
-    let tps = round_to_precision(tps.unwrap_or(0.0), 2);
-    let peak_tps = round_to_precision(peak_tps, 2);
-    let tokens_per_second = round_to_precision(tokens_per_second.unwrap_or(0.0), 2);
+    let decimals = state.tps_rounding_decimals;
+    let tps = round_to_precision(tps.unwrap_or(0.0), decimals);
+    let peak_tps = round_to_precision(peak_tps, decimals);
+    let tokens_per_second = round_to_precision(tokens_per_second.unwrap_or(0.0), decimals);
 
     EmaMetricsResponse {
         accounts,
@@ -740,11 +727,6 @@ async fn compute_ema_metrics_uncached(state: &AppState, window: EmaWindow) -> Em
 fn round_to_precision(value: f64, decimals: u32) -> f64 {
     let multiplier = 10_f64.powi(decimals as i32);
     (value * multiplier).round() / multiplier
-}
-
-/// Applies the peak TPS multiplier without randomization.
-fn apply_peak_tps_multiplier(value: f64, multiplier: f64) -> f64 {
-    value * multiplier
 }
 
 #[derive(Debug, Deserialize)]

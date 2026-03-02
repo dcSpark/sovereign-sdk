@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 const DEFAULT_RETENTION_SECS: u64 = 5 * 24 * 60 * 60;
-const DEFAULT_PEAK_TPS_MULTIPLIER: f64 = 1.0;
+const DEFAULT_TPS_ROUNDING_DECIMALS: u32 = 2;
 const DEFAULT_POSTGRES_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_POSTGRES_MIN_CONNECTIONS: u32 = 0;
 const DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECS: u64 = 30;
@@ -20,8 +20,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub tsink_data_path: PathBuf,
     pub tsink_retention_secs: u64,
-    /// Multiplier applied to PeakTPS metric output on EMA endpoints and /tps/peak.
-    pub peak_tps_multiplier: f64,
+    /// Number of decimal places for TPS, PeakTPS, and TokensPerSecond on EMA endpoints.
+    pub tps_rounding_decimals: u32,
     pub da_postgres_max_connections: u32,
     pub da_postgres_min_connections: u32,
     pub indexer_postgres_max_connections: u32,
@@ -97,23 +97,10 @@ impl Config {
             Err(_) => DEFAULT_RETENTION_SECS,
         };
 
-        let peak_tps_multiplier = match env::var("PEAK_TPS_MULTIPLIER") {
-            Ok(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    DEFAULT_PEAK_TPS_MULTIPLIER
-                } else {
-                    let parsed = trimmed
-                        .parse::<f64>()
-                        .map_err(|_| anyhow!("PEAK_TPS_MULTIPLIER must be a valid number"))?;
-                    if parsed < 0.0 {
-                        return Err(anyhow!("PEAK_TPS_MULTIPLIER must be >= 0"));
-                    }
-                    parsed
-                }
-            }
-            Err(_) => DEFAULT_PEAK_TPS_MULTIPLIER,
-        };
+        let tps_rounding_decimals = env_u32_or_default(
+            "TPS_ROUNDING_DECIMALS",
+            DEFAULT_TPS_ROUNDING_DECIMALS,
+        )?;
 
         let da_postgres_max_connections = env_u32_or_default(
             "SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS",
@@ -184,7 +171,7 @@ impl Config {
             bind_addr,
             tsink_data_path: PathBuf::from(tsink_data_path),
             tsink_retention_secs,
-            peak_tps_multiplier,
+            tps_rounding_decimals,
             da_postgres_max_connections,
             da_postgres_min_connections,
             indexer_postgres_max_connections,

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -44,62 +44,124 @@ enum StartMode {
     WhenEnvPresent(&'static str),
 }
 
+/// Cargo build specification for a managed service.
+#[derive(Clone, Copy)]
+struct CargoBuild {
+    package: &'static str,
+    /// Extra features to pass via `--features`.
+    features: Option<&'static str>,
+    /// Extra env vars to set during the build (e.g. SKIP_GUEST_BUILD=1).
+    env: Option<(&'static str, &'static str)>,
+}
+
 #[derive(Clone, Copy)]
 struct ManagedServiceDefinition {
     id: &'static str,
     display_name: &'static str,
     script: &'static str,
     start_mode: StartMode,
+    build: Option<CargoBuild>,
 }
 
-const MANAGED_SERVICES: [ManagedServiceDefinition; 8] = [
+const MANAGED_SERVICES: [ManagedServiceDefinition; 9] = [
     ManagedServiceDefinition {
         id: "rollup",
         display_name: "rollup",
         script: "run_rollup.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-rollup-ligero",
+            features: None,
+            env: Some(("SKIP_GUEST_BUILD", "1")),
+        }),
     },
     ManagedServiceDefinition {
         id: "oracle",
         display_name: "oracle",
         script: "run_oracle.sh",
         start_mode: StartMode::WhenEnvFlag("START_ORACLE"),
+        build: Some(CargoBuild {
+            package: "oracle",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "worker",
         display_name: "worker",
         script: "run_verifier_service.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-proof-verifier-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "fvk",
         display_name: "fvk",
         script: "run_fvk_service.sh",
         start_mode: StartMode::WhenEnvPresent("POOL_FVK_PK"),
+        build: Some(CargoBuild {
+            package: "midnight-fvk-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "indexer",
         display_name: "indexer",
         script: "run_indexer.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-indexer",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "proof-pool",
         display_name: "proof pool",
         script: "run_proof_pool.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "midnight-proof-pool-service",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "mcp",
         display_name: "mcp",
         script: "run_mcp.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "mcp-external",
+            features: None,
+            env: None,
+        }),
     },
     ManagedServiceDefinition {
         id: "metrics",
         display_name: "metrics",
         script: "run_metrics.sh",
         start_mode: StartMode::Always,
+        build: Some(CargoBuild {
+            package: "sov-metrics-api",
+            features: None,
+            env: None,
+        }),
+    },
+    ManagedServiceDefinition {
+        id: "replica",
+        display_name: "replica",
+        script: "run_replica.sh",
+        start_mode: StartMode::WhenEnvFlag("START_REPLICA"),
+        build: Some(CargoBuild {
+            package: "sov-rollup-ligero",
+            features: Some("sov-modules-rollup-blueprint/tee"),
+            env: Some(("SKIP_GUEST_BUILD", "1")),
+        }),
     },
 ];
 
@@ -132,6 +194,10 @@ fn service_config_names(service_id: &str) -> Vec<String> {
             names.push("proof-pool-service".to_string());
             names.push("midnight-proof-pool-service".to_string());
         }
+        "replica" => {
+            names.push("replica-node".to_string());
+            names.push("rollup-replica".to_string());
+        }
         _ => {}
     }
     names
@@ -157,10 +223,24 @@ fn primary_service_remote_env(service_id: &str) -> String {
         .unwrap_or_else(|| "SERVICE_UNKNOWN_REMOTE".to_string())
 }
 
+fn is_replica_mode() -> bool {
+    env_flag("START_REPLICA")
+}
+
 fn service_is_remote(service_id: &str) -> bool {
-    service_config_env_keys(service_id, "REMOTE")
+    if service_config_env_keys(service_id, "REMOTE")
         .into_iter()
         .any(|env_key| env_flag(&env_key))
+    {
+        return true;
+    }
+
+    // In replica mode, all non-replica services are implicitly remote
+    if is_replica_mode() && service_id != "replica" {
+        return true;
+    }
+
+    false
 }
 
 fn resolve_env_url(env_var: &str) -> Option<String> {
@@ -175,6 +255,32 @@ fn resolve_env_url(env_var: &str) -> Option<String> {
     } else {
         Some(format!("http://{}", value))
     }
+}
+
+fn extract_auth_token(uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("auth_token=") {
+                let token = value.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(value) = auth.to_str() {
+            if let Some(token) = value.strip_prefix("Bearer ") {
+                let token = token.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn should_start_by_default(service: &ManagedServiceDefinition) -> bool {
@@ -202,6 +308,8 @@ fn find_managed_service(service: &str) -> Option<&'static ManagedServiceDefiniti
         | "proof-pool-service"
         | "midnight-proof-pool-service"
         | "midnight_proof_pool_service" => "proof-pool",
+        "replica node" | "replica_node" | "rollup-replica" | "rollup_replica"
+        | "replica-node" => "replica",
         other => other,
     };
 
@@ -351,7 +459,10 @@ impl LogBuffer {
 struct AppState {
     script_dir: PathBuf,
     demo_data_dir: PathBuf,
+    workspace_root: PathBuf,
     state: Mutex<ServiceState>,
+    /// Guards concurrent builds. Holds the label of the current build (service id or "all").
+    building: Mutex<Option<String>>,
     log_tx: broadcast::Sender<LogLine>,
     log_buffer: Arc<Mutex<LogBuffer>>,
     sys_info: RwLock<System>,
@@ -461,6 +572,8 @@ pub struct HealthResponse {
     pub services: Vec<ServiceHealth>,
     #[serde(rename = "checkedAt")]
     pub checked_at: String,
+    #[serde(rename = "replicaMode")]
+    pub replica_mode: bool,
 }
 
 /// Service definition for health checking
@@ -470,14 +583,18 @@ struct ServiceDefinition {
     env_var: &'static str,
     default_url: &'static str,
     health_path: &'static str,
-    /// If true, the service is optional (e.g., fvk-service only when POOL_FVK_PK is set)
-    optional_env: Option<&'static str>,
+    /// Service is hidden unless ANY of these env vars are present (empty = always visible)
+    optional_envs: &'static [&'static str],
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let demo_data_dir = script_dir.join("demo_data");
+    let demo_data_dir = if is_replica_mode() {
+        script_dir.join("demo_data_replica")
+    } else {
+        script_dir.join("demo_data")
+    };
 
     let bind_addr =
         std::env::var("SERVICE_CONTROLLER_BIND").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
@@ -499,10 +616,18 @@ async fn main() -> anyhow::Result<()> {
     let mut sys = System::new_all();
     sys.refresh_all();
 
+    let workspace_root = script_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| script_dir.clone());
+
     let app_state = Arc::new(AppState {
         script_dir,
         demo_data_dir,
+        workspace_root,
         state: Mutex::new(ServiceState::default()),
+        building: Mutex::new(None),
         log_tx,
         log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
         sys_info: RwLock::new(sys),
@@ -521,6 +646,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/clean", post(clean).get(clean))
         .route("/clean-database", post(clean_database).get(clean_database))
         .route("/reset-tee", post(reset_tee).get(reset_tee))
+        .route(
+            "/reset-replica",
+            post(reset_replica).get(reset_replica),
+        )
+        .route("/build", post(build_all).get(build_all))
+        .route("/build/:service", post(build_service).get(build_service))
         .route("/services", get(services))
         .route("/health", get(health_check))
         .route("/stats", get(system_stats))
@@ -1113,6 +1244,179 @@ async fn restart_service(
     guarded_start_single_service(&app, service, false).await
 }
 
+async fn build_single(
+    app: &Arc<AppState>,
+    service: &'static ManagedServiceDefinition,
+) -> ApiResult {
+    let build_spec = service.build.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Service '{}' has no build configuration", service.id),
+        )
+    })?;
+
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--release")
+        .arg("-p")
+        .arg(build_spec.package);
+
+    if let Some(features) = build_spec.features {
+        command.arg("--features").arg(features);
+    }
+
+    if let Some((key, value)) = build_spec.env {
+        command.env(key, value);
+    }
+
+    command
+        .current_dir(&app.workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|err| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to start build for '{}': {err}",
+                service.id
+            ),
+        )
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    if let Some(stdout) = stdout {
+        spawn_log_reader(
+            stdout,
+            "stdout",
+            "build",
+            app.log_tx.clone(),
+            Arc::clone(&app.log_buffer),
+        );
+    }
+    if let Some(stderr) = stderr {
+        spawn_log_reader(
+            stderr,
+            "stderr",
+            "build",
+            app.log_tx.clone(),
+            Arc::clone(&app.log_buffer),
+        );
+    }
+
+    let status = child.wait().await.map_err(|err| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Build process for '{}' failed: {err}", service.id),
+        )
+    })?;
+
+    if status.success() {
+        Ok(format!(
+            "Build successful for '{}' (package: {})",
+            service.id, build_spec.package
+        ))
+    } else {
+        Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Build failed for '{}' (package: {}, exit code: {})",
+                service.id,
+                build_spec.package,
+                status.code().unwrap_or(-1)
+            ),
+        ))
+    }
+}
+
+async fn build_all(State(app): State<Arc<AppState>>) -> ApiResult {
+    {
+        let mut building = app.building.lock().await;
+        if let Some(label) = building.as_ref() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("A build is already in progress: {label}"),
+            ));
+        }
+        *building = Some("all".to_string());
+    }
+
+    let result = build_all_inner(&app).await;
+
+    {
+        let mut building = app.building.lock().await;
+        *building = None;
+    }
+
+    result
+}
+
+async fn build_all_inner(app: &Arc<AppState>) -> ApiResult {
+    let services_to_build: Vec<_> = MANAGED_SERVICES
+        .iter()
+        .filter(|s| s.build.is_some() && !service_is_remote(s.id))
+        .collect();
+
+    let mut built = Vec::new();
+    let mut failures = Vec::new();
+
+    for service in services_to_build {
+        match build_single(app, service).await {
+            Ok(_) => built.push(service.id),
+            Err(err) => {
+                failures.push(format!("{}: {}", service.id, err.message));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(format!("Built all services: {}", built.join(", ")))
+    } else {
+        Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Built: {}. Failures: {}",
+                if built.is_empty() {
+                    "none".to_string()
+                } else {
+                    built.join(", ")
+                },
+                failures.join(" | ")
+            ),
+        ))
+    }
+}
+
+async fn build_service(
+    Path(service): Path<String>,
+    State(app): State<Arc<AppState>>,
+) -> ApiResult {
+    let service = resolve_managed_service(&service)?;
+
+    {
+        let mut building = app.building.lock().await;
+        if let Some(label) = building.as_ref() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("A build is already in progress: {label}"),
+            ));
+        }
+        *building = Some(service.id.to_string());
+    }
+
+    let result = build_single(&app, service).await;
+
+    {
+        let mut building = app.building.lock().await;
+        *building = None;
+    }
+
+    result
+}
+
 async fn clean(State(app): State<Arc<AppState>>) -> ApiResult {
     ensure_services_stopped_for_clean_like_actions(&app).await?;
 
@@ -1321,6 +1625,92 @@ async fn reset_tee(State(app): State<Arc<AppState>>) -> ApiResult {
     };
 
     Err(ApiError::new(StatusCode::BAD_GATEWAY, message))
+}
+
+async fn reset_replica(
+    State(_app): State<Arc<AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let expected_token = std::env::var("REPLICA_RESET_AUTH_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REPLICA_RESET_AUTH_TOKEN not configured",
+            )
+        })?;
+
+    let provided_token = extract_auth_token(&uri, &headers).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "Missing auth_token query parameter or Authorization: Bearer header",
+        )
+    })?;
+
+    if provided_token != expected_token {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "Invalid auth token",
+        ));
+    }
+
+    let controller_url = std::env::var("REPLICA_CONTROLLER_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REPLICA_CONTROLLER_URL not configured (e.g. http://replica-vm:9090)",
+            )
+        })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create HTTP client for replica reset: {err}"),
+            )
+        })?;
+
+    let steps = ["stop", "clean", "start"];
+    let mut results = Vec::new();
+
+    for step in &steps {
+        let url = format!("{}/{}", controller_url, step);
+        tracing::info!(step, url, "Replica reset: calling remote controller");
+
+        let response = client.post(&url).send().await.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("Replica reset '{step}' failed: {err}"),
+            )
+        })?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let message = if body.trim().is_empty() {
+                format!("Replica reset '{step}' failed: upstream returned {status}")
+            } else {
+                format!(
+                    "Replica reset '{step}' failed: upstream returned {status} ({})",
+                    body.trim()
+                )
+            };
+            return Err(ApiError::new(StatusCode::BAD_GATEWAY, message));
+        }
+
+        results.push(format!("{step}: ok"));
+    }
+
+    Ok(format!("Replica reset successful ({})", results.join(", ")))
 }
 
 async fn services(State(app): State<Arc<AppState>>) -> Json<Vec<ManagedServiceStatus>> {
@@ -1535,7 +1925,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "ROLLUP_RPC_URL",
             default_url: "http://127.0.0.1:12346",
             health_path: "/healthcheck",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "worker",
@@ -1543,7 +1933,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "BIND_ADDR",
             default_url: "http://127.0.0.1:8080",
             health_path: "/health",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "fvk",
@@ -1551,7 +1941,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "MIDNIGHT_FVK_SERVICE_URL",
             default_url: "http://127.0.0.1:8088",
             health_path: "/health",
-            optional_env: Some("POOL_FVK_PK"),
+            optional_envs: &["POOL_FVK_PK"],
         },
         ServiceDefinition {
             id: "indexer",
@@ -1559,7 +1949,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "INDEXER_BIND",
             default_url: "http://127.0.0.1:13100",
             health_path: "/health",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "mcp",
@@ -1567,7 +1957,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "MCP_SERVER_BIND_ADDRESS",
             default_url: "http://127.0.0.1:3000",
             health_path: "/health",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "metrics",
@@ -1575,7 +1965,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "METRICS_API_BIND",
             default_url: "http://127.0.0.1:13200",
             health_path: "/health",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "oracle",
@@ -1583,7 +1973,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "ORACLE_SERVER_BIND_ADDRESS",
             default_url: "http://127.0.0.1:8090",
             health_path: "/",
-            optional_env: None,
+            optional_envs: &[],
         },
         ServiceDefinition {
             id: "proof-pool",
@@ -1591,7 +1981,15 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             env_var: "PROOF_POOL_BIND_ADDR",
             default_url: "http://127.0.0.1:11235",
             health_path: "/health",
-            optional_env: None,
+            optional_envs: &[],
+        },
+        ServiceDefinition {
+            id: "replica",
+            name: "replica",
+            env_var: "REPLICA_RPC_URL",
+            default_url: "http://127.0.0.1:12347",
+            health_path: "/healthcheck",
+            optional_envs: &["START_REPLICA", "REPLICA_CONTROLLER_URL"],
         },
     ];
 
@@ -1617,10 +2015,10 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
             running_snapshot.get(svc.id).copied().flatten()
         };
 
-        let enabled_by_env = if let Some(required_env) = svc.optional_env {
-            env_present(required_env)
-        } else {
+        let enabled_by_env = if svc.optional_envs.is_empty() {
             true
+        } else {
+            svc.optional_envs.iter().any(|env| env_present(env))
         };
 
         // Hide optional services unless explicitly enabled or actively running.
@@ -1663,6 +2061,7 @@ async fn health_check(State(app): State<Arc<AppState>>) -> Result<Json<HealthRes
         status: overall_status.to_string(),
         services: service_results,
         checked_at: chrono::Utc::now().to_rfc3339(),
+        replica_mode: is_replica_mode(),
     }))
 }
 

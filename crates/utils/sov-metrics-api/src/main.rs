@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr;
     let tsink_data_path = config.tsink_data_path;
     let tsink_retention_secs = config.tsink_retention_secs;
-    let peak_tps_multiplier = config.peak_tps_multiplier;
+    let tps_rounding_decimals = config.tps_rounding_decimals;
     let da_postgres_max_connections = config.da_postgres_max_connections;
     let da_postgres_min_connections = config.da_postgres_min_connections;
     let indexer_postgres_max_connections = config.indexer_postgres_max_connections;
@@ -122,14 +122,14 @@ async fn main() -> anyhow::Result<()> {
         tps_peak_cache: api::TpsPeakCache::new(),
         ema_metrics_cache: api::EmaMetricsCache::new(),
         indexer_db: indexer_db.clone(),
-        peak_tps_multiplier,
+        tps_rounding_decimals,
         ledger_api_base_url: ledger_api_base_url.clone(),
         ledger_http_client,
     });
 
     info!(
-        "sov-metrics-api listening on {} (peak_tps_multiplier={}, ledger_api_base_url={})",
-        bind_addr, peak_tps_multiplier, ledger_api_base_url
+        "sov-metrics-api listening on {} (tps_rounding_decimals={}, ledger_api_base_url={})",
+        bind_addr, tps_rounding_decimals, ledger_api_base_url
     );
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

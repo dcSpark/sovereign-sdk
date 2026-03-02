@@ -138,6 +138,7 @@ function App() {
   const healthyCount = health?.services.filter(s => s.status === 'healthy').length ?? 0;
   const totalCount = health?.services.length ?? 0;
   const hasRunningServices = health?.services.some((service) => service.running) ?? false;
+  const replicaMode = health?.replicaMode ?? false;
   const servicesStatusText = `${healthyCount}/${totalCount} healthy`;
   const servicesStatusColor = healthyCount === totalCount ? 'healthy' : healthyCount === 0 ? 'unhealthy' : 'warning';
 
@@ -238,29 +239,53 @@ function App() {
                     {actionLoadingKey === actionKey('restart') ? 'Restarting...' : 'Restart All'}
                   </button>
                   <button
-                    className="control-btn clean"
-                    onClick={() => handleAction('clean')}
+                    className="control-btn build"
+                    onClick={() => handleAction('build')}
                     disabled={actionLoadingKey !== null}
                   >
-                    <span className="btn-icon">🗑</span>
-                    {actionLoadingKey === actionKey('clean') ? 'Cleaning...' : 'Clean Data'}
+                    <span className="btn-icon">⚒</span>
+                    {actionLoadingKey === actionKey('build') ? 'Building...' : 'Build All'}
                   </button>
-                  <button
-                    className="control-btn clean-db"
-                    onClick={() => handleAction('clean-database')}
-                    disabled={actionLoadingKey !== null || hasRunningServices}
-                  >
-                    <span className="btn-icon">⌫</span>
-                    {actionLoadingKey === actionKey('clean-database') ? 'Cleaning...' : 'Clean Database'}
-                  </button>
-                  <button
-                    className="control-btn reset-tee"
-                    onClick={() => handleAction('reset-tee')}
-                    disabled={actionLoadingKey !== null || hasRunningServices}
-                  >
-                    <span className="btn-icon">⟲</span>
-                    {actionLoadingKey === actionKey('reset-tee') ? 'Resetting...' : 'Reset TEE'}
-                  </button>
+                  {!replicaMode && (
+                    <button
+                      className="control-btn clean"
+                      onClick={() => handleAction('clean')}
+                      disabled={actionLoadingKey !== null}
+                    >
+                      <span className="btn-icon">🗑</span>
+                      {actionLoadingKey === actionKey('clean') ? 'Cleaning...' : 'Clean Data'}
+                    </button>
+                  )}
+                  {!replicaMode && (
+                    <button
+                      className="control-btn clean-db"
+                      onClick={() => handleAction('clean-database')}
+                      disabled={actionLoadingKey !== null || hasRunningServices}
+                    >
+                      <span className="btn-icon">⌫</span>
+                      {actionLoadingKey === actionKey('clean-database') ? 'Cleaning...' : 'Clean Database'}
+                    </button>
+                  )}
+                  {!replicaMode && (
+                    <button
+                      className="control-btn reset-tee"
+                      onClick={() => handleAction('reset-tee')}
+                      disabled={actionLoadingKey !== null || hasRunningServices}
+                    >
+                      <span className="btn-icon">⟲</span>
+                      {actionLoadingKey === actionKey('reset-tee') ? 'Resetting...' : 'Reset TEE'}
+                    </button>
+                  )}
+                  {!replicaMode && (
+                    <button
+                      className="control-btn reset-tee"
+                      onClick={() => handleAction('reset-replica')}
+                      disabled={actionLoadingKey !== null}
+                    >
+                      <span className="btn-icon">⟲</span>
+                      {actionLoadingKey === actionKey('reset-replica') ? 'Resetting...' : 'Reset Replica'}
+                    </button>
+                  )}
                 </div>
                 {actionResult && (
                   <div className={`action-toast ${actionResult.success ? 'success' : 'error'}`}>
@@ -386,6 +411,13 @@ function App() {
                                 disabled={actionLoadingKey !== null}
                               >
                                 {actionLoadingKey === actionKey('restart', service.id) ? '...' : 'Restart'}
+                              </button>
+                              <button
+                                className="service-action-btn build"
+                                onClick={() => handleAction('build', service.id)}
+                                disabled={actionLoadingKey !== null}
+                              >
+                                {actionLoadingKey === actionKey('build', service.id) ? '...' : 'Build'}
                               </button>
                             </div>
                           ) : (

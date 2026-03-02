@@ -1,9 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Get the workspace root (assuming this script is in examples/rollup-ligero/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+BIN="$WORKSPACE_ROOT/target/release/sov-indexer"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p sov-indexer"
+  exit 1
+fi
+
 echo "🚀 Starting ligero indexer..."
-# Run the ligero indexer from examples/rollup-ligero directory
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
 export RUST_LOG="${RUST_LOG:-info}"
@@ -18,4 +27,4 @@ export INDEX_DB="${INDEX_DB:-sqlite://demo_data/wallet_index.sqlite?mode=rwc}"
 echo "   DA_CONNECTION_STRING=$DA_CONNECTION_STRING"
 echo "   INDEX_DB=$INDEX_DB"
 
-cargo run -p sov-indexer --release
+exec "$BIN"

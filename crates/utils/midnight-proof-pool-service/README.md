@@ -8,7 +8,9 @@ requested number of pending transactions to the sequencer, and the service refil
 ## Endpoints
 
 - `GET /status?auth_token=...`
-  - Returns `{ max_proofs, ready_proofs, proof_generation_active, proof_generation_state, proof_generation_interval_ms, max_concurrent_proofs }`
+  - Returns `{ max_proofs, ready_proofs, proof_generation_active, proof_generation_state, proof_generation_interval_ms, max_concurrent_proofs, startup_progress, scale_up_progress }`
+  - `startup_progress` includes `{ in_progress, stage, total_wallets, wallets_created, viewer_fvk_bundles_ready, wallets_funded, wallets_balance_ready, deposits_submitted, deposit_notes_indexed, elapsed_ms }`
+  - `scale_up_progress` includes `{ in_progress, stage, start_wallets, target_wallets, current_wallets, wallets_needed, wallets_remaining, current_batch_size, wallets_created, viewer_fvk_bundles_ready, wallets_funded, wallets_balance_ready, deposits_submitted, deposit_notes_indexed, wallets_appended, elapsed_ms }`
 - `POST /max_proofs?auth_token=...` with JSON body `{ "max_proofs": N }`
   - Updates the target `MAX_PROOFS` (the service scales wallets up in bounded batches and refills pending proofs to match)
 - Also supports: `GET /max_proofs?auth_token=...&max_proofs=N` (phone-friendly)

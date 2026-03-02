@@ -85,13 +85,16 @@ if [[ -z "${MIDNIGHT_FVK_SERVICE_SIGNING_SK_HEX:-}" ]]; then
   fi
 fi
 
-echo "Building midnight-fvk-service..."
-cd "$WORKSPACE_ROOT"
-cargo build --release -p midnight-fvk-service
+BIN="$WORKSPACE_ROOT/target/release/midnight-fvk-service"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p midnight-fvk-service"
+  exit 1
+fi
 
 echo "🚀 Starting midnight-fvk-service..."
 echo "   MIDNIGHT_FVK_SERVICE_BIND=$MIDNIGHT_FVK_SERVICE_BIND"
 echo "   MIDNIGHT_FVK_SERVICE_DB=$MIDNIGHT_FVK_SERVICE_DB"
 echo ""
 
-exec "$WORKSPACE_ROOT/target/release/midnight-fvk-service" serve
+exec "$BIN" serve
