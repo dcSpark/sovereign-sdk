@@ -112,10 +112,21 @@ FVKs are stored in the `fvk_registry` table with columns:
 
 You can add/remove FVKs at runtime without restarting the indexer:
 
-**List all FVKs:**
+**List FVKs (paginated):**
 ```bash
-curl http://localhost:13100/fvks
+curl "http://localhost:13100/fvks?limit=100"
 ```
+
+**Fetch next page:**
+```bash
+# Replace <next_cursor> with the previous response's `next_cursor`
+curl "http://localhost:13100/fvks?limit=100&cursor=<next_cursor>"
+```
+
+The response includes:
+- `count` (items in this page)
+- `total_count` (registry size)
+- `next_cursor` (null on last page)
 
 **Add a new FVK:**
 ```bash
