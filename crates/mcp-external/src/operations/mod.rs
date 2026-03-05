@@ -25,7 +25,7 @@ pub use get_default_address::get_default_address;
 pub use get_privacy_balance::{get_privacy_balance, PrivacyBalanceResult, UnspentNote};
 #[allow(unused_imports)]
 pub use get_privacy_notes::{
-    get_privacy_notes, select_largest_notes, select_largest_notes_covering_amount, SpendableNote,
+    get_privacy_notes, select_largest_notes_covering_amount, SpendableNote,
 };
 #[allow(unused_imports)]
 pub use get_transaction_status::{get_transaction_status, TransactionDetails};
