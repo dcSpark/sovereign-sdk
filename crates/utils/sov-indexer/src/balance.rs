@@ -1,21 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, JsonValue,
-    QueryFilter, QuerySelect,
+    ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::index_db as idx;
 use crate::viewer;
-use midnight_privacy::{nullifier, recipient_from_pk_v2, EncryptedNote, Hash32, PrivacyAddress};
+use midnight_privacy::{nullifier, recipient_from_pk_v2, Hash32, PrivacyAddress};
 
 const DOMAIN: Hash32 = [1u8; 32];
 const NULLIFIER_CHUNK_SIZE: usize = 500;
-// SQLite commonly defaults to 999 bind parameters; keep `IN (...)` batches below that.
-const EVENT_ID_CHUNK_SIZE: usize = 900;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BalanceRequest {
@@ -60,27 +58,6 @@ pub async fn get_wallet_balance(
     address: &str,
     req: BalanceRequest,
 ) -> Result<BalanceResponse> {
-    #[derive(Debug)]
-    struct DepositRow {
-        event_id: i32,
-        amount: Option<String>,
-        rho: Option<String>,
-        encrypted_notes: Option<JsonValue>,
-    }
-
-    #[derive(Debug)]
-    struct TransferRow {
-        event_id: i32,
-        decrypted_notes: Option<JsonValue>,
-        encrypted_notes: Option<JsonValue>,
-    }
-
-    #[derive(Debug)]
-    struct WithdrawRow {
-        event_id: i32,
-        encrypted_notes: Option<JsonValue>,
-    }
-
     let parsed_address = address
         .parse::<PrivacyAddress>()
         .context("Invalid privacy address")?;
@@ -90,7 +67,8 @@ pub async fn get_wallet_balance(
     let pk_ivk = parsed_address.pk_ivk();
     let user_recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend, &pk_ivk);
 
-    let vfk = match req.vfk {
+    // Keep request validation behavior compatible even though vfk is not needed in notes index mode.
+    let _vfk = match req.vfk {
         Some(vfk_hex) => Some(parse_hash32_hex(&vfk_hex, "vfk")?),
         None => None,
     };
@@ -99,249 +77,118 @@ pub async fn get_wallet_balance(
     let wallet_bech32m = viewer::hex_to_bech32m_address(&hex::encode(user_recipient))
         .context("Failed to convert wallet recipient to bech32m")?;
 
-    let deposit_rows: Vec<DepositRow> = if vfk.is_some() {
-        #[derive(FromQueryResult)]
-        struct DepositDbRow {
-            event_id: i32,
-            amount: Option<String>,
-            rho: Option<String>,
-            encrypted_notes: Option<JsonValue>,
-        }
+    let started = Instant::now();
+    let response = get_wallet_balance_from_notes_index(db, &wallet_bech32m, &nf_key).await?;
+    tracing::debug!(
+        address,
+        source = "notes_nullifiers",
+        elapsed_ms = started.elapsed().as_millis(),
+        note_count = response.unspent_notes.len(),
+        "Computed wallet balance"
+    );
+    Ok(response)
+}
 
-        idx::midnight_deposit::Entity::find()
-            .select_only()
-            .column(idx::midnight_deposit::Column::EventId)
-            .column(idx::midnight_deposit::Column::Amount)
-            .column(idx::midnight_deposit::Column::Rho)
-            .column(idx::midnight_deposit::Column::EncryptedNotes)
-            .filter(idx::midnight_deposit::Column::Recipient.eq(wallet_bech32m.clone()))
-            .into_model::<DepositDbRow>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|r| DepositRow {
-                event_id: r.event_id,
-                amount: r.amount,
-                rho: r.rho,
-                encrypted_notes: r.encrypted_notes,
-            })
-            .collect()
-    } else {
-        #[derive(FromQueryResult)]
-        struct DepositDbRow {
-            event_id: i32,
-            amount: Option<String>,
-            rho: Option<String>,
-        }
-
-        idx::midnight_deposit::Entity::find()
-            .select_only()
-            .column(idx::midnight_deposit::Column::EventId)
-            .column(idx::midnight_deposit::Column::Amount)
-            .column(idx::midnight_deposit::Column::Rho)
-            .filter(idx::midnight_deposit::Column::Recipient.eq(wallet_bech32m.clone()))
-            .filter(idx::midnight_deposit::Column::Amount.is_not_null())
-            .filter(idx::midnight_deposit::Column::Rho.is_not_null())
-            .into_model::<DepositDbRow>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|r| DepositRow {
-                event_id: r.event_id,
-                amount: r.amount,
-                rho: r.rho,
-                encrypted_notes: None,
-            })
-            .collect()
-    };
-
-    // Transfers:
-    // - Prefer indexed involvement fields (`recipient`, `privacy_sender`) to keep this query scoped
-    //   to the wallet and avoid scanning the entire transfer table.
-    // - When a VFK is provided, also include *untagged* transfers (missing recipient/privacy_sender)
-    //   that still have encrypted notes, so we can decrypt and recover change notes.
-    // - Without a VFK, include only a small backward-compatibility set: rows with decrypted notes
-    //   but missing involvement fields.
-    let missing_involvement_fields = Condition::all()
-        .add(idx::midnight_transfer::Column::Recipient.is_null())
-        .add(idx::midnight_transfer::Column::PrivacySender.is_null());
-    let transfer_filter = if vfk.is_some() {
-        Condition::any()
-            .add(idx::midnight_transfer::Column::Recipient.eq(wallet_bech32m.clone()))
-            .add(idx::midnight_transfer::Column::PrivacySender.eq(wallet_bech32m.clone()))
-            .add(
-                Condition::all()
-                    .add(idx::midnight_transfer::Column::EncryptedNotes.is_not_null())
-                    .add(missing_involvement_fields.clone()),
-            )
-    } else {
-        Condition::any()
-            .add(idx::midnight_transfer::Column::Recipient.eq(wallet_bech32m.clone()))
-            .add(idx::midnight_transfer::Column::PrivacySender.eq(wallet_bech32m.clone()))
-            .add(
-                Condition::all()
-                    .add(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
-                    .add(missing_involvement_fields.clone()),
-            )
-    };
-    let transfer_rows: Vec<TransferRow> = if vfk.is_some() {
-        #[derive(FromQueryResult)]
-        struct TransferDbRow {
-            event_id: i32,
-            decrypted_notes: Option<JsonValue>,
-            encrypted_notes: Option<JsonValue>,
-        }
-
-        idx::midnight_transfer::Entity::find()
-            .select_only()
-            .column(idx::midnight_transfer::Column::EventId)
-            .column(idx::midnight_transfer::Column::DecryptedNotes)
-            .column(idx::midnight_transfer::Column::EncryptedNotes)
-            .filter(transfer_filter)
-            .into_model::<TransferDbRow>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|r| TransferRow {
-                event_id: r.event_id,
-                decrypted_notes: r.decrypted_notes,
-                encrypted_notes: r.encrypted_notes,
-            })
-            .collect()
-    } else {
-        #[derive(FromQueryResult)]
-        struct TransferDbRow {
-            event_id: i32,
-            decrypted_notes: Option<JsonValue>,
-        }
-
-        idx::midnight_transfer::Entity::find()
-            .select_only()
-            .column(idx::midnight_transfer::Column::EventId)
-            .column(idx::midnight_transfer::Column::DecryptedNotes)
-            .filter(idx::midnight_transfer::Column::DecryptedNotes.is_not_null())
-            .filter(transfer_filter)
-            .into_model::<TransferDbRow>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|r| TransferRow {
-                event_id: r.event_id,
-                decrypted_notes: r.decrypted_notes,
-                encrypted_notes: None,
-            })
-            .collect()
-    };
-
-    let withdraw_rows: Vec<WithdrawRow> = if vfk.is_some() {
-        #[derive(FromQueryResult)]
-        struct WithdrawDbRow {
-            event_id: i32,
-            encrypted_notes: Option<JsonValue>,
-        }
-
-        let withdraw_filter = Condition::any()
-            .add(idx::midnight_withdraw::Column::PrivacySender.eq(wallet_bech32m.clone()))
-            // Backward-compat: include untagged withdraws so we can decrypt and recover
-            // change notes even if `privacy_sender` hasn't been backfilled yet.
-            .add(idx::midnight_withdraw::Column::PrivacySender.is_null());
-
-        idx::midnight_withdraw::Entity::find()
-            .select_only()
-            .column(idx::midnight_withdraw::Column::EventId)
-            .column(idx::midnight_withdraw::Column::EncryptedNotes)
-            .filter(idx::midnight_withdraw::Column::EncryptedNotes.is_not_null())
-            .filter(withdraw_filter)
-            .into_model::<WithdrawDbRow>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|r| WithdrawRow {
-                event_id: r.event_id,
-                encrypted_notes: r.encrypted_notes,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut event_ids = Vec::new();
-    event_ids.extend(deposit_rows.iter().map(|row| row.event_id));
-    event_ids.extend(transfer_rows.iter().map(|row| row.event_id));
-    event_ids.extend(withdraw_rows.iter().map(|row| row.event_id));
-
-    let event_map = load_event_map(db, &event_ids).await?;
-
-    let mut notes = Vec::new();
-    let mut seen_rhos = HashSet::new();
-
-    for row in deposit_rows {
-        let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
-            continue;
-        };
-        if let (Some(amount), Some(rho_hex)) = (row.amount.as_ref(), row.rho.as_ref()) {
-            if let (Ok(value), Ok(rho)) = (amount.parse::<u128>(), parse_hash32_hex(rho_hex, "rho"))
-            {
-                add_note(
-                    &mut notes,
-                    &mut seen_rhos,
-                    NoteRecord {
-                        rho,
-                        value,
-                        sender_id: None,
-                        tx_hash: tx_hash.clone(),
-                        timestamp_ms: *timestamp_ms,
-                        kind: "deposit".to_string(),
-                    },
-                );
-            }
-        }
-
-        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
-        for note in decrypted_notes {
-            if let Some(record) =
-                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "deposit")
-            {
-                add_note(&mut notes, &mut seen_rhos, record);
-            }
-        }
+async fn get_wallet_balance_from_notes_index(
+    db: &DatabaseConnection,
+    wallet_bech32m: &str,
+    nf_key: &Hash32,
+) -> Result<BalanceResponse> {
+    #[derive(FromQueryResult)]
+    struct NotesNullifierRow {
+        rho: Option<String>,
+        value: Option<String>,
+        sender_id: Option<String>,
+        created_tx_hash: Option<String>,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        created_kind: Option<String>,
     }
 
-    for row in transfer_rows {
-        let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
-            continue;
-        };
-        let mut decrypted_notes = notes_from_decrypted_row(row.decrypted_notes.as_ref());
-        if decrypted_notes.is_empty() {
-            decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
+    let rows: Vec<NotesNullifierRow> = match idx::notes_nullifiers::Entity::find()
+        .select_only()
+        .column(idx::notes_nullifiers::Column::Rho)
+        .column(idx::notes_nullifiers::Column::Value)
+        .column(idx::notes_nullifiers::Column::SenderId)
+        .column(idx::notes_nullifiers::Column::CreatedTxHash)
+        .column(idx::notes_nullifiers::Column::CreatedAt)
+        .column(idx::notes_nullifiers::Column::CreatedKind)
+        .filter(idx::notes_nullifiers::Column::Recipient.eq(wallet_bech32m.to_string()))
+        .filter(idx::notes_nullifiers::Column::Rho.is_not_null())
+        .filter(idx::notes_nullifiers::Column::Value.is_not_null())
+        // Filter obvious spends early; we still verify with nullifier lookups to
+        // tolerate temporary backfill lag in notes_nullifiers.
+        .filter(idx::notes_nullifiers::Column::SpentTxHash.is_null())
+        .into_model::<NotesNullifierRow>()
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) if is_missing_notes_index_table(&err) => {
+            return Err(anyhow::anyhow!(
+                "notes_nullifiers table is required for wallet balance but is unavailable: {}",
+                err
+            ));
         }
-        for note in decrypted_notes {
-            if let Some(record) =
-                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "transfer")
-            {
-                add_note(&mut notes, &mut seen_rhos, record);
-            }
-        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if rows.is_empty() {
+        return Ok(BalanceResponse {
+            balance: "0".to_string(),
+            unspent_notes: Vec::new(),
+        });
     }
 
-    for row in withdraw_rows {
-        let Some((tx_hash, timestamp_ms)) = event_map.get(&row.event_id) else {
+    let mut notes = Vec::with_capacity(rows.len());
+    let mut seen_rhos = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let (Some(rho_hex), Some(value_str)) = (row.rho.as_deref(), row.value.as_deref()) else {
             continue;
         };
-        let decrypted_notes = notes_from_row(row.encrypted_notes.as_ref(), vfk.as_ref());
-        for note in decrypted_notes {
-            if let Some(record) =
-                note_from_decrypted(&note, &user_recipient, tx_hash, *timestamp_ms, "withdraw")
-            {
-                add_note(&mut notes, &mut seen_rhos, record);
-            }
-        }
+        let Ok(rho) = parse_hash32_hex(rho_hex, "rho") else {
+            continue;
+        };
+        let Ok(value) = value_str.parse::<u128>() else {
+            continue;
+        };
+        let sender_id = row.sender_id.as_deref().and_then(parse_sender_id_to_hash32);
+
+        add_note(
+            &mut notes,
+            &mut seen_rhos,
+            NoteRecord {
+                rho,
+                value,
+                sender_id,
+                tx_hash: row.created_tx_hash.unwrap_or_default(),
+                timestamp_ms: row
+                    .created_at
+                    .map(|ts| ts.timestamp_millis())
+                    .unwrap_or_default(),
+                kind: row.created_kind.unwrap_or_else(|| "transfer".to_string()),
+            },
+        );
     }
 
-    let mut note_states = Vec::new();
-    let mut nullifier_lookup = HashSet::new();
+    if notes.is_empty() {
+        return Ok(BalanceResponse {
+            balance: "0".to_string(),
+            unspent_notes: Vec::new(),
+        });
+    }
+
+    finalize_balance_from_notes(db, notes, nf_key).await
+}
+
+async fn finalize_balance_from_notes(
+    db: &DatabaseConnection,
+    notes: Vec<NoteRecord>,
+    nf_key: &Hash32,
+) -> Result<BalanceResponse> {
+    let mut note_states = Vec::with_capacity(notes.len());
+    let mut nullifier_lookup = HashSet::with_capacity(notes.len().saturating_mul(2));
     for note in notes {
-        let nf = nullifier(&DOMAIN, &nf_key, &note.rho);
+        let nf = nullifier(&DOMAIN, nf_key, &note.rho);
         let nf_hex = hex::encode(nf);
 
         nullifier_lookup.insert(nf_hex.clone());
@@ -386,108 +233,20 @@ pub async fn get_wallet_balance(
     })
 }
 
-async fn load_event_map(
-    db: &DatabaseConnection,
-    event_ids: &[i32],
-) -> Result<HashMap<i32, (String, i64)>> {
-    #[derive(FromQueryResult)]
-    struct EventMetaRow {
-        id: i32,
-        tx_hash: String,
-        created_at: chrono::DateTime<chrono::Utc>,
-    }
-
-    let mut event_ids = event_ids.to_vec();
-    event_ids.sort_unstable();
-    event_ids.dedup();
-
-    if event_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // Only fetch the event columns we need for balance computation. Avoid selecting
-    // large `payload`/`events` JSON blobs to reduce DB CPU + network I/O.
-    let mut map = HashMap::with_capacity(event_ids.len());
-    for chunk in event_ids.chunks(EVENT_ID_CHUNK_SIZE) {
-        let events: Vec<EventMetaRow> = idx::Entity::find()
-            .select_only()
-            .column(idx::Column::Id)
-            .column(idx::Column::TxHash)
-            .column(idx::Column::CreatedAt)
-            .filter(idx::Column::Id.is_in(chunk.to_vec()))
-            .into_model::<EventMetaRow>()
-            .all(db)
-            .await?;
-
-        for ev in events {
-            map.insert(ev.id, (ev.tx_hash, ev.created_at.timestamp_millis()));
-        }
-    }
-    Ok(map)
-}
-
 fn add_note(notes: &mut Vec<NoteRecord>, seen_rhos: &mut HashSet<Hash32>, note: NoteRecord) {
     if seen_rhos.insert(note.rho) {
         notes.push(note);
     }
 }
 
-fn notes_from_row(
-    encrypted: Option<&serde_json::Value>,
-    vfk: Option<&Hash32>,
-) -> Vec<viewer::DecryptedNote> {
-    let Some(vfk) = vfk else {
-        return Vec::new();
-    };
-    let Some(json) = encrypted else {
-        return Vec::new();
-    };
-
-    let notes: Vec<EncryptedNote> = serde_json::from_value(json.clone()).unwrap_or_default();
-    let mut decrypted_notes = Vec::new();
-    for note in notes {
-        if let Ok(decrypted) = viewer::decrypt_note(vfk, &note) {
-            decrypted_notes.push(decrypted);
-        }
-    }
-    decrypted_notes
-}
-
-fn notes_from_decrypted_row(decrypted: Option<&serde_json::Value>) -> Vec<viewer::DecryptedNote> {
-    let Some(json) = decrypted else {
-        return Vec::new();
-    };
-
-    serde_json::from_value(json.clone()).unwrap_or_default()
-}
-
-fn note_from_decrypted(
-    note: &viewer::DecryptedNote,
-    user_recipient: &Hash32,
-    tx_hash: &str,
-    timestamp_ms: i64,
-    kind: &str,
-) -> Option<NoteRecord> {
-    let recipient = parse_hash32_hex(&note.recipient, "recipient").ok()?;
-    if &recipient != user_recipient {
-        return None;
+fn parse_sender_id_to_hash32(value: &str) -> Option<Hash32> {
+    if let Ok(privacy_address) = value.parse::<PrivacyAddress>() {
+        let pk_spend = privacy_address.to_pk();
+        let pk_ivk = privacy_address.pk_ivk();
+        return Some(recipient_from_pk_v2(&DOMAIN, &pk_spend, &pk_ivk));
     }
 
-    let rho = parse_hash32_hex(&note.rho, "rho").ok()?;
-    let value = note.value.parse::<u128>().ok()?;
-    let sender_id = note
-        .sender_id
-        .as_ref()
-        .and_then(|value| parse_hash32_hex(value, "sender_id").ok());
-
-    Some(NoteRecord {
-        rho,
-        value,
-        sender_id,
-        tx_hash: tx_hash.to_string(),
-        timestamp_ms,
-        kind: kind.to_string(),
-    })
+    parse_hash32_hex(value, "sender_id").ok()
 }
 
 async fn fetch_spent_nullifiers(
@@ -530,6 +289,14 @@ fn normalize_nullifier(value: &str) -> String {
         .strip_prefix("0x")
         .unwrap_or(value)
         .to_lowercase()
+}
+
+fn is_missing_notes_index_table(err: &sea_orm::DbErr) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("notes_nullifiers")
+        && (msg.contains("no such table")
+            || msg.contains("does not exist")
+            || msg.contains("no such column"))
 }
 
 fn parse_hash32_hex(value: &str, field: &str) -> Result<Hash32> {
