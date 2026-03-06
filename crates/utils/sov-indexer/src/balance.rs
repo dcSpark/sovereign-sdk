@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use bech32::Hrp;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
@@ -240,6 +241,10 @@ fn add_note(notes: &mut Vec<NoteRecord>, seen_rhos: &mut HashSet<Hash32>, note: 
 }
 
 fn parse_sender_id_to_hash32(value: &str) -> Option<Hash32> {
+    if let Some(raw_hash) = parse_bech32m_hash32(value) {
+        return Some(raw_hash);
+    }
+
     if let Ok(privacy_address) = value.parse::<PrivacyAddress>() {
         let pk_spend = privacy_address.to_pk();
         let pk_ivk = privacy_address.pk_ivk();
@@ -247,6 +252,18 @@ fn parse_sender_id_to_hash32(value: &str) -> Option<Hash32> {
     }
 
     parse_hash32_hex(value, "sender_id").ok()
+}
+
+fn parse_bech32m_hash32(value: &str) -> Option<Hash32> {
+    let (hrp, data) = bech32::decode(value).ok()?;
+    let expected_hrp = Hrp::parse(viewer::PRIVACY_ADDRESS_HRP).ok()?;
+    if hrp != expected_hrp || data.len() != 32 {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&data);
+    Some(out)
 }
 
 async fn fetch_spent_nullifiers(
