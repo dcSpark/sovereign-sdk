@@ -5,20 +5,63 @@ type GlDigest = [u64; 4];
 
 const GL_ONE: u64 = 1;
 const ZERO_DIGEST: GlDigest = [0, 0, 0, 0];
+const GL_MODULUS: u64 = 0xffff_ffff_0000_0001;
+const GL_NEG_ORDER: u64 = GL_MODULUS.wrapping_neg();
+
+#[inline]
+fn gl_reduce128(x: u128) -> u64 {
+    let x_lo = x as u64;
+    let x_hi = (x >> 64) as u64;
+    let x_hi_hi = x_hi >> 32;
+    let x_hi_lo = x_hi & GL_NEG_ORDER;
+
+    let (mut t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
+    if borrow {
+        t0 = t0.wrapping_sub(GL_NEG_ORDER);
+    }
+
+    let t1 = x_hi_lo.wrapping_mul(GL_NEG_ORDER);
+    let (t2, carry) = t0.overflowing_add(t1);
+    t2.wrapping_add(GL_NEG_ORDER.wrapping_mul(carry as u64))
+}
+
+#[inline]
+fn gl_canonicalize(x: u64) -> u64 {
+    if x >= GL_MODULUS {
+        x - GL_MODULUS
+    } else {
+        x
+    }
+}
+
+#[inline]
+fn gl_eq(a: u64, b: u64) -> bool {
+    gl_canonicalize(a) == gl_canonicalize(b)
+}
 
 #[inline]
 fn gl_add(a: u64, b: u64) -> u64 {
-    a.wrapping_add(b)
+    let (sum, over) = a.overflowing_add(b);
+    let (mut sum, over2) = sum.overflowing_add((over as u64) * GL_NEG_ORDER);
+    if over2 {
+        sum = sum.wrapping_add(GL_NEG_ORDER);
+    }
+    sum
 }
 
 #[inline]
 fn gl_sub(a: u64, b: u64) -> u64 {
-    a.wrapping_sub(b)
+    let (diff, under) = a.overflowing_sub(b);
+    let (mut diff, under2) = diff.overflowing_sub((under as u64) * GL_NEG_ORDER);
+    if under2 {
+        diff = diff.wrapping_sub(GL_NEG_ORDER);
+    }
+    diff
 }
 
 #[inline]
 fn gl_mul(a: u64, b: u64) -> u64 {
-    a.wrapping_mul(b)
+    gl_reduce128((a as u128) * (b as u128))
 }
 
 #[inline]
@@ -39,8 +82,8 @@ const TAG_BL_BUCKET: u64 = 7;
 const BL_DEPTH: u32 = 16;
 const BL_BUCKET_SIZE: usize = 12;
 
-const INPUT_ADDR: u32 = 0x104;
-const OUTPUT_ADDR: u32 = 0x100;
+const INPUT_ADDR: u32 = 0x4104;
+const OUTPUT_ADDR: u32 = 0x4100;
 
 struct RamReader {
     addr: u32,
@@ -182,8 +225,29 @@ fn bl_bucket_leaf(entries: &[GlDigest; BL_BUCKET_SIZE]) -> GlDigest {
     poseidon2_hash(&input)
 }
 
+fn digest_to_bytes(d: &GlDigest) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut i = 0usize;
+    while i < 4 {
+        let b = d[i].to_le_bytes();
+        out[i * 8..(i + 1) * 8].copy_from_slice(&b);
+        i += 1;
+    }
+    out
+}
+
 fn bl_bucket_pos(id: &GlDigest) -> u32 {
-    (id[0] as u32) & ((1u32 << BL_DEPTH) - 1)
+    // Match module-side `blacklist_pos_from_recipient`.
+    let id_bytes = digest_to_bytes(id);
+    let mut pos: u32 = 0;
+    let mut i = 0usize;
+    while i < BL_DEPTH as usize {
+        let byte = id_bytes[31 - (i / 8)];
+        let bit = (byte >> (i % 8)) & 1;
+        pos |= (bit as u32) << (i as u32);
+        i += 1;
+    }
+    pos
 }
 
 fn assert_not_blacklisted(id: &GlDigest, blacklist_root: &GlDigest, reader: &mut RamReader) {
@@ -197,7 +261,7 @@ fn assert_not_blacklisted(id: &GlDigest, blacklist_root: &GlDigest, reader: &mut
     for entry in &entries {
         prod = enforce_prod_digest_diff(prod, id, entry);
     }
-    assert!(gl_mul(prod, bucket_inv) == GL_ONE);
+    assert!(gl_eq(gl_mul(prod, bucket_inv), GL_ONE));
 
     let leaf = bl_bucket_leaf(&entries);
     let pos = bl_bucket_pos(id);

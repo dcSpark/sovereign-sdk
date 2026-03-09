@@ -71,6 +71,10 @@ sov-mock-zkvm = { workspace = true, features = ["native"] }
 midnight-privacy = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 
+# Nightstream trace simulation helpers (used by /prove pre-simulation).
+neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+
 
 # Runtime type for transaction signing
 demo-stf = { path = "../../../examples/demo-rollup/stf", features = ["native"] }

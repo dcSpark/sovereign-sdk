@@ -31,16 +31,16 @@ sov-rollup-interface = { workspace = true }
 sov-mock-zkvm = { workspace = true }
 
 # Nightstream dependencies
-neo-fold = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7", features = ["poseidon-precompile"] }
-neo-math = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7" }
-neo-ajtai = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7" }
-neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7" }
-neo-ccs = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7" }
+neo-fold = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3", features = ["poseidon-precompile"] }
+neo-math = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+neo-ajtai = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+neo-ccs = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
+neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "87493e3dd35642d3c3c6f2f383370d74664dfae3" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 p3-goldilocks = "0.4.1"
-neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "d4b8df4121ca15902dbe4f29f75761f64898a8d7" }
 
 [features]
 default = []

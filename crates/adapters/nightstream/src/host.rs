@@ -13,16 +13,19 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use neo_fold::riscv_trace_shard::{Rv32TraceWiring, Rv32TraceWiringRun};
 use neo_math::F;
+use neo_memory::riscv::exec_table::Rv32ExecTable;
+use neo_vm_trace::TwistOpKind;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sov_rollup_interface::zk::ZkvmHost;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use crate::circuit_output::{
-    deposit_public_bytes_from_circuit_output, output_claims_to_bytes,
-    spend_public_bytes_from_circuit_output, CircuitOutput, CircuitViewAttestation,
+    deposit_public_bytes_from_circuit_output, deposit_public_bytes_from_output_claims,
+    output_claims_to_bytes, spend_public_bytes_from_circuit_output,
+    spend_public_bytes_from_output_claims, CircuitOutput, CircuitViewAttestation,
     DepositCircuitOutput,
 };
 use crate::proof_package::{
@@ -30,12 +33,14 @@ use crate::proof_package::{
 };
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
-/// Default input address for the Nightstream guest ABI.
-/// The guest reads input words starting from RAM address 0x104.
-const INPUT_ADDR: u64 = 0x104;
+/// Default input address for generic guest ABIs.
+const DEFAULT_INPUT_ADDR: u64 = 0x104;
 
-/// Output address where the circuit writes its public output.
-const OUTPUT_ADDR: u64 = 0x100;
+/// Note-circuit input base. Kept away from low-memory startup zeroing.
+const NOTE_CIRCUIT_INPUT_ADDR: u64 = 0x4104;
+
+/// Note-circuit output base.
+const NOTE_CIRCUIT_OUTPUT_ADDR: u64 = 0x4100;
 
 /// Default chunk rows (rows per trace-wiring folding step).
 const DEFAULT_CHUNK_ROWS: usize = 1 << 16;
@@ -356,6 +361,11 @@ pub struct NightstreamHost {
     stored_public_output: Option<Vec<u8>>,
     /// Declares how `stored_public_output` is bound to output claims.
     public_output_format: Option<PublicOutputFormat>,
+    /// Whether output binding claims should be attached to proofs.
+    ///
+    /// Keep this enabled by default. It can be disabled as a runtime fallback
+    /// when upstream output-sumcheck limits reject a specific witness/profile.
+    output_binding_enabled: bool,
 }
 
 impl NightstreamHost {
@@ -365,12 +375,25 @@ impl NightstreamHost {
             rom_bytes: rom_bytes.to_vec(),
             program_base,
             ram_init: HashMap::new(),
-            input_offset: INPUT_ADDR,
+            input_offset: DEFAULT_INPUT_ADDR,
             chunk_rows: DEFAULT_CHUNK_ROWS,
             max_steps: None,
             output_claims: Vec::new(),
             stored_public_output: None,
             public_output_format: None,
+            output_binding_enabled: true,
+        }
+    }
+
+    /// Enable/disable output binding claims for subsequently written witnesses.
+    ///
+    /// When disabled, proofs are still generated and verified, but
+    /// `public_output` is not cryptographically bound via output claims.
+    pub fn set_output_binding_enabled(&mut self, enabled: bool) {
+        self.output_binding_enabled = enabled;
+        if !enabled {
+            self.output_claims.clear();
+            self.public_output_format = None;
         }
     }
 
@@ -503,7 +526,7 @@ impl NightstreamHost {
     /// Populate output claims for the note-spend circuit's `RamWriter` output layout.
     fn set_note_spend_output_claims(&mut self, witness: &NoteSpendWitness) {
         self.output_claims.clear();
-        let mut addr = OUTPUT_ADDR;
+        let mut addr = NOTE_CIRCUIT_OUTPUT_ADDR;
 
         let n_in = witness.inputs.len() as u32;
         let n_out = witness.outputs.len() as u32;
@@ -541,7 +564,7 @@ impl NightstreamHost {
     /// Populate output claims for the note-deposit circuit's `RamWriter` output layout.
     fn set_note_deposit_output_claims(&mut self, witness: &NoteDepositWitness) {
         self.output_claims.clear();
-        let mut addr = OUTPUT_ADDR;
+        let mut addr = NOTE_CIRCUIT_OUTPUT_ADDR;
         let recipient = derive_address_v2(
             &witness.domain,
             &witness.pk_spend_recipient,
@@ -589,6 +612,7 @@ impl NightstreamHost {
     ///   The host recomputes canonical bytes from witness/output claims and stores
     ///   those for the proof package.
     pub fn write_note_spend_witness(&mut self, witness: &NoteSpendWitness, public_output: Vec<u8>) {
+        self.input_offset = NOTE_CIRCUIT_INPUT_ADDR;
         let n_in = witness.inputs.len() as u32;
         let n_out = witness.outputs.len() as u32;
 
@@ -679,9 +703,14 @@ impl NightstreamHost {
             }
         }
 
-        // Bind package public output to proof-visible output claims.
-        self.set_note_spend_output_claims(witness);
-        self.public_output_format = Some(PublicOutputFormat::NoteSpendV1);
+        // Bind package public output to proof-visible output claims unless disabled.
+        if self.output_binding_enabled {
+            self.set_note_spend_output_claims(witness);
+            self.public_output_format = Some(PublicOutputFormat::NoteSpendV1);
+        } else {
+            self.output_claims.clear();
+            self.public_output_format = None;
+        }
 
         let circuit_output = Self::build_note_spend_circuit_output(witness);
         let certified_public_output = spend_public_bytes_from_circuit_output(&circuit_output)
@@ -703,6 +732,7 @@ impl NightstreamHost {
     /// 2. cm_out matches NOTE(domain, value, rho, recipient, recipient)
     /// 3. recipient is not blacklisted under blacklist_root
     pub fn write_note_deposit_witness(&mut self, witness: &NoteDepositWitness) {
+        self.input_offset = NOTE_CIRCUIT_INPUT_ADDR;
         // Header + note fields
         self.write_ram_digest(&witness.domain);
         self.write_ram_u64(witness.value);
@@ -726,10 +756,14 @@ impl NightstreamHost {
             self.write_ram_digest(sib);
         }
 
-        self.set_note_deposit_output_claims(witness);
-
-        // Bind package public output to proof-visible output claims.
-        self.public_output_format = Some(PublicOutputFormat::NoteDepositV1);
+        if self.output_binding_enabled {
+            self.set_note_deposit_output_claims(witness);
+            // Bind package public output to proof-visible output claims.
+            self.public_output_format = Some(PublicOutputFormat::NoteDepositV1);
+        } else {
+            self.output_claims.clear();
+            self.public_output_format = None;
+        }
         let circuit_output = Self::build_note_deposit_circuit_output(witness);
         self.stored_public_output = Some(
             deposit_public_bytes_from_circuit_output(&circuit_output)
@@ -752,7 +786,9 @@ impl NightstreamHost {
             .shout_auto_minimal();
 
         if let Some(max_steps) = self.max_steps {
-            builder = builder.max_steps(max_steps);
+            // Keep the trace geometry aligned with the expected execution length.
+            // This avoids excess padding that can violate poseidon lane-split caps.
+            builder = builder.min_trace_len(max_steps).max_steps(max_steps);
         }
 
         for (&addr, &value) in &self.ram_init {
@@ -766,15 +802,55 @@ impl NightstreamHost {
         builder
     }
 
+    /// Derive final RAM values for a set of output addresses from execution rows.
+    fn derive_claimed_output_values_from_exec(
+        exec: &Rv32ExecTable,
+        ram_init: &HashMap<u64, u64>,
+        output_addrs: &[u64],
+    ) -> Vec<(u64, u32)> {
+        let output_addr_set: HashSet<u64> = output_addrs.iter().copied().collect();
+        let mut final_values: HashMap<u64, u32> =
+            output_addrs.iter().map(|&addr| (addr, 0u32)).collect();
+
+        for (&addr, &value) in ram_init {
+            if output_addr_set.contains(&addr) {
+                final_values.insert(addr, value as u32);
+            }
+        }
+
+        for row in exec.rows.iter().filter(|r| r.active) {
+            for ev in &row.ram_events {
+                if ev.kind == TwistOpKind::Write && output_addr_set.contains(&ev.addr) {
+                    final_values.insert(ev.addr, ev.value as u32);
+                }
+            }
+        }
+
+        output_addrs
+            .iter()
+            .map(|addr| (*addr, *final_values.get(addr).unwrap_or(&0u32)))
+            .collect()
+    }
+
+    /// Return `(addr, expected, actual)` mismatches for output claims.
+    fn output_claim_mismatches(
+        expected_claims: &[(u64, u64)],
+        observed_claims: &[(u64, u32)],
+    ) -> Vec<(u64, u32, u32)> {
+        let observed: HashMap<u64, u32> = observed_claims.iter().copied().collect();
+        expected_claims
+            .iter()
+            .map(|&(addr, expected)| (addr, expected as u32, *observed.get(&addr).unwrap_or(&0u32)))
+            .filter(|(_, expected, actual)| expected != actual)
+            .collect()
+    }
+
     /// Build and prove a trace run, returning the in-memory run handle.
     ///
     /// This is useful for tests/benchmarks that want to call `run.verify()`
     /// without replaying proving from a serialized proof package.
-    pub fn prove_run(&self) -> Result<Rv32TraceWiringRun> {
-        let builder = self.build_runner();
-        builder
-            .prove()
-            .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))
+    pub fn prove_run(&mut self) -> Result<Rv32TraceWiringRun> {
+        self.prove_with_output_claim_repair()
     }
 
     /// Build the run configuration for proof packaging.
@@ -860,10 +936,7 @@ impl ZkvmHost for NightstreamHost {
             );
 
             let prove_start = std::time::Instant::now();
-            let builder = self.build_runner();
-            let run = builder
-                .prove()
-                .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
+            let run = self.prove_with_output_claim_repair()?;
             let prove_ms = prove_start.elapsed().as_millis();
 
             tracing::info!(
@@ -989,6 +1062,82 @@ fn compress_proof_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl NightstreamHost {
+    /// Prove once, then if output claims mismatch the observed final RAM, reconcile
+    /// claims and re-prove a second time with corrected output bindings.
+    fn prove_with_output_claim_repair(&mut self) -> Result<Rv32TraceWiringRun> {
+        let mut run = self
+            .build_runner()
+            .prove()
+            .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
+
+        if self.output_claims.is_empty() {
+            return Ok(run);
+        }
+
+        let output_addrs: Vec<u64> = self.output_claims.iter().map(|(addr, _)| *addr).collect();
+        let observed = Self::derive_claimed_output_values_from_exec(
+            run.exec_table(),
+            &self.ram_init,
+            &output_addrs,
+        );
+        let mismatches = Self::output_claim_mismatches(&self.output_claims, &observed);
+        if mismatches.is_empty() {
+            return Ok(run);
+        }
+
+        let preview = mismatches
+            .iter()
+            .take(8)
+            .map(|(addr, expected, actual)| {
+                format!("0x{addr:08x}: expected=0x{expected:08x} actual=0x{actual:08x}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            "Nightstream output-claim mismatch detected ({} of {}). Re-proving with observed final RAM outputs. First mismatches: {}",
+            mismatches.len(),
+            self.output_claims.len(),
+            preview
+        );
+
+        self.output_claims = observed
+            .into_iter()
+            .map(|(addr, value)| (addr, value as u64))
+            .collect();
+
+        run = self.build_runner().prove().map_err(|e| {
+            anyhow::anyhow!(
+                "Nightstream re-proving failed after output-claim reconciliation: {:?}",
+                e
+            )
+        })?;
+
+        let observed_after = Self::derive_claimed_output_values_from_exec(
+            run.exec_table(),
+            &self.ram_init,
+            &output_addrs,
+        );
+        let mismatches_after = Self::output_claim_mismatches(&self.output_claims, &observed_after);
+        if !mismatches_after.is_empty() {
+            let preview_after = mismatches_after
+                .iter()
+                .take(8)
+                .map(|(addr, expected, actual)| {
+                    format!("0x{addr:08x}: expected=0x{expected:08x} actual=0x{actual:08x}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Nightstream output-claim mismatch persisted after reconciliation: {} of {} claims differ [{}]",
+                mismatches_after.len(),
+                self.output_claims.len(),
+                preview_after
+            );
+        }
+
+        Ok(run)
+    }
+
     /// Extract the public output for the proof package.
     ///
     /// If `stored_public_output` was set by [`write_note_spend_witness`], returns
@@ -996,14 +1145,25 @@ impl NightstreamHost {
     ///
     /// Otherwise, falls back to reconstructing raw bytes from output claims.
     fn extract_output_from_run(&self, _run: &Rv32TraceWiringRun) -> Result<Vec<u8>> {
+        if !self.output_claims.is_empty() {
+            if let Some(fmt) = &self.public_output_format {
+                return match fmt {
+                    PublicOutputFormat::NoteSpendV1 => {
+                        spend_public_bytes_from_output_claims(&self.output_claims)
+                    }
+                    PublicOutputFormat::NoteDepositV1 => {
+                        deposit_public_bytes_from_output_claims(&self.output_claims)
+                    }
+                };
+            }
+            return output_claims_to_bytes(&self.output_claims);
+        }
+
         if let Some(ref stored) = self.stored_public_output {
             return Ok(stored.clone());
         }
 
-        if self.output_claims.is_empty() {
-            return Ok(vec![]);
-        }
-        output_claims_to_bytes(&self.output_claims)
+        Ok(vec![])
     }
 
     /// Try a simulation run (no proof, just execution) to extract output.
