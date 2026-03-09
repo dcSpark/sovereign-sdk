@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build all RISC-V circuit guests and export their ROM byte arrays.
+# Build all Nightstream circuit guests and export their checked-in byte arrays.
 #
 # This script iterates over each circuit subdirectory containing a build.sh
 # and runs it. The generated *_rom.rs files are written to this directory.
 #
 # Prerequisites:
-#   rustup target add riscv32im-unknown-none-elf
+#   rustup toolchain install nightly
 #   python3
 #
 # The Nightstream repo must be a sibling of the sovereign-ligero checkout,

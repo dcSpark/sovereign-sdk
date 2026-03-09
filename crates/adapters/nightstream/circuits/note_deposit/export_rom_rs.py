@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Build the note_deposit RISC-V guest and export its .neo_start section as a
-Rust constant byte array (note_deposit_rom.rs).
-
-The Rv32B1 runner validates all ROM words as 32-bit instructions, so only
-the .neo_start section (code) goes into the ROM.
+Build the note_deposit RV64IM guest and export its ELF bytes as a Rust constant.
 
 Usage:
     python3 export_rom_rs.py               # build + export
@@ -14,94 +10,132 @@ Usage:
 from __future__ import annotations
 
 import hashlib
-import struct
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
-def _read_cstr(buf: bytes, off: int) -> str:
-    end = buf.find(b"\x00", off)
-    if end < 0:
-        raise ValueError("unterminated string in shstrtab")
-    return buf[off:end].decode("utf-8", errors="strict")
+def _cargo_home_for_guest(guest_dir: Path) -> Path:
+    cargo_home = guest_dir.parent / ".cargo-home-rv64"
+    cargo_home.mkdir(parents=True, exist_ok=True)
+    _bootstrap_cargo_home(cargo_home)
+    config_path = cargo_home / "config.toml"
+    if config_path.exists():
+        config_path.unlink()
+    return cargo_home
 
 
-def _parse_elf32_sections(data: bytes) -> list[tuple[str, int, int, int]]:
-    """Parse all sections from a 32-bit little-endian ELF.
+def _ensure_symlink(dest: Path, src: Path) -> None:
+    if dest.exists() or dest.is_symlink():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.symlink_to(src, target_is_directory=True)
 
-    Returns a list of (name, addr, file_offset, size) tuples.
-    """
-    if data[:4] != b"\x7fELF":
-        raise ValueError("not an ELF file")
 
-    ei_class = data[4]
-    ei_data = data[5]
-    if ei_class != 1:
-        raise ValueError(f"expected ELFCLASS32 (1), got {ei_class}")
-    if ei_data != 1:
-        raise ValueError(f"expected little-endian ELF (1), got {ei_data}")
+def _bootstrap_cargo_home(cargo_home: Path) -> None:
+    global_cargo = Path.home() / ".cargo"
+    _ensure_symlink(cargo_home / "git" / "db", global_cargo / "git" / "db")
+    (cargo_home / "git" / "checkouts").mkdir(parents=True, exist_ok=True)
+    _ensure_symlink(cargo_home / "registry" / "index", global_cargo / "registry" / "index")
+    (cargo_home / "registry" / "cache").mkdir(parents=True, exist_ok=True)
+    (cargo_home / "registry" / "src").mkdir(parents=True, exist_ok=True)
 
-    e_shoff = struct.unpack_from("<I", data, 0x20)[0]
-    e_shentsize = struct.unpack_from("<H", data, 0x2E)[0]
-    e_shnum = struct.unpack_from("<H", data, 0x30)[0]
-    e_shstrndx = struct.unpack_from("<H", data, 0x32)[0]
-    if e_shoff == 0 or e_shnum == 0:
-        raise ValueError("ELF has no section header table")
-    if e_shentsize == 0:
-        raise ValueError("ELF e_shentsize is 0")
-    if e_shstrndx >= e_shnum:
-        raise ValueError(f"invalid e_shstrndx={e_shstrndx} for e_shnum={e_shnum}")
 
-    def read_shdr(i: int) -> tuple[int, int, int, int]:
-        off = e_shoff + i * e_shentsize
-        sh_name = struct.unpack_from("<I", data, off + 0x00)[0]
-        sh_addr = struct.unpack_from("<I", data, off + 0x0C)[0]
-        sh_offset = struct.unpack_from("<I", data, off + 0x10)[0]
-        sh_size = struct.unpack_from("<I", data, off + 0x14)[0]
-        return sh_name, sh_addr, sh_offset, sh_size
+def _cargo_offline_args() -> list[str]:
+    return ["--offline"] if os.environ.get("NIGHTSTREAM_CARGO_OFFLINE") == "1" else []
 
-    shstr_name, _, shstr_off, shstr_size = read_shdr(e_shstrndx)
-    _ = shstr_name
-    shstrtab = data[shstr_off : shstr_off + shstr_size]
 
-    sections = []
-    for i in range(e_shnum):
-        sh_name, sh_addr, sh_offset, sh_size = read_shdr(i)
-        if sh_name >= len(shstrtab):
+def _metadata_for_guest(guest_dir: Path) -> dict:
+    cargo_home = _cargo_home_for_guest(guest_dir)
+    result = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            *_cargo_offline_args(),
+            "--format-version",
+            "1",
+            "--manifest-path",
+            str(guest_dir / "Cargo.toml"),
+        ],
+        cwd=guest_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CARGO_HOME": str(cargo_home)},
+    )
+    return json.loads(result.stdout)
+
+
+def _nightstream_guest_support(guest_dir: Path) -> tuple[Path, Path]:
+    metadata = _metadata_for_guest(guest_dir)
+    for package in metadata["packages"]:
+        if package["name"] != "nightstream-sdk":
             continue
-        name = _read_cstr(shstrtab, sh_name)
-        sections.append((name, sh_addr, sh_offset, sh_size))
-    return sections
+        manifest_path = Path(package["manifest_path"])
+        guest_support_dir = manifest_path.parent / "guest"
+        target_json = guest_support_dir / "riscv64im-unknown-none-elf.json"
+        linker = guest_support_dir / "riscv64im-unknown-none-elf.ld"
+        if target_json.exists() and linker.exists():
+            return target_json, linker
+    raise RuntimeError("failed to locate nightstream-sdk guest support files via cargo metadata")
 
 
-def _extract_section(data: bytes, sections: list, name: str) -> tuple[int, bytes]:
-    """Extract a named section's (addr, content) from parsed sections."""
-    for sname, saddr, soff, ssize in sections:
-        if sname == name:
-            return saddr, data[soff : soff + ssize]
-    raise ValueError(f"missing section {name}")
+def _normalized_target_json(original: Path, target_dir: Path) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    data = json.loads(original.read_text(encoding="utf-8"))
+    if not isinstance(data.get("target-pointer-width"), str):
+        data["target-pointer-width"] = str(data["target-pointer-width"])
+    normalized = target_dir / original.name
+    normalized.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return normalized
 
 
-def _format_rom_module(
-    gen_path: str,
-    rom_base: int,
-    rom_bytes: bytes,
-    sha256_hex: str,
-) -> str:
+def _build_rv64im_guest(guest_dir: Path, target_dir: Path) -> Path:
+    target_json, linker = _nightstream_guest_support(guest_dir)
+    target_json = _normalized_target_json(target_json, target_dir)
+    cargo_home = _cargo_home_for_guest(guest_dir)
+    rustflags = f"{os.environ.get('RUSTFLAGS', '').strip()} -C link-arg=-T{linker}".strip()
+    subprocess.run(
+        [
+            "cargo",
+            "+nightly",
+            "build",
+            *_cargo_offline_args(),
+            "-Z",
+            "build-std=core,alloc",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "--release",
+            "--target",
+            str(target_json),
+        ],
+        cwd=guest_dir,
+        check=True,
+        env={
+            **os.environ,
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_TARGET_DIR": str(target_dir),
+            "RUSTFLAGS": rustflags,
+        },
+    )
+    return target_dir / "riscv64im-unknown-none-elf" / "release" / "note_deposit"
+
+
+def _format_rom_module(gen_path: str, elf_bytes: bytes, sha256_hex: str) -> str:
     lines = []
     lines.append(f"// @generated by {gen_path}")
     lines.append(f"// sha256={sha256_hex}")
+    lines.append("// format=elf64-rv64im")
     lines.append("")
-
-    lines.append(f"pub const NOTE_DEPOSIT_ROM_BASE: u64 = {rom_base}u64;")
-    lines.append(f"pub const NOTE_DEPOSIT_ROM: [u8; {len(rom_bytes)}] = [")
-    for i in range(0, len(rom_bytes), 16):
-        chunk = rom_bytes[i : i + 16]
+    lines.append("pub const NOTE_DEPOSIT_ROM_BASE: u64 = 0u64;")
+    lines.append(f"pub const NOTE_DEPOSIT_ROM: [u8; {len(elf_bytes)}] = [")
+    for i in range(0, len(elf_bytes), 16):
+        chunk = elf_bytes[i : i + 16]
         hexes = ", ".join(f"0x{b:02x}" for b in chunk)
         lines.append(f"    {hexes},")
     lines.append("];")
-
     lines.append("")
     return "\n".join(lines)
 
@@ -110,49 +144,27 @@ def main() -> int:
     guest_dir = Path(__file__).resolve().parent
     circuits_dir = guest_dir.parent
     out_rs = circuits_dir / "note_deposit_rom.rs"
-    target_triple = "riscv32im-unknown-none-elf"
+    target_dir = guest_dir / "target"
 
     skip_build = "--skip-build" in sys.argv
 
     if not skip_build:
-        print(f"Building note_deposit guest ({target_triple})...")
-        subprocess.run(["cargo", "build", "--release"], cwd=guest_dir, check=True)
+        print("Building note_deposit guest (riscv64im-unknown-none-elf)...")
+        elf = _build_rv64im_guest(guest_dir, target_dir)
+    else:
+        elf = target_dir / "riscv64im-unknown-none-elf" / "release" / "note_deposit"
 
-    elf = guest_dir / f"target/{target_triple}/release/note_deposit"
     if not elf.exists():
         raise FileNotFoundError(f"missing expected ELF: {elf}")
 
-    elf_data = elf.read_bytes()
-    sections = _parse_elf32_sections(elf_data)
-
-    # --- Code ROM (.neo_start only) ---
-    rom_base, rom_bytes = _extract_section(elf_data, sections, ".neo_start")
-    if len(rom_bytes) == 0:
-        raise ValueError(".neo_start is empty")
-    if len(rom_bytes) % 4 != 0:
-        raise ValueError(f".neo_start length must be multiple of 4, got {len(rom_bytes)}")
-    if rom_base != 0:
-        raise ValueError(
-            f".neo_start base must be 0 for Rv32B1 (got 0x{rom_base:x}).  "
-            "Ensure the linker script places .neo_start first at address 0."
-        )
-
-    # Validate no compressed instructions in code.
-    for i in range(0, len(rom_bytes), 4):
-        first_half = struct.unpack_from("<H", rom_bytes, i)[0]
-        if (first_half & 0b11) != 0b11:
-            raise ValueError(
-                f"Code contains compressed instruction at word {i // 4} "
-                f"(0x{rom_bytes[i:i+4].hex()}).  Build with -C target-feature=-c."
-            )
-
-    sha256_hex = hashlib.sha256(rom_bytes).hexdigest()
+    elf_bytes = elf.read_bytes()
+    sha256_hex = hashlib.sha256(elf_bytes).hexdigest()
 
     gen_path = "crates/adapters/nightstream/circuits/note_deposit/export_rom_rs.py"
-    rs_content = _format_rom_module(gen_path, rom_base, rom_bytes, sha256_hex)
+    rs_content = _format_rom_module(gen_path, elf_bytes, sha256_hex)
     out_rs.write_text(rs_content, encoding="utf-8")
 
-    print(f"Wrote {out_rs.name} (code={len(rom_bytes)}, sha256={sha256_hex})")
+    print(f"Wrote {out_rs.name} (elf={len(elf_bytes)}, sha256={sha256_hex})")
     return 0
 
 

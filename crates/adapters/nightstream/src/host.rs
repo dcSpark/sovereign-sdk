@@ -1,8 +1,8 @@
 //! Host implementation for Nightstream zkVM.
 //!
-//! The host loads a RISC-V ROM (extracted from a compiled `nightstream-sdk` guest),
-//! accepts inputs via RAM initialization, and produces proofs using Nightstream's
-//! `Rv32TraceWiring` builder (time-in-rows trace CCS).
+//! The host loads RV64IM guest bytes (currently the full ELF), accepts inputs via
+//! RAM initialization, and produces proofs using Nightstream's
+//! `Rv64TraceWiring` builder.
 //!
 //! For the note-spend circuit, use [`NightstreamHost::write_note_spend_witness`]
 //! which writes structured cryptographic inputs in the exact binary layout the
@@ -11,15 +11,13 @@
 use anyhow::{Context, Result};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
-use neo_fold::riscv_trace_shard::{Rv32TraceWiring, Rv32TraceWiringRun};
+use neo_fold::rv64_trace_shard::{Rv64TraceWiring, Rv64TraceWiringRun};
 use neo_math::F;
-use neo_memory::riscv::exec_table::Rv32ExecTable;
-use neo_vm_trace::TwistOpKind;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sov_rollup_interface::zk::ZkvmHost;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 
 use crate::circuit_output::{
@@ -29,12 +27,12 @@ use crate::circuit_output::{
     DepositCircuitOutput,
 };
 use crate::proof_package::{
-    encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv32TraceWiringRunConfig,
+    encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv64TraceWiringRunConfig,
 };
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
 /// Default input address for generic guest ABIs.
-const DEFAULT_INPUT_ADDR: u64 = 0x104;
+const DEFAULT_INPUT_ADDR: u64 = 0x108;
 
 /// Note-circuit input base. Kept away from low-memory startup zeroing.
 const NOTE_CIRCUIT_INPUT_ADDR: u64 = 0x4104;
@@ -335,14 +333,12 @@ pub struct NoteDepositWitness {
 
 /// Host for Nightstream zkVM (Sovereign adapter).
 ///
-/// Wraps the Nightstream `Rv32TraceWiring` builder, translating between the
+/// Wraps the Nightstream `Rv64TraceWiring` builder, translating between the
 /// Sovereign SDK `ZkvmHost` interface and Nightstream's RISC-V proving pipeline.
 #[derive(Clone, Debug)]
 pub struct NightstreamHost {
-    /// ROM bytes from the `.neo_start` ELF section.
+    /// Guest bytes for the circuit (currently the full RV64IM ELF).
     rom_bytes: Vec<u8>,
-    /// Program base address (from .neo_start section header).
-    program_base: u64,
     /// RAM initialization values: address -> value (u32).
     ram_init: HashMap<u64, u64>,
     /// Current write offset for `add_hint` (tracks next free RAM address for inputs).
@@ -369,11 +365,10 @@ pub struct NightstreamHost {
 }
 
 impl NightstreamHost {
-    /// Create a new NightstreamHost from ROM bytes and program base address.
-    pub fn new(rom_bytes: &[u8], program_base: u64) -> Self {
+    /// Create a new NightstreamHost from guest bytes and a compatibility base address.
+    pub fn new(rom_bytes: &[u8], _program_base: u64) -> Self {
         Self {
             rom_bytes: rom_bytes.to_vec(),
-            program_base,
             ram_init: HashMap::new(),
             input_offset: DEFAULT_INPUT_ADDR,
             chunk_rows: DEFAULT_CHUNK_ROWS,
@@ -405,7 +400,7 @@ impl NightstreamHost {
 
     /// Set an explicit max architectural instruction bound.
     ///
-    /// This is forwarded to `Rv32TraceWiring::max_steps`.
+    /// This is forwarded to `Rv64TraceWiring::max_steps`.
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = Some(max_steps);
         self
@@ -771,19 +766,18 @@ impl NightstreamHost {
         );
     }
 
-    /// Compute the SHA-256 code commitment of the ROM bytes.
+    /// Compute the SHA-256 code commitment of the guest bytes.
     pub fn compute_commitment(&self) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
         hasher.update(&self.rom_bytes);
         hasher.finalize().into()
     }
 
-    /// Build the `Rv32TraceWiring` runner from the current configuration.
-    fn build_runner(&self) -> Rv32TraceWiring {
-        let mut builder = Rv32TraceWiring::from_rom(self.program_base, &self.rom_bytes)
-            .xlen(32)
-            .chunk_rows(self.chunk_rows)
-            .shout_auto_minimal();
+    /// Build the `Rv64TraceWiring` runner from the current configuration.
+    fn build_runner(&self) -> Result<Rv64TraceWiring> {
+        let mut builder = Rv64TraceWiring::from_elf(&self.rom_bytes)
+            .map_err(|e| anyhow::anyhow!("Nightstream RV64 guest load failed: {:?}", e))?
+            .chunk_rows(self.chunk_rows);
 
         if let Some(max_steps) = self.max_steps {
             // Keep the trace geometry aligned with the expected execution length.
@@ -799,65 +793,22 @@ impl NightstreamHost {
             builder = builder.output_claim(addr, F::from_u64(value));
         }
 
-        builder
-    }
-
-    /// Derive final RAM values for a set of output addresses from execution rows.
-    fn derive_claimed_output_values_from_exec(
-        exec: &Rv32ExecTable,
-        ram_init: &HashMap<u64, u64>,
-        output_addrs: &[u64],
-    ) -> Vec<(u64, u32)> {
-        let output_addr_set: HashSet<u64> = output_addrs.iter().copied().collect();
-        let mut final_values: HashMap<u64, u32> =
-            output_addrs.iter().map(|&addr| (addr, 0u32)).collect();
-
-        for (&addr, &value) in ram_init {
-            if output_addr_set.contains(&addr) {
-                final_values.insert(addr, value as u32);
-            }
-        }
-
-        for row in exec.rows.iter().filter(|r| r.active) {
-            for ev in &row.ram_events {
-                if ev.kind == TwistOpKind::Write && output_addr_set.contains(&ev.addr) {
-                    final_values.insert(ev.addr, ev.value as u32);
-                }
-            }
-        }
-
-        output_addrs
-            .iter()
-            .map(|addr| (*addr, *final_values.get(addr).unwrap_or(&0u32)))
-            .collect()
-    }
-
-    /// Return `(addr, expected, actual)` mismatches for output claims.
-    fn output_claim_mismatches(
-        expected_claims: &[(u64, u64)],
-        observed_claims: &[(u64, u32)],
-    ) -> Vec<(u64, u32, u32)> {
-        let observed: HashMap<u64, u32> = observed_claims.iter().copied().collect();
-        expected_claims
-            .iter()
-            .map(|&(addr, expected)| (addr, expected as u32, *observed.get(&addr).unwrap_or(&0u32)))
-            .filter(|(_, expected, actual)| expected != actual)
-            .collect()
+        Ok(builder)
     }
 
     /// Build and prove a trace run, returning the in-memory run handle.
     ///
     /// This is useful for tests/benchmarks that want to call `run.verify()`
     /// without replaying proving from a serialized proof package.
-    pub fn prove_run(&mut self) -> Result<Rv32TraceWiringRun> {
-        self.prove_with_output_claim_repair()
+    pub fn prove_run(&mut self) -> Result<Rv64TraceWiringRun> {
+        self.prove_run_once()
     }
 
     /// Build the run configuration for proof packaging.
-    fn build_config(&self, run: &Rv32TraceWiringRun) -> Rv32TraceWiringRunConfig {
-        Rv32TraceWiringRunConfig {
-            program_base: self.program_base,
-            xlen: 32,
+    fn build_config(&self, run: &Rv64TraceWiringRun) -> Rv64TraceWiringRunConfig {
+        Rv64TraceWiringRunConfig {
+            program_base: 0,
+            xlen: 64,
             chunk_rows: self.chunk_rows,
             max_steps: self.max_steps,
             trace_len: Some(run.trace_len()),
@@ -869,19 +820,19 @@ impl NightstreamHost {
     }
 }
 
-/// Host arguments for Nightstream: ROM bytes + program base address.
+/// Host arguments for Nightstream: guest bytes + compatibility base address.
 #[derive(Clone, Debug, Default)]
 pub struct NightstreamHostArgs {
-    /// ROM bytes from the `.neo_start` ELF section.
+    /// Guest bytes for the circuit (currently the full RV64IM ELF).
     pub rom_bytes: Vec<u8>,
-    /// Program base address (from .neo_start section header).
+    /// Reserved for compatibility with the old ROM-based flow. Currently unused.
     pub program_base: u64,
     /// Optional max architectural instruction bound.
     pub max_steps: Option<usize>,
 }
 
 impl NightstreamHostArgs {
-    /// Create new host args from ROM bytes and base address.
+    /// Create new host args from guest bytes and a compatibility base address.
     pub fn new(rom_bytes: Vec<u8>, program_base: u64) -> Self {
         Self {
             rom_bytes,
@@ -930,13 +881,13 @@ impl ZkvmHost for NightstreamHost {
     fn run(&mut self, with_proof: bool) -> Result<Vec<u8>> {
         if with_proof {
             tracing::info!(
-                "Nightstream: Generating proof with Rv32TraceWiring (chunk_rows={}, max_steps={:?})",
+                "Nightstream: Generating proof with Rv64TraceWiring (chunk_rows={}, max_steps={:?})",
                 self.chunk_rows,
                 self.max_steps,
             );
 
             let prove_start = std::time::Instant::now();
-            let run = self.prove_with_output_claim_repair()?;
+            let run = self.prove_run_once()?;
             let prove_ms = prove_start.elapsed().as_millis();
 
             tracing::info!(
@@ -966,7 +917,7 @@ impl ZkvmHost for NightstreamHost {
             let proof_steps = run.proof().steps.len();
             let proof = encode_shard_proof_bytes(run.proof())
                 .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
-            let steps_public = run.steps_public();
+            let steps_public = Vec::new();
 
             tracing::info!(
                 "Nightstream: proof generated in {}ms, {} folding steps, {} step instances",
@@ -994,7 +945,7 @@ impl ZkvmHost for NightstreamHost {
                 let total = sz_proof + sz_steps + sz_rom + sz_config + sz_output;
                 tracing::info!(
                     "Nightstream proof package size breakdown: \
-                     proof={:.2}MB, steps_public={:.2}MB, rom={:.1}KB, \
+                     proof={:.2}MB, steps_public={:.2}MB, guest={:.1}KB, \
                      config={:.1}KB, output={} bytes, total={:.2}MB",
                     sz_proof as f64 / 1_048_576.0,
                     sz_steps as f64 / 1_048_576.0,
@@ -1026,13 +977,13 @@ impl ZkvmHost for NightstreamHost {
                 }
             };
 
-            let builder = self.build_runner();
+            let builder = self.build_runner()?;
             let run = builder
                 .prove()
                 .map_err(|e| anyhow::anyhow!("Nightstream simulation prove failed: {:?}", e))?;
             let proof = encode_shard_proof_bytes(run.proof())
                 .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
-            let steps_public = run.steps_public();
+            let steps_public = Vec::new();
 
             let package = NightstreamProofPackage {
                 proof,
@@ -1062,80 +1013,14 @@ fn compress_proof_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl NightstreamHost {
-    /// Prove once, then if output claims mismatch the observed final RAM, reconcile
-    /// claims and re-prove a second time with corrected output bindings.
-    fn prove_with_output_claim_repair(&mut self) -> Result<Rv32TraceWiringRun> {
-        let mut run = self
-            .build_runner()
+    /// Prove once with the current RAM initialization and output claims.
+    ///
+    /// For RV64, output claims are enforced directly by Nightstream during proving,
+    /// so the successful run is already the authoritative binding source.
+    fn prove_run_once(&mut self) -> Result<Rv64TraceWiringRun> {
+        self.build_runner()?
             .prove()
-            .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))?;
-
-        if self.output_claims.is_empty() {
-            return Ok(run);
-        }
-
-        let output_addrs: Vec<u64> = self.output_claims.iter().map(|(addr, _)| *addr).collect();
-        let observed = Self::derive_claimed_output_values_from_exec(
-            run.exec_table(),
-            &self.ram_init,
-            &output_addrs,
-        );
-        let mismatches = Self::output_claim_mismatches(&self.output_claims, &observed);
-        if mismatches.is_empty() {
-            return Ok(run);
-        }
-
-        let preview = mismatches
-            .iter()
-            .take(8)
-            .map(|(addr, expected, actual)| {
-                format!("0x{addr:08x}: expected=0x{expected:08x} actual=0x{actual:08x}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::warn!(
-            "Nightstream output-claim mismatch detected ({} of {}). Re-proving with observed final RAM outputs. First mismatches: {}",
-            mismatches.len(),
-            self.output_claims.len(),
-            preview
-        );
-
-        self.output_claims = observed
-            .into_iter()
-            .map(|(addr, value)| (addr, value as u64))
-            .collect();
-
-        run = self.build_runner().prove().map_err(|e| {
-            anyhow::anyhow!(
-                "Nightstream re-proving failed after output-claim reconciliation: {:?}",
-                e
-            )
-        })?;
-
-        let observed_after = Self::derive_claimed_output_values_from_exec(
-            run.exec_table(),
-            &self.ram_init,
-            &output_addrs,
-        );
-        let mismatches_after = Self::output_claim_mismatches(&self.output_claims, &observed_after);
-        if !mismatches_after.is_empty() {
-            let preview_after = mismatches_after
-                .iter()
-                .take(8)
-                .map(|(addr, expected, actual)| {
-                    format!("0x{addr:08x}: expected=0x{expected:08x} actual=0x{actual:08x}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "Nightstream output-claim mismatch persisted after reconciliation: {} of {} claims differ [{}]",
-                mismatches_after.len(),
-                self.output_claims.len(),
-                preview_after
-            );
-        }
-
-        Ok(run)
+            .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))
     }
 
     /// Extract the public output for the proof package.
@@ -1144,7 +1029,7 @@ impl NightstreamHost {
     /// those bytes directly (the output claims enforce correctness at the ZK level).
     ///
     /// Otherwise, falls back to reconstructing raw bytes from output claims.
-    fn extract_output_from_run(&self, _run: &Rv32TraceWiringRun) -> Result<Vec<u8>> {
+    fn extract_output_from_run(&self, _run: &Rv64TraceWiringRun) -> Result<Vec<u8>> {
         if !self.output_claims.is_empty() {
             if let Some(fmt) = &self.public_output_format {
                 return match fmt {
@@ -1168,7 +1053,7 @@ impl NightstreamHost {
 
     /// Try a simulation run (no proof, just execution) to extract output.
     fn try_simulate(&self) -> Result<Vec<u8>> {
-        let builder = self.build_runner();
+        let builder = self.build_runner()?;
         let run = builder
             .prove()
             .map_err(|e| anyhow::anyhow!("Nightstream simulation failed: {:?}", e))?;

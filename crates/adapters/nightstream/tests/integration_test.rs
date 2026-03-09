@@ -40,9 +40,37 @@ mod note_deposit_rom {
     ));
 }
 
-const POSEIDON_TLEN_AUTOTUNE_CAP: usize = 510;
+const NOTE_SPEND_TLEN_AUTOTUNE_CAP: usize = usize::MAX;
+const NOTE_DEPOSIT_TLEN_AUTOTUNE_CAP: usize = usize::MAX;
 
-fn max_consecutive_pc_run(exec: &neo_memory::riscv::exec_table::Rv32ExecTable) -> usize {
+fn exec_table_from_sim(
+    sim: &neo_vm_trace::VmTrace<u64, u64, u128>,
+) -> neo_memory::riscv::exec_table::RiscvExecTable {
+    neo_memory::riscv::exec_table::RiscvExecTable::from_trace_padded_with_xlen(
+        sim,
+        sim.steps.len(),
+        64,
+    )
+    .expect("simulation exec table")
+}
+
+fn simulate_rv64_elf(
+    elf: &[u8],
+    ram_pairs: &[(u64, u32)],
+    max_steps: usize,
+) -> neo_vm_trace::VmTrace<u64, u64, u128> {
+    use neo_fold::rv64_trace_shard::Rv64TraceWiring;
+
+    let mut wiring = Rv64TraceWiring::from_elf(elf)
+        .expect("load RV64 guest")
+        .max_steps(max_steps);
+    for &(addr, val) in ram_pairs {
+        wiring = wiring.ram_init_u32(addr, val);
+    }
+    wiring.simulate().expect("simulation trace")
+}
+
+fn max_consecutive_pc_run(exec: &neo_memory::riscv::exec_table::RiscvExecTable) -> usize {
     let mut best = 1usize;
     let mut cur = 0usize;
     let mut prev_pc: Option<u64> = None;
@@ -59,7 +87,7 @@ fn max_consecutive_pc_run(exec: &neo_memory::riscv::exec_table::Rv32ExecTable) -
 }
 
 fn boundary_splits_virtual_sequence(
-    exec: &neo_memory::riscv::exec_table::Rv32ExecTable,
+    exec: &neo_memory::riscv::exec_table::RiscvExecTable,
     chunk_rows: usize,
 ) -> bool {
     if chunk_rows == 0 {
@@ -84,7 +112,7 @@ fn boundary_splits_virtual_sequence(
 }
 
 fn effective_step_rows_for_requested(
-    exec: &neo_memory::riscv::exec_table::Rv32ExecTable,
+    exec: &neo_memory::riscv::exec_table::RiscvExecTable,
     requested_chunk_rows_arch: usize,
 ) -> usize {
     let requested_chunk_rows = requested_chunk_rows_arch.max(max_consecutive_pc_run(exec));
@@ -100,7 +128,7 @@ fn effective_step_rows_for_requested(
 }
 
 fn auto_tune_chunk_rows(
-    exec: &neo_memory::riscv::exec_table::Rv32ExecTable,
+    exec: &neo_memory::riscv::exec_table::RiscvExecTable,
     requested_chunk_rows_arch: usize,
     t_len_cap: usize,
 ) -> (usize, usize) {
@@ -108,20 +136,26 @@ fn auto_tune_chunk_rows(
         .min(exec.rows.len().max(1))
         .min(t_len_cap)
         .max(1);
-    let mut best = None::<(usize, usize)>;
+    let total_rows = exec.rows.len().max(1);
+    let mut best = None::<(usize, usize, usize)>;
     for candidate in 1..=search_max {
         let step_rows = effective_step_rows_for_requested(exec, candidate);
         if step_rows > t_len_cap {
             continue;
         }
+        let fold_count = total_rows.div_ceil(step_rows.max(1));
         match best {
-            Some((best_chunk_rows, best_step_rows))
-                if step_rows < best_step_rows
-                    || (step_rows == best_step_rows && candidate <= best_chunk_rows) => {}
-            _ => best = Some((candidate, step_rows)),
+            Some((best_chunk_rows, best_step_rows, best_fold_count))
+                if fold_count > best_fold_count
+                    || (fold_count == best_fold_count && step_rows < best_step_rows)
+                    || (fold_count == best_fold_count
+                        && step_rows == best_step_rows
+                        && candidate >= best_chunk_rows) => {}
+            _ => best = Some((candidate, step_rows, fold_count)),
         }
     }
-    best.unwrap_or((1usize, effective_step_rows_for_requested(exec, 1usize)))
+    best.map(|(chunk_rows, step_rows, _)| (chunk_rows, step_rows))
+        .unwrap_or((1usize, effective_step_rows_for_requested(exec, 1usize)))
 }
 
 fn parse_usize_after(msg: &str, key: &str) -> Option<usize> {
@@ -194,7 +228,7 @@ fn test_prove_and_verify_value_validator() {
     let mut host = NightstreamHost::from_args(&args);
 
     // Configure the host with the value-validator inputs.
-    // The guest expects two u32 values at RAM[0x104]:
+    // The RV64 `#[provable]` wrapper reads two u32 values starting at RAM[0x108]:
     //   - proven: u32 (the value to validate)
     //   - claimed: u32 (must equal proven)
     host.add_u32_input(test_value); // proven
@@ -287,11 +321,7 @@ fn test_verify_with_wrong_commitment() {
 #[test]
 fn test_note_spend_prove_verify_with_witness() {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
-    use neo_memory::riscv::exec_table::Rv32ExecTable;
-    use neo_memory::riscv::lookups::{
-        decode_program, RiscvCpu, RiscvMemory, RiscvShoutTables, PROG_ID, RAM_ID,
-    };
-    use neo_vm_trace::{trace_program, Twist};
+    use neo_fold::rv64_trace_shard::Rv64TraceWiring;
     use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
     use sov_nightstream_adapter::{
@@ -535,27 +565,11 @@ fn test_note_spend_prove_verify_with_witness() {
     host.write_note_spend_witness(&witness, public_bytes);
 
     let ram_pairs = host.ram_init_pairs();
-    let low_ram_preview: Vec<(u64, u32)> = ram_pairs
-        .iter()
-        .copied()
-        .filter(|(addr, _)| *addr >= 0x4100 && *addr <= 0x4140)
-        .take(16)
-        .collect();
-    println!("low_ram_preview={low_ram_preview:?}");
-    println!("witness_ram_words={}", ram_pairs.len());
 
     // Mirror the Nightstream benchmark flow: simulate first, require halt,
     // then set proving bounds from the observed execution profile.
     let (executed_steps, sim_exec) = {
-        let decoded = decode_program(rom).expect("decode ROM");
-        let mut cpu = RiscvCpu::new(32);
-        cpu.load_program(base, decoded);
-        let mut twist = RiscvMemory::with_program_in_twist(32, PROG_ID, base, rom);
-        for &(addr, val) in &ram_pairs {
-            twist.store(RAM_ID, addr, val as u64);
-        }
-        let shout = RiscvShoutTables::new(32);
-        let sim = trace_program(cpu, twist, shout, 200_000).expect("simulation trace");
+        let sim = simulate_rv64_elf(rom, &ram_pairs, 200_000);
         println!(
             "trace_sim_steps={} trace_sim_did_halt={} trace_sim_total_twist_events={} trace_sim_total_shout_events={}",
             sim.len(),
@@ -577,8 +591,7 @@ fn test_note_spend_prove_verify_with_witness() {
             println!("trace_sim_tail={tail:?}");
             panic!("circuit did not halt within 200K simulation steps");
         }
-        let exec =
-            Rv32ExecTable::from_trace_padded(&sim, sim.steps.len()).expect("simulation exec table");
+        let exec = exec_table_from_sim(&sim);
         (sim.steps.len(), exec)
     };
 
@@ -587,7 +600,7 @@ fn test_note_spend_prove_verify_with_witness() {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0);
     let requested_chunk_rows = chunk_rows_override
-        .unwrap_or(executed_steps.min(POSEIDON_TLEN_AUTOTUNE_CAP))
+        .unwrap_or(executed_steps.min(NOTE_SPEND_TLEN_AUTOTUNE_CAP))
         .min(executed_steps)
         .max(1);
     let (chunk_rows, estimated_step_rows) = match chunk_rows_override {
@@ -595,7 +608,7 @@ fn test_note_spend_prove_verify_with_witness() {
             requested_chunk_rows,
             effective_step_rows_for_requested(&sim_exec, requested_chunk_rows),
         ),
-        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, POSEIDON_TLEN_AUTOTUNE_CAP),
+        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, NOTE_SPEND_TLEN_AUTOTUNE_CAP),
     };
     let no_output_binding = std::env::var_os("NS_PERF_NO_OUTPUT_BINDING").is_some();
     println!(
@@ -613,15 +626,10 @@ fn test_note_spend_prove_verify_with_witness() {
     const MAX_POSEIDON_RETRIES: usize = 8;
     let mut run = loop {
         if no_output_binding {
-            use neo_fold::riscv_trace_shard::Rv32TraceWiring;
-            let mut wiring = Rv32TraceWiring::from_rom(
-                note_spend_rom::NOTE_SPEND_ROM_BASE,
-                &note_spend_rom::NOTE_SPEND_ROM,
-            )
-            .xlen(32)
+            let mut wiring = Rv64TraceWiring::from_elf(&note_spend_rom::NOTE_SPEND_ROM)
+                .expect("load RV64 guest")
             .chunk_rows(prove_chunk_rows)
-            .max_steps(executed_steps)
-            .shout_auto_minimal();
+            .max_steps(executed_steps);
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }
@@ -703,9 +711,14 @@ fn test_note_spend_prove_verify_with_witness() {
     println!("  Folding steps:    {}", run.fold_count());
     println!("  CCS constraints:  {}", run.ccs_num_constraints());
     println!("  CCS variables:    {}", run.ccs_num_variables());
+    let has_shout_events = run
+        .exec_table()
+        .rows
+        .iter()
+        .any(|row| !row.shout_events.is_empty());
     println!(
-        "  Requires Poseidon stage: {}",
-        run.requires_poseidon_stage()
+        "  Has shout events:  {}",
+        has_shout_events
     );
     if std::env::var_os("NS_MEASURE_PROOF_SIZE").is_some() {
         if no_output_binding {
@@ -750,14 +763,9 @@ fn test_note_spend_prove_verify_with_witness() {
 
 /// Full prove+verify cycle for the note-deposit circuit with a valid witness.
 #[test]
-#[ignore = "requires lower t_len/chunk tuning for poseidon-precompile split cap"]
 fn test_note_deposit_prove_verify_with_witness() {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
-    use neo_memory::riscv::exec_table::Rv32ExecTable;
-    use neo_memory::riscv::lookups::{
-        decode_program, RiscvCpu, RiscvMemory, RiscvShoutTables, PROG_ID, RAM_ID,
-    };
-    use neo_vm_trace::{trace_program, Twist};
+    use neo_fold::rv64_trace_shard::Rv64TraceWiring;
     use p3_field::{PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
     use sov_nightstream_adapter::{default_blacklist_root, BlacklistProof, NoteDepositWitness};
@@ -850,23 +858,9 @@ fn test_note_deposit_prove_verify_with_witness() {
 
     let ram_pairs = host.ram_init_pairs();
     let (executed_steps, sim_exec) = {
-        let decoded = decode_program(&note_deposit_rom::NOTE_DEPOSIT_ROM).expect("decode ROM");
-        let mut cpu = RiscvCpu::new(32);
-        cpu.load_program(note_deposit_rom::NOTE_DEPOSIT_ROM_BASE, decoded);
-        let mut twist = RiscvMemory::with_program_in_twist(
-            32,
-            PROG_ID,
-            note_deposit_rom::NOTE_DEPOSIT_ROM_BASE,
-            &note_deposit_rom::NOTE_DEPOSIT_ROM,
-        );
-        for &(addr, val) in &ram_pairs {
-            twist.store(RAM_ID, addr, val as u64);
-        }
-        let shout = RiscvShoutTables::new(32);
-        let sim = trace_program(cpu, twist, shout, 200_000).expect("simulation trace");
+        let sim = simulate_rv64_elf(&note_deposit_rom::NOTE_DEPOSIT_ROM, &ram_pairs, 200_000);
         assert!(sim.did_halt(), "note-deposit circuit did not halt");
-        let exec =
-            Rv32ExecTable::from_trace_padded(&sim, sim.steps.len()).expect("simulation exec table");
+        let exec = exec_table_from_sim(&sim);
         (sim.steps.len(), exec)
     };
 
@@ -875,7 +869,7 @@ fn test_note_deposit_prove_verify_with_witness() {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0);
     let requested_chunk_rows = chunk_rows_override
-        .unwrap_or(executed_steps.min(POSEIDON_TLEN_AUTOTUNE_CAP))
+        .unwrap_or(executed_steps.min(NOTE_DEPOSIT_TLEN_AUTOTUNE_CAP))
         .min(executed_steps)
         .max(1);
     let (chunk_rows, estimated_step_rows) = match chunk_rows_override {
@@ -883,7 +877,7 @@ fn test_note_deposit_prove_verify_with_witness() {
             requested_chunk_rows,
             effective_step_rows_for_requested(&sim_exec, requested_chunk_rows),
         ),
-        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, POSEIDON_TLEN_AUTOTUNE_CAP),
+        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, NOTE_DEPOSIT_TLEN_AUTOTUNE_CAP),
     };
     println!(
         "note_deposit: selected_chunk_rows={} selected_max_steps={} estimated_step_rows={} chunk_override={}",
@@ -900,15 +894,10 @@ fn test_note_deposit_prove_verify_with_witness() {
     const MAX_POSEIDON_RETRIES: usize = 8;
     let mut run = loop {
         if no_output_binding {
-            use neo_fold::riscv_trace_shard::Rv32TraceWiring;
-            let mut wiring = Rv32TraceWiring::from_rom(
-                note_deposit_rom::NOTE_DEPOSIT_ROM_BASE,
-                &note_deposit_rom::NOTE_DEPOSIT_ROM,
-            )
-            .xlen(32)
+            let mut wiring = Rv64TraceWiring::from_elf(&note_deposit_rom::NOTE_DEPOSIT_ROM)
+                .expect("load RV64 guest")
             .chunk_rows(prove_chunk_rows)
-            .max_steps(executed_steps)
-            .shout_auto_minimal();
+            .max_steps(executed_steps);
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }
@@ -1027,10 +1016,9 @@ fn test_note_deposit_prove_verify_with_witness() {
 #[ignore = "debug helper for replaying captured /prove witness payloads"]
 fn test_note_spend_replay_witness_json() {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
-    use neo_memory::riscv::lookups::{
-        decode_program, RiscvCpu, RiscvMemory, RiscvShoutTables, PROG_ID, RAM_ID,
-    };
-    use neo_vm_trace::{trace_program, Twist};
+    use neo_fold::rv64_trace_shard::Rv64TraceWiring;
+    use neo_memory::riscv::exec_table::RiscvExecTable;
+    use neo_memory::riscv::lookups::RAM_ID;
     use p3_field::{PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
     use sov_nightstream_adapter::{default_blacklist_root, NoteSpendWitness};
@@ -1329,20 +1317,7 @@ fn test_note_spend_replay_witness_json() {
         .filter(|(addr, _)| *addr >= 0x4100 && *addr <= 0x4140)
         .collect();
     println!("replay_ram_preview={ram_preview:?}");
-    let decoded = decode_program(&note_spend_rom::NOTE_SPEND_ROM).expect("decode ROM");
-    let mut cpu = RiscvCpu::new(32);
-    cpu.load_program(note_spend_rom::NOTE_SPEND_ROM_BASE, decoded);
-    let mut twist = RiscvMemory::with_program_in_twist(
-        32,
-        PROG_ID,
-        note_spend_rom::NOTE_SPEND_ROM_BASE,
-        &note_spend_rom::NOTE_SPEND_ROM,
-    );
-    for &(addr, val) in &ram_pairs {
-        twist.store(RAM_ID, addr, val as u64);
-    }
-    let shout = RiscvShoutTables::new(32);
-    let sim = trace_program(cpu, twist, shout, 300_000).expect("simulation trace");
+    let sim = simulate_rv64_elf(&note_spend_rom::NOTE_SPEND_ROM, &ram_pairs, 300_000);
     let debug_addr: u64 = 0x4090;
     let debug_writes = sim
         .steps
@@ -1397,15 +1372,13 @@ fn test_note_spend_replay_witness_json() {
         })
         .unwrap_or(false);
     if replay_prove {
-        use neo_fold::riscv_trace_shard::Rv32TraceWiring;
         use neo_math::F;
-        use neo_memory::riscv::exec_table::Rv32ExecTable;
         use neo_vm_trace::TwistOpKind;
         use p3_field::PrimeCharacteristicRing;
         use std::collections::{BTreeSet, HashMap};
 
         fn derive_output_claims_for_addresses(
-            exec: &Rv32ExecTable,
+            exec: &RiscvExecTable,
             ram_pairs: &[(u64, u32)],
             output_addrs: &[u64],
         ) -> Vec<(u64, u32)> {
@@ -1506,8 +1479,7 @@ fn test_note_spend_replay_witness_json() {
             .iter()
             .map(|(addr, _)| *addr)
             .collect();
-        let sim_exec =
-            Rv32ExecTable::from_trace_padded(&sim, sim.steps.len()).expect("simulation exec table");
+        let sim_exec = exec_table_from_sim(&sim);
         let output_min = output_addrs.iter().copied().min().unwrap_or(0);
         let output_max = output_addrs.iter().copied().max().unwrap_or(0);
         let output_writes = sim_exec
@@ -1571,13 +1543,10 @@ fn test_note_spend_replay_witness_json() {
             })
             .unwrap_or(false);
         if !skip_wiring {
-            let mut wiring = Rv32TraceWiring::from_rom(
-                note_spend_rom::NOTE_SPEND_ROM_BASE,
-                &note_spend_rom::NOTE_SPEND_ROM,
-            )
-            .xlen(32)
+            let mut wiring = Rv64TraceWiring::from_elf(&note_spend_rom::NOTE_SPEND_ROM)
+                .expect("load RV64 guest")
             .chunk_rows(chunk_rows)
-            .shout_auto_minimal();
+            .max_steps(sim.steps.len());
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }

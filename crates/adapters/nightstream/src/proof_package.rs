@@ -1,8 +1,8 @@
 //! Proof package for Nightstream proofs.
 //!
-//! Defines `NightstreamProofPackage` and `Rv32TraceWiringRunConfig` locally so the
-//! sovereign-ligero adapter is self-contained -- no `sovereign_bridge` module
-//! in the Nightstream crate is needed.
+//! Defines `NightstreamProofPackage` and `Rv64TraceWiringRunConfig` locally so the
+//! sovereign-ligero adapter is self-contained without depending on Nightstream's
+//! internal bridge modules.
 
 use crate::circuit_output::{
     deposit_public_bytes_from_output_claims, spend_public_bytes_from_output_claims,
@@ -10,7 +10,7 @@ use crate::circuit_output::{
 use neo_ajtai::Commitment as Cmt;
 use neo_ccs::{matrix::Mat, CeClaim};
 use neo_fold::pi_ccs::rot_rhos_to_mats;
-use neo_fold::riscv_trace_shard::Rv32TraceWiring;
+use neo_fold::rv64_trace_shard::Rv64TraceWiring;
 use neo_fold::shard::{
     BatchedTimeProof, FoldStep, MemOrLutProof, MemSidecarProof, RlcDecProof, ShardProof, StepProof,
 };
@@ -39,12 +39,12 @@ pub enum PublicOutputFormat {
     NoteDepositV1,
 }
 
-/// Configuration needed to reconstruct a run from ROM bytes.
+/// Configuration needed to reconstruct a run from guest bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Rv32TraceWiringRunConfig {
-    /// Program base address (must be 0 for current Nightstream).
+pub struct Rv64TraceWiringRunConfig {
+    /// Reserved for compatibility with the old ROM-based flow. Always `0`.
     pub program_base: u64,
-    /// Word size (must be 32).
+    /// Word size (must be 64 for RV64IM guests).
     pub xlen: usize,
     /// Rows per trace step used during proving (`chunk_rows` in builder).
     #[serde(default = "default_chunk_rows")]
@@ -79,7 +79,7 @@ pub struct PoolViewerSig {
     pub signature: Vec<u8>,
 }
 
-/// A self-contained proof package for Nightstream RV32 proofs.
+/// A self-contained proof package for Nightstream RV64 proofs.
 ///
 /// Contains everything needed for an external verifier to check the proof
 /// without access to the original proving session.
@@ -93,17 +93,18 @@ pub struct NightstreamProofPackage {
     /// Public step instance bundles produced during proving.
     ///
     /// These carry per-step MCS commitments + public inputs, plus memory and
-    /// lookup instances. They are produced by `Rv32TraceWiringRun::steps_public()`.
+    /// lookup instances. The adapter keeps this field for package compatibility,
+    /// but the current RV64 host path does not populate it.
     pub steps_public: Vec<StepInstanceBundle<Cmt, F, K>>,
 
     /// Public output bytes (bincode-serialized application output).
     pub public_output: Vec<u8>,
 
-    /// ROM bytes (the `.neo_start` section of the guest ELF).
+    /// Guest bytes (currently the full RV64IM ELF).
     pub rom_bytes: Vec<u8>,
 
     /// Run configuration needed to reconstruct verification context.
-    pub config: Rv32TraceWiringRunConfig,
+    pub config: Rv64TraceWiringRunConfig,
 
     /// Optional pool-operator signature over the viewer FVK commitment.
     #[serde(default)]
@@ -130,16 +131,20 @@ impl NightstreamProofPackage {
         Ok(decode_shard_proof_wire(&self.proof)?.steps.len())
     }
 
-    /// Verify this proof package by reconstructing the run from ROM/config and
+    /// Verify this proof package by reconstructing the run from guest bytes/config and
     /// comparing canonical proof bytes.
     ///
     /// This keeps verification entirely inside the adapter without requiring serde
     /// support in upstream Nightstream proof structs.
     pub fn verify(&self) -> Result<bool, PiCcsError> {
-        let mut builder = Rv32TraceWiring::from_rom(self.config.program_base, &self.rom_bytes)
-            .xlen(self.config.xlen)
-            .chunk_rows(self.config.chunk_rows)
-            .shout_auto_minimal();
+        if self.config.xlen != 64 {
+            return Err(PiCcsError::InvalidInput(format!(
+                "Nightstream RV64 proof package requires xlen == 64 (got {})",
+                self.config.xlen
+            )));
+        }
+
+        let mut builder = Rv64TraceWiring::from_elf(&self.rom_bytes)?.chunk_rows(self.config.chunk_rows);
 
         if let Some(max_steps) = self.config.max_steps {
             builder = builder.max_steps(max_steps);
@@ -150,7 +155,7 @@ impl NightstreamProofPackage {
         }
 
         for (&reg, &value) in &self.config.reg_init {
-            builder = builder.reg_init_u32(reg, value as u32);
+            builder = builder.reg_init_u64(reg, value);
         }
 
         for &(addr, value) in &self.config.output_claims {

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the value_validator RISC-V guest and export its ROM as a Rust constant.
+# Build the value_validator RV64IM guest and export its checked-in bytes as a Rust constant.
 #
 # Prerequisites:
-#   rustup target add riscv32im-unknown-none-elf
+#   rustup toolchain install nightly
 #
 # The nightstream-sdk dependency is fetched from GitHub automatically via Cargo.
 #
@@ -16,14 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 NC='\033[0m'
-
-# Ensure riscv32im target is installed.
-if ! rustup target list --installed | grep -q riscv32im-unknown-none-elf; then
-    echo -e "${YELLOW}Installing riscv32im-unknown-none-elf target...${NC}"
-    rustup target add riscv32im-unknown-none-elf
-fi
 
 EXTRA_ARGS=()
 for arg in "$@"; do
@@ -35,4 +28,4 @@ done
 # Build and export.
 python3 export_rom_rs.py "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 
-echo -e "${GREEN}Done. ROM written to ../value_validator_rom.rs${NC}"
+echo -e "${GREEN}Done. Guest bytes written to ../value_validator_rom.rs${NC}"
