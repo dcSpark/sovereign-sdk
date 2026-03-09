@@ -42,7 +42,7 @@ bincode = { workspace = true }
 hex = { workspace = true }
 bech32 = { workspace = true }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-neo-ccs = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "4f959c1ce53e7181bf052a3d6d9163f68c9984a5" }
+neo-ccs = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "fc7986151b8a1b65391000f4281a9f2fefa6d300" }
 p3-goldilocks = "0.4.1"
 p3-field = "0.4.1"
 sov-bank = { workspace = true }

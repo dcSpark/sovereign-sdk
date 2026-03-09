@@ -1314,7 +1314,7 @@ fn test_note_spend_replay_witness_json() {
     let ram_preview: Vec<(u64, u32)> = ram_pairs
         .iter()
         .copied()
-        .filter(|(addr, _)| *addr >= 0x4100 && *addr <= 0x4140)
+        .filter(|(addr, _)| *addr >= 0x100 && *addr <= 0x140)
         .collect();
     println!("replay_ram_preview={ram_preview:?}");
     let sim = simulate_rv64_elf(&note_spend_rom::NOTE_SPEND_ROM, &ram_pairs, 300_000);
@@ -1425,7 +1425,7 @@ fn test_note_spend_replay_witness_json() {
         }
 
         let mut template_output_claims: Vec<(u64, u32)> = Vec::new();
-        let mut out_addr: u64 = 0x4100;
+        let mut out_addr: u64 = 0x100;
         push_digest_claim(&mut template_output_claims, &mut out_addr, &witness.anchor);
         push_u32_claim(
             &mut template_output_claims,

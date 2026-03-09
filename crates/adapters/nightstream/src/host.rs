@@ -13,11 +13,13 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use neo_fold::rv64_trace_shard::{Rv64TraceWiring, Rv64TraceWiringRun};
 use neo_math::F;
+use neo_memory::riscv::lookups::RAM_ID;
+use neo_vm_trace::TwistOpKind;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sov_rollup_interface::zk::ZkvmHost;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 
 use crate::circuit_output::{
@@ -34,11 +36,13 @@ use crate::{NightstreamCodeCommitment, NightstreamGuest};
 /// Default input address for generic guest ABIs.
 const DEFAULT_INPUT_ADDR: u64 = 0x108;
 
-/// Note-circuit input base. Kept away from low-memory startup zeroing.
-const NOTE_CIRCUIT_INPUT_ADDR: u64 = 0x4104;
+/// Note-spend input/output base. Matches the upstream Nightstream guest ABI.
+const NOTE_SPEND_INPUT_ADDR: u64 = 0x104;
+const NOTE_SPEND_OUTPUT_ADDR: u64 = 0x100;
 
-/// Note-circuit output base.
-const NOTE_CIRCUIT_OUTPUT_ADDR: u64 = 0x4100;
+/// Note-deposit input/output base. Kept away from low-memory startup zeroing.
+const NOTE_DEPOSIT_INPUT_ADDR: u64 = 0x4104;
+const NOTE_DEPOSIT_OUTPUT_ADDR: u64 = 0x4100;
 
 /// Default chunk rows (rows per trace-wiring folding step).
 const DEFAULT_CHUNK_ROWS: usize = 1 << 16;
@@ -521,7 +525,7 @@ impl NightstreamHost {
     /// Populate output claims for the note-spend circuit's `RamWriter` output layout.
     fn set_note_spend_output_claims(&mut self, witness: &NoteSpendWitness) {
         self.output_claims.clear();
-        let mut addr = NOTE_CIRCUIT_OUTPUT_ADDR;
+        let mut addr = NOTE_SPEND_OUTPUT_ADDR;
 
         let n_in = witness.inputs.len() as u32;
         let n_out = witness.outputs.len() as u32;
@@ -559,7 +563,7 @@ impl NightstreamHost {
     /// Populate output claims for the note-deposit circuit's `RamWriter` output layout.
     fn set_note_deposit_output_claims(&mut self, witness: &NoteDepositWitness) {
         self.output_claims.clear();
-        let mut addr = NOTE_CIRCUIT_OUTPUT_ADDR;
+        let mut addr = NOTE_DEPOSIT_OUTPUT_ADDR;
         let recipient = derive_address_v2(
             &witness.domain,
             &witness.pk_spend_recipient,
@@ -607,7 +611,7 @@ impl NightstreamHost {
     ///   The host recomputes canonical bytes from witness/output claims and stores
     ///   those for the proof package.
     pub fn write_note_spend_witness(&mut self, witness: &NoteSpendWitness, public_output: Vec<u8>) {
-        self.input_offset = NOTE_CIRCUIT_INPUT_ADDR;
+        self.input_offset = NOTE_SPEND_INPUT_ADDR;
         let n_in = witness.inputs.len() as u32;
         let n_out = witness.outputs.len() as u32;
 
@@ -727,7 +731,7 @@ impl NightstreamHost {
     /// 2. cm_out matches NOTE(domain, value, rho, recipient, recipient)
     /// 3. recipient is not blacklisted under blacklist_root
     pub fn write_note_deposit_witness(&mut self, witness: &NoteDepositWitness) {
-        self.input_offset = NOTE_CIRCUIT_INPUT_ADDR;
+        self.input_offset = NOTE_DEPOSIT_INPUT_ADDR;
         // Header + note fields
         self.write_ram_digest(&witness.domain);
         self.write_ram_u64(witness.value);
@@ -773,8 +777,8 @@ impl NightstreamHost {
         hasher.finalize().into()
     }
 
-    /// Build the `Rv64TraceWiring` runner from the current configuration.
-    fn build_runner(&self) -> Result<Rv64TraceWiring> {
+    /// Build an `Rv64TraceWiring` runner with guest bytes and RAM initialization.
+    fn build_base_runner(&self) -> Result<Rv64TraceWiring> {
         let mut builder = Rv64TraceWiring::from_elf(&self.rom_bytes)
             .map_err(|e| anyhow::anyhow!("Nightstream RV64 guest load failed: {:?}", e))?
             .chunk_rows(self.chunk_rows);
@@ -789,11 +793,76 @@ impl NightstreamHost {
             builder = builder.ram_init_u32(addr, value as u32);
         }
 
+        Ok(builder)
+    }
+
+    /// Build the `Rv64TraceWiring` runner from the current configuration.
+    fn build_runner(&self) -> Result<Rv64TraceWiring> {
+        let mut builder = self.build_base_runner()?;
+
         for &(addr, value) in &self.output_claims {
             builder = builder.output_claim(addr, F::from_u64(value));
         }
 
         Ok(builder)
+    }
+
+    /// Align note-spend output claims with the upstream RV64 flow.
+    ///
+    /// Upstream derives output binding claims from a simulation trace rather
+    /// than reconstructing them from the witness structure. This keeps the host
+    /// and guest aligned even when the guest's internal witness/public-output
+    /// semantics evolve.
+    fn refresh_note_spend_output_claims_from_simulation(&mut self) -> Result<()> {
+        if self.public_output_format != Some(PublicOutputFormat::NoteSpendV1)
+            || self.output_claims.is_empty()
+        {
+            return Ok(());
+        }
+
+        let output_addrs: Vec<u64> = self.output_claims.iter().map(|(addr, _)| *addr).collect();
+        let output_addr_set: BTreeSet<u64> = output_addrs.iter().copied().collect();
+        let trace = self
+            .build_base_runner()?
+            .simulate()
+            .map_err(|e| anyhow::anyhow!("Nightstream output-claim simulation failed: {:?}", e))?;
+
+        if !trace.did_halt() {
+            let limit = self
+                .max_steps
+                .map(|steps| steps.to_string())
+                .unwrap_or_else(|| "default".to_owned());
+            return Err(anyhow::anyhow!(
+                "Nightstream output-claim simulation did not halt within max_steps={limit}"
+            ));
+        }
+
+        let mut final_output_values: HashMap<u64, u64> =
+            output_addr_set.iter().map(|&addr| (addr, 0u64)).collect();
+
+        for (&addr, &value) in &self.ram_init {
+            if output_addr_set.contains(&addr) {
+                final_output_values.insert(addr, value);
+            }
+        }
+
+        for step in &trace.steps {
+            for ev in &step.twist_events {
+                if ev.twist_id == RAM_ID
+                    && ev.kind == TwistOpKind::Write
+                    && output_addr_set.contains(&ev.addr)
+                {
+                    final_output_values.insert(ev.addr, ev.value as u64);
+                }
+            }
+        }
+
+        self.output_claims = output_addrs
+            .into_iter()
+            .map(|addr| (addr, *final_output_values.get(&addr).unwrap_or(&0u64)))
+            .collect();
+
+        Ok(())
     }
 
     /// Build and prove a trace run, returning the in-memory run handle.
@@ -1018,6 +1087,7 @@ impl NightstreamHost {
     /// For RV64, output claims are enforced directly by Nightstream during proving,
     /// so the successful run is already the authoritative binding source.
     fn prove_run_once(&mut self) -> Result<Rv64TraceWiringRun> {
+        self.refresh_note_spend_output_claims_from_simulation()?;
         self.build_runner()?
             .prove()
             .map_err(|e| anyhow::anyhow!("Nightstream proving failed: {:?}", e))
@@ -1052,7 +1122,8 @@ impl NightstreamHost {
     }
 
     /// Try a simulation run (no proof, just execution) to extract output.
-    fn try_simulate(&self) -> Result<Vec<u8>> {
+    fn try_simulate(&mut self) -> Result<Vec<u8>> {
+        self.refresh_note_spend_output_claims_from_simulation()?;
         let builder = self.build_runner()?;
         let run = builder
             .prove()
