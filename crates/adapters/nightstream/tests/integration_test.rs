@@ -762,13 +762,12 @@ fn test_note_spend_prove_verify_with_witness() {
     println!("=============================================\n");
 }
 
-/// Exercise the proof-pool viewer-attested note-spend path end-to-end.
-#[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "release-only: upstream Nightstream debug builds trip MLE assertions during prove"
-)]
-fn test_note_spend_prove_verify_with_viewer_witness() {
+/// Build a realistic viewer-attested note-spend witness mirroring proof-pool `/prove`.
+fn realistic_viewer_attested_note_spend_case(
+) -> (
+    sov_nightstream_adapter::NoteSpendWitness,
+    sov_nightstream_adapter::circuit_output::SpendPublicWire,
+) {
     use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
     use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
     use p3_goldilocks::Goldilocks;
@@ -1103,28 +1102,8 @@ fn test_note_spend_prove_verify_with_viewer_witness() {
             mac,
         }]),
     };
-    let public_bytes =
-        bincode::serialize(&expected_public).expect("serialize viewer public output");
 
-    let rom = &note_spend_rom::NOTE_SPEND_ROM;
-    let base = note_spend_rom::NOTE_SPEND_ROM_BASE;
-    let mut host = NightstreamHost::new(rom, base);
-    host.write_note_spend_witness(&witness, public_bytes);
-
-    let ram_pairs = host.ram_init_pairs();
-    let sim = simulate_rv64_elf(rom, &ram_pairs, 200_000);
-    assert!(
-        sim.did_halt(),
-        "viewer-attested witness must halt in simulation"
-    );
-    let commitment = host.code_commitment();
-    let proof_bytes = host
-        .run(true)
-        .expect("viewer-attested packaged proving should succeed");
-    let verified_public: SpendPublicWire = NightstreamVerifier::verify(&proof_bytes, &commitment)
-        .expect("viewer-attested proof should verify");
-
-    assert_eq!(verified_public, expected_public);
+    (witness, expected_public)
 }
 
 /// Full prove+verify cycle for the note-deposit circuit with a valid witness.
@@ -1376,42 +1355,44 @@ fn test_note_deposit_prove_verify_with_witness() {
     assert!(run.trace_len() > 0);
 }
 
-/// Replay a captured viewer-attested `/prove` witness through the full RV64
-/// proof path with output binding enabled.
+/// Exercise the proof-pool viewer-attested `/prove` flow without requiring an
+/// external JSON witness file.
 ///
-/// This mirrors the `proof-pool -> sov-proof-verifier-service /prove` path that
-/// starts failing once `POOL_FVK_PK` injects viewer attestations into the
-/// witness.
-///
-/// Usage:
-/// `NS_WITNESS_JSON=/tmp/nightstream_note_spend_viewer_witness.json \
-///    cargo test -p sov-nightstream-adapter --release --features native \
-///    test_note_spend_replay_viewer_witness_with_output_binding -- --ignored --nocapture`
+/// In release builds this runs the full prove + in-memory verify +
+/// packaged-proof verify path. In debug builds we still run the realistic
+/// witness through simulation and chunk-row tuning, but skip proving because
+/// upstream Nightstream currently trips debug-only MLE assertions.
 #[test]
-#[ignore = "debug helper for replaying proof-pool viewer witnesses with output binding enabled"]
 fn test_note_spend_replay_viewer_witness_with_output_binding() {
-    use sov_nightstream_adapter::NoteSpendWitness;
+    use sov_nightstream_adapter::circuit_output::SpendPublicWire;
 
-    let path = std::env::var("NS_WITNESS_JSON").expect("set NS_WITNESS_JSON to witness JSON path");
-    let bytes = std::fs::read(&path).expect("read witness JSON");
-    let witness: NoteSpendWitness = serde_json::from_slice(&bytes).expect("parse witness JSON");
+    let (witness, expected_public) = realistic_viewer_attested_note_spend_case();
+    let public_bytes =
+        bincode::serialize(&expected_public).expect("serialize viewer public output");
 
     assert!(
         !witness.viewers.is_empty(),
-        "captured witness must include viewer attestations to cover the proof-pool case"
+        "viewer-attested replay case must include viewers"
     );
+    for (viewer_idx, viewer) in witness.viewers.iter().enumerate() {
+        assert_eq!(
+            viewer.per_output.len(),
+            witness.outputs.len(),
+            "viewer[{viewer_idx}] per_output length must equal outputs length"
+        );
+    }
 
-    let mut host = NightstreamHost::new(
+    let mut sim_host = NightstreamHost::new(
         &note_spend_rom::NOTE_SPEND_ROM,
         note_spend_rom::NOTE_SPEND_ROM_BASE,
     );
-    host.write_note_spend_witness(&witness, vec![]);
+    sim_host.write_note_spend_witness(&witness, public_bytes.clone());
 
-    let ram_pairs = host.ram_init_pairs();
+    let ram_pairs = sim_host.ram_init_pairs();
     let sim = simulate_rv64_elf(&note_spend_rom::NOTE_SPEND_ROM, &ram_pairs, 300_000);
     assert!(
         sim.did_halt(),
-        "captured viewer witness must halt in simulation before proving"
+        "viewer-attested replay witness must halt in simulation before proving"
     );
 
     let sim_exec = exec_table_from_sim(&sim);
@@ -1422,679 +1403,91 @@ fn test_note_spend_replay_viewer_witness_with_output_binding() {
         NOTE_SPEND_TLEN_AUTOTUNE_CAP,
     );
     println!(
-        "viewer_replay_sim_steps={} chunk_rows={} estimated_step_rows={}",
+        "viewer_replay_sim_steps={} chunk_rows={} estimated_step_rows={} viewers={} outputs={} attestations={}",
         sim.steps.len(),
         chunk_rows,
-        estimated_step_rows
+        estimated_step_rows,
+        witness.viewers.len(),
+        witness.outputs.len(),
+        expected_public
+            .view_attestations
+            .as_ref()
+            .map(|atts| atts.len())
+            .unwrap_or(0),
     );
 
-    host.set_chunk_rows(chunk_rows);
-    host.set_max_steps(sim.steps.len());
-
-    match host.run(true) {
-        Ok(proof_bytes) => {
-            println!(
-                "viewer_replay_prove_ok=true proof_bytes={} chunk_rows={}",
-                proof_bytes.len(),
-                chunk_rows
-            );
-            assert!(!proof_bytes.is_empty(), "proof payload must not be empty");
-        }
-        Err(err) => {
-            let msg = err.to_string();
-            println!("viewer_replay_prove_error={msg}");
-            assert!(
-                msg.contains("RV64 RAM output binding mismatch")
-                    || msg.contains("Nightstream proving failed"),
-                "unexpected prove error while replaying viewer witness: {msg}"
-            );
-        }
-    }
-}
-
-/// Replay a captured note-spend witness JSON through simulation/proving.
-///
-/// Usage:
-/// `NS_WITNESS_JSON=/tmp/nightstream_note_spend_witness_fail_...json \
-///    cargo test -p sov-nightstream-adapter --release --features native \
-///    test_note_spend_replay_witness_json -- --ignored --nocapture`
-#[test]
-#[ignore = "debug helper for replaying captured /prove witness payloads"]
-fn test_note_spend_replay_witness_json() {
-    use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
-    use neo_fold::rv64_trace_shard::Rv64TraceWiring;
-    use neo_memory::riscv::exec_table::RiscvExecTable;
-    use neo_memory::riscv::lookups::RAM_ID;
-    use p3_field::{PrimeCharacteristicRing, PrimeField64};
-    use p3_goldilocks::Goldilocks;
-    use sov_nightstream_adapter::{default_blacklist_root, NoteSpendWitness};
-
-    let path = std::env::var("NS_WITNESS_JSON").expect("set NS_WITNESS_JSON to witness JSON path");
-    let bytes = std::fs::read(&path).expect("read witness JSON");
-    let witness: NoteSpendWitness = serde_json::from_slice(&bytes).expect("parse witness JSON");
-    println!(
-        "blacklist_root_is_default={}",
-        witness.blacklist_root == default_blacklist_root()
-    );
-
-    type GlDigest = [Goldilocks; 4];
-    const TAG_MT_NODE: u64 = 1;
-    const TAG_NOTE: u64 = 2;
-    const TAG_PRF_NF: u64 = 3;
-    const TAG_PK: u64 = 4;
-    const TAG_ADDR: u64 = 5;
-    const TAG_NFKEY: u64 = 6;
-    const TAG_BL_BUCKET: u64 = 7;
-    const BL_DEPTH: usize = 16;
-    const BL_BUCKET_SIZE: usize = 12;
-
-    fn hash32_to_gl(h: &[u8; 32]) -> GlDigest {
-        let mut d = [Goldilocks::ZERO; 4];
-        for i in 0..4 {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&h[i * 8..(i + 1) * 8]);
-            d[i] = Goldilocks::from_u64(u64::from_le_bytes(buf));
-        }
-        d
-    }
-
-    fn gl_to_hash32(d: &GlDigest) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for (i, elem) in d.iter().enumerate() {
-            out[i * 8..(i + 1) * 8].copy_from_slice(&elem.as_canonical_u64().to_le_bytes());
-        }
-        out
-    }
-
-    fn derive_pk_spend(spend_sk: &GlDigest) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 5];
-        inp[0] = Goldilocks::from_u64(TAG_PK);
-        inp[1..5].copy_from_slice(spend_sk);
-        poseidon2_hash(&inp)
-    }
-
-    fn derive_nf_key(domain: &GlDigest, spend_sk: &GlDigest) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 9];
-        inp[0] = Goldilocks::from_u64(TAG_NFKEY);
-        inp[1..5].copy_from_slice(domain);
-        inp[5..9].copy_from_slice(spend_sk);
-        poseidon2_hash(&inp)
-    }
-
-    fn derive_address(domain: &GlDigest, pk_spend: &GlDigest, pk_ivk: &GlDigest) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 13];
-        inp[0] = Goldilocks::from_u64(TAG_ADDR);
-        inp[1..5].copy_from_slice(domain);
-        inp[5..9].copy_from_slice(pk_spend);
-        inp[9..13].copy_from_slice(pk_ivk);
-        poseidon2_hash(&inp)
-    }
-
-    fn note_cm(
-        domain: &GlDigest,
-        value: u64,
-        rho: &GlDigest,
-        recipient: &GlDigest,
-        sender_id: &GlDigest,
-    ) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 18];
-        inp[0] = Goldilocks::from_u64(TAG_NOTE);
-        inp[1..5].copy_from_slice(domain);
-        inp[5] = Goldilocks::from_u64(value);
-        inp[6..10].copy_from_slice(rho);
-        inp[10..14].copy_from_slice(recipient);
-        inp[14..18].copy_from_slice(sender_id);
-        poseidon2_hash(&inp)
-    }
-
-    fn derive_nullifier(domain: &GlDigest, nf_key: &GlDigest, rho: &GlDigest) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 13];
-        inp[0] = Goldilocks::from_u64(TAG_PRF_NF);
-        inp[1..5].copy_from_slice(domain);
-        inp[5..9].copy_from_slice(nf_key);
-        inp[9..13].copy_from_slice(rho);
-        poseidon2_hash(&inp)
-    }
-
-    fn mt_node(level: u64, left: &GlDigest, right: &GlDigest) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 10];
-        inp[0] = Goldilocks::from_u64(TAG_MT_NODE);
-        inp[1] = Goldilocks::from_u64(level);
-        inp[2..6].copy_from_slice(left);
-        inp[6..10].copy_from_slice(right);
-        poseidon2_hash(&inp)
-    }
-
-    fn merkle_root(leaf: &GlDigest, pos: u32, siblings: &[[u8; 32]], depth: u32) -> GlDigest {
-        let mut cur = *leaf;
-        let mut p = pos;
-        for lvl in 0..depth as usize {
-            let sib = hash32_to_gl(&siblings[lvl]);
-            if (p & 1) == 0 {
-                cur = mt_node(lvl as u64, &cur, &sib);
-            } else {
-                cur = mt_node(lvl as u64, &sib, &cur);
-            }
-            p >>= 1;
-        }
-        cur
-    }
-
-    fn enforce_prod_digest_diff(mut acc: Goldilocks, a: &GlDigest, b: &GlDigest) -> Goldilocks {
-        for i in 0..4 {
-            acc *= a[i] - b[i];
-        }
-        acc
-    }
-
-    fn bl_bucket_leaf(entries: &[[u8; 32]; BL_BUCKET_SIZE]) -> GlDigest {
-        let mut inp = [Goldilocks::ZERO; 1 + BL_BUCKET_SIZE * 4];
-        inp[0] = Goldilocks::from_u64(TAG_BL_BUCKET);
-        for (i, e) in entries.iter().enumerate() {
-            let gl = hash32_to_gl(e);
-            let off = 1 + i * 4;
-            inp[off..off + 4].copy_from_slice(&gl);
-        }
-        poseidon2_hash(&inp)
-    }
-
-    fn bl_bucket_pos(id: &GlDigest) -> u32 {
-        let bytes = gl_to_hash32(id);
-        let mut pos = 0u32;
-        for i in 0..BL_DEPTH {
-            let byte = bytes[31 - (i / 8)];
-            let bit = (byte >> (i % 8)) & 1;
-            pos |= (bit as u32) << (i as u32);
-        }
-        pos
-    }
-
-    let domain_gl = hash32_to_gl(&witness.domain);
-    let spend_sk_gl = hash32_to_gl(&witness.spend_sk);
-    let pk_ivk_owner_gl = hash32_to_gl(&witness.pk_ivk_owner);
-    let pk_spend_owner_gl = derive_pk_spend(&spend_sk_gl);
-    let nf_key_gl = derive_nf_key(&domain_gl, &spend_sk_gl);
-    let recipient_owner_gl = derive_address(&domain_gl, &pk_spend_owner_gl, &pk_ivk_owner_gl);
-    let sender_id_out_gl = recipient_owner_gl;
-    let sender_id_out = gl_to_hash32(&sender_id_out_gl);
-    let mut input_anchor_ok = true;
-    let mut input_nf_ok = true;
-    let mut in_values = Vec::new();
-    let mut in_rhos = Vec::new();
-    let mut sum_in: u64 = 0;
-    for (idx, input) in witness.inputs.iter().enumerate() {
-        let rho_gl = hash32_to_gl(&input.rho);
-        let sender_gl = hash32_to_gl(&input.sender_id);
-        let cm_gl = note_cm(
-            &domain_gl,
-            input.value,
-            &rho_gl,
-            &recipient_owner_gl,
-            &sender_gl,
-        );
-        let root_gl = merkle_root(&cm_gl, input.position, &input.siblings, witness.depth);
-        let anchor_ok = gl_to_hash32(&root_gl) == witness.anchor;
-        let nf_gl = derive_nullifier(&domain_gl, &nf_key_gl, &rho_gl);
-        let nf_ok = gl_to_hash32(&nf_gl) == input.nullifier;
+    if cfg!(debug_assertions) {
         println!(
-            "replay_input[{idx}] anchor_ok={} nullifier_ok={} pos={} siblings={}",
-            anchor_ok,
-            nf_ok,
-            input.position,
-            input.siblings.len()
+            "viewer_replay_debug_skip=true reason=upstream_nightstream_debug_mle_assertion"
         );
-        input_anchor_ok &= anchor_ok;
-        input_nf_ok &= nf_ok;
-        in_values.push(input.value);
-        in_rhos.push(rho_gl);
-        sum_in = sum_in.wrapping_add(input.value);
+        return;
     }
-    println!(
-        "replay_inputs_anchor_all_ok={} replay_inputs_nullifier_all_ok={}",
-        input_anchor_ok, input_nf_ok
-    );
 
-    let mut output_cm_ok = true;
-    let mut out_values = Vec::new();
-    let mut out_rhos = Vec::new();
-    let mut out_recipients = Vec::new();
-    let mut sum_out: u64 = 0;
-    for (j, output) in witness.outputs.iter().enumerate() {
-        let out_rho_gl = hash32_to_gl(&output.rho);
-        let pk_spend_gl = hash32_to_gl(&output.pk_spend);
-        let pk_ivk_gl = hash32_to_gl(&output.pk_ivk);
-        let rcp_gl = derive_address(&domain_gl, &pk_spend_gl, &pk_ivk_gl);
-        let cm_gl = note_cm(
-            &domain_gl,
-            output.value,
-            &out_rho_gl,
-            &rcp_gl,
-            &sender_id_out_gl,
-        );
-        let cm_ok = gl_to_hash32(&cm_gl) == output.cm;
-        println!("replay_output[{j}] cm_ok={cm_ok}");
-        output_cm_ok &= cm_ok;
-        sum_out = sum_out.wrapping_add(output.value);
-        out_values.push(output.value);
-        out_rhos.push(out_rho_gl);
-        out_recipients.push(gl_to_hash32(&rcp_gl));
-    }
-    let balance_ok = sum_in == witness.withdraw_amount.wrapping_add(sum_out);
-    println!("replay_balance_ok={balance_ok}");
-
-    let mut enforce_prod = Goldilocks::ONE;
-    for v in &in_values {
-        enforce_prod *= Goldilocks::from_u64(*v);
-    }
-    for v in &out_values {
-        enforce_prod *= Goldilocks::from_u64(*v);
-    }
-    for out_rho in &out_rhos {
-        for in_rho in &in_rhos {
-            enforce_prod = enforce_prod_digest_diff(enforce_prod, out_rho, in_rho);
-        }
-    }
-    if out_rhos.len() == 2 {
-        enforce_prod = enforce_prod_digest_diff(enforce_prod, &out_rhos[0], &out_rhos[1]);
-    }
-    let mut inv_buf = [0u8; 8];
-    inv_buf.copy_from_slice(&witness.inv_enforce[..8]);
-    let inv_enforce_u64 = u64::from_le_bytes(inv_buf);
-    let enforce_ok = enforce_prod * Goldilocks::from_u64(inv_enforce_u64) == Goldilocks::ONE;
-    println!("replay_enforce_ok={enforce_ok}");
-
-    let mut bl_ok = true;
-    let mut ids_to_check: Vec<[u8; 32]> = vec![sender_id_out];
-    if witness.withdraw_amount == 0 {
-        if let Some(rcp0) = out_recipients.first() {
-            ids_to_check.push(*rcp0);
-        }
-    }
-    if ids_to_check.len() != witness.blacklist_proofs.len() {
-        bl_ok = false;
-        println!(
-            "replay_blacklist_shape_mismatch ids_to_check={} proofs={}",
-            ids_to_check.len(),
-            witness.blacklist_proofs.len()
-        );
-    }
-    for (k, (id, proof)) in ids_to_check
-        .iter()
-        .zip(witness.blacklist_proofs.iter())
-        .enumerate()
-    {
-        let id_gl = hash32_to_gl(id);
-        let mut prod = Goldilocks::ONE;
-        for e in &proof.bucket_entries {
-            let e_gl = hash32_to_gl(e);
-            prod = enforce_prod_digest_diff(prod, &id_gl, &e_gl);
-        }
-        let mut inv_b = [0u8; 8];
-        inv_b.copy_from_slice(&proof.bucket_inv[..8]);
-        let inv_u64 = u64::from_le_bytes(inv_b);
-        let inv_ok = prod * Goldilocks::from_u64(inv_u64) == Goldilocks::ONE;
-
-        let leaf = bl_bucket_leaf(&proof.bucket_entries);
-        let pos = bl_bucket_pos(&id_gl);
-        let root = merkle_root(&leaf, pos, &proof.siblings, BL_DEPTH as u32);
-        let root_ok = gl_to_hash32(&root) == witness.blacklist_root;
-        println!(
-            "replay_blacklist[{k}] inv_ok={} root_ok={}",
-            inv_ok, root_ok
-        );
-        bl_ok &= inv_ok && root_ok;
-    }
-    println!(
-        "replay_summary output_cm_ok={} balance_ok={} enforce_ok={} blacklist_ok={}",
-        output_cm_ok, balance_ok, enforce_ok, bl_ok
-    );
-
-    let mut host = NightstreamHost::new(
+    let mut run_host = NightstreamHost::new(
         &note_spend_rom::NOTE_SPEND_ROM,
         note_spend_rom::NOTE_SPEND_ROM_BASE,
     );
-    host.set_output_binding_enabled(false);
-    host.write_note_spend_witness(&witness, vec![]);
+    run_host.write_note_spend_witness(&witness, public_bytes.clone());
+    run_host.set_chunk_rows(chunk_rows);
+    run_host.set_max_steps(sim.steps.len());
 
-    let ram_pairs = host.ram_init_pairs();
-    let ram_preview: Vec<(u64, u32)> = ram_pairs
-        .iter()
-        .copied()
-        .filter(|(addr, _)| *addr >= 0x100 && *addr <= 0x140)
-        .collect();
-    println!("replay_ram_preview={ram_preview:?}");
-    let sim = simulate_rv64_elf(&note_spend_rom::NOTE_SPEND_ROM, &ram_pairs, 300_000);
-    let debug_addr: u64 = 0x4090;
-    let debug_writes = sim
-        .steps
-        .iter()
-        .flat_map(|s| s.twist_events.iter())
-        .filter(|ev| {
-            ev.twist_id == RAM_ID
-                && ev.kind == neo_vm_trace::TwistOpKind::Write
-                && ev.addr == debug_addr
-        })
-        .map(|ev| ev.value)
-        .collect::<Vec<_>>();
-    if let Some(last) = debug_writes.last() {
-        println!(
-            "replay_debug_stage_writes={} last_stage={} (addr=0x{debug_addr:08x})",
-            debug_writes.len(),
-            last
-        );
-    } else {
-        println!("replay_debug_stage_writes=0 (addr=0x{debug_addr:08x})");
-    }
+    let t_run_prove = Instant::now();
+    let mut run = run_host
+        .prove_run()
+        .expect("viewer-attested replay witness should prove in-memory");
+    let run_prove_ms = t_run_prove.elapsed().as_millis();
+
+    let t_run_verify = Instant::now();
+    run.verify()
+        .expect("viewer-attested replay run.verify() should succeed");
+    let run_verify_ms = t_run_verify.elapsed().as_millis();
 
     println!(
-        "replay_witness={} steps={} did_halt={} total_twist_events={} total_shout_events={}",
-        path,
-        sim.len(),
-        sim.did_halt(),
-        sim.total_twist_events(),
-        sim.total_shout_events()
+        "viewer_replay_run_verify prove_ms={} verify_ms={} trace_len={} fold_count={}",
+        run_prove_ms,
+        run_verify_ms,
+        run.trace_len(),
+        run.fold_count(),
     );
-    if !sim.did_halt() {
-        let tail: Vec<(u64, u64, u32, bool)> = sim
-            .steps
-            .iter()
-            .rev()
-            .take(16)
-            .map(|s| (s.pc_before, s.pc_after, s.opcode, s.halted))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        println!("trace_sim_tail={tail:?}");
-    }
 
-    let replay_prove = std::env::var("NS_REPLAY_PROVE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    if replay_prove {
-        use neo_math::F;
-        use neo_vm_trace::TwistOpKind;
-        use p3_field::PrimeCharacteristicRing;
-        use std::collections::{BTreeSet, HashMap};
+    let mut package_host = NightstreamHost::new(
+        &note_spend_rom::NOTE_SPEND_ROM,
+        note_spend_rom::NOTE_SPEND_ROM_BASE,
+    );
+    package_host.write_note_spend_witness(&witness, public_bytes.clone());
+    package_host.set_chunk_rows(chunk_rows);
+    package_host.set_max_steps(sim.steps.len());
+    let commitment = package_host.code_commitment();
 
-        fn derive_output_claims_for_addresses(
-            exec: &RiscvExecTable,
-            ram_pairs: &[(u64, u32)],
-            output_addrs: &[u64],
-        ) -> Vec<(u64, u32)> {
-            let output_addr_set: BTreeSet<u64> = output_addrs.iter().copied().collect();
-            let mut final_output_values: HashMap<u64, u32> =
-                output_addr_set.iter().map(|&addr| (addr, 0u32)).collect();
-            for &(addr, value) in ram_pairs {
-                if output_addr_set.contains(&addr) {
-                    final_output_values.insert(addr, value);
-                }
-            }
-            for row in exec.rows.iter().filter(|r| r.active) {
-                for ev in &row.ram_events {
-                    if ev.kind == TwistOpKind::Write && output_addr_set.contains(&ev.addr) {
-                        final_output_values.insert(ev.addr, ev.value as u32);
-                    }
-                }
-            }
-            output_addrs
-                .iter()
-                .map(|addr| (*addr, *final_output_values.get(addr).unwrap_or(&0u32)))
-                .collect()
-        }
+    let t_package_prove = Instant::now();
+    let proof_bytes = package_host
+        .run(true)
+        .expect("viewer-attested replay witness should package successfully");
+    let package_prove_ms = t_package_prove.elapsed().as_millis();
+    assert!(!proof_bytes.is_empty(), "proof payload must not be empty");
 
-        fn push_u32_claim(out: &mut Vec<(u64, u32)>, addr: &mut u64, val: u32) {
-            out.push((*addr, val));
-            *addr += 4;
-        }
+    let package = decompress_package(&proof_bytes);
+    assert_eq!(
+        package.public_output, public_bytes,
+        "packaged public_output should match the witness-derived SpendPublicWire bytes"
+    );
 
-        fn push_u64_claim(out: &mut Vec<(u64, u32)>, addr: &mut u64, val: u64) {
-            push_u32_claim(out, addr, val as u32);
-            push_u32_claim(out, addr, (val >> 32) as u32);
-        }
+    let t_package_verify = Instant::now();
+    let verified_public: SpendPublicWire = NightstreamVerifier::verify(&proof_bytes, &commitment)
+        .expect("viewer-attested replay package verification should succeed");
+    let package_verify_ms = t_package_verify.elapsed().as_millis();
 
-        fn push_digest_claim(out: &mut Vec<(u64, u32)>, addr: &mut u64, d: &[u8; 32]) {
-            for i in 0..4 {
-                let mut lo = [0u8; 4];
-                let mut hi = [0u8; 4];
-                lo.copy_from_slice(&d[i * 8..i * 8 + 4]);
-                hi.copy_from_slice(&d[i * 8 + 4..i * 8 + 8]);
-                push_u32_claim(out, addr, u32::from_le_bytes(lo));
-                push_u32_claim(out, addr, u32::from_le_bytes(hi));
-            }
-        }
+    assert_eq!(
+        verified_public, expected_public,
+        "verified public output should match the witness-derived viewer-attested SpendPublic"
+    );
 
-        let mut template_output_claims: Vec<(u64, u32)> = Vec::new();
-        let mut out_addr: u64 = 0x100;
-        push_digest_claim(&mut template_output_claims, &mut out_addr, &witness.anchor);
-        push_u32_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            witness.inputs.len() as u32,
-        );
-        for input in &witness.inputs {
-            push_digest_claim(&mut template_output_claims, &mut out_addr, &input.nullifier);
-        }
-        push_u64_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            witness.withdraw_amount,
-        );
-        push_digest_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            &witness.withdraw_to,
-        );
-        push_u32_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            witness.outputs.len() as u32,
-        );
-        for output in &witness.outputs {
-            push_digest_claim(&mut template_output_claims, &mut out_addr, &output.cm);
-        }
-        push_digest_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            &witness.blacklist_root,
-        );
-        push_u32_claim(
-            &mut template_output_claims,
-            &mut out_addr,
-            witness.viewers.len() as u32,
-        );
-        for viewer in &witness.viewers {
-            for (out_w, output) in viewer.per_output.iter().zip(&witness.outputs) {
-                push_digest_claim(&mut template_output_claims, &mut out_addr, &output.cm);
-                push_digest_claim(
-                    &mut template_output_claims,
-                    &mut out_addr,
-                    &viewer.fvk_commitment,
-                );
-                push_digest_claim(&mut template_output_claims, &mut out_addr, &out_w.ct_hash);
-                push_digest_claim(&mut template_output_claims, &mut out_addr, &out_w.mac);
-            }
-        }
-        let output_addrs: Vec<u64> = template_output_claims
-            .iter()
-            .map(|(addr, _)| *addr)
-            .collect();
-        let sim_exec = exec_table_from_sim(&sim);
-        let output_min = output_addrs.iter().copied().min().unwrap_or(0);
-        let output_max = output_addrs.iter().copied().max().unwrap_or(0);
-        let output_writes = sim_exec
-            .rows
-            .iter()
-            .filter(|r| r.active)
-            .flat_map(|r| r.ram_events.iter())
-            .filter(|ev| {
-                ev.kind == TwistOpKind::Write && ev.addr >= output_min && ev.addr <= output_max
-            })
-            .map(|ev| (ev.addr, ev.value as u32))
-            .collect::<Vec<_>>();
-        println!(
-            "replay_sim_output_window=[0x{output_min:08x}..=0x{output_max:08x}] writes_in_window={}",
-            output_writes.len()
-        );
-        for (idx, (addr, val)) in output_writes.iter().take(16).enumerate() {
-            println!("replay_sim_output_write[{idx}]=0x{addr:08x} value=0x{val:08x}");
-        }
-        let sim_observed = derive_output_claims_for_addresses(&sim_exec, &ram_pairs, &output_addrs);
-        let sim_observed_map: HashMap<u64, u32> = sim_observed.iter().copied().collect();
-        let sim_mismatches = template_output_claims
-            .iter()
-            .filter_map(|(addr, expected)| {
-                let actual = *sim_observed_map.get(addr).unwrap_or(&0u32);
-                if actual == *expected {
-                    None
-                } else {
-                    Some((*addr, *expected, actual))
-                }
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "replay_sim_claims={} mismatches={}",
-            template_output_claims.len(),
-            sim_mismatches.len()
-        );
-        if let Some((addr, expected, actual)) = sim_mismatches.first() {
-            println!(
-                "replay_sim_first_mismatch=0x{addr:08x} expected=0x{expected:08x} actual=0x{actual:08x}"
-            );
-        }
-        for (idx, (addr, expected, actual)) in sim_mismatches.iter().take(8).enumerate() {
-            println!(
-                "replay_sim_mismatch[{idx}]=0x{addr:08x} expected=0x{expected:08x} actual=0x{actual:08x}"
-            );
-        }
-
-        let chunk_rows = std::env::var("NS_REPLAY_CHUNK_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(510usize)
-            .max(1);
-        let skip_wiring = std::env::var("NS_REPLAY_SKIP_WIRING")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        if !skip_wiring {
-            let mut wiring = Rv64TraceWiring::from_elf(&note_spend_rom::NOTE_SPEND_ROM)
-                .expect("load RV64 guest")
-                .chunk_rows(chunk_rows)
-                .max_steps(sim.steps.len());
-            for &(addr, val) in &ram_pairs {
-                wiring = wiring.ram_init_u32(addr, val);
-            }
-            for &(addr, val) in &template_output_claims {
-                wiring = wiring.output_claim(addr, F::from_u64(val as u64));
-            }
-            let t_wiring = std::time::Instant::now();
-            let mut wiring_run = wiring.prove().expect("wiring prove with template claims");
-            let wiring_ms = t_wiring.elapsed().as_millis();
-            let wiring_verify = wiring_run.verify();
-            let observed = derive_output_claims_for_addresses(
-                wiring_run.exec_table(),
-                &ram_pairs,
-                &output_addrs,
-            );
-            let observed_map: HashMap<u64, u32> = observed.iter().copied().collect();
-            let mismatches = template_output_claims
-                .iter()
-                .filter_map(|(addr, expected)| {
-                    let actual = *observed_map.get(addr).unwrap_or(&0u32);
-                    if actual == *expected {
-                        None
-                    } else {
-                        Some((*addr, *expected, actual))
-                    }
-                })
-                .collect::<Vec<_>>();
-            println!(
-                "replay_wiring_prove_ms={} claims={} mismatches={} verify_ok={}",
-                wiring_ms,
-                template_output_claims.len(),
-                mismatches.len(),
-                wiring_verify.is_ok()
-            );
-            if let Some((addr, expected, actual)) = mismatches.first() {
-                println!(
-                    "replay_wiring_first_mismatch=0x{addr:08x} expected=0x{expected:08x} actual=0x{actual:08x}"
-                );
-            }
-            for (idx, (addr, expected, actual)) in mismatches.iter().take(8).enumerate() {
-                println!(
-                    "replay_wiring_mismatch[{idx}]=0x{addr:08x} expected=0x{expected:08x} actual=0x{actual:08x}"
-                );
-            }
-        } else {
-            println!("replay_wiring_skipped=true");
-        }
-
-        let mut prove_host = NightstreamHost::new(
-            &note_spend_rom::NOTE_SPEND_ROM,
-            note_spend_rom::NOTE_SPEND_ROM_BASE,
-        );
-        let replay_no_output_binding = std::env::var("NS_REPLAY_NO_OUTPUT_BINDING")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        if replay_no_output_binding {
-            prove_host.set_output_binding_enabled(false);
-        }
-        prove_host.set_chunk_rows(chunk_rows.max(1));
-        let replay_set_max_steps = std::env::var("NS_REPLAY_SET_MAX_STEPS")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-        if replay_set_max_steps {
-            prove_host.set_max_steps(sim.steps.len());
-        }
-        prove_host.write_note_spend_witness(&witness, vec![]);
-        let t = std::time::Instant::now();
-        match prove_host.run(true) {
-            Ok(proof) => {
-                println!(
-                    "replay_prove_ok=true chunk_rows={} no_output_binding={} set_max_steps={} proof_bytes={} elapsed_ms={}",
-                    chunk_rows,
-                    replay_no_output_binding,
-                    replay_set_max_steps,
-                    proof.len(),
-                    t.elapsed().as_millis()
-                );
-            }
-            Err(err) => {
-                println!(
-                    "replay_prove_ok=false chunk_rows={} no_output_binding={} set_max_steps={} elapsed_ms={} error={}",
-                    chunk_rows,
-                    replay_no_output_binding,
-                    replay_set_max_steps,
-                    t.elapsed().as_millis(),
-                    err
-                );
-            }
-        }
-    }
+    println!(
+        "viewer_replay_packaged_verify prove_ms={} verify_ms={} proof_bytes={} verification_mode=replay_builder_prove",
+        package_prove_ms,
+        package_verify_ms,
+        proof_bytes.len(),
+    );
 }
 
 /// Test prove+verify cycle twice with different inputs using trace wiring.
