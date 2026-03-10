@@ -275,11 +275,8 @@ impl ZkVerifier for NightstreamVerifier {
             native::ensure_code_commitment(&package.rom_bytes, &code_commitment.0)?;
             tracing::info!("Nightstream: code commitment OK");
 
-            // Verify the proof package (reconstruct run + compare canonical proof bytes).
-            tracing::info!(
-                "Nightstream: starting proof verification (replay mode, {} step instances)...",
-                package.steps_public.len(),
-            );
+            // Verify the proof package directly against its packaged verifier context.
+            tracing::info!("Nightstream: starting proof verification...");
             let verify_start = std::time::Instant::now();
             native::verify_proof_package(&package)?;
             let verify_ms = verify_start.elapsed().as_millis();
@@ -346,8 +343,8 @@ mod native {
     /// Verify a Nightstream proof package.
     ///
     /// This delegates to `NightstreamProofPackage::verify()` which:
-    /// 1. Reconstructs and runs the trace wiring from ROM + config.
-    /// 2. Canonically re-encodes the generated proof and compares it to the packaged proof bytes.
+    /// 1. Verifies the packaged shard proof directly against packaged public verifier context.
+    /// 2. Rechecks that `public_output` matches the proof-certified application outputs.
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
         let ok = package
             .verify()

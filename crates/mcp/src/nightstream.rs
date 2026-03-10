@@ -58,8 +58,7 @@ impl Nightstream {
 
         let public_output_bytes =
             bincode::serialize(public).context("Failed to bincode-serialize SpendPublic")?;
-        let public_output =
-            base64::engine::general_purpose::STANDARD.encode(&public_output_bytes);
+        let public_output = base64::engine::general_purpose::STANDARD.encode(&public_output_bytes);
 
         #[derive(Serialize)]
         struct ProveRequest<'a> {
@@ -117,8 +116,7 @@ pub fn inject_pool_viewer_sig(
     use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
     use std::io::{Read, Write};
 
-    let sig_bytes = hex::decode(pool_sig_hex.trim())
-        .context("pool_sig_hex is not valid hex")?;
+    let sig_bytes = hex::decode(pool_sig_hex.trim()).context("pool_sig_hex is not valid hex")?;
     anyhow::ensure!(
         sig_bytes.len() == 64,
         "pool_sig_hex must decode to 64 bytes (got {})",
@@ -134,17 +132,16 @@ pub fn inject_pool_viewer_sig(
         buf
     };
 
-    let mut package: NightstreamProofPackage =
-        bincode::deserialize(&decompressed)
-            .context("Failed to deserialize NightstreamProofPackage")?;
+    let mut package: NightstreamProofPackage = bincode::deserialize(&decompressed)
+        .context("Failed to deserialize NightstreamProofPackage")?;
 
     package.pool_viewer_sig = Some(PoolViewerSig {
         fvk_commitment,
         signature: sig_bytes,
     });
 
-    let raw = bincode::serialize(&package)
-        .context("Failed to re-serialize NightstreamProofPackage")?;
+    let raw =
+        bincode::serialize(&package).context("Failed to re-serialize NightstreamProofPackage")?;
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
     encoder

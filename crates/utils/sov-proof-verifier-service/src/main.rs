@@ -148,9 +148,7 @@ async fn main() -> Result<()> {
     let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!(
-            "No value-setter method ID provided, will auto-compute from value_validator ROM"
-        );
+        info!("No value-setter method ID provided, will auto-compute from value_validator ROM");
         None
     };
 
@@ -158,9 +156,7 @@ async fn main() -> Result<()> {
     let midnight_method_id = if let Some(method_id_hex) = args.midnight_method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!(
-            "No midnight method ID provided, will auto-compute from Nightstream ROM"
-        );
+        info!("No midnight method ID provided, will auto-compute from Nightstream ROM");
         None
     };
 

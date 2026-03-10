@@ -39,12 +39,19 @@ pub struct Config {
     ///
     /// Accepts either a circuit name (e.g. `note_spend_guest`) or a full path.
     /// Defaults to `note_spend_guest`.
-    #[serde(default = "default_nightstream_program", alias = "ZK_PROGRAM_PATH", alias = "ligero_program_path")]
+    #[serde(
+        default = "default_nightstream_program",
+        alias = "ZK_PROGRAM_PATH",
+        alias = "ligero_program_path"
+    )]
     #[validate(custom(function = "validate_nightstream_program"))]
     pub nightstream_program_path: String,
 
     /// Nightstream proof service URL (env: NIGHTSTREAM_PROOF_SERVICE_URL, alias: LIGERO_PROOF_SERVICE_URL).
-    #[serde(default = "default_nightstream_proof_service_url", alias = "ligero_proof_service_url")]
+    #[serde(
+        default = "default_nightstream_proof_service_url",
+        alias = "ligero_proof_service_url"
+    )]
     #[validate(custom(function = "validate_http_url"))]
     pub nightstream_proof_service_url: Url,
 

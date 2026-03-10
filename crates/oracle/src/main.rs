@@ -788,7 +788,10 @@ async fn main() -> Result<()> {
 
     let cache_cap =
         NonZeroUsize::new(cfg.oracle_cache_size).unwrap_or(NonZeroUsize::new(5000).unwrap());
-    info!(cache_size = cfg.oracle_cache_size, "Attestation LRU cache configured");
+    info!(
+        cache_size = cfg.oracle_cache_size,
+        "Attestation LRU cache configured"
+    );
 
     let state = AppState {
         signing_key,

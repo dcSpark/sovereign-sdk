@@ -763,8 +763,7 @@ fn test_note_spend_prove_verify_with_witness() {
 }
 
 /// Build a realistic viewer-attested note-spend witness mirroring proof-pool `/prove`.
-fn realistic_viewer_attested_note_spend_case(
-) -> (
+fn realistic_viewer_attested_note_spend_case() -> (
     sov_nightstream_adapter::NoteSpendWitness,
     sov_nightstream_adapter::circuit_output::SpendPublicWire,
 ) {
@@ -1417,9 +1416,7 @@ fn test_note_spend_replay_viewer_witness_with_output_binding() {
     );
 
     if cfg!(debug_assertions) {
-        println!(
-            "viewer_replay_debug_skip=true reason=upstream_nightstream_debug_mle_assertion"
-        );
+        println!("viewer_replay_debug_skip=true reason=upstream_nightstream_debug_mle_assertion");
         return;
     }
 
@@ -1471,6 +1468,10 @@ fn test_note_spend_replay_viewer_witness_with_output_binding() {
         package.public_output, public_bytes,
         "packaged public_output should match the witness-derived SpendPublicWire bytes"
     );
+    assert!(
+        !package.verifier_context.is_empty(),
+        "viewer-attested packaged proof should include packaged verifier context"
+    );
 
     let t_package_verify = Instant::now();
     let verified_public: SpendPublicWire = NightstreamVerifier::verify(&proof_bytes, &commitment)
@@ -1483,10 +1484,11 @@ fn test_note_spend_replay_viewer_witness_with_output_binding() {
     );
 
     println!(
-        "viewer_replay_packaged_verify prove_ms={} verify_ms={} proof_bytes={} verification_mode=replay_builder_prove",
+        "viewer_replay_packaged_verify prove_ms={} verify_ms={} proof_bytes={} verifier_ctx_bytes={}",
         package_prove_ms,
         package_verify_ms,
         proof_bytes.len(),
+        package.verifier_context.len(),
     );
 }
 

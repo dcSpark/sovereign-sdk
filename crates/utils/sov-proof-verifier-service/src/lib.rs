@@ -4,7 +4,6 @@
 //! and transforms them into non-ZK transactions for the rollup node.
 
 use anyhow::{Context, Result};
-use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
@@ -15,6 +14,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use futures::future::join_all;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
@@ -53,7 +53,13 @@ use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
 
 /// The rollup's Spec type (must match rollup-nightstream configuration)
-pub type RollupSpec = ConfigurableSpec<MidnightDaSpec, sov_nightstream_adapter::Nightstream, MockZkvm, MultiAddressEvm, Native>;
+pub type RollupSpec = ConfigurableSpec<
+    MidnightDaSpec,
+    sov_nightstream_adapter::Nightstream,
+    MockZkvm,
+    MultiAddressEvm,
+    Native,
+>;
 
 type RuntimeCall = <DemoRuntime<RollupSpec> as DispatchCall>::Decodable;
 type DemoTransaction = Transaction<DemoRuntime<RollupSpec>, RollupSpec>;
@@ -185,9 +191,7 @@ impl AppState {
                 })
                 .unwrap_or(false)
         }
-        if env_truthy("SOV_PROOF_VERIFIER_SKIP_VERIFY")
-            || env_truthy("SKIP_VERIFY")
-        {
+        if env_truthy("SOV_PROOF_VERIFIER_SKIP_VERIFY") || env_truthy("SKIP_VERIFY") {
             std::env::set_var("NIGHTSTREAM_SKIP_VERIFICATION", "1");
             info!(
                 "Proof verification skipping is ENABLED (env var set) — returning public outputs without verification"
@@ -753,8 +757,7 @@ async fn prove_handler(
             return prove_verify_error_response(
                 StatusCode::BAD_REQUEST,
                 1,
-                "/prove requires a 'witness' field with the full NoteSpendWitness."
-                    .to_string(),
+                "/prove requires a 'witness' field with the full NoteSpendWitness.".to_string(),
             );
         }
     };
@@ -903,10 +906,10 @@ async fn verify_handler(
             .map_err(|e| ServiceError::ProofError(format!("Verification failed: {e}")))?;
 
         // Deserialize public output
-        let _public: midnight_privacy::SpendPublic =
-            bincode::deserialize(&package.public_output).map_err(|e| {
-                ServiceError::Internal(format!("Failed to deserialize public output: {e}"))
-            })?;
+        let _public: midnight_privacy::SpendPublic = bincode::deserialize(&package.public_output)
+            .map_err(|e| {
+            ServiceError::Internal(format!("Failed to deserialize public output: {e}"))
+        })?;
         Ok(())
     })
     .await;
@@ -1869,12 +1872,13 @@ async fn verify_value_setter_proof(
 
     let proof = proof.to_vec();
 
-    let public: ValueProofPublic = tokio::task::spawn_blocking(move || {
-        NightstreamVerifier::verify(&proof, &commitment)
-    })
-    .await
-    .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
-    .map_err(|e| ServiceError::ProofError(format!("Nightstream verification failed: {}", e)))?;
+    let public: ValueProofPublic =
+        tokio::task::spawn_blocking(move || NightstreamVerifier::verify(&proof, &commitment))
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+            .map_err(|e| {
+                ServiceError::ProofError(format!("Nightstream verification failed: {}", e))
+            })?;
 
     if public.value != value {
         return Err(ServiceError::ProofError(format!(
@@ -2213,7 +2217,9 @@ async fn verify_midnight_proof_nightstream(
     })
     .await
     .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
-    .map_err(|e| ServiceError::ProofError(format!("Nightstream proof verification failed: {}", e)))?;
+    .map_err(|e| {
+        ServiceError::ProofError(format!("Nightstream proof verification failed: {}", e))
+    })?;
 
     Ok(public)
 }
@@ -2226,8 +2232,7 @@ pub async fn verify_midnight_withdraw_proof(
     expected_withdraw_amount: u128,
     pool_fvk_pk: Option<Ed25519VerifyingKey>,
 ) -> Result<SpendPublic, ServiceError> {
-    let public: SpendPublic =
-        verify_midnight_proof_nightstream(method_id_opt, &proof).await?;
+    let public: SpendPublic = verify_midnight_proof_nightstream(method_id_opt, &proof).await?;
 
     // Verify public output against expected values
     if public.anchor_root != expected_anchor_root {
@@ -2293,12 +2298,9 @@ pub async fn verify_midnight_withdraw_proof(
         })?;
 
         // Verify Ed25519 signature over the FVK commitment
-        let signature = ed25519_dalek::Signature::from_slice(&pool_sig.signature)
-            .map_err(|e| {
-                ServiceError::ProofError(format!(
-                    "Invalid Ed25519 signature in pool_viewer_sig: {e}"
-                ))
-            })?;
+        let signature = ed25519_dalek::Signature::from_slice(&pool_sig.signature).map_err(|e| {
+            ServiceError::ProofError(format!("Invalid Ed25519 signature in pool_viewer_sig: {e}"))
+        })?;
 
         pool_pk
             .verify(&pool_sig.fvk_commitment, &signature)

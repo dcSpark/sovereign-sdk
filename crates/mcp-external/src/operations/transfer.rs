@@ -7,10 +7,6 @@ use midnight_privacy::{
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
     PrivacyAddress, SpendPublic,
 };
-use sov_nightstream_adapter::{
-    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
-    ViewerWitness,
-};
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
 use sov_mock_da::MockDaSpec;
@@ -20,6 +16,10 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
+use sov_nightstream_adapter::{
+    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
+};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
@@ -543,7 +543,12 @@ pub async fn transfer(
         out_values_for_inv.push(change_amount_u64);
         out_rhos_for_inv.push(out_rho_1.unwrap());
     }
-    let inv_enforce = inv_enforce_v2(&in_values_u64, &in_rhos, &out_values_for_inv, &out_rhos_for_inv);
+    let inv_enforce = inv_enforce_v2(
+        &in_values_u64,
+        &in_rhos,
+        &out_values_for_inv,
+        &out_rhos_for_inv,
+    );
 
     let mut blacklist_proofs = vec![BlacklistProof::from_opening(
         &sender_opening.recipient,
@@ -605,12 +610,17 @@ pub async fn transfer(
         view_attestations,
     };
 
-    tracing::debug!("Generating Nightstream ZK proof with {} output(s)...", num_outputs);
+    tracing::debug!(
+        "Generating Nightstream ZK proof with {} output(s)...",
+        num_outputs
+    );
     let proof_start = StdInstant::now();
     let proof_bytes = nightstream
         .generate_proof(&witness, &public)
         .await
-        .inspect_err(|e| tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e))
+        .inspect_err(|e| {
+            tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e)
+        })
         .context("Failed to generate Nightstream proof for transfer")?;
     timing_proof_ms = proof_start.elapsed().as_millis();
 

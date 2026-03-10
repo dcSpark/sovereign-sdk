@@ -6,7 +6,6 @@ use midnight_privacy::{
     CallMessage as MidnightCallMessage, FrozenAddressesResponse, PrivacyAddress,
 };
 use sov_address::MultiAddressEvm;
-use sov_nightstream_adapter::Nightstream;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -14,6 +13,7 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::{Amount, Spec};
+use sov_nightstream_adapter::Nightstream;
 
 use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;

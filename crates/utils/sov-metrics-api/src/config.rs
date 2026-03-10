@@ -97,10 +97,8 @@ impl Config {
             Err(_) => DEFAULT_RETENTION_SECS,
         };
 
-        let tps_rounding_decimals = env_u32_or_default(
-            "TPS_ROUNDING_DECIMALS",
-            DEFAULT_TPS_ROUNDING_DECIMALS,
-        )?;
+        let tps_rounding_decimals =
+            env_u32_or_default("TPS_ROUNDING_DECIMALS", DEFAULT_TPS_ROUNDING_DECIMALS)?;
 
         let da_postgres_max_connections = env_u32_or_default(
             "SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS",

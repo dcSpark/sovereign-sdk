@@ -508,12 +508,10 @@ impl Provider {
                 "Verifier service returned error"
             );
             match reason {
-                Some(reason) => anyhow::bail!(
-                    "Verifier service error ({status}, {error_kind}): {reason}"
-                ),
-                None => anyhow::bail!(
-                    "Verifier service error ({status}, {error_kind}): {body}"
-                ),
+                Some(reason) => {
+                    anyhow::bail!("Verifier service error ({status}, {error_kind}): {reason}")
+                }
+                None => anyhow::bail!("Verifier service error ({status}, {error_kind}): {body}"),
             }
         }
 

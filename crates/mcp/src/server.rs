@@ -31,7 +31,8 @@ use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec =
+    ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 pub type McpWalletContext = WalletContext<McpRuntime, McpSpec>;
 

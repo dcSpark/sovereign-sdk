@@ -817,7 +817,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Nightstream proof client (HTTP service)
     tracing::info!("[mcp] Initializing Nightstream proof service client");
-    tracing::info!("[mcp] Proof service URL: {}", cfg.nightstream_proof_service_url);
+    tracing::info!(
+        "[mcp] Proof service URL: {}",
+        cfg.nightstream_proof_service_url
+    );
     tracing::info!("[mcp] Circuit: {}", cfg.nightstream_program_path);
 
     let nightstream = Arc::new(Nightstream::new(

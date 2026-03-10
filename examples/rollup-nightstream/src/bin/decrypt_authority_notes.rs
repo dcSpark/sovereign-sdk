@@ -484,7 +484,10 @@ mod tests {
 
         assert!(decrypted.fvk_match, "FVK commitment should match");
         assert_eq!(decrypted.mac_valid, Some(true), "MAC should be valid");
-        assert!(decrypted.sender_id.is_some(), "Transfer notes should have sender_id");
+        assert!(
+            decrypted.sender_id.is_some(),
+            "Transfer notes should have sender_id"
+        );
         assert_eq!(decrypted.value, 150, "Value should be 150");
         assert_eq!(
             decrypted.domain, "0101010101010101010101010101010101010101010101010101010101010101",

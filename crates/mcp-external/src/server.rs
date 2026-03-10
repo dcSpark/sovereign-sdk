@@ -31,12 +31,12 @@ use rmcp::{
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types::TxReceiptResult;
 use sov_bank::config_gas_token_id;
-use sov_nightstream_adapter::Nightstream;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::{Amount, Spec};
+use sov_nightstream_adapter::Nightstream;
 use tokio::sync::{Mutex, RwLock};
 
 pub type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
@@ -1441,7 +1441,8 @@ impl CryptoServer {
             midnight_privacy::recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk_owner);
         let nightstream_ref = self.nightstream_prover.as_ref().ok_or_else(|| {
             ErrorData::invalid_params(
-                "Nightstream proof service not configured; set NIGHTSTREAM_PROOF_SERVICE_URL.".to_string(),
+                "Nightstream proof service not configured; set NIGHTSTREAM_PROOF_SERVICE_URL."
+                    .to_string(),
                 None,
             )
         })?;

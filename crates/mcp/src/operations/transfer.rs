@@ -7,10 +7,6 @@ use midnight_privacy::{
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     PrivacyAddress, SpendPublic,
 };
-use sov_nightstream_adapter::{
-    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
-    ViewerWitness,
-};
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
@@ -22,6 +18,10 @@ use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
 use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
+use sov_nightstream_adapter::{
+    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
+};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
@@ -31,7 +31,8 @@ use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec =
+    ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 const TREE_DEPTH: u8 = 16;
@@ -609,12 +610,17 @@ pub async fn transfer(
         view_attestations,
     };
 
-    tracing::info!("Generating Nightstream ZK proof with {} output(s)...", num_outputs);
+    tracing::info!(
+        "Generating Nightstream ZK proof with {} output(s)...",
+        num_outputs
+    );
 
     let proof_bytes = nightstream
         .generate_proof(&witness, &public)
         .await
-        .inspect_err(|e| tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e))
+        .inspect_err(|e| {
+            tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e)
+        })
         .context("Failed to generate Nightstream proof for transfer")?;
 
     let proof_bytes = if let Some(ref bundle) = viewer_fvk_bundle {

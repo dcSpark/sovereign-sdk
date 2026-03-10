@@ -13,6 +13,8 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use neo_fold::rv64_trace_shard::{Rv64TraceWiring, Rv64TraceWiringRun};
 use neo_math::F;
+use neo_memory::output_check::ProgramIO;
+use neo_memory::riscv::lookups::RAM_ID;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -27,7 +29,8 @@ use crate::circuit_output::{
     CircuitViewAttestation, DepositCircuitOutput,
 };
 use crate::proof_package::{
-    encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv64TraceWiringRunConfig,
+    encode_verifier_context, NightstreamProofPackage, NightstreamVerifierContext,
+    OutputBindingConfigWire, PublicOutputFormat, Rv64TraceWiringRunConfig,
 };
 use crate::{NightstreamCodeCommitment, NightstreamGuest};
 
@@ -801,6 +804,67 @@ impl NightstreamHost {
         self.prove_run_once()
     }
 
+    fn output_program_io(&self) -> ProgramIO<F> {
+        let mut program_io = ProgramIO::new();
+        for &(addr, value) in &self.output_claims {
+            program_io = program_io.with_output(addr, F::from_u64(value));
+        }
+        program_io
+    }
+
+    fn build_verifier_context(
+        &self,
+        run: &Rv64TraceWiringRun,
+    ) -> Result<NightstreamVerifierContext> {
+        let steps_public = run.steps_public();
+        if steps_public.is_empty() {
+            anyhow::bail!("Nightstream run did not expose any public step instances");
+        }
+
+        let output_binding = if self.output_claims.is_empty() {
+            None
+        } else {
+            let logical_program_io = run
+                .memory_layout()
+                .remap_program_io(&self.output_program_io())
+                .map_err(|e| anyhow::anyhow!("Nightstream output remap failed: {e}"))?;
+            let num_bits = steps_public
+                .first()
+                .and_then(|step| {
+                    step.mem_insts
+                        .iter()
+                        .find(|inst| inst.mem_id == RAM_ID.0)
+                        .map(|inst| inst.d)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Nightstream packaged verifier context is missing the RAM mem instance"
+                    )
+                })?;
+            Some(OutputBindingConfigWire {
+                num_bits,
+                program_io: logical_program_io,
+                mem_id: RAM_ID.0,
+            })
+        };
+
+        let step_linking_pairs = if steps_public.len() > 1 {
+            vec![(run.layout().pc_final, run.layout().pc0)]
+        } else {
+            Vec::new()
+        };
+
+        Ok(NightstreamVerifierContext {
+            ccs: run.ccs().clone(),
+            params: run.params().clone(),
+            steps_public,
+            output_binding,
+            step_linking_pairs,
+            proof_profile: Some(run.profile_config().clone()),
+            memory_layout: Some(run.memory_layout().clone()),
+        })
+    }
+
     /// Build the run configuration for proof packaging.
     fn build_config(&self, run: &Rv64TraceWiringRun) -> Rv64TraceWiringRunConfig {
         Rv64TraceWiringRunConfig {
@@ -912,40 +976,42 @@ impl ZkvmHost for NightstreamHost {
             let output_value = self.extract_output_from_run(&run)?;
 
             let proof_steps = run.proof().steps.len();
-            let proof = encode_shard_proof_bytes(run.proof())
-                .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
-            let steps_public = Vec::new();
+            let verifier_context = self.build_verifier_context(&run)?;
+            let verifier_context_bytes =
+                encode_verifier_context(&verifier_context).map_err(|e| {
+                    anyhow::anyhow!("Nightstream verifier context encoding failed: {e:?}")
+                })?;
 
             tracing::info!(
                 "Nightstream: proof generated in {}ms, {} folding steps, {} step instances",
                 prove_ms,
                 proof_steps,
-                steps_public.len(),
+                verifier_context.steps_public.len(),
             );
 
             let package = NightstreamProofPackage {
-                proof,
-                steps_public,
+                proof: run.proof().clone(),
+                verifier_context: verifier_context_bytes,
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
                 config: self.build_config(&run),
                 pool_viewer_sig: None,
             };
 
-            if let (Ok(sz_proof), Ok(sz_steps), Ok(sz_rom), Ok(sz_config), Ok(sz_output)) = (
+            if let (Ok(sz_proof), Ok(sz_ctx), Ok(sz_rom), Ok(sz_config), Ok(sz_output)) = (
                 bincode::serialized_size(&package.proof),
-                bincode::serialized_size(&package.steps_public),
+                bincode::serialized_size(&package.verifier_context),
                 bincode::serialized_size(&package.rom_bytes),
                 bincode::serialized_size(&package.config),
                 bincode::serialized_size(&package.public_output),
             ) {
-                let total = sz_proof + sz_steps + sz_rom + sz_config + sz_output;
+                let total = sz_proof + sz_ctx + sz_rom + sz_config + sz_output;
                 tracing::info!(
                     "Nightstream proof package size breakdown: \
-                     proof={:.2}MB, steps_public={:.2}MB, guest={:.1}KB, \
+                     proof={:.2}MB, verifier_ctx={:.2}MB, guest={:.1}KB, \
                      config={:.1}KB, output={} bytes, total={:.2}MB",
                     sz_proof as f64 / 1_048_576.0,
-                    sz_steps as f64 / 1_048_576.0,
+                    sz_ctx as f64 / 1_048_576.0,
                     sz_rom as f64 / 1_024.0,
                     sz_config as f64 / 1_024.0,
                     sz_output,
@@ -978,13 +1044,15 @@ impl ZkvmHost for NightstreamHost {
             let run = builder
                 .prove()
                 .map_err(|e| anyhow::anyhow!("Nightstream simulation prove failed: {:?}", e))?;
-            let proof = encode_shard_proof_bytes(run.proof())
-                .map_err(|e| anyhow::anyhow!("Nightstream proof encoding failed: {:?}", e))?;
-            let steps_public = Vec::new();
+            let verifier_context = self.build_verifier_context(&run)?;
+            let verifier_context_bytes =
+                encode_verifier_context(&verifier_context).map_err(|e| {
+                    anyhow::anyhow!("Nightstream verifier context encoding failed: {e:?}")
+                })?;
 
             let package = NightstreamProofPackage {
-                proof,
-                steps_public,
+                proof: run.proof().clone(),
+                verifier_context: verifier_context_bytes,
                 public_output: output_value,
                 rom_bytes: self.rom_bytes.clone(),
                 config: self.build_config(&run),

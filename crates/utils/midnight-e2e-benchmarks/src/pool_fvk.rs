@@ -68,8 +68,7 @@ pub fn inject_pool_sig_hex_into_proof_bytes(
     use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
     use std::io::{Read, Write};
 
-    let sig_bytes = hex::decode(pool_sig_hex.trim())
-        .context("pool_sig_hex is not valid hex")?;
+    let sig_bytes = hex::decode(pool_sig_hex.trim()).context("pool_sig_hex is not valid hex")?;
     if sig_bytes.len() != 64 {
         anyhow::bail!(
             "pool_sig_hex must decode to 64 bytes (got {} bytes)",
@@ -86,12 +85,11 @@ pub fn inject_pool_sig_hex_into_proof_bytes(
         buf
     };
 
-    let mut package: NightstreamProofPackage =
-        bincode::deserialize(&decompressed).context("Failed to deserialize NightstreamProofPackage")?;
+    let mut package: NightstreamProofPackage = bincode::deserialize(&decompressed)
+        .context("Failed to deserialize NightstreamProofPackage")?;
 
-    let public: midnight_privacy::SpendPublic =
-        bincode::deserialize(&package.public_output)
-            .context("Failed to deserialize SpendPublic from package.public_output")?;
+    let public: midnight_privacy::SpendPublic = bincode::deserialize(&package.public_output)
+        .context("Failed to deserialize SpendPublic from package.public_output")?;
 
     let fvk_commitment = public
         .view_attestations
@@ -105,8 +103,8 @@ pub fn inject_pool_sig_hex_into_proof_bytes(
         signature: sig_bytes,
     });
 
-    let raw = bincode::serialize(&package)
-        .context("Failed to re-serialize NightstreamProofPackage")?;
+    let raw =
+        bincode::serialize(&package).context("Failed to re-serialize NightstreamProofPackage")?;
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
     encoder

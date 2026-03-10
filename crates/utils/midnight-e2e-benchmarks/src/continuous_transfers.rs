@@ -14,9 +14,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk,
-    recipient_from_pk_v2, recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote,
-    Hash32, MerkleTree, PrivacyAddress, SpendPublic,
+    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
+    recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
+    PrivacyAddress, SpendPublic,
 };
 use rand::Rng;
 use reqwest::Client as HttpClient;
@@ -125,7 +125,8 @@ fn call_prover_service(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No response from prover service after retries")))
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("No response from prover service after retries")))
 }
 
 #[derive(Clone, Debug)]
@@ -1987,8 +1988,7 @@ async fn perform_transfer_cycle(
             cms.push(cm);
         }
 
-        let positions: Vec<Option<u64>> =
-            cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
+        let positions: Vec<Option<u64>> = cms.iter().map(|cm| pos_by_cm.get(cm).copied()).collect();
 
         if positions.iter().any(|p| p.is_none()) {
             eprintln!(

@@ -8,11 +8,11 @@ use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::wallet::WalletContext;
 use sov_address::MultiAddressEvm;
-use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;

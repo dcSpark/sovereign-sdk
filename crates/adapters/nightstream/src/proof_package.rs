@@ -1,27 +1,35 @@
 //! Proof package for Nightstream proofs.
 //!
-//! Defines `NightstreamProofPackage` and `Rv64TraceWiringRunConfig` locally so the
-//! sovereign-ligero adapter is self-contained without depending on Nightstream's
-//! internal bridge modules.
+//! The package is self-contained for proofs emitted by this adapter's `/prove`
+//! path: it carries the shard proof plus the verifier-side public context
+//! needed to run the lightweight shard verifier directly, without replaying
+//! `Rv64TraceWiring::prove()`.
 
 use crate::circuit_output::{
     deposit_public_bytes_from_output_claims, digest32_from_output_claims,
     spend_public_binding_digest_from_public_bytes,
 };
-use neo_ajtai::Commitment as Cmt;
-use neo_ccs::{matrix::Mat, CeClaim};
-use neo_fold::pi_ccs::rot_rhos_to_mats;
-use neo_fold::rv64_trace_shard::Rv64TraceWiring;
+use neo_ajtai::{s_lincomb, s_mul, Commitment as Cmt};
+use neo_ccs::{matrix::Mat, CcsStructure, CeClaim};
+use neo_fold::output_binding::OutputBindingConfig;
+use neo_fold::pi_ccs::FoldingMode;
 use neo_fold::shard::{
-    BatchedTimeProof, FoldStep, MemOrLutProof, MemSidecarProof, RlcDecProof, ShardProof, StepProof,
+    fold_shard_verify, fold_shard_verify_with_output_binding,
+    fold_shard_verify_with_output_binding_and_step_linking, fold_shard_verify_with_step_linking,
+    CommitMixers, ShardFoldOutputs, ShardProof, StepLinkingConfig,
 };
-use neo_fold::{PiCcsError, PiCcsProof};
-use neo_math::{F, K};
-use neo_memory::output_check::OutputBindingProof;
+use neo_fold::PiCcsError;
+use neo_math::ring::{cf_inv, Rq as RqEl};
+use neo_math::{D, F, K};
+use neo_memory::output_check::ProgramIO;
 use neo_memory::witness::StepInstanceBundle;
+use neo_memory::{AffineWordAddressRemap, RiscvGuestMemoryLayout, RiscvProofProfileConfig};
+use neo_params::NeoParams;
+use neo_transcript::{Poseidon2Transcript, Transcript};
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 /// Declares how `public_output` must be interpreted and bound to proof-visible data.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +47,11 @@ pub enum PublicOutputFormat {
     NoteDepositV1,
 }
 
-/// Configuration needed to reconstruct a run from guest bytes.
+/// Configuration needed to reconstruct the guest-visible statement.
+///
+/// The lightweight verifier uses [`NightstreamVerifierContext`] for the actual
+/// shard verification. This config remains in the package so the application
+/// output binding can be rechecked against the guest-visible output claims.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rv64TraceWiringRunConfig {
     /// Reserved for compatibility with the old ROM-based flow. Always `0`.
@@ -59,7 +71,7 @@ pub struct Rv64TraceWiringRunConfig {
     pub ram_init: HashMap<u64, u64>,
     /// Initial register values: register index -> value.
     pub reg_init: HashMap<u64, u64>,
-    /// Output claims: (address, expected_value_as_u64).
+    /// Guest-visible output claims: `(guest_addr, expected_value_as_u64)`.
     pub output_claims: Vec<(u64, u64)>,
     /// Optional format used to bind `public_output` to proof-visible outputs.
     #[serde(default)]
@@ -79,33 +91,200 @@ pub struct PoolViewerSig {
     pub signature: Vec<u8>,
 }
 
+/// Output-binding context needed by the lightweight packaged verifier.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputBindingConfigWire {
+    /// Number of logical address bits in the bound memory space.
+    pub num_bits: usize,
+    /// Claimed logical program outputs.
+    pub program_io: ProgramIO<F>,
+    /// Logical memory identifier the proof bound against.
+    pub mem_id: u32,
+}
+
+impl OutputBindingConfigWire {
+    fn to_native(
+        &self,
+        steps: &[StepInstanceBundle<Cmt, F, K>],
+    ) -> Result<OutputBindingConfig, PiCcsError> {
+        let mem_idx = steps
+            .first()
+            .and_then(|step| {
+                step.mem_insts
+                    .iter()
+                    .position(|inst| inst.mem_id == self.mem_id)
+            })
+            .ok_or_else(|| {
+                PiCcsError::InvalidInput(format!(
+                    "missing mem_id={} in packaged step instances for output binding",
+                    self.mem_id
+                ))
+            })?;
+
+        for (step_idx, step) in steps.iter().enumerate().skip(1) {
+            match step
+                .mem_insts
+                .iter()
+                .position(|inst| inst.mem_id == self.mem_id)
+            {
+                Some(idx) if idx == mem_idx => {}
+                Some(idx) => {
+                    return Err(PiCcsError::InvalidInput(format!(
+                        "mem_id={} moved from mem_idx={} to mem_idx={} at step {}",
+                        self.mem_id, mem_idx, idx, step_idx
+                    )));
+                }
+                None => {
+                    return Err(PiCcsError::InvalidInput(format!(
+                        "missing mem_id={} in packaged step {} for output binding",
+                        self.mem_id, step_idx
+                    )));
+                }
+            }
+        }
+
+        Ok(OutputBindingConfig::new(self.num_bits, self.program_io.clone()).with_mem_idx(mem_idx))
+    }
+}
+
+/// Verifier-only public context needed to verify a packaged proof directly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NightstreamVerifierContext {
+    /// The prepared CCS relation used by the shard verifier.
+    pub ccs: CcsStructure<F>,
+    /// The public Neo parameter set used during proving.
+    pub params: NeoParams,
+    /// Public step instances produced during proving.
+    pub steps_public: Vec<StepInstanceBundle<Cmt, F, K>>,
+    /// Optional output-binding configuration for proofs that bind final memory state.
+    #[serde(default)]
+    pub output_binding: Option<OutputBindingConfigWire>,
+    /// Step-linking equalities `(prev_col, next_col)` applied across step boundaries.
+    #[serde(default)]
+    pub step_linking_pairs: Vec<(usize, usize)>,
+    /// Optional verifier-visible RISC-V proof profile metadata.
+    #[serde(default)]
+    pub proof_profile: Option<RiscvProofProfileConfig>,
+    /// Optional deterministic guest-memory layout bound to the proof.
+    #[serde(default)]
+    pub memory_layout: Option<RiscvGuestMemoryLayout>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NightstreamVerifierContextWire {
+    ccs: Vec<u8>,
+    params: Vec<u8>,
+    steps_public: Vec<StepInstanceBundleBytes>,
+    #[serde(default)]
+    output_binding: Option<OutputBindingConfigWire>,
+    #[serde(default)]
+    step_linking_pairs: Vec<(usize, usize)>,
+    #[serde(default)]
+    proof_profile: Option<RiscvProofProfileConfig>,
+    #[serde(default)]
+    memory_layout: Option<RiscvGuestMemoryLayout>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StepInstanceBundleBytes {
+    mcs_inst: Vec<u8>,
+    lut_insts: Vec<u8>,
+    mem_insts: Vec<MemInstanceWire>,
+    time_columns: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemInstanceWire {
+    mem_id: u32,
+    comms: Vec<u8>,
+    k: usize,
+    d: usize,
+    n_side: usize,
+    steps: usize,
+    lanes: usize,
+    ell: usize,
+    init: Vec<u8>,
+    init_digest: Option<[u8; 32]>,
+    guest_addr_remap: Option<AffineWordAddressRemap>,
+}
+
+impl MemInstanceWire {
+    fn from_native(
+        inst: &neo_memory::witness::MemInstance<Cmt, F>,
+        step_idx: usize,
+        mem_idx: usize,
+    ) -> Result<Self, PiCcsError> {
+        let comms = bincode::serialize(&inst.comms).map_err(|e| {
+            PiCcsError::InvalidInput(format!(
+                "verifier context step[{step_idx}] memory[{mem_idx}] commitments serialization failed: {e}"
+            ))
+        })?;
+        let init = bincode::serialize(&inst.init).map_err(|e| {
+            PiCcsError::InvalidInput(format!(
+                "verifier context step[{step_idx}] memory[{mem_idx}] init serialization failed: {e}"
+            ))
+        })?;
+
+        Ok(Self {
+            mem_id: inst.mem_id,
+            comms,
+            k: inst.k,
+            d: inst.d,
+            n_side: inst.n_side,
+            steps: inst.steps,
+            lanes: inst.lanes,
+            ell: inst.ell,
+            init,
+            init_digest: inst.init_digest,
+            guest_addr_remap: inst.guest_addr_remap.clone(),
+        })
+    }
+
+    fn to_native(
+        &self,
+        step_idx: usize,
+        mem_idx: usize,
+    ) -> Result<neo_memory::witness::MemInstance<Cmt, F>, PiCcsError> {
+        Ok(neo_memory::witness::MemInstance {
+            mem_id: self.mem_id,
+            comms: bincode::deserialize(&self.comms).map_err(|e| {
+                PiCcsError::InvalidInput(format!(
+                    "verifier context step[{step_idx}] memory[{mem_idx}] commitments deserialization failed: {e}"
+                ))
+            })?,
+            k: self.k,
+            d: self.d,
+            n_side: self.n_side,
+            steps: self.steps,
+            lanes: self.lanes,
+            ell: self.ell,
+            init: bincode::deserialize(&self.init).map_err(|e| {
+                PiCcsError::InvalidInput(format!(
+                    "verifier context step[{step_idx}] memory[{mem_idx}] init deserialization failed: {e}"
+                ))
+            })?,
+            init_digest: self.init_digest,
+            guest_addr_remap: self.guest_addr_remap.clone(),
+        })
+    }
+}
+
 /// A self-contained proof package for Nightstream RV64 proofs.
-///
-/// Contains everything needed for an external verifier to check the proof
-/// without access to the original proving session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NightstreamProofPackage {
-    /// The folding proof encoded as adapter-owned binary bytes.
+    /// The native shard proof emitted by Nightstream.
+    pub proof: ShardProof,
+    /// Public verifier context packaged by the `/prove` path.
     ///
-    /// This avoids depending on serde impls in upstream Nightstream proof types.
-    pub proof: Vec<u8>,
-
-    /// Public step instance bundles produced during proving.
-    ///
-    /// These carry per-step MCS commitments + public inputs, plus memory and
-    /// lookup instances. The adapter keeps this field for package compatibility,
-    /// but the current RV64 host path does not populate it.
-    pub steps_public: Vec<StepInstanceBundle<Cmt, F, K>>,
-
+    /// Stored as adapter-owned bytes because upstream `MemInstance` does not
+    /// bincode-roundtrip cleanly when embedded directly.
+    pub verifier_context: Vec<u8>,
     /// Public output bytes (bincode-serialized application output).
     pub public_output: Vec<u8>,
-
     /// Guest bytes (currently the full RV64IM ELF).
     pub rom_bytes: Vec<u8>,
-
-    /// Run configuration needed to reconstruct verification context.
+    /// Guest-visible statement/configuration metadata.
     pub config: Rv64TraceWiringRunConfig,
-
     /// Optional pool-operator signature over the viewer FVK commitment.
     #[serde(default)]
     pub pool_viewer_sig: Option<PoolViewerSig>,
@@ -126,16 +305,12 @@ impl NightstreamProofPackage {
         })
     }
 
-    /// Returns the number of folding steps encoded in `proof`.
+    /// Returns the number of folding steps encoded in the packaged proof.
     pub fn proof_step_count(&self) -> Result<usize, PiCcsError> {
-        Ok(decode_shard_proof_wire(&self.proof)?.steps.len())
+        Ok(self.proof.steps.len())
     }
 
-    /// Verify this proof package by reconstructing the run from guest bytes/config and
-    /// comparing canonical proof bytes.
-    ///
-    /// This keeps verification entirely inside the adapter without requiring serde
-    /// support in upstream Nightstream proof structs.
+    /// Verify this proof package directly against the packaged verifier context.
     pub fn verify(&self) -> Result<bool, PiCcsError> {
         if self.config.xlen != 64 {
             return Err(PiCcsError::InvalidInput(format!(
@@ -144,35 +319,91 @@ impl NightstreamProofPackage {
             )));
         }
 
-        let mut builder =
-            Rv64TraceWiring::from_elf(&self.rom_bytes)?.chunk_rows(self.config.chunk_rows);
+        self.verify_lightweight()?;
+        self.verify_public_output_binding()?;
+        Ok(true)
+    }
 
-        if let Some(max_steps) = self.config.max_steps {
-            builder = builder.max_steps(max_steps);
+    fn verify_lightweight(&self) -> Result<(), PiCcsError> {
+        let verifier_context = decode_verifier_context(&self.verifier_context)?;
+        validate_proof_metadata(&verifier_context, &self.proof)?;
+
+        let steps_public = &verifier_context.steps_public;
+        if steps_public.is_empty() {
+            return Err(PiCcsError::InvalidInput(
+                "packaged verifier context is missing step instances".into(),
+            ));
         }
 
-        for (&addr, &value) in &self.config.ram_init {
-            builder = builder.ram_init_u32(addr, value as u32);
-        }
+        let mut transcript = Poseidon2Transcript::new(b"neo.fold/session");
+        let seed_me: &[CeClaim<Cmt, F, K>] = &[];
+        let mode = FoldingMode::Optimized;
+        let mixers = default_mixers();
 
-        for (&reg, &value) in &self.config.reg_init {
-            builder = builder.reg_init_u64(reg, value);
-        }
+        let outputs: ShardFoldOutputs<Cmt, F, K> = match verifier_context.output_binding.as_ref() {
+            Some(ob_wire) => {
+                let ob_cfg = ob_wire.to_native(steps_public)?;
+                if steps_public.len() > 1 {
+                    let step_linking = required_step_linking(&verifier_context.step_linking_pairs)?;
+                    fold_shard_verify_with_output_binding_and_step_linking(
+                        mode,
+                        &mut transcript,
+                        &verifier_context.params,
+                        &verifier_context.ccs,
+                        steps_public,
+                        seed_me,
+                        &self.proof,
+                        mixers,
+                        &ob_cfg,
+                        &step_linking,
+                    )?
+                } else {
+                    fold_shard_verify_with_output_binding(
+                        mode,
+                        &mut transcript,
+                        &verifier_context.params,
+                        &verifier_context.ccs,
+                        steps_public,
+                        seed_me,
+                        &self.proof,
+                        mixers,
+                        &ob_cfg,
+                    )?
+                }
+            }
+            None => {
+                if steps_public.len() > 1 {
+                    let step_linking = required_step_linking(&verifier_context.step_linking_pairs)?;
+                    fold_shard_verify_with_step_linking(
+                        mode,
+                        &mut transcript,
+                        &verifier_context.params,
+                        &verifier_context.ccs,
+                        steps_public,
+                        seed_me,
+                        &self.proof,
+                        mixers,
+                        &step_linking,
+                    )?
+                } else {
+                    fold_shard_verify(
+                        mode,
+                        &mut transcript,
+                        &verifier_context.params,
+                        &verifier_context.ccs,
+                        steps_public,
+                        seed_me,
+                        &self.proof,
+                        mixers,
+                    )?
+                }
+            }
+        };
 
-        for &(addr, value) in &self.config.output_claims {
-            builder = builder.output_claim(addr, F::from_u64(value));
-        }
+        validate_shard_outputs(steps_public, &outputs)
+    }
 
-        let run = builder.prove()?;
-
-        // Sanity check that the regenerated proof is internally valid.
-        run.verify_proof(run.proof())?;
-
-        let regenerated = encode_shard_proof_bytes(run.proof())?;
-        if regenerated != self.proof {
-            return Ok(false);
-        }
-
+    fn verify_public_output_binding(&self) -> Result<(), PiCcsError> {
         if let Some(format) = &self.config.public_output_format {
             match format {
                 PublicOutputFormat::NoteSpendV1 => {
@@ -180,8 +411,8 @@ impl NightstreamProofPackage {
                         spend_public_binding_digest_from_public_bytes(&self.public_output)
                             .map_err(|e| {
                                 PiCcsError::InvalidInput(format!(
-                                "failed to derive note-spend binding digest from public_output: {e}"
-                            ))
+                            "failed to derive note-spend binding digest from public_output: {e}"
+                        ))
                             })?;
                     let claimed =
                         digest32_from_output_claims(&self.config.output_claims).map_err(|e| {
@@ -214,464 +445,218 @@ impl NightstreamProofPackage {
             }
         }
 
-        Ok(true)
+        Ok(())
     }
-}
-
-/// Encode a Nightstream shard proof into adapter-owned binary bytes.
-pub(crate) fn encode_shard_proof_bytes(proof: &ShardProof) -> Result<Vec<u8>, PiCcsError> {
-    let wire = ShardProofWire::from_native(proof);
-    bincode::serialize(&wire)
-        .map_err(|e| PiCcsError::InvalidInput(format!("proof wire serialization failed: {e}")))
-}
-
-fn decode_shard_proof_wire(bytes: &[u8]) -> Result<ShardProofWire, PiCcsError> {
-    bincode::deserialize(bytes)
-        .map_err(|e| PiCcsError::InvalidInput(format!("proof wire deserialization failed: {e}")))
 }
 
 fn default_chunk_rows() -> usize {
     1 << 16
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TimeSumcheckWire {
-    claimed_sum: K,
-    round_polys: Vec<Vec<K>>,
-    r_time: Vec<K>,
+pub(crate) fn encode_verifier_context(
+    ctx: &NightstreamVerifierContext,
+) -> Result<Vec<u8>, PiCcsError> {
+    let steps_public = ctx
+        .steps_public
+        .iter()
+        .enumerate()
+        .map(|(step_idx, step)| {
+            Ok(StepInstanceBundleBytes {
+                mcs_inst: bincode::serialize(&step.mcs_inst).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] MCS serialization failed: {e}"
+                    ))
+                })?,
+                lut_insts: bincode::serialize(&step.lut_insts).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] LUT serialization failed: {e}"
+                    ))
+                })?,
+                mem_insts: step
+                    .mem_insts
+                    .iter()
+                    .enumerate()
+                    .map(|(mem_idx, inst)| MemInstanceWire::from_native(inst, step_idx, mem_idx))
+                    .collect::<Result<Vec<_>, _>>()?,
+                time_columns: bincode::serialize(&step.time_columns).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] time-column serialization failed: {e}"
+                    ))
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, PiCcsError>>()?;
+
+    let wire = NightstreamVerifierContextWire {
+        ccs: bincode::serialize(&ctx.ccs).map_err(|e| {
+            PiCcsError::InvalidInput(format!("verifier context CCS serialization failed: {e}"))
+        })?,
+        params: bincode::serialize(&ctx.params).map_err(|e| {
+            PiCcsError::InvalidInput(format!("verifier context params serialization failed: {e}"))
+        })?,
+        steps_public,
+        output_binding: ctx.output_binding.clone(),
+        step_linking_pairs: ctx.step_linking_pairs.clone(),
+        proof_profile: ctx.proof_profile.clone(),
+        memory_layout: ctx.memory_layout.clone(),
+    };
+
+    bincode::serialize(&wire).map_err(|e| {
+        PiCcsError::InvalidInput(format!("verifier context wire serialization failed: {e}"))
+    })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TimePointOpeningWire {
-    point: Vec<K>,
-    col_ids: Vec<usize>,
-    evals: Vec<K>,
-    source: String,
-}
+pub(crate) fn decode_verifier_context(
+    bytes: &[u8],
+) -> Result<NightstreamVerifierContext, PiCcsError> {
+    let wire: NightstreamVerifierContextWire = bincode::deserialize(bytes).map_err(|e| {
+        PiCcsError::InvalidInput(format!("verifier context wire deserialization failed: {e}"))
+    })?;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TimeOpeningProofWire {
-    point: Vec<K>,
-    col_ids: Vec<usize>,
-    evals: Vec<K>,
-    digit_evals: Vec<Vec<K>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OpeningClaimEntryWire {
-    point: Vec<K>,
-    col_ids: Vec<usize>,
-    source: String,
-    domain: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OpeningClaimManifestWire {
-    entries: Vec<OpeningClaimEntryWire>,
-    digest: [u8; 32],
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OpeningReductionGroupWire {
-    point: Vec<K>,
-    domain: String,
-    claim_indices: Vec<usize>,
-    group_digest: [u8; 32],
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OpeningReductionProofWire {
-    groups: Vec<OpeningReductionGroupWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OpeningUnificationProofWire {
-    claimed_sum: K,
-    round_polys: Vec<Vec<K>>,
-    r_unify: Vec<K>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct JointOpeningGroupProofWire {
-    point: Vec<K>,
-    domain: String,
-    claim_indices: Vec<usize>,
-    group_digest: [u8; 32],
-    joint_claim_digits: Vec<K>,
-    joint_claim: K,
-    joint_commitment: Cmt,
-    opening_ccs_proof: Option<PiCcsProof>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct JointOpeningLaneProofWire {
-    claim_kind: String,
-    groups: Vec<JointOpeningGroupProofWire>,
-    unified_fold: Option<JointOpeningGroupProofWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct FoldingLanesWire {
-    main_children: usize,
-    val_children: usize,
-    wb_children: usize,
-    wp_children: usize,
-    stage8_children: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShoutAddrPreGroupProofWire {
-    ell_addr: u32,
-    active_lanes: Vec<u32>,
-    round_polys: Vec<Vec<Vec<K>>>,
-    r_addr: Vec<K>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShoutAddrPreProofWire {
-    claimed_sums: Vec<K>,
-    groups: Vec<ShoutAddrPreGroupProofWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum MemOrLutProofWire {
-    Twist(neo_memory::twist::TwistProof<K>),
-    Shout(neo_memory::shout::ShoutProof<K>),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct MemSidecarProofWire {
-    val_me_claims: Vec<CeClaim<Cmt, F, K>>,
-    wb_me_claims: Vec<CeClaim<Cmt, F, K>>,
-    wp_me_claims: Vec<CeClaim<Cmt, F, K>>,
-    poseidon_cycle_me_claims: Vec<CeClaim<Cmt, F, K>>,
-    poseidon_local_me_claims: Vec<CeClaim<Cmt, F, K>>,
-    shout_addr_pre: ShoutAddrPreProofWire,
-    proofs: Vec<MemOrLutProofWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BatchedTimeProofWire {
-    claimed_sums: Vec<K>,
-    degree_bounds: Vec<usize>,
-    labels: Vec<Vec<u8>>,
-    round_polys: Vec<Vec<Vec<K>>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RlcDecProofWire {
-    rlc_rhos: Vec<Mat<F>>,
-    rlc_parent: CeClaim<Cmt, F, K>,
-    dec_children: Vec<CeClaim<Cmt, F, K>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct FoldStepWire {
-    ccs_out: Vec<CeClaim<Cmt, F, K>>,
-    ccs_proof: PiCcsProof,
-    rlc_rhos: Vec<Mat<F>>,
-    rlc_parent: CeClaim<Cmt, F, K>,
-    dec_children: Vec<CeClaim<Cmt, F, K>>,
-    cpu_sumcheck: TimeSumcheckWire,
-    shift_sumcheck: TimeSumcheckWire,
-    time_cpu_commitments: Vec<Cmt>,
-    time_mem_commitments: Vec<Cmt>,
-    time_t: usize,
-    time_declared_len: usize,
-    time_col_ids: Vec<usize>,
-    memory_time_proofs: Vec<Vec<u8>>,
-    openings: Vec<TimePointOpeningWire>,
-    opening_proofs: Vec<TimeOpeningProofWire>,
-    opening_manifest: OpeningClaimManifestWire,
-    opening_reduction: OpeningReductionProofWire,
-    opening_unification: OpeningUnificationProofWire,
-    joint_opening_lane: JointOpeningLaneProofWire,
-    folding_lanes: FoldingLanesWire,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StepProofWire {
-    fold: FoldStepWire,
-    mem: MemSidecarProofWire,
-    batched_time: BatchedTimeProofWire,
-    poseidon_local_time: Option<BatchedTimeProofWire>,
-    poseidon_cycle_fold: Vec<RlcDecProofWire>,
-    poseidon_local_fold: Vec<RlcDecProofWire>,
-    val_fold: Vec<RlcDecProofWire>,
-    wb_fold: Vec<RlcDecProofWire>,
-    wp_fold: Vec<RlcDecProofWire>,
-    compressed_substeps: Option<Vec<StepProofWire>>,
-    stage8_fold: Vec<RlcDecProofWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardSegmentMetaWire {
-    kind: String,
-    public_steps: usize,
-    proof_steps: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardProofWire {
-    steps: Vec<StepProofWire>,
-    output_proof: Option<OutputBindingProof>,
-    segment_meta: Option<Vec<ShardSegmentMetaWire>>,
-}
-
-impl ShardProofWire {
-    fn from_native(proof: &ShardProof) -> Self {
-        Self {
-            steps: proof.steps.iter().map(StepProofWire::from_native).collect(),
-            output_proof: proof.output_proof.clone(),
-            segment_meta: proof.segment_meta.as_ref().map(|meta| {
-                meta.iter()
-                    .map(|m| ShardSegmentMetaWire {
-                        kind: format!("{:?}", m.kind),
-                        public_steps: m.public_steps,
-                        proof_steps: m.proof_steps,
-                    })
-                    .collect()
-            }),
-        }
-    }
-}
-
-impl StepProofWire {
-    fn from_native(step: &StepProof) -> Self {
-        Self {
-            fold: FoldStepWire::from_native(&step.fold),
-            mem: MemSidecarProofWire::from_native(&step.mem),
-            batched_time: BatchedTimeProofWire::from_native(&step.batched_time),
-            poseidon_local_time: step
-                .poseidon_local_time
-                .as_ref()
-                .map(BatchedTimeProofWire::from_native),
-            poseidon_cycle_fold: step
-                .poseidon_cycle_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-            poseidon_local_fold: step
-                .poseidon_local_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-            val_fold: step
-                .val_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-            wb_fold: step
-                .wb_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-            wp_fold: step
-                .wp_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-            compressed_substeps: step.compressed_substeps.as_ref().map(|sub| {
-                sub.iter()
-                    .map(StepProofWire::from_native)
-                    .collect::<Vec<_>>()
-            }),
-            stage8_fold: step
-                .stage8_fold
-                .iter()
-                .map(RlcDecProofWire::from_native)
-                .collect(),
-        }
-    }
-}
-
-impl FoldStepWire {
-    fn from_native(step: &FoldStep) -> Self {
-        Self {
-            ccs_out: step.ccs_out.clone(),
-            ccs_proof: step.ccs_proof.clone(),
-            rlc_rhos: rot_rhos_to_mats(&step.rlc_rhos),
-            rlc_parent: step.rlc_parent.clone(),
-            dec_children: step.dec_children.clone(),
-            cpu_sumcheck: TimeSumcheckWire {
-                claimed_sum: step.cpu_sumcheck.claimed_sum,
-                round_polys: step.cpu_sumcheck.round_polys.clone(),
-                r_time: step.cpu_sumcheck.r_time.clone(),
-            },
-            shift_sumcheck: TimeSumcheckWire {
-                claimed_sum: step.shift_sumcheck.claimed_sum,
-                round_polys: step.shift_sumcheck.round_polys.clone(),
-                r_time: step.shift_sumcheck.r_time.clone(),
-            },
-            time_cpu_commitments: step.time_cpu_commitments.clone(),
-            time_mem_commitments: step.time_mem_commitments.clone(),
-            time_t: step.time_t,
-            time_declared_len: step.time_declared_len,
-            time_col_ids: step.time_col_ids.clone(),
-            memory_time_proofs: step
-                .memory_time_proofs
-                .iter()
-                .map(|label| (*label).to_vec())
-                .collect(),
-            openings: step
-                .openings
-                .iter()
-                .map(|o| TimePointOpeningWire {
-                    point: o.point.clone(),
-                    col_ids: o.col_ids.clone(),
-                    evals: o.evals.clone(),
-                    source: format!("{:?}", o.source),
+    Ok(NightstreamVerifierContext {
+        ccs: bincode::deserialize(&wire.ccs).map_err(|e| {
+            PiCcsError::InvalidInput(format!("verifier context CCS deserialization failed: {e}"))
+        })?,
+        params: bincode::deserialize(&wire.params).map_err(|e| {
+            PiCcsError::InvalidInput(format!(
+                "verifier context params deserialization failed: {e}"
+            ))
+        })?,
+        steps_public: wire
+            .steps_public
+            .into_iter()
+            .enumerate()
+            .map(|(step_idx, step)| {
+                let mcs_inst = bincode::deserialize(&step.mcs_inst).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] MCS deserialization failed: {e}"
+                    ))
+                })?;
+                let lut_insts = bincode::deserialize(&step.lut_insts).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] LUT deserialization failed: {e}"
+                    ))
+                })?;
+                let mem_insts = step
+                    .mem_insts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(mem_idx, inst)| inst.to_native(step_idx, mem_idx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let time_columns = bincode::deserialize(&step.time_columns).map_err(|e| {
+                    PiCcsError::InvalidInput(format!(
+                        "verifier context step[{step_idx}] time-column deserialization failed: {e}"
+                    ))
+                })?;
+                Ok(StepInstanceBundle {
+                    mcs_inst,
+                    lut_insts,
+                    mem_insts,
+                    time_columns,
+                    _phantom: PhantomData,
                 })
-                .collect(),
-            opening_proofs: step
-                .opening_proofs
-                .iter()
-                .map(|o| TimeOpeningProofWire {
-                    point: o.point.clone(),
-                    col_ids: o.col_ids.clone(),
-                    evals: o.evals.clone(),
-                    digit_evals: o.digit_evals.clone(),
-                })
-                .collect(),
-            opening_manifest: OpeningClaimManifestWire {
-                entries: step
-                    .opening_manifest
-                    .entries
-                    .iter()
-                    .map(|entry| OpeningClaimEntryWire {
-                        point: entry.point.clone(),
-                        col_ids: entry.col_ids.clone(),
-                        source: format!("{:?}", entry.source),
-                        domain: format!("{:?}", entry.domain),
-                    })
-                    .collect(),
-                digest: step.opening_manifest.digest,
-            },
-            opening_reduction: OpeningReductionProofWire {
-                groups: step
-                    .opening_reduction
-                    .groups
-                    .iter()
-                    .map(|group| OpeningReductionGroupWire {
-                        point: group.point.clone(),
-                        domain: format!("{:?}", group.domain),
-                        claim_indices: group.claim_indices.clone(),
-                        group_digest: group.group_digest,
-                    })
-                    .collect(),
-            },
-            opening_unification: OpeningUnificationProofWire {
-                claimed_sum: step.opening_unification.claimed_sum,
-                round_polys: step.opening_unification.round_polys.clone(),
-                r_unify: step.opening_unification.r_unify.clone(),
-            },
-            joint_opening_lane: JointOpeningLaneProofWire {
-                claim_kind: format!("{:?}", step.joint_opening_lane.claim_kind),
-                groups: step
-                    .joint_opening_lane
-                    .groups
-                    .iter()
-                    .map(|group| JointOpeningGroupProofWire {
-                        point: group.point.clone(),
-                        domain: format!("{:?}", group.domain),
-                        claim_indices: group.claim_indices.clone(),
-                        group_digest: group.group_digest,
-                        joint_claim_digits: group.joint_claim_digits.clone(),
-                        joint_claim: group.joint_claim,
-                        joint_commitment: group.joint_commitment.clone(),
-                        opening_ccs_proof: group.opening_ccs_proof.clone(),
-                    })
-                    .collect(),
-                unified_fold: step.joint_opening_lane.unified_fold.as_ref().map(|group| {
-                    JointOpeningGroupProofWire {
-                        point: group.point.clone(),
-                        domain: format!("{:?}", group.domain),
-                        claim_indices: group.claim_indices.clone(),
-                        group_digest: group.group_digest,
-                        joint_claim_digits: group.joint_claim_digits.clone(),
-                        joint_claim: group.joint_claim,
-                        joint_commitment: group.joint_commitment.clone(),
-                        opening_ccs_proof: group.opening_ccs_proof.clone(),
-                    }
-                }),
-            },
-            folding_lanes: FoldingLanesWire {
-                main_children: step.folding_lanes.main_children,
-                val_children: step.folding_lanes.val_children,
-                wb_children: step.folding_lanes.wb_children,
-                wp_children: step.folding_lanes.wp_children,
-                stage8_children: step.folding_lanes.stage8_children,
-            },
-        }
-    }
+            })
+            .collect::<Result<Vec<_>, PiCcsError>>()?,
+        output_binding: wire.output_binding,
+        step_linking_pairs: wire.step_linking_pairs,
+        proof_profile: wire.proof_profile,
+        memory_layout: wire.memory_layout,
+    })
 }
 
-impl MemSidecarProofWire {
-    fn from_native(mem: &MemSidecarProof<Cmt, F, K>) -> Self {
-        Self {
-            val_me_claims: mem.val_me_claims.clone(),
-            wb_me_claims: mem.wb_me_claims.clone(),
-            wp_me_claims: mem.wp_me_claims.clone(),
-            poseidon_cycle_me_claims: mem.poseidon_cycle_me_claims.clone(),
-            poseidon_local_me_claims: mem.poseidon_local_me_claims.clone(),
-            shout_addr_pre: ShoutAddrPreProofWire {
-                claimed_sums: mem.shout_addr_pre.claimed_sums.clone(),
-                groups: mem
-                    .shout_addr_pre
-                    .groups
-                    .iter()
-                    .map(|g| ShoutAddrPreGroupProofWire {
-                        ell_addr: g.ell_addr,
-                        active_lanes: g.active_lanes.clone(),
-                        round_polys: g.round_polys.clone(),
-                        r_addr: g.r_addr.clone(),
-                    })
-                    .collect(),
-            },
-            proofs: mem
-                .proofs
-                .iter()
-                .map(|proof| match proof {
-                    MemOrLutProof::Twist(t) => MemOrLutProofWire::Twist(t.clone()),
-                    MemOrLutProof::Shout(s) => MemOrLutProofWire::Shout(s.clone()),
-                })
-                .collect(),
-        }
+fn required_step_linking(pairs: &[(usize, usize)]) -> Result<StepLinkingConfig, PiCcsError> {
+    if pairs.is_empty() {
+        return Err(PiCcsError::InvalidInput(
+            "multi-step packaged verification requires step_linking_pairs".into(),
+        ));
     }
+    Ok(StepLinkingConfig::new(pairs.to_vec()))
 }
 
-impl BatchedTimeProofWire {
-    fn from_native(proof: &BatchedTimeProof) -> Self {
-        Self {
-            claimed_sums: proof.claimed_sums.clone(),
-            degree_bounds: proof.degree_bounds.clone(),
-            labels: proof.labels.iter().map(|label| (*label).to_vec()).collect(),
-            round_polys: proof.round_polys.clone(),
+fn validate_proof_metadata(
+    ctx: &NightstreamVerifierContext,
+    proof: &ShardProof,
+) -> Result<(), PiCcsError> {
+    if let Some(expected) = &ctx.proof_profile {
+        let actual = proof.riscv_profile.as_ref().ok_or_else(|| {
+            PiCcsError::InvalidInput(
+                "packaged verifier context expected riscv_profile, but proof omitted it".into(),
+            )
+        })?;
+        if actual != expected {
+            return Err(PiCcsError::ProtocolError(format!(
+                "RISC-V proof profile mismatch: packaged={expected:?} proof={actual:?}"
+            )));
         }
     }
-}
 
-impl RlcDecProofWire {
-    fn from_native(proof: &RlcDecProof) -> Self {
-        Self {
-            rlc_rhos: rot_rhos_to_mats(&proof.rlc_rhos),
-            rlc_parent: proof.rlc_parent.clone(),
-            dec_children: proof.dec_children.clone(),
+    if let Some(expected) = &ctx.memory_layout {
+        let actual = proof.riscv_memory_layout.as_ref().ok_or_else(|| {
+            PiCcsError::InvalidInput(
+                "packaged verifier context expected riscv_memory_layout, but proof omitted it"
+                    .into(),
+            )
+        })?;
+        if actual != expected {
+            return Err(PiCcsError::ProtocolError(format!(
+                "RISC-V memory layout mismatch: packaged={expected:?} proof={actual:?}"
+            )));
         }
     }
+
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn validate_shard_outputs(
+    steps_public: &[StepInstanceBundle<Cmt, F, K>],
+    outputs: &ShardFoldOutputs<Cmt, F, K>,
+) -> Result<(), PiCcsError> {
+    let has_twist_or_shout = steps_public
+        .iter()
+        .any(|step| !step.mem_insts.is_empty() || !step.lut_insts.is_empty());
+    if !has_twist_or_shout && !outputs.obligations.val.is_empty() {
+        return Err(PiCcsError::ProtocolError(
+            "CCS-only packaged verification produced unexpected val-lane obligations".into(),
+        ));
+    }
+    Ok(())
+}
 
-    #[test]
-    fn proof_wire_roundtrip_rejects_invalid_bytes() {
-        let bytes = vec![1u8, 2, 3, 4];
-        let err = decode_shard_proof_wire(&bytes).expect_err("invalid proof wire should fail");
-        match err {
-            PiCcsError::InvalidInput(_) => {}
-            other => panic!("unexpected error variant: {other:?}"),
+type Mixers = CommitMixers<fn(&[Mat<F>], &[Cmt]) -> Cmt, fn(&[Cmt], u32) -> Cmt>;
+
+fn rot_matrix_to_rq(mat: &Mat<F>) -> RqEl {
+    debug_assert_eq!(mat.rows(), D);
+    debug_assert_eq!(mat.cols(), D);
+
+    let mut coeffs = [F::ZERO; D];
+    for i in 0..D {
+        coeffs[i] = mat[(i, 0)];
+    }
+    cf_inv(coeffs)
+}
+
+fn default_mixers() -> Mixers {
+    fn mix_rhos_commits(rhos: &[Mat<F>], cs: &[Cmt]) -> Cmt {
+        debug_assert!(!cs.is_empty(), "mix_rhos_commits: empty commitments");
+        let rq_els: Vec<RqEl> = rhos.iter().map(rot_matrix_to_rq).collect();
+        s_lincomb(&rq_els, cs).expect("s_lincomb should succeed for packaged verification")
+    }
+
+    fn combine_b_pows(cs: &[Cmt], b: u32) -> Cmt {
+        debug_assert!(!cs.is_empty(), "combine_b_pows: empty commitments");
+        let mut acc = cs[0].clone();
+        let mut pow = F::from_u64(b as u64);
+        for c in cs.iter().skip(1) {
+            let rq_pow = RqEl::from_field_scalar(pow);
+            let term = s_mul(&rq_pow, c);
+            acc.add_inplace(&term);
+            pow *= F::from_u64(b as u64);
         }
+        acc
+    }
+
+    CommitMixers {
+        mix_rhos_commits,
+        combine_b_pows,
     }
 }

@@ -1667,9 +1667,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                                     bincode::deserialize(proof_bytes).context(
                                         "cached proof payload is not a NightstreamProofPackage",
                                     )?;
-                                let public: SpendPublic =
-                                    bincode::deserialize(&package.public_output)
-                                        .context("cached proof public_output is not valid SpendPublic")?;
+                                let public: SpendPublic = bincode::deserialize(
+                                    &package.public_output,
+                                )
+                                .context("cached proof public_output is not valid SpendPublic")?;
                                 public
                                     .view_attestations
                                     .as_ref()

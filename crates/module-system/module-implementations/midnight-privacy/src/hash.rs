@@ -415,7 +415,11 @@ pub fn inv_enforce_v2(
 
     /// Multiply acc by all 4 element-wise differences (a[i] - b[i]).
     /// Matches the circuit's `enforce_prod_digest_diff`.
-    fn digest_diff_prod(mut acc: Goldilocks, a: &[Goldilocks; 4], b: &[Goldilocks; 4]) -> Goldilocks {
+    fn digest_diff_prod(
+        mut acc: Goldilocks,
+        a: &[Goldilocks; 4],
+        b: &[Goldilocks; 4],
+    ) -> Goldilocks {
         for i in 0..4 {
             acc *= a[i] - b[i];
         }

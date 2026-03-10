@@ -36,7 +36,6 @@ pub struct MidnightPrivacyConfig<S: Spec> {
 
     /// Single supported token (native)
     pub token_id: sov_bank::TokenId,
-
 }
 
 impl<S: Spec> ValueMidnightPrivacy<S> {
