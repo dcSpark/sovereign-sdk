@@ -31,7 +31,7 @@ If `MCP_AUTO_INITIALIZE_SESSIONS=true` and `MCP_AUTO_CREATE_WALLET=true`, unknow
 
 - Rust toolchain
 - Running Sovereign SDK L2 rollup node
-- Ligero proof service (`ligero-http-server`) running (default: `http://127.0.0.1:8080`)
+- Nightstream proof service running (default: `http://127.0.0.1:8080`)
 
 ### Configuration
 
@@ -42,8 +42,8 @@ Configure the following environment variables:
 - `ROLLUP_RPC_URL` - L2 rollup RPC endpoint
 - `VERIFIER_URL` - Transaction verifier service endpoint
 - `INDEXER_URL` - Transaction indexer endpoint
-- `LIGERO_PROOF_SERVICE_URL` - Ligero proof service base URL (default: `http://127.0.0.1:8080`)
-- `LIGERO_PROGRAM_PATH` - Ligero circuit name or program specifier (default: `note_spend_guest`)
+- `NIGHTSTREAM_PROOF_SERVICE_URL` - Nightstream proof service base URL (default: `http://127.0.0.1:8080`)
+- `NIGHTSTREAM_PROGRAM_PATH` - Nightstream circuit name or program specifier (default: `note_spend_guest`)
 - `POOL_FVK_PK` - Optional 32-byte `ed25519` public key enabling pool-signed viewer commitments (must match `midnight-fvk-service` signer)
 - `MIDNIGHT_FVK_SERVICE_URL` - Optional `midnight-fvk-service` base URL (default `http://127.0.0.1:8088`)
 - `AUTO_FUND_DEPOSIT_AMOUNT` - Optional amount (in dust) to auto-fund a new wallet when `createWallet` runs (best-effort).
@@ -55,6 +55,8 @@ Configure the following environment variables:
 - `MCP_SESSION_DB_ENCRYPTION_KEY` - Optional 32-byte encryption key (hex or base64) used to encrypt persisted session data. If unset, session data is stored unencrypted.
 - `MCP_AUTO_INITIALIZE_SESSIONS` - Optional boolean to auto-send `notifications/initialized` and allow resuming persisted sessions without an explicit initialize request.
 - `MCP_AUTO_CREATE_WALLET` - Optional boolean (requires `MCP_AUTO_INITIALIZE_SESSIONS=true`) that auto-runs `createWallet` for bootstrapped sessions with no wallet and for brand-new session ids that are auto-created.
+
+Legacy compatibility: `LIGERO_PROOF_SERVICE_URL` and `LIGERO_PROGRAM_PATH` are still accepted as aliases, but new setups should use the `NIGHTSTREAM_*` names.
 
 ### Start the Server
 
@@ -185,7 +187,7 @@ Run the fast, self-contained tests:
 cargo test -p mcp
 ```
 
-Integration tests (rollup/indexer/verifier + Ligero proof service) are ignored by default. Run them explicitly with:
+Integration tests (rollup/indexer/verifier + Nightstream proof service) are ignored by default. Run them explicitly with:
 
 ```bash
 cargo test --all-targets -- --ignored
@@ -195,7 +197,9 @@ Note: `-- --ignored` runs only the ignored tests; non-ignored tests will be repo
 
 - `ROLLUP_RPC_URL`, `VERIFIER_URL`, `INDEXER_URL`
 - `WALLET_PRIVATE_KEY`, `PRIVPOOL_SPEND_KEY` (used by integration test wallet setup, not runtime server config)
-- `LIGERO_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:8080`)
-- `LIGERO_PROGRAM_PATH` (defaults to `note_spend_guest`)
+- `NIGHTSTREAM_PROOF_SERVICE_URL` (defaults to `http://127.0.0.1:8080`)
+- `NIGHTSTREAM_PROGRAM_PATH` (defaults to `note_spend_guest`)
+
+The legacy `LIGERO_*` environment variables are still accepted by the test helpers as fallbacks.
 
 Set `RUST_LOG=debug` for verbose logging during development.

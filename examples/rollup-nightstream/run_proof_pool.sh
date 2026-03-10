@@ -3,14 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${SERVICE_TARGET_DIR:-release}"
+BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/midnight-proof-pool-service"
+
+source "$SCRIPT_DIR/pool_fvk_env.sh"
+resolve_pool_fvk_pk
 
 normalize_host() {
-  local host="$1"
-  if [[ "$host" == "0.0.0.0" || "$host" == "::" ]]; then
-    echo "127.0.0.1"
-    return
-  fi
-  echo "$host"
+  normalize_bind_host "$1"
 }
 
 default_url_from_bind() {
@@ -38,7 +38,8 @@ export MAX_PROOFS="${MAX_PROOFS:-1}"
 export PROOF_POOL_BIND_ADDR="${PROOF_POOL_BIND_ADDR:-127.0.0.1:11235}"
 export ROLLUP_RPC_URL="${ROLLUP_RPC_URL:-http://127.0.0.1:12346}"
 export INDEXER_URL="${INDEXER_URL:-$(default_url_from_bind "${INDEXER_BIND:-127.0.0.1:13100}" 13100)}"
-export LIGERO_PROOF_SERVICE_URL="${LIGERO_PROOF_SERVICE_URL:-$(default_url_from_bind "${PROVER_BIND_ADDR:-0.0.0.0:8080}" 8080)}"
+export MIDNIGHT_FVK_SERVICE_URL="$(midnight_fvk_service_url)"
+export NIGHTSTREAM_PROOF_SERVICE_URL="${NIGHTSTREAM_PROOF_SERVICE_URL:-${LIGERO_PROOF_SERVICE_URL:-$(default_url_from_bind "${PROVER_BIND_ADDR:-0.0.0.0:8080}" 8080)}}"
 export WALLET_SETUP_BACKOFF_MS="${WALLET_SETUP_BACKOFF_MS:-1000}"
 export SEQUENCER_READY_CHECK_TIMEOUT_MS="${SEQUENCER_READY_CHECK_TIMEOUT_MS:-2000}"
 export MAX_CONCURRENT_PROOFS="${MAX_CONCURRENT_PROOFS:-5}"
@@ -52,6 +53,17 @@ echo "  Bind address:   $PROOF_POOL_BIND_ADDR"
 echo "  MAX_PROOFS:     $MAX_PROOFS"
 echo "  ROLLUP_RPC_URL: $ROLLUP_RPC_URL"
 echo "  INDEXER_URL:    $INDEXER_URL"
+echo "  Prover URL:     $NIGHTSTREAM_PROOF_SERVICE_URL"
+echo "  FVK URL:        $MIDNIGHT_FVK_SERVICE_URL"
+print_pool_fvk_pk_status
+
+wait_for_midnight_fvk_service
+
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build ${TARGET_DIR/release/--release }-p midnight-proof-pool-service"
+  exit 1
+fi
 
 cd "$WORKSPACE_ROOT/examples/rollup-nightstream"
-exec cargo run -p midnight-proof-pool-service --release
+exec "$BIN"

@@ -6,6 +6,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${SERVICE_TARGET_DIR:-release}"
+ROLLUP_BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/sov-rollup-nightstream"
+ORACLE_BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/oracle"
 
 # Replica-specific paths
 REPLICA_DATA_DIR_REL="${REPLICA_DATA_DIR_REL:-demo_data_replica}"
@@ -175,15 +178,17 @@ export RUST_LOG="${RUST_LOG:-info}"
 # TEE mock attestation - enables mock mode for TEE verification
 export SOV_TEE_MOCK_ATTESTATION="${SOV_TEE_MOCK_ATTESTATION:-1}"
 
-# Build with TEE feature
-echo "Building replica rollup with TEE support..."
-cd "$WORKSPACE_ROOT"
-SKIP_GUEST_BUILD=1 cargo build --release -p sov-rollup-nightstream --features sov-modules-rollup-blueprint/tee
+if [[ ! -f "$ROLLUP_BIN" ]]; then
+    echo "ERROR: Rollup binary not found at $ROLLUP_BIN"
+    echo "Run: SKIP_GUEST_BUILD=1 cargo build ${TARGET_DIR/release/--release }-p sov-rollup-nightstream --features sov-modules-rollup-blueprint/tee"
+    exit 1
+fi
 
-# Build and start Oracle
-echo ""
-echo "Building oracle..."
-cargo build --release -p oracle
+if [[ ! -f "$ORACLE_BIN" ]]; then
+    echo "ERROR: Oracle binary not found at $ORACLE_BIN"
+    echo "Run: cargo build ${TARGET_DIR/release/--release }-p oracle"
+    exit 1
+fi
 
 # Configure oracle
 export ORACLE_SERVER_BIND_ADDRESS="$REPLICA_ORACLE_BIND"
@@ -195,7 +200,7 @@ echo ""
 echo "Starting oracle for replica..."
 echo "  Oracle Bind: $REPLICA_ORACLE_BIND"
 
-"$WORKSPACE_ROOT/target/release/oracle" &
+"$ORACLE_BIN" &
 ORACLE_PID=$!
 PIDS+=("$ORACLE_PID")
 
@@ -218,7 +223,7 @@ echo ""
 
 cd "$WORKSPACE_ROOT/examples/rollup-nightstream"
 
-"$WORKSPACE_ROOT/target/release/sov-rollup-nightstream" \
+"$ROLLUP_BIN" \
     --rollup-config-path rollup_config_replica.toml \
     --prometheus-exporter-bind "0.0.0.0:13201" \
     --genesis-config-dir "$REPLICA_GENESIS_DIR_REL" \

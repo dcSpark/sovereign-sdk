@@ -79,9 +79,16 @@ impl Nightstream {
             .json(&request)
             .send()
             .await
-            .with_context(|| format!("POST {endpoint}"))?
-            .error_for_status()
-            .with_context(|| format!("POST {endpoint} returned error status"))?;
+            .with_context(|| format!("POST {endpoint}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read response body: {e})"));
+            anyhow::bail!("POST {endpoint} returned {status}: {body}");
+        }
 
         let proof_bytes = response
             .bytes()

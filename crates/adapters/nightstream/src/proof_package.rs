@@ -5,7 +5,8 @@
 //! internal bridge modules.
 
 use crate::circuit_output::{
-    deposit_public_bytes_from_output_claims, spend_public_bytes_from_output_claims,
+    deposit_public_bytes_from_output_claims, digest32_from_output_claims,
+    spend_public_binding_digest_from_public_bytes,
 };
 use neo_ajtai::Commitment as Cmt;
 use neo_ccs::{matrix::Mat, CeClaim};
@@ -27,9 +28,8 @@ use std::collections::HashMap;
 pub enum PublicOutputFormat {
     /// Nightstream note-spend output format written at `OUTPUT_ADDR`.
     ///
-    /// Verification reconstructs raw output bytes from output-claims, parses them
-    /// as note-spend circuit output, and requires `public_output` bytes to match
-    /// the canonical SpendPublic wire encoding.
+    /// Verification recomputes a digest of the canonical SpendPublic bytes and
+    /// requires it to match the proof-certified digest claims.
     NoteSpendV1,
     /// Nightstream note-deposit output format written at `OUTPUT_ADDR`.
     ///
@@ -144,7 +144,8 @@ impl NightstreamProofPackage {
             )));
         }
 
-        let mut builder = Rv64TraceWiring::from_elf(&self.rom_bytes)?.chunk_rows(self.config.chunk_rows);
+        let mut builder =
+            Rv64TraceWiring::from_elf(&self.rom_bytes)?.chunk_rows(self.config.chunk_rows);
 
         if let Some(max_steps) = self.config.max_steps {
             builder = builder.max_steps(max_steps);
@@ -173,31 +174,43 @@ impl NightstreamProofPackage {
         }
 
         if let Some(format) = &self.config.public_output_format {
-            let certified = match format {
+            match format {
                 PublicOutputFormat::NoteSpendV1 => {
-                    spend_public_bytes_from_output_claims(&self.config.output_claims).map_err(
-                        |e| {
-                            PiCcsError::InvalidInput(format!(
-                                "failed to derive certified note-spend public output from output claims: {e}"
+                    let certified =
+                        spend_public_binding_digest_from_public_bytes(&self.public_output)
+                            .map_err(|e| {
+                                PiCcsError::InvalidInput(format!(
+                                "failed to derive note-spend binding digest from public_output: {e}"
                             ))
-                        },
-                    )?
+                            })?;
+                    let claimed =
+                        digest32_from_output_claims(&self.config.output_claims).map_err(|e| {
+                            PiCcsError::InvalidInput(format!(
+                                "failed to derive note-spend binding digest from output claims: {e}"
+                            ))
+                        })?;
+                    if certified != claimed {
+                        return Err(PiCcsError::InvalidInput(
+                            "public_output does not match proof-certified note-spend digest"
+                                .to_string(),
+                        ));
+                    }
                 }
                 PublicOutputFormat::NoteDepositV1 => {
-                    deposit_public_bytes_from_output_claims(&self.config.output_claims).map_err(
-                        |e| {
-                            PiCcsError::InvalidInput(format!(
-                                "failed to derive certified note-deposit public output from output claims: {e}"
-                            ))
-                        },
-                    )?
+                    let certified =
+                        deposit_public_bytes_from_output_claims(&self.config.output_claims)
+                            .map_err(|e| {
+                                PiCcsError::InvalidInput(format!(
+                                    "failed to derive certified note-deposit public output from output claims: {e}"
+                                ))
+                            })?;
+                    if certified != self.public_output {
+                        return Err(PiCcsError::InvalidInput(
+                            "public_output does not match proof-certified output claims"
+                                .to_string(),
+                        ));
+                    }
                 }
-            };
-
-            if certified != self.public_output {
-                return Err(PiCcsError::InvalidInput(
-                    "public_output does not match proof-certified output claims".to_string(),
-                ));
             }
         }
 

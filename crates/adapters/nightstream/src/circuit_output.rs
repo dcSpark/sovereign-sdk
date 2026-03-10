@@ -11,12 +11,18 @@
 //! This module provides `parse_circuit_output` to decode this layout into `SpendPublic`.
 
 use anyhow::{anyhow, Result};
+use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
 use serde::{Deserialize, Serialize};
 
 /// A 4-element Goldilocks digest (32 bytes as 4 x u64 LE).
 pub type GlDigest = [Goldilocks; 4];
+
+const TAG_SPEND_BIND_INIT: u64 = 200;
+const TAG_SPEND_BIND_NULLIFIER: u64 = 201;
+const TAG_SPEND_BIND_OUTPUT_COMMITMENT: u64 = 202;
+const TAG_SPEND_BIND_VIEW_ATTESTATION: u64 = 203;
 
 /// Convert a GlDigest to a 32-byte Hash32 (little-endian encoding).
 pub fn gldigest_to_hash32(digest: &GlDigest) -> [u8; 32] {
@@ -26,6 +32,16 @@ pub fn gldigest_to_hash32(digest: &GlDigest) -> [u8; 32] {
         out[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
     out
+}
+
+fn hash32_to_gldigest(hash32: &[u8; 32]) -> GlDigest {
+    let mut digest = [Goldilocks::ZERO; 4];
+    for i in 0..4 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&hash32[i * 8..(i + 1) * 8]);
+        digest[i] = Goldilocks::from_u64(u64::from_le_bytes(buf));
+    }
+    digest
 }
 
 /// Read a GlDigest (4 x u64 LE) from a byte slice at a given offset.
@@ -308,6 +324,120 @@ pub fn spend_public_bytes_from_output_claims(output_claims: &[(u64, u64)]) -> Re
     let raw = output_claims_to_bytes(output_claims)?;
     let parsed = parse_circuit_output(&raw)?;
     spend_public_bytes_from_circuit_output(&parsed)
+}
+
+fn spend_public_binding_digest_from_parts(
+    anchor_root: &[u8; 32],
+    blacklist_root: &[u8; 32],
+    nullifiers: &[[u8; 32]],
+    withdraw_amount: u128,
+    output_commitments: &[[u8; 32]],
+    view_attestations: Option<&[SpendPublicViewAttestation]>,
+) -> [u8; 32] {
+    let mut init = [Goldilocks::ZERO; 14];
+    init[0] = Goldilocks::from_u64(TAG_SPEND_BIND_INIT);
+    init[1..5].copy_from_slice(&hash32_to_gldigest(anchor_root));
+    init[5..9].copy_from_slice(&hash32_to_gldigest(blacklist_root));
+    init[9] = Goldilocks::from_u64(nullifiers.len() as u64);
+    init[10] = Goldilocks::from_u64(withdraw_amount as u64);
+    init[11] = Goldilocks::from_u64((withdraw_amount >> 64) as u64);
+    init[12] = Goldilocks::from_u64(output_commitments.len() as u64);
+    init[13] = Goldilocks::from_u64(view_attestations.map(|atts| atts.len()).unwrap_or(0) as u64);
+
+    let mut acc = poseidon2_hash(&init);
+
+    for nullifier in nullifiers {
+        let mut input = [Goldilocks::ZERO; 9];
+        input[0] = Goldilocks::from_u64(TAG_SPEND_BIND_NULLIFIER);
+        input[1..5].copy_from_slice(&acc);
+        input[5..9].copy_from_slice(&hash32_to_gldigest(nullifier));
+        acc = poseidon2_hash(&input);
+    }
+
+    for output_commitment in output_commitments {
+        let mut input = [Goldilocks::ZERO; 9];
+        input[0] = Goldilocks::from_u64(TAG_SPEND_BIND_OUTPUT_COMMITMENT);
+        input[1..5].copy_from_slice(&acc);
+        input[5..9].copy_from_slice(&hash32_to_gldigest(output_commitment));
+        acc = poseidon2_hash(&input);
+    }
+
+    if let Some(view_attestations) = view_attestations {
+        for attestation in view_attestations {
+            let mut input = [Goldilocks::ZERO; 21];
+            input[0] = Goldilocks::from_u64(TAG_SPEND_BIND_VIEW_ATTESTATION);
+            input[1..5].copy_from_slice(&acc);
+            input[5..9].copy_from_slice(&hash32_to_gldigest(&attestation.cm));
+            input[9..13].copy_from_slice(&hash32_to_gldigest(&attestation.fvk_commitment));
+            input[13..17].copy_from_slice(&hash32_to_gldigest(&attestation.ct_hash));
+            input[17..21].copy_from_slice(&hash32_to_gldigest(&attestation.mac));
+            acc = poseidon2_hash(&input);
+        }
+    }
+
+    gldigest_to_hash32(&acc)
+}
+
+/// Derive the proof-binding digest for a parsed note-spend circuit output.
+pub fn spend_public_binding_digest_from_circuit_output(output: &CircuitOutput) -> [u8; 32] {
+    let view_attestations = if output.view_attestations.is_empty() {
+        None
+    } else {
+        Some(
+            output
+                .view_attestations
+                .iter()
+                .map(|att| SpendPublicViewAttestation {
+                    cm: att.cm,
+                    fvk_commitment: att.fvk_commitment,
+                    ct_hash: att.ct_hash,
+                    mac: att.mac,
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    spend_public_binding_digest_from_parts(
+        &output.anchor_root,
+        &output.blacklist_root,
+        &output.nullifiers,
+        output.withdraw_amount as u128,
+        &output.output_commitments,
+        view_attestations.as_deref(),
+    )
+}
+
+/// Derive the proof-binding digest for canonical SpendPublic bytes.
+pub fn spend_public_binding_digest_from_public_wire(wire: &SpendPublicWire) -> [u8; 32] {
+    spend_public_binding_digest_from_parts(
+        &wire.anchor_root,
+        &wire.blacklist_root,
+        &wire.nullifiers,
+        wire.withdraw_amount,
+        &wire.output_commitments,
+        wire.view_attestations.as_deref(),
+    )
+}
+
+/// Deserialize canonical SpendPublic bytes and derive the proof-binding digest.
+pub fn spend_public_binding_digest_from_public_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
+    let wire: SpendPublicWire = bincode::deserialize(bytes)
+        .map_err(|e| anyhow!("Failed to deserialize SpendPublicWire: {}", e))?;
+    Ok(spend_public_binding_digest_from_public_wire(&wire))
+}
+
+/// Convert output claims into a 32-byte digest binding payload.
+pub fn digest32_from_output_claims(output_claims: &[(u64, u64)]) -> Result<[u8; 32]> {
+    let raw = output_claims_to_bytes(output_claims)?;
+    if raw.len() != 32 {
+        return Err(anyhow!(
+            "Expected 32 bytes of digest output claims, got {}",
+            raw.len()
+        ));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&raw);
+    Ok(digest)
 }
 
 /// Parse raw note-deposit output bytes.

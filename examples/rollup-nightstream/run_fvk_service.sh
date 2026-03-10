@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${SERVICE_TARGET_DIR:-release}"
+BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/midnight-fvk-service"
 
 export RUST_LOG="${RUST_LOG:-info}"
 export MIDNIGHT_FVK_SERVICE_BIND="${MIDNIGHT_FVK_SERVICE_BIND:-127.0.0.1:8088}"
@@ -46,6 +48,11 @@ echo "Midnight FVK Service"
 echo "  Bind: $MIDNIGHT_FVK_SERVICE_BIND"
 echo "  DB:   $MIDNIGHT_FVK_SERVICE_DB"
 
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build ${TARGET_DIR/release/--release }-p midnight-fvk-service"
+  exit 1
+fi
+
 cd "$WORKSPACE_ROOT"
-cargo build --release -p midnight-fvk-service
-exec "$WORKSPACE_ROOT/target/release/midnight-fvk-service" serve
+exec "$BIN" serve

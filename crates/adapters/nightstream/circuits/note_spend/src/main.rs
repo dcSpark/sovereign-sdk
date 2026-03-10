@@ -240,6 +240,10 @@ const TAG_VIEW_KDF: u64 = 101;
 const TAG_VIEW_STREAM: u64 = 102;
 const TAG_CT_HASH: u64 = 103;
 const TAG_VIEW_MAC: u64 = 104;
+const TAG_SPEND_BIND_INIT: u64 = 200;
+const TAG_SPEND_BIND_NULLIFIER: u64 = 201;
+const TAG_SPEND_BIND_OUTPUT_COMMITMENT: u64 = 202;
+const TAG_SPEND_BIND_VIEW_ATTESTATION: u64 = 203;
 
 fn digest_to_bytes(d: &GlDigest) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -367,6 +371,59 @@ fn encode_note_plain(
         i += 1;
     }
     pt
+}
+
+fn spend_public_bind_init(
+    anchor: &GlDigest,
+    blacklist_root: &GlDigest,
+    n_in: u32,
+    withdraw_amount: u64,
+    n_out: u32,
+    n_atts: u32,
+) -> GlDigest {
+    let mut input = [0u64; 14];
+    input[0] = TAG_SPEND_BIND_INIT;
+    input[1..5].copy_from_slice(anchor);
+    input[5..9].copy_from_slice(blacklist_root);
+    input[9] = n_in as u64;
+    input[10] = withdraw_amount;
+    input[11] = 0;
+    input[12] = n_out as u64;
+    input[13] = n_atts as u64;
+    poseidon2_hash(&input)
+}
+
+fn spend_public_bind_nullifier(acc: &GlDigest, nullifier: &GlDigest) -> GlDigest {
+    let mut input = [0u64; 9];
+    input[0] = TAG_SPEND_BIND_NULLIFIER;
+    input[1..5].copy_from_slice(acc);
+    input[5..9].copy_from_slice(nullifier);
+    poseidon2_hash(&input)
+}
+
+fn spend_public_bind_output_commitment(acc: &GlDigest, cm: &GlDigest) -> GlDigest {
+    let mut input = [0u64; 9];
+    input[0] = TAG_SPEND_BIND_OUTPUT_COMMITMENT;
+    input[1..5].copy_from_slice(acc);
+    input[5..9].copy_from_slice(cm);
+    poseidon2_hash(&input)
+}
+
+fn spend_public_bind_view_attestation(
+    acc: &GlDigest,
+    cm: &GlDigest,
+    fvk_commitment: &GlDigest,
+    ct_hash: &GlDigest,
+    mac: &GlDigest,
+) -> GlDigest {
+    let mut input = [0u64; 21];
+    input[0] = TAG_SPEND_BIND_VIEW_ATTESTATION;
+    input[1..5].copy_from_slice(acc);
+    input[5..9].copy_from_slice(cm);
+    input[9..13].copy_from_slice(fvk_commitment);
+    input[13..17].copy_from_slice(ct_hash);
+    input[17..21].copy_from_slice(mac);
+    poseidon2_hash(&input)
 }
 
 #[nightstream_sdk::provable]
@@ -515,6 +572,21 @@ fn note_spend() -> ! {
     w.write_digest(&blacklist_root);
 
     w.write_u32(n_viewers);
+    let mut public_output_digest = spend_public_bind_init(
+        &anchor,
+        &blacklist_root,
+        n_in,
+        withdraw_amount,
+        n_out,
+        n_viewers.wrapping_mul(n_out),
+    );
+    for i in 0..n_in as usize {
+        public_output_digest = spend_public_bind_nullifier(&public_output_digest, &nullifiers[i]);
+    }
+    for j in 0..n_out as usize {
+        public_output_digest =
+            spend_public_bind_output_commitment(&public_output_digest, &cm_outs_pub[j]);
+    }
 
     for _v in 0..n_viewers as usize {
         let fvk_commitment_pub = r.read_digest();
@@ -550,8 +622,18 @@ fn note_spend() -> ! {
             w.write_digest(&fvk_commitment_pub);
             w.write_digest(&ct_hash_pub);
             w.write_digest(&mac_pub);
+            public_output_digest = spend_public_bind_view_attestation(
+                &public_output_digest,
+                &output_cms[j],
+                &fvk_commitment_pub,
+                &ct_hash_pub,
+                &mac_pub,
+            );
         }
     }
+
+    let expected_public_output_digest = r.read_digest();
+    assert!(digest_eq(&public_output_digest, &expected_public_output_digest));
 
     nightstream_sdk::halt();
 }

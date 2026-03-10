@@ -28,6 +28,8 @@
 #   POST /stop              Stop all services
 #   POST /stop/:service     Stop a specific service
 #   POST /restart           Restart all services
+#   POST /build             Build all managed service binaries
+#   POST /build/:service    Build a specific service binary
 #   POST /clean             Clean demo_data directory
 #   POST /clean-database    Truncate all Postgres tables
 #   GET  /logs              WebSocket log stream
@@ -127,6 +129,8 @@ export TEE_ORACLE_PUBKEY_HEX="${TEE_ORACLE_PUBKEY_HEX:-0x2e7a268b5b68ef23fd64ebf
 
 # ── Service controller ────────────────────────────────────────────────────────
 export SERVICE_CONTROLLER_BIND="$CONTROLLER_BIND"
+export SERVICE_TARGET_DIR="$TARGET_DIR"
+export SERVICE_CONTROLLER_BUILD_MODE="$([ "$RELEASE_MODE" -eq 1 ] && echo release || echo debug)"
 if [ "$AUTO_START" -eq 1 ]; then
   export SERVICE_CONTROLLER_AUTO_START=1
 fi
@@ -241,6 +245,14 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   print_info "Building metrics API..."
   cargo build $CARGO_PROFILE -p sov-metrics-api 2>&1 | tail -3
   print_ok "sov-metrics-api"
+
+  print_info "Building oracle..."
+  cargo build $CARGO_PROFILE -p oracle 2>&1 | tail -3
+  print_ok "oracle"
+
+  print_info "Building FVK service..."
+  cargo build $CARGO_PROFILE -p midnight-fvk-service 2>&1 | tail -3
+  print_ok "midnight-fvk-service"
 
   print_info "Building service controller..."
   SKIP_GUEST_BUILD=1 cargo build $CARGO_PROFILE -p sov-rollup-nightstream --bin rollup-nightstream-service-controller 2>&1 | tail -3

@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${SERVICE_TARGET_DIR:-release}"
+BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/sov-metrics-api"
 
 BIND_ADDR="${METRICS_API_BIND:-0.0.0.0:13200}"
 export RUST_LOG="${RUST_LOG:-info}"
@@ -21,5 +23,11 @@ echo "  DA connection: $DA_CONNECTION_STRING"
 echo "  Indexer DB:    $INDEXER_DB_CONNECTION_STRING"
 echo "  Ledger API:    $LEDGER_API_URL"
 
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build ${TARGET_DIR/release/--release }-p sov-metrics-api"
+  exit 1
+fi
+
 cd "$WORKSPACE_ROOT/examples/rollup-nightstream"
-exec cargo run -p sov-metrics-api --release
+exec "$BIN"

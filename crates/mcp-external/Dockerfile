@@ -29,10 +29,10 @@ COPY . .
 RUN cargo build --locked --release -p mcp-external
 
 # ---------------------------------------------------------------------
-# Fetch Ligero runtime assets (binaries + shader) from ligero-prover
+# Fetch legacy Ligero runtime assets (binaries + shader) from ligero-prover
 #
-# These assets are kept for optional local proving/debugging. MCP-External
-# now uses the Ligero HTTP proof service by default.
+# These assets are kept for optional local proving/debugging compatibility.
+# MCP-External now uses the Nightstream HTTP proof service by default.
 # ---------------------------------------------------------------------
 # Use the Ligero repo branch that includes `ligero-runner` and the prebuilt circuits in
 # `utils/circuits/bins/`.
@@ -77,7 +77,7 @@ RUN groupadd --system mcp && useradd --system --no-create-home --gid mcp --home 
 
 COPY --from=builder /app/target/release/mcp-external /usr/local/bin/mcp-external
 
-# Ligero assets (binaries/shaders/programs are copied from the Ligero branch during build).
+# Legacy Ligero assets (binaries/shaders/programs are copied from the Ligero branch during build).
 COPY --from=builder /opt/ligero/bin /opt/ligero/bin
 COPY --from=builder /opt/ligero/lib /opt/ligero/lib
 COPY --from=builder /opt/ligero/shader /opt/ligero/shader
@@ -88,8 +88,8 @@ RUN chmod +x /opt/ligero/bin/webgpu_prover \
     && chown -R mcp:mcp /app /opt/ligero
 
 ENV MCP_SERVER_BIND_ADDRESS=0.0.0.0:3000 \
-    LIGERO_PROOF_SERVICE_URL=http://127.0.0.1:8080 \
-    LIGERO_PROGRAM_PATH=note_spend_guest \
+    NIGHTSTREAM_PROOF_SERVICE_URL=http://127.0.0.1:8080 \
+    NIGHTSTREAM_PROGRAM_PATH=note_spend_guest \
     RUST_LOG=info
 
 EXPOSE 3000

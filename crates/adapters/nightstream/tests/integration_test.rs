@@ -608,7 +608,11 @@ fn test_note_spend_prove_verify_with_witness() {
             requested_chunk_rows,
             effective_step_rows_for_requested(&sim_exec, requested_chunk_rows),
         ),
-        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, NOTE_SPEND_TLEN_AUTOTUNE_CAP),
+        None => auto_tune_chunk_rows(
+            &sim_exec,
+            requested_chunk_rows,
+            NOTE_SPEND_TLEN_AUTOTUNE_CAP,
+        ),
     };
     let no_output_binding = std::env::var_os("NS_PERF_NO_OUTPUT_BINDING").is_some();
     println!(
@@ -628,8 +632,8 @@ fn test_note_spend_prove_verify_with_witness() {
         if no_output_binding {
             let mut wiring = Rv64TraceWiring::from_elf(&note_spend_rom::NOTE_SPEND_ROM)
                 .expect("load RV64 guest")
-            .chunk_rows(prove_chunk_rows)
-            .max_steps(executed_steps);
+                .chunk_rows(prove_chunk_rows)
+                .max_steps(executed_steps);
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }
@@ -716,10 +720,7 @@ fn test_note_spend_prove_verify_with_witness() {
         .rows
         .iter()
         .any(|row| !row.shout_events.is_empty());
-    println!(
-        "  Has shout events:  {}",
-        has_shout_events
-    );
+    println!("  Has shout events:  {}", has_shout_events);
     if std::env::var_os("NS_MEASURE_PROOF_SIZE").is_some() {
         if no_output_binding {
             use flate2::write::DeflateEncoder;
@@ -759,6 +760,371 @@ fn test_note_spend_prove_verify_with_witness() {
     assert_eq!(vec![out_cm], test_public.output_commitments);
     assert_eq!(blacklist_root, test_public.blacklist_root);
     println!("=============================================\n");
+}
+
+/// Exercise the proof-pool viewer-attested note-spend path end-to-end.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: upstream Nightstream debug builds trip MLE assertions during prove"
+)]
+fn test_note_spend_prove_verify_with_viewer_witness() {
+    use neo_ccs::crypto::poseidon2_goldilocks::poseidon2_hash;
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+    use p3_goldilocks::Goldilocks;
+    use sov_nightstream_adapter::circuit_output::{SpendPublicViewAttestation, SpendPublicWire};
+    use sov_nightstream_adapter::{
+        default_blacklist_root, BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness,
+        ViewerOutputWitness, ViewerWitness,
+    };
+
+    type GlDigest = [Goldilocks; 4];
+    const ZERO_DIGEST: GlDigest = [Goldilocks::ZERO; 4];
+    const MAX_INS: usize = 4;
+    const NOTE_PLAIN_LEN: usize = 272;
+
+    const TAG_MT_NODE: u64 = 1;
+    const TAG_NOTE: u64 = 2;
+    const TAG_PRF_NF: u64 = 3;
+    const TAG_PK: u64 = 4;
+    const TAG_ADDR: u64 = 5;
+    const TAG_NFKEY: u64 = 6;
+    const TAG_FVK_COMMIT: u64 = 100;
+    const TAG_VIEW_KDF: u64 = 101;
+    const TAG_VIEW_STREAM: u64 = 102;
+    const TAG_CT_HASH: u64 = 103;
+    const TAG_VIEW_MAC: u64 = 104;
+
+    fn gl_digest_to_bytes(d: &GlDigest) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, elem) in d.iter().enumerate() {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&elem.as_canonical_u64().to_le_bytes());
+        }
+        out
+    }
+
+    fn pack_bytes_to_felts(bytes: &[u8], out: &mut [u64]) -> usize {
+        let len = bytes.len();
+        let n_elems = len.div_ceil(8);
+        for i in 0..n_elems {
+            let off = i * 8;
+            let mut buf = [0u8; 8];
+            let take = if off + 8 <= len { 8 } else { len - off };
+            buf[..take].copy_from_slice(&bytes[off..off + take]);
+            out[i] = u64::from_le_bytes(buf);
+        }
+        n_elems
+    }
+
+    fn view_fvk_commitment(fvk: &GlDigest) -> GlDigest {
+        let mut input = [Goldilocks::ZERO; 5];
+        input[0] = Goldilocks::from_u64(TAG_FVK_COMMIT);
+        input[1..5].copy_from_slice(fvk);
+        poseidon2_hash(&input)
+    }
+
+    fn view_kdf(fvk: &GlDigest, cm: &GlDigest) -> GlDigest {
+        let mut input = [Goldilocks::ZERO; 9];
+        input[0] = Goldilocks::from_u64(TAG_VIEW_KDF);
+        input[1..5].copy_from_slice(fvk);
+        input[5..9].copy_from_slice(cm);
+        poseidon2_hash(&input)
+    }
+
+    fn view_stream_block(k: &GlDigest, ctr: u32) -> GlDigest {
+        let mut input = [Goldilocks::ZERO; 6];
+        input[0] = Goldilocks::from_u64(TAG_VIEW_STREAM);
+        input[1..5].copy_from_slice(k);
+        input[5] = Goldilocks::from_u64(ctr as u64);
+        poseidon2_hash(&input)
+    }
+
+    fn view_ct_hash(ct: &[u8; NOTE_PLAIN_LEN]) -> GlDigest {
+        let mut packed = [0u64; 1 + (NOTE_PLAIN_LEN / 8) + 1];
+        packed[0] = TAG_CT_HASH;
+        let n = pack_bytes_to_felts(ct, &mut packed[1..]);
+        packed[1 + n] = NOTE_PLAIN_LEN as u64;
+
+        let mut input = vec![Goldilocks::ZERO; 1 + n + 1];
+        for (idx, value) in packed[..1 + n + 1].iter().enumerate() {
+            input[idx] = Goldilocks::from_u64(*value);
+        }
+        poseidon2_hash(&input)
+    }
+
+    fn view_mac(k: &GlDigest, cm: &GlDigest, ct_h: &GlDigest) -> GlDigest {
+        let mut input = [Goldilocks::ZERO; 13];
+        input[0] = Goldilocks::from_u64(TAG_VIEW_MAC);
+        input[1..5].copy_from_slice(k);
+        input[5..9].copy_from_slice(cm);
+        input[9..13].copy_from_slice(ct_h);
+        poseidon2_hash(&input)
+    }
+
+    fn view_stream_xor_encrypt(k: &GlDigest, pt: &[u8; NOTE_PLAIN_LEN]) -> [u8; NOTE_PLAIN_LEN] {
+        let mut ct = [0u8; NOTE_PLAIN_LEN];
+        let mut ctr = 0u32;
+        let mut off = 0usize;
+        while off < NOTE_PLAIN_LEN {
+            let ks = view_stream_block(k, ctr);
+            let ks_bytes = gl_digest_to_bytes(&ks);
+            ctr += 1;
+            let take = (NOTE_PLAIN_LEN - off).min(32);
+            for j in 0..take {
+                ct[off + j] = pt[off + j] ^ ks_bytes[j];
+            }
+            off += take;
+        }
+        ct
+    }
+
+    fn encode_note_plain(
+        domain: &GlDigest,
+        value: u64,
+        rho: &GlDigest,
+        recipient: &GlDigest,
+        sender_id: &GlDigest,
+        cm_ins: &[GlDigest; MAX_INS],
+        n_in: u32,
+    ) -> [u8; NOTE_PLAIN_LEN] {
+        let mut pt = [0u8; NOTE_PLAIN_LEN];
+        pt[..32].copy_from_slice(&gl_digest_to_bytes(domain));
+        pt[32..40].copy_from_slice(&value.to_le_bytes());
+        pt[48..80].copy_from_slice(&gl_digest_to_bytes(rho));
+        pt[80..112].copy_from_slice(&gl_digest_to_bytes(recipient));
+        pt[112..144].copy_from_slice(&gl_digest_to_bytes(sender_id));
+        for (idx, cm) in cm_ins.iter().enumerate() {
+            if (idx as u32) < n_in {
+                let off = 144 + idx * 32;
+                pt[off..off + 32].copy_from_slice(&gl_digest_to_bytes(cm));
+            }
+        }
+        pt
+    }
+
+    let domain_gl = [Goldilocks::from_u64(1); 4];
+    let domain = gl_digest_to_bytes(&domain_gl);
+
+    let spend_sk_gl = [
+        Goldilocks::from_u64(42),
+        Goldilocks::from_u64(43),
+        Goldilocks::from_u64(44),
+        Goldilocks::from_u64(45),
+    ];
+    let spend_sk = gl_digest_to_bytes(&spend_sk_gl);
+
+    let mut pk_input = [Goldilocks::ZERO; 5];
+    pk_input[0] = Goldilocks::from_u64(TAG_PK);
+    pk_input[1..5].copy_from_slice(&spend_sk_gl);
+    let pk_spend_gl = poseidon2_hash(&pk_input);
+
+    let pk_ivk_gl = [
+        Goldilocks::from_u64(100),
+        Goldilocks::from_u64(101),
+        Goldilocks::from_u64(102),
+        Goldilocks::from_u64(103),
+    ];
+    let pk_ivk_owner = gl_digest_to_bytes(&pk_ivk_gl);
+
+    let mut nfk_input = [Goldilocks::ZERO; 9];
+    nfk_input[0] = Goldilocks::from_u64(TAG_NFKEY);
+    nfk_input[1..5].copy_from_slice(&domain_gl);
+    nfk_input[5..9].copy_from_slice(&spend_sk_gl);
+    let nf_key_gl = poseidon2_hash(&nfk_input);
+
+    let mut addr_input = [Goldilocks::ZERO; 13];
+    addr_input[0] = Goldilocks::from_u64(TAG_ADDR);
+    addr_input[1..5].copy_from_slice(&domain_gl);
+    addr_input[5..9].copy_from_slice(&pk_spend_gl);
+    addr_input[9..13].copy_from_slice(&pk_ivk_gl);
+    let recipient_gl = poseidon2_hash(&addr_input);
+    let sender_id_gl = recipient_gl;
+
+    let value: u64 = 1000;
+    let rho_gl = [
+        Goldilocks::from_u64(200),
+        Goldilocks::from_u64(201),
+        Goldilocks::from_u64(202),
+        Goldilocks::from_u64(203),
+    ];
+    let rho = gl_digest_to_bytes(&rho_gl);
+    let sender_id = gl_digest_to_bytes(&sender_id_gl);
+
+    let mut cm_input = [Goldilocks::ZERO; 18];
+    cm_input[0] = Goldilocks::from_u64(TAG_NOTE);
+    cm_input[1..5].copy_from_slice(&domain_gl);
+    cm_input[5] = Goldilocks::from_u64(value);
+    cm_input[6..10].copy_from_slice(&rho_gl);
+    cm_input[10..14].copy_from_slice(&recipient_gl);
+    cm_input[14..18].copy_from_slice(&sender_id_gl);
+    let cm_gl = poseidon2_hash(&cm_input);
+
+    let sib0 = ZERO_DIGEST;
+    let node_left = {
+        let mut inp = [Goldilocks::ZERO; 10];
+        inp[0] = Goldilocks::from_u64(TAG_MT_NODE);
+        inp[1] = Goldilocks::from_u64(0);
+        inp[2..6].copy_from_slice(&cm_gl);
+        inp[6..10].copy_from_slice(&sib0);
+        poseidon2_hash(&inp)
+    };
+    let sib1 = {
+        let mut inp = [Goldilocks::ZERO; 10];
+        inp[0] = Goldilocks::from_u64(TAG_MT_NODE);
+        inp[1] = Goldilocks::from_u64(0);
+        inp[2..6].copy_from_slice(&ZERO_DIGEST);
+        inp[6..10].copy_from_slice(&ZERO_DIGEST);
+        poseidon2_hash(&inp)
+    };
+    let root_gl = {
+        let mut inp = [Goldilocks::ZERO; 10];
+        inp[0] = Goldilocks::from_u64(TAG_MT_NODE);
+        inp[1] = Goldilocks::from_u64(1);
+        inp[2..6].copy_from_slice(&node_left);
+        inp[6..10].copy_from_slice(&sib1);
+        poseidon2_hash(&inp)
+    };
+    let anchor = gl_digest_to_bytes(&root_gl);
+    let siblings = vec![gl_digest_to_bytes(&sib0), gl_digest_to_bytes(&sib1)];
+
+    let mut nf_input = [Goldilocks::ZERO; 13];
+    nf_input[0] = Goldilocks::from_u64(TAG_PRF_NF);
+    nf_input[1..5].copy_from_slice(&domain_gl);
+    nf_input[5..9].copy_from_slice(&nf_key_gl);
+    nf_input[9..13].copy_from_slice(&rho_gl);
+    let nf_gl = poseidon2_hash(&nf_input);
+    let nullifier = gl_digest_to_bytes(&nf_gl);
+
+    let out_rho_gl = [
+        Goldilocks::from_u64(300),
+        Goldilocks::from_u64(301),
+        Goldilocks::from_u64(302),
+        Goldilocks::from_u64(303),
+    ];
+    let out_rho = gl_digest_to_bytes(&out_rho_gl);
+    let out_pk_spend = gl_digest_to_bytes(&pk_spend_gl);
+    let out_pk_ivk = pk_ivk_owner;
+
+    let out_cm_gl = {
+        let mut inp = [Goldilocks::ZERO; 18];
+        inp[0] = Goldilocks::from_u64(TAG_NOTE);
+        inp[1..5].copy_from_slice(&domain_gl);
+        inp[5] = Goldilocks::from_u64(value);
+        inp[6..10].copy_from_slice(&out_rho_gl);
+        inp[10..14].copy_from_slice(&recipient_gl);
+        inp[14..18].copy_from_slice(&sender_id_gl);
+        poseidon2_hash(&inp)
+    };
+    let out_cm = gl_digest_to_bytes(&out_cm_gl);
+
+    let mut enforce_prod = Goldilocks::from_u64(value);
+    enforce_prod *= Goldilocks::from_u64(value);
+    for i in 0..4 {
+        enforce_prod *= out_rho_gl[i] - rho_gl[i];
+    }
+    let inv_enforce_gl = enforce_prod.inverse();
+    let mut inv_enforce = [0u8; 32];
+    inv_enforce[..8].copy_from_slice(&inv_enforce_gl.as_canonical_u64().to_le_bytes());
+
+    let viewer_fvk_gl = [
+        Goldilocks::from_u64(700),
+        Goldilocks::from_u64(701),
+        Goldilocks::from_u64(702),
+        Goldilocks::from_u64(703),
+    ];
+    let viewer_fvk = gl_digest_to_bytes(&viewer_fvk_gl);
+    let viewer_fvk_commitment = gl_digest_to_bytes(&view_fvk_commitment(&viewer_fvk_gl));
+
+    let mut cm_ins = [ZERO_DIGEST; MAX_INS];
+    cm_ins[0] = cm_gl;
+    let plaintext = encode_note_plain(
+        &domain_gl,
+        value,
+        &out_rho_gl,
+        &recipient_gl,
+        &sender_id_gl,
+        &cm_ins,
+        1,
+    );
+    let k = view_kdf(&viewer_fvk_gl, &out_cm_gl);
+    let ciphertext = view_stream_xor_encrypt(&k, &plaintext);
+    let ct_hash_gl = view_ct_hash(&ciphertext);
+    let mac_gl = view_mac(&k, &out_cm_gl, &ct_hash_gl);
+    let ct_hash = gl_digest_to_bytes(&ct_hash_gl);
+    let mac = gl_digest_to_bytes(&mac_gl);
+
+    let blacklist_root = default_blacklist_root();
+    let witness = NoteSpendWitness {
+        domain,
+        spend_sk,
+        pk_ivk_owner,
+        depth: 2,
+        anchor,
+        inputs: vec![NoteSpendInput {
+            value,
+            rho,
+            sender_id,
+            position: 0,
+            siblings,
+            nullifier,
+        }],
+        withdraw_amount: 0,
+        withdraw_to: [0u8; 32],
+        outputs: vec![NoteSpendOutput {
+            value,
+            rho: out_rho,
+            pk_spend: out_pk_spend,
+            pk_ivk: out_pk_ivk,
+            cm: out_cm,
+        }],
+        inv_enforce,
+        blacklist_root,
+        blacklist_proofs: vec![
+            BlacklistProof::default_for_identity(&sender_id),
+            BlacklistProof::default_for_identity(&sender_id),
+        ],
+        viewers: vec![ViewerWitness {
+            fvk_commitment: viewer_fvk_commitment,
+            fvk: viewer_fvk,
+            per_output: vec![ViewerOutputWitness { ct_hash, mac }],
+        }],
+    };
+
+    let expected_public = SpendPublicWire {
+        anchor_root: anchor,
+        blacklist_root,
+        nullifiers: vec![nullifier],
+        withdraw_amount: 0,
+        output_commitments: vec![out_cm],
+        view_attestations: Some(vec![SpendPublicViewAttestation {
+            cm: out_cm,
+            fvk_commitment: viewer_fvk_commitment,
+            ct_hash,
+            mac,
+        }]),
+    };
+    let public_bytes =
+        bincode::serialize(&expected_public).expect("serialize viewer public output");
+
+    let rom = &note_spend_rom::NOTE_SPEND_ROM;
+    let base = note_spend_rom::NOTE_SPEND_ROM_BASE;
+    let mut host = NightstreamHost::new(rom, base);
+    host.write_note_spend_witness(&witness, public_bytes);
+
+    let ram_pairs = host.ram_init_pairs();
+    let sim = simulate_rv64_elf(rom, &ram_pairs, 200_000);
+    assert!(
+        sim.did_halt(),
+        "viewer-attested witness must halt in simulation"
+    );
+    let commitment = host.code_commitment();
+    let proof_bytes = host
+        .run(true)
+        .expect("viewer-attested packaged proving should succeed");
+    let verified_public: SpendPublicWire = NightstreamVerifier::verify(&proof_bytes, &commitment)
+        .expect("viewer-attested proof should verify");
+
+    assert_eq!(verified_public, expected_public);
 }
 
 /// Full prove+verify cycle for the note-deposit circuit with a valid witness.
@@ -877,7 +1243,11 @@ fn test_note_deposit_prove_verify_with_witness() {
             requested_chunk_rows,
             effective_step_rows_for_requested(&sim_exec, requested_chunk_rows),
         ),
-        None => auto_tune_chunk_rows(&sim_exec, requested_chunk_rows, NOTE_DEPOSIT_TLEN_AUTOTUNE_CAP),
+        None => auto_tune_chunk_rows(
+            &sim_exec,
+            requested_chunk_rows,
+            NOTE_DEPOSIT_TLEN_AUTOTUNE_CAP,
+        ),
     };
     println!(
         "note_deposit: selected_chunk_rows={} selected_max_steps={} estimated_step_rows={} chunk_override={}",
@@ -896,8 +1266,8 @@ fn test_note_deposit_prove_verify_with_witness() {
         if no_output_binding {
             let mut wiring = Rv64TraceWiring::from_elf(&note_deposit_rom::NOTE_DEPOSIT_ROM)
                 .expect("load RV64 guest")
-            .chunk_rows(prove_chunk_rows)
-            .max_steps(executed_steps);
+                .chunk_rows(prove_chunk_rows)
+                .max_steps(executed_steps);
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }
@@ -1004,6 +1374,82 @@ fn test_note_deposit_prove_verify_with_witness() {
     }
 
     assert!(run.trace_len() > 0);
+}
+
+/// Replay a captured viewer-attested `/prove` witness through the full RV64
+/// proof path with output binding enabled.
+///
+/// This mirrors the `proof-pool -> sov-proof-verifier-service /prove` path that
+/// starts failing once `POOL_FVK_PK` injects viewer attestations into the
+/// witness.
+///
+/// Usage:
+/// `NS_WITNESS_JSON=/tmp/nightstream_note_spend_viewer_witness.json \
+///    cargo test -p sov-nightstream-adapter --release --features native \
+///    test_note_spend_replay_viewer_witness_with_output_binding -- --ignored --nocapture`
+#[test]
+#[ignore = "debug helper for replaying proof-pool viewer witnesses with output binding enabled"]
+fn test_note_spend_replay_viewer_witness_with_output_binding() {
+    use sov_nightstream_adapter::NoteSpendWitness;
+
+    let path = std::env::var("NS_WITNESS_JSON").expect("set NS_WITNESS_JSON to witness JSON path");
+    let bytes = std::fs::read(&path).expect("read witness JSON");
+    let witness: NoteSpendWitness = serde_json::from_slice(&bytes).expect("parse witness JSON");
+
+    assert!(
+        !witness.viewers.is_empty(),
+        "captured witness must include viewer attestations to cover the proof-pool case"
+    );
+
+    let mut host = NightstreamHost::new(
+        &note_spend_rom::NOTE_SPEND_ROM,
+        note_spend_rom::NOTE_SPEND_ROM_BASE,
+    );
+    host.write_note_spend_witness(&witness, vec![]);
+
+    let ram_pairs = host.ram_init_pairs();
+    let sim = simulate_rv64_elf(&note_spend_rom::NOTE_SPEND_ROM, &ram_pairs, 300_000);
+    assert!(
+        sim.did_halt(),
+        "captured viewer witness must halt in simulation before proving"
+    );
+
+    let sim_exec = exec_table_from_sim(&sim);
+    let requested_chunk_rows = sim.steps.len().min(NOTE_SPEND_TLEN_AUTOTUNE_CAP).max(1);
+    let (chunk_rows, estimated_step_rows) = auto_tune_chunk_rows(
+        &sim_exec,
+        requested_chunk_rows,
+        NOTE_SPEND_TLEN_AUTOTUNE_CAP,
+    );
+    println!(
+        "viewer_replay_sim_steps={} chunk_rows={} estimated_step_rows={}",
+        sim.steps.len(),
+        chunk_rows,
+        estimated_step_rows
+    );
+
+    host.set_chunk_rows(chunk_rows);
+    host.set_max_steps(sim.steps.len());
+
+    match host.run(true) {
+        Ok(proof_bytes) => {
+            println!(
+                "viewer_replay_prove_ok=true proof_bytes={} chunk_rows={}",
+                proof_bytes.len(),
+                chunk_rows
+            );
+            assert!(!proof_bytes.is_empty(), "proof payload must not be empty");
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            println!("viewer_replay_prove_error={msg}");
+            assert!(
+                msg.contains("RV64 RAM output binding mismatch")
+                    || msg.contains("Nightstream proving failed"),
+                "unexpected prove error while replaying viewer witness: {msg}"
+            );
+        }
+    }
 }
 
 /// Replay a captured note-spend witness JSON through simulation/proving.
@@ -1545,8 +1991,8 @@ fn test_note_spend_replay_witness_json() {
         if !skip_wiring {
             let mut wiring = Rv64TraceWiring::from_elf(&note_spend_rom::NOTE_SPEND_ROM)
                 .expect("load RV64 guest")
-            .chunk_rows(chunk_rows)
-            .max_steps(sim.steps.len());
+                .chunk_rows(chunk_rows)
+                .max_steps(sim.steps.len());
             for &(addr, val) in &ram_pairs {
                 wiring = wiring.ram_init_u32(addr, val);
             }

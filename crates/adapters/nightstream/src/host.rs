@@ -13,20 +13,18 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use neo_fold::rv64_trace_shard::{Rv64TraceWiring, Rv64TraceWiringRun};
 use neo_math::F;
-use neo_memory::riscv::lookups::RAM_ID;
-use neo_vm_trace::TwistOpKind;
 use p3_field::PrimeCharacteristicRing;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sov_rollup_interface::zk::ZkvmHost;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::Write;
 
 use crate::circuit_output::{
     deposit_public_bytes_from_circuit_output, deposit_public_bytes_from_output_claims,
-    output_claims_to_bytes, spend_public_bytes_from_circuit_output,
-    spend_public_bytes_from_output_claims, CircuitOutput, CircuitViewAttestation,
-    DepositCircuitOutput,
+    output_claims_to_bytes, spend_public_binding_digest_from_circuit_output,
+    spend_public_bytes_from_circuit_output, spend_public_bytes_from_output_claims, CircuitOutput,
+    CircuitViewAttestation, DepositCircuitOutput,
 };
 use crate::proof_package::{
     encode_shard_proof_bytes, NightstreamProofPackage, PublicOutputFormat, Rv64TraceWiringRunConfig,
@@ -38,7 +36,6 @@ const DEFAULT_INPUT_ADDR: u64 = 0x108;
 
 /// Note-spend input/output base. Matches the upstream Nightstream guest ABI.
 const NOTE_SPEND_INPUT_ADDR: u64 = 0x104;
-const NOTE_SPEND_OUTPUT_ADDR: u64 = 0x100;
 
 /// Note-deposit input/output base. Kept away from low-memory startup zeroing.
 const NOTE_DEPOSIT_INPUT_ADDR: u64 = 0x4104;
@@ -522,42 +519,11 @@ impl NightstreamHost {
         }
     }
 
-    /// Populate output claims for the note-spend circuit's `RamWriter` output layout.
-    fn set_note_spend_output_claims(&mut self, witness: &NoteSpendWitness) {
+    /// Bind note-spend proofs to a digest of the canonical SpendPublic payload.
+    fn set_note_spend_binding_digest_claims(&mut self, start_addr: u64, digest: &[u8; 32]) {
         self.output_claims.clear();
-        let mut addr = NOTE_SPEND_OUTPUT_ADDR;
-
-        let n_in = witness.inputs.len() as u32;
-        let n_out = witness.outputs.len() as u32;
-        let n_viewers = witness.viewers.len() as u32;
-
-        self.write_output_claim_digest_at(&mut addr, &witness.anchor);
-        self.write_output_claim_u32_at(&mut addr, n_in);
-        for input in &witness.inputs {
-            self.write_output_claim_digest_at(&mut addr, &input.nullifier);
-        }
-        self.write_output_claim_u64_at(&mut addr, witness.withdraw_amount);
-        self.write_output_claim_digest_at(&mut addr, &witness.withdraw_to);
-        self.write_output_claim_u32_at(&mut addr, n_out);
-        for output in &witness.outputs {
-            self.write_output_claim_digest_at(&mut addr, &output.cm);
-        }
-        self.write_output_claim_digest_at(&mut addr, &witness.blacklist_root);
-        self.write_output_claim_u32_at(&mut addr, n_viewers);
-
-        for viewer in &witness.viewers {
-            assert_eq!(
-                viewer.per_output.len(),
-                n_out as usize,
-                "viewer.per_output length must equal n_out"
-            );
-            for (out_w, output) in viewer.per_output.iter().zip(&witness.outputs) {
-                self.write_output_claim_digest_at(&mut addr, &output.cm);
-                self.write_output_claim_digest_at(&mut addr, &viewer.fvk_commitment);
-                self.write_output_claim_digest_at(&mut addr, &out_w.ct_hash);
-                self.write_output_claim_digest_at(&mut addr, &out_w.mac);
-            }
-        }
+        let mut addr = start_addr;
+        self.write_output_claim_digest_at(&mut addr, digest);
     }
 
     /// Populate output claims for the note-deposit circuit's `RamWriter` output layout.
@@ -702,16 +668,21 @@ impl NightstreamHost {
             }
         }
 
-        // Bind package public output to proof-visible output claims unless disabled.
+        let circuit_output = Self::build_note_spend_circuit_output(witness);
+        let binding_digest = spend_public_binding_digest_from_circuit_output(&circuit_output);
+        let binding_digest_addr = self.input_offset;
+        self.write_ram_digest(&binding_digest);
+
+        // Bind package public output to a digest that the guest recomputes from
+        // the canonical note-spend public fields.
         if self.output_binding_enabled {
-            self.set_note_spend_output_claims(witness);
+            self.set_note_spend_binding_digest_claims(binding_digest_addr, &binding_digest);
             self.public_output_format = Some(PublicOutputFormat::NoteSpendV1);
         } else {
             self.output_claims.clear();
             self.public_output_format = None;
         }
 
-        let circuit_output = Self::build_note_spend_circuit_output(witness);
         let certified_public_output = spend_public_bytes_from_circuit_output(&circuit_output)
             .expect("failed to serialize certified note-spend public output");
 
@@ -819,49 +790,6 @@ impl NightstreamHost {
         {
             return Ok(());
         }
-
-        let output_addrs: Vec<u64> = self.output_claims.iter().map(|(addr, _)| *addr).collect();
-        let output_addr_set: BTreeSet<u64> = output_addrs.iter().copied().collect();
-        let trace = self
-            .build_base_runner()?
-            .simulate()
-            .map_err(|e| anyhow::anyhow!("Nightstream output-claim simulation failed: {:?}", e))?;
-
-        if !trace.did_halt() {
-            let limit = self
-                .max_steps
-                .map(|steps| steps.to_string())
-                .unwrap_or_else(|| "default".to_owned());
-            return Err(anyhow::anyhow!(
-                "Nightstream output-claim simulation did not halt within max_steps={limit}"
-            ));
-        }
-
-        let mut final_output_values: HashMap<u64, u64> =
-            output_addr_set.iter().map(|&addr| (addr, 0u64)).collect();
-
-        for (&addr, &value) in &self.ram_init {
-            if output_addr_set.contains(&addr) {
-                final_output_values.insert(addr, value);
-            }
-        }
-
-        for step in &trace.steps {
-            for ev in &step.twist_events {
-                if ev.twist_id == RAM_ID
-                    && ev.kind == TwistOpKind::Write
-                    && output_addr_set.contains(&ev.addr)
-                {
-                    final_output_values.insert(ev.addr, ev.value as u64);
-                }
-            }
-        }
-
-        self.output_claims = output_addrs
-            .into_iter()
-            .map(|addr| (addr, *final_output_values.get(&addr).unwrap_or(&0u64)))
-            .collect();
-
         Ok(())
     }
 
@@ -1100,6 +1028,10 @@ impl NightstreamHost {
     ///
     /// Otherwise, falls back to reconstructing raw bytes from output claims.
     fn extract_output_from_run(&self, _run: &Rv64TraceWiringRun) -> Result<Vec<u8>> {
+        if let Some(ref stored) = self.stored_public_output {
+            return Ok(stored.clone());
+        }
+
         if !self.output_claims.is_empty() {
             if let Some(fmt) = &self.public_output_format {
                 return match fmt {
@@ -1114,10 +1046,6 @@ impl NightstreamHost {
             return output_claims_to_bytes(&self.output_claims);
         }
 
-        if let Some(ref stored) = self.stored_public_output {
-            return Ok(stored.clone());
-        }
-
         Ok(vec![])
     }
 
@@ -1130,5 +1058,88 @@ impl NightstreamHost {
             .map_err(|e| anyhow::anyhow!("Nightstream simulation failed: {:?}", e))?;
 
         self.extract_output_from_run(&run)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(seed: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (idx, byte) in out.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(idx as u8);
+        }
+        out
+    }
+
+    fn sample_note_spend_witness_with_viewer() -> NoteSpendWitness {
+        NoteSpendWitness {
+            domain: digest(1),
+            spend_sk: digest(33),
+            pk_ivk_owner: digest(65),
+            depth: 16,
+            anchor: digest(97),
+            inputs: vec![NoteSpendInput {
+                value: 200,
+                rho: digest(129),
+                sender_id: digest(161),
+                position: 3,
+                siblings: vec![digest(193); 16],
+                nullifier: digest(17),
+            }],
+            withdraw_amount: 0,
+            withdraw_to: [0u8; 32],
+            outputs: vec![NoteSpendOutput {
+                value: 200,
+                rho: digest(49),
+                pk_spend: digest(81),
+                pk_ivk: digest(113),
+                cm: digest(145),
+            }],
+            inv_enforce: digest(177),
+            blacklist_root: digest(209),
+            blacklist_proofs: vec![
+                BlacklistProof {
+                    bucket_entries: [[0u8; 32]; BL_BUCKET_SIZE],
+                    bucket_inv: digest(241),
+                    siblings: vec![digest(25); 16],
+                },
+                BlacklistProof {
+                    bucket_entries: [[0u8; 32]; BL_BUCKET_SIZE],
+                    bucket_inv: digest(57),
+                    siblings: vec![digest(89); 16],
+                },
+            ],
+            viewers: vec![ViewerWitness {
+                fvk_commitment: digest(121),
+                fvk: digest(153),
+                per_output: vec![ViewerOutputWitness {
+                    ct_hash: digest(185),
+                    mac: digest(217),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn note_spend_stores_certified_output_with_viewer_attestations() {
+        let witness = sample_note_spend_witness_with_viewer();
+        let mut host = NightstreamHost::new(&[], 0);
+        host.write_note_spend_witness(&witness, Vec::new());
+
+        let stored_public_output = host
+            .stored_public_output
+            .clone()
+            .expect("stored public output");
+        let certified_binding_digest =
+            crate::circuit_output::spend_public_binding_digest_from_public_bytes(
+                &stored_public_output,
+            )
+            .expect("binding digest from public output");
+        let claim_digest = crate::circuit_output::digest32_from_output_claims(&host.output_claims)
+            .expect("digest claims");
+
+        assert_eq!(certified_binding_digest, claim_digest);
     }
 }

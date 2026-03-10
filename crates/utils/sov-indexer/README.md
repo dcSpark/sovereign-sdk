@@ -17,7 +17,7 @@ Status coverage
 
 Quick start
 1) Set configuration via environment variables (can also be in a `.env` file):
-   - `DA_CONNECTION_STRING` (required): e.g. `sqlite://examples/rollup-ligero/demo_data/da.sqlite?mode=rwc`
+   - `DA_CONNECTION_STRING` (required): e.g. `sqlite://examples/rollup-nightstream/demo_data/da.sqlite?mode=rwc`
    - `INDEX_DB` (optional): local index DB, default `sqlite://wallet_index.sqlite?mode=rwc`
    - `INDEXER_BIND` (optional): listen address, default `0.0.0.0:13100`
    - `MIDNIGHT_FVK_SERVICE_URL` (optional): midnight-fvk-service base URL, default `http://127.0.0.1:8088`

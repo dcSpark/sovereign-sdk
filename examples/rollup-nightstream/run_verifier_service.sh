@@ -1,8 +1,10 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${SERVICE_TARGET_DIR:-release}"
+BIN="$WORKSPACE_ROOT/target/$TARGET_DIR/proof-verifier"
 
 source "$SCRIPT_DIR/pool_fvk_env.sh"
 resolve_pool_fvk_pk
@@ -16,7 +18,7 @@ CHAIN_ID="${CHAIN_ID:-4321}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-${MAX_CONCURRENT_VERIFICATIONS:-}}"
 ROLLUP_CONFIG_PATH="${ROLLUP_CONFIG_PATH:-$SCRIPT_DIR/rollup_config.toml}"
-PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-${LIGERO_PROOF_SERVICE_URL:-}}"
+PROVER_SERVICE_URL="${PROVER_SERVICE_URL:-${NIGHTSTREAM_PROOF_SERVICE_URL:-${LIGERO_PROOF_SERVICE_URL:-}}}"
 
 DEFER_FLAG=""
 DSS="${DEFER_SEQUENCER_SUBMISSION:-${DEFER_SUBMISSION:-}}"
@@ -56,7 +58,13 @@ if [ -n "$PROVER_SERVICE_URL" ]; then
   PROVER_SERVICE_ARGS+=(--prover-service-url "$PROVER_SERVICE_URL")
 fi
 
-exec "$WORKSPACE_ROOT/target/release/proof-verifier" \
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build ${TARGET_DIR/release/--release }-p sov-proof-verifier-service"
+  exit 1
+fi
+
+exec "$BIN" \
   "${METHOD_ID_ARGS[@]}" \
   "${MAX_CONCURRENT_ARGS[@]}" \
   "${PROVER_SERVICE_ARGS[@]}" \

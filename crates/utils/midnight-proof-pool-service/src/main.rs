@@ -39,6 +39,8 @@ use tracing_subscriber::EnvFilter;
 const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
+const DEFAULT_NOTE_TREE_WAIT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_NOTE_TREE_WAIT_POLL_MS: u64 = 1_000;
 const POOL_STATE_TABLE: &str = "pool_wallets";
 
 #[derive(Clone, Debug)]
@@ -96,8 +98,7 @@ impl Config {
         let proof_generation_interval_ms = env_u64("PROOF_GENERATION_INTERVAL_MS", 0);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
-        let nightstream_program_path =
-            env_string("NIGHTSTREAM_PROGRAM_PATH", "note_spend_guest");
+        let nightstream_program_path = env_string("NIGHTSTREAM_PROGRAM_PATH", "note_spend_guest");
         let nightstream_proof_service_url =
             env_string("NIGHTSTREAM_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
         let pool_state_file = env_optional_string("POOL_STATE_FILE")
@@ -1926,17 +1927,55 @@ async fn wait_for_note_in_tree(
         .context("note value does not fit into u64")?;
     let recipient = privacy_key.recipient(&DOMAIN);
     let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
+    let cm_hex = hex::encode(cm);
+    let timeout = Duration::from_secs(note_tree_wait_timeout_secs());
+    let poll = Duration::from_millis(note_tree_wait_poll_ms());
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
 
-    let (_root, _pos, _sib) = global_tree_syncer()
-        .resolve_positions_and_openings(provider, &[cm])
-        .await
-        .with_context(|| {
-            format!(
-                "waiting for note commitment position cm={}",
-                hex::encode(cm)
-            )
-        })?;
-    Ok(())
+    loop {
+        attempts += 1;
+
+        let error = match global_tree_syncer()
+            .resolve_positions_and_openings(provider, &[cm])
+            .await
+        {
+            Ok(_) => {
+                if attempts > 1 {
+                    tracing::info!(
+                        cm = %cm_hex,
+                        attempts,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Note commitment became visible in commitment tree"
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) => err,
+        };
+
+        if started.elapsed() >= timeout {
+            bail!(
+                "Timed out waiting for note commitment position cm={} after {} attempts over {}s: {}",
+                cm_hex,
+                attempts,
+                timeout.as_secs(),
+                format!("{:#}", error)
+            );
+        }
+
+        if attempts == 1 || attempts % 5 == 0 {
+            tracing::info!(
+                cm = %cm_hex,
+                attempts,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                "Waiting for note commitment to appear in commitment tree"
+            );
+        }
+
+        sleep(poll).await;
+    }
 }
 
 async fn wait_for_sequencer_ready(node_url: &str, timeout: Duration) -> Result<()> {
@@ -2639,6 +2678,24 @@ fn tree_resolve_retry_delay_ms() -> u64 {
         .or_else(|| std::env::var("MCP_TREE_RESOLVE_RETRY_DELAY_MS").ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
+}
+
+fn note_tree_wait_timeout_secs() -> u64 {
+    std::env::var("PROOF_POOL_NOTE_TREE_WAIT_TIMEOUT_SECS")
+        .ok()
+        .or_else(|| std::env::var("MCP_NOTE_TREE_WAIT_TIMEOUT_SECS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NOTE_TREE_WAIT_TIMEOUT_SECS)
+}
+
+fn note_tree_wait_poll_ms() -> u64 {
+    std::env::var("PROOF_POOL_NOTE_TREE_WAIT_POLL_MS")
+        .ok()
+        .or_else(|| std::env::var("MCP_NOTE_TREE_WAIT_POLL_MS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NOTE_TREE_WAIT_POLL_MS)
 }
 
 fn is_tree_positions_resolution_error(error_text: &str) -> bool {

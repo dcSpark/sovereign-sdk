@@ -12,11 +12,11 @@ use mcp_external::wallet::WalletContext;
 use midnight_privacy::FullViewingKey;
 use rand::RngCore;
 use sov_address::MultiAddressEvm;
-use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 
 type McpSpec = ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 type McpRuntime = Runtime<McpSpec>;
@@ -125,7 +125,7 @@ async fn test_wallet_address() -> Result<()> {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-#[ignore = "requires running rollup/verifier/indexer services and Ligero prover assets"]
+#[ignore = "requires running rollup/verifier/indexer services and Nightstream proof service"]
 async fn test_get_privacy_balance() -> Result<()> {
     let _ = dotenvy::dotenv();
 

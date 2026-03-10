@@ -702,6 +702,22 @@ async fn pending_hashes_handler(
 }
 
 fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: String) -> Response {
+    if status.is_server_error() {
+        error!(
+            %status,
+            exit_code,
+            error = %message,
+            "Local /prove or /verify request failed"
+        );
+    } else {
+        warn!(
+            %status,
+            exit_code,
+            error = %message,
+            "Local /prove or /verify request rejected"
+        );
+    }
+
     (
         status,
         Json(ProveVerifyResponse {
@@ -3267,4 +3283,3 @@ async fn submit_to_node(state: &AppState, tx_bytes: Vec<u8>) -> Result<String, S
 
     Ok(tx_hash)
 }
-

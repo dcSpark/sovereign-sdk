@@ -32,6 +32,7 @@
   --color-start: #73bf69;
   --color-stop: #f2495c;
   --color-restart: #ff9830;
+  --color-build: #e0a458;
   --color-clean: #b877d9;
   
   --radius: 4px;
@@ -404,6 +405,16 @@ body {
   color: var(--color-bg);
 }
 
+.control-btn.build {
+  border-color: var(--color-build);
+  color: var(--color-build);
+}
+
+.control-btn.build:hover:not(:disabled) {
+  background: var(--color-build);
+  color: var(--color-bg);
+}
+
 .control-btn.clean {
   border-color: var(--color-clean);
   color: var(--color-clean);
@@ -658,6 +669,16 @@ body {
 
 .service-action-btn.restart:hover:not(:disabled) {
   background: var(--color-restart);
+  color: var(--color-bg);
+}
+
+.service-action-btn.build {
+  border-color: var(--color-build);
+  color: var(--color-build);
+}
+
+.service-action-btn.build:hover:not(:disabled) {
+  background: var(--color-build);
   color: var(--color-bg);
 }
 
