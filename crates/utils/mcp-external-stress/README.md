@@ -25,6 +25,12 @@ Convenience wrapper for the public testnet deployment:
 sh scripts/mcp-external-stress.sh --wallets 2 --txs 1
 ```
 
+Run the same workload continuously in a loop (until Ctrl-C):
+
+```bash
+sh scripts/mcp-external-stress.sh --wallets 2 --txs 1 --continuous
+```
+
 Probe the deployment (no wallet creation, no transactions):
 
 ```bash

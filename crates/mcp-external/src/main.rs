@@ -1,5 +1,5 @@
 use axum::body::{to_bytes, Body};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     HeaderMap, Method, Request, StatusCode,
@@ -7,6 +7,7 @@ use axum::http::{
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use futures::stream::{self, StreamExt};
 use rmcp::model::{ClientJsonRpcMessage, ClientNotification, InitializedNotification};
 use rmcp::transport::common::http_header::HEADER_SESSION_ID;
 use rmcp::transport::common::server_side_http::{session_id, SessionId};
@@ -52,6 +53,9 @@ use crate::session_store::{SessionSnapshot, SessionStore};
 use crate::wallet::WalletContext;
 
 const DEFAULT_AUTO_FUND_GAS_RESERVE: u128 = 1_000_000u128;
+const DEFAULT_AUTHORITY_ACCOUNTS_LIMIT: usize = 100;
+const MAX_AUTHORITY_ACCOUNTS_LIMIT: usize = 1000;
+const DEFAULT_AUTHORITY_BALANCE_CONCURRENCY: usize = 16;
 
 struct SessionContext {
     requested_id: Option<String>,
@@ -1145,12 +1149,40 @@ struct AuthorityWalletData {
 }
 
 /// Response type for /authority/accounts - array of [wallet_id, wallet_data] tuples
-/// Matches MockMCP's response format
+/// Uses MockMCP's wallet tuple format for each account entry
 type AuthorityAccountsResponse = Vec<(String, AuthorityWalletData)>;
 
 /// Response type for /authority/info - array of frozen wallet addresses
 /// Matches MockMCP's response format
 type AuthorityInfoResponse = Vec<String>;
+
+fn default_authority_accounts_limit() -> usize {
+    DEFAULT_AUTHORITY_ACCOUNTS_LIMIT
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityAccountsQuery {
+    /// Enable paginated response shape and batched/concurrent balance fetches.
+    /// Default is false for backwards compatibility.
+    #[serde(default)]
+    paginated: bool,
+    /// Page size for returned accounts (default 100, max 1000)
+    #[serde(default = "default_authority_accounts_limit")]
+    limit: usize,
+    /// Pagination cursor (exclusive): last `fvk_commitment` from previous page
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityAccountsPageResponse {
+    count: usize,
+    total_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    accounts: AuthorityAccountsResponse,
+}
 
 async fn authority_info_handler(State(state): State<AppState>) -> impl IntoResponse {
     // /authority/info returns just the list of frozen addresses (matches MockMCP spec)
@@ -1170,21 +1202,41 @@ async fn authority_info_handler(State(state): State<AppState>) -> impl IntoRespo
     }
 }
 
-async fn authority_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // /authority/accounts returns all accounts with wallet data (matches MockMCP spec)
-    authority_accounts_full(state).await
+async fn authority_accounts_handler(
+    State(state): State<AppState>,
+    Query(query): Query<AuthorityAccountsQuery>,
+) -> axum::response::Response {
+    if query.paginated {
+        authority_accounts_paginated(state, query).await
+    } else {
+        authority_accounts_legacy(state).await
+    }
 }
 
-async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
-    // Step 1: Get all registered FVKs from the indexer
-    let fvk_registry = match state.provider.get_fvk_registry().await {
+async fn authority_accounts_paginated(
+    state: AppState,
+    query: AuthorityAccountsQuery,
+) -> axum::response::Response {
+    let page_limit = query.limit.clamp(1, MAX_AUTHORITY_ACCOUNTS_LIMIT);
+
+    // Step 1: Get a page of registered FVKs from the indexer
+    let fvk_registry = match state
+        .provider
+        .get_fvk_registry(Some(page_limit), query.cursor.as_deref())
+        .await
+    {
         Ok(registry) => registry,
         Err(e) => {
             tracing::warn!("Failed to fetch FVK registry: {}", e);
-            // Return empty array if indexer is unavailable
+            // Return empty page if indexer is unavailable
             return (
                 StatusCode::OK,
-                Json(Vec::<(String, AuthorityWalletData)>::new()),
+                Json(AuthorityAccountsPageResponse {
+                    count: 0,
+                    total_count: 0,
+                    next_cursor: None,
+                    accounts: Vec::new(),
+                }),
             )
                 .into_response();
         }
@@ -1200,7 +1252,128 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
             }
         };
 
-    // Step 3: Build account list with balances
+    // Step 3: Build page account list with batched/concurrent balance fetches
+    let balance_concurrency = DEFAULT_AUTHORITY_BALANCE_CONCURRENCY.clamp(1, page_limit.max(1));
+    let provider = state.provider.clone();
+    let frozen_addresses = Arc::new(frozen_addresses);
+
+    let mut indexed_accounts: Vec<(usize, (String, AuthorityWalletData))> =
+        stream::iter(fvk_registry.fvks.into_iter().enumerate())
+            .map(|(idx, fvk_entry)| {
+                let provider = provider.clone();
+                let frozen_addresses = frozen_addresses.clone();
+                async move {
+                    let Some(privacy_address) = fvk_entry.shielded_address else {
+                        return None;
+                    };
+                    let fvk = fvk_entry.fvk;
+
+                    // Try to get balance for this address
+                    let (balance, last_send) = match provider
+                        .get_wallet_balance(&privacy_address, None, Some(&fvk), Some(&fvk))
+                        .await
+                    {
+                        Ok(balance_resp) => {
+                            // Find the most recent transfer (for lastSend timestamp)
+                            let last_send_ts = balance_resp
+                                .unspent_notes
+                                .iter()
+                                .filter(|n| n.kind == "transfer")
+                                .map(|n| n.timestamp_ms)
+                                .max();
+
+                            let last_send = match last_send_ts {
+                                Some(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                                    .map(|dt| dt.to_rfc3339())
+                                    .unwrap_or_else(|| "0000-01-01T00:00:00Z".to_string()),
+                                None => "0000-01-01T00:00:00Z".to_string(),
+                            };
+
+                            (balance_resp.balance, last_send)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to fetch balance for {}: {}",
+                                &privacy_address[..20.min(privacy_address.len())],
+                                e
+                            );
+                            ("0".to_string(), "0000-01-01T00:00:00Z".to_string())
+                        }
+                    };
+
+                    // Check if address is frozen
+                    let frozen = if frozen_addresses.contains(&privacy_address) {
+                        Some("Frozen by authority".to_string())
+                    } else {
+                        None
+                    };
+
+                    let wallet_data = AuthorityWalletData {
+                        authority_vfk: fvk,
+                        balance,
+                        frozen,
+                        last_send,
+                        pending_balance: "0".to_string(), // Not tracked in our system
+                        privacy_address: privacy_address.clone(),
+                        privacy_spend_key: None, // Never expose private keys
+                    };
+
+                    // Use privacy_address (bech32m privpool1...) as the wallet identifier
+                    Some((idx, (privacy_address, wallet_data)))
+                }
+            })
+            .buffer_unordered(balance_concurrency)
+            .collect::<Vec<Option<(usize, (String, AuthorityWalletData))>>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+    // Keep response ordering stable with the indexer's page order.
+    indexed_accounts.sort_by_key(|(idx, _)| *idx);
+    let accounts: AuthorityAccountsResponse = indexed_accounts
+        .into_iter()
+        .map(|(_, account)| account)
+        .collect();
+    let total_count = fvk_registry.total_count.unwrap_or(fvk_registry.count);
+
+    (
+        StatusCode::OK,
+        Json(AuthorityAccountsPageResponse {
+            count: accounts.len(),
+            total_count,
+            next_cursor: fvk_registry.next_cursor,
+            accounts,
+        }),
+    )
+        .into_response()
+}
+
+async fn authority_accounts_legacy(state: AppState) -> axum::response::Response {
+    // Legacy behavior: fetch full FVK list and resolve wallet balances sequentially.
+    let fvk_registry = match state.provider.get_all_fvk_registry().await {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::warn!("Failed to fetch full FVK registry: {}", e);
+            // Return empty array if indexer is unavailable
+            return (
+                StatusCode::OK,
+                Json(Vec::<(String, AuthorityWalletData)>::new()),
+            )
+                .into_response();
+        }
+    };
+
+    // Get frozen addresses to check freeze status
+    let frozen_addresses: std::collections::HashSet<String> =
+        match crate::operations::list_frozen_addresses(&state.provider).await {
+            Ok(res) => res.addresses.into_iter().map(|a| a.to_string()).collect(),
+            Err(e) => {
+                tracing::warn!("Failed to fetch frozen addresses: {}", e);
+                std::collections::HashSet::new()
+            }
+        };
+
     let mut accounts: AuthorityAccountsResponse = Vec::new();
 
     for fvk_entry in fvk_registry.fvks {
@@ -1209,7 +1382,7 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
             continue;
         };
 
-        // Try to get balance for this address
+        // Legacy behavior: sequential per-wallet balance calls.
         let (balance, last_send) = match state
             .provider
             .get_wallet_balance(
@@ -1248,7 +1421,6 @@ async fn authority_accounts_full(state: AppState) -> impl IntoResponse {
             }
         };
 
-        // Check if address is frozen
         let frozen = if frozen_addresses.contains(privacy_address) {
             Some("Frozen by authority".to_string())
         } else {

@@ -16,6 +16,7 @@ Options:
                       File with stable MCP session IDs to reuse across runs
                       (default: <repo>/.mcp-external-stress-session-ids.txt)
   --send-amount <N>    Amount (dust) per tx (default: 1000)
+  --continuous         Continuously repeat the current run in a loop
   --confirm            Poll confirmation (adds extra load)
   --rust-log <SPEC>    Override RUST_LOG (default: mcp_external_stress=info,rmcp=warn)
   -h, --help           Show help
@@ -25,6 +26,7 @@ Environment variables (optional, flags override):
   MCP_STRESS_SESSION_IDS_FILE
   SEND_AMOUNT
   CONFIRM
+  MCP_STRESS_CONTINUOUS
   MCP_STRESS_RUST_LOG
 EOF
 }
@@ -34,8 +36,10 @@ TXS_PER_WALLET=""
 SESSION_IDS_FILE=""
 
 MCP_ENDPOINT="${MCP_ENDPOINT:-https://midnight-l2-testnet.shinkai.com/mcp/mcp}"
+#MCP_ENDPOINT="${MCP_ENDPOINT:-http://127.0.0.1:3000/mcp}"
 SEND_AMOUNT="${SEND_AMOUNT:-1000}"
 CONFIRM="${CONFIRM:-0}"
+CONTINUOUS="${MCP_STRESS_CONTINUOUS:-0}"
 RUST_LOG="${MCP_STRESS_RUST_LOG:-mcp_external_stress=info,rmcp=warn}"
 
 # Backwards-compatible positional args: <wallets> <txs-per-wallet>
@@ -70,6 +74,10 @@ else
         CONFIRM=1
         shift
         ;;
+      --continuous)
+        CONTINUOUS=1
+        shift
+        ;;
       --rust-log)
         RUST_LOG="${2:-}"
         shift 2
@@ -102,6 +110,16 @@ esac
 case "$TXS_PER_WALLET" in
   *[!0-9]*|'') echo "--txs must be a non-negative integer" >&2; exit 2 ;;
 esac
+case "$CONTINUOUS" in
+  1|true|TRUE|yes|YES) CONTINUOUS=1 ;;
+  0|false|FALSE|no|NO|'') CONTINUOUS=0 ;;
+  *) echo "--continuous (or MCP_STRESS_CONTINUOUS) must be boolean: 1/0/true/false/yes/no" >&2; exit 2 ;;
+esac
+
+if [ "$CONTINUOUS" -eq 1 ] && [ "$TXS_PER_WALLET" -eq 0 ]; then
+  echo "--txs must be >= 1 when --continuous is enabled" >&2
+  exit 2
+fi
 
 export RUST_LOG
 
@@ -115,14 +133,23 @@ SESSION_IDS_FILE="${SESSION_IDS_FILE:-${MCP_STRESS_SESSION_IDS_FILE:-$REPO_ROOT/
 # that indicate a full tree rebuild.  Only active while this script runs.
 MCP_SERVER_LOG="${MCP_SERVER_LOG:-$REPO_ROOT/logs/mcp-external.log}"
 _rebuild_watcher_pid=""
+_stop_requested=0
 
 _cleanup_watcher() {
   if [ -n "$_rebuild_watcher_pid" ] && kill -0 "$_rebuild_watcher_pid" 2>/dev/null; then
     kill "$_rebuild_watcher_pid" 2>/dev/null || true
     wait "$_rebuild_watcher_pid" 2>/dev/null || true
   fi
+  _rebuild_watcher_pid=""
 }
-trap _cleanup_watcher EXIT INT TERM
+
+_request_stop() {
+  _stop_requested=1
+  _cleanup_watcher
+}
+
+trap _cleanup_watcher EXIT
+trap _request_stop INT TERM
 
 _extract_field() {
   # Extract a key=value field from a tracing log line.  Usage: _extract_field "key" "$line"
@@ -327,5 +354,55 @@ set -- \
 case "$CONFIRM" in
   1|true|TRUE|yes|YES) set -- "$@" --confirm ;;
 esac
+
+if [ "$CONTINUOUS" -eq 1 ]; then
+  echo "[stress] Building mcp-external-stress once before continuous loop..."
+  cargo build -p mcp-external-stress --manifest-path "$REPO_ROOT/Cargo.toml"
+
+  TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+  if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+    STRESS_BIN="$TARGET_DIR/$CARGO_BUILD_TARGET/debug/mcp-external-stress"
+  else
+    STRESS_BIN="$TARGET_DIR/debug/mcp-external-stress"
+  fi
+
+  if [ ! -x "$STRESS_BIN" ]; then
+    echo "[stress] Built binary not found (or not executable): $STRESS_BIN" >&2
+    exit 1
+  fi
+
+  run_num=0
+  while :; do
+    if [ "$_stop_requested" -eq 1 ]; then
+      echo "[stress] Stop requested; exiting continuous mode."
+      exit 130
+    fi
+    run_num=$((run_num + 1))
+    echo "[stress] Starting run #$run_num (continuous mode)"
+    if "$STRESS_BIN" "$@"; then
+      if [ "$_stop_requested" -eq 1 ]; then
+        echo "[stress] Interrupted (Ctrl-C); exiting continuous mode."
+        exit 130
+      fi
+      echo "[stress] Run #$run_num completed; restarting..."
+    else
+      status=$?
+      if [ "$_stop_requested" -eq 1 ]; then
+        echo "[stress] Interrupted (Ctrl-C); exiting continuous mode."
+        exit 130
+      fi
+      case "$status" in
+        130)
+          echo "[stress] Interrupted (Ctrl-C); exiting continuous mode."
+          exit 130
+          ;;
+        *)
+          echo "[stress] Run #$run_num failed with exit code $status; stopping."
+          exit "$status"
+          ;;
+      esac
+    fi
+  done
+fi
 
 exec cargo run -p mcp-external-stress --manifest-path "$REPO_ROOT/Cargo.toml" -- "$@"
