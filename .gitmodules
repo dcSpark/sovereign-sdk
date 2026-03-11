@@ -10,3 +10,6 @@
 [submodule "crates/module-system/sov-test-utils/lib/v2-periphery"]
 	path = crates/module-system/sov-test-utils/lib/v2-periphery
 	url = https://github.com/Uniswap/v2-periphery.git
+[submodule "examples/rollup-ligero/midnight-l2-contracts"]
+	path = examples/rollup-ligero/midnight-l2-contracts
+	url = https://github.com/dcSpark/midnight-l2-contracts
