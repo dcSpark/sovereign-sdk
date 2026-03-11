@@ -1,22 +1,17 @@
 use anyhow::{anyhow, Context, Result};
-use base_crypto::fab::{AlignedValue, ValueAtom};
 use hex::FromHex;
-use midnight_onchain_state::state::{ChargedState, ContractMaintenanceAuthority, ContractState};
-use midnight_serialize::{tagged_deserialize, Deserializable};
-use midnight_storage::arena::{set_allow_non_normal_form_deserialization, Sp};
-use midnight_storage::db::InMemoryDB;
-use midnight_storage::storage::HashMap as StorageHashMap;
+use midnight_node_ledger_helpers::base_crypto::fab::{AlignedValue, ValueAtom};
+use midnight_node_ledger_helpers::mn_ledger_serialize::tagged_deserialize;
+use midnight_node_ledger_helpers::mn_ledger_storage::arena::Sp;
+use midnight_node_ledger_helpers::onchain_runtime::state::ContractState;
+use midnight_node_ledger_helpers::DefaultDB;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 use std::ops::Deref;
-use std::sync::Once;
 
 pub mod utils;
-
-const LEGACY_CONTRACT_STATE_TAG_V4: &[u8] = b"midnight:contract-state[v4]:";
 
 const CONTRACT_STATE_QUERY: &str = r#"
 query CONTRACT_STATE_QUERY($address: HexEncoded!, $offset: ContractActionOffset) {
@@ -25,8 +20,6 @@ state
 }
 }
 "#;
-
-static SET_NORMAL_FORM_FLAG: Once = Once::new();
 
 /// Client wrapper for querying the Midnight GraphQL indexer.
 pub struct MidnightIndexerClient {
@@ -38,7 +31,6 @@ pub struct MidnightIndexerClient {
 impl MidnightIndexerClient {
     /// Builds a client for the Midnight indexer GraphQL endpoint.
     pub fn new(client: Client, endpoint: String, contract_address: String) -> Self {
-        SET_NORMAL_FORM_FLAG.call_once(|| set_allow_non_normal_form_deserialization(true));
         Self {
             client,
             endpoint,
@@ -138,8 +130,9 @@ pub struct RollupLedger {
     pub signature_threshold: u8,
     pub sequencers: BTreeSet<[u8; 32]>,
     pub finalizers: BTreeSet<[u8; 32]>,
-    pub committed_batches: BTreeMap<u64, [u8; 32]>,
-    pub finalized_state_roots: BTreeMap<u64, [u8; 32]>,
+    pub last_committed_batch_hash: [u8; 32],
+    pub last_finalized_state_root: [u8; 32],
+    pub last_finalized_batch_hash: [u8; 32],
     pub withdraw_roots: BTreeMap<u64, [u8; 32]>,
     pub misc_data: RollupMiscData,
     pub first_cross_domain_message_index: u64,
@@ -187,40 +180,9 @@ pub struct L2MessageQueueLedger {
     pub branches: Vec<[u8; 32]>,
 }
 
-fn deserialize_contract_state(bytes: &[u8]) -> Result<ContractState<InMemoryDB>> {
-    match tagged_deserialize(bytes) {
-        Ok(state) => Ok(state),
-        Err(primary_err) => match deserialize_contract_state_v4(bytes) {
-            Ok(Some(legacy)) => Ok(legacy),
-            Ok(None) => Err(anyhow!(
-                "failed to deserialize ContractState: {}",
-                primary_err
-            )),
-            Err(legacy_err) => Err(anyhow!(
-                "failed to deserialize ContractState: {}; legacy decode error: {}",
-                primary_err,
-                legacy_err
-            )),
-        },
-    }
-}
-
-fn deserialize_contract_state_v4(bytes: &[u8]) -> Result<Option<ContractState<InMemoryDB>>> {
-    if !bytes.starts_with(LEGACY_CONTRACT_STATE_TAG_V4) {
-        return Ok(None);
-    }
-
-    let mut reader = Cursor::new(&bytes[LEGACY_CONTRACT_STATE_TAG_V4.len()..]);
-    let legacy_value = <StateValue as Deserializable>::deserialize(&mut reader, 0)
-        .map_err(|err| anyhow!("legacy contract-state data decode failed: {}", err))?;
-    let data = ChargedState::new(legacy_value);
-
-    Ok(Some(ContractState {
-        data,
-        operations: StorageHashMap::new(),
-        maintenance_authority: ContractMaintenanceAuthority::new(),
-        balance: StorageHashMap::new(),
-    }))
+fn deserialize_contract_state(bytes: &[u8]) -> Result<ContractState<DefaultDB>> {
+    tagged_deserialize(bytes)
+        .map_err(|err| anyhow!("failed to deserialize ContractState: {}", err))
 }
 
 struct RollupHead {
@@ -231,8 +193,9 @@ struct RollupHead {
     signature_threshold: u8,
     sequencers: BTreeSet<[u8; 32]>,
     finalizers: BTreeSet<[u8; 32]>,
-    committed_batches: BTreeMap<u64, [u8; 32]>,
-    finalized_state_roots: BTreeMap<u64, [u8; 32]>,
+    last_committed_batch_hash: [u8; 32],
+    last_finalized_state_root: [u8; 32],
+    last_finalized_batch_hash: [u8; 32],
     withdraw_roots: BTreeMap<u64, [u8; 32]>,
     misc_data: RollupMiscData,
     first_cross_domain_message_index: u64,
@@ -250,7 +213,7 @@ struct RollupTail {
     pending_withdrawals: BTreeMap<[u8; 32], u128>,
 }
 
-fn decode_bridge_ledger(state: &ContractState<InMemoryDB>) -> Result<BridgeLedger> {
+fn decode_bridge_ledger(state: &ContractState<DefaultDB>) -> Result<BridgeLedger> {
     let root = state.data.get_ref();
     let root_parts = expect_array(root).context("bridge state root must be an array")?;
     if root_parts.len() != 3 {
@@ -272,8 +235,9 @@ fn decode_bridge_ledger(state: &ContractState<InMemoryDB>) -> Result<BridgeLedge
         signature_threshold: rollup_head.signature_threshold,
         sequencers: rollup_head.sequencers,
         finalizers: rollup_head.finalizers,
-        committed_batches: rollup_head.committed_batches,
-        finalized_state_roots: rollup_head.finalized_state_roots,
+        last_committed_batch_hash: rollup_head.last_committed_batch_hash,
+        last_finalized_state_root: rollup_head.last_finalized_state_root,
+        last_finalized_batch_hash: rollup_head.last_finalized_batch_hash,
         withdraw_roots: rollup_head.withdraw_roots,
         misc_data: rollup_head.misc_data,
         first_cross_domain_message_index: rollup_head.first_cross_domain_message_index,
@@ -298,9 +262,9 @@ fn decode_bridge_ledger(state: &ContractState<InMemoryDB>) -> Result<BridgeLedge
 
 fn decode_rollup_head(value: &StateValue) -> Result<RollupHead> {
     let items = expect_array(value).context("rollup header must be an array")?;
-    if items.len() != 12 {
+    if items.len() != 13 {
         return Err(anyhow!(
-            "rollup header expected 12 entries, found {}",
+            "rollup header expected 13 entries, found {}",
             items.len()
         ));
     }
@@ -320,13 +284,17 @@ fn decode_rollup_head(value: &StateValue) -> Result<RollupHead> {
     )?;
     let sequencers = decode_bytes32_set(iter_next(&mut iter, "sequencers")?.deref(), "sequencers")?;
     let finalizers = decode_bytes32_set(iter_next(&mut iter, "finalizers")?.deref(), "finalizers")?;
-    let committed_batches = decode_u64_bytes32_map(
-        iter_next(&mut iter, "committedBatches")?.deref(),
-        "committedBatches",
+    let last_committed_batch_hash = decode_bytes32_value(
+        iter_next(&mut iter, "lastCommittedBatchHash")?.deref(),
+        "lastCommittedBatchHash",
     )?;
-    let finalized_state_roots = decode_u64_bytes32_map(
-        iter_next(&mut iter, "finalizedStateRoots")?.deref(),
-        "finalizedStateRoots",
+    let last_finalized_state_root = decode_bytes32_value(
+        iter_next(&mut iter, "lastFinalizedStateRoot")?.deref(),
+        "lastFinalizedStateRoot",
+    )?;
+    let last_finalized_batch_hash = decode_bytes32_value(
+        iter_next(&mut iter, "lastFinalizedBatchHash")?.deref(),
+        "lastFinalizedBatchHash",
     )?;
     let withdraw_roots = decode_u64_bytes32_map(
         iter_next(&mut iter, "withdrawRoots")?.deref(),
@@ -350,8 +318,9 @@ fn decode_rollup_head(value: &StateValue) -> Result<RollupHead> {
         signature_threshold,
         sequencers,
         finalizers,
-        committed_batches,
-        finalized_state_roots,
+        last_committed_batch_hash,
+        last_finalized_state_root,
+        last_finalized_batch_hash,
         withdraw_roots,
         misc_data,
         first_cross_domain_message_index,
@@ -827,7 +796,7 @@ struct ContractActionState {
     state: String,
 }
 
-type StateValue = midnight_onchain_state::state::StateValue<InMemoryDB>;
+type StateValue = midnight_node_ledger_helpers::onchain_runtime::state::StateValue<DefaultDB>;
 
 #[cfg(test)]
 mod tests {

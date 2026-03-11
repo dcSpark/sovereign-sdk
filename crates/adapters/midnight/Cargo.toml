@@ -14,11 +14,8 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-base_crypto = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2", package = "midnight-base-crypto" }
 hex = { workspace = true }
-midnight-onchain-state = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
-midnight-serialize = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
-midnight-storage = { git = "https://github.com/dcSpark/midnight-ledger", branch = "midnight-l2" }
+midnight-node-ledger-helpers = { git = "https://github.com/midnightntwrk/midnight-node", rev = "c0e000e5", package = "midnight-node-ledger-helpers", features = ["can-panic"] }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
