@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use neo_fold::rv64_trace_shard::{Rv64TraceWiring, Rv64TraceWiringRun};
+use neo_fold::ProverComputeBackend;
 use neo_math::F;
 use neo_memory::output_check::ProgramIO;
 use neo_memory::riscv::lookups::RAM_ID;
@@ -351,6 +352,8 @@ pub struct NightstreamHost {
     chunk_rows: usize,
     /// Optional max architectural instruction bound for execution.
     max_steps: Option<usize>,
+    /// Compute backend used for proving.
+    compute_backend: ProverComputeBackend,
     /// Output claims: (address, expected_value).
     output_claims: Vec<(u64, u64)>,
     /// Pre-built public output bytes (bincode-serialized SpendPublic).
@@ -377,6 +380,7 @@ impl NightstreamHost {
             input_offset: DEFAULT_INPUT_ADDR,
             chunk_rows: DEFAULT_CHUNK_ROWS,
             max_steps: None,
+            compute_backend: ProverComputeBackend::auto(),
             output_claims: Vec::new(),
             stored_public_output: None,
             public_output_format: None,
@@ -410,14 +414,30 @@ impl NightstreamHost {
         self
     }
 
+    /// Set the Nightstream compute backend used by proving.
+    pub fn with_compute_backend(mut self, compute_backend: ProverComputeBackend) -> Self {
+        self.compute_backend = compute_backend;
+        self
+    }
+
     /// Set an explicit max architectural instruction bound on an existing host.
     pub fn set_max_steps(&mut self, max_steps: usize) {
         self.max_steps = Some(max_steps);
     }
 
+    /// Set the Nightstream compute backend used by proving.
+    pub fn set_compute_backend(&mut self, compute_backend: ProverComputeBackend) {
+        self.compute_backend = compute_backend;
+    }
+
     /// Set chunk rows on an existing host.
     pub fn set_chunk_rows(&mut self, chunk_rows: usize) {
         self.chunk_rows = chunk_rows;
+    }
+
+    /// Return the currently configured Nightstream compute backend.
+    pub fn compute_backend(&self) -> &ProverComputeBackend {
+        &self.compute_backend
     }
 
     /// Return RAM init words as sorted `(addr, value)` pairs.
@@ -755,7 +775,8 @@ impl NightstreamHost {
     fn build_base_runner(&self) -> Result<Rv64TraceWiring> {
         let mut builder = Rv64TraceWiring::from_elf(&self.rom_bytes)
             .map_err(|e| anyhow::anyhow!("Nightstream RV64 guest load failed: {:?}", e))?
-            .chunk_rows(self.chunk_rows);
+            .chunk_rows(self.chunk_rows)
+            .compute_backend(self.compute_backend.clone());
 
         if let Some(max_steps) = self.max_steps {
             // Keep the trace geometry aligned with the expected execution length.
@@ -890,6 +911,8 @@ pub struct NightstreamHostArgs {
     pub program_base: u64,
     /// Optional max architectural instruction bound.
     pub max_steps: Option<usize>,
+    /// Nightstream compute backend used for proving.
+    pub compute_backend: ProverComputeBackend,
 }
 
 impl NightstreamHostArgs {
@@ -899,7 +922,14 @@ impl NightstreamHostArgs {
             rom_bytes,
             program_base,
             max_steps: None,
+            compute_backend: ProverComputeBackend::auto(),
         }
+    }
+
+    /// Override the Nightstream compute backend used for proving.
+    pub fn with_compute_backend(mut self, compute_backend: ProverComputeBackend) -> Self {
+        self.compute_backend = compute_backend;
+        self
     }
 }
 
@@ -912,6 +942,7 @@ impl ZkvmHost for NightstreamHost {
         if let Some(max_steps) = args.max_steps {
             host = host.with_max_steps(max_steps);
         }
+        host = host.with_compute_backend(args.compute_backend.clone());
         host
     }
 

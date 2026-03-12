@@ -14,11 +14,12 @@ use neo_ccs::{matrix::Mat, CcsStructure, CeClaim};
 use neo_fold::output_binding::OutputBindingConfig;
 use neo_fold::pi_ccs::FoldingMode;
 use neo_fold::shard::{
-    fold_shard_verify, fold_shard_verify_with_output_binding,
-    fold_shard_verify_with_output_binding_and_step_linking, fold_shard_verify_with_step_linking,
-    CommitMixers, ShardFoldOutputs, ShardProof, StepLinkingConfig,
+    fold_shard_verify_with_backend, fold_shard_verify_with_output_binding_and_backend,
+    fold_shard_verify_with_output_binding_and_step_linking_and_backend,
+    fold_shard_verify_with_step_linking_and_backend, CommitMixers, ShardFoldOutputs, ShardProof,
+    StepLinkingConfig,
 };
-use neo_fold::PiCcsError;
+use neo_fold::{PiCcsError, ProverComputeBackend};
 use neo_math::ring::{cf_inv, Rq as RqEl};
 use neo_math::{D, F, K};
 use neo_memory::output_check::ProgramIO;
@@ -209,6 +210,7 @@ struct MemInstanceWire {
 }
 
 impl MemInstanceWire {
+    #[cfg(feature = "native")]
     fn from_native(
         inst: &neo_memory::witness::MemInstance<Cmt, F>,
         step_idx: usize,
@@ -312,6 +314,15 @@ impl NightstreamProofPackage {
 
     /// Verify this proof package directly against the packaged verifier context.
     pub fn verify(&self) -> Result<bool, PiCcsError> {
+        self.verify_with_backend(&ProverComputeBackend::auto())
+    }
+
+    /// Verify this proof package directly against the packaged verifier context
+    /// using an explicit Nightstream compute backend.
+    pub fn verify_with_backend(
+        &self,
+        compute_backend: &ProverComputeBackend,
+    ) -> Result<bool, PiCcsError> {
         if self.config.xlen != 64 {
             return Err(PiCcsError::InvalidInput(format!(
                 "Nightstream RV64 proof package requires xlen == 64 (got {})",
@@ -319,12 +330,15 @@ impl NightstreamProofPackage {
             )));
         }
 
-        self.verify_lightweight()?;
+        self.verify_lightweight_with_backend(compute_backend)?;
         self.verify_public_output_binding()?;
         Ok(true)
     }
 
-    fn verify_lightweight(&self) -> Result<(), PiCcsError> {
+    fn verify_lightweight_with_backend(
+        &self,
+        compute_backend: &ProverComputeBackend,
+    ) -> Result<(), PiCcsError> {
         let verifier_context = decode_verifier_context(&self.verifier_context)?;
         validate_proof_metadata(&verifier_context, &self.proof)?;
 
@@ -345,7 +359,7 @@ impl NightstreamProofPackage {
                 let ob_cfg = ob_wire.to_native(steps_public)?;
                 if steps_public.len() > 1 {
                     let step_linking = required_step_linking(&verifier_context.step_linking_pairs)?;
-                    fold_shard_verify_with_output_binding_and_step_linking(
+                    fold_shard_verify_with_output_binding_and_step_linking_and_backend(
                         mode,
                         &mut transcript,
                         &verifier_context.params,
@@ -356,9 +370,10 @@ impl NightstreamProofPackage {
                         mixers,
                         &ob_cfg,
                         &step_linking,
+                        compute_backend,
                     )?
                 } else {
-                    fold_shard_verify_with_output_binding(
+                    fold_shard_verify_with_output_binding_and_backend(
                         mode,
                         &mut transcript,
                         &verifier_context.params,
@@ -368,13 +383,14 @@ impl NightstreamProofPackage {
                         &self.proof,
                         mixers,
                         &ob_cfg,
+                        compute_backend,
                     )?
                 }
             }
             None => {
                 if steps_public.len() > 1 {
                     let step_linking = required_step_linking(&verifier_context.step_linking_pairs)?;
-                    fold_shard_verify_with_step_linking(
+                    fold_shard_verify_with_step_linking_and_backend(
                         mode,
                         &mut transcript,
                         &verifier_context.params,
@@ -384,9 +400,10 @@ impl NightstreamProofPackage {
                         &self.proof,
                         mixers,
                         &step_linking,
+                        compute_backend,
                     )?
                 } else {
-                    fold_shard_verify(
+                    fold_shard_verify_with_backend(
                         mode,
                         &mut transcript,
                         &verifier_context.params,
@@ -395,6 +412,7 @@ impl NightstreamProofPackage {
                         seed_me,
                         &self.proof,
                         mixers,
+                        compute_backend,
                     )?
                 }
             }
@@ -453,6 +471,7 @@ fn default_chunk_rows() -> usize {
     1 << 16
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn encode_verifier_context(
     ctx: &NightstreamVerifierContext,
 ) -> Result<Vec<u8>, PiCcsError> {

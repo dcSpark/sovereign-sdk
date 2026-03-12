@@ -788,12 +788,13 @@ async fn prove_handler(
 
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServiceError> {
         use sov_nightstream_adapter::circuits::note_spend_rom;
-        use sov_nightstream_adapter::NightstreamHost;
+        use sov_nightstream_adapter::{NightstreamHost, ProverComputeBackend};
 
         let mut host = NightstreamHost::new(
             &note_spend_rom::NOTE_SPEND_ROM,
             note_spend_rom::NOTE_SPEND_ROM_BASE,
-        );
+        )
+        .with_compute_backend(ProverComputeBackend::auto());
         host.write_note_spend_witness(&witness, public_output_bytes);
 
         host.run(true)

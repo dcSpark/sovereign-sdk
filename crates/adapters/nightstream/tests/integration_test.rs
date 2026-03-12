@@ -11,7 +11,7 @@
 
 use sov_nightstream_adapter::{
     NightstreamCodeCommitment, NightstreamHost, NightstreamHostArgs, NightstreamProofPackage,
-    NightstreamVerifier,
+    NightstreamVerifier, ProverComputeBackend,
 };
 use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier, ZkvmHost};
 use std::time::Instant;
@@ -209,6 +209,25 @@ fn test_code_commitment_roundtrip() {
     assert_eq!(encoded.len(), 32);
 }
 
+#[test]
+fn test_host_defaults_to_auto_backend() {
+    let host = NightstreamHost::new(
+        &value_validator_rom::VALUE_VALIDATOR_ROM,
+        value_validator_rom::VALUE_VALIDATOR_ROM_BASE,
+    );
+    assert_eq!(host.compute_backend(), &ProverComputeBackend::auto());
+
+    let args = NightstreamHostArgs::new(
+        value_validator_rom::VALUE_VALIDATOR_ROM.to_vec(),
+        value_validator_rom::VALUE_VALIDATOR_ROM_BASE,
+    );
+    let host_from_args = NightstreamHost::from_args(&args);
+    assert_eq!(
+        host_from_args.compute_backend(),
+        &ProverComputeBackend::auto()
+    );
+}
+
 /// Test the full prove-verify cycle with the value-validator guest program.
 ///
 /// This test:
@@ -263,6 +282,15 @@ fn test_prove_and_verify_value_validator() {
         package.public_output.len(),
         package.rom_bytes.len()
     );
+
+    assert!(package
+        .verify_with_backend(&ProverComputeBackend::Cpu)
+        .expect("CPU packaged verification should succeed"));
+    assert!(package
+        .verify()
+        .expect("default packaged verification should succeed"));
+    NightstreamVerifier::verify_proof_package_with_backend(&package, &ProverComputeBackend::Cpu)
+        .expect("CPU packaged verifier helper should succeed");
 
     // Verify via NightstreamVerifier (using NIGHTSTREAM_SKIP_VERIFICATION for
     // non-native testing, or full verification with native feature)
@@ -1472,6 +1500,12 @@ fn test_note_spend_replay_viewer_witness_with_output_binding() {
         !package.verifier_context.is_empty(),
         "viewer-attested packaged proof should include packaged verifier context"
     );
+    assert!(package
+        .verify_with_backend(&ProverComputeBackend::Cpu)
+        .expect("CPU packaged verification should succeed for note-spend"));
+    assert!(package
+        .verify()
+        .expect("default packaged verification should succeed for note-spend"));
 
     let t_package_verify = Instant::now();
     let verified_public: SpendPublicWire = NightstreamVerifier::verify(&proof_bytes, &commitment)

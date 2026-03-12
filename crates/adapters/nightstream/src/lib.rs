@@ -50,6 +50,7 @@ pub use host::{
     NoteDepositWitness, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
     ViewerWitness,
 };
+pub use neo_fold::{DeviceApi, MojoBackendConfig, ProverComputeBackend};
 
 mod proof_package;
 pub use proof_package::{NightstreamProofPackage, PoolViewerSig};
@@ -310,6 +311,14 @@ impl NightstreamVerifier {
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
         native::verify_proof_package(package)
     }
+
+    /// Verify a proof package with an explicit Nightstream compute backend.
+    pub fn verify_proof_package_with_backend(
+        package: &NightstreamProofPackage,
+        compute_backend: &ProverComputeBackend,
+    ) -> Result<(), anyhow::Error> {
+        native::verify_proof_package_with_backend(package, compute_backend)
+    }
 }
 
 #[cfg(feature = "native")]
@@ -348,6 +357,21 @@ mod native {
     pub fn verify_proof_package(package: &NightstreamProofPackage) -> Result<(), anyhow::Error> {
         let ok = package
             .verify()
+            .map_err(|e| anyhow::anyhow!("Nightstream proof verification failed: {:?}", e))?;
+
+        if !ok {
+            anyhow::bail!("Nightstream proof verification returned false");
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_proof_package_with_backend(
+        package: &NightstreamProofPackage,
+        compute_backend: &ProverComputeBackend,
+    ) -> Result<(), anyhow::Error> {
+        let ok = package
+            .verify_with_backend(compute_backend)
             .map_err(|e| anyhow::anyhow!("Nightstream proof verification failed: {:?}", e))?;
 
         if !ok {
