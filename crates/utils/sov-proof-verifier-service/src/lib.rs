@@ -1528,10 +1528,23 @@ async fn verify_and_record_midnight_handler(
             ))
         })?;
 
+    let tx_hash = tx_without_proof.hash().to_string();
+
     let tx = if let Some(proof_bytes) = remote_proof_bytes.as_ref() {
         attach_proof_to_midnight_transaction(&tx_without_proof, proof_bytes)?
     } else {
-        tx_without_proof
+        tx_without_proof.clone()
+    };
+
+    let full_transaction_blob = if remote_proof_bytes.is_some() {
+        let tx_with_proof_bytes = borsh::to_vec(&tx).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to serialize rehydrated midnight transaction: {e}"
+            ))
+        })?;
+        BASE64_STANDARD.encode(tx_with_proof_bytes)
+    } else {
+        req.body.clone()
     };
 
     let parsed_call = parse_midnight_call(&tx)?;
@@ -1539,10 +1552,9 @@ async fn verify_and_record_midnight_handler(
 
     let signature_start = std::time::Instant::now();
     let rollup_chain_hash = ensure_rollup_chain_hash(&state).await?;
-    verify_midnight_transaction_signature(&tx, &rollup_chain_hash)?;
+    verify_midnight_transaction_signature(&tx_without_proof, &rollup_chain_hash)?;
     metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
 
-    let tx_hash = tx.hash().to_string();
     let transaction_data = create_transaction_without_proof(&tx)?;
 
     async fn handle_no_proof_midnight_call(
@@ -1710,7 +1722,7 @@ async fn verify_and_record_midnight_handler(
 
             let persist_start = std::time::Instant::now();
             // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+            let pre_auth_data = match extract_pre_authenticated_data(&tx_without_proof) {
                 Ok(data) => {
                     debug!("✓ Extracted pre-authenticated data for transfer (includes lightweight tx without proof)");
                     Some(data)
@@ -1745,7 +1757,7 @@ async fn verify_and_record_midnight_handler(
                 true,       // signature_valid
                 Some(true), // proof_verified: true
                 &transaction_data,
-                &req.body,
+                &full_transaction_blob,
                 pre_auth_data,
                 view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
@@ -1823,7 +1835,7 @@ async fn verify_and_record_midnight_handler(
 
             let persist_start = std::time::Instant::now();
             // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+            let pre_auth_data = match extract_pre_authenticated_data(&tx_without_proof) {
                 Ok(data) => {
                     debug!("✓ Extracted pre-authenticated data for withdraw (includes lightweight tx without proof)");
                     Some(data)
@@ -1856,7 +1868,7 @@ async fn verify_and_record_midnight_handler(
                 true,       // signature_valid
                 Some(true), // proof_verified: true (has proof and verified correctly)
                 &transaction_data,
-                &req.body,
+                &full_transaction_blob,
                 pre_auth_data,
                 view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
