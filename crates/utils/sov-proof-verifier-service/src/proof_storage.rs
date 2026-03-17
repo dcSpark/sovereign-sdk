@@ -1,6 +1,14 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{
+    config::{Builder as S3ConfigBuilder, Region},
+    presigning::PresigningConfig,
+    primitives::ByteStream,
+    Client,
+};
 use chrono::{Datelike, Utc};
-use s3::{creds::Credentials, Bucket, Region};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,7 +39,7 @@ pub struct ProofStorage {
     bucket_name: String,
     key_prefix: String,
     download_ttl_secs: u32,
-    bucket: Box<Bucket>,
+    client: Client,
 }
 
 impl ProofStorage {
@@ -60,27 +68,30 @@ impl ProofStorage {
             .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
             .unwrap_or_else(|| "us-east-1".to_string());
 
-        let region = match std::env::var("SOV_PROOF_VERIFIER_PROOF_ENDPOINT") {
-            Ok(endpoint) if !endpoint.trim().is_empty() => Region::Custom {
-                region: region_name.clone(),
-                endpoint: endpoint.trim().to_string(),
-            },
-            _ => region_name
-                .parse::<Region>()
-                .with_context(|| format!("Invalid S3 region '{region_name}'"))?,
-        };
+        let region = Region::new(region_name.clone());
+        let shared_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(region.clone())
+            .load()
+            .await;
 
-        let credentials = Credentials::new(None, None, None, None, None)
-            .context("Failed to load AWS credentials for proof storage")?;
+        let mut config_builder = S3ConfigBuilder::from(&shared_config)
+            .region(region)
+            .force_path_style(false);
 
-        let bucket = Bucket::new(&bucket_name, region, credentials)
-            .context("Failed to create S3 bucket client for proof storage")?;
+        if let Ok(endpoint) = std::env::var("SOV_PROOF_VERIFIER_PROOF_ENDPOINT") {
+            let endpoint = endpoint.trim();
+            if !endpoint.is_empty() {
+                config_builder = config_builder.endpoint_url(endpoint.to_string());
+            }
+        }
+
+        let client = Client::from_conf(config_builder.build());
 
         Ok(Some(Self {
             bucket_name,
             key_prefix,
             download_ttl_secs,
-            bucket,
+            client,
         }))
     }
 
@@ -99,21 +110,21 @@ impl ProofStorage {
             now.day(),
             sha256
         );
-        let path = format!("/{}", key);
 
-        let response = self
-            .bucket
-            .put_object_with_content_type(&path, &proof_bytes, "application/octet-stream")
+        self.client
+            .put_object()
+            .bucket(&self.bucket_name)
+            .key(&key)
+            .content_type("application/octet-stream")
+            .body(ByteStream::from(proof_bytes.clone()))
+            .send()
             .await
-            .with_context(|| format!("Failed to store proof package in s3://{}/{}", self.bucket_name, key))?;
-
-        anyhow::ensure!(
-            (200..300).contains(&response.status_code()),
-            "Unexpected S3 status while storing proof package in s3://{}/{}: {}",
-            self.bucket_name,
-            key,
-            response.status_code()
-        );
+            .with_context(|| {
+                format!(
+                    "Failed to store proof package in s3://{}/{}",
+                    self.bucket_name, key
+                )
+            })?;
 
         let proof_ref = ProofReference {
             bucket: self.bucket_name.clone(),
@@ -139,22 +150,28 @@ impl ProofStorage {
             self.bucket_name
         );
 
-        let path = format!("/{}", proof_ref.key.trim_start_matches('/'));
         let response = self
-            .bucket
-            .get_object(&path)
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(proof_ref.key.trim_start_matches('/'))
+            .send()
             .await
-            .with_context(|| format!("Failed to fetch proof package from s3://{}/{}", self.bucket_name, proof_ref.key))?;
+            .with_context(|| {
+                format!(
+                    "Failed to fetch proof package from s3://{}/{}",
+                    self.bucket_name, proof_ref.key
+                )
+            })?;
 
-        anyhow::ensure!(
-            (200..300).contains(&response.status_code()),
-            "Unexpected S3 status while fetching proof package from s3://{}/{}: {}",
-            self.bucket_name,
-            proof_ref.key,
-            response.status_code()
-        );
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .context("Failed to read proof package bytes from S3")?
+            .into_bytes()
+            .to_vec();
 
-        let bytes = response.to_vec();
         if let Some(expected_sha256) = proof_ref.sha256.as_deref() {
             let actual_sha256 = hex::encode(Sha256::digest(&bytes));
             anyhow::ensure!(
@@ -178,15 +195,25 @@ impl ProofStorage {
             self.bucket_name
         );
 
-        let path = format!("/{}", proof_ref.key.trim_start_matches('/'));
-        self.bucket
-            .presign_get(&path, self.download_ttl_secs, None)
+        let config = PresigningConfig::expires_in(Duration::from_secs(
+            self.download_ttl_secs.into(),
+        ))
+        .context("Invalid proof download presign TTL")?;
+
+        let request = self
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(proof_ref.key.trim_start_matches('/'))
+            .presigned(config)
             .await
             .with_context(|| {
                 format!(
                     "Failed to presign proof download URL for s3://{}/{}",
                     self.bucket_name, proof_ref.key
                 )
-            })
+            })?;
+
+        Ok(request.uri().to_string())
     }
 }
