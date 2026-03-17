@@ -37,6 +37,9 @@ pub struct ProofRef {
 
 #[derive(Debug, Clone)]
 pub struct GeneratedProof {
+    /// Inline proof bytes when the prover returns them directly. When `proof_ref`
+    /// is present, MCP can keep the transaction lightweight and avoid fetching
+    /// the proof package from object storage.
     pub proof_bytes: Vec<u8>,
     pub proof_ref: Option<ProofRef>,
 }
@@ -57,8 +60,6 @@ struct ProveResponse {
     proof: Option<String>,
     #[serde(default)]
     proof_ref: Option<ProofRef>,
-    #[serde(default)]
-    proof_download_url: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -178,32 +179,11 @@ impl Nightstream {
 
         let proof_ref = response_body
             .proof_ref
-            .clone()
             .context("Proof service returned neither proof bytes nor proof_ref")?;
-        let download_url = response_body
-            .proof_download_url
-            .context("Proof service returned a proof_ref without proof_download_url")?;
-
-        let proof_bytes = self
-            .http
-            .get(&download_url)
-            .send()
-            .await
-            .with_context(|| format!("GET {download_url}"))?
-            .error_for_status()
-            .context("Failed to download proof package from presigned URL")?
-            .bytes()
-            .await
-            .context("Failed to read proof package bytes from presigned URL")?
-            .to_vec();
-
-        anyhow::ensure!(
-            !proof_bytes.is_empty(),
-            "Downloaded proof package is empty"
-        );
-
         Ok(GeneratedProof {
-            proof_bytes,
+            // Build the signed tx without embedding the large proof. The verifier
+            // service will re-attach it from object storage using `proof_ref`.
+            proof_bytes: Vec::new(),
             proof_ref: Some(proof_ref),
         })
     }

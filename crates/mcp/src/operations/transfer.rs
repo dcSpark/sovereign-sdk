@@ -630,6 +630,12 @@ pub async fn transfer(
         })
         .context("Failed to generate Nightstream proof for transfer")?;
 
+    tracing::debug!(
+        proof_bytes_len = generated_proof.proof_bytes.len(),
+        using_proof_ref = generated_proof.proof_ref.is_some(),
+        "Generated Nightstream proof"
+    );
+
     let proof_bytes = generated_proof.proof_bytes;
 
     let unsigned_tx = create_transfer_unsigned_tx(

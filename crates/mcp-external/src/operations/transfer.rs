@@ -633,6 +633,7 @@ pub async fn transfer(
     tracing::debug!(
         elapsed_ms = timing_proof_ms,
         proof_bytes_len = generated_proof.proof_bytes.len(),
+        using_proof_ref = generated_proof.proof_ref.is_some(),
         "Generated Nightstream proof"
     );
     let proof_bytes = generated_proof.proof_bytes;
