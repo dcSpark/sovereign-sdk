@@ -12,6 +12,7 @@ MEMORY_SIZE="${MEMORY_SIZE:-}"
 TIMEOUT="${TIMEOUT:-}"
 EPHEMERAL_STORAGE_MB="${EPHEMERAL_STORAGE_MB:-}"
 AUTH_TYPE="${AUTH_TYPE:-}"
+FUNCTION_URL_INVOKE_MODE="${FUNCTION_URL_INVOKE_MODE:-}"
 NIGHTSTREAM_REF="${NIGHTSTREAM_REF:-}"
 NODE_RPC_URL="${NODE_RPC_URL:-}"
 BIND_ADDR="${BIND_ADDR:-}"
@@ -54,6 +55,7 @@ require_env MEMORY_SIZE
 require_env TIMEOUT
 require_env EPHEMERAL_STORAGE_MB
 require_env AUTH_TYPE
+require_env FUNCTION_URL_INVOKE_MODE
 require_env NIGHTSTREAM_REF
 require_env NODE_RPC_URL
 require_env BIND_ADDR
@@ -68,7 +70,7 @@ ACCOUNT_ID="$(
 )"
 ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-FUNCTION_ENV_VARS="Variables={BIND_ADDR=${BIND_ADDR},AWS_LWA_PORT=8080,AWS_LWA_READINESS_CHECK_PATH=/health,DA_DB=${DA_DB},NODE_RPC_URL=${NODE_RPC_URL}}"
+FUNCTION_ENV_VARS="Variables={BIND_ADDR=${BIND_ADDR},AWS_LWA_PORT=8080,AWS_LWA_READINESS_CHECK_PATH=/health,AWS_LWA_INVOKE_MODE=response_stream,DA_DB=${DA_DB},NODE_RPC_URL=${NODE_RPC_URL}}"
 if [[ -n "$POOL_FVK_PK" ]]; then
   FUNCTION_ENV_VARS+=",POOL_FVK_PK=${POOL_FVK_PK}"
 fi
@@ -81,6 +83,7 @@ echo "Function name:     $FUNCTION_NAME"
 echo "ECR repository:    $ECR_REPOSITORY"
 echo "Image URI:         $IMAGE_URI"
 echo "Node RPC URL:      $NODE_RPC_URL"
+echo "Function URL mode: $FUNCTION_URL_INVOKE_MODE"
 echo "Lambda subnets:    $LAMBDA_SUBNET_IDS"
 echo "Lambda SGs:        $LAMBDA_SECURITY_GROUP_IDS"
 
@@ -201,6 +204,7 @@ if AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" \
       aws lambda update-function-url-config \
         --function-name "$FUNCTION_NAME" \
         --auth-type "$AUTH_TYPE" \
+        --invoke-mode "$FUNCTION_URL_INVOKE_MODE" \
         --query 'FunctionUrl' --output text
   )"
 else
@@ -209,6 +213,7 @@ else
       aws lambda create-function-url-config \
         --function-name "$FUNCTION_NAME" \
         --auth-type "$AUTH_TYPE" \
+        --invoke-mode "$FUNCTION_URL_INVOKE_MODE" \
         --query 'FunctionUrl' --output text
   )"
 fi

@@ -117,6 +117,7 @@ MEMORY_SIZE=10240 \
 TIMEOUT=900 \
 EPHEMERAL_STORAGE_MB=4096 \
 AUTH_TYPE=NONE \
+FUNCTION_URL_INVOKE_MODE=RESPONSE_STREAM \
 NIGHTSTREAM_REF=<nightstream-git-ref> \
 NODE_RPC_URL=<rollup-rpc-url> \
 DA_DB=<database-url> \
@@ -138,35 +139,12 @@ Notes:
 
 - The Lambda image target uses the AWS Lambda Web Adapter and routes traffic to the service on port `8080`.
 - `AUTH_TYPE` must now be specified explicitly.
+- `FUNCTION_URL_INVOKE_MODE` should be `RESPONSE_STREAM` for `/prove`, so long proofs and large proof payloads can complete over the public Lambda URL.
 - The deploy script creates the ECR repository and Lambda execution role if they do not already exist.
 - The deploy script requires all deployment-specific identifiers, networking settings, and URLs to be provided explicitly.
 - The deploy script accepts `POOL_FVK_PK` as an optional deployment-time configuration override.
+- The deploy script configures the Lambda Web Adapter for response streaming.
 - `/prove` and `/verify` can run in Lambda without a colocated rollup node. Endpoints that submit to the sequencer still need a reachable `NODE_RPC_URL`.
-
-### Private VPC REST Endpoint
-
-To provision a private API Gateway endpoint inside the Midnight VPC:
-
-```bash
-AWS_PROFILE=<profile> \
-AWS_REGION=<region> \
-FUNCTION_NAME=<lambda-function-name> \
-PRIVATE_API_NAME=<private-api-name> \
-PRIVATE_STAGE_NAME=<stage-name> \
-VPC_ID=<vpc-id> \
-VPC_CIDRS=<cidr-1>,<cidr-2> \
-VPCE_SUBNET_IDS=<subnet-id-1>,<subnet-id-2> \
-VPCE_SG_NAME=<vpce-security-group-name> \
-./scripts/configure_proof_verifier_private_api.sh
-```
-
-This creates:
-
-- an `execute-api` interface VPC endpoint in the supplied subnets
-- a private REST API Gateway with the supplied name
-- a private stage with the supplied name
-
-Inside the VPC, callers can use the URLs printed by the script after deployment.
 
 ### Run the Service
 
