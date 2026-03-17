@@ -72,8 +72,8 @@ midnight-privacy = { workspace = true, features = ["native"] }
 sov-stf-runner = { workspace = true }
 
 # Nightstream trace simulation helpers (used by /prove pre-simulation).
-neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "a2b0b8a87f6d555217535545476ef09ede805dac" }
-neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "a2b0b8a87f6d555217535545476ef09ede805dac" }
+neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
 
 
 # Runtime type for transaction signing

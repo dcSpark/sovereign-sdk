@@ -15,4 +15,4 @@ path = "src/main.rs"
 panic = "abort"
 
 [dependencies]
-nightstream-sdk = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "a2b0b8a87f6d555217535545476ef09ede805dac", default-features = false }
+nightstream-sdk = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d", default-features = false }

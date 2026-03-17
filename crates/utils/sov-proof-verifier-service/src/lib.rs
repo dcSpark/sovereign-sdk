@@ -95,7 +95,7 @@ pub struct AppState {
     config: Arc<ServiceConfig>,
     node_client: NodeClient,
     http_client: reqwest::Client,
-    rollup_chain_hash: [u8; 32],
+    rollup_chain_hash: Arc<tokio::sync::RwLock<Option<[u8; 32]>>>,
     /// Semaphore to limit concurrent verifications
     verification_semaphore: Arc<tokio::sync::Semaphore>,
     /// Local nonce counter (synchronized across all requests)
@@ -132,6 +132,25 @@ async fn fetch_rollup_chain_hash(node_client: &NodeClient) -> Result<[u8; 32]> {
     let mut chain_hash = [0u8; 32];
     chain_hash.copy_from_slice(&chain_hash_vec);
     Ok(chain_hash)
+}
+
+async fn ensure_rollup_chain_hash(state: &AppState) -> Result<[u8; 32], ServiceError> {
+    if let Some(chain_hash) = *state.rollup_chain_hash.read().await {
+        return Ok(chain_hash);
+    }
+
+    let chain_hash = fetch_rollup_chain_hash(&state.node_client)
+        .await
+        .map_err(|e| {
+            ServiceError::SubmissionError(format!(
+                "Failed to fetch /rollup/schema from node {}: {}",
+                state.config.node_rpc_url, e
+            ))
+        })?;
+
+    let mut cached = state.rollup_chain_hash.write().await;
+    let cached_value = cached.get_or_insert(chain_hash);
+    Ok(*cached_value)
 }
 
 const DEFAULT_VERIFIER_SQLITE_MAX_CONNECTIONS: u32 = 10;
@@ -213,11 +232,23 @@ impl AppState {
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
 
-        let rollup_chain_hash = fetch_rollup_chain_hash(&node_client).await?;
-        info!(
-            "Using rollup chain hash from /rollup/schema: 0x{}",
-            hex::encode(rollup_chain_hash)
-        );
+        let rollup_chain_hash = match fetch_rollup_chain_hash(&node_client).await {
+            Ok(chain_hash) => {
+                info!(
+                    "Using rollup chain hash from /rollup/schema: 0x{}",
+                    hex::encode(chain_hash)
+                );
+                Some(chain_hash)
+            }
+            Err(err) => {
+                warn!(
+                    node_rpc_url = %config.node_rpc_url,
+                    error = %err,
+                    "Failed to fetch /rollup/schema during startup; local /prove and /verify can still run, and node-dependent endpoints will retry on demand"
+                );
+                None
+            }
+        };
 
         // Load signing key once at startup
         let signing_key = load_private_key(&config.signing_key_path)
@@ -392,7 +423,7 @@ impl AppState {
             config: Arc::new(config),
             node_client,
             http_client: reqwest::Client::new(),
-            rollup_chain_hash,
+            rollup_chain_hash: Arc::new(tokio::sync::RwLock::new(rollup_chain_hash)),
             verification_semaphore: Arc::new(tokio::sync::Semaphore::new(max_permits)),
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
@@ -1298,7 +1329,8 @@ async fn verify_and_record_midnight_handler(
     metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
     let signature_start = std::time::Instant::now();
-    verify_midnight_transaction_signature(&tx, &state.rollup_chain_hash)?;
+    let rollup_chain_hash = ensure_rollup_chain_hash(&state).await?;
+    verify_midnight_transaction_signature(&tx, &rollup_chain_hash)?;
     metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
 
     let tx_hash = tx.hash().to_string();
@@ -1902,6 +1934,8 @@ async fn create_and_sign_non_zk_transaction(
     state: &AppState,
     value: u32,
 ) -> Result<Vec<u8>, ServiceError> {
+    let rollup_chain_hash = ensure_rollup_chain_hash(state).await?;
+
     // Use the cached signing key
     let signing_key = &*state.signing_key;
 
@@ -1933,7 +1967,7 @@ async fn create_and_sign_non_zk_transaction(
     debug!("  Chain ID: {}", state.config.chain_id);
     debug!(
         "  Using rollup chain hash from /rollup/schema: {}",
-        hex::encode(&state.rollup_chain_hash)
+        hex::encode(rollup_chain_hash)
     );
 
     // Create the transaction
@@ -1948,7 +1982,7 @@ async fn create_and_sign_non_zk_transaction(
         nonce,
         signing_key,
         state.config.chain_id,
-        &state.rollup_chain_hash,
+        &rollup_chain_hash,
     )
     .map_err(|e| {
         error!("Failed to create transaction bytes: {}", e);

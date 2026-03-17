@@ -4,6 +4,8 @@
 # DOCKERFILE FOR SOV-PROOF-VERIFIER-SERVICE (Nightstream)
 #
 # Pure-Rust build — no external binaries or GPU dependencies required.
+# Supports both a normal container runtime image and a Lambda-compatible image
+# target via the AWS Lambda Web Adapter.
 ################################################################################
 
 # Stage 1: Build Rust application
@@ -47,20 +49,11 @@ ENV SKIP_GUEST_BUILD=ligero \
 
 # Clone the Nightstream repo — sovereign-ligero has path dependencies that
 # resolve to /Nightstream/crates/{neo-fold,neo-math,neo-ajtai,neo-memory,neo-ccs,nightstream-sdk}.
-ARG NIGHTSTREAM_REF=main
-RUN --mount=type=ssh \
-    mkdir -p -m 0700 /root/.ssh \
-    && ssh-keyscan github.com >> /root/.ssh/known_hosts \
-    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
-    && git clone --depth 1 --branch "${NIGHTSTREAM_REF}" git@github.com:dcSpark/Nightstream.git /Nightstream
+ARG NIGHTSTREAM_REF=5b98cb6471fccea81b86a335c54d6f3a73f5499d
+RUN git clone https://github.com/LFDT-Nightstream/Nightstream.git /Nightstream \
+    && git -C /Nightstream checkout "${NIGHTSTREAM_REF}"
 
-# Build with SSH forwarding for private git dependencies:
-#   DOCKER_BUILDKIT=1 docker build --ssh default -f crates/utils/sov-proof-verifier-service/Dockerfile .
-RUN --mount=type=ssh \
-    mkdir -p -m 0700 /root/.ssh \
-    && ssh-keyscan github.com >> /root/.ssh/known_hosts \
-    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
-    && cargo build --release -p sov-proof-verifier-service
+RUN cargo build --release -p sov-proof-verifier-service
 
 # Stage 2: Minimal runtime image
 FROM ubuntu:24.04 AS runtime
@@ -89,7 +82,7 @@ RUN chmod +x /app/docker-entrypoint.sh
 # Address the HTTP server listens on.
 ENV BIND_ADDRESS=0.0.0.0:8080
 # URL of the rollup node RPC endpoint.
-ENV NODE_RPC_URL=http://localhost:12346
+ENV NODE_RPC_URL=http://127.0.0.1:12346
 # Path to the Ed25519 signing key (JSON) used for non-ZK transactions.
 ENV SIGNING_KEY_PATH=/app/keys/token_deployer_private_key.json
 # Path to the rollup configuration TOML. Used to derive the DA DB connection
@@ -125,3 +118,11 @@ ENV RUST_LOG=info
 EXPOSE 8080
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+# Stage 3: Lambda-compatible runtime image
+FROM runtime AS lambda-runtime
+
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.0-rc1 /lambda-adapter /opt/extensions/lambda-adapter
+
+ENV AWS_LWA_PORT=8080
+ENV AWS_LWA_READINESS_CHECK_PATH=/health

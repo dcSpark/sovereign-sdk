@@ -32,7 +32,6 @@ ROLLUP_CONFIG_TEMPLATE="$SCRIPT_DIR/rollup_config.toml"
 
 # Defaults
 SKIP_BUILD=0
-KEEP_STATE=0
 RELEASE_MODE=1
 ROLLUP_PORT=12346
 SKIP_VERIFY=0
@@ -82,6 +81,19 @@ step=0
 print_step() { step=$((step+1)); echo ""; echo -e "${CYAN}${BOLD}[$step] $1${NC}"; echo "────────────────────────────────────────────────────"; }
 print_ok()   { echo -e "  ${GREEN}OK${NC} $1"; }
 print_info() { echo -e "  ${YELLOW}INFO${NC} $1"; }
+
+env_flag() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+KEEP_STATE_ENV="${ROLLUP_KEEP_STATE:-${KEEP_STATE:-}}"
+KEEP_STATE=0
+if env_flag "$KEEP_STATE_ENV"; then
+  KEEP_STATE=1
+fi
 
 # ----- Preamble -------------------------------------------------------------
 
