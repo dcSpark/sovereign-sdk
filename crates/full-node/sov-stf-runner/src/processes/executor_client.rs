@@ -49,6 +49,7 @@ pub struct ExecutorBridgeState {
     pub last_finalized_batch_index: u64,
     pub last_finalized_batch_hash: [u8; 32],
     pub last_committed_batch_index: u64,
+    pub last_committed_batch_hash: [u8; 32],
 }
 
 /// HTTP client for the Bridge executor service.
@@ -140,10 +141,20 @@ impl ExecutorClient {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
+        let last_committed_batch_hash = raw
+            .get("lastCommittedBatchHash")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                hex::decode(s).ok()
+            })
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .unwrap_or([0u8; 32]);
         Ok(ExecutorBridgeState {
             last_finalized_batch_index,
             last_finalized_batch_hash,
             last_committed_batch_index,
+            last_committed_batch_hash,
         })
     }
 

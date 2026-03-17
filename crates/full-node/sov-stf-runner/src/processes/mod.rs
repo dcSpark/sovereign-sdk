@@ -44,11 +44,22 @@ pub async fn start_tee_workflow_in_background<Ps>(
     midnight_bridge: Option<MidnightIndexerClient>,
     executor_client: Option<ExecutorClient>,
     rollup_id: Option<[u8; 32]>,
+    storage_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<JoinHandle<()>>
 where
     Ps: ProverService,
     Ps::DaService: DaService<Error = anyhow::Error>,
 {
+    // ---- Crash recovery: complete a committed-but-not-finalized batch from a
+    //      previous run before anything else.
+    if let (Some(ref sp), Some(ref executor)) = (&storage_path, &executor_client) {
+        match bridge_lifecycle::recover_pending_finalize(sp, executor).await {
+            Ok(true) => info!("Pending-finalize recovery succeeded"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "Pending-finalize recovery failed (will proceed; may hit COMMIT_OUT_OF_ORDER)"),
+        }
+    }
+
     let mut batch_data = 0u64;
     let mut prev_batch_hash = [0u8; 32];
     let mut seeded_from_l1 = false;
@@ -83,15 +94,24 @@ where
         if let Some(ref executor) = executor_client {
             match executor.get_state().await {
                 Ok(state) => {
-                    let last_finalized = state.last_finalized_batch_index;
-                    batch_data = last_finalized + 1;
-                    prev_batch_hash = state.last_finalized_batch_hash;
+                    let cursor = std::cmp::max(
+                        state.last_committed_batch_index,
+                        state.last_finalized_batch_index,
+                    );
+                    prev_batch_hash = if cursor == state.last_committed_batch_index
+                        && state.last_committed_batch_index > state.last_finalized_batch_index
+                    {
+                        state.last_committed_batch_hash
+                    } else {
+                        state.last_finalized_batch_hash
+                    };
+                    batch_data = cursor + 1;
                     seeded_from_l1 = true;
                     info!(
-                        last_finalized_batch_index = last_finalized,
+                        last_finalized_batch_index = state.last_finalized_batch_index,
+                        last_committed_batch_index = state.last_committed_batch_index,
                         next_batch_index = batch_data,
                         prev_batch_hash = hex::encode(prev_batch_hash),
-                        committed_index = state.last_committed_batch_index,
                         "Seeded TEE batch cursor from executor /state"
                     );
                 }
@@ -121,6 +141,7 @@ where
                         executor_finalized_index = state.last_finalized_batch_index,
                         executor_committed_index = state.last_committed_batch_index,
                         executor_finalized_hash = hex::encode(state.last_finalized_batch_hash),
+                        executor_committed_hash = hex::encode(state.last_committed_batch_hash),
                         "Executor /state cross-check at startup"
                     );
                 }
@@ -145,6 +166,7 @@ where
         midnight_bridge,
         executor_client,
         rollup_id,
+        storage_path,
     )
     .post_aggregated_proof_to_da_in_background()
     .await)

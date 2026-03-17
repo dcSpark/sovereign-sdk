@@ -682,6 +682,9 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                         // resolved earlier (before runner/sequencer creation) so that
                         // L1 Bridge deployment doesn't race with background tasks.
 
+                        let tee_storage_path =
+                            Some(std::path::PathBuf::from(&rollup_config.storage.path));
+
                         let tee_handle = start_tee_workflow_in_background(
                             prover_service,
                             rollup_config.proof_manager.aggregated_proof_block_jump,
@@ -693,14 +696,51 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                             indexer,
                             executor_client.take(),
                             rollup_id.take(),
+                            tee_storage_path,
                         )
                         .await?;
 
                         if let Some(mut child) = managed_executor_child.take() {
                             let mut shutdown_rx = secondary_shutdown_receiver;
+                            let shutdown_storage_path =
+                                std::path::PathBuf::from(&rollup_config.storage.path);
+                            let shutdown_exec_url = {
+                                let ext = rollup_config.sequencer.extension.as_ref();
+                                let tee_config =
+                                    ext.and_then(|e| e.tee_configuration.as_ref());
+                                let l1b = tee_config.and_then(|t| t.l1_bridge.as_ref());
+                                l1b.map(|b| bridge_lifecycle::executor_url(b.executor_port))
+                                    .or_else(|| {
+                                        tee_config
+                                            .and_then(|t| t.executor_url.clone())
+                                    })
+                            };
                             background_handles.push(tokio::spawn(async move {
                                 let _ = shutdown_rx.changed().await;
                                 tracing::info!("Shutting down managed executor service...");
+
+                                if let Some(exec_url) = shutdown_exec_url {
+                                    let client = ExecutorClient::new(
+                                        reqwest::Client::new(),
+                                        exec_url,
+                                    );
+                                    match bridge_lifecycle::recover_pending_finalize(
+                                        &shutdown_storage_path,
+                                        &client,
+                                    )
+                                    .await
+                                    {
+                                        Ok(true) => tracing::info!(
+                                            "Completed pending finalize during graceful shutdown"
+                                        ),
+                                        Ok(false) => {}
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "Failed to complete pending finalize during shutdown (will recover on next start)"
+                                        ),
+                                    }
+                                }
+
                                 let _ = child.kill().await;
                             }));
                         }

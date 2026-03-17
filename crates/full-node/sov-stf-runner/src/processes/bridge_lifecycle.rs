@@ -10,6 +10,7 @@ use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
 const BRIDGE_ADDRESS_FILE: &str = "bridge_contract_address";
+const PENDING_FINALIZE_FILE: &str = "pending_finalize.json";
 
 /// Deploy the Bridge contract via bridge-cli and return the contract address.
 ///
@@ -229,4 +230,133 @@ pub fn resolve_bridge_cli_path(bridge_cli_path: &Path, config_dir: &Path) -> Pat
     } else {
         config_dir.join(bridge_cli_path)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pending-finalize persistence (crash recovery for committed-but-not-finalized
+// batches).  The file is written atomically (write tmp + rename) so a crash
+// mid-write never leaves a corrupt file.
+// ---------------------------------------------------------------------------
+
+/// Data persisted after a successful `commitBatch` so the batch can be
+/// finalized on restart if the rollup crashes before `finalizeBatch` completes.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PendingFinalize {
+    /// The L1 batch index that was committed.
+    pub batch_index: u64,
+    /// The BatchPublicDataV1Full JSON as expected by the executor.
+    pub batch_public_data_json: String,
+    /// Hex-encoded rollup ID (32 bytes).
+    pub rollup_id_hex: String,
+}
+
+/// Persist the pending-finalize payload to disk (atomic write).
+pub fn persist_pending_finalize(storage_path: &Path, data: &PendingFinalize) -> Result<()> {
+    let target = storage_path.join(PENDING_FINALIZE_FILE);
+    let tmp = storage_path.join(format!("{PENDING_FINALIZE_FILE}.tmp"));
+    let json = serde_json::to_string_pretty(data)
+        .context("Failed to serialize pending_finalize data")?;
+    std::fs::write(&tmp, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &target)
+        .with_context(|| format!("Failed to rename {} -> {}", tmp.display(), target.display()))?;
+    info!(
+        batch_index = data.batch_index,
+        path = %target.display(),
+        "Persisted pending-finalize data"
+    );
+    Ok(())
+}
+
+/// Remove the pending-finalize file after successful finalization.
+pub fn remove_pending_finalize(storage_path: &Path) {
+    let target = storage_path.join(PENDING_FINALIZE_FILE);
+    match std::fs::remove_file(&target) {
+        Ok(()) => info!(path = %target.display(), "Removed pending-finalize file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %target.display(), error = %e, "Failed to remove pending-finalize file"),
+    }
+}
+
+/// Load a previously persisted pending-finalize payload, if any.
+pub fn load_pending_finalize(storage_path: &Path) -> Option<PendingFinalize> {
+    let target = storage_path.join(PENDING_FINALIZE_FILE);
+    match std::fs::read_to_string(&target) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(pf) => Some(pf),
+            Err(e) => {
+                warn!(path = %target.display(), error = %e, "Corrupt pending-finalize file; ignoring");
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(path = %target.display(), error = %e, "Error reading pending-finalize file");
+            None
+        }
+    }
+}
+
+/// Attempt to complete a pending finalize from a previous run.
+///
+/// Returns `true` if a pending batch was successfully finalized, `false` if
+/// there was nothing to do, and an error if finalization failed.
+pub async fn recover_pending_finalize(
+    storage_path: &Path,
+    executor: &super::ExecutorClient,
+) -> Result<bool> {
+    use super::executor_client::ExecutorBridgeState;
+
+    let pending = match load_pending_finalize(storage_path) {
+        Some(pf) => pf,
+        None => return Ok(false),
+    };
+
+    let state: ExecutorBridgeState = executor
+        .get_state()
+        .await
+        .context("Failed to query executor /state for pending-finalize recovery")?;
+
+    if state.last_committed_batch_index <= state.last_finalized_batch_index {
+        info!(
+            committed = state.last_committed_batch_index,
+            finalized = state.last_finalized_batch_index,
+            "No committed-but-not-finalized gap on L1; removing stale pending-finalize file"
+        );
+        remove_pending_finalize(storage_path);
+        return Ok(false);
+    }
+
+    info!(
+        pending_batch_index = pending.batch_index,
+        l1_committed = state.last_committed_batch_index,
+        l1_finalized = state.last_finalized_batch_index,
+        "Recovering committed-but-not-finalized batch from previous run"
+    );
+
+    const SIGNATURE_MAX_NONCE: u64 = 256;
+    const SIGNER_BITMAP: u8 = 0b111;
+    const FINALIZE_TIMESTAMP: u64 = 0;
+
+    let signatures_json = executor
+        .build_signatures(&pending.batch_public_data_json, SIGNATURE_MAX_NONCE)
+        .await
+        .context("build_signatures failed during pending-finalize recovery")?;
+
+    executor
+        .finalize_batch(
+            &pending.batch_public_data_json,
+            &signatures_json,
+            SIGNER_BITMAP,
+            FINALIZE_TIMESTAMP,
+        )
+        .await
+        .context("finalize_batch failed during pending-finalize recovery")?;
+
+    info!(
+        batch_index = pending.batch_index,
+        "Successfully finalized pending batch from previous run"
+    );
+    remove_pending_finalize(storage_path);
+    Ok(true)
 }

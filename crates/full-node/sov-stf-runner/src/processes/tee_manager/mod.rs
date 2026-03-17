@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{env, num::NonZero};
 
 use backon::{BackoffBuilder, ExponentialBuilder};
@@ -97,6 +98,7 @@ pub struct TeeProofManager<Ps: ProverService> {
     midnight_bridge: Option<MidnightIndexerClient>,
     executor_client: Option<ExecutorClient>,
     rollup_id: Option<[u8; 32]>,
+    storage_path: Option<PathBuf>,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -119,6 +121,7 @@ where
         midnight_bridge: Option<MidnightIndexerClient>,
         executor_client: Option<ExecutorClient>,
         rollup_id: Option<[u8; 32]>,
+        storage_path: Option<PathBuf>,
     ) -> Self {
         Self {
             prover_service,
@@ -139,6 +142,7 @@ where
             midnight_bridge,
             executor_client,
             rollup_id,
+            storage_path,
         }
     }
 
@@ -328,6 +332,23 @@ where
                 da_end_height,
             );
 
+            // Build the batch struct early so we can persist it for crash recovery.
+            let batch = BatchPublicDataV1 {
+                version: 1,
+                layer2_chain_id: public_data.layer2_chain_id,
+                batch_index: self.batch_index,
+                da_start_height,
+                da_end_height,
+                da_commitment: da_commitment_root,
+                prev_state_root: public_data.initial_state_root,
+                post_state_root: public_data.final_state_root,
+                prev_batch_hash: self.prev_batch_hash,
+                batch_hash,
+                last_processed_queue_index: public_data.last_processed_queue_index,
+                message_queue_hash: public_data.message_queue_hash,
+                withdraw_root: public_data.withdraw_root,
+            };
+
             // Commit batch on L1 via executor service (if configured).
             // Track success so we only advance the durable batch cursor when L1 accepted both commit AND finalize.
             let mut l1_ok = if let Some(ref executor) = self.executor_client {
@@ -340,6 +361,24 @@ where
                             batch_index = self.batch_index,
                             "L1 commitBatch submitted via executor"
                         );
+
+                        // Persist batch data so we can finalize on restart if the
+                        // process crashes between commit and finalize.
+                        if let Some(ref sp) = self.storage_path {
+                            if let Some(ref rid) = self.rollup_id {
+                                if let Ok(bpd_json) = batch_public_data_to_executor_json(&batch, rid) {
+                                    let pf = super::bridge_lifecycle::PendingFinalize {
+                                        batch_index: self.batch_index,
+                                        batch_public_data_json: bpd_json,
+                                        rollup_id_hex: hex::encode(rid),
+                                    };
+                                    if let Err(e) = super::bridge_lifecycle::persist_pending_finalize(sp, &pf) {
+                                        warn!(error = %e, "Failed to persist pending-finalize (non-fatal)");
+                                    }
+                                }
+                            }
+                        }
+
                         true
                     }
                     Err(e) => {
@@ -357,24 +396,6 @@ where
                     "Executor not configured; skipping L1 commit/finalize (set executor_url and rollup_id_hex in tee_configuration to enable)"
                 );
                 true // no executor configured, L1 interaction is optional
-            };
-
-            tracing::debug!("Generating TEE attestation...");
-
-            let batch = BatchPublicDataV1 {
-                version: 1,
-                layer2_chain_id: public_data.layer2_chain_id,
-                batch_index: self.batch_index,
-                da_start_height,
-                da_end_height,
-                da_commitment: da_commitment_root,
-                prev_state_root: public_data.initial_state_root,
-                post_state_root: public_data.final_state_root,
-                prev_batch_hash: self.prev_batch_hash,
-                batch_hash,
-                last_processed_queue_index: public_data.last_processed_queue_index,
-                message_queue_hash: public_data.message_queue_hash,
-                withdraw_root: public_data.withdraw_root,
             };
 
             let mock_attestation = env_flag_enabled("SOV_TEE_MOCK_ATTESTATION");
@@ -505,6 +526,9 @@ where
                                             batch_index = self.batch_index,
                                             "L1 finalizeBatch submitted via executor"
                                         );
+                                        if let Some(ref sp) = self.storage_path {
+                                            super::bridge_lifecycle::remove_pending_finalize(sp);
+                                        }
                                     }
                                 }
                                 Err(e) => {
