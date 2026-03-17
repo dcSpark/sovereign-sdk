@@ -3,6 +3,8 @@
 //! This service receives signed Nightstream transactions, verifies them in parallel,
 //! and transforms them into non-ZK transactions for the rollup node.
 
+mod proof_storage;
+
 use anyhow::{Context, Result};
 use axum::{
     extract::{Query, State},
@@ -51,6 +53,8 @@ use sov_midnight_da::storable::{
 };
 use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
+
+use crate::proof_storage::{ProofReference, ProofStorage};
 
 /// The rollup's Spec type (must match rollup-nightstream configuration)
 pub type RollupSpec = ConfigurableSpec<
@@ -104,6 +108,8 @@ pub struct AppState {
     signing_key: Arc<<<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey>,
     /// Connection to the MockDA database shared with the rollup node
     da_conn: Arc<DatabaseConnection>,
+    /// Optional S3-backed proof storage used to keep large proof packages off the wire.
+    proof_storage: Option<Arc<ProofStorage>>,
     /// Optional persistence of the full incoming worker tx blob (configurable via rollup_config.toml [da]).
     incoming_worker_tx_saver: IncomingWorkerTxSaver,
     /// Optional pool public key used to authenticate signed viewer commitments (FVK commitments).
@@ -228,6 +234,14 @@ impl AppState {
             }
             _ => None,
         };
+
+        let proof_storage = ProofStorage::from_env().await?;
+        if let Some(storage) = proof_storage.as_ref() {
+            info!(
+                bucket = %storage.bucket(),
+                "S3-backed proof storage enabled for /prove, /verify, and /midnight-privacy"
+            );
+        }
 
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
@@ -428,6 +442,7 @@ impl AppState {
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
             da_conn: Arc::new(da_conn),
+            proof_storage: proof_storage.map(Arc::new),
             incoming_worker_tx_saver,
             pool_fvk_pk,
         })
@@ -450,6 +465,15 @@ struct ProveVerifyRequest {
     /// Base64-encoded bincode SpendPublic bytes for the proof package's public_output.
     #[serde(default)]
     public_output: Option<String>,
+    /// S3-backed proof reference used by `/verify`.
+    #[serde(default)]
+    proof_ref: Option<ProofReference>,
+    /// Optional hex-encoded pool viewer signature to inject before storing the proof package.
+    #[serde(default)]
+    pool_viewer_sig_hex: Option<String>,
+    /// Optional hex-encoded 32-byte FVK commitment covered by `pool_viewer_sig_hex`.
+    #[serde(default)]
+    pool_viewer_fvk_commitment: Option<String>,
 }
 
 /// Response body for the local `/prove` and `/verify` endpoints.
@@ -461,6 +485,10 @@ struct ProveVerifyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     proof: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    proof_ref: Option<ProofReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_download_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
@@ -469,6 +497,10 @@ struct ProveVerifyResponse {
 pub struct VerifyAndSubmitRequest {
     /// Base64-encoded signed transaction bytes (same format as node RPC)
     pub body: String,
+    /// Optional S3-backed proof reference. When present, `body` is expected to
+    /// contain the proof-stripped lightweight transaction.
+    #[serde(default)]
+    pub proof_ref: Option<ProofReference>,
 }
 
 /// Response from proof verification
@@ -759,10 +791,99 @@ fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: Stri
             success: false,
             exit_code,
             proof: None,
+            proof_ref: None,
+            proof_download_url: None,
             error: Some(message),
         }),
     )
         .into_response()
+}
+
+fn parse_fixed_hex<const N: usize>(name: &str, value: &str) -> Result<[u8; N], ServiceError> {
+    let trimmed = value.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| ServiceError::ParseError(format!("Invalid hex in '{name}': {e}")))?;
+    let len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        ServiceError::ParseError(format!(
+            "'{name}' must decode to {N} bytes (got {})",
+            len
+        ))
+    })
+}
+
+fn inject_pool_viewer_sig_into_proof(
+    proof_bytes: Vec<u8>,
+    fvk_commitment_hex: &str,
+    signature_hex: &str,
+) -> Result<Vec<u8>, ServiceError> {
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
+
+    let fvk_commitment =
+        parse_fixed_hex::<32>("pool_viewer_fvk_commitment", fvk_commitment_hex)?;
+    let signature = parse_fixed_hex::<64>("pool_viewer_sig_hex", signature_hex)?.to_vec();
+
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to decompress proof bytes for pool viewer signature injection: {e}"
+            ))
+        })?;
+        buf
+    };
+
+    let mut package: NightstreamProofPackage = bincode::deserialize(&decompressed).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to deserialize NightstreamProofPackage for pool viewer signature injection: {e}"
+        ))
+    })?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature,
+    });
+
+    let serialized = bincode::serialize(&package).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to serialize NightstreamProofPackage after pool viewer signature injection: {e}"
+        ))
+    })?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&serialized).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to write recompressed proof package after pool viewer signature injection: {e}"
+        ))
+    })?;
+    encoder.finish().map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to finish proof package recompression after pool viewer signature injection: {e}"
+        ))
+    })
+}
+
+async fn load_proof_bytes_from_reference(
+    state: &AppState,
+    proof_ref: &ProofReference,
+) -> Result<Vec<u8>, ServiceError> {
+    let storage = state.proof_storage.as_ref().ok_or_else(|| {
+        ServiceError::Internal(
+            "Proof reference requested, but S3-backed proof storage is not configured".to_string(),
+        )
+    })?;
+
+    storage.load_proof(proof_ref).await.map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to load proof package from S3 reference {}: {}",
+            proof_ref.key, e
+        ))
+    })
 }
 
 async fn prove_handler(
@@ -780,7 +901,7 @@ async fn prove_handler(
         }
     };
 
-    let return_binary = req.binary.unwrap_or(false);
+    let return_binary = req.binary.unwrap_or(false) && state.proof_storage.is_none();
 
     let witness = match req.witness {
         Some(w) => w,
@@ -817,6 +938,22 @@ async fn prove_handler(
         }
     };
 
+    let maybe_pool_viewer_sig = match (
+        req.pool_viewer_fvk_commitment.as_deref(),
+        req.pool_viewer_sig_hex.as_deref(),
+    ) {
+        (Some(fvk_commitment), Some(signature)) => Some((fvk_commitment.to_string(), signature.to_string())),
+        (None, None) => None,
+        _ => {
+            return prove_verify_error_response(
+                StatusCode::BAD_REQUEST,
+                1,
+                "Both 'pool_viewer_fvk_commitment' and 'pool_viewer_sig_hex' are required together"
+                    .to_string(),
+            );
+        }
+    };
+
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServiceError> {
         use sov_nightstream_adapter::circuits::note_spend_rom;
         use sov_nightstream_adapter::{NightstreamHost, ProverComputeBackend};
@@ -836,6 +973,49 @@ async fn prove_handler(
 
     match result {
         Ok(Ok(proof_bytes)) => {
+            let proof_bytes = match maybe_pool_viewer_sig {
+                Some((fvk_commitment, signature)) => {
+                    match inject_pool_viewer_sig_into_proof(proof_bytes, &fvk_commitment, &signature)
+                    {
+                        Ok(proof_bytes) => proof_bytes,
+                        Err(err) => {
+                            return prove_verify_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                1,
+                                err.to_string(),
+                            );
+                        }
+                    }
+                }
+                None => proof_bytes,
+            };
+
+            if let Some(storage) = state.proof_storage.as_ref() {
+                match storage.store_proof(proof_bytes).await {
+                    Ok(stored_proof) => {
+                        return (
+                            StatusCode::OK,
+                            Json(ProveVerifyResponse {
+                                success: true,
+                                exit_code: 0,
+                                proof: None,
+                                proof_ref: Some(stored_proof.proof_ref),
+                                proof_download_url: stored_proof.proof_download_url,
+                                error: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Err(err) => {
+                        return prove_verify_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            1,
+                            format!("Failed to store generated proof package in S3: {err}"),
+                        );
+                    }
+                }
+            }
+
             if return_binary {
                 (
                     StatusCode::OK,
@@ -850,6 +1030,8 @@ async fn prove_handler(
                         success: true,
                         exit_code: 0,
                         proof: Some(BASE64_STANDARD.encode(&proof_bytes)),
+                        proof_ref: None,
+                        proof_download_url: None,
                         error: None,
                     }),
                 )
@@ -888,24 +1070,37 @@ async fn verify_handler(
 
     let method_id = state.config.midnight_method_id;
 
-    let proof_b64 = match req.proof.as_ref() {
-        Some(p) => p.clone(),
-        None => {
-            return prove_verify_error_response(
-                StatusCode::BAD_REQUEST,
-                1,
-                "Proof is required for /verify".to_string(),
-            );
+    let proof_bytes = if let Some(proof_ref) = req.proof_ref.as_ref() {
+        match load_proof_bytes_from_reference(&state, proof_ref).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return prove_verify_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    1,
+                    err.to_string(),
+                );
+            }
         }
-    };
-    let proof_bytes = match BASE64_STANDARD.decode(&proof_b64) {
-        Ok(b) => b,
-        Err(e) => {
-            return prove_verify_error_response(
-                StatusCode::BAD_REQUEST,
-                1,
-                format!("Failed to decode proof: {e}"),
-            );
+    } else {
+        let proof_b64 = match req.proof.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                return prove_verify_error_response(
+                    StatusCode::BAD_REQUEST,
+                    1,
+                    "Either 'proof' or 'proof_ref' is required for /verify".to_string(),
+                );
+            }
+        };
+        match BASE64_STANDARD.decode(&proof_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                return prove_verify_error_response(
+                    StatusCode::BAD_REQUEST,
+                    1,
+                    format!("Failed to decode proof: {e}"),
+                );
+            }
         }
     };
 
@@ -953,6 +1148,8 @@ async fn verify_handler(
                 success: true,
                 exit_code: 0,
                 proof: None,
+                proof_ref: None,
+                proof_download_url: None,
                 error: None,
             }),
         )
@@ -1307,8 +1504,14 @@ async fn verify_and_record_midnight_handler(
         .map_err(|e| ServiceError::DecodeError(format!("Invalid base64: {}", e)))?;
     metrics.deserialize_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
+    let remote_proof_bytes = if let Some(proof_ref) = req.proof_ref.as_ref() {
+        Some(load_proof_bytes_from_reference(&state, proof_ref).await?)
+    } else {
+        None
+    };
+
     let parse_start = std::time::Instant::now();
-    let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
+    let tx_without_proof: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
             let err = e.to_string();
             let hint = if err.contains("Unexpected length of input") {
@@ -1324,6 +1527,12 @@ async fn verify_and_record_midnight_handler(
                 hint
             ))
         })?;
+
+    let tx = if let Some(proof_bytes) = remote_proof_bytes.as_ref() {
+        attach_proof_to_midnight_transaction(&tx_without_proof, proof_bytes)?
+    } else {
+        tx_without_proof
+    };
 
     let parsed_call = parse_midnight_call(&tx)?;
     metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
@@ -2154,6 +2363,82 @@ fn parse_midnight_call(
         other => Err(ServiceError::UnsupportedCall(format!(
             "Expected midnight_privacy call, got {other:?}"
         ))),
+    }
+}
+
+fn attach_proof_to_midnight_transaction(
+    tx: &DemoTransaction,
+    proof_bytes: &[u8],
+) -> Result<DemoTransaction, ServiceError> {
+    use sov_modules_api::transaction::{Version0, VersionedTx};
+    use sov_modules_api::SafeVec;
+
+    match &tx.versioned_tx {
+        VersionedTx::V0(v0) => {
+            let runtime_call = match &v0.runtime_call {
+                RuntimeCall::MidnightPrivacy(midnight_call) => {
+                    let call = match midnight_call {
+                        MidnightCallMessage::Transfer {
+                            anchor_root,
+                            nullifiers,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Transfer {
+                            proof: SafeVec::try_from(proof_bytes.to_vec()).map_err(|_| {
+                                ServiceError::ParseError("Proof too large for SafeVec".to_string())
+                            })?,
+                            anchor_root: *anchor_root,
+                            nullifiers: nullifiers.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        MidnightCallMessage::Withdraw {
+                            anchor_root,
+                            nullifier,
+                            withdraw_amount,
+                            to,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Withdraw {
+                            proof: SafeVec::try_from(proof_bytes.to_vec()).map_err(|_| {
+                                ServiceError::ParseError("Proof too large for SafeVec".to_string())
+                            })?,
+                            anchor_root: *anchor_root,
+                            nullifier: *nullifier,
+                            withdraw_amount: *withdraw_amount,
+                            to: to.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        _ => {
+                            return Err(ServiceError::UnsupportedCall(
+                                "proof_ref is only supported for midnight transfer/withdraw calls"
+                                    .to_string(),
+                            ))
+                        }
+                    };
+
+                    RuntimeCall::MidnightPrivacy(call)
+                }
+                other => {
+                    return Err(ServiceError::UnsupportedCall(format!(
+                        "proof_ref is only supported for midnight_privacy calls, got {other:?}"
+                    )))
+                }
+            };
+
+            Ok(Transaction {
+                versioned_tx: VersionedTx::V0(Version0 {
+                    signature: v0.signature.clone(),
+                    pub_key: v0.pub_key.clone(),
+                    runtime_call,
+                    uniqueness: v0.uniqueness.clone(),
+                    details: v0.details.clone(),
+                }),
+            })
+        }
     }
 }
 

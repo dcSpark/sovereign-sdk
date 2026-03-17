@@ -92,7 +92,7 @@ pub async fn freeze_address(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -115,7 +115,7 @@ pub async fn unfreeze_address(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -138,7 +138,7 @@ pub async fn add_pool_admin(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -161,7 +161,7 @@ pub async fn remove_pool_admin(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;

@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use midnight_privacy::SpendPublic;
 use reqwest::Client as HttpClient;
-use serde::Serialize;
+use reqwest::header::CONTENT_TYPE;
+use serde::{Deserialize, Serialize};
 use sov_nightstream_adapter::NoteSpendWitness;
 
 /// Minimal wrapper used by MCP to generate Nightstream proofs.
@@ -20,6 +21,46 @@ pub struct Nightstream {
     #[allow(dead_code)]
     circuit: String,
     http: HttpClient,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofRef {
+    pub bucket: String,
+    pub key: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedProof {
+    pub proof_bytes: Vec<u8>,
+    pub proof_ref: Option<ProofRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolViewerSignature {
+    pub fvk_commitment: [u8; 32],
+    pub pool_sig_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProveResponse {
+    success: bool,
+    #[serde(rename = "exitCode")]
+    #[allow(dead_code)]
+    exit_code: i32,
+    #[serde(default)]
+    proof: Option<String>,
+    #[serde(default)]
+    proof_ref: Option<ProofRef>,
+    #[serde(default)]
+    proof_download_url: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 impl Nightstream {
@@ -43,7 +84,8 @@ impl Nightstream {
         &self,
         witness: &NoteSpendWitness,
         public: &SpendPublic,
-    ) -> Result<Vec<u8>> {
+        pool_viewer_signature: Option<&PoolViewerSignature>,
+    ) -> Result<GeneratedProof> {
         let base_url = self.proof_service_url.trim();
         anyhow::ensure!(
             !base_url.is_empty(),
@@ -64,13 +106,18 @@ impl Nightstream {
         struct ProveRequest<'a> {
             witness: &'a NoteSpendWitness,
             public_output: String,
-            binary: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pool_viewer_sig_hex: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pool_viewer_fvk_commitment: Option<String>,
         }
 
         let request = ProveRequest {
             witness,
             public_output,
-            binary: true,
+            pool_viewer_sig_hex: pool_viewer_signature.map(|sig| sig.pool_sig_hex.as_str()),
+            pool_viewer_fvk_commitment: pool_viewer_signature
+                .map(|sig| hex::encode(sig.fvk_commitment)),
         };
 
         let response = self
@@ -83,18 +130,82 @@ impl Nightstream {
             .error_for_status()
             .with_context(|| format!("POST {endpoint} returned error status"))?;
 
-        let proof_bytes = response
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        if !content_type.contains("application/json") {
+            let proof_bytes = response
+                .bytes()
+                .await
+                .context("Failed to read proof bytes from response")?
+                .to_vec();
+            anyhow::ensure!(
+                !proof_bytes.is_empty(),
+                "Nightstream proof service returned empty proof payload"
+            );
+            return Ok(GeneratedProof {
+                proof_bytes,
+                proof_ref: None,
+            });
+        }
+
+        let response_body: ProveResponse = response
+            .json()
+            .await
+            .context("Failed to deserialize /prove response")?;
+
+        anyhow::ensure!(
+            response_body.success,
+            "{}",
+            response_body
+                .error
+                .unwrap_or_else(|| "Nightstream proof service reported failure".to_string())
+        );
+
+        if let Some(proof_b64) = response_body.proof {
+            let proof_bytes = base64::engine::general_purpose::STANDARD
+                .decode(proof_b64)
+                .context("Failed to decode base64 proof returned by proof service")?;
+            return Ok(GeneratedProof {
+                proof_bytes,
+                proof_ref: response_body.proof_ref,
+            });
+        }
+
+        let proof_ref = response_body
+            .proof_ref
+            .clone()
+            .context("Proof service returned neither proof bytes nor proof_ref")?;
+        let download_url = response_body
+            .proof_download_url
+            .context("Proof service returned a proof_ref without proof_download_url")?;
+
+        let proof_bytes = self
+            .http
+            .get(&download_url)
+            .send()
+            .await
+            .with_context(|| format!("GET {download_url}"))?
+            .error_for_status()
+            .context("Failed to download proof package from presigned URL")?
             .bytes()
             .await
-            .context("Failed to read proof bytes from response")?
+            .context("Failed to read proof package bytes from presigned URL")?
             .to_vec();
 
         anyhow::ensure!(
             !proof_bytes.is_empty(),
-            "Nightstream proof service returned empty proof payload"
+            "Downloaded proof package is empty"
         );
 
-        Ok(proof_bytes)
+        Ok(GeneratedProof {
+            proof_bytes,
+            proof_ref: Some(proof_ref),
+        })
     }
 }
 
@@ -105,6 +216,7 @@ fn normalize_base_url(url: &str) -> String {
 /// Inject a pre-computed pool viewer signature into DEFLATE-compressed proof
 /// package bytes. The `pool_sig_hex` is the hex-encoded Ed25519 signature (64
 /// bytes) and `fvk_commitment` is the 32-byte FVK commitment it covers.
+#[allow(dead_code)]
 pub fn inject_pool_viewer_sig(
     proof_bytes: Vec<u8>,
     fvk_commitment: [u8; 32],

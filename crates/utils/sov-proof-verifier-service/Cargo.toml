@@ -43,6 +43,7 @@ thiserror = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true, features = ["json"] }
+s3 = { package = "rust-s3", version = "0.37.1", default-features = false, features = ["tokio-rustls-tls"] }
 
 # Base64 encoding
 base64 = { workspace = true }

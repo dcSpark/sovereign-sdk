@@ -615,25 +615,22 @@ pub async fn transfer(
         num_outputs
     );
 
-    let proof_bytes = nightstream
-        .generate_proof(&witness, &public)
+    let pool_viewer_signature = viewer_fvk_bundle.as_ref().map(|bundle| {
+        crate::nightstream::PoolViewerSignature {
+            fvk_commitment: bundle.fvk_commitment,
+            pool_sig_hex: bundle.pool_sig_hex.clone(),
+        }
+    });
+
+    let generated_proof = nightstream
+        .generate_proof(&witness, &public, pool_viewer_signature.as_ref())
         .await
         .inspect_err(|e| {
             tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e)
         })
         .context("Failed to generate Nightstream proof for transfer")?;
 
-    let proof_bytes = if let Some(ref bundle) = viewer_fvk_bundle {
-        tracing::info!("Injecting pool viewer signature into proof package");
-        crate::nightstream::inject_pool_viewer_sig(
-            proof_bytes,
-            bundle.fvk_commitment,
-            &bundle.pool_sig_hex,
-        )
-        .context("Failed to inject pool viewer signature into proof package")?
-    } else {
-        proof_bytes
-    };
+    let proof_bytes = generated_proof.proof_bytes;
 
     let unsigned_tx = create_transfer_unsigned_tx(
         provider,
@@ -650,7 +647,7 @@ pub async fn transfer(
         .context("Failed to sign transaction")?;
 
     let tx_hash = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, generated_proof.proof_ref.as_ref())
         .await
         .context("Failed to submit transaction to verifier service")?;
 
