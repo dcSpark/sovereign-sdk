@@ -180,6 +180,10 @@ name = "generate-genesis-keys"
 path = "src/bin/generate_genesis_keys.rs"
 
 [[bin]]
+name = "print-genesis-info"
+path = "src/bin/print_genesis_info.rs"
+
+[[bin]]
 name = "generate-authority-fvk"
 path = "src/bin/generate_authority_fvk.rs"
 

@@ -92,6 +92,10 @@ export SOV_PROVER_MODE=prove
 ./target/release/sov-rollup-ligero
 ```
 
+For TEE-mode settlement flow and L1 Bridge integration (executor setup, config, and logs), see:
+
+- [`L1_INTERACTIONS.md`](./L1_INTERACTIONS.md)
+
 ## Service Orchestration
 
 ### Run All Services Locally

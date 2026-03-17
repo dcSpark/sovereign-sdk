@@ -27,11 +27,42 @@ pub struct TEEConfiguration {
     pub tee_attestation_oracle_url: String,
     /// Optional base URL of the Bridge executor service (HTTP). When set, the TEE manager will call
     /// POST /commit-batch and POST /build-signatures, POST /finalize-batch to submit L1 batch lifecycle.
+    /// Ignored when `l1_bridge` is configured (the rollup manages the executor itself).
     #[serde(default)]
     pub executor_url: Option<String>,
     /// Optional rollup ID (64 hex chars) for BatchPublicDataV1Full. Required when executor_url is set.
     #[serde(default)]
     pub rollup_id_hex: Option<String>,
+    /// Managed L1 Bridge lifecycle. When present, the rollup auto-deploys the Bridge contract on
+    /// genesis and spawns the executor service as a child process. When absent, legacy behaviour
+    /// applies (manual executor via `executor_url`, or no L1 interactions at all).
+    #[serde(default)]
+    pub l1_bridge: Option<L1BridgeConfig>,
+}
+
+/// Configuration for rollup-managed L1 Bridge contract deployment and executor service.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct L1BridgeConfig {
+    /// Path to the bridge-cli directory (contains `src/cli.ts` and `src/executor-server.ts`).
+    /// Relative paths are resolved from the rollup config file location.
+    pub bridge_cli_path: PathBuf,
+    /// Midnight network name passed to bridge-cli (`"undeployed"` for local, `"preview"` for testnet).
+    pub network: String,
+    /// Port for the managed executor HTTP service (default: 3001).
+    #[serde(default = "default_executor_port")]
+    pub executor_port: u16,
+    /// Hex seed (64 chars) for the deployer/funding wallet on the Midnight L1 network.
+    pub funding_seed: String,
+    /// Optional rollup ID (64 hex chars) for BatchPublicDataV1Full. Overrides top-level `rollup_id_hex`.
+    #[serde(default)]
+    pub rollup_id_hex: Option<String>,
+    /// Pre-existing contract address. When set, skip auto-deploy and use this address directly.
+    #[serde(default)]
+    pub contract_address: Option<String>,
+}
+
+const fn default_executor_port() -> u16 {
+    3001
 }
 
 /// Configuration data used by sequencer extensions, such as EVM endpoints.

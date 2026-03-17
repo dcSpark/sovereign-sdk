@@ -19,7 +19,6 @@ use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
 use crate::processes::executor_client::{batch_public_data_to_executor_json, ExecutorClient};
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
-use crate::processes::TEEBatchData;
 use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
 use tracing::info;
 
@@ -329,30 +328,36 @@ where
                 da_end_height,
             );
 
-            // Commit batch on L1 via executor service (if configured)
-            if self.executor_client.is_none() {
+            // Commit batch on L1 via executor service (if configured).
+            // Track success so we only advance the durable batch cursor when L1 accepted both commit AND finalize.
+            let mut l1_ok = if let Some(ref executor) = self.executor_client {
+                match executor
+                    .commit_batch(&self.prev_batch_hash, &batch_hash)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            batch_index = self.batch_index,
+                            "L1 commitBatch submitted via executor"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            batch_index = self.batch_index,
+                            error = %e,
+                            "Executor commit_batch failed; batch cursor will NOT advance"
+                        );
+                        false
+                    }
+                }
+            } else {
                 tracing::debug!(
                     batch_index = self.batch_index,
                     "Executor not configured; skipping L1 commit/finalize (set executor_url and rollup_id_hex in tee_configuration to enable)"
                 );
-            }
-            if let Some(ref executor) = self.executor_client {
-                if let Err(e) = executor
-                    .commit_batch(&self.prev_batch_hash, &batch_hash)
-                    .await
-                {
-                    warn!(
-                        batch_index = self.batch_index,
-                        error = %e,
-                        "Executor commit_batch failed; continuing without L1 commit"
-                    );
-                } else {
-                    info!(
-                        batch_index = self.batch_index,
-                        "L1 commitBatch submitted via executor"
-                    );
-                }
-            }
+                true // no executor configured, L1 interaction is optional
+            };
 
             tracing::debug!("Generating TEE attestation...");
 
@@ -463,57 +468,63 @@ where
                 .publish_tee_attestation_blob_with_metadata(attestation)
                 .await?;
 
-            // Finalize batch on L1 via executor service (if configured)
-            if let (Some(ref executor), Some(rollup_id)) =
-                (self.executor_client.as_ref(), self.rollup_id.as_ref())
-            {
-                match batch_public_data_to_executor_json(&batch, rollup_id) {
-                    Ok(batch_public_data_json) => {
-                        const SIGNATURE_MAX_NONCE: u64 = 256;
-                        const SIGNER_BITMAP: u8 = 0b111; // three signers
-                        const FINALIZE_TIMESTAMP: u64 = 0;
+            // Finalize batch on L1 via executor service (if configured).
+            // Only attempt finalize if commit succeeded -- otherwise the contract is not expecting it.
+            if l1_ok {
+                if let (Some(ref executor), Some(rollup_id)) =
+                    (self.executor_client.as_ref(), self.rollup_id.as_ref())
+                {
+                    match batch_public_data_to_executor_json(&batch, rollup_id) {
+                        Ok(batch_public_data_json) => {
+                            const SIGNATURE_MAX_NONCE: u64 = 256;
+                            const SIGNER_BITMAP: u8 = 0b111; // three signers
+                            const FINALIZE_TIMESTAMP: u64 = 0;
 
-                        match executor
-                            .build_signatures(&batch_public_data_json, SIGNATURE_MAX_NONCE)
-                            .await
-                        {
-                            Ok(signatures_json) => {
-                                if let Err(e) = executor
-                                    .finalize_batch(
-                                        &batch_public_data_json,
-                                        &signatures_json,
-                                        SIGNER_BITMAP,
-                                        FINALIZE_TIMESTAMP,
-                                    )
-                                    .await
-                                {
+                            match executor
+                                .build_signatures(&batch_public_data_json, SIGNATURE_MAX_NONCE)
+                                .await
+                            {
+                                Ok(signatures_json) => {
+                                    if let Err(e) = executor
+                                        .finalize_batch(
+                                            &batch_public_data_json,
+                                            &signatures_json,
+                                            SIGNER_BITMAP,
+                                            FINALIZE_TIMESTAMP,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            batch_index = self.batch_index,
+                                            error = %e,
+                                            "Executor finalize_batch failed; batch cursor will NOT advance"
+                                        );
+                                        l1_ok = false;
+                                    } else {
+                                        info!(
+                                            batch_index = self.batch_index,
+                                            "L1 finalizeBatch submitted via executor"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     warn!(
                                         batch_index = self.batch_index,
                                         error = %e,
-                                        "Executor finalize_batch failed"
+                                        "Executor build_signatures failed; batch cursor will NOT advance"
                                     );
-                                } else {
-                                    info!(
-                                        batch_index = self.batch_index,
-                                        "L1 finalizeBatch submitted via executor"
-                                    );
+                                    l1_ok = false;
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    batch_index = self.batch_index,
-                                    error = %e,
-                                    "Executor build_signatures failed"
-                                );
-                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            batch_index = self.batch_index,
-                            error = %e,
-                            "Failed to serialize batch public data for executor"
-                        );
+                        Err(e) => {
+                            warn!(
+                                batch_index = self.batch_index,
+                                error = %e,
+                                "Failed to serialize batch public data for executor; batch cursor will NOT advance"
+                            );
+                            l1_ok = false;
+                        }
                     }
                 }
             }
@@ -522,24 +533,14 @@ where
             self.stf_info_receiver
                 .inc_next_height_to_receive_by(num_proofs_to_create as u64);
 
-            self.batch_index += 1;
-
-            self.prev_batch_hash = batch_hash;
-
-            let tee_data = TEEBatchData {
-                last_batch_index: self.batch_index,
-                last_prev_batch_hash: self.prev_batch_hash,
-            };
-            let serialized_tee_data = borsh::to_vec(&tee_data);
-            match serialized_tee_data {
-                Ok(d) => {
-                    if let Err(e) = std::fs::write("tee_batch_data.borsh", d) {
-                        warn!("Failed to write tee_batch_data.borsh: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to serialize TEE batch data for writing: {}", e);
-                }
+            if l1_ok {
+                self.batch_index += 1;
+                self.prev_batch_hash = batch_hash;
+            } else {
+                warn!(
+                    batch_index = self.batch_index,
+                    "L1 commit/finalize failed; batch cursor NOT advanced (will retry same batch next cycle)"
+                );
             }
         }
         tracing::debug!("Finished processing STF info");

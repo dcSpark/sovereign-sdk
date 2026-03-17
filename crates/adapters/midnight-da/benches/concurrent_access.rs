@@ -49,6 +49,7 @@ fn bench_storable_midnight_da_service(c: &mut Criterion) {
             receiver.clone(),
         )
         .await;
+        da_service.spawn_background_tasks(receiver.clone()).await;
 
         let mut handles = vec![];
 

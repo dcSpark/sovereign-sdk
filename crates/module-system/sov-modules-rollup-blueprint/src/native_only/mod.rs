@@ -57,6 +57,8 @@ pub const GIT_COMMIT_HASH: &str = env!("GIT_COMMIT_HASH");
 use crate::RollupBlueprint;
 
 #[cfg(feature = "tee")]
+use sov_stf_runner::processes::bridge_lifecycle;
+#[cfg(feature = "tee")]
 use sov_stf_runner::processes::{start_tee_workflow_in_background, ExecutorClient};
 
 /// This trait defines how to create all the necessary dependencies required by a rollup.
@@ -316,6 +318,10 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
         let da_service = self
             .create_da_service(&rollup_config, secondary_shutdown_receiver.clone())
             .await;
+        // Take any eagerly-spawned background handle (e.g. read-only poller).
+        // The periodic block producer is NOT started yet -- it will be spawned
+        // via `spawn_background_tasks` after one-time startup work (genesis
+        // init, L1 Bridge deployment) is complete.
         let da_service_handle = da_service.take_background_join_handle().await;
         let da_service = Arc::new(da_service);
         let current_finalized_header = da_service.get_last_finalized_block_header().await?;
@@ -346,6 +352,8 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
             "Recovering the state root"
         );
         let native_stf = StfBlueprint::new();
+        #[allow(unused_variables)]
+        let is_genesis = prev_root.is_none();
         let (prover_storage, prev_state_root, genesis_state_root) = match prev_root {
             // Missing prev_root means need for initialization
             None => {
@@ -433,6 +441,118 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
             background_handles.push(handle);
         }
 
+        // --- L1 Bridge lifecycle management (early, before runner/sequencer) ---
+        // Deploying the L1 contract and starting the executor can take a long
+        // time (~60 s).  Performing this work before the runner and sequencer
+        // are created avoids background-task timeouts and backlog accumulation.
+        #[cfg(feature = "tee")]
+        let (mut executor_client, mut rollup_id, mut managed_executor_child): (
+            Option<ExecutorClient>,
+            Option<[u8; 32]>,
+            Option<tokio::process::Child>,
+        ) = {
+            let mut executor_client: Option<ExecutorClient> = None;
+            let mut rollup_id: Option<[u8; 32]> = None;
+            let mut managed_executor_child: Option<tokio::process::Child> = None;
+
+            if operating_mode == OperatingMode::TEE {
+                let ext = rollup_config.sequencer.extension.as_ref();
+                let tee_config = ext.and_then(|e| e.tee_configuration.as_ref());
+                let l1_bridge = tee_config.and_then(|t| t.l1_bridge.as_ref());
+                let storage_path = std::path::Path::new(&rollup_config.storage.path);
+
+                if let Some(l1b) = l1_bridge {
+                    let config_dir = std::env::current_dir()
+                        .context("Failed to get current directory")?;
+                    let cli_path = bridge_lifecycle::resolve_bridge_cli_path(
+                        &l1b.bridge_cli_path,
+                        &config_dir,
+                    );
+
+                    let contract_address = if is_genesis
+                        && l1b.contract_address.as_ref().map_or(true, |s| s.is_empty())
+                    {
+                        let root_hex = hex::encode(&genesis_state_root.as_ref()[..32]);
+                        let batch_hash_hex = "00".repeat(32);
+                        let addr = bridge_lifecycle::deploy_bridge(
+                            &cli_path,
+                            &l1b.network,
+                            &l1b.funding_seed,
+                            &root_hex,
+                            &batch_hash_hex,
+                            l1b.rollup_id_hex.as_deref(),
+                        )
+                        .await?;
+                        bridge_lifecycle::persist_contract_address(storage_path, &addr)?;
+                        addr
+                    } else {
+                        bridge_lifecycle::resolve_contract_address(
+                            l1b.contract_address.as_deref(),
+                            storage_path,
+                        )
+                        .context(
+                            "No Bridge contract address configured or persisted. \
+                             Set contract_address in [tee_configuration.l1_bridge] or \
+                             start with a clean genesis to auto-deploy.",
+                        )?
+                    };
+
+                    let child = bridge_lifecycle::start_executor(
+                        &cli_path,
+                        &l1b.network,
+                        &contract_address,
+                        l1b.executor_port,
+                        &l1b.funding_seed,
+                    )
+                    .await?;
+                    managed_executor_child = Some(child);
+
+                    let exec_url = bridge_lifecycle::executor_url(l1b.executor_port);
+                    bridge_lifecycle::wait_for_executor_ready(
+                        &exec_url,
+                        Duration::from_secs(120),
+                    )
+                    .await?;
+
+                    let http_client = Client::builder()
+                        .build()
+                        .context("Failed to build executor HTTP client")?;
+                    executor_client = Some(ExecutorClient::new(http_client, exec_url));
+
+                    rollup_id = parse_rollup_id_hex(
+                        l1b.rollup_id_hex
+                            .as_deref()
+                            .or(tee_config.and_then(|t| t.rollup_id_hex.as_deref())),
+                    );
+                } else if let Some(tee) = tee_config {
+                    executor_client = tee
+                        .executor_url
+                        .as_ref()
+                        .filter(|s| !s.is_empty())
+                        .map(|url| -> anyhow::Result<_> {
+                            let client = Client::builder()
+                                .build()
+                                .context("Failed to build executor HTTP client")?;
+                            Ok(ExecutorClient::new(client, url.clone()))
+                        })
+                        .transpose()?;
+                    rollup_id = parse_rollup_id_hex(tee.rollup_id_hex.as_deref());
+                }
+            }
+
+            (executor_client, rollup_id, managed_executor_child)
+        };
+
+        // All one-time startup work (genesis init, L1 Bridge deployment) is
+        // done.  Start the DA periodic block producer now so that the runner
+        // begins with a clean slate (no backlog of accumulated empty blocks).
+        if let Some(handle) = da_service
+            .spawn_background_tasks(secondary_shutdown_receiver.clone())
+            .await
+        {
+            background_handles.push(handle);
+        }
+
         let visible_state_height_tracker: Box<dyn ProvableHeightTracker> = Box::new(
             MaximumProvableHeight::new(state_update_sender.subscribe(), Self::Runtime::default()),
         );
@@ -517,8 +637,8 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                     #[cfg(feature = "tee")]
                     {
                         let ext = rollup_config.sequencer.extension.as_ref();
-                        let oracle_url = ext
-                            .and_then(|e| e.tee_configuration.as_ref())
+                        let tee_config = ext.and_then(|e| e.tee_configuration.as_ref());
+                        let oracle_url = tee_config
                             .map(|t| t.tee_attestation_oracle_url.clone())
                             .unwrap_or_else(|| "http://127.0.0.1:8090".to_owned());
 
@@ -526,7 +646,6 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
 
                         let indexer: Option<MidnightIndexerClient> = match bridge {
                             None => None,
-
                             Some(cfg) => {
                                 if cfg.mock_events_path.is_some() {
                                     tracing::warn!(
@@ -559,47 +678,34 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                             }
                         };
 
-                        let executor_client = if let Some(tee) = ext.and_then(|e| e.tee_configuration.as_ref()) {
-                            tee.executor_url
-                                .as_ref()
-                                .filter(|s| !s.is_empty())
-                                .map(|url| -> anyhow::Result<_> {
-                                    let client = Client::builder()
-                                        .build()
-                                        .context("Failed to build executor HTTP client")?;
-                                    Ok(ExecutorClient::new(client, url.clone()))
-                                })
-                                .transpose()?
-                        } else {
-                            None
-                        };
-                        let rollup_id = ext
-                            .and_then(|e| e.tee_configuration.as_ref())
-                            .and_then(|tee| {
-                                let hex_str = tee.rollup_id_hex.as_ref()?;
-                                let s = hex_str.strip_prefix("0x").unwrap_or(hex_str).trim();
-                                if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
-                                    return None;
-                                }
-                                let bytes = hex::decode(s).ok()?;
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(bytes.get(..32)?);
-                                Some(arr)
-                            });
+                        // executor_client, rollup_id, and managed_executor_child were
+                        // resolved earlier (before runner/sequencer creation) so that
+                        // L1 Bridge deployment doesn't race with background tasks.
 
-                        start_tee_workflow_in_background(
+                        let tee_handle = start_tee_workflow_in_background(
                             prover_service,
                             rollup_config.proof_manager.aggregated_proof_block_jump,
                             proof_sender,
                             genesis_state_root,
                             stf_info_receiver,
-                            secondary_shutdown_receiver,
+                            secondary_shutdown_receiver.clone(),
                             oracle_url,
                             indexer,
-                            executor_client,
-                            rollup_id,
+                            executor_client.take(),
+                            rollup_id.take(),
                         )
-                        .await?
+                        .await?;
+
+                        if let Some(mut child) = managed_executor_child.take() {
+                            let mut shutdown_rx = secondary_shutdown_receiver;
+                            background_handles.push(tokio::spawn(async move {
+                                let _ = shutdown_rx.changed().await;
+                                tracing::info!("Shutting down managed executor service...");
+                                let _ = child.kill().await;
+                            }));
+                        }
+
+                        tee_handle
                     }
                     #[cfg(not(feature = "tee"))]
                     {
@@ -835,6 +941,19 @@ fn spawn_os_signal_handler(shutdown_sender: tokio::sync::watch::Sender<()>) {
             .send(())
             .expect("Failed to send shutdown signal");
     });
+}
+
+#[cfg(feature = "tee")]
+fn parse_rollup_id_hex(hex_str: Option<&str>) -> Option<[u8; 32]> {
+    let hex_str = hex_str?;
+    let s = hex_str.strip_prefix("0x").unwrap_or(hex_str).trim();
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = hex::decode(s).ok()?;
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes.get(..32)?);
+    Some(arr)
 }
 
 /// The result of [`FullNodeBlueprint::create_sequencer`].

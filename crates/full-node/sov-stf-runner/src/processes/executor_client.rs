@@ -43,6 +43,14 @@ async fn post_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body_bytes).context("executor response JSON parse failed")
 }
 
+/// Key batch fields from the executor's Bridge contract state (GET /state).
+#[derive(Debug, Clone)]
+pub struct ExecutorBridgeState {
+    pub last_finalized_batch_index: u64,
+    pub last_finalized_batch_hash: [u8; 32],
+    pub last_committed_batch_index: u64,
+}
+
 /// HTTP client for the Bridge executor service.
 #[derive(Clone)]
 pub struct ExecutorClient {
@@ -90,6 +98,53 @@ impl ExecutorClient {
         }
         let out: Out = post_json(&self.client, &self.base_url, "/build-signatures", &body).await?;
         Ok(out.signatures)
+    }
+
+    /// Fetches Bridge contract state from the executor (GET /state).
+    /// Returns key batch-related fields for diagnostic cross-checks.
+    pub async fn get_state(&self) -> Result<ExecutorBridgeState> {
+        let url = format!("{}/state", base_url_normalized(&self.base_url));
+        let res = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("executor GET /state request failed")?;
+        let status = res.status();
+        let body_bytes = res
+            .bytes()
+            .await
+            .context("executor /state response body read failed")?;
+        if !status.is_success() {
+            let msg = String::from_utf8_lossy(&body_bytes);
+            anyhow::bail!("executor /state: {} (status {})", msg.trim(), status);
+        }
+        let raw: serde_json::Value =
+            serde_json::from_slice(&body_bytes).context("executor /state JSON parse failed")?;
+        let last_finalized_batch_index = raw
+            .get("lastFinalizedBatchIndex")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let last_finalized_batch_hash = raw
+            .get("lastFinalizedBatchHash")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                hex::decode(s).ok()
+            })
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .unwrap_or([0u8; 32]);
+        let last_committed_batch_index = raw
+            .get("lastCommittedBatchIndex")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(ExecutorBridgeState {
+            last_finalized_batch_index,
+            last_finalized_batch_hash,
+            last_committed_batch_index,
+        })
     }
 
     /// Submits finalizeBatch to the executor (POST /finalize-batch).
