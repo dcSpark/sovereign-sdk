@@ -135,6 +135,7 @@ export ORACLE_SIGNING_KEY_HEX="${ORACLE_SIGNING_KEY_HEX}"
 export DA_CONNECTION_STRING="${DA_CONNECTION_STRING:-sqlite://${TEE_DATA_DIR_REL}/da.sqlite?mode=rwc}"
 export INDEX_DB="${INDEX_DB:-sqlite://${TEE_DATA_DIR_REL}/wallet_index.sqlite?mode=rwc}"
 export INDEXER_DB_CONNECTION_STRING="${INDEXER_DB_CONNECTION_STRING:-$INDEX_DB}"
+export POOL_STATE_FILE="${POOL_STATE_FILE:-${TEE_DATA_DIR_REL}/pool_state.sqlite}"
 
 # Make verifier service read the same rollup config.
 export ROLLUP_CONFIG_PATH="${ROLLUP_CONFIG_PATH:-$TEE_ROLLUP_CONFIG}"

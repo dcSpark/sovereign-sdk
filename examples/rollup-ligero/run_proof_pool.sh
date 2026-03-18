@@ -75,7 +75,7 @@ export SEQUENCER_READY_CHECK_TIMEOUT_MS="${SEQUENCER_READY_CHECK_TIMEOUT_MS:-200
 export MAX_CONCURRENT_PROOFS="${MAX_CONCURRENT_PROOFS:-5}"
 export ADMIN_WALLET_PRIVATE_KEY="${ADMIN_WALLET_PRIVATE_KEY:-75fbf8d98746c2692e502942b938c82379fd09ea9f5b60d4d39e87e1b42468fd}"
 export DA_CONNECTION_STRING="${DA_CONNECTION_STRING:-sqlite://$SCRIPT_DIR/demo_data/da.sqlite?mode=rwc}"
-export POOL_STATE_FILE="${POOL_STATE_FILE:-$SCRIPT_DIR/pool_state.sqlite}"
+export POOL_STATE_FILE="${POOL_STATE_FILE:-$SCRIPT_DIR/demo_data/pool_state.sqlite}"
 
 echo "========================================"
 echo "Midnight Proof Pool Service"
