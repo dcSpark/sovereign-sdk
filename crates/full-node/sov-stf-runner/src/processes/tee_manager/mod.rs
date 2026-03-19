@@ -393,7 +393,7 @@ where
             } else {
                 tracing::debug!(
                     batch_index = self.batch_index,
-                    "Executor not configured; skipping L1 commit/finalize (set executor_url and rollup_id_hex in tee_configuration to enable)"
+                    "Executor not configured; skipping L1 commit/finalize (configure [sequencer.extension.midnight_bridge] to enable)"
                 );
                 true // no executor configured, L1 interaction is optional
             };

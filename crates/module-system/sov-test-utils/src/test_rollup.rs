@@ -234,9 +234,6 @@ impl<R: FullNodeBlueprint<Native>, StoragePath: AsPath> RollupBuilder<R, Storage
                     midnight_bridge: None,
                     tee_configuration: Some(TEEConfiguration {
                         tee_attestation_oracle_url: "http://127.0.0.1:8080".to_string(),
-                        executor_url: None,
-                        rollup_id_hex: None,
-                        l1_bridge: None,
                     }),
                 }),
                 num_cache_warmup_workers: TEST_NUM_CACHE_WARMUP_WORKERS,

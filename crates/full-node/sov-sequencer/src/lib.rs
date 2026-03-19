@@ -19,7 +19,7 @@ use axum::async_trait;
 pub use common::StateUpdateNotification;
 pub use common::{react_to_state_updates, Sequencer};
 pub use config::{
-    L1BridgeConfig, SeqConfigExtension, SequencerConfig, SequencerKindConfig, TEEConfiguration,
+    SeqConfigExtension, SequencerConfig, SequencerKindConfig, TEEConfiguration,
 };
 pub use rest_api::SequencerApis;
 use serde::Serialize;

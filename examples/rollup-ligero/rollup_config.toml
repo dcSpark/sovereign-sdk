@@ -104,13 +104,20 @@ num_cache_warmup_workers = 4
 num_parallel_tx_workers = 4
 [sequencer.extension]
 max_log_limit = 20000
-# Example Midnight bridge configuration (disabled)
+
+# Unified Midnight bridge configuration (disabled for non-TEE local dev).
+# Uncomment the entire section to enable L1 interactions: contract deployment,
+# executor service, indexer access, and deposit monitoring.
 # [sequencer.extension.midnight_bridge]
-# signing_key_path = "demo_data/midnight_bridge_signer.json" # JSON PrivateKeyAndAddress
-# mock_events_path = "demo_data/midnight_bridge_events.json" # Uncomment for offline testing
-# indexer_http = "https://indexer.preview.midnight.network/api/v3/graphql"
-# contract_address = "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12"
+# bridge_cli_path = "midnight-l2-contracts/bridge-cli"
+# network = "undeployed"
+# executor_port = 3001
+# funding_seed = "0000000000000000000000000000000000000000000000000000000000000001"
+# rollup_id_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+# indexer_http = "http://localhost:8088/api/v3/graphql"
 # indexer_timeout_ms = 30000
+# contract_address = ""
+# signing_key_path = "assets/midnight_bridge_signer.json"
 # poll_interval_ms = 1000
 # max_fee = 1000000
 

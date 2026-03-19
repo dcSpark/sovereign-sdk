@@ -21,10 +21,10 @@ use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
 use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
 use sov_stf_runner::RollupConfig;
-// use tracing::warn;
+use tracing::warn;
 
 use crate::eth_dev_signer;
-// use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
+use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
 
 /// Rollup with a [`ConfigurableSpec`] with [`MidnightDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
 #[derive(Default)]
@@ -114,8 +114,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             buffer_raw_txs: true,
         };
 
-        // let mut endpoints = NodeEndpoints {
-        let endpoints = NodeEndpoints {
+        let mut endpoints = NodeEndpoints {
             jsonrpsee_module: sov_ethereum::get_ethereum_rpc(
                 eth_rpc_config,
                 Arc::clone(&sequencer),
@@ -124,8 +123,6 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             ..Default::default()
         };
 
-        // Midnight bridge disabled for this rollup; keep implementation intact.
-        /*
         let cursor_store = if extension.midnight_bridge.is_some() {
             match BridgeCursorStore::open(&rollup_config.storage.path) {
                 Ok(store) => Some(store),
@@ -142,12 +139,19 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             None
         };
 
-        if let Some(handle) =
-            spawn_midnight_bridge(Arc::clone(&sequencer), &extension, cursor_store)?
-        {
+        let resolved_addr =
+            sov_stf_runner::processes::bridge_lifecycle::load_contract_address(
+                &rollup_config.storage.path,
+            );
+
+        if let Some(handle) = spawn_midnight_bridge(
+            Arc::clone(&sequencer),
+            &extension,
+            cursor_store,
+            resolved_addr.as_deref(),
+        )? {
             endpoints.background_handles.push(handle);
         }
-        */
 
         Ok(endpoints)
     }

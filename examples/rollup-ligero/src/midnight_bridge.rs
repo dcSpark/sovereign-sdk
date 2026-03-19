@@ -181,15 +181,19 @@ where
 }
 
 /// Spawns the Midnight bridge background task when enabled via `sequencer.extension.midnight_bridge`.
+///
+/// `resolved_contract_address` is the contract address that was deployed or loaded during bridge
+/// lifecycle startup. When provided it takes precedence over the config value.
 pub(crate) fn spawn_midnight_bridge<Seq>(
     sequencer: Arc<Seq>,
     extension: &SeqConfigExtension,
     cursor_store: Option<BridgeCursorStore>,
+    resolved_contract_address: Option<&str>,
 ) -> Result<Option<JoinHandle<anyhow::Result<()>>>>
 where
     Seq: BridgeSequencer,
 {
-    let Some(config) = load_runtime_settings(extension)? else {
+    let Some(config) = load_runtime_settings(extension, resolved_contract_address)? else {
         debug!("Midnight bridge disabled");
         return Ok(None);
     };
@@ -222,7 +226,10 @@ where
     Ok(Some(tokio::spawn(async move { bridge.run().await })))
 }
 
-fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<BridgeConfig>> {
+fn load_runtime_settings(
+    extension: &SeqConfigExtension,
+    resolved_contract_address: Option<&str>,
+) -> Result<Option<BridgeConfig>> {
     let Some(raw) = extension.midnight_bridge.as_ref() else {
         info!("Midnight bridge disabled: missing `[sequencer.extension.midnight_bridge]` block");
         return Ok(None);
@@ -261,9 +268,12 @@ fn load_runtime_settings(extension: &SeqConfigExtension) -> Result<Option<Bridge
         let indexer_http = raw.indexer_http.clone().ok_or_else(|| {
             anyhow!("indexer_http must be provided when mock_events_path is not configured")
         })?;
-        let contract_address = raw.contract_address.clone().ok_or_else(|| {
-            anyhow!("contract_address must be provided when mock_events_path is not configured")
-        })?;
+        let contract_address = resolved_contract_address
+            .map(String::from)
+            .or_else(|| raw.contract_address.clone())
+            .ok_or_else(|| {
+                anyhow!("contract_address must be provided when mock_events_path is not configured")
+            })?;
         validate_contract_address(&contract_address)?;
 
         let timeout = Duration::from_millis(raw.indexer_timeout_ms.max(1));

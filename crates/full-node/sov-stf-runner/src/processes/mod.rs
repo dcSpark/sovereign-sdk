@@ -5,15 +5,14 @@ mod stf_info_manager;
 mod zk_manager;
 use std::num::NonZero;
 
-#[cfg(feature = "tee")]
 pub mod bridge_lifecycle;
-#[cfg(feature = "tee")]
 mod executor_client;
 #[cfg(feature = "tee")]
 mod tee_manager;
 
+pub use executor_client::ExecutorClient;
 #[cfg(feature = "tee")]
-pub use executor_client::{ExecutorClient, batch_public_data_to_executor_json};
+pub use executor_client::batch_public_data_to_executor_json;
 #[cfg(feature = "tee")]
 pub use tee_manager::*;
 
