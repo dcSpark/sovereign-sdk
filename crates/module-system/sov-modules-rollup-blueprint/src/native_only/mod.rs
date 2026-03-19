@@ -507,7 +507,7 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
             managed_executor_child = Some(child);
 
             let exec_url = bridge_lifecycle::executor_url(bcfg.executor_port);
-            bridge_lifecycle::wait_for_executor_ready(&exec_url, Duration::from_secs(120))
+            bridge_lifecycle::wait_for_executor_ready(&exec_url, Duration::from_secs(240))
                 .await?;
 
             let http_client = Client::builder()

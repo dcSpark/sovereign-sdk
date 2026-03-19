@@ -144,11 +144,32 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
                 &rollup_config.storage.path,
             );
 
+        let rollup_dedup_url = rollup_config
+            .runner
+            .http_config
+            .public_address
+            .clone()
+            .or_else(|| {
+                // Use 127.0.0.1 when bind_host is 0.0.0.0 so the bridge can reach the rollup
+                // (0.0.0.0 is a server bind address, not a connectable address).
+                let host = if rollup_config.runner.http_config.bind_host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &rollup_config.runner.http_config.bind_host
+                };
+                Some(format!(
+                    "http://{}:{}",
+                    host,
+                    rollup_config.runner.http_config.bind_port
+                ))
+            });
+
         if let Some(handle) = spawn_midnight_bridge(
             Arc::clone(&sequencer),
             &extension,
             cursor_store,
             resolved_addr.as_deref(),
+            rollup_dedup_url,
         )? {
             endpoints.background_handles.push(handle);
         }

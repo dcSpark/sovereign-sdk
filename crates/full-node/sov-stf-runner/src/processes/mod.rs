@@ -63,61 +63,62 @@ where
     let mut prev_batch_hash = [0u8; 32];
     let mut seeded_from_l1 = false;
 
-    // Primary: seed batch cursor from L1 Bridge contract state (via adapter snapshot).
-    // batch_data is the NEXT batch to create, i.e. lastFinalizedBatchIndex + 1.
-    if let Some(client) = midnight_bridge.as_ref() {
-        match client.snapshot().await {
-            Ok(snap) => {
-                let last_finalized = snap.rollup.misc_data.last_finalized_batch_index;
-                batch_data = last_finalized + 1;
-                prev_batch_hash = snap.rollup.last_finalized_batch_hash;
+    // Prefer executor for seeding when present so the rollup's next commit parent
+    // matches what the executor (and L1 contract) expect, avoiding BAD_PARENT_BATCH_HASH
+    // when indexer and executor state differ (e.g. undeployed network or clean restart).
+    if let Some(ref executor) = executor_client {
+        match executor.get_state().await {
+            Ok(state) => {
+                let cursor = std::cmp::max(
+                    state.last_committed_batch_index,
+                    state.last_finalized_batch_index,
+                );
+                prev_batch_hash = if cursor == state.last_committed_batch_index
+                    && state.last_committed_batch_index > state.last_finalized_batch_index
+                {
+                    state.last_committed_batch_hash
+                } else {
+                    state.last_finalized_batch_hash
+                };
+                batch_data = cursor + 1;
                 seeded_from_l1 = true;
                 info!(
-                    last_finalized_batch_index = last_finalized,
+                    last_finalized_batch_index = state.last_finalized_batch_index,
+                    last_committed_batch_index = state.last_committed_batch_index,
                     next_batch_index = batch_data,
                     prev_batch_hash = hex::encode(prev_batch_hash),
-                    "Seeded TEE batch cursor from L1 Bridge adapter"
+                    "Seeded TEE batch cursor from executor /state"
                 );
             }
             Err(e) => {
                 warn!(
                     error = %e,
-                    "L1 Bridge adapter snapshot unavailable at startup"
+                    "Executor /state unavailable at startup"
                 );
             }
         }
     }
 
-    // Secondary: seed from executor /state when adapter is not available but executor is.
+    // Fallback: seed from L1 Bridge adapter (indexer) when executor did not provide state.
     if !seeded_from_l1 {
-        if let Some(ref executor) = executor_client {
-            match executor.get_state().await {
-                Ok(state) => {
-                    let cursor = std::cmp::max(
-                        state.last_committed_batch_index,
-                        state.last_finalized_batch_index,
-                    );
-                    prev_batch_hash = if cursor == state.last_committed_batch_index
-                        && state.last_committed_batch_index > state.last_finalized_batch_index
-                    {
-                        state.last_committed_batch_hash
-                    } else {
-                        state.last_finalized_batch_hash
-                    };
-                    batch_data = cursor + 1;
+        if let Some(client) = midnight_bridge.as_ref() {
+            match client.snapshot().await {
+                Ok(snap) => {
+                    let last_finalized = snap.rollup.misc_data.last_finalized_batch_index;
+                    batch_data = last_finalized + 1;
+                    prev_batch_hash = snap.rollup.last_finalized_batch_hash;
                     seeded_from_l1 = true;
                     info!(
-                        last_finalized_batch_index = state.last_finalized_batch_index,
-                        last_committed_batch_index = state.last_committed_batch_index,
+                        last_finalized_batch_index = last_finalized,
                         next_batch_index = batch_data,
                         prev_batch_hash = hex::encode(prev_batch_hash),
-                        "Seeded TEE batch cursor from executor /state"
+                        "Seeded TEE batch cursor from L1 Bridge adapter"
                     );
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
-                        "Executor /state also unavailable"
+                        "L1 Bridge adapter snapshot unavailable at startup"
                     );
                 }
             }
@@ -126,29 +127,9 @@ where
 
     if !seeded_from_l1 {
         warn!(
-            "No L1 source available; defaulting to batch_index=0. \
+            "No executor or L1 source available; defaulting to batch_index=0. \
              The executor service must be running for TEE mode to commit/finalize batches."
         );
-    }
-
-    // Diagnostic cross-check: log executor /state even when adapter was primary source.
-    if seeded_from_l1 && midnight_bridge.is_some() {
-        if let Some(ref executor) = executor_client {
-            match executor.get_state().await {
-                Ok(state) => {
-                    info!(
-                        executor_finalized_index = state.last_finalized_batch_index,
-                        executor_committed_index = state.last_committed_batch_index,
-                        executor_finalized_hash = hex::encode(state.last_finalized_batch_hash),
-                        executor_committed_hash = hex::encode(state.last_committed_batch_hash),
-                        "Executor /state cross-check at startup"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Executor /state cross-check failed (non-fatal)");
-                }
-            }
-        }
     }
 
     Ok(TeeProofManager::new(

@@ -29,7 +29,7 @@ use sov_modules_api::runtime::capabilities::authentication::{
 use sov_modules_api::transaction::TxDetails;
 use sov_modules_api::transaction::{PriorityFeeBips, Transaction, UnsignedTransaction};
 use sov_modules_api::FullyBakedTx;
-use sov_modules_api::{Amount, CredentialId, RawTx, Spec};
+use sov_modules_api::{Amount, CredentialId, PrivateKey, PublicKey, RawTx, Spec};
 use sov_rollup_interface::common::SlotNumber;
 use sov_rollup_interface::TxHash;
 use sov_sequencer::{Sequencer, SequencerNotReadyDetails};
@@ -184,11 +184,17 @@ where
 ///
 /// `resolved_contract_address` is the contract address that was deployed or loaded during bridge
 /// lifecycle startup. When provided it takes precedence over the config value.
+///
+/// `rollup_dedup_url` should be the rollup's HTTP base URL (e.g. `http://127.0.0.1:12346`). When set,
+/// the bridge fetches the next generation for its credential from the rollup's dedup API at startup,
+/// so credit transactions pass the uniqueness check. If omitted, the bridge uses generation 0, which
+/// will fail if the bridge credential has already been used on the rollup.
 pub(crate) fn spawn_midnight_bridge<Seq>(
     sequencer: Arc<Seq>,
     extension: &SeqConfigExtension,
     cursor_store: Option<BridgeCursorStore>,
     resolved_contract_address: Option<&str>,
+    rollup_dedup_url: Option<String>,
 ) -> Result<Option<JoinHandle<anyhow::Result<()>>>>
 where
     Seq: BridgeSequencer,
@@ -222,7 +228,13 @@ where
         deposit_source,
     } = config;
 
-    let bridge = MidnightBridge::new(sequencer, runtime, deposit_source, cursor_store)?;
+    let bridge = MidnightBridge::new(
+        sequencer,
+        runtime,
+        deposit_source,
+        cursor_store,
+        rollup_dedup_url,
+    )?;
     Ok(Some(tokio::spawn(async move { bridge.run().await })))
 }
 
@@ -313,6 +325,13 @@ struct RuntimeBridgeSettings {
     max_fee: Amount,
 }
 
+/// Response from the rollup dedup endpoint when using `?select=generation`.
+#[derive(Debug, Deserialize)]
+struct DedupGenerationResponse {
+    #[serde(default)]
+    generation: Option<u64>,
+}
+
 struct MidnightBridge<Seq> {
     sequencer: Arc<Seq>,
     settings: RuntimeBridgeSettings,
@@ -322,6 +341,8 @@ struct MidnightBridge<Seq> {
     idle_notice_sent: bool,
     next_chain_index: Option<u64>,
     cursor_store: Option<BridgeCursorStore>,
+    /// When set, the bridge syncs next_generation from this rollup URL at startup.
+    rollup_dedup_url: Option<String>,
 }
 
 impl<Seq> MidnightBridge<Seq>
@@ -333,6 +354,7 @@ where
         settings: RuntimeBridgeSettings,
         deposit_source: DepositSource,
         mut cursor_store: Option<BridgeCursorStore>,
+        rollup_dedup_url: Option<String>,
     ) -> Result<Self> {
         let mut restored_cursor = None;
 
@@ -373,6 +395,7 @@ where
             idle_notice_sent: false,
             next_chain_index,
             cursor_store,
+            rollup_dedup_url,
         };
 
         if restored_cursor.is_none() {
@@ -397,6 +420,89 @@ where
         self.persist_cursor(cursor);
     }
 
+    /// Fetches the next generation for the bridge credential from the rollup dedup API
+    /// and sets `next_generation` so credit transactions pass the uniqueness check.
+    /// Retries on connection errors so the rollup HTTP server has time to start.
+    async fn sync_next_generation_from_rollup(&mut self) {
+        const MAX_DEDUP_RETRIES: u32 = 10;
+        const RETRY_DELAY_MS: u64 = 500;
+
+        let Some(ref base_url) = self.rollup_dedup_url else {
+            debug!(
+                "Midnight bridge has no rollup_dedup_url; using next_generation=0 (may fail if credential already used)"
+            );
+            return;
+        };
+
+        let credential_id = self.settings.signing_key.private_key.pub_key().credential_id();
+        let url = format!(
+            "{}/rollup/addresses/{}/dedup?select=generation",
+            base_url.trim_end_matches('/'),
+            credential_id
+        );
+
+        for attempt in 1..=MAX_DEDUP_RETRIES {
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<DedupGenerationResponse>().await {
+                        Ok(decoded) => {
+                            if let Some(gen) = decoded.generation {
+                                // Never decrease: we may have already incremented locally after
+                                // submitting a credit that isn’t reflected in rollup state yet.
+                                self.next_generation = self.next_generation.max(gen);
+                                debug!(
+                                    credential_id = %credential_id,
+                                    next_generation = self.next_generation,
+                                    "Midnight bridge synced next_generation from rollup dedup"
+                                );
+                            } else {
+                                warn!(
+                                    url = %url,
+                                    "Rollup dedup response had no generation field; using next_generation=0"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                url = %url,
+                                error = ?err,
+                                "Midnight bridge failed to parse dedup response; using next_generation=0"
+                            );
+                        }
+                    }
+                    return;
+                }
+                Ok(resp) => {
+                    warn!(
+                        url = %url,
+                        status = %resp.status(),
+                        "Midnight bridge dedup request failed; using next_generation=0"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    let is_connect_err = err.is_connect();
+                    if is_connect_err && attempt < MAX_DEDUP_RETRIES {
+                        debug!(
+                            url = %url,
+                            attempt,
+                            max = MAX_DEDUP_RETRIES,
+                            "Rollup not ready, retrying dedup fetch"
+                        );
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    } else {
+                        warn!(
+                            url = %url,
+                            error = ?err,
+                            "Midnight bridge failed to fetch dedup; using next_generation=0"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     async fn run(mut self) -> Result<()> {
         let mut ticker = interval(self.settings.poll_interval);
         enum PollRequest {
@@ -405,6 +511,11 @@ where
         }
         loop {
             ticker.tick().await;
+
+            // Re-sync next_generation each poll so we see current rollup state (initial sync
+            // can run before state has this credential, giving 0 and then uniqueness failures).
+            self.sync_next_generation_from_rollup().await;
+
             let request = match &self.deposit_source {
                 DepositSource::Mock(source) => PollRequest::Mock(source.path().to_path_buf()),
                 DepositSource::Indexer(source) => PollRequest::Indexer(source.client_arc()),
@@ -921,7 +1032,14 @@ mod tests {
             events_path: events_path.clone(),
         });
         let mut bridge =
-            MidnightBridge::new(Arc::clone(&sequencer), settings, deposit_source, None).unwrap();
+            MidnightBridge::new(
+                Arc::clone(&sequencer),
+                settings,
+                deposit_source,
+                None,
+                None,
+            )
+            .unwrap();
 
         let snapshot = read_deposit_file(&events_path).await.unwrap();
         assert_eq!(snapshot.len(), deposits.len());
@@ -977,7 +1095,14 @@ mod tests {
         let deposit_source = DepositSource::Mock(MockDepositSource {
             events_path: events_path.clone(),
         });
-        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source, None).unwrap();
+        let mut bridge = MidnightBridge::new(
+            sequencer,
+            settings,
+            deposit_source,
+            None,
+            None,
+        )
+        .unwrap();
 
         let deposit = read_deposit_file(&events_path)
             .await
@@ -1028,7 +1153,14 @@ mod tests {
         let deposit_source = DepositSource::Mock(MockDepositSource {
             events_path: events_path.clone(),
         });
-        let mut bridge = MidnightBridge::new(sequencer, settings, deposit_source, None).unwrap();
+        let mut bridge = MidnightBridge::new(
+            sequencer,
+            settings,
+            deposit_source,
+            None,
+            None,
+        )
+        .unwrap();
 
         let deposit = read_deposit_file(&events_path)
             .await
