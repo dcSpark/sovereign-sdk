@@ -110,38 +110,173 @@ pub async fn get_privacy_notes(
     Ok(notes)
 }
 
-/// Select up to `max_inputs` notes, largest-first.
-///
-/// This matches the tx-generator policy: always use as many notes as possible
-/// (up to 4), in descending value order.
-pub fn select_largest_notes(
-    mut notes: Vec<SpendableNote>,
-    max_inputs: usize,
-) -> Vec<SpendableNote> {
-    notes.sort_by(|a, b| {
-        b.value
-            .cmp(&a.value)
-            .then(b.timestamp_ms.cmp(&a.timestamp_ms))
-    });
-    notes.truncate(max_inputs);
-    notes
-}
-
 /// Convenience helper: select up to `max_inputs` notes and ensure the sum covers `send_amount`.
 pub fn select_largest_notes_covering_amount(
     notes: Vec<SpendableNote>,
     send_amount: u128,
     max_inputs: usize,
 ) -> Result<Vec<SpendableNote>> {
+    const ABI_I64_MAX_U128: u128 = i64::MAX as u128;
+
     anyhow::ensure!(send_amount > 0, "send_amount must be > 0");
-    let selected = select_largest_notes(notes, max_inputs);
-    let total_in: u128 = selected.iter().map(|n| n.value).sum();
+    anyhow::ensure!(max_inputs > 0, "max_inputs must be > 0");
     anyhow::ensure!(
-        total_in >= send_amount,
-        "insufficient funds within {} inputs: need {}, have {}",
+        send_amount <= ABI_I64_MAX_U128,
+        "send_amount ({}) exceeds i64 max ({}) required by note_spend_guest v2 ABI",
+        send_amount,
+        i64::MAX
+    );
+    let safe_total_upper = send_amount
+        .checked_add(ABI_I64_MAX_U128)
+        .ok_or_else(|| anyhow::anyhow!("send_amount + i64::MAX overflows u128"))?;
+
+    // `note_spend_guest` v2 encodes note values as i64 in the witness ABI.
+    let mut abi_compatible_notes: Vec<SpendableNote> = notes
+        .into_iter()
+        .filter(|n| n.value <= ABI_I64_MAX_U128)
+        .collect();
+    abi_compatible_notes.sort_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then(b.timestamp_ms.cmp(&a.timestamp_ms))
+    });
+
+    // Max-safe consolidate policy:
+    // - Keep largest-first deterministic ordering.
+    // - Include up to `max_inputs` notes to consolidate UTXOs.
+    // - Never let total exceed `send_amount + i64::MAX`, so change stays ABI-safe.
+    let mut selected: Vec<SpendableNote> =
+        Vec::with_capacity(max_inputs.min(abi_compatible_notes.len()));
+    let mut total_in: u128 = 0;
+    for note in abi_compatible_notes.into_iter() {
+        if selected.len() >= max_inputs {
+            break;
+        }
+        let candidate_total = total_in
+            .checked_add(note.value)
+            .ok_or_else(|| anyhow::anyhow!("sum of selected note values overflows u128"))?;
+        if candidate_total > safe_total_upper {
+            continue;
+        }
+        total_in = candidate_total;
+        selected.push(note);
+    }
+
+    if selected.is_empty() {
+        anyhow::bail!(
+            "no spendable notes compatible with note_spend_guest v2 ABI (value must be <= {})",
+            i64::MAX
+        );
+    }
+
+    if total_in >= send_amount {
+        return Ok(selected);
+    }
+
+    anyhow::bail!(
+        "insufficient spendable funds within {} inputs: need {}, have {}",
         max_inputs,
         send_amount,
         total_in
     );
-    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_note(value: u128, timestamp_ms: i64, seed: u64) -> SpendableNote {
+        SpendableNote {
+            value,
+            rho: format!("{seed:064x}"),
+            sender_id: format!("{:064x}", seed + 1),
+            tx_hash: format!("tx-{seed}"),
+            timestamp_ms,
+            kind: "transfer".to_string(),
+        }
+    }
+
+    #[test]
+    fn covering_selection_uses_extra_inputs_for_consolidation() {
+        let notes = vec![
+            test_note(90, 3, 1),
+            test_note(80, 2, 2),
+            test_note(70, 1, 3),
+        ];
+
+        let selected = select_largest_notes_covering_amount(notes, 85, 4).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].value, 90);
+        assert_eq!(selected[1].value, 80);
+        assert_eq!(selected[2].value, 70);
+    }
+
+    #[test]
+    fn covering_selection_skips_notes_above_i64_max() {
+        let cap = i64::MAX as u128;
+        let notes = vec![
+            test_note(cap + 1, 3, 1),
+            test_note(100, 2, 2),
+            test_note(90, 1, 3),
+        ];
+
+        let selected = select_largest_notes_covering_amount(notes, 100, 4).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].value, 100);
+        assert_eq!(selected[1].value, 90);
+    }
+
+    #[test]
+    fn covering_selection_rejects_send_amount_above_i64_max() {
+        let cap = i64::MAX as u128;
+        let notes = vec![test_note(cap, 1, 1)];
+
+        let err = select_largest_notes_covering_amount(notes, cap + 1, 4).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("send_amount"));
+        assert!(msg.contains("i64 max"));
+    }
+
+    #[test]
+    fn covering_selection_reports_insufficient_with_input_cap() {
+        let notes = vec![
+            test_note(50, 3, 1),
+            test_note(40, 2, 2),
+            test_note(30, 1, 3),
+        ];
+
+        let err = select_largest_notes_covering_amount(notes, 95, 2).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("insufficient spendable funds within 2 inputs"));
+    }
+
+    #[test]
+    fn covering_selection_avoids_oversized_change_while_still_consolidating() {
+        let cap = i64::MAX as u128;
+        let notes = vec![
+            test_note(cap, 3, 1),
+            test_note(cap, 2, 2),
+            test_note(1, 1, 3),
+        ];
+
+        let selected = select_largest_notes_covering_amount(notes, 1, 4).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].value, cap);
+        assert_eq!(selected[1].value, 1);
+    }
+
+    #[test]
+    fn covering_selection_fills_slots_with_later_fitting_notes() {
+        let cap = i64::MAX as u128;
+        let notes = vec![
+            test_note(cap, 3, 1),
+            test_note(cap, 2, 2),
+            test_note(1, 1, 3),
+        ];
+
+        let selected = select_largest_notes_covering_amount(notes, 1, 2).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].value, cap);
+        assert_eq!(selected[1].value, 1);
+    }
 }

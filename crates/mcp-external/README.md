@@ -85,19 +85,32 @@ For compatibility with the `midnight-sim/mockmcp` API shape, `mcp-external` also
 
 - `GET /authority` - Discover available authority endpoints
 - `GET /authority/info` - List frozen (blacklisted) privacy addresses (returns `["addr1", "addr2"]`)
-- `GET /authority/accounts` - List all accounts with wallet data (MockMCP-compatible format)
+- `GET /authority/accounts` - Legacy full account list (default), or paginated mode with `?paginated=true`
 - `POST /authority/freeze` - Freeze a privacy address (requires `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` + `ADMIN_WALLET_PRIVATE_KEY`)
 - `POST /authority/thaw` - Unfreeze a privacy address (requires `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` + `ADMIN_WALLET_PRIVATE_KEY`)
 - `GET /authority/tps` - TPS over 1m/5m/15m windows (requires `METRICS_API_URL`)
 
-#### GET /authority/accounts Response Format
+#### GET /authority/accounts
 
-Returns an array of `[wallet_id, wallet_data]` tuples matching the MockMCP spec:
+Default behavior (backward-compatible):
+- Returns a plain array of `[wallet_id, wallet_data]` tuples
+- Fetches all accounts and resolves balances sequentially
+
+Paginated mode:
+- Add `paginated=true`
+- Response changes to a paginated object
+
+Paginated query parameters:
+- `paginated` (optional, default `false`)
+- `limit` (optional, default `100`, max `1000`, only used when `paginated=true`)
+- `cursor` (optional, exclusive cursor from previous response `nextCursor`, only used when `paginated=true`)
+
+Legacy response format (default):
 
 ```json
 [
   [
-    "fvk_commitment_hex",
+    "privpool1...",
     {
       "authorityVFK": "full_viewing_key_hex",
       "balance": "10000000",
@@ -111,8 +124,35 @@ Returns an array of `[wallet_id, wallet_data]` tuples matching the MockMCP spec:
 ]
 ```
 
+Paginated response format (`?paginated=true`):
+
+Returns a paginated object. The `accounts` field uses `[wallet_id, wallet_data]` tuples matching the MockMCP wallet tuple shape:
+
+```json
+{
+  "count": 1,
+  "totalCount": 15342,
+  "nextCursor": "ab12cd34...",
+  "accounts": [
+    [
+      "privpool1...",
+      {
+        "authorityVFK": "full_viewing_key_hex",
+        "balance": "10000000",
+        "frozen": null,
+        "lastSend": "2026-01-27T12:00:00Z",
+        "pendingBalance": "0",
+        "privacyAddress": "privpool1...",
+        "privacySpendKey": null
+      }
+    ]
+  ]
+}
+```
+
 **Notes:**
 - Accounts are sourced from the indexer's FVK registry (registered viewing keys)
+- `nextCursor` is `null` on the last page
 - `privacySpendKey` is always `null` for security (private keys are never exposed)
 - `frozen` is `null` if not frozen, or a string with the freeze reason
 - `lastSend` defaults to `"0000-01-01T00:00:00Z"` if no transfer history exists

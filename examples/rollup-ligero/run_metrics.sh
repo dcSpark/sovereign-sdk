@@ -75,5 +75,12 @@ echo "     GET  http://${BIND_ADDR}/token-velocity            - Token velocity"
 echo "     GET  http://${BIND_ADDR}/swagger-ui/               - Swagger UI"
 echo ""
 
+BIN="$WORKSPACE_ROOT/target/release/sov-metrics-api"
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  echo "Run: cargo build --release -p sov-metrics-api"
+  exit 1
+fi
+
 cd "$WORKSPACE_ROOT/examples/rollup-ligero"
-exec cargo run -p sov-metrics-api --release
+exec "$BIN"

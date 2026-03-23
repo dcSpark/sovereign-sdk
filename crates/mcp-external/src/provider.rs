@@ -1068,24 +1068,49 @@ pub struct FvkEntry {
 /// Response from the indexer's FVK list endpoint
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FvkListResponse {
+    /// Number of entries included in this response page.
     pub count: usize,
+    /// Total number of FVK entries available across all pages.
+    #[serde(default)]
+    pub total_count: Option<usize>,
+    /// Cursor to retrieve the next page, if any.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
     pub fvks: Vec<FvkEntry>,
 }
 
 impl Provider {
-    /// Get all registered FVKs from the indexer
+    /// Get a page of registered FVKs from the indexer
     ///
-    /// This queries the indexer's `/fvks` endpoint to retrieve all registered
+    /// This queries the indexer's `/fvks` endpoint to retrieve registered
     /// Full Viewing Keys and their associated shielded addresses.
-    pub async fn get_fvk_registry(&self) -> Result<FvkListResponse> {
+    pub async fn get_fvk_registry(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<FvkListResponse> {
         let base_url = self.indexer_url.trim_end_matches('/');
         let url = format!("{}/fvks", base_url);
 
-        tracing::debug!("Fetching FVK registry from indexer: {}", url);
+        #[derive(serde::Serialize)]
+        struct FvkListQuery<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cursor: Option<&'a str>,
+        }
+
+        tracing::debug!(
+            "Fetching FVK registry page from indexer: {} (limit={:?}, cursor={:?})",
+            url,
+            limit,
+            cursor
+        );
 
         let response = self
             .http_client
             .get(&url)
+            .query(&FvkListQuery { limit, cursor })
             .send()
             .await
             .with_context(|| format!("Failed to fetch FVK registry from indexer at {}", url))?;
@@ -1109,8 +1134,45 @@ impl Provider {
             format!("Failed to parse FVK registry JSON from indexer at {}", url)
         })?;
 
-        tracing::debug!("Fetched {} FVKs from indexer", fvk_list.count);
+        tracing::debug!(
+            "Fetched {} FVKs from indexer page (total_count={:?}, next_cursor={:?})",
+            fvk_list.count,
+            fvk_list.total_count,
+            fvk_list.next_cursor
+        );
 
         Ok(fvk_list)
+    }
+
+    /// Get all registered FVKs by traversing paginated `/fvks` responses.
+    pub async fn get_all_fvk_registry(&self) -> Result<FvkListResponse> {
+        const FVK_PAGE_LIMIT: usize = 1000;
+
+        let mut all_fvks = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut total_count: Option<usize> = None;
+
+        loop {
+            let page = self
+                .get_fvk_registry(Some(FVK_PAGE_LIMIT), cursor.as_deref())
+                .await?;
+            if total_count.is_none() {
+                total_count = page.total_count;
+            }
+            all_fvks.extend(page.fvks);
+
+            if let Some(next_cursor) = page.next_cursor {
+                cursor = Some(next_cursor);
+            } else {
+                break;
+            }
+        }
+
+        Ok(FvkListResponse {
+            count: all_fvks.len(),
+            total_count: Some(total_count.unwrap_or(all_fvks.len())),
+            next_cursor: None,
+            fvks: all_fvks,
+        })
     }
 }

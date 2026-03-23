@@ -221,6 +221,14 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     print_info "Building metrics API..."
     cargo build $CARGO_PROFILE -p sov-metrics-api 2>&1 | tail -3
     print_ok "sov-metrics-api"
+
+    print_info "Building oracle..."
+    cargo build $CARGO_PROFILE -p oracle 2>&1 | tail -3
+    print_ok "oracle"
+
+    print_info "Building FVK service..."
+    cargo build $CARGO_PROFILE -p midnight-fvk-service 2>&1 | tail -3
+    print_ok "midnight-fvk-service"
   else
     print_info "Replica mode -- skipping primary service builds"
   fi

@@ -49,6 +49,23 @@ fn default_limit() -> usize {
     50
 }
 
+const DEFAULT_FVK_LIMIT: usize = 100;
+const MAX_FVK_LIMIT: usize = 1000;
+
+fn default_fvk_limit() -> usize {
+    DEFAULT_FVK_LIMIT
+}
+
+/// Query parameters for paginated FVK list endpoint
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FvkListQuery {
+    /// Maximum number of results (default 100, max 1000)
+    #[serde(default = "default_fvk_limit")]
+    pub limit: usize,
+    /// Pagination cursor (exclusive): last `fvk_commitment` from previous page
+    pub cursor: Option<String>,
+}
+
 /// Query parameters for paginated transaction endpoints
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TransactionListQuery {
@@ -74,7 +91,13 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FvkListResponse {
+    /// Number of entries returned in this page
     pub count: usize,
+    /// Total entries available in the registry
+    pub total_count: usize,
+    /// Cursor to fetch the next page (null when this is the last page)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub fvks: Vec<FvkResponse>,
 }
 
@@ -539,30 +562,62 @@ pub struct FvkResponse {
 #[utoipa::path(
     get,
     path = "/fvks",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max results (default 100, max 1000)"),
+        ("cursor" = Option<String>, Query, description = "Exclusive cursor using the last fvk_commitment from previous page")
+    ),
     responses(
         (status = 200, description = "List FVKs", body = FvkListResponse)
     ),
     tag = "fvks"
 )]
-async fn list_fvks(State(state): State<AppState>) -> impl IntoResponse {
-    let fvks: Vec<FvkResponse> = state
-        .vfk_registry
-        .entries()
-        .into_iter()
+async fn list_fvks(
+    Query(q): Query<FvkListQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let mut entries = state.vfk_registry.entries();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_count = entries.len();
+    let limit = q.limit.clamp(1, MAX_FVK_LIMIT);
+    let start_idx = q
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            entries
+                .binary_search_by(|(commitment, _, _, _)| commitment.as_str().cmp(cursor))
+                .map_or_else(|idx| idx, |idx| idx + 1)
+        })
+        .unwrap_or(0);
+    let end_idx = start_idx.saturating_add(limit).min(total_count);
+
+    let page_entries = &entries[start_idx..end_idx];
+    let fvks: Vec<FvkResponse> = page_entries
+        .iter()
         .map(
             |(commitment, fvk, shielded_addr, wallet_addr)| FvkResponse {
-                fvk_commitment: commitment,
-                fvk: hex::encode(fvk),
-                shielded_address: shielded_addr,
-                wallet_address: wallet_addr,
+                fvk_commitment: commitment.clone(),
+                fvk: hex::encode(*fvk),
+                shielded_address: shielded_addr.clone(),
+                wallet_address: wallet_addr.clone(),
             },
         )
         .collect();
+    let next_cursor = page_entries
+        .last()
+        .map(|(commitment, _, _, _)| commitment.clone());
+    let next_cursor = if end_idx < total_count {
+        next_cursor
+    } else {
+        None
+    };
 
     (
         StatusCode::OK,
         Json(FvkListResponse {
             count: fvks.len(),
+            total_count,
+            next_cursor,
             fvks,
         }),
     )
@@ -1423,6 +1478,7 @@ async fn get_freeze_history(
     ),
     components(schemas(
         ListQuery,
+        FvkListQuery,
         TransactionListQuery,
         VfkBody,
         balance::BalanceRequest,
