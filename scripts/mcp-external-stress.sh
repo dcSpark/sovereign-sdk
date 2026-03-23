@@ -328,4 +328,8 @@ case "$CONFIRM" in
   1|true|TRUE|yes|YES) set -- "$@" --confirm ;;
 esac
 
+if command -v mcp-external-stress >/dev/null 2>&1; then
+  exec mcp-external-stress "$@"
+fi
+
 exec cargo run -p mcp-external-stress --manifest-path "$REPO_ROOT/Cargo.toml" -- "$@"
