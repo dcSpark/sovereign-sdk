@@ -149,3 +149,32 @@ output "rds_connection_string" {
   description = "PostgreSQL connection string (password not included)"
   value       = "postgresql://${aws_db_instance.main.username}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${aws_db_instance.main.db_name}"
 }
+
+# -----------------------------------------------------------------------------
+# Midnight Monitor Outputs
+# -----------------------------------------------------------------------------
+
+output "monitor_lambda_function_name" {
+  description = "Name of the Midnight monitor Lambda function"
+  value       = aws_lambda_function.monitor.function_name
+}
+
+output "monitor_lambda_function_arn" {
+  description = "ARN of the Midnight monitor Lambda function"
+  value       = aws_lambda_function.monitor.arn
+}
+
+output "monitor_alerts_topic_arn" {
+  description = "SNS topic ARN used for Midnight monitor alerts"
+  value       = aws_sns_topic.monitor_alerts.arn
+}
+
+output "monitor_scheduler_arn" {
+  description = "ARN of the EventBridge Scheduler rule for the monitor"
+  value       = aws_scheduler_schedule.monitor.arn
+}
+
+output "monitor_slack_configuration_arn" {
+  description = "AWS Chatbot Slack channel configuration ARN used by monitor alerts"
+  value       = aws_chatbot_slack_channel_configuration.monitor.chat_configuration_arn
+}

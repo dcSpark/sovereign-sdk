@@ -177,3 +177,46 @@ variable "rds_deletion_protection" {
   type        = bool
   default     = false
 }
+
+# -----------------------------------------------------------------------------
+# Midnight Monitor Configuration
+# -----------------------------------------------------------------------------
+
+variable "monitor_base_url" {
+  description = "Base URL the monitor Lambda should probe through nginx"
+  type        = string
+  default     = "http://172.33.91.192"
+}
+
+variable "monitor_env" {
+  description = "Environment dimension emitted with Midnight monitor metrics"
+  type        = string
+  default     = "midnight-l2-testnet"
+}
+
+variable "monitor_lambda_image_tag" {
+  description = "ECR image tag to deploy for the ARM64 monitor Lambda"
+  type        = string
+  default     = "arm64-20260318-2051"
+}
+
+variable "monitor_proof_pool_auth_token" {
+  description = "Auth token passed to the proof-pool send check"
+  type        = string
+  sensitive   = true
+}
+
+variable "slack_workspace_id" {
+  description = "Slack workspace/team ID for the AWS Chatbot channel configuration"
+  type        = string
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID for the AWS Chatbot channel configuration"
+  type        = string
+}
+
+variable "slack_channel_name" {
+  description = "Human-readable Slack channel name for the AWS Chatbot configuration"
+  type        = string
+}

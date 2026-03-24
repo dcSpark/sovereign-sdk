@@ -63,3 +63,15 @@ rds_deletion_protection   = false # Set to true for production
 #   export TF_VAR_rds_master_password="your-secure-password"
 # Or pass it directly:
 #   terraform apply -var="rds_master_password=your-secure-password"
+
+# Midnight monitor configuration
+monitor_base_url         = "http://172.33.91.192"
+monitor_env              = "midnight-l2-testnet"
+monitor_lambda_image_tag = "arm64-20260323-132009"
+
+# IMPORTANT: Set the monitor auth token and Slack identifiers via environment variables
+# or a non-checked-in tfvars override file before applying:
+#   export TF_VAR_monitor_proof_pool_auth_token="..."
+#   export TF_VAR_slack_workspace_id="T01234567"
+#   export TF_VAR_slack_channel_id="C01234567"
+#   export TF_VAR_slack_channel_name="midnight-alerts"

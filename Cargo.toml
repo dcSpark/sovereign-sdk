@@ -38,6 +38,7 @@ members = [
     "crates/utils/sov-indexer",
     "crates/utils/sov-metrics-api",
     "crates/utils/mcp-external-stress",
+    "crates/utils/midnight-monitor-lambda",
     # Module System
     "crates/module-system/sov-cli",
     "crates/module-system/sov-modules-stf-blueprint",
