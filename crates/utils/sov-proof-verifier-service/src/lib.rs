@@ -140,12 +140,35 @@ async fn fetch_rollup_chain_hash(node_client: &NodeClient) -> Result<[u8; 32]> {
     Ok(chain_hash)
 }
 
+async fn fetch_rollup_chain_hash_with_timeout(
+    node_client: &NodeClient,
+    timeout_secs: u64,
+) -> Result<[u8; 32]> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        fetch_rollup_chain_hash(node_client),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Timed out fetching /rollup/schema after {}s",
+            timeout_secs
+        )),
+    }
+}
+
 async fn ensure_rollup_chain_hash(state: &AppState) -> Result<[u8; 32], ServiceError> {
     if let Some(chain_hash) = *state.rollup_chain_hash.read().await {
         return Ok(chain_hash);
     }
 
-    let chain_hash = fetch_rollup_chain_hash(&state.node_client)
+    let fetch_timeout_secs = env_u64(
+        "SOV_PROOF_VERIFIER_CHAIN_HASH_FETCH_TIMEOUT_SECS",
+        DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS,
+    );
+
+    let chain_hash = fetch_rollup_chain_hash_with_timeout(&state.node_client, fetch_timeout_secs)
         .await
         .map_err(|e| {
             ServiceError::SubmissionError(format!(
@@ -167,6 +190,7 @@ const DEFAULT_VERIFIER_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_VERIFIER_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_VERIFIER_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VERIFIER_MAX_LIFETIME_SECS: u64 = 1_800;
+const DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS: u64 = 10;
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
@@ -245,8 +269,15 @@ impl AppState {
 
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
+        let chain_hash_fetch_timeout_secs = env_u64(
+            "SOV_PROOF_VERIFIER_CHAIN_HASH_FETCH_TIMEOUT_SECS",
+            DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS,
+        );
 
-        let rollup_chain_hash = match fetch_rollup_chain_hash(&node_client).await {
+        let rollup_chain_hash =
+            match fetch_rollup_chain_hash_with_timeout(&node_client, chain_hash_fetch_timeout_secs)
+                .await
+            {
             Ok(chain_hash) => {
                 info!(
                     "Using rollup chain hash from /rollup/schema: 0x{}",
@@ -257,6 +288,7 @@ impl AppState {
             Err(err) => {
                 warn!(
                     node_rpc_url = %config.node_rpc_url,
+                    timeout_secs = chain_hash_fetch_timeout_secs,
                     error = %err,
                     "Failed to fetch /rollup/schema during startup; local /prove and /verify can still run, and node-dependent endpoints will retry on demand"
                 );

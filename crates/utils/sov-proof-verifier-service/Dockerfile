@@ -50,8 +50,20 @@ ENV SKIP_GUEST_BUILD=ligero \
 # Clone the Nightstream repo — sovereign-ligero has path dependencies that
 # resolve to /Nightstream/crates/{neo-fold,neo-math,neo-ajtai,neo-memory,neo-ccs,nightstream-sdk}.
 ARG NIGHTSTREAM_REF=5b98cb6471fccea81b86a335c54d6f3a73f5499d
-RUN git clone https://github.com/LFDT-Nightstream/Nightstream.git /Nightstream \
-    && git -C /Nightstream checkout "${NIGHTSTREAM_REF}"
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /Nightstream; \
+      git init /Nightstream; \
+      git -C /Nightstream remote add origin https://github.com/LFDT-Nightstream/Nightstream.git; \
+      if git -C /Nightstream fetch --depth 1 origin "${NIGHTSTREAM_REF}" \
+        && git -C /Nightstream checkout FETCH_HEAD; then \
+        break; \
+      fi; \
+      if [ "${attempt}" -eq 5 ]; then \
+        exit 1; \
+      fi; \
+      sleep $((attempt * 5)); \
+    done
 
 RUN cargo build --release -p sov-proof-verifier-service
 
