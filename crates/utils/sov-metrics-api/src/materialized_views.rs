@@ -28,23 +28,58 @@ struct ViewSpec {
 const INDEXER_VIEW_SPECS: &[ViewSpec] = &[
     ViewSpec {
         view_name: INDEXER_TRANSFER_TOTALS_VIEW,
-        version: 1,
+        version: 2,
         create_sql: r#"
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_metrics_transfer_totals AS
-SELECT
-    1::int AS id,
-    COALESCE(
-        SUM(
+WITH stats AS (
+    SELECT
+        pg_class.reltuples::numeric AS estimated_rows
+    FROM pg_class
+    WHERE pg_class.oid = 'midnight_transfer'::regclass::oid
+),
+sample AS (
+    SELECT
+        count(*)::numeric AS sample_rows,
+        count(*) FILTER (WHERE midnight_transfer.amount::text ~ '^[0-9]+$'::text)::numeric AS valid_rows,
+        avg(
             CASE
-                WHEN amount ~ '^[0-9]+$' THEN CAST(amount AS NUMERIC)
-                ELSE 0
+                WHEN midnight_transfer.amount::text ~ '^[0-9]+$'::text
+                    THEN midnight_transfer.amount::numeric
+                ELSE NULL::numeric
             END
-        ),
-        0
-    )::text AS total_amount,
-    COUNT(*) FILTER (WHERE amount ~ '^[0-9]+$')::bigint AS total_transactions,
-    NOW()::timestamptz AS refreshed_at
-FROM midnight_transfer
+        ) AS avg_valid_amount
+    FROM midnight_transfer TABLESAMPLE system (0.1)
+)
+SELECT
+    1 AS id,
+    COALESCE(
+        round(
+            (
+                (SELECT stats.estimated_rows FROM stats)
+                * COALESCE(
+                    (SELECT sample.valid_rows / NULLIF(sample.sample_rows, 0::numeric) FROM sample),
+                    0::numeric
+                )
+                * COALESCE((SELECT sample.avg_valid_amount FROM sample), 0::numeric)
+            ),
+            0
+        )::text,
+        '0'::text
+    ) AS total_amount,
+    COALESCE(
+        round(
+            (
+                (SELECT stats.estimated_rows FROM stats)
+                * COALESCE(
+                    (SELECT sample.valid_rows / NULLIF(sample.sample_rows, 0::numeric) FROM sample),
+                    0::numeric
+                )
+            ),
+            0
+        )::bigint,
+        0::bigint
+    ) AS total_transactions,
+    now() AS refreshed_at
 "#,
         create_unique_index_sql: r#"
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_metrics_transfer_totals_id
@@ -117,32 +152,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_metrics_transfer_stats_24h_id
     },
     ViewSpec {
         view_name: INDEXER_ACCOUNT_TOTALS_VIEW,
-        version: 1,
+        version: 2,
         create_sql: r#"
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_metrics_account_totals AS
-WITH recent_senders AS (
+WITH recent_events AS (
+    SELECT e.id
+    FROM events e
+    WHERE e.created_at >= (now() - '00:05:00'::interval)
+),
+recent_senders AS (
     SELECT t.privacy_sender
-    FROM midnight_transfer t
-    JOIN events e ON e.id = t.event_id
+    FROM recent_events re
+    JOIN midnight_transfer t ON t.event_id = re.id
     WHERE t.privacy_sender IS NOT NULL
-      AND e.created_at >= NOW() - INTERVAL '5 minutes'
     UNION
     SELECT w.privacy_sender
-    FROM midnight_withdraw w
-    JOIN events e ON e.id = w.event_id
+    FROM recent_events re
+    JOIN midnight_withdraw w ON w.event_id = re.id
     WHERE w.privacy_sender IS NOT NULL
-      AND e.created_at >= NOW() - INTERVAL '5 minutes'
 )
 SELECT
-    1::int AS id,
-    (SELECT COUNT(*)::bigint FROM fvk_registry) AS total_accounts,
-    (
-        (SELECT COUNT(*)::bigint FROM midnight_transfer WHERE view_attestations IS NOT NULL)
-        +
-        (SELECT COUNT(*)::bigint FROM midnight_withdraw WHERE view_attestations IS NOT NULL)
+    1 AS id,
+    (SELECT count(*) AS count FROM fvk_registry) AS total_accounts,
+    COALESCE(
+        (
+            SELECT round(c.reltuples * (1::double precision - s.null_frac))::bigint AS round
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+            WHERE n.nspname = 'public'::name
+              AND c.relname = 'midnight_transfer'::name
+              AND s.attname = 'view_attestations'::name
+        ),
+        0::bigint
+    ) + (
+        SELECT count(*) AS count
+        FROM midnight_withdraw
+        WHERE midnight_withdraw.view_attestations IS NOT NULL
     ) AS total_disclosure_events,
-    (SELECT COUNT(*)::bigint FROM recent_senders) AS sending_accounts_5m,
-    NOW()::timestamptz AS refreshed_at
+    (SELECT count(*) AS count FROM recent_senders) AS sending_accounts_5m,
+    now() AS refreshed_at
 "#,
         create_unique_index_sql: r#"
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_metrics_account_totals_id
