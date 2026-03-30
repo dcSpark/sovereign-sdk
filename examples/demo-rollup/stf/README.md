@@ -134,6 +134,22 @@ complete State Transition Function!
 Your modules optionally implement RPC methods via the `rpc_gen` macro, in order to enable the full-node to expose them, annotate the `Runtime` with `expose_rpc`.
 In the example above, you can see how to use the `expose_rpc` macro on the `native` `Runtime`.
 
+### Midnight Withdrawals Prototype
+
+- `examples/demo-rollup/stf/src/midnight_withdrawals.rs` implements the first slice of the Midnight bridge architecture (design doc §9).
+- At genesis we enable it through `midnight_withdrawals.json`; each call to `withdraw_night` burns the canonical NIGHT token and logs a `StoredWithdrawal` keyed by a nonce.
+- The module exposes REST helpers underneath `/modules/midnight_withdrawals/...` so rollup operators (or test relayers) can fetch the latest nonce and a specific withdrawal record — this serves as the temporary “proof” requested for the MVP.
+- Runtime wiring happens via the new `midnight_withdrawals` field, so every rollup using `demo-stf` automatically gains the burn + log behavior.
+
+**How this maps to the long-term architecture:**
+
+1. ✅ Step 1–2 (L2 gateway burns NIGHT and captures calldata) now live inside the STF.
+2. 🔜 Steps 3–4 require replacing the simple `StateMap` with a proper append-only Merkle tree / message queue so we can compute `withdrawRoot` deterministically.
+3. 🔜 Step 5 needs TEE/attestation wiring so each finalized batch publishes the `withdrawRoot` alongside state roots.
+4. 🔜 Steps 6–7 involve the Midnight contracts plus replay protection, fed by the proofs that will eventually be built atop the REST data.
+
+Until those TODOs land, the REST responses plus the Bank balance delta are the recommended way to exercise and verify the prototype.
+
 ## Make Full Node Integrations Simpler with the State Transition Runner:
 
 Now that we have an app, we want to be able to run it. For any custom state transition, your full node implementation is going to need a little

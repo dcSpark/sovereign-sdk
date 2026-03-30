@@ -11,6 +11,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
+pub mod protocol_types;
 pub mod utils;
 
 const CONTRACT_STATE_QUERY: &str = r#"

@@ -278,6 +278,14 @@ pub const SCHEMA_JSON: &str = r#"{
             "value": {
               "ByIndex": 124
             }
+          },
+          {
+            "name": "MidnightWithdrawals",
+            "discriminant": 16,
+            "template": null,
+            "value": {
+              "ByIndex": 141
+            }
           }
         ],
         "hide_tag": false
@@ -3459,6 +3467,70 @@ pub const SCHEMA_JSON: &str = r#"{
       }
     },
     {
+      "Tuple": {
+        "template": null,
+        "peekable": false,
+        "fields": [
+          {
+            "value": {
+              "ByIndex": 142
+            },
+            "silent": false,
+            "doc": ""
+          }
+        ]
+      }
+    },
+    {
+      "Enum": {
+        "type_name": "CallMessage",
+        "variants": [
+          {
+            "name": "WithdrawNight",
+            "discriminant": 0,
+            "template": null,
+            "value": {
+              "ByIndex": 143
+            }
+          }
+        ],
+        "hide_tag": false
+      }
+    },
+    {
+      "Struct": {
+        "type_name": "__SovVirtualWallet_CallMessage_WithdrawNight",
+        "template": null,
+        "peekable": false,
+        "fields": [
+          {
+            "display_name": "midnight_address",
+            "silent": false,
+            "value": {
+              "Immediate": "String"
+            },
+            "doc": ""
+          },
+          {
+            "display_name": "amount",
+            "silent": false,
+            "value": {
+              "ByIndex": 11
+            },
+            "doc": ""
+          },
+          {
+            "display_name": "gas_limit",
+            "silent": false,
+            "value": {
+              "ByIndex": 68
+            },
+            "doc": ""
+          }
+        ]
+      }
+    },
+    {
       "Enum": {
         "type_name": "UniquenessData",
         "variants": [
@@ -3793,6 +3865,9 @@ pub const SCHEMA_JSON: &str = r#"{
         },
         {
           "name": "midnight_privacy"
+        },
+        {
+          "name": "midnight_withdrawals"
         }
       ]
     },
@@ -4963,6 +5038,32 @@ pub const SCHEMA_JSON: &str = r#"{
       "fields_or_variants": [
         {
           "name": "admin"
+        }
+      ]
+    },
+    {
+      "name": "",
+      "fields_or_variants": []
+    },
+    {
+      "name": "CallMessage",
+      "fields_or_variants": [
+        {
+          "name": "withdraw_night"
+        }
+      ]
+    },
+    {
+      "name": "__SovVirtualWallet_CallMessage_WithdrawNight",
+      "fields_or_variants": [
+        {
+          "name": "midnight_address"
+        },
+        {
+          "name": "amount"
+        },
+        {
+          "name": "gas_limit"
         }
       ]
     },

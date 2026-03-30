@@ -5,6 +5,7 @@
 use std::convert::AsRef;
 use std::path::{Path, PathBuf};
 
+pub use crate::midnight_withdrawals::MidnightWithdrawalsConfig;
 pub use midnight_privacy::MidnightPrivacyConfig;
 use serde::de::DeserializeOwned;
 pub use sov_accounts::{AccountConfig, AccountData};
@@ -56,6 +57,8 @@ pub struct GenesisPaths {
     pub value_setter_zk_genesis_path: PathBuf,
     /// Midnight Privacy genesis path
     pub midnight_privacy_genesis_path: PathBuf,
+    /// Midnight Withdrawals genesis path
+    pub midnight_withdrawals_genesis_path: PathBuf,
 }
 
 impl GenesisPaths {
@@ -79,6 +82,7 @@ impl GenesisPaths {
             value_setter_genesis_path: dir.as_ref().join("value_setter.json"),
             value_setter_zk_genesis_path: dir.as_ref().join("value_setter_zk.json"),
             midnight_privacy_genesis_path: dir.as_ref().join("midnight_privacy.json"),
+            midnight_withdrawals_genesis_path: dir.as_ref().join("midnight_withdrawals.json"),
         }
     }
 }
@@ -132,6 +136,9 @@ where
     let midnight_privacy_config: MidnightPrivacyConfig<S> =
         read_genesis_json(&genesis_paths.midnight_privacy_genesis_path)?;
 
+    let midnight_withdrawals_config: MidnightWithdrawalsConfig =
+        read_genesis_json(&genesis_paths.midnight_withdrawals_genesis_path)?;
+
     Ok(GenesisConfig::new(
         bank_config,
         sequencer_registry_config,
@@ -149,6 +156,7 @@ where
         value_setter_config,
         value_setter_zk_config,
         midnight_privacy_config,
+        midnight_withdrawals_config,
     ))
 }
 
