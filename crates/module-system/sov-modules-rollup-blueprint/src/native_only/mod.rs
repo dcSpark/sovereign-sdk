@@ -515,6 +515,17 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                 .context("Failed to build executor HTTP client")?;
             executor_client = Some(ExecutorClient::new(http_client, exec_url));
 
+            if is_genesis {
+                info!("Setting verifier set on freshly deployed Bridge contract...");
+                executor_client
+                    .as_ref()
+                    .expect("executor_client just created")
+                    .set_verifier_set()
+                    .await
+                    .context("Failed to set verifier set on Bridge contract")?;
+                info!("Verifier set configured successfully");
+            }
+
             rollup_id = parse_rollup_id_hex(bcfg.rollup_id_hex.as_deref());
             resolved_contract_address = Some(contract_address);
         }

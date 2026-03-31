@@ -155,6 +155,18 @@ impl ExecutorClient {
         })
     }
 
+    /// Calls the executor's setVerifierSet endpoint (POST /set-verifier-set).
+    ///
+    /// The executor reads `VERIFIER_SECRET_KEYS` from its environment (or uses
+    /// built-in defaults), derives the corresponding public keys, and submits a
+    /// `setVerifierSet` transaction to the Bridge contract.
+    pub async fn set_verifier_set(&self) -> Result<()> {
+        let body = json!({});
+        let _: serde_json::Value =
+            post_json(&self.client, &self.base_url, "/set-verifier-set", &body).await?;
+        Ok(())
+    }
+
     /// Submits finalizeBatch to the executor (POST /finalize-batch).
     pub async fn finalize_batch(
         &self,

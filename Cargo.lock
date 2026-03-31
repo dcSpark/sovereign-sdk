@@ -8296,20 +8296,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "midnight-monitor-lambda"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "lambda_runtime",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.22",
-]
-
-[[package]]
 name = "midnight-ledger"
 version = "7.0.0"
 source = "git+https://github.com/midnightntwrk/midnight-ledger?tag=hard-fork-test-ledger-7.0.0#c567cd4a584ed8b04b4f466c2555be062f7f9c7f"
@@ -8393,6 +8379,20 @@ source = "git+https://github.com/midnightntwrk/midnight-ledger?tag=hard-fork-tes
 dependencies = [
  "proc-macro2",
  "quote 1.0.43",
+]
+
+[[package]]
+name = "midnight-monitor-lambda"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "lambda_runtime",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
