@@ -94,7 +94,7 @@ export SOV_PROVER_MODE=prove
 
 For TEE-mode settlement flow and L1 Bridge integration (executor setup, config, and logs), see:
 
-- [`L1_INTERACTIONS.md`](./L1_INTERACTIONS.md)
+- [`MIDNIGHT_BRIDGE.md`](./MIDNIGHT_BRIDGE.md)
 
 ## Service Orchestration
 

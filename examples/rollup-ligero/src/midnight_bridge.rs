@@ -58,6 +58,7 @@ pub(crate) struct BridgeCursorStore {
 
 impl BridgeCursorStore {
     const KEY_BYTES: &'static [u8] = b"midnight_bridge.cursor";
+    const WITHDRAWAL_RELAY_KEY: &'static [u8] = b"midnight_bridge.withdrawal_relay_cursor";
     const CURSOR_SUBDIR: &'static str = "midnight_bridge_cursor";
 
     pub(crate) fn open(storage_path: &Path) -> Result<Self> {
@@ -117,6 +118,37 @@ impl BridgeCursorStore {
         self.db
             .write_schemas(batch)
             .context("Failed to persist Midnight bridge cursor")
+    }
+
+    fn load_withdrawal_relay_cursor(&self) -> Result<Option<u64>> {
+        let raw = self
+            .accessor
+            .get_value_option(&Self::WITHDRAWAL_RELAY_KEY.to_vec(), SlotNumber::GENESIS)
+            .context("Failed to read withdrawal relay cursor from accessory DB")?;
+        match raw {
+            Some(bytes) => {
+                anyhow::ensure!(
+                    bytes.len() == 8,
+                    "Withdrawal relay cursor payload must be 8 bytes, got {}",
+                    bytes.len()
+                );
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(u64::from_le_bytes(arr)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn persist_withdrawal_relay_cursor(&self, cursor: u64) -> Result<()> {
+        let bytes = cursor.to_le_bytes().to_vec();
+        let batch = AccessoryDb::materialize_values(
+            vec![(Self::WITHDRAWAL_RELAY_KEY.to_vec(), Some(bytes))],
+            SlotNumber::GENESIS,
+        )?;
+        self.db
+            .write_schemas(batch)
+            .context("Failed to persist withdrawal relay cursor")
     }
 }
 
@@ -223,6 +255,11 @@ where
         }
     }
 
+    let executor_base_url = extension
+        .midnight_bridge
+        .as_ref()
+        .map(|b| format!("http://127.0.0.1:{}", b.executor_port));
+
     let BridgeConfig {
         runtime,
         deposit_source,
@@ -234,6 +271,7 @@ where
         deposit_source,
         cursor_store,
         rollup_dedup_url,
+        executor_base_url,
     )?;
     Ok(Some(tokio::spawn(async move { bridge.run().await })))
 }
@@ -332,6 +370,38 @@ struct DedupGenerationResponse {
     generation: Option<u64>,
 }
 
+/// Response from `GET /modules/midnight-withdrawals/withdrawals/queue`.
+#[derive(Debug, Deserialize)]
+struct WithdrawalQueueStatusResponse {
+    next_nonce: u64,
+}
+
+/// Response from `GET /modules/midnight-withdrawals/withdrawals/{nonce}/proof`.
+#[derive(Debug, Deserialize)]
+struct WithdrawalProofResponse {
+    sender_bytes_hex: String,
+    recipient_bytes_hex: String,
+    amount: String,
+    l1_proof: L1ProofResponse,
+}
+
+/// The `l1_proof` sub-object within [`WithdrawalProofResponse`].
+#[derive(Debug, Deserialize)]
+struct L1ProofResponse {
+    batch_index: u64,
+    nonce: u64,
+    index_bits_le: Vec<bool>,
+    sibling_hashes_hex: Vec<String>,
+}
+
+/// Partial response from the executor's `GET /state` endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutorStateResponse {
+    #[serde(default)]
+    last_finalized_batch_index: Option<String>,
+}
+
 struct MidnightBridge<Seq> {
     sequencer: Arc<Seq>,
     settings: RuntimeBridgeSettings,
@@ -343,6 +413,10 @@ struct MidnightBridge<Seq> {
     cursor_store: Option<BridgeCursorStore>,
     /// When set, the bridge syncs next_generation from this rollup URL at startup.
     rollup_dedup_url: Option<String>,
+    /// Next withdrawal nonce to relay to L1 (all nonces below this have been relayed).
+    next_relay_nonce: u64,
+    /// Base URL for the managed executor HTTP service (e.g. `http://127.0.0.1:3001`).
+    executor_base_url: Option<String>,
 }
 
 impl<Seq> MidnightBridge<Seq>
@@ -355,6 +429,7 @@ where
         deposit_source: DepositSource,
         mut cursor_store: Option<BridgeCursorStore>,
         rollup_dedup_url: Option<String>,
+        executor_base_url: Option<String>,
     ) -> Result<Self> {
         let mut restored_cursor = None;
 
@@ -386,6 +461,22 @@ where
             DepositSource::Mock(_) => None,
         };
 
+        // Restore the withdrawal relay cursor from persistent storage.
+        let next_relay_nonce = cursor_store
+            .as_ref()
+            .and_then(|store| match store.load_withdrawal_relay_cursor() {
+                Ok(Some(cursor)) => {
+                    info!(cursor, "Midnight bridge restored withdrawal relay cursor");
+                    Some(cursor)
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    warn!(error = ?err, "Failed to read withdrawal relay cursor");
+                    None
+                }
+            })
+            .unwrap_or(0);
+
         let bridge = Self {
             sequencer,
             settings,
@@ -396,6 +487,8 @@ where
             next_chain_index,
             cursor_store,
             rollup_dedup_url,
+            next_relay_nonce,
+            executor_base_url,
         };
 
         if restored_cursor.is_none() {
@@ -418,6 +511,163 @@ where
     fn set_cursor(&mut self, cursor: u64) {
         self.next_chain_index = Some(cursor);
         self.persist_cursor(cursor);
+    }
+
+    fn advance_relay_cursor(&mut self, next_nonce: u64) {
+        self.next_relay_nonce = next_nonce;
+        if let Some(store) = &self.cursor_store {
+            if let Err(err) = store.persist_withdrawal_relay_cursor(next_nonce) {
+                warn!(
+                    value = next_nonce,
+                    error = ?err,
+                    "Failed to persist withdrawal relay cursor"
+                );
+            }
+        }
+    }
+
+    /// Relays pending L2→L1 withdrawal proofs to the executor service.
+    ///
+    /// For each unrelayed nonce, fetches the Merkle proof from the rollup REST API and
+    /// POSTs it to the executor's `relay-withdraw-night-with-proof` endpoint. The relay
+    /// cursor is persisted after each successful relay so progress survives restarts.
+    async fn relay_pending_withdrawals(&mut self) -> Result<()> {
+        let executor_url = match &self.executor_base_url {
+            Some(url) => url.clone(),
+            None => return Ok(()),
+        };
+        let rollup_url = match &self.rollup_dedup_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => return Ok(()),
+        };
+
+        // 1. Get last finalized batch index from the executor.
+        let state_url = format!("{}/state", executor_url.trim_end_matches('/'));
+        let state_resp: ExecutorStateResponse = match reqwest::get(&state_url).await {
+            Ok(resp) if resp.status().is_success() => resp
+                .json()
+                .await
+                .context("Failed to parse executor /state response")?,
+            Ok(resp) => {
+                debug!(
+                    status = %resp.status(),
+                    "Executor /state returned non-success; skipping withdrawal relay"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                debug!(error = ?err, "Executor /state unreachable; skipping withdrawal relay");
+                return Ok(());
+            }
+        };
+
+        let finalized_batch_index: u64 = state_resp
+            .last_finalized_batch_index
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if finalized_batch_index == 0 {
+            return Ok(());
+        }
+
+        // 2. Get the withdrawal queue status from the rollup.
+        let queue_url = format!(
+            "{}/modules/midnight-withdrawals/withdrawals/queue",
+            rollup_url
+        );
+        let queue_resp: WithdrawalQueueStatusResponse = reqwest::get(&queue_url)
+            .await
+            .context("Failed to fetch withdrawal queue status")?
+            .json()
+            .await
+            .context("Failed to parse withdrawal queue status")?;
+
+        let next_nonce = queue_resp.next_nonce;
+        if next_nonce <= self.next_relay_nonce {
+            return Ok(());
+        }
+
+        // 3. Relay each pending withdrawal.
+        let client = reqwest::Client::new();
+        for nonce in self.next_relay_nonce..next_nonce {
+            let proof_url = format!(
+                "{}/modules/midnight-withdrawals/withdrawals/{}/proof?batch_index={}",
+                rollup_url, nonce, finalized_batch_index
+            );
+            let proof: WithdrawalProofResponse = match reqwest::get(&proof_url).await {
+                Ok(resp) if resp.status().is_success() => resp
+                    .json()
+                    .await
+                    .context("Failed to parse withdrawal proof response")?,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(
+                        nonce,
+                        status = %status,
+                        body = %body,
+                        "Failed to fetch withdrawal proof; will retry next cycle"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(nonce, error = ?err, "Failed to fetch withdrawal proof; will retry next cycle");
+                    break;
+                }
+            };
+
+            let relay_url = format!(
+                "{}/relay-withdraw-night-with-proof",
+                executor_url.trim_end_matches('/')
+            );
+            let relay_body = serde_json::json!({
+                "l2Sender": proof.sender_bytes_hex,
+                "recipient": proof.recipient_bytes_hex,
+                "amount": proof.amount,
+                "batchIndex": proof.l1_proof.batch_index.to_string(),
+                "nonce": proof.l1_proof.nonce.to_string(),
+                "indexBits": proof.l1_proof.index_bits_le,
+                "siblings": proof.l1_proof.sibling_hashes_hex,
+            });
+
+            match client.post(&relay_url).json(&relay_body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        nonce,
+                        batch_index = finalized_batch_index,
+                        amount = %proof.amount,
+                        "Relayed withdrawal proof to L1 executor"
+                    );
+                    self.advance_relay_cursor(nonce + 1);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if body.contains("ALREADY_EXECUTED") {
+                        info!(
+                            nonce,
+                            "Withdrawal already executed on L1; advancing cursor"
+                        );
+                        self.advance_relay_cursor(nonce + 1);
+                        continue;
+                    }
+                    warn!(
+                        nonce,
+                        status = %status,
+                        body = %body,
+                        "Withdrawal relay failed; will retry next cycle"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(nonce, error = ?err, "Withdrawal relay request failed; will retry next cycle");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Fetches the next generation for the bridge credential from the rollup dedup API
@@ -532,6 +782,11 @@ where
 
             if let Err(err) = poll_result {
                 warn!(error = ?err, "Midnight bridge failed to fetch deposits");
+            }
+
+            // Relay pending L2→L1 withdrawal proofs to the executor.
+            if let Err(err) = self.relay_pending_withdrawals().await {
+                warn!(error = ?err, "Withdrawal relay cycle failed");
             }
         }
     }

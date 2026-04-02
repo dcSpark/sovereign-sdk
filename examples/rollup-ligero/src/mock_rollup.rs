@@ -16,7 +16,9 @@ use sov_modules_api::rest::StateUpdateReceiver;
 use sov_modules_api::{NodeEndpoints, Spec, Storage, SyncStatus, ZkVerifier};
 use sov_modules_rollup_blueprint::pluggable_traits::PluggableSpec;
 use sov_modules_rollup_blueprint::proof_sender::SovApiProofSender;
-use sov_modules_rollup_blueprint::{FullNodeBlueprint, RollupBlueprint, SequencerCreationReceipt};
+use sov_modules_rollup_blueprint::{
+    FullNodeBlueprint, RollupBlueprint, SequencerCreationReceipt, WalletBlueprint,
+};
 use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
 use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
@@ -52,6 +54,8 @@ where
     type Spec = MockRollupSpec<WitnessGeneration>;
     type Runtime = Runtime<Self::Spec>;
 }
+
+impl WalletBlueprint<Native> for MockDemoRollup<Native> {}
 
 #[async_trait]
 impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {

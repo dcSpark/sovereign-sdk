@@ -543,9 +543,13 @@ impl<S: Spec> MidnightWithdrawals<S> {
 
     fn sender_bytes(address: &S::Address) -> Result<[u8; 32]> {
         let raw = address.as_ref();
-        ensure!(raw.len() == 32, "Sender address must be exactly 32 bytes");
+        ensure!(
+            raw.len() <= 32,
+            "Sender address must be at most 32 bytes, got {}",
+            raw.len()
+        );
         let mut out = [0u8; 32];
-        out.copy_from_slice(raw);
+        out[..raw.len()].copy_from_slice(raw);
         Ok(out)
     }
 
