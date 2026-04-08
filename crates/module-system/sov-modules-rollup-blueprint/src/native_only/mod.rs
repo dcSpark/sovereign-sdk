@@ -671,6 +671,26 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                         let tee_storage_path =
                             Some(std::path::PathBuf::from(&rollup_config.storage.path));
 
+                        // Build the rollup URL so the TEE manager can query STF
+                        // module state (e.g. the withdrawal queue root).
+                        let tee_rollup_url = rollup_config
+                            .runner
+                            .http_config
+                            .public_address
+                            .clone()
+                            .or_else(|| {
+                                let host =
+                                    if rollup_config.runner.http_config.bind_host == "0.0.0.0" {
+                                        "127.0.0.1"
+                                    } else {
+                                        &rollup_config.runner.http_config.bind_host
+                                    };
+                                Some(format!(
+                                    "http://{}:{}",
+                                    host, rollup_config.runner.http_config.bind_port
+                                ))
+                            });
+
                         let tee_handle = start_tee_workflow_in_background(
                             prover_service,
                             rollup_config.proof_manager.aggregated_proof_block_jump,
@@ -683,6 +703,7 @@ pub trait FullNodeBlueprint<M: ExecutionMode>: RollupBlueprint<M> {
                             executor_client.take(),
                             rollup_id.take(),
                             tee_storage_path,
+                            tee_rollup_url,
                         )
                         .await?;
 

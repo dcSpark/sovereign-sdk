@@ -147,6 +147,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address,
             Some(rollup_config.storage.path.clone()),
+            None,
         )
     }
 

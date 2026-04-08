@@ -99,6 +99,10 @@ pub struct TeeProofManager<Ps: ProverService> {
     executor_client: Option<ExecutorClient>,
     rollup_id: Option<[u8; 32]>,
     storage_path: Option<PathBuf>,
+    /// Rollup REST base URL for querying STF module state (e.g. withdraw_root).
+    rollup_url: Option<String>,
+    /// Consecutive L1 settlement failure count (for exponential backoff).
+    l1_settlement_failures: u32,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -122,6 +126,7 @@ where
         executor_client: Option<ExecutorClient>,
         rollup_id: Option<[u8; 32]>,
         storage_path: Option<PathBuf>,
+        rollup_url: Option<String>,
     ) -> Self {
         Self {
             prover_service,
@@ -143,6 +148,8 @@ where
             executor_client,
             rollup_id,
             storage_path,
+            rollup_url,
+            l1_settlement_failures: 0,
         }
     }
 
@@ -333,6 +340,8 @@ where
             );
 
             // Build the batch struct early so we can persist it for crash recovery.
+            // NOTE: withdraw_root is now sourced from the L2 STF (via the prover's
+            // REST query to the rollup), not the L1 indexer snapshot.
             let batch = BatchPublicDataV1 {
                 version: 1,
                 layer2_chain_id: public_data.layer2_chain_id,
@@ -349,9 +358,90 @@ where
                 withdraw_root: public_data.withdraw_root,
             };
 
+            // Backoff: if previous settlement failed, wait before retrying.
+            if self.l1_settlement_failures > 0 {
+                let delay_secs = std::cmp::min(
+                    2u64.saturating_pow(self.l1_settlement_failures),
+                    60,
+                );
+                info!(
+                    batch_index = self.batch_index,
+                    failures = self.l1_settlement_failures,
+                    delay_secs,
+                    "Backing off before retrying L1 settlement"
+                );
+                sleep(Duration::from_secs(delay_secs)).await;
+            }
+
+            // Resync: query L1 state to detect if the contract is ahead of our
+            // cursor (e.g. after crash recovery finalized a batch, or if the
+            // executor returned an error but the L1 tx actually succeeded).
+            let mut skip_settlement = false;
+            let mut skip_commit = false;
+            if let Some(ref executor) = self.executor_client {
+                match executor.get_state().await {
+                    Ok(state) => {
+                        info!(
+                            batch_index = self.batch_index,
+                            l1_finalized = state.last_finalized_batch_index,
+                            l1_committed = state.last_committed_batch_index,
+                            prev_batch_hash = hex::encode(self.prev_batch_hash),
+                            "L1 state before batch settlement"
+                        );
+                        if state.last_finalized_batch_index >= self.batch_index {
+                            // L1 already finalized this batch (or later) — resync cursor.
+                            info!(
+                                batch_index = self.batch_index,
+                                l1_finalized = state.last_finalized_batch_index,
+                                "L1 is ahead; resyncing cursor"
+                            );
+                            self.batch_index = state.last_finalized_batch_index + 1;
+                            self.prev_batch_hash = state.last_finalized_batch_hash;
+                            if let Some(ref sp) = self.storage_path {
+                                super::bridge_lifecycle::remove_pending_finalize(sp);
+                            }
+                            self.l1_settlement_failures = 0;
+                            skip_settlement = true;
+                        } else if state.last_committed_batch_index >= self.batch_index
+                            && state.last_committed_batch_index > state.last_finalized_batch_index
+                        {
+                            // Batch already committed but not finalized — skip commit,
+                            // proceed directly to finalize.
+                            info!(
+                                batch_index = self.batch_index,
+                                "Batch already committed on L1; skipping commit, proceeding to finalize"
+                            );
+                            skip_commit = true;
+                        } else if state.last_finalized_batch_hash != self.prev_batch_hash
+                            && state.last_finalized_batch_index + 1 == self.batch_index
+                        {
+                            // Our prev_batch_hash doesn't match L1's — resync.
+                            warn!(
+                                batch_index = self.batch_index,
+                                our_prev = hex::encode(self.prev_batch_hash),
+                                l1_prev = hex::encode(state.last_finalized_batch_hash),
+                                "prev_batch_hash mismatch; resyncing from L1"
+                            );
+                            self.prev_batch_hash = state.last_finalized_batch_hash;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            batch_index = self.batch_index,
+                            error = %e,
+                            "Failed to query executor state for resync; proceeding with cached cursor"
+                        );
+                    }
+                }
+            }
+
             // Commit batch on L1 via executor service (if configured).
             // Track success so we only advance the durable batch cursor when L1 accepted both commit AND finalize.
-            let mut l1_ok = if let Some(ref executor) = self.executor_client {
+            let mut l1_ok = if skip_settlement {
+                true // cursor already resynced above
+            } else if skip_commit {
+                true // commit already on L1, proceed to finalize
+            } else if let Some(ref executor) = self.executor_client {
                 match executor
                     .commit_batch(&self.prev_batch_hash, &batch_hash)
                     .await
@@ -491,7 +581,8 @@ where
 
             // Finalize batch on L1 via executor service (if configured).
             // Only attempt finalize if commit succeeded -- otherwise the contract is not expecting it.
-            if l1_ok {
+            // Skip if we already resynced the cursor above.
+            if l1_ok && !skip_settlement {
                 if let (Some(ref executor), Some(rollup_id)) =
                     (self.executor_client.as_ref(), self.rollup_id.as_ref())
                 {
@@ -558,12 +649,17 @@ where
                 .inc_next_height_to_receive_by(num_proofs_to_create as u64);
 
             if l1_ok {
-                self.batch_index += 1;
-                self.prev_batch_hash = batch_hash;
+                if !skip_settlement {
+                    self.batch_index += 1;
+                    self.prev_batch_hash = batch_hash;
+                }
+                self.l1_settlement_failures = 0;
             } else {
+                self.l1_settlement_failures = self.l1_settlement_failures.saturating_add(1);
                 warn!(
                     batch_index = self.batch_index,
-                    "L1 commit/finalize failed; batch cursor NOT advanced (will retry same batch next cycle)"
+                    failures = self.l1_settlement_failures,
+                    "L1 commit/finalize failed; batch cursor NOT advanced (will retry with backoff)"
                 );
             }
         }

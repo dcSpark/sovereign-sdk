@@ -90,7 +90,46 @@ TEE_RESET=1 ./tee_local.sh --release --skip-build
 
 ### Making deposits
 
-TODO
+Deposits lock NIGHT on the L1 Bridge contract and credit the corresponding amount on L2. The rollup automatically detects deposit events via the Midnight indexer and mints funds to the specified L2 recipient.
+
+**Via the executor** (simplest — uses the running executor service):
+
+```bash
+# Deposit 1 000 000 000 000 tNIGHT to an L2 address (the amount must not exceed
+# the funding wallet's balance on the Midnight network):
+curl -s -X POST http://127.0.0.1:3001/deposit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "amount": "1000000000000",
+    "l2Recipient": "sov16fkyars4xdzl7c8cdspuvuacf52jktgnacjpxsg0hyf0zlk6jqm"
+  }' | jq
+```
+
+The `l2Recipient` is the 64-hex-char credential ID of the L2 account that will receive the bridged funds. You can obtain it from an L2 key file:
+
+```bash
+python3 -c "
+import json, hashlib
+key = json.load(open('demo_data_tee/genesis/generated_keypairs.json'))[0]
+print('address:', key['address'])
+"
+```
+
+**Via the decoder-rs CLI** (alternative, useful for scripting):
+
+```bash
+cd midnight-l2-contracts/bridge-cli/decoder-rs
+cargo run -- deposit \
+  --executor-url http://127.0.0.1:3001 \
+  --amount 1000000000000 \
+  --l2-recipient sov16fkyars4xdzl7c8cdspuvuacf52jktgnacjpxsg0hyf0zlk6jqm
+```
+
+After a few seconds the rollup will pick up the deposit event and credit funds. Verify:
+
+```bash
+curl -s http://127.0.0.1:12346/modules/bank/tokens/gas_token/balances/sov16fkyars4xdzl7c8cdspuvuacf52jktgnacjpxsg0hyf0zlk6jqm | jq
+```
 
 ### Making withdrawals
 
@@ -144,7 +183,7 @@ curl -s http://127.0.0.1:12346/modules/midnight-withdrawals/withdrawals/0/proof?
 curl -s -X POST http://127.0.0.1:3001/claim-l1-withdrawal-unshielded \
   -H 'Content-Type: application/json' \
   -d '{
-    "recipient": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "recipient": "1e524a8e02b8022f243db6c992f48c866dff4fa3b1c01624f9f2c1d269e11017",
     "amount": "1000000"
   }' | jq
 ```

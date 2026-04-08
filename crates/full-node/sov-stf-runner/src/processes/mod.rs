@@ -44,6 +44,7 @@ pub async fn start_tee_workflow_in_background<Ps>(
     executor_client: Option<ExecutorClient>,
     rollup_id: Option<[u8; 32]>,
     storage_path: Option<std::path::PathBuf>,
+    rollup_url: Option<String>,
 ) -> anyhow::Result<JoinHandle<()>>
 where
     Ps: ProverService,
@@ -147,6 +148,7 @@ where
         executor_client,
         rollup_id,
         storage_path,
+        rollup_url,
     )
     .post_aggregated_proof_to_da_in_background()
     .await)

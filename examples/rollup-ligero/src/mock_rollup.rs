@@ -201,6 +201,23 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         let outer_vm = MockZkvmHost::new_non_blocking();
         let da_verifier = Default::default();
 
+        let rollup_url = rollup_config
+            .runner
+            .http_config
+            .public_address
+            .clone()
+            .or_else(|| {
+                let host = if rollup_config.runner.http_config.bind_host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &rollup_config.runner.http_config.bind_host
+                };
+                Some(format!(
+                    "http://{}:{}",
+                    host, rollup_config.runner.http_config.bind_port
+                ))
+            });
+
         ParallelProverService::new_with_default_workers(
             inner_vm,
             outer_vm,
@@ -209,6 +226,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address,
             Some(rollup_config.storage.path.clone()),
+            rollup_url,
         )
     }
 

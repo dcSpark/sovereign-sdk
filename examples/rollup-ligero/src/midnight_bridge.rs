@@ -382,6 +382,7 @@ struct WithdrawalProofResponse {
     sender_bytes_hex: String,
     recipient_bytes_hex: String,
     amount: String,
+    withdraw_root_hex: String,
     l1_proof: L1ProofResponse,
 }
 
@@ -400,6 +401,8 @@ struct L1ProofResponse {
 struct ExecutorStateResponse {
     #[serde(default)]
     last_finalized_batch_index: Option<String>,
+    #[serde(default, rename = "withdrawRoot")]
+    withdraw_root: Option<String>,
 }
 
 struct MidnightBridge<Seq> {
@@ -571,6 +574,13 @@ where
             return Ok(());
         }
 
+        let l1_withdraw_root = state_resp.withdraw_root.as_deref().unwrap_or("(not available)");
+        debug!(
+            finalized_batch_index,
+            l1_withdraw_root,
+            "Withdrawal relay: executor state"
+        );
+
         // 2. Get the withdrawal queue status from the rollup.
         let queue_url = format!(
             "{}/modules/midnight-withdrawals/withdrawals/queue",
@@ -616,6 +626,35 @@ where
                     break;
                 }
             };
+
+            // Diagnostic: log the full proof data for debugging.
+            debug!(
+                nonce,
+                batch_index = finalized_batch_index,
+                sender = %proof.sender_bytes_hex,
+                recipient = %proof.recipient_bytes_hex,
+                amount = %proof.amount,
+                stf_withdraw_root = %proof.withdraw_root_hex,
+                l1_withdraw_root,
+                index_bits = ?proof.l1_proof.index_bits_le,
+                siblings_count = proof.l1_proof.sibling_hashes_hex.len(),
+                "Relaying withdrawal proof"
+            );
+
+            // Guard: skip relay if the STF's withdraw root doesn't match the L1
+            // batch's root — this means the batch was finalized before this
+            // withdrawal was included. A future batch will cover it.
+            if l1_withdraw_root != "(not available)"
+                && !proof.withdraw_root_hex.eq_ignore_ascii_case(l1_withdraw_root)
+            {
+                debug!(
+                    nonce,
+                    stf_root = %proof.withdraw_root_hex,
+                    l1_root = l1_withdraw_root,
+                    "Withdrawal not yet covered by finalized batch; will retry after next finalization"
+                );
+                break;
+            }
 
             let relay_url = format!(
                 "{}/relay-withdraw-night-with-proof",
