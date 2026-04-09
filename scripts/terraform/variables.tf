@@ -206,6 +206,24 @@ variable "monitor_proof_pool_auth_token" {
   sensitive   = true
 }
 
+variable "monitor_tee_reset_url" {
+  description = "TEE reset endpoint URL probed by the monitor Lambda"
+  type        = string
+  default     = "http://74.235.106.62:9898/reset"
+}
+
+variable "monitor_tee_reset_host_cidr" {
+  description = "CIDR the monitor Lambda may use for the TEE reset endpoint"
+  type        = string
+  default     = "74.235.106.62/32"
+}
+
+variable "monitor_tee_reset_port" {
+  description = "TCP port the monitor Lambda may use for the TEE reset endpoint"
+  type        = number
+  default     = 9898
+}
+
 variable "slack_workspace_id" {
   description = "Slack workspace/team ID for the AWS Chatbot channel configuration"
   type        = string

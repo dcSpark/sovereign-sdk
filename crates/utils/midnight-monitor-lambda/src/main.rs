@@ -16,8 +16,11 @@ const DEFAULT_STRESS_WALLETS: usize = 3;
 const DEFAULT_STRESS_TXS: usize = 1;
 const DEFAULT_STRESS_SESSION_IDS_FILE: &str = "/tmp/mcp-external-stress-session-ids.txt";
 const DEFAULT_STRESS_SCRIPT_PATH: &str = "scripts/mcp-external-stress.sh";
+const DEFAULT_TEE_RESET_URL: &str = "http://74.235.106.62:9898/reset";
 const MONITOR_METRICS_NAMESPACE: &str = "Midnight/Monitor";
+const S5_PEAK_TPS_CHECK: &str = "metrics:s5-peak-tps";
 const PROOF_POOL_SEND_CHECK: &str = "proof-pool:send";
+const TEE_RESET_ENDPOINT_CHECK: &str = "tee:reset-endpoint";
 const MCP_STRESS_CHECK: &str = "mcp:stress";
 
 #[derive(Clone, Copy)]
@@ -75,6 +78,7 @@ struct Config {
     base_url: String,
     monitor_env: String,
     proof_pool_auth_token: Option<String>,
+    tee_reset_url: String,
     http_timeout_secs: u64,
     stress_wallets: usize,
     stress_txs: usize,
@@ -85,6 +89,12 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let base_url = required_env("BASE_URL")?;
+        let tee_reset_url = optional_env("MONITOR_TEE_RESET_URL")
+            .or_else(|| optional_env("TEE_RESET_URL"))
+            .unwrap_or_else(|| DEFAULT_TEE_RESET_URL.to_string());
+        reqwest::Url::parse(&tee_reset_url).with_context(|| {
+            format!("TEE reset URL must be a valid absolute URL: {tee_reset_url}")
+        })?;
         let stress_script_path = env::var_os("MCP_STRESS_SCRIPT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(default_stress_script_path);
@@ -93,6 +103,7 @@ impl Config {
             base_url: normalize_base_url(&base_url),
             monitor_env: required_env("MONITOR_ENV")?,
             proof_pool_auth_token: optional_env("PROOF_POOL_AUTH_TOKEN"),
+            tee_reset_url,
             http_timeout_secs: env_parse("HTTP_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT_SECS)?,
             stress_wallets: env_parse("STRESS_WALLETS", DEFAULT_STRESS_WALLETS)?,
             stress_txs: env_parse("STRESS_TXS", DEFAULT_STRESS_TXS)?,
@@ -113,7 +124,9 @@ struct MonitorReport {
     duration_ms: u128,
     all_checks_passed: bool,
     health_checks: Vec<HealthCheckResult>,
+    s5_peak_tps: OperationCheckResult<S5PeakTpsResult>,
     proof_pool_send: OperationCheckResult<ProofPoolSendResult>,
+    tee_reset_endpoint: OperationCheckResult<TeeEndpointResult>,
     mcp_stress: OperationCheckResult<StressRunResult>,
 }
 
@@ -139,12 +152,27 @@ struct ProofPoolSendResult {
 }
 
 #[derive(Debug, Serialize, Clone)]
+struct S5PeakTpsResult {
+    url: String,
+    status_code: u16,
+    tps: f64,
+    peak_tps: f64,
+    peak_tps_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct OperationCheckResult<T> {
     check: String,
     healthy: bool,
     latency_ms: u128,
     result: Option<T>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TeeEndpointResult {
+    url: String,
+    status_code: Option<u16>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -208,14 +236,22 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
     info!(base_url = config.base_url, "running service health checks");
     let health_checks = check_services(&client, &config.base_url).await;
 
+    info!("running s5 PeakTPS check");
+    let s5_peak_tps = run_s5_peak_tps_check(&client, &config).await;
+
     info!("running proof-pool send check");
     let proof_pool_send = run_proof_pool_send_check(&client, &config).await;
+
+    info!("running tee reset endpoint check");
+    let tee_reset_endpoint = run_tee_reset_endpoint_check(&client, &config).await;
 
     info!("running MCP stress check");
     let mcp_stress = run_mcp_stress_check(&config).await;
 
     let all_checks_passed = health_checks.iter().all(|result| result.healthy)
+        && s5_peak_tps.healthy
         && proof_pool_send.healthy
+        && tee_reset_endpoint.healthy
         && mcp_stress.healthy;
     let report = MonitorReport {
         request_id,
@@ -224,7 +260,9 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
         duration_ms: started.elapsed().as_millis(),
         all_checks_passed,
         health_checks,
+        s5_peak_tps,
         proof_pool_send,
+        tee_reset_endpoint,
         mcp_stress,
     };
 
@@ -324,6 +362,84 @@ async fn run_proof_pool_send_check(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct S5MetricsResponse {
+    #[serde(rename = "TPS")]
+    tps: f64,
+    #[serde(rename = "PeakTPS")]
+    peak_tps: f64,
+    #[serde(rename = "PeakTPSAtMs")]
+    peak_tps_at_ms: Option<i64>,
+}
+
+async fn run_s5_peak_tps_check(
+    client: &Client,
+    config: &Config,
+) -> OperationCheckResult<S5PeakTpsResult> {
+    let started = Instant::now();
+    match execute_s5_peak_tps_check(client, config).await {
+        Ok(result) => OperationCheckResult {
+            check: S5_PEAK_TPS_CHECK.to_string(),
+            healthy: true,
+            latency_ms: started.elapsed().as_millis(),
+            result: Some(result),
+            error: None,
+        },
+        Err(err) => OperationCheckResult {
+            check: S5_PEAK_TPS_CHECK.to_string(),
+            healthy: false,
+            latency_ms: started.elapsed().as_millis(),
+            result: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+async fn execute_s5_peak_tps_check(client: &Client, config: &Config) -> Result<S5PeakTpsResult> {
+    let url = format!("{}/metrics/s5", config.base_url);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("s5 metrics request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read s5 metrics response body")?;
+
+    parse_s5_peak_tps_response(url, status.as_u16(), &body)
+}
+
+fn parse_s5_peak_tps_response(
+    url: String,
+    status_code: u16,
+    body: &str,
+) -> Result<S5PeakTpsResult> {
+    if !(200..300).contains(&status_code) {
+        bail!(
+            "s5 metrics returned {}: {}",
+            status_code,
+            excerpt(body).unwrap_or_else(|| "<empty>".to_string())
+        );
+    }
+
+    let parsed: S5MetricsResponse = serde_json::from_str(body)
+        .with_context(|| format!("failed to parse s5 metrics response: {body}"))?;
+
+    if parsed.peak_tps <= 0.0 {
+        bail!("PeakTPS must be > 0, got {} from {}", parsed.peak_tps, url);
+    }
+
+    Ok(S5PeakTpsResult {
+        url,
+        status_code,
+        tps: parsed.tps,
+        peak_tps: parsed.peak_tps,
+        peak_tps_at_ms: parsed.peak_tps_at_ms,
+    })
+}
+
 async fn execute_proof_pool_send_check(
     client: &Client,
     config: &Config,
@@ -372,6 +488,74 @@ fn parse_proof_pool_send_response(status_code: u16, body: &str) -> Result<ProofP
     }
 
     Ok(parsed)
+}
+
+async fn run_tee_reset_endpoint_check(
+    client: &Client,
+    config: &Config,
+) -> OperationCheckResult<TeeEndpointResult> {
+    let started = Instant::now();
+    match execute_tee_reset_endpoint_check(client, config).await {
+        Ok(result) => OperationCheckResult {
+            check: TEE_RESET_ENDPOINT_CHECK.to_string(),
+            healthy: true,
+            latency_ms: started.elapsed().as_millis(),
+            result: Some(result),
+            error: None,
+        },
+        Err(err) => OperationCheckResult {
+            check: TEE_RESET_ENDPOINT_CHECK.to_string(),
+            healthy: false,
+            latency_ms: started.elapsed().as_millis(),
+            result: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+async fn execute_tee_reset_endpoint_check(
+    client: &Client,
+    config: &Config,
+) -> Result<TeeEndpointResult> {
+    let url = config.tee_reset_url.clone();
+    match client.post(&url).send().await {
+        Ok(response) => Ok(TeeEndpointResult {
+            url,
+            status_code: Some(response.status().as_u16()),
+        }),
+        Err(err) => {
+            let is_connection_refused = {
+                let mut current = Some(&err as &(dyn std::error::Error + 'static));
+                let mut found = false;
+                while let Some(error) = current {
+                    if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("connection refused")
+                    {
+                        found = true;
+                        break;
+                    }
+                    current = error.source();
+                }
+                found
+            };
+
+            if err.is_timeout() || is_connection_refused {
+                return Err(anyhow!("tee reset endpoint request failed: {err:#}"));
+            }
+
+            warn!(
+                url = %url,
+                error = format!("{err:#}"),
+                "tee reset endpoint request had a non-fatal transport error; treating endpoint as alive"
+            );
+            Ok(TeeEndpointResult {
+                url,
+                status_code: None,
+            })
+        }
+    }
 }
 
 async fn run_mcp_stress_check(config: &Config) -> OperationCheckResult<StressRunResult> {
@@ -511,7 +695,7 @@ fn emit_metrics(report: &MonitorReport) -> Result<()> {
 
 fn build_metric_events(report: &MonitorReport) -> Result<Vec<Value>> {
     let timestamp = current_timestamp_millis()?;
-    let mut events = Vec::with_capacity(report.health_checks.len() + 3);
+    let mut events = Vec::with_capacity(report.health_checks.len() + 5);
 
     events.push(json!({
         "_aws": {
@@ -546,10 +730,26 @@ fn build_metric_events(report: &MonitorReport) -> Result<Vec<Value>> {
     events.push(build_check_metric_event(
         timestamp,
         &report.environment,
+        &report.s5_peak_tps.check,
+        report.s5_peak_tps.healthy,
+        report.s5_peak_tps.latency_ms,
+        report.s5_peak_tps.error.as_deref(),
+    ));
+    events.push(build_check_metric_event(
+        timestamp,
+        &report.environment,
         &report.proof_pool_send.check,
         report.proof_pool_send.healthy,
         report.proof_pool_send.latency_ms,
         report.proof_pool_send.error.as_deref(),
+    ));
+    events.push(build_check_metric_event(
+        timestamp,
+        &report.environment,
+        &report.tee_reset_endpoint.check,
+        report.tee_reset_endpoint.healthy,
+        report.tee_reset_endpoint.latency_ms,
+        report.tee_reset_endpoint.error.as_deref(),
     ));
     events.push(build_check_metric_event(
         timestamp,
@@ -619,12 +819,36 @@ fn failed_checks(report: &MonitorReport) -> Vec<String> {
         })
         .collect::<Vec<_>>();
 
+    if !report.s5_peak_tps.healthy {
+        failures.push(format!(
+            "{} ({})",
+            report.s5_peak_tps.check,
+            report
+                .s5_peak_tps
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+        ));
+    }
+
     if !report.proof_pool_send.healthy {
         failures.push(format!(
             "{} ({})",
             report.proof_pool_send.check,
             report
                 .proof_pool_send
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+        ));
+    }
+
+    if !report.tee_reset_endpoint.healthy {
+        failures.push(format!(
+            "{} ({})",
+            report.tee_reset_endpoint.check,
+            report
+                .tee_reset_endpoint
                 .error
                 .as_deref()
                 .unwrap_or("unknown error")
@@ -755,10 +979,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        build_metric_events, failed_checks, parse_proof_pool_send_response, parse_stress_summary,
-        service_url, validate_stress_summary, HealthCheckResult, MonitorReport,
-        OperationCheckResult, ProofPoolSendResult, StressRunResult, MCP_STRESS_CHECK,
-        PROOF_POOL_SEND_CHECK,
+        build_metric_events, failed_checks, parse_proof_pool_send_response,
+        parse_s5_peak_tps_response, parse_stress_summary, service_url, validate_stress_summary,
+        HealthCheckResult, MonitorReport, OperationCheckResult, ProofPoolSendResult,
+        S5PeakTpsResult, StressRunResult, TeeEndpointResult, MCP_STRESS_CHECK,
+        PROOF_POOL_SEND_CHECK, S5_PEAK_TPS_CHECK, TEE_RESET_ENDPOINT_CHECK,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -790,7 +1015,7 @@ mod tests {
         let report = sample_report();
         let events = build_metric_events(&report).expect("metric events should build");
 
-        assert_eq!(events.len(), 11);
+        assert_eq!(events.len(), 13);
         assert_eq!(find_metric_value(&events[0], "Heartbeat"), Some(1));
         assert_eq!(find_metric_value(&events[0], "RunStatus"), Some(1));
 
@@ -829,6 +1054,18 @@ mod tests {
             .expect_err("response should fail");
 
         assert!(format!("{err:#}").contains("failed to parse proof-pool send response"));
+    }
+
+    #[test]
+    fn s5_peak_tps_parser_rejects_zero_peak_tps() {
+        let err = parse_s5_peak_tps_response(
+            "https://example.com/metrics/s5".to_string(),
+            200,
+            r#"{"TPS":0.12,"PeakTPS":0.0,"PeakTPSAtMs":123}"#,
+        )
+        .expect_err("PeakTPS == 0 should fail");
+
+        assert!(format!("{err:#}").contains("PeakTPS must be > 0"));
     }
 
     #[test]
@@ -910,6 +1147,19 @@ mod tests {
                 sample_health("health:oracle", "oracle"),
                 sample_health("health:proof-pool", "proof-pool"),
             ],
+            s5_peak_tps: OperationCheckResult {
+                check: S5_PEAK_TPS_CHECK.to_string(),
+                healthy: true,
+                latency_ms: 8,
+                result: Some(S5PeakTpsResult {
+                    url: "http://172.33.91.192/metrics/s5".to_string(),
+                    status_code: 200,
+                    tps: 3.25,
+                    peak_tps: 4.5,
+                    peak_tps_at_ms: Some(1_700_000_000_000),
+                }),
+                error: None,
+            },
             proof_pool_send: OperationCheckResult {
                 check: PROOF_POOL_SEND_CHECK.to_string(),
                 healthy: true,
@@ -920,6 +1170,16 @@ mod tests {
                     accepted: 1,
                     rejected: 0,
                     ready_proofs: 100,
+                }),
+                error: None,
+            },
+            tee_reset_endpoint: OperationCheckResult {
+                check: TEE_RESET_ENDPOINT_CHECK.to_string(),
+                healthy: true,
+                latency_ms: 12,
+                result: Some(TeeEndpointResult {
+                    url: "http://74.235.106.62:9898/reset".to_string(),
+                    status_code: Some(405),
                 }),
                 error: None,
             },

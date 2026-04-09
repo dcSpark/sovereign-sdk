@@ -25,7 +25,9 @@ locals {
     health_metrics    = "health:metrics"
     health_oracle     = "health:oracle"
     health_proof_pool = "health:proof-pool"
+    metrics_s5_peak   = "metrics:s5-peak-tps"
     proof_pool_send   = "proof-pool:send"
+    tee_reset         = "tee:reset-endpoint"
     mcp_stress        = "mcp:stress"
   }
 }
@@ -79,6 +81,14 @@ resource "aws_security_group" "monitor_lambda" {
     protocol    = "tcp"
     cidr_blocks = [local.monitor_target_host_cidr]
   }
+
+  egress {
+    description = "TEE reset endpoint"
+    from_port   = var.monitor_tee_reset_port
+    to_port     = var.monitor_tee_reset_port
+    protocol    = "tcp"
+    cidr_blocks = [var.monitor_tee_reset_host_cidr]
+  }
 }
 
 resource "aws_lambda_function" "monitor" {
@@ -96,6 +106,7 @@ resource "aws_lambda_function" "monitor" {
       BASE_URL              = var.monitor_base_url
       MONITOR_ENV           = var.monitor_env
       PROOF_POOL_AUTH_TOKEN = var.monitor_proof_pool_auth_token
+      TEE_RESET_URL         = var.monitor_tee_reset_url
       RUST_LOG              = "info"
     }
   }

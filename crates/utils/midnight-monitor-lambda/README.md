@@ -5,7 +5,9 @@ Lambda-friendly monitor for the Ligero deployment behind the nginx routes.
 It checks:
 
 - service health endpoints under `BASE_URL/<service>/...`
+- `GET BASE_URL/metrics/s5` and requires `PeakTPS > 0`
 - `POST BASE_URL/proof-pool/send` with `proof_quantity=1`
+- `POST TEE_RESET_URL` without auth and treats any returned HTTP status as proof the endpoint is alive; only timeout or connection-refused failures mark it unhealthy
 - `scripts/mcp-external-stress.sh` against `BASE_URL/mcp/mcp` with 3 wallets and 1 tx by default
 - emits CloudWatch Embedded Metric Format events under the `Midnight/Monitor` namespace
 
@@ -14,6 +16,7 @@ It checks:
 - `BASE_URL` (required), for example `https://midnight-l2-testnet.shinkai.com`
 - `MONITOR_ENV` (required), for example `midnight-l2-testnet`
 - `PROOF_POOL_AUTH_TOKEN` (optional, but needed if `/proof-pool/send` is protected)
+- `MONITOR_TEE_RESET_URL` (optional; falls back to `TEE_RESET_URL`, default `http://74.235.106.62:9898/reset`)
 - `HTTP_TIMEOUT_SECS` (default `10`)
 - `STRESS_WALLETS` (default `3`)
 - `STRESS_TXS` (default `1`)
@@ -39,7 +42,9 @@ The emitted `Check` dimension values are:
 - `health:metrics`
 - `health:oracle`
 - `health:proof-pool`
+- `metrics:s5-peak-tps`
 - `proof-pool:send`
+- `tee:reset-endpoint`
 - `mcp:stress`
 
 The MCP stress check is considered healthy as long as at least one of the configured sends succeeds.
@@ -70,6 +75,7 @@ Before applying the Terraform monitor resources, provide:
 
 - a pushed ARM64 image tag in ECR for `midnight-monitor-lambda`
 - `monitor_proof_pool_auth_token`
+- `monitor_tee_reset_url` plus matching network egress settings if the TEE endpoint changes
 - `slack_workspace_id`
 - `slack_channel_id`
 - `slack_channel_name`
