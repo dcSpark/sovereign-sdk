@@ -18,8 +18,9 @@ pub struct MidnightPrivacyConfig<S: Spec> {
     /// Size of the recent roots window (how many recent roots to keep)
     pub root_window_size: u32,
 
-    /// Ligero method ID (code commitment) of the guest program that verifies spend proofs.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies spend proofs.
+    /// For Ligero: SHA-256(WASM program bytes || packing parameter).
+    /// For Nightstream: SHA-256(ROM bytes).
     pub method_id: [u8; 32],
 
     /// Admin of the module who can update the method ID.

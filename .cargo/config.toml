@@ -1,3 +1,10 @@
+[env]
+# Skip guest (zkVM) builds by default during development. Guest compilation
+# targets RISC-V and pulls in crates incompatible with the host, causing long
+# build times and errors in rust-analyzer. Override with SKIP_GUEST_BUILD=0
+# when you actually need to compile guest code.
+SKIP_GUEST_BUILD = { value = "1", force = false }
+
 [build]
 # See <https://github.com/Sovereign-Labs/sovereign-sdk-wip/issues/1196>: it might break.
 # But right now it seems to work.

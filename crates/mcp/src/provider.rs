@@ -10,9 +10,25 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use borsh::{self, BorshDeserialize};
+use demo_stf::runtime::Runtime as DemoRuntime;
+use midnight_privacy::CallMessage as MidnightCallMessage;
+use sov_address::MultiAddressEvm;
 use sov_bank::TokenId;
-use sov_modules_api::{Amount, CryptoSpec, Spec};
+use sov_mock_da::MockDaSpec;
+use sov_mock_zkvm::MockZkvm;
+use sov_modules_api::{
+    configurable_spec::ConfigurableSpec, execution_mode::Native,
+    transaction::{Transaction, Version0, VersionedTx}, Amount, CryptoSpec, SafeVec, Spec,
+};
 use sov_node_client::NodeClient;
+use sov_nightstream_adapter::Nightstream;
+
+use crate::nightstream::ProofRef;
+
+type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
+type McpRuntime = DemoRuntime<McpSpec>;
+type McpTransaction = Transaction<McpRuntime, McpSpec>;
 
 /// Chain data from the rollup schema
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -81,6 +97,69 @@ pub struct ListTransactionsResponse {
     /// Total number of matching transactions (optional)
     #[serde(default)]
     pub total: Option<u64>,
+}
+
+fn strip_midnight_proof_from_signed_tx(raw_tx: &[u8]) -> Result<Vec<u8>> {
+    let tx: McpTransaction =
+        BorshDeserialize::try_from_slice(raw_tx).context("Failed to deserialize signed transaction")?;
+
+    match &tx.versioned_tx {
+        VersionedTx::V0(v0) => {
+            let runtime_call = match &v0.runtime_call {
+                demo_stf::runtime::RuntimeCall::MidnightPrivacy(midnight_call) => {
+                    let stripped_call = match midnight_call {
+                        MidnightCallMessage::Transfer {
+                            anchor_root,
+                            nullifiers,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Transfer {
+                            proof: SafeVec::new(),
+                            anchor_root: *anchor_root,
+                            nullifiers: nullifiers.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        MidnightCallMessage::Withdraw {
+                            anchor_root,
+                            nullifier,
+                            withdraw_amount,
+                            to,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Withdraw {
+                            proof: SafeVec::new(),
+                            anchor_root: *anchor_root,
+                            nullifier: *nullifier,
+                            withdraw_amount: *withdraw_amount,
+                            to: to.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        _ => return Ok(raw_tx.to_vec()),
+                    };
+
+                    demo_stf::runtime::RuntimeCall::MidnightPrivacy(stripped_call)
+                }
+                _ => return Ok(raw_tx.to_vec()),
+            };
+
+            let lightweight_tx = McpTransaction {
+                versioned_tx: VersionedTx::V0(Version0 {
+                    signature: v0.signature.clone(),
+                    pub_key: v0.pub_key.clone(),
+                    runtime_call,
+                    uniqueness: v0.uniqueness.clone(),
+                    details: v0.details.clone(),
+                }),
+            };
+
+            borsh::to_vec(&lightweight_tx)
+                .context("Failed to serialize proof-stripped signed transaction")
+        }
+    }
 }
 
 /// Provider for RPC communication with the Sovereign rollup
@@ -217,26 +296,40 @@ impl Provider {
     /// This method submits a borsh-serialized transaction to the verifier service,
     /// which will verify the proof and then submit to the sequencer.
     /// Returns the transaction hash from the verifier response.
-    pub async fn submit_to_verifier(&self, raw_tx: Vec<u8>) -> Result<String> {
+    pub async fn submit_to_verifier(
+        &self,
+        raw_tx: Vec<u8>,
+        proof_ref: Option<&ProofRef>,
+    ) -> Result<String> {
         use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
         use base64::Engine as _;
 
-        let tx_b64 = BASE64_STANDARD.encode(&raw_tx);
+        let tx_body = if proof_ref.is_some() {
+            let lightweight_tx = strip_midnight_proof_from_signed_tx(&raw_tx)
+                .context("Failed to strip proof from signed midnight transaction")?;
+            BASE64_STANDARD.encode(&lightweight_tx)
+        } else {
+            BASE64_STANDARD.encode(&raw_tx)
+        };
+        let proof_ref = proof_ref.cloned();
         // Trim trailing slash from verifier_url to avoid double slashes
         let base_url = self.verifier_url.trim_end_matches('/');
         let endpoint = format!("{}/midnight-privacy", base_url);
 
         tracing::info!("Submitting transaction to verifier service at {}", endpoint);
         tracing::debug!(
-            "Transaction size: {} bytes, base64 size: {} bytes",
+            "Transaction size: {} bytes, request body size: {} bytes",
             raw_tx.len(),
-            tx_b64.len()
+            tx_body.len()
         );
 
         let resp = self
             .http_client
             .post(&endpoint)
-            .json(&serde_json::json!({ "body": tx_b64 }))
+            .json(&serde_json::json!({
+                "body": tx_body,
+                "proof_ref": proof_ref,
+            }))
             .send()
             .await
             .context("Failed to send transaction to verifier service")?;

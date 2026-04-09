@@ -1,16 +1,14 @@
 //! Transfer operation for Midnight Privacy module
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    inv_enforce_v2, nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32,
     PrivacyAddress, SpendPublic,
 };
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
-use sov_ligero_adapter::{Ligero as LigeroAdapter, LigeroProofPackage};
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -18,18 +16,28 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
+use sov_nightstream_adapter::{
+    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
+};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
 use crate::commitment_tree::global_tree_syncer;
 use crate::fvk_service::ViewerFvkBundle;
-use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::nightstream::Nightstream;
 use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<
+    MockDaSpec,
+    sov_nightstream_adapter::Nightstream,
+    MockZkvm,
+    MultiAddressEvm,
+    Native,
+>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
@@ -258,7 +266,7 @@ async fn create_transfer_unsigned_tx(
 ///
 /// If `send_amount` == `sum(inputs)`, creates 1 output (no change).
 pub async fn transfer(
-    ligero: &Ligero,
+    nightstream: &Nightstream,
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     spend_sk: Hash32,
@@ -500,472 +508,135 @@ pub async fn transfer(
         anyhow::bail!("Destination privacy address is frozen (blacklisted)");
     }
 
-    // Note: The proof service generates raw proof bytes; we still package the proof
-    // with the public output (SpendPublic) for verifier compatibility.
-
-    // Step 5: Generate ZK proof
-    tracing::debug!("Generating ZK proof with {} output(s)...", num_outputs);
-
-    use ligetron::bn254fr_native::submod_checked;
-    use ligetron::Bn254Fr;
-
-    fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
-        let mut out = Bn254Fr::new();
-        out.set_bytes_big(h);
-        out
-    }
-
-    fn inv_enforce_v2(
-        in_values: &[u64],
-        in_rhos: &[Hash32],
-        out_values: &[u64],
-        out_rhos: &[Hash32],
-    ) -> Hash32 {
-        let mut enforce_prod = Bn254Fr::from_u32(1);
-
-        for v in in_values {
-            enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-        }
-        for v in out_values {
-            enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-        }
-
-        let mut delta = Bn254Fr::new();
-        for out_rho in out_rhos {
-            let out_fr = bn254fr_from_hash32_be(out_rho);
-            for in_rho in in_rhos {
-                let in_fr = bn254fr_from_hash32_be(in_rho);
-                submod_checked(&mut delta, &out_fr, &in_fr);
-                enforce_prod.mulmod_checked(&delta);
-            }
-        }
-        if out_rhos.len() == 2 {
-            let a = bn254fr_from_hash32_be(&out_rhos[0]);
-            let b = bn254fr_from_hash32_be(&out_rhos[1]);
-            submod_checked(&mut delta, &a, &b);
-            enforce_prod.mulmod_checked(&delta);
-        }
-
-        let mut inv = enforce_prod.clone();
-        inv.inverse();
-        inv.to_bytes_be()
-    }
-
-    let n_in: usize = inputs.len();
-    let n_out: usize = if has_change { 2 } else { 1 };
-    let withdraw_amount: u64 = 0;
-    let withdraw_to: Hash32 = [0u8; 32];
-
-    let mut out_values: Vec<u64> = vec![send_amount_u64];
-    let mut out_rhos: Vec<Hash32> = vec![out_rho_0];
-    if has_change {
-        out_values.push(change_amount_u64);
-        out_rhos.push(out_rho_1.expect("change rho set when has_change"));
-    }
-    let inv_enforce = inv_enforce_v2(&in_values_u64, &in_rhos, &out_values, &out_rhos);
-
-    fn u64_to_i64(v: u64, label: &'static str) -> Result<i64> {
-        i64::try_from(v).with_context(|| {
-            format!("{label} does not fit into i64 (required by note_spend_guest v2 ABI)")
+    // Step 5: Build NoteSpendWitness, SpendPublic, and generate Nightstream proof
+    let witness_inputs: Vec<NoteSpendInput> = (0..in_values_u64.len())
+        .map(|i| NoteSpendInput {
+            value: in_values_u64[i],
+            rho: in_rhos[i],
+            sender_id: in_sender_ids[i],
+            position: positions[i] as u32,
+            siblings: siblings_by_input[i].clone(),
+            nullifier: nullifiers[i],
         })
-    }
+        .collect();
 
-    fn arg32(b: &Hash32) -> LigeroProgramArguments {
-        LigeroProgramArguments::HexBytesB64 {
-            hex: hex::encode(b),
-            bytes_b64: general_purpose::STANDARD.encode(b),
-        }
-    }
-
-    // Build args + private indices in the exact order required by note_spend_guest v2.
-    let mut private_indices: Vec<u32> = Vec::new();
-    let mut proof_args: Vec<LigeroProgramArguments> = Vec::new();
-    let push = |arg: LigeroProgramArguments,
-                private: bool,
-                private_indices: &mut Vec<u32>,
-                proof_args: &mut Vec<LigeroProgramArguments>| {
-        proof_args.push(arg);
-        if private {
-            private_indices.push(proof_args.len() as u32); // 1-based
-        }
-    };
-
-    // Header:
-    push(arg32(&DOMAIN), false, &mut private_indices, &mut proof_args); // 1 domain
-    push(
-        arg32(&spend_sk),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 2 spend_sk
-    push(
-        arg32(&pk_ivk_owner),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 3 pk_ivk_owner
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(depth as u64, "depth")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 4 depth
-    push(
-        arg32(&anchor_root),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 5 anchor
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(n_in as u64, "n_in")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 6 n_in
-
-    // Inputs (0..n_in)
-    for i in 0..n_in {
-        // value_in_i [PRIVATE]
-        push(
-            LigeroProgramArguments::I64 {
-                i64: u64_to_i64(in_values_u64[i], "value_in")?,
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // rho_in_i [PRIVATE]
-        push(
-            arg32(&in_rhos[i]),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // sender_id_in_i [PRIVATE]
-        push(
-            arg32(&in_sender_ids[i]),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // pos_i [PRIVATE]
-        push(
-            LigeroProgramArguments::I64 {
-                i64: u64_to_i64(positions[i], "pos")?,
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // siblings_i[k] [PRIVATE]
-        for s in &siblings_by_input[i] {
-            push(arg32(s), true, &mut private_indices, &mut proof_args);
-        }
-        // nullifier_i [PUBLIC]
-        push(
-            arg32(&nullifiers[i]),
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
-    }
-
-    // Withdraw binding.
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(withdraw_amount, "withdraw_amount")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&withdraw_to),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(n_out as u64, "n_out")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Output 0.
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(send_amount_u64, "value_out_0")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&out_rho_0),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&destination_pk_spend),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&destination_pk_ivk),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&cm_out_0),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Output 1 (change).
+    let mut witness_outputs = vec![NoteSpendOutput {
+        value: send_amount_u64,
+        rho: out_rho_0,
+        pk_spend: destination_pk_spend,
+        pk_ivk: destination_pk_ivk,
+        cm: cm_out_0,
+    }];
     if has_change {
-        let rho1 = out_rho_1.expect("change rho set when has_change");
-        let cm1 = cm_out_1.expect("change cm set when has_change");
-        push(
-            LigeroProgramArguments::I64 {
-                i64: u64_to_i64(change_amount_u64, "value_out_1")?,
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(arg32(&rho1), true, &mut private_indices, &mut proof_args);
-        push(
-            arg32(&pk_spend_owner),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(
-            arg32(&pk_ivk_owner),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(arg32(&cm1), false, &mut private_indices, &mut proof_args);
+        witness_outputs.push(NoteSpendOutput {
+            value: change_amount_u64,
+            rho: out_rho_1.unwrap(),
+            pk_spend: pk_spend_owner,
+            pk_ivk: pk_ivk_owner,
+            cm: cm_out_1.unwrap(),
+        });
     }
 
-    // inv_enforce (private).
-    push(
-        arg32(&inv_enforce),
-        true,
-        &mut private_indices,
-        &mut proof_args,
+    let mut out_values_for_inv = vec![send_amount_u64];
+    let mut out_rhos_for_inv = vec![out_rho_0];
+    if has_change {
+        out_values_for_inv.push(change_amount_u64);
+        out_rhos_for_inv.push(out_rho_1.unwrap());
+    }
+    let inv_enforce = inv_enforce_v2(
+        &in_values_u64,
+        &in_rhos,
+        &out_values_for_inv,
+        &out_rhos_for_inv,
     );
 
-    // === Deny-map (blacklist) arguments ===
-    //
-    // ABI extension (note_spend_guest v2 w/ deny-map buckets):
-    //   - blacklist_root (PUBLIC)
-    //   - for each checked id:
-    //       bucket_entries[BLACKLIST_BUCKET_SIZE] (PRIVATE)
-    //       bucket_inv (PRIVATE)
-    //       bucket_siblings[BLACKLIST_TREE_DEPTH] (PRIVATE)
-    //
-    // Viewer arguments, if any, come AFTER this section.
-    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-    anyhow::ensure!(
-        sender_opening.siblings.len() == bl_depth,
-        "sender deny-map opening has wrong sibling length: got {}, expected {}",
-        sender_opening.siblings.len(),
-        bl_depth
-    );
-    anyhow::ensure!(
-        dest_opening.siblings.len() == bl_depth,
-        "destination deny-map opening has wrong sibling length: got {}, expected {}",
-        dest_opening.siblings.len(),
-        bl_depth
-    );
+    let mut blacklist_proofs = vec![BlacklistProof::from_opening(
+        &sender_opening.recipient,
+        sender_opening.bucket_entries,
+        sender_opening.siblings.clone(),
+    )];
+    blacklist_proofs.push(BlacklistProof::from_opening(
+        &dest_opening.recipient,
+        dest_opening.bucket_entries,
+        dest_opening.siblings.clone(),
+    ));
 
-    fn bl_bucket_inv_for_id(
-        id: &Hash32,
-        bucket_entries: &midnight_privacy::BlacklistBucketEntries,
-    ) -> Result<Hash32> {
-        let id_fr = bn254fr_from_hash32_be(id);
-        let mut prod = Bn254Fr::from_u32(1);
-        let mut delta = Bn254Fr::new();
-        for e in bucket_entries.iter() {
-            let e_fr = bn254fr_from_hash32_be(e);
-            submod_checked(&mut delta, &id_fr, &e_fr);
-            prod.mulmod_checked(&delta);
+    let viewer_witnesses: Vec<ViewerWitness> = if let Some(ref atts) = view_attestations {
+        if let Some(ref bundle) = viewer_fvk_bundle {
+            vec![ViewerWitness {
+                fvk_commitment: atts[0].fvk_commitment,
+                fvk: bundle.fvk,
+                per_output: atts
+                    .iter()
+                    .map(|a| ViewerOutputWitness {
+                        ct_hash: a.ct_hash,
+                        mac: a.mac,
+                    })
+                    .collect(),
+            }]
+        } else {
+            vec![]
         }
-        anyhow::ensure!(
-            !prod.is_zero(),
-            "deny-map bucket collision: id is present in bucket entries"
-        );
-        let mut inv = prod.clone();
-        inv.inverse();
-        Ok(inv.to_bytes_be())
-    }
-
-    push(
-        arg32(&blacklist_root),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Opening 0: sender_id (spender identity)
-    for e in sender_opening.bucket_entries.iter() {
-        push(arg32(e), true, &mut private_indices, &mut proof_args);
-    }
-    let sender_inv =
-        bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
-    push(
-        arg32(&sender_inv),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    for sib in sender_opening.siblings.iter().take(bl_depth) {
-        push(arg32(sib), true, &mut private_indices, &mut proof_args);
-    }
-
-    // Opening 1: pay recipient (transfer only; change outputs are enforced to be self in-circuit).
-    for e in dest_opening.bucket_entries.iter() {
-        push(arg32(e), true, &mut private_indices, &mut proof_args);
-    }
-    let dest_inv = bl_bucket_inv_for_id(&dest_opening.recipient, &dest_opening.bucket_entries)?;
-    push(
-        arg32(&dest_inv),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    for sib in dest_opening.siblings.iter().take(bl_depth) {
-        push(arg32(sib), true, &mut private_indices, &mut proof_args);
-    }
-
-    // Viewer section arguments (Level B) if viewer FVK is configured.
-    let viewer_fvk_commitment_arg_idx: Option<usize> = if let (Some(ref bundle), Some(ref atts)) =
-        (viewer_fvk_bundle.as_ref(), &view_attestations)
-    {
-        // n_viewers
-        push(
-            LigeroProgramArguments::I64 { i64: 1 },
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        let fvk_commitment_arg_idx = proof_args.len();
-        // fvk_commitment (public)
-        push(
-            arg32(&bundle.fvk_commitment),
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // fvk (private)
-        push(
-            arg32(&bundle.fvk),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // For each output, ct_hash + mac (public)
-        for att in atts.iter().take(n_out) {
-            push(
-                arg32(&att.ct_hash),
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
-            push(
-                arg32(&att.mac),
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
-        }
-        Some(fvk_commitment_arg_idx)
     } else {
-        None
+        vec![]
     };
 
-    // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
-    let proof_args_for_package = proof_args.clone();
-    let private_indices_for_package: Vec<usize> =
-        private_indices.iter().map(|i| *i as usize).collect();
+    let witness = NoteSpendWitness {
+        domain: DOMAIN,
+        spend_sk,
+        pk_ivk_owner,
+        depth: depth as u32,
+        anchor: anchor_root,
+        inputs: witness_inputs,
+        withdraw_amount: 0,
+        withdraw_to: [0u8; 32],
+        outputs: witness_outputs,
+        inv_enforce,
+        blacklist_root,
+        blacklist_proofs,
+        viewers: viewer_witnesses,
+    };
 
-    let proof_start = StdInstant::now();
-    let proof_bytes_raw = ligero
-        .generate_proof(private_indices, proof_args)
-        .await
-        .inspect_err(|e| tracing::error!("Failed to generate Ligero proof for transfer: {:?}", e))
-        .context("Failed to generate Ligero proof for transfer")?;
-    timing_proof_ms = proof_start.elapsed().as_millis();
-
-    tracing::debug!(
-        elapsed_ms = timing_proof_ms,
-        proof_bytes_len = proof_bytes_raw.len(),
-        "Generated proof bytes"
-    );
-
-    // Package proof with public outputs (SpendPublic) for verifier compatibility
     let mut output_commitments = vec![cm_out_0];
     if has_change {
         output_commitments.push(cm_out_1.unwrap());
     }
-    let public_output = SpendPublic {
+    let public = SpendPublic {
         anchor_root,
         blacklist_root,
         nullifiers: nullifiers.clone(),
-        withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
+        withdraw_amount: 0,
         output_commitments,
         view_attestations,
     };
 
-    let mut args_json_values: Vec<serde_json::Value> = proof_args_for_package
-        .iter()
-        .map(|a| serde_json::to_value(a))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("Failed to serialize Ligero args to JSON values for package")?;
-
-    if let (Some(idx), Some(ref bundle)) =
-        (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref())
-    {
-        let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"
-            )
-        })?;
-        obj.insert(
-            "pool_sig_hex".to_string(),
-            serde_json::Value::String(bundle.pool_sig_hex.clone()),
-        );
-    }
-
-    let args_json = serde_json::to_vec(&args_json_values)
-        .context("Failed to serialize Ligero args for package")?;
-    let proof_package = LigeroProofPackage::new(
-        proof_bytes_raw,
-        bincode::serialize(&public_output).context("Failed to serialize spend public output")?,
-        args_json,
-        private_indices_for_package,
-    )
-    .context("Failed to build LigeroProofPackage")?;
-
-    let proof_bytes =
-        bincode::serialize(&proof_package).context("Failed to serialize Ligero proof package")?;
     tracing::debug!(
-        proof_package_len = proof_bytes.len(),
-        "Serialized Ligero proof package for submission"
+        "Generating Nightstream ZK proof with {} output(s)...",
+        num_outputs
     );
+    let proof_start = StdInstant::now();
+    let pool_viewer_signature = viewer_fvk_bundle.as_ref().map(|bundle| {
+        crate::nightstream::PoolViewerSignature {
+            fvk_commitment: bundle.fvk_commitment,
+            pool_sig_hex: bundle.pool_sig_hex.clone(),
+        }
+    });
+    let generated_proof = nightstream
+        .generate_proof(&witness, &public, pool_viewer_signature.as_ref())
+        .await
+        .inspect_err(|e| {
+            tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e)
+        })
+        .context("Failed to generate Nightstream proof for transfer")?;
+    timing_proof_ms = proof_start.elapsed().as_millis();
+
+    tracing::debug!(
+        elapsed_ms = timing_proof_ms,
+        proof_bytes_len = generated_proof.proof_bytes.len(),
+        using_proof_ref = generated_proof.proof_ref.is_some(),
+        "Generated Nightstream proof"
+    );
+    let proof_bytes = generated_proof.proof_bytes;
 
     // Step 6: Create and sign transaction
     let unsigned_tx_start = StdInstant::now();
@@ -999,7 +670,7 @@ pub async fn transfer(
     // Step 7: Submit transaction to verifier service
     let submit_start = StdInstant::now();
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, generated_proof.proof_ref.as_ref())
         .await
         .context("Failed to submit transaction to verifier service")?;
     let tx_hash = submit_result.tx_hash;

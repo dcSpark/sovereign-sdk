@@ -26,7 +26,7 @@ sha2 = { workspace = true }
 anyhow = { workspace = true }
 sov-modules-api = { workspace = true }
 sov-rollup-interface = { workspace = true }
-sov-ligero-adapter = { workspace = true }
+sov-nightstream-adapter = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -41,6 +41,6 @@ native = [
     "sov-rollup-interface/native",
     "sov-state/native",
     "sov-address/native",
-    "sov-ligero-adapter/native"
+    "sov-nightstream-adapter/native"
 ]
 

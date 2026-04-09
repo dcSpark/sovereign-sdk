@@ -8,8 +8,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use demo_stf::runtime::{Runtime, RuntimeCall};
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use midnight_privacy::{
     nf_key_from_sk, note_commitment, nullifier, pk_from_sk, pk_ivk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
@@ -36,17 +34,15 @@ use sov_test_utils::default_test_signed_transaction;
 use tokio::time::sleep;
 
 use crate::fvk_service::fetch_viewer_fvk_bundle;
-use crate::pool_fvk::{
-    decode_ligero_hash32_arg, ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes,
-};
+use crate::pool_fvk::{ensure_pool_fvk_pk_env, inject_pool_sig_hex_into_proof_bytes};
 use crate::{
     find_rollup_binary, make_viewer_bundle, setup_ligero_env, start_local_verifier, wait_for_ready,
     ChildGuard,
 };
-use sov_rollup_ligero::MockDemoRollup;
+use sov_rollup_nightstream::NightstreamRollup;
 
-// Match the spec used by the demo rollup binary
-type DemoRollupSpec = <MockDemoRollup<Native> as RollupBlueprint<Native>>::Spec;
+// Match the spec used by the nightstream rollup binary
+type DemoRollupSpec = <NightstreamRollup<Native> as RollupBlueprint<Native>>::Spec;
 
 /// Must match the domain used by the MidnightPrivacy module (genesis config).
 const DOMAIN: Hash32 = [1u8; 32];
@@ -586,7 +582,7 @@ fn prepare_environment(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn sov-rollup-ligero")?;
+        .context("Failed to spawn rollup-nightstream")?;
 
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
@@ -1611,7 +1607,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
     };
 
     // Check cache and generate proofs in parallel (with concurrency limit)
-    use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+    use sov_rollup_interface::zk::ZkvmHost;
     let depth_usize = TREE_DEPTH as usize;
     let viewer_fvk_commitment_arg_pos: Option<usize> = if expected_viewer_fvk_commitment.is_some() {
         // note_spend_guest v2 fixed layout:
@@ -1667,21 +1663,20 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                                 let proof_bytes = cached_proof_bytes
                                     .as_ref()
                                     .expect("cached_proof_bytes must be Some here");
-                                let package: sov_ligero_adapter::LigeroProofPackage =
+                                let package: sov_nightstream_adapter::NightstreamProofPackage =
                                     bincode::deserialize(proof_bytes).context(
-                                        "cached proof payload is not a LigeroProofPackage",
+                                        "cached proof payload is not a NightstreamProofPackage",
                                     )?;
-                                let args: Vec<JsonValue> =
-                                    serde_json::from_slice(&package.args_json)
-                                        .context("cached proof args_json is not valid JSON")?;
-                                anyhow::ensure!(
-                                    args.len() >= arg_pos,
-                                    "cached proof args too short"
-                                );
-                                decode_ligero_hash32_arg(
-                                    &args[arg_pos - 1],
-                                    "viewer.fvk_commitment",
+                                let public: SpendPublic = bincode::deserialize(
+                                    &package.public_output,
                                 )
+                                .context("cached proof public_output is not valid SpendPublic")?;
+                                public
+                                    .view_attestations
+                                    .as_ref()
+                                    .and_then(|v| v.first())
+                                    .map(|va| va.fvk_commitment)
+                                    .ok_or_else(|| anyhow!("No view attestations in cached proof"))
                             })()
                             .ok();
 
@@ -1736,7 +1731,7 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         let siblings = mt.open(position as usize);
         let anchor = shared_anchor;
         let sem = semaphore.clone();
-        let program_path_for_host = program_path_for_host.clone();
+        let _program_path_for_host = program_path_for_host.clone();
         let viewer_fvk = viewer_fvk; // Option<Hash32>, Copy
         let pool_sig_hex = pool_sig_hex.clone();
         let client = client.clone();
@@ -1804,8 +1799,10 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                 bl_depth
             );
 
+            let sender_bl_recipient = sender_opening.recipient;
             let sender_bl_bucket_entries = sender_opening.bucket_entries;
             let sender_bl_siblings = sender_opening.siblings;
+            let out_bl_recipient = out_opening.recipient;
             let out_bl_bucket_entries = out_opening.bucket_entries;
             let out_bl_siblings = out_opening.siblings;
 
@@ -1886,172 +1883,84 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
                     view_attestations,
                 };
 
-                let n_out: usize = 1;
-                // LigeroConfig private indices are 1-based (by argument position).
-                let mut private_indices: Vec<usize> = Vec::new();
-                private_indices.extend_from_slice(&[2, 3]); // spend_sk, pk_ivk_owner
+                // Compute inv_enforce for the enforce-product check.
+                let in_values = vec![out_value_u64];
+                let in_rhos = vec![rho];
+                let out_values = vec![out_value_u64];
+                let out_rhos = vec![out_rho];
+                let inv_enforce = midnight_privacy::inv_enforce_v2(
+                    &in_values, &in_rhos, &out_values, &out_rhos,
+                );
 
-                let n_in: usize = 1;
-                let per_in = 5usize + depth_usize;
-                let withdraw_idx = 7usize + n_in * per_in;
-                let outs_base = withdraw_idx + 3;
-
-                // Input 0 private args.
-                private_indices.extend_from_slice(&[7, 8, 9, 10]); // value_in, rho_in, sender_id_in, pos
-                // siblings [11..11+depth)
-                for j in 0..depth_usize {
-                    private_indices.push(11 + j);
-                }
-
-                // output 0 private args:
-                let out_base = outs_base;
-                private_indices.extend_from_slice(&[
-                    out_base,     // value_out
-                    out_base + 1, // rho_out
-                    out_base + 2, // pk_spend_out
-                    out_base + 3, // pk_ivk_out
-                ]);
-                // inv_enforce (private)
-                let inv_enforce_idx = outs_base + 5 * n_out;
-                private_indices.push(inv_enforce_idx);
-
-                // Deny-map (blacklist) section:
-                // - blacklist_root is PUBLIC (comes right after inv_enforce)
-                // - for each checked id: bucket_entries[BLACKLIST_BUCKET_SIZE] + bucket_inv + siblings[BLACKLIST_TREE_DEPTH]
-                let bl_root_idx = inv_enforce_idx + 1;
-                let bl_args_start = bl_root_idx + 1;
-                let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-                let bl_per_check =
-                    midnight_privacy::BLACKLIST_BUCKET_SIZE + 1usize + bl_depth;
-                // Transfers: sender_id + pay recipient.
-                let bl_checks = 2usize;
-                for j in 0..(bl_checks * bl_per_check) {
-                    private_indices.push(bl_args_start + j);
-                }
-
-                // Viewer section: fvk is private (when enabled) and comes after the deny-map.
-                if viewer_data.is_some() {
-                    let n_viewers_idx = bl_args_start + bl_checks * bl_per_check;
-                    private_indices.push(n_viewers_idx + 2);
-                }
-                let fvk_commitment_arg_pos =
-                    viewer_data
-                        .is_some()
-                        .then_some(bl_args_start + bl_checks * bl_per_check + 1);
-
-                let program_path = program_path_for_host.as_ref().clone();
-                let mut host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_path)
-                    .with_private_indices(private_indices);
-
-                // Typed binary ABI for zkVM performance (matches note_spend_guest v2 argument layout)
-                host.add_hex_arg(hex::encode(domain)); // 1 domain (PUBLIC)
-                host.add_hex_arg(hex::encode(spend_sk)); // 2 spend_sk (PRIVATE)
-                host.add_hex_arg(hex::encode(pk_ivk_owner)); // 3 pk_ivk_owner (PRIVATE)
-                host.add_u64_arg(depth_usize as u64); // 4 depth (PUBLIC)
-                host.add_hex_arg(hex::encode(anchor)); // 5 anchor (PUBLIC)
-                host.add_u64_arg(1); // 6 n_in (PUBLIC)
-
-                host.add_u64_arg(out_value_u64); // 7 value_in (PRIVATE)
-                host.add_hex_arg(hex::encode(rho)); // 8 rho_in (PRIVATE)
-                host.add_hex_arg(hex::encode(in_sender_id)); // 9 sender_id_in (PRIVATE)
-                host.add_u64_arg(position as u64); // 10 pos (PRIVATE)
-                for s in &siblings {
-                    host.add_hex_arg(hex::encode(s));
-                }
-                host.add_hex_arg(hex::encode(nf)); // nullifier (PUBLIC)
-                host.add_u64_arg(0); // withdraw_amount (PUBLIC)
-                host.add_hex_arg(hex::encode([0u8; 32])); // withdraw_to (PUBLIC; must be 0 for transfers)
-                host.add_u64_arg(n_out as u64); // n_out (PUBLIC)
-
-                // Output 0
-                host.add_u64_arg(out_value_u64);
-                host.add_hex_arg(hex::encode(out_rho));
-                host.add_hex_arg(hex::encode(out_pk_spend));
-                host.add_hex_arg(hex::encode(out_pk_ivk));
-                host.add_hex_arg(hex::encode(cm_out));
-
-                // inv_enforce (PRIVATE)
-                let inv_enforce = {
-                    let mut enforce_prod = Bn254Fr::from_u32(1);
-                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(out_value_u64));
-                    enforce_prod.mulmod_checked(&Bn254Fr::from_u64(out_value_u64));
-                    let mut delta = Bn254Fr::new();
-                    let mut out_fr = Bn254Fr::new();
-                    out_fr.set_bytes_big(&out_rho);
-                    let mut in_fr = Bn254Fr::new();
-                    in_fr.set_bytes_big(&rho);
-                    submod_checked(&mut delta, &out_fr, &in_fr);
-                    enforce_prod.mulmod_checked(&delta);
-                    let mut inv = enforce_prod.clone();
-                    inv.inverse();
-                    inv.to_bytes_be()
-                };
-                host.add_hex_arg(hex::encode(inv_enforce));
-
-                // Deny-map (blacklist) args:
-                //   blacklist_root (PUBLIC)
-                //   sender check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
-                //   pay recipient check: bucket_entries[12] (PRIVATE) + bucket_inv (PRIVATE) + siblings[16] (PRIVATE)
-                let bucket_inv_for_id = |id: &Hash32, bucket_entries: &[Hash32]| -> anyhow::Result<Hash32> {
-                    anyhow::ensure!(
-                        bucket_entries.len() == midnight_privacy::BLACKLIST_BUCKET_SIZE,
-                        "bucket_entries length mismatch: got {}, expected {}",
-                        bucket_entries.len(),
-                        midnight_privacy::BLACKLIST_BUCKET_SIZE
-                    );
-                    let mut id_fr = Bn254Fr::new();
-                    id_fr.set_bytes_big(id);
-                    let mut prod = Bn254Fr::from_u32(1);
-                    let mut delta = Bn254Fr::new();
-                    for e in bucket_entries {
-                        let mut e_fr = Bn254Fr::new();
-                        e_fr.set_bytes_big(e);
-                        submod_checked(&mut delta, &id_fr, &e_fr);
-                        prod.mulmod_checked(&delta);
-                    }
-                    anyhow::ensure!(
-                        !prod.is_zero(),
-                        "bucket_inv undefined: id appears blacklisted or invalid bucket"
-                    );
-                    let mut inv = prod.clone();
-                    inv.inverse();
-                    Ok(inv.to_bytes_be())
+                use sov_nightstream_adapter::circuits::note_spend_rom;
+                use sov_nightstream_adapter::{
+                    BlacklistProof, NightstreamHost, NoteSpendInput, NoteSpendOutput,
+                    NoteSpendWitness, ViewerOutputWitness, ViewerWitness,
                 };
 
-                host.add_hex_arg(hex::encode(blacklist_root));
-                for e in &sender_bl_bucket_entries {
-                    host.add_hex_arg(hex::encode(e));
-                }
-                let sender_bucket_inv = bucket_inv_for_id(&sender_id_out, &sender_bl_bucket_entries)?;
-                host.add_hex_arg(hex::encode(sender_bucket_inv));
-                for sib in sender_bl_siblings.iter().take(bl_depth) {
-                    host.add_hex_arg(hex::encode(sib));
-                }
-                for e in &out_bl_bucket_entries {
-                    host.add_hex_arg(hex::encode(e));
-                }
-                let out_bucket_inv = bucket_inv_for_id(&out_recipient, &out_bl_bucket_entries)?;
-                host.add_hex_arg(hex::encode(out_bucket_inv));
-                for sib in out_bl_siblings.iter().take(bl_depth) {
-                    host.add_hex_arg(hex::encode(sib));
-                }
+                let witness = NoteSpendWitness {
+                    domain,
+                    spend_sk,
+                    pk_ivk_owner,
+                    depth: TREE_DEPTH as u32,
+                    anchor,
+                    inputs: vec![NoteSpendInput {
+                        value: out_value_u64,
+                        rho,
+                        sender_id: in_sender_id,
+                        position: position as u32,
+                        siblings: siblings.clone(),
+                        nullifier: nf,
+                    }],
+                    withdraw_amount: 0,
+                    withdraw_to: [0u8; 32],
+                    outputs: vec![NoteSpendOutput {
+                        value: out_value_u64,
+                        rho: out_rho,
+                        pk_spend: out_pk_spend,
+                        pk_ivk: out_pk_ivk,
+                        cm: cm_out,
+                    }],
+                    inv_enforce,
+                    blacklist_root,
+                    blacklist_proofs: vec![
+                        BlacklistProof::from_opening(
+                            &sender_bl_recipient,
+                            sender_bl_bucket_entries,
+                            sender_bl_siblings,
+                        ),
+                        BlacklistProof::from_opening(
+                            &out_bl_recipient,
+                            out_bl_bucket_entries,
+                            out_bl_siblings,
+                        ),
+                    ],
+                    viewers: if let Some((fvk, ref att)) = viewer_data {
+                        vec![ViewerWitness {
+                            fvk_commitment: att.fvk_commitment,
+                            fvk,
+                            per_output: vec![ViewerOutputWitness {
+                                ct_hash: att.ct_hash,
+                                mac: att.mac,
+                            }],
+                        }]
+                    } else {
+                        vec![]
+                    },
+                };
 
-                // Viewer section (Level-B) - add viewer args if configured.
-                if let Some((ref fvk, ref att)) = viewer_data {
-                    // m_viewers
-                    host.add_u64_arg(1);
-                    // public fvk_commitment
-                    host.add_hex_arg(hex::encode(att.fvk_commitment));
-                    // private fvk
-                    host.add_hex_arg(hex::encode(fvk));
-                    // per-output (only j=0 here): ct_hash, mac
-                    host.add_hex_arg(hex::encode(att.ct_hash));
-                    host.add_hex_arg(hex::encode(att.mac));
-                }
+                let public_bytes = bincode::serialize(&public)
+                    .context("Failed to serialize SpendPublic for Nightstream")?;
 
-                host.set_public_output(&public)
-                    .context("set public output")?;
+                let mut host = NightstreamHost::new(
+                    &note_spend_rom::NOTE_SPEND_ROM,
+                    note_spend_rom::NOTE_SPEND_ROM_BASE,
+                );
+                host.write_note_spend_witness(&witness, public_bytes);
                 let mut proof_data = host.run(true).context("generate transfer proof")?;
+
+                let fvk_commitment_arg_pos: Option<usize> =
+                    viewer_data.as_ref().map(|_| 0); // placeholder for pool sig injection
                 if let Some(pool_sig_hex) = pool_sig_hex.as_deref() {
                     let Some(arg_pos) = fvk_commitment_arg_pos else {
                         bail!("POOL_FVK_PK is set but viewer section is missing in proof args");
@@ -2142,15 +2051,15 @@ pub async fn run(config: RunnerConfig) -> Result<()> {
         eprintln!("[skip] skipping pre-verification (--skip-verify flag set)");
     } else if cache_dir.is_none() {
         eprintln!("[verify] pre-verifying {} proofs locally...", proofs.len());
-        use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
+        use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
         use sov_rollup_interface::zk::ZkVerifier;
-        let method_commitment = LigeroCodeCommitment(method_id);
+        let method_commitment = NightstreamCodeCommitment(method_id);
         for (idx, (account_idx, proof_bytes)) in proofs.iter().enumerate() {
             let input = dep_inputs
                 .iter()
                 .find(|d| d.account_idx == *account_idx)
                 .with_context(|| format!("Missing DepInput for account {}", account_idx))?;
-            match LigeroVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
+            match NightstreamVerifier::verify::<SpendPublic>(proof_bytes, &method_commitment) {
                 Ok(public) => {
                     let nf_key = nf_key_from_sk(&domain, &input.spend_sk);
                     let nf_exp = nullifier(&domain, &nf_key, &input.rho);

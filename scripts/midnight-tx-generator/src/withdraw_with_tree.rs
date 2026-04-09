@@ -10,12 +10,12 @@ use midnight_privacy::{
 use rand::Rng;
 use serde_json;
 use sov_cli::wallet_state::PrivateKeyAndAddress;
-use sov_ligero_adapter::Ligero;
+// TODO: Migrate to Nightstream - was: use sov_ligero_adapter::Ligero;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::Transaction;
 use sov_modules_api::Spec;
 use sov_modules_rollup_blueprint::RollupBlueprint;
-use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+// TODO: Migrate to Nightstream - was: use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
 use sov_rollup_ligero::MockDemoRollup;
 use sov_test_utils::default_test_signed_transaction;
 use std::fs;
@@ -190,17 +190,8 @@ fn main() -> Result<()> {
         &deny_openings,
     )?;
 
-    let mut host = <Ligero as Zkvm>::Host::from_args(&program_path)
-        .with_packing(packing)
-        .with_private_indices(private_indices);
-    note_spend_guest_v2::add_args_to_host(&mut host, &args)?;
-
-    let mut public_output = public_output;
-    public_output.blacklist_root = blacklist_root;
-    host.set_public_output(&public_output)?;
-
-    println!("Generating proof...");
-    let proof_bytes = host.run(true)?;
+    // TODO: Migrate to Nightstream - was using Ligero as Zkvm / LigeroHost for proof generation
+    let proof_bytes: Vec<u8> = todo!("TODO: Migrate to Nightstream - proof generation");
     println!("✓ Proof: {} bytes", proof_bytes.len());
 
     let key_data: PrivateKeyAndAddress<DemoRollupSpec> =

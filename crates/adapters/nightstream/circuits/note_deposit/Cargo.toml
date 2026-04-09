@@ -1,0 +1,18 @@
+[package]
+name = "note-deposit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "note_deposit"
+path = "src/main.rs"
+
+# Standalone guest project: do not inherit the repo workspace.
+[workspace]
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+nightstream-sdk = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d", default-features = false }

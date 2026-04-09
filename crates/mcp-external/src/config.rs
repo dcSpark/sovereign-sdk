@@ -3,12 +3,11 @@ use serde::Deserialize;
 use url::Url;
 use validator::Validate;
 
-fn default_ligero_program() -> String {
-    // MCP-External is primarily used for midnight-privacy flows.
+fn default_nightstream_program() -> String {
     "note_spend_guest".to_string()
 }
 
-fn default_ligero_proof_service_url() -> Url {
+fn default_nightstream_proof_service_url() -> Url {
     Url::parse("http://127.0.0.1:8080").expect("default proof service URL is valid")
 }
 
@@ -36,21 +35,25 @@ pub struct Config {
     #[validate(custom(function = "validate_http_url"))]
     pub indexer_url: Url,
 
-    /// Ligero guest program to use (env: LIGERO_PROGRAM_PATH, optional).
+    /// Nightstream circuit/program identifier (env: NIGHTSTREAM_PROGRAM_PATH, optional).
     ///
-    /// Accepts either:
-    /// - a circuit name (e.g. `note_spend_guest`)
-    /// - a full path to a `.wasm` file (for services that accept paths)
-    ///
+    /// Accepts either a circuit name (e.g. `note_spend_guest`) or a full path.
     /// Defaults to `note_spend_guest`.
-    #[serde(default = "default_ligero_program", alias = "ZK_PROGRAM_PATH")]
-    #[validate(custom(function = "validate_ligero_program"))]
-    pub ligero_program_path: String,
+    #[serde(
+        default = "default_nightstream_program",
+        alias = "ZK_PROGRAM_PATH",
+        alias = "ligero_program_path"
+    )]
+    #[validate(custom(function = "validate_nightstream_program"))]
+    pub nightstream_program_path: String,
 
-    /// Ligero proof service URL (env: LIGERO_PROOF_SERVICE_URL).
-    #[serde(default = "default_ligero_proof_service_url")]
+    /// Nightstream proof service URL (env: NIGHTSTREAM_PROOF_SERVICE_URL, alias: LIGERO_PROOF_SERVICE_URL).
+    #[serde(
+        default = "default_nightstream_proof_service_url",
+        alias = "ligero_proof_service_url"
+    )]
     #[validate(custom(function = "validate_http_url"))]
-    pub ligero_proof_service_url: Url,
+    pub nightstream_proof_service_url: Url,
 
     /// Optional amount to auto-fund a new wallet (env: AUTO_FUND_DEPOSIT_AMOUNT, optional; alias: STARTUP_DEPOSIT_AMOUNT).
     /// Requires ADMIN_WALLET_PRIVATE_KEY to be set.
@@ -111,19 +114,17 @@ fn default_server_bind_address() -> String {
     "127.0.0.1:3000".into()
 }
 
-fn validate_ligero_program(program: &String) -> Result<(), validator::ValidationError> {
+fn validate_nightstream_program(program: &String) -> Result<(), validator::ValidationError> {
     let program = program.trim();
     if program.is_empty() {
         return Err(validator::ValidationError::new("empty_program")
-            .with_message("LIGERO_PROGRAM_PATH must be set (circuit name or .wasm path)".into()));
+            .with_message("NIGHTSTREAM_PROGRAM_PATH must be set (circuit name or path)".into()));
     }
 
-    // If the caller provided an existing path, accept it.
     if std::path::Path::new(program).exists() {
         return Ok(());
     }
 
-    // Otherwise, treat it as a circuit name; the proof service resolves it.
     Ok(())
 }
 

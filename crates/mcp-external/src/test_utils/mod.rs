@@ -2,8 +2,6 @@
 //!
 //! This module provides common utilities for testing across the MCP crate.
 
-pub mod ligero;
-
 /// Test wallet key for use in integration tests
 ///
 /// This key corresponds to the test wallet defined in test-data/keys/token_deployer_private_key.json

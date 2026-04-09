@@ -1,6 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use base64::{prelude::BASE64_STANDARD, Engine};
-use midnight_privacy::Hash32;
 
 fn decode_hex_bytes(label: &str, s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
@@ -59,61 +57,60 @@ pub fn ensure_pool_fvk_pk_env() -> Result<Option<[u8; 32]>> {
     load_pool_fvk_pk_from_env()
 }
 
-pub fn decode_ligero_hash32_arg(v: &serde_json::Value, label: &str) -> Result<Hash32> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| anyhow!("Expected Ligero arg object for {label}"))?;
-
-    if let Some(b64) = obj.get("bytes_b64").and_then(|v| v.as_str()) {
-        let bytes = BASE64_STANDARD
-            .decode(b64)
-            .with_context(|| format!("Invalid base64 in {label}.bytes_b64"))?;
-        let len = bytes.len();
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("{label}.bytes_b64 must decode to 32 bytes (got {len})"))?;
-        return Ok(bytes);
-    }
-
-    let hex_str = obj
-        .get("hex")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing {label}.hex"))?;
-    let bytes = decode_hex_bytes(&format!("{label}.hex"), hex_str)?;
-    let len = bytes.len();
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("{label}.hex must be 32 bytes (got {len})"))?;
-    Ok(bytes)
-}
-
 pub fn inject_pool_sig_hex_into_proof_bytes(
     proof_bytes: Vec<u8>,
-    fvk_commitment_arg_pos: usize,
+    _fvk_commitment_arg_pos: usize,
     pool_sig_hex: String,
 ) -> Result<Vec<u8>> {
-    let mut package: sov_ligero_adapter::LigeroProofPackage =
-        bincode::deserialize(&proof_bytes).context("Proof payload is not a LigeroProofPackage")?;
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
 
-    let mut args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json)
-        .context("LigeroProofPackage.args_json is not valid JSON")?;
+    let sig_bytes = hex::decode(pool_sig_hex.trim()).context("pool_sig_hex is not valid hex")?;
+    if sig_bytes.len() != 64 {
+        anyhow::bail!(
+            "pool_sig_hex must decode to 64 bytes (got {} bytes)",
+            sig_bytes.len()
+        );
+    }
 
-    let idx = fvk_commitment_arg_pos
-        .checked_sub(1)
-        .ok_or_else(|| anyhow!("fvk_commitment_arg_pos must be >= 1"))?;
-    let arg = args
-        .get_mut(idx)
-        .ok_or_else(|| anyhow!("Ligero args too short (missing arg #{fvk_commitment_arg_pos})"))?;
-    let obj = arg.as_object_mut().ok_or_else(|| {
-        anyhow!(
-            "Expected Ligero arg object for viewer.fvk_commitment (arg #{fvk_commitment_arg_pos})"
-        )
-    })?;
-    obj.insert(
-        "pool_sig_hex".to_string(),
-        serde_json::Value::String(pool_sig_hex),
-    );
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder
+            .read_to_end(&mut buf)
+            .context("Failed to decompress proof bytes")?;
+        buf
+    };
 
-    package.args_json = serde_json::to_vec(&args).context("Failed to reserialize args_json")?;
-    bincode::serialize(&package).context("Failed to serialize LigeroProofPackage")
+    let mut package: NightstreamProofPackage = bincode::deserialize(&decompressed)
+        .context("Failed to deserialize NightstreamProofPackage")?;
+
+    let public: midnight_privacy::SpendPublic = bincode::deserialize(&package.public_output)
+        .context("Failed to deserialize SpendPublic from package.public_output")?;
+
+    let fvk_commitment = public
+        .view_attestations
+        .as_ref()
+        .and_then(|atts| atts.first())
+        .map(|att| att.fvk_commitment)
+        .ok_or_else(|| anyhow!("Cannot inject pool sig: SpendPublic has no view_attestations"))?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature: sig_bytes,
+    });
+
+    let raw =
+        bincode::serialize(&package).context("Failed to re-serialize NightstreamProofPackage")?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&raw)
+        .context("Failed to write to deflate encoder")?;
+    encoder
+        .finish()
+        .context("Failed to finish deflate compression")
 }

@@ -17,14 +17,16 @@ use sov_modules_api::{
     TxState,
 };
 
-/// ValueSetterZk module: Sets a value only if a valid Ligetron ZK proof is provided.
+/// ValueSetterZk module: Sets a value only if a valid ZK proof is provided.
 ///
 /// The proof must demonstrate that the value meets certain constraints (enforced by the guest program).
-/// For this implementation, the guest program verifies that the value is within [0, 100].
+/// For this implementation, the guest program verifies that the value is within [0, 65535].
+///
+/// Uses the Nightstream proof backend for verification.
 ///
 /// # Module State
 /// - `value`: The current value (u32)
-/// - `method_id`: Ligetron method ID (code commitment) for proof verification
+/// - `method_id`: Code commitment for proof verification (32 bytes, Nightstream)
 /// - `admin`: Administrator who can update the method ID
 ///
 /// # Derives
@@ -40,8 +42,9 @@ pub struct ValueSetterZk<S: Spec> {
     #[state]
     pub value: StateValue<u32>,
 
-    /// Code commitment (32 bytes) of the Ligetron guest program that verifies value constraints.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies value constraints.
+    /// For Ligero: SHA-256(WASM bytes || packing).
+    /// For Nightstream: SHA-256(ROM bytes).
     #[state]
     pub method_id: StateValue<[u8; 32]>,
 

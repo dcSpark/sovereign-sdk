@@ -1,7 +1,9 @@
 //! Off-chain Parallel Proof Verification Service
 //!
-//! This service receives signed Ligero transactions, verifies them in parallel,
+//! This service receives signed Nightstream transactions, verifies them in parallel,
 //! and transforms them into non-ZK transactions for the rollup node.
+
+mod proof_storage;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -14,7 +16,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use futures::future::join_all;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions,
@@ -22,7 +24,6 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sov_api_spec::types::AcceptTxBody;
-use sov_ligero_adapter::{Ligero, LigeroCodeCommitment};
 use sov_modules_api::{
     capabilities::UniquenessData,
     configurable_spec::ConfigurableSpec,
@@ -35,9 +36,8 @@ use sov_node_client::NodeClient;
 use sov_rollup_interface::{
     crypto::PrivateKey,
     crypto::PublicKey,
-    zk::{CodeCommitment, CryptoSpec, Zkvm, ZkvmHost},
+    zk::{CryptoSpec, ZkvmHost},
 };
-use std::sync::OnceLock;
 use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info, warn};
 
@@ -54,8 +54,16 @@ use sov_midnight_da::storable::{
 use sov_midnight_da::MidnightDaSpec;
 use sov_mock_zkvm::MockZkvm;
 
-/// The rollup's Spec type (must match rollup-ligero configuration)
-pub type RollupSpec = ConfigurableSpec<MidnightDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+use crate::proof_storage::{ProofReference, ProofStorage};
+
+/// The rollup's Spec type (must match rollup-nightstream configuration)
+pub type RollupSpec = ConfigurableSpec<
+    MidnightDaSpec,
+    sov_nightstream_adapter::Nightstream,
+    MockZkvm,
+    MultiAddressEvm,
+    Native,
+>;
 
 type RuntimeCall = <DemoRuntime<RollupSpec> as DispatchCall>::Decodable;
 type DemoTransaction = Transaction<DemoRuntime<RollupSpec>, RollupSpec>;
@@ -67,11 +75,12 @@ pub struct ServiceConfig {
     pub node_rpc_url: String,
     /// Private key path for signing non-ZK transactions
     pub signing_key_path: String,
-    /// Ligero method ID for value-setter proof verification
-    /// If None, it will be computed from the value_validator_rust.wasm program
+    /// Method ID for value-setter proof verification.
+    /// If None, it will be computed from the value_validator ROM bytes (SHA-256).
     pub value_setter_method_id: Option<[u8; 32]>,
-    /// Ligero method ID for midnight note_spend_guest proof verification
-    /// If None, it will be computed from the note_spend_guest.wasm program
+    /// Method ID for midnight note_spend proof verification.
+    /// Computed from the embedded note_spend ROM bytes (SHA-256).
+    /// Auto-computed at startup if not provided.
     pub midnight_method_id: Option<[u8; 32]>,
     /// Maximum number of concurrent verification tasks
     pub max_concurrent_verifications: usize,
@@ -82,9 +91,6 @@ pub struct ServiceConfig {
     /// If true, do NOT submit to sequencer immediately; queue and wait for an explicit flush.
     /// Useful for benchmarks to remove the worker bottleneck and release all txs at once.
     pub defer_sequencer_submission: bool,
-    /// Optional URL of a remote ligero-http-server prover/verifier service.
-    /// When `None`, local daemon pools are used.
-    pub prover_service_url: Option<String>,
 }
 
 /// Shared application state
@@ -93,7 +99,7 @@ pub struct AppState {
     config: Arc<ServiceConfig>,
     node_client: NodeClient,
     http_client: reqwest::Client,
-    rollup_chain_hash: [u8; 32],
+    rollup_chain_hash: Arc<tokio::sync::RwLock<Option<[u8; 32]>>>,
     /// Semaphore to limit concurrent verifications
     verification_semaphore: Arc<tokio::sync::Semaphore>,
     /// Local nonce counter (synchronized across all requests)
@@ -102,13 +108,11 @@ pub struct AppState {
     signing_key: Arc<<<RollupSpec as Spec>::CryptoSpec as CryptoSpec>::PrivateKey>,
     /// Connection to the MockDA database shared with the rollup node
     da_conn: Arc<DatabaseConnection>,
+    /// Optional S3-backed proof storage used to keep large proof packages off the wire.
+    proof_storage: Option<Arc<ProofStorage>>,
     /// Optional persistence of the full incoming worker tx blob (configurable via rollup_config.toml [da]).
     incoming_worker_tx_saver: IncomingWorkerTxSaver,
     /// Optional pool public key used to authenticate signed viewer commitments (FVK commitments).
-    ///
-    /// When set via `POOL_FVK_PK`, Transfer/Withdraw transactions must carry a pool signature
-    /// over the viewer `fvk_commitment` inside the Ligero proof package args (see
-    /// `enforce_pool_signed_viewer_commitment`).
     pool_fvk_pk: Option<Ed25519VerifyingKey>,
 }
 
@@ -136,6 +140,48 @@ async fn fetch_rollup_chain_hash(node_client: &NodeClient) -> Result<[u8; 32]> {
     Ok(chain_hash)
 }
 
+async fn fetch_rollup_chain_hash_with_timeout(
+    node_client: &NodeClient,
+    timeout_secs: u64,
+) -> Result<[u8; 32]> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        fetch_rollup_chain_hash(node_client),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Timed out fetching /rollup/schema after {}s",
+            timeout_secs
+        )),
+    }
+}
+
+async fn ensure_rollup_chain_hash(state: &AppState) -> Result<[u8; 32], ServiceError> {
+    if let Some(chain_hash) = *state.rollup_chain_hash.read().await {
+        return Ok(chain_hash);
+    }
+
+    let fetch_timeout_secs = env_u64(
+        "SOV_PROOF_VERIFIER_CHAIN_HASH_FETCH_TIMEOUT_SECS",
+        DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS,
+    );
+
+    let chain_hash = fetch_rollup_chain_hash_with_timeout(&state.node_client, fetch_timeout_secs)
+        .await
+        .map_err(|e| {
+            ServiceError::SubmissionError(format!(
+                "Failed to fetch /rollup/schema from node {}: {}",
+                state.config.node_rpc_url, e
+            ))
+        })?;
+
+    let mut cached = state.rollup_chain_hash.write().await;
+    let cached_value = cached.get_or_insert(chain_hash);
+    Ok(*cached_value)
+}
+
 const DEFAULT_VERIFIER_SQLITE_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_VERIFIER_SQLITE_MIN_CONNECTIONS: u32 = 1;
 const DEFAULT_VERIFIER_POSTGRES_MAX_CONNECTIONS: u32 = 12;
@@ -144,6 +190,7 @@ const DEFAULT_VERIFIER_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_VERIFIER_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_VERIFIER_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VERIFIER_MAX_LIFETIME_SECS: u64 = 1_800;
+const DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS: u64 = 10;
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
@@ -183,9 +230,7 @@ impl AppState {
                 .with_context(|| format!("{env_name} must be a valid ed25519 public key"))
         }
 
-        // Allow skipping cryptographic verification via env var.
-        // If any of these env vars are truthy, set LIGERO_SKIP_VERIFICATION=1 so
-        // sov_ligero_adapter::LigeroVerifier returns the public output without verifying.
+        // Allow skipping cryptographic verification via env var (testing only).
         fn env_truthy(name: &str) -> bool {
             std::env::var(name)
                 .ok()
@@ -195,12 +240,8 @@ impl AppState {
                 })
                 .unwrap_or(false)
         }
-        if env_truthy("SOV_PROOF_VERIFIER_SKIP_VERIFY")
-            || env_truthy("SKIP_VERIFY")
-            || env_truthy("LIGERO_SKIP_VERIFICATION")
-        {
-            // Ensure the adapter sees this flag
-            std::env::set_var("LIGERO_SKIP_VERIFICATION", "1");
+        if env_truthy("SOV_PROOF_VERIFIER_SKIP_VERIFY") || env_truthy("SKIP_VERIFY") {
+            std::env::set_var("NIGHTSTREAM_SKIP_VERIFICATION", "1");
             info!(
                 "Proof verification skipping is ENABLED (env var set) — returning public outputs without verification"
             );
@@ -218,14 +259,42 @@ impl AppState {
             _ => None,
         };
 
+        let proof_storage = ProofStorage::from_env().await?;
+        if let Some(storage) = proof_storage.as_ref() {
+            info!(
+                bucket = %storage.bucket(),
+                "S3-backed proof storage enabled for /prove, /verify, and /midnight-privacy"
+            );
+        }
+
         let max_permits = config.max_concurrent_verifications;
         let node_client = NodeClient::new_unchecked(&config.node_rpc_url);
-
-        let rollup_chain_hash = fetch_rollup_chain_hash(&node_client).await?;
-        info!(
-            "Using rollup chain hash from /rollup/schema: 0x{}",
-            hex::encode(rollup_chain_hash)
+        let chain_hash_fetch_timeout_secs = env_u64(
+            "SOV_PROOF_VERIFIER_CHAIN_HASH_FETCH_TIMEOUT_SECS",
+            DEFAULT_CHAIN_HASH_FETCH_TIMEOUT_SECS,
         );
+
+        let rollup_chain_hash =
+            match fetch_rollup_chain_hash_with_timeout(&node_client, chain_hash_fetch_timeout_secs)
+                .await
+            {
+            Ok(chain_hash) => {
+                info!(
+                    "Using rollup chain hash from /rollup/schema: 0x{}",
+                    hex::encode(chain_hash)
+                );
+                Some(chain_hash)
+            }
+            Err(err) => {
+                warn!(
+                    node_rpc_url = %config.node_rpc_url,
+                    timeout_secs = chain_hash_fetch_timeout_secs,
+                    error = %err,
+                    "Failed to fetch /rollup/schema during startup; local /prove and /verify can still run, and node-dependent endpoints will retry on demand"
+                );
+                None
+            }
+        };
 
         // Load signing key once at startup
         let signing_key = load_private_key(&config.signing_key_path)
@@ -233,9 +302,9 @@ impl AppState {
 
         info!("✓ Loaded signing key from: {}", config.signing_key_path);
 
-        // Compute value-setter method ID if not provided
+        // Compute value-setter method ID if not provided (SHA-256 of value_validator ROM).
         if config.value_setter_method_id.is_none() {
-            info!("Computing value-setter method ID from value_validator_rust.wasm...");
+            info!("Computing value-setter method ID from value_validator ROM...");
             match compute_value_setter_method_id() {
                 Ok(method_id) => {
                     info!("✓ Value-setter method ID: 0x{}", hex::encode(method_id));
@@ -248,19 +317,12 @@ impl AppState {
             }
         }
 
-        // Compute midnight method ID if not provided
+        // Compute midnight method ID if not provided (SHA-256 of note_spend ROM).
         if config.midnight_method_id.is_none() {
-            info!("Computing midnight method ID from note_spend_guest.wasm...");
-            match compute_midnight_method_id() {
-                Ok(method_id) => {
-                    info!("✓ Midnight method ID: 0x{}", hex::encode(method_id));
-                    config.midnight_method_id = Some(method_id);
-                }
-                Err(e) => {
-                    error!("Failed to compute midnight method ID: {}", e);
-                    info!("Midnight endpoint will not be available");
-                }
-            }
+            info!("Computing midnight method ID from embedded Nightstream ROM...");
+            let method_id = compute_nightstream_midnight_method_id();
+            info!("✓ Midnight method ID: 0x{}", hex::encode(method_id));
+            config.midnight_method_id = Some(method_id);
         }
 
         // For SQLite, we need to build SqliteConnectOptions with busy_timeout
@@ -407,357 +469,43 @@ impl AppState {
             config: Arc::new(config),
             node_client,
             http_client: reqwest::Client::new(),
-            rollup_chain_hash,
+            rollup_chain_hash: Arc::new(tokio::sync::RwLock::new(rollup_chain_hash)),
             verification_semaphore: Arc::new(tokio::sync::Semaphore::new(max_permits)),
             nonce_counter: Arc::new(tokio::sync::Mutex::new(None)),
             signing_key: Arc::new(signing_key),
             da_conn: Arc::new(da_conn),
+            proof_storage: proof_storage.map(Arc::new),
             incoming_worker_tx_saver,
             pool_fvk_pk,
         })
     }
 }
 
-fn ligero_skip_verify_enabled() -> bool {
-    std::env::var("LIGERO_SKIP_VERIFICATION")
-        .ok()
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
-}
-
-fn parse_ligero_i64_arg(v: &serde_json::Value, label: &str) -> Result<i64, ServiceError> {
-    v.get("i64").and_then(|v| v.as_i64()).ok_or_else(|| {
-        ServiceError::ParseError(format!("Expected Ligero i64 argument for {label}"))
-    })
-}
-
-fn decode_hex_bytes(label: &str, s: &str) -> Result<Vec<u8>, ServiceError> {
-    let s = s.trim();
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(s).map_err(|e| ServiceError::ParseError(format!("Invalid hex for {label}: {e}")))
-}
-
-fn decode_ligero_hash32_arg(
-    v: &serde_json::Value,
-    label: &str,
-) -> Result<MidnightHash32, ServiceError> {
-    let obj = v.as_object().ok_or_else(|| {
-        ServiceError::ParseError(format!("Expected Ligero arg object for {label}"))
-    })?;
-
-    if let Some(b64) = obj.get("bytes_b64").and_then(|v| v.as_str()) {
-        let bytes = BASE64_STANDARD.decode(b64).map_err(|e| {
-            ServiceError::ParseError(format!("Invalid base64 in {label}.bytes_b64: {e}"))
-        })?;
-        let len = bytes.len();
-        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-            ServiceError::ParseError(format!(
-                "{label}.bytes_b64 must decode to 32 bytes, got {len}",
-            ))
-        })?;
-        return Ok(bytes);
-    }
-
-    let hex_str = obj
-        .get("hex")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ServiceError::ParseError(format!("Missing {label}.hex")))?;
-    let bytes = decode_hex_bytes(&format!("{label}.hex"), hex_str)?;
-    let len = bytes.len();
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        ServiceError::ParseError(format!("{label}.hex must be 32 bytes, got {len}"))
-    })?;
-    Ok(bytes)
-}
-
-fn decode_pool_signature_from_ligero_arg(
-    v: &serde_json::Value,
-    label: &str,
-) -> Result<[u8; 64], ServiceError> {
-    let obj = v.as_object().ok_or_else(|| {
-        ServiceError::ParseError(format!("Expected Ligero arg object for {label}"))
-    })?;
-
-    // Accept a few common spellings to match upstream payloads.
-    let sig_hex = obj
-        .get("pool_sig_hex")
-        .or_else(|| obj.get("signature"))
-        .or_else(|| obj.get("pool_signature"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            ServiceError::SignatureError(format!(
-                "Missing pool signature on viewer fvk_commitment arg (expected one of: pool_sig_hex, signature, pool_signature)"
-            ))
-        })?;
-
-    let bytes = decode_hex_bytes("pool signature", sig_hex)?;
-    let len = bytes.len();
-    let bytes: [u8; 64] = bytes.try_into().map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Pool signature must be 64 bytes (128 hex chars), got {len} bytes",
-        ))
-    })?;
-    Ok(bytes)
-}
-
-/// Locate the Level-B viewer section and return the index of the first viewer `fvk_commitment` arg.
-///
-/// This follows the fixed ABI described in `crates/adapters/ligero/reference_circuits/note_spend_guest_v2.rs`.
-fn locate_viewer_fvk_commitment_index(
-    args: &[serde_json::Value],
-) -> Result<Option<usize>, ServiceError> {
-    // Header indices (0-based):
-    // 0 domain, 1 spend_sk, 2 pk_ivk_owner, 3 depth, 4 anchor, 5 n_in
-    if args.len() < 6 {
-        return Err(ServiceError::ParseError(
-            "Ligero args too short for note_spend_guest v2 header".to_string(),
-        ));
-    }
-
-    let depth_i64 = parse_ligero_i64_arg(&args[3], "depth")?;
-    let depth: usize = usize::try_from(depth_i64).map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Invalid depth (expected non-negative i64), got {depth_i64}"
-        ))
-    })?;
-
-    let n_in_i64 = parse_ligero_i64_arg(&args[5], "n_in")?;
-    let n_in: usize = usize::try_from(n_in_i64).map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Invalid n_in (expected non-negative i64), got {n_in_i64}"
-        ))
-    })?;
-    if n_in == 0 || n_in > 4 {
-        return Err(ServiceError::ParseError(format!(
-            "Invalid n_in (expected 1..=4), got {n_in}"
-        )));
-    }
-
-    // Walk inputs
-    let mut idx: usize = 6;
-    for _ in 0..n_in {
-        // value_in, rho_in, sender_id_in, pos
-        idx = idx
-            .checked_add(4)
-            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-        // siblings[depth]
-        idx = idx
-            .checked_add(depth)
-            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-        // nullifier (public)
-        idx = idx
-            .checked_add(1)
-            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-    }
-
-    if idx + 3 > args.len() {
-        return Err(ServiceError::ParseError(
-            "Ligero args truncated before withdraw binding".to_string(),
-        ));
-    }
-
-    let withdraw_amount_i64 = parse_ligero_i64_arg(&args[idx], "withdraw_amount")?;
-    let withdraw_amount_u64: u64 = withdraw_amount_i64.try_into().map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Invalid withdraw_amount (expected non-negative i64), got {withdraw_amount_i64}"
-        ))
-    })?;
-    let n_out_index = idx + 2;
-    let n_out_i64 = parse_ligero_i64_arg(&args[n_out_index], "n_out")?;
-    let n_out: usize = usize::try_from(n_out_i64).map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Invalid n_out (expected non-negative i64), got {n_out_i64}"
-        ))
-    })?;
-    if n_out > 2 {
-        return Err(ServiceError::ParseError(format!(
-            "Invalid n_out (expected 0..=2), got {n_out}"
-        )));
-    }
-
-    // Skip withdraw_to + n_out
-    idx = n_out_index + 1;
-
-    // outputs: 5 args per output
-    idx = idx
-        .checked_add(5 * n_out)
-        .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-
-    // inv_enforce
-    idx = idx
-        .checked_add(1)
-        .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-
-    // blacklist_root
-    idx = idx
-        .checked_add(1)
-        .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-
-    let checks: usize = if withdraw_amount_u64 == 0 { 2 } else { 1 };
-    let bl_bucket_size: usize = midnight_privacy::BLACKLIST_BUCKET_SIZE as usize;
-    let bl_depth: usize = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-    for _ in 0..checks {
-        // bucket_entries + bucket_inv + siblings
-        idx = idx
-            .checked_add(bl_bucket_size + 1 + bl_depth)
-            .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-    }
-
-    if idx == args.len() {
-        // No viewers section present.
-        return Ok(None);
-    }
-    if idx >= args.len() {
-        return Err(ServiceError::ParseError(
-            "Ligero args index past end while locating viewer section".to_string(),
-        ));
-    }
-
-    let n_viewers_i64 = parse_ligero_i64_arg(&args[idx], "n_viewers")?;
-    let n_viewers: usize = usize::try_from(n_viewers_i64).map_err(|_| {
-        ServiceError::ParseError(format!(
-            "Invalid n_viewers (expected non-negative i64), got {n_viewers_i64}"
-        ))
-    })?;
-    if n_viewers != 1 {
-        return Err(ServiceError::SignatureError(format!(
-            "POOL_FVK_PK enforcement requires exactly 1 viewer (n_viewers=1), got {n_viewers}"
-        )));
-    }
-
-    // Layout per viewer: fvk_commitment, fvk, then for each output ct_hash + mac.
-    let expected_total = idx
-        .checked_add(1 + n_viewers * (2 + 2 * n_out))
-        .ok_or_else(|| ServiceError::ParseError("arg index overflow".to_string()))?;
-    if expected_total != args.len() {
-        return Err(ServiceError::ParseError(format!(
-            "Ligero args length mismatch for viewer section: expected {expected_total}, got {}",
-            args.len()
-        )));
-    }
-
-    Ok(Some(idx + 1))
-}
-
-fn verify_pool_sig_over_commitment(
-    pool_pk: &Ed25519VerifyingKey,
-    fvk_commitment: &MidnightHash32,
-    signature: &[u8; 64],
-) -> Result<(), ServiceError> {
-    pool_pk
-        .verify_strict(fvk_commitment, &Ed25519Signature::from_bytes(signature))
-        .map_err(|e| ServiceError::SignatureError(format!("Invalid pool signature: {e}")))
-}
-
-fn enforce_pool_signed_viewer_commitment_in_args(
-    pool_pk: &Ed25519VerifyingKey,
-    args: &[serde_json::Value],
-) -> Result<MidnightHash32, ServiceError> {
-    let idx = locate_viewer_fvk_commitment_index(&args)?.ok_or_else(|| {
-        ServiceError::SignatureError(
-            "Missing viewer section in proof args (POOL_FVK_PK is set)".to_string(),
-        )
-    })?;
-
-    let fvk_commitment = decode_ligero_hash32_arg(&args[idx], "viewer.fvk_commitment")?;
-    let signature = decode_pool_signature_from_ligero_arg(&args[idx], "viewer.fvk_commitment")?;
-
-    verify_pool_sig_over_commitment(pool_pk, &fvk_commitment, &signature)?;
-
-    Ok(fvk_commitment)
-}
-
-#[derive(Debug, Clone)]
-pub struct ViewCiphertextMeta {
-    cm: MidnightHash32,
-    fvk_commitment: MidnightHash32,
-    ct_len: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct ViewCiphertextsMeta {
-    notes: Vec<ViewCiphertextMeta>,
-}
-
-fn view_ciphertexts_meta(
-    view_ciphertexts: Option<&Vec<EncryptedNote>>,
-) -> Option<ViewCiphertextsMeta> {
-    let notes = view_ciphertexts?;
-    let notes = notes
-        .iter()
-        .map(|n| ViewCiphertextMeta {
-            cm: n.cm,
-            fvk_commitment: n.fvk_commitment,
-            ct_len: n.ct.len(),
-        })
-        .collect();
-    Some(ViewCiphertextsMeta { notes })
-}
-
-#[cfg(test)]
-fn enforce_pool_signed_viewer_commitment(
-    pool_pk: &Ed25519VerifyingKey,
-    proof: &[u8],
-) -> Result<MidnightHash32, ServiceError> {
-    let package: sov_ligero_adapter::LigeroProofPackage =
-        bincode::deserialize(proof).map_err(|e| {
-            ServiceError::ParseError(format!("Proof payload is not a LigeroProofPackage ({e})"))
-        })?;
-
-    let args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json).map_err(|e| {
-        ServiceError::ParseError(format!(
-            "LigeroProofPackage.args_json is not valid JSON: {e}"
-        ))
-    })?;
-
-    enforce_pool_signed_viewer_commitment_in_args(pool_pk, &args)
-}
-
-/// Request body for the prover service /verify endpoint
-#[derive(Debug, Serialize)]
-struct ProverServiceVerifyRequest {
-    circuit: String,
-    args: Vec<serde_json::Value>,
-    proof: String, // base64-encoded
-    #[serde(rename = "privateIndices")]
-    private_indices: Vec<usize>,
-}
-
-/// Response from the prover service /verify endpoint
-#[derive(Debug, Deserialize)]
-struct ProverServiceVerifyResponse {
-    success: bool,
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
-    error: Option<String>,
-}
-
 /// Request body for the local `/prove` and `/verify` endpoints.
 #[derive(Debug, Clone, Deserialize)]
 struct ProveVerifyRequest {
-    /// Circuit name (e.g. "note_spend_guest") or direct wasm path.
-    circuit: String,
-    /// Ligero program arguments.
-    args: Vec<ligero_runner::LigeroArg>,
     /// Base64 proof bytes (required for `/verify`, ignored for `/prove`).
     #[serde(default)]
     proof: Option<String>,
-    /// Optional private argument indices.
-    #[serde(default, rename = "privateIndices")]
-    private_indices: Vec<usize>,
-    /// Optional packing size (defaults to 8192).
-    #[serde(default)]
-    packing: Option<u32>,
-    /// Optional gzip toggle for `/prove` (defaults to false).
-    #[serde(default)]
-    gzip: Option<bool>,
-    /// Optional response mode for `/prove`.
     /// When true, `/prove` returns raw proof bytes (`application/octet-stream`) instead of JSON/base64.
     #[serde(default)]
     binary: Option<bool>,
+    /// Full circuit witness for `/prove`. Contains all data (public + private) the
+    /// note-spend RISC-V circuit needs.
+    #[serde(default)]
+    witness: Option<sov_nightstream_adapter::NoteSpendWitness>,
+    /// Base64-encoded bincode SpendPublic bytes for the proof package's public_output.
+    #[serde(default)]
+    public_output: Option<String>,
+    /// S3-backed proof reference used by `/verify`.
+    #[serde(default)]
+    proof_ref: Option<ProofReference>,
+    /// Optional hex-encoded pool viewer signature to inject before storing the proof package.
+    #[serde(default)]
+    pool_viewer_sig_hex: Option<String>,
+    /// Optional hex-encoded 32-byte FVK commitment covered by `pool_viewer_sig_hex`.
+    #[serde(default)]
+    pool_viewer_fvk_commitment: Option<String>,
 }
 
 /// Response body for the local `/prove` and `/verify` endpoints.
@@ -769,458 +517,11 @@ struct ProveVerifyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     proof: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    proof_ref: Option<ProofReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_download_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-}
-
-fn discover_ligero_paths() -> Result<ligero_runner::LigeroPaths, ServiceError> {
-    ligero_runner::LigeroPaths::discover()
-        .or_else(|_| Ok::<_, anyhow::Error>(ligero_runner::LigeroPaths::fallback()))
-        .map_err(|e| {
-            ServiceError::Internal(format!(
-                "Failed to discover Ligero prover/verifier paths: {e}"
-            ))
-        })
-}
-
-fn resolve_circuit_program(circuit: &str) -> Result<std::path::PathBuf, ServiceError> {
-    if circuit.contains('/') || circuit.contains('\\') || circuit.ends_with(".wasm") {
-        if let Ok(path) = ligero_runner::resolve_program(circuit) {
-            return Ok(path);
-        }
-    }
-
-    let candidates = [
-        circuit.to_string(),
-        format!("{}_guest", circuit),
-        format!("{}_guest.wasm", circuit),
-        format!("{}.wasm", circuit),
-    ];
-
-    for candidate in candidates {
-        if let Ok(path) = ligero_runner::resolve_program(&candidate) {
-            return Ok(path);
-        }
-    }
-
-    Err(ServiceError::ParseError(format!(
-        "Could not resolve circuit '{}'",
-        circuit
-    )))
-}
-
-fn get_or_create_prover_daemon_pool(
-    paths: &ligero_runner::LigeroPaths,
-    workers: usize,
-) -> Result<ligero_runner::daemon::DaemonPool, ServiceError> {
-    use std::collections::HashMap;
-
-    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
-        OnceLock::new();
-
-    let key = format!(
-        "{}|{}",
-        paths.prover_bin.display(),
-        paths.shader_dir.display()
-    );
-
-    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = pools_lock.lock().unwrap();
-    if let Some(pool) = guard.get(&key) {
-        return Ok(pool.clone());
-    }
-
-    info!(
-        "Starting Ligero prover daemon pool (workers={}) using prover_bin={} shader_dir={}",
-        workers.max(1),
-        paths.prover_bin.display(),
-        paths.shader_dir.display(),
-    );
-
-    let pool =
-        ligero_runner::daemon::DaemonPool::new_prover(paths, workers.max(1)).map_err(|e| {
-            ServiceError::ProofError(format!("Failed to start prover daemon pool: {e}"))
-        })?;
-    guard.insert(key, pool.clone());
-    Ok(pool)
-}
-
-fn get_or_create_verifier_daemon_pool(
-    paths: &ligero_runner::LigeroPaths,
-    workers: usize,
-) -> Result<ligero_runner::daemon::DaemonPool, ServiceError> {
-    use std::collections::HashMap;
-
-    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
-        OnceLock::new();
-
-    let key = format!(
-        "{}|{}",
-        paths.verifier_bin.display(),
-        paths.shader_dir.display()
-    );
-
-    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = pools_lock.lock().unwrap();
-    if let Some(pool) = guard.get(&key) {
-        return Ok(pool.clone());
-    }
-
-    info!(
-        "Starting Ligero verifier daemon pool (workers={}) using verifier_bin={} shader_dir={}",
-        workers.max(1),
-        paths.verifier_bin.display(),
-        paths.shader_dir.display(),
-    );
-
-    let pool =
-        ligero_runner::daemon::DaemonPool::new_verifier(paths, workers.max(1)).map_err(|e| {
-            ServiceError::ProofError(format!("Failed to start verifier daemon pool: {e}"))
-        })?;
-    guard.insert(key, pool.clone());
-    Ok(pool)
-}
-
-/// Verify proof using the remote ligero-http-server prover service via REST API.
-///
-/// This sends an HTTP POST to the prover service's /verify endpoint.
-async fn verify_with_prover_service(
-    http_client: &reqwest::Client,
-    prover_url: &str,
-    circuit: &str,
-    package: &sov_ligero_adapter::LigeroProofPackage,
-) -> Result<(), ServiceError> {
-    let args: Vec<serde_json::Value> = serde_json::from_slice(&package.args_json)
-        .map_err(|e| ServiceError::ProofError(format!("Failed to parse package args_json: {e}")))?;
-
-    let proof_b64 = BASE64_STANDARD.encode(&package.proof);
-
-    let request = ProverServiceVerifyRequest {
-        circuit: circuit.to_string(),
-        args,
-        proof: proof_b64,
-        private_indices: package.private_indices.clone(),
-    };
-
-    let url = format!("{}/verify", prover_url.trim_end_matches('/'));
-    debug!("Sending verification request to prover service: {}", url);
-
-    let response = http_client
-        .post(&url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| {
-            ServiceError::ProofError(format!("Failed to connect to prover service at {url}: {e}"))
-        })?;
-
-    let status = response.status();
-    let body = response.text().await.map_err(|e| {
-        ServiceError::ProofError(format!("Failed to read prover service response: {e}"))
-    })?;
-
-    let resp: ProverServiceVerifyResponse = serde_json::from_str(&body).map_err(|e| {
-        ServiceError::ProofError(format!(
-            "Failed to parse prover service response (status={}, body={}): {e}",
-            status, body
-        ))
-    })?;
-
-    if !resp.success {
-        error!(
-            circuit,
-            exit_code = resp.exit_code,
-            prover_url = url,
-            proof_bytes = package.proof.len(),
-            public_output_bytes = package.public_output.len(),
-            args_json_bytes = package.args_json.len(),
-            n_private_indices = package.private_indices.len(),
-            error = resp.error.as_deref().unwrap_or("(none)"),
-            raw_response_body = %body,
-            "Prover service verification FAILED"
-        );
-        return Err(ServiceError::ProofError(format!(
-            "Prover service verification failed (exit_code={}, circuit={}): {}",
-            resp.exit_code,
-            circuit,
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        )));
-    }
-
-    debug!(
-        "✓ Prover service verification succeeded for circuit {}",
-        circuit
-    );
-    Ok(())
-}
-
-/// Verify using a long-lived verifier pool hosted in a separate process.
-///
-/// - Uses `webgpu_verifier --daemon` worker processes managed in-process by `ligero_runner::daemon::DaemonPool`.
-/// - Worker count is derived from `max_concurrent_verifications` (no daemon-specific env vars).
-fn verify_with_ligero_verifier_daemon(
-    commitment: &[u8; 32],
-    package: &sov_ligero_adapter::LigeroProofPackage,
-    workers: usize,
-) -> Result<(), ServiceError> {
-    use std::collections::HashMap;
-
-    let verifier_paths =
-        ligero_runner::verifier::VerifierPaths::discover_with_commitment(Some(commitment))
-            .map_err(|e| {
-                ServiceError::ProofError(format!("Ligero verifier config discovery failed: {e}"))
-            })?;
-
-    let args: Vec<ligero_runner::LigeroArg> = serde_json::from_slice(&package.args_json)
-        .map_err(|e| ServiceError::ProofError(format!("Failed to parse package args_json: {e}")))?;
-
-    let mut cfg = verifier_paths.to_config(args, package.private_indices.clone());
-
-    // Proof bytes in the package may be gzip-compressed (proof_data.gz) or raw (proof_data.bin).
-    // Select the correct verifier mode based on the bytes we received.
-    let is_gzip = package.is_valid_gzip();
-    let proof_filename = if is_gzip {
-        "proof_data.gz"
-    } else {
-        "proof_data.bin"
-    };
-    cfg.gzip_proof = is_gzip;
-    cfg.proof_path = Some(proof_filename.to_string());
-
-    let cfg_json = serde_json::to_value(&cfg).map_err(|e| {
-        ServiceError::ProofError(format!("Failed to serialize Ligero config JSON: {e}"))
-    })?;
-
-    // Daemon verifier expects a proof path, not raw bytes: write to temp dir.
-    let dir = tempfile::tempdir()
-        .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
-    let proof_path = dir.path().join(proof_filename);
-    std::fs::write(&proof_path, &package.proof)
-        .map_err(|e| ServiceError::Internal(format!("Failed to write {proof_filename}: {e}")))?;
-
-    // Lazily initialize (and cache) daemon pools per (verifier_bin, shader_dir).
-    static POOLS: OnceLock<std::sync::Mutex<HashMap<String, ligero_runner::daemon::DaemonPool>>> =
-        OnceLock::new();
-
-    let bins_dir = verifier_paths
-        .verifier_bin
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    let key = format!(
-        "{}|{}",
-        verifier_paths.verifier_bin.display(),
-        verifier_paths.shader_path.display()
-    );
-
-    let pools_lock = POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let pool = {
-        let mut guard = pools_lock.lock().unwrap();
-        if let Some(p) = guard.get(&key) {
-            p.clone()
-        } else {
-            info!(
-                "Starting Ligero verifier daemon pool (workers={}) using verifier_bin={} shader_dir={} bins_dir={}",
-                workers.max(1),
-                verifier_paths.verifier_bin.display(),
-                verifier_paths.shader_path.display(),
-                bins_dir.display(),
-            );
-            let ligero_paths = ligero_runner::LigeroPaths {
-                prover_bin: bins_dir.join("webgpu_prover"),
-                verifier_bin: verifier_paths.verifier_bin.clone(),
-                shader_dir: verifier_paths.shader_path.clone(),
-                bins_dir,
-            };
-            let created =
-                ligero_runner::daemon::DaemonPool::new_verifier(&ligero_paths, workers.max(1))
-                    .map_err(|e| {
-                        ServiceError::ProofError(format!(
-                            "Failed to start Ligero verifier daemon pool: {e}"
-                        ))
-                    })?;
-            guard.insert(key, created.clone());
-            created
-        }
-    };
-
-    let resp = pool
-        .verify(cfg_json, proof_path.to_string_lossy().as_ref())
-        .map_err(|e| {
-            ServiceError::ProofError(format!("Ligero verifier daemon request failed: {e}"))
-        })?;
-
-    if !resp.ok {
-        error!(
-            ok = resp.ok,
-            exit_code = ?resp.exit_code,
-            verify_ok = ?resp.verify_ok,
-            error = resp.error.as_deref().unwrap_or("(none)"),
-            workers,
-            proof_path = %proof_path.display(),
-            "Ligero verifier daemon returned ok=false"
-        );
-        return Err(ServiceError::ProofError(format!(
-            "Ligero verifier daemon returned ok=false (exit_code={:?}): {}",
-            resp.exit_code,
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        )));
-    }
-
-    if resp.verify_ok != Some(true) {
-        error!(
-            ok = resp.ok,
-            exit_code = ?resp.exit_code,
-            verify_ok = ?resp.verify_ok,
-            workers,
-            proof_path = %proof_path.display(),
-            "Ligero verifier daemon did not confirm proof validity"
-        );
-        return Err(ServiceError::ProofError(format!(
-            "Ligero verifier daemon did not confirm proof validity (verify_ok={:?})",
-            resp.verify_ok
-        )));
-    }
-
-    Ok(())
-}
-
-fn prove_with_ligero_daemon(
-    req: &ProveVerifyRequest,
-    workers: usize,
-) -> Result<Vec<u8>, ServiceError> {
-    let program = resolve_circuit_program(&req.circuit)?;
-    let paths = discover_ligero_paths()?;
-    let pool = get_or_create_prover_daemon_pool(&paths, workers)?;
-
-    let use_gzip = req.gzip.unwrap_or(false);
-    let packing = req.packing.unwrap_or(8192);
-    let proof_filename = if use_gzip {
-        "proof_data.gz"
-    } else {
-        "proof_data.bin"
-    };
-
-    let proof_dir = tempfile::tempdir()
-        .map_err(|e| ServiceError::Internal(format!("Failed to create proof temp dir: {e}")))?;
-    let proof_path = proof_dir.path().join(proof_filename);
-
-    let mut cfg = serde_json::json!({
-        "program": program.to_string_lossy(),
-        "shader-path": paths.shader_dir.to_string_lossy(),
-        "packing": packing,
-        "gzip-proof": use_gzip,
-        "args": req.args,
-        "proof-path": proof_path.to_string_lossy().to_string(),
-    });
-    if !req.private_indices.is_empty() {
-        cfg["private-indices"] = serde_json::json!(req.private_indices);
-    }
-
-    let resp = pool
-        .prove(cfg)
-        .map_err(|e| ServiceError::ProofError(format!("Prover daemon request failed: {e}")))?;
-
-    if !resp.ok {
-        error!(
-            circuit = %req.circuit,
-            ok = resp.ok,
-            exit_code = ?resp.exit_code,
-            error = resp.error.as_deref().unwrap_or("(none)"),
-            packing,
-            use_gzip,
-            n_args = req.args.len(),
-            n_private_indices = req.private_indices.len(),
-            proof_path = %proof_path.display(),
-            "Prover daemon returned ok=false for /prove-and-verify"
-        );
-        return Err(ServiceError::ProofError(format!(
-            "Prover daemon returned ok=false (circuit={}, exit_code={:?}): {}",
-            req.circuit,
-            resp.exit_code,
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        )));
-    }
-
-    let proof_file = resp
-        .proof_path
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or(proof_path);
-    let proof_bytes = std::fs::read(&proof_file)
-        .map_err(|e| ServiceError::Internal(format!("Failed to read proof output: {e}")))?;
-    Ok(proof_bytes)
-}
-
-fn verify_with_ligero_daemon_api(
-    req: &ProveVerifyRequest,
-    workers: usize,
-) -> Result<(), ServiceError> {
-    let proof_b64 = req
-        .proof
-        .as_ref()
-        .ok_or_else(|| ServiceError::ParseError("Proof is required for /verify".to_string()))?;
-    let proof_bytes = BASE64_STANDARD
-        .decode(proof_b64)
-        .map_err(|e| ServiceError::ParseError(format!("Failed to decode proof: {e}")))?;
-
-    let program = resolve_circuit_program(&req.circuit)?;
-    let paths = discover_ligero_paths()?;
-    let pool = get_or_create_verifier_daemon_pool(&paths, workers)?;
-
-    let is_gzip = proof_bytes.len() >= 2 && proof_bytes[0] == 0x1f && proof_bytes[1] == 0x8b;
-    let proof_filename = if is_gzip {
-        "proof_data.gz"
-    } else {
-        "proof_data.bin"
-    };
-
-    let dir = tempfile::tempdir()
-        .map_err(|e| ServiceError::Internal(format!("Failed to create temp dir: {e}")))?;
-    let proof_path = dir.path().join(proof_filename);
-    std::fs::write(&proof_path, &proof_bytes)
-        .map_err(|e| ServiceError::Internal(format!("Failed to write proof file: {e}")))?;
-
-    let redacted_args = ligero_runner::redaction::redacted_args(&req.args, &req.private_indices);
-    let mut cfg = serde_json::json!({
-        "program": program.to_string_lossy(),
-        "shader-path": paths.shader_dir.to_string_lossy(),
-        "packing": req.packing.unwrap_or(8192),
-        "gzip-proof": is_gzip,
-        "args": redacted_args,
-    });
-    if !req.private_indices.is_empty() {
-        cfg["private-indices"] = serde_json::json!(req.private_indices);
-    }
-
-    let resp = pool
-        .verify(cfg, proof_path.to_string_lossy().as_ref())
-        .map_err(|e| ServiceError::ProofError(format!("Verifier daemon request failed: {e}")))?;
-
-    if !resp.ok || resp.verify_ok != Some(true) {
-        error!(
-            circuit = %req.circuit,
-            ok = resp.ok,
-            exit_code = ?resp.exit_code,
-            verify_ok = ?resp.verify_ok,
-            error = resp.error.as_deref().unwrap_or("(none)"),
-            proof_bytes = proof_bytes.len(),
-            is_gzip,
-            packing = req.packing.unwrap_or(8192),
-            n_args = req.args.len(),
-            n_private_indices = req.private_indices.len(),
-            "Ligero daemon verification FAILED for /verify API"
-        );
-        return Err(ServiceError::ProofError(format!(
-            "Verification failed (circuit={}, exit_code={:?}, verify_ok={:?}): {}",
-            req.circuit,
-            resp.exit_code,
-            resp.verify_ok,
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        )));
-    }
-
-    Ok(())
 }
 
 /// Request body for proof verification
@@ -1228,6 +529,10 @@ fn verify_with_ligero_daemon_api(
 pub struct VerifyAndSubmitRequest {
     /// Base64-encoded signed transaction bytes (same format as node RPC)
     pub body: String,
+    /// Optional S3-backed proof reference. When present, `body` is expected to
+    /// contain the proof-stripped lightweight transaction.
+    #[serde(default)]
+    pub proof_ref: Option<ProofReference>,
 }
 
 /// Response from proof verification
@@ -1257,7 +562,7 @@ pub struct VerificationMetrics {
     pub parse_ms: f64,
     /// Time to verify transaction signature (ms)
     pub signature_verify_ms: f64,
-    /// Time to verify Ligero proof (ms)
+    /// Time to verify proof (ms)
     pub proof_verify_ms: f64,
     /// Time to create non-ZK transaction (ms)
     pub tx_creation_ms: f64,
@@ -1285,7 +590,7 @@ impl Default for VerificationMetrics {
     }
 }
 
-/// Public output from Ligero value proof
+/// Public output from value proof
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 pub struct ValueProofPublic {
     pub value: u32,
@@ -1355,7 +660,7 @@ impl IntoResponse for ServiceError {
                 (StatusCode::UNAUTHORIZED, msg.clone())
             }
             ServiceError::ProofError(msg) => {
-                error!(details = %msg, "Proof verification failed");
+                error!("Proof verification error: {}", msg);
                 (StatusCode::UNPROCESSABLE_ENTITY, msg.clone())
             }
             ServiceError::SubmissionError(msg) => {
@@ -1372,18 +677,8 @@ impl IntoResponse for ServiceError {
             }
         };
 
-        let error_kind = match &self {
-            ServiceError::DecodeError(_) => "decode_error",
-            ServiceError::ParseError(_) => "parse_error",
-            ServiceError::SignatureError(_) => "signature_error",
-            ServiceError::ProofError(_) => "proof_error",
-            ServiceError::SubmissionError(_) => "submission_error",
-            ServiceError::UnsupportedCall(_) => "unsupported_call",
-            ServiceError::Internal(_) => "internal_error",
-        };
         let body = Json(serde_json::json!({
             "error": message,
-            "error_kind": error_kind,
             "status": status.as_u16(),
         }));
 
@@ -1506,16 +801,121 @@ async fn pending_hashes_handler(
 }
 
 fn prove_verify_error_response(status: StatusCode, exit_code: i32, message: String) -> Response {
+    if status.is_server_error() {
+        error!(
+            %status,
+            exit_code,
+            error = %message,
+            "Local /prove or /verify request failed"
+        );
+    } else {
+        warn!(
+            %status,
+            exit_code,
+            error = %message,
+            "Local /prove or /verify request rejected"
+        );
+    }
+
     (
         status,
         Json(ProveVerifyResponse {
             success: false,
             exit_code,
             proof: None,
+            proof_ref: None,
+            proof_download_url: None,
             error: Some(message),
         }),
     )
         .into_response()
+}
+
+fn parse_fixed_hex<const N: usize>(name: &str, value: &str) -> Result<[u8; N], ServiceError> {
+    let trimmed = value.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| ServiceError::ParseError(format!("Invalid hex in '{name}': {e}")))?;
+    let len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        ServiceError::ParseError(format!(
+            "'{name}' must decode to {N} bytes (got {})",
+            len
+        ))
+    })
+}
+
+fn inject_pool_viewer_sig_into_proof(
+    proof_bytes: Vec<u8>,
+    fvk_commitment_hex: &str,
+    signature_hex: &str,
+) -> Result<Vec<u8>, ServiceError> {
+    use flate2::read::DeflateDecoder;
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use sov_nightstream_adapter::{NightstreamProofPackage, PoolViewerSig};
+    use std::io::{Read, Write};
+
+    let fvk_commitment =
+        parse_fixed_hex::<32>("pool_viewer_fvk_commitment", fvk_commitment_hex)?;
+    let signature = parse_fixed_hex::<64>("pool_viewer_sig_hex", signature_hex)?.to_vec();
+
+    let decompressed = {
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to decompress proof bytes for pool viewer signature injection: {e}"
+            ))
+        })?;
+        buf
+    };
+
+    let mut package: NightstreamProofPackage = bincode::deserialize(&decompressed).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to deserialize NightstreamProofPackage for pool viewer signature injection: {e}"
+        ))
+    })?;
+
+    package.pool_viewer_sig = Some(PoolViewerSig {
+        fvk_commitment,
+        signature,
+    });
+
+    let serialized = bincode::serialize(&package).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to serialize NightstreamProofPackage after pool viewer signature injection: {e}"
+        ))
+    })?;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&serialized).map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to write recompressed proof package after pool viewer signature injection: {e}"
+        ))
+    })?;
+    encoder.finish().map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to finish proof package recompression after pool viewer signature injection: {e}"
+        ))
+    })
+}
+
+async fn load_proof_bytes_from_reference(
+    state: &AppState,
+    proof_ref: &ProofReference,
+) -> Result<Vec<u8>, ServiceError> {
+    let storage = state.proof_storage.as_ref().ok_or_else(|| {
+        ServiceError::Internal(
+            "Proof reference requested, but S3-backed proof storage is not configured".to_string(),
+        )
+    })?;
+
+    storage.load_proof(proof_ref).await.map_err(|e| {
+        ServiceError::Internal(format!(
+            "Failed to load proof package from S3 reference {}: {}",
+            proof_ref.key, e
+        ))
+    })
 }
 
 async fn prove_handler(
@@ -1533,12 +933,121 @@ async fn prove_handler(
         }
     };
 
-    let return_binary = req.binary.unwrap_or(false);
-    let workers = state.config.max_concurrent_verifications;
-    let result = tokio::task::spawn_blocking(move || prove_with_ligero_daemon(&req, workers)).await;
+    let return_binary = req.binary.unwrap_or(false) && state.proof_storage.is_none();
+
+    let witness = match req.witness {
+        Some(w) => w,
+        None => {
+            return prove_verify_error_response(
+                StatusCode::BAD_REQUEST,
+                1,
+                "/prove requires a 'witness' field with the full NoteSpendWitness.".to_string(),
+            );
+        }
+    };
+
+    let public_output_bytes = match req.public_output {
+        Some(ref b64) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| {
+                    return prove_verify_error_response(
+                        StatusCode::BAD_REQUEST,
+                        1,
+                        format!("Invalid base64 in 'public_output': {e}"),
+                    );
+                })
+                .unwrap_or_default()
+        }
+        None => {
+            return prove_verify_error_response(
+                StatusCode::BAD_REQUEST,
+                1,
+                "/prove requires a 'public_output' field (base64-encoded bincode SpendPublic)."
+                    .to_string(),
+            );
+        }
+    };
+
+    let maybe_pool_viewer_sig = match (
+        req.pool_viewer_fvk_commitment.as_deref(),
+        req.pool_viewer_sig_hex.as_deref(),
+    ) {
+        (Some(fvk_commitment), Some(signature)) => Some((fvk_commitment.to_string(), signature.to_string())),
+        (None, None) => None,
+        _ => {
+            return prove_verify_error_response(
+                StatusCode::BAD_REQUEST,
+                1,
+                "Both 'pool_viewer_fvk_commitment' and 'pool_viewer_sig_hex' are required together"
+                    .to_string(),
+            );
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServiceError> {
+        use sov_nightstream_adapter::circuits::note_spend_rom;
+        use sov_nightstream_adapter::{NightstreamHost, ProverComputeBackend};
+
+        let mut host = NightstreamHost::new(
+            &note_spend_rom::NOTE_SPEND_ROM,
+            note_spend_rom::NOTE_SPEND_ROM_BASE,
+        )
+        .with_compute_backend(ProverComputeBackend::auto());
+        host.write_note_spend_witness(&witness, public_output_bytes);
+
+        host.run(true)
+            .map_err(|e| ServiceError::Internal(format!("Nightstream proving failed: {e}")))
+    })
+    .await
+    .map_err(|e| e);
 
     match result {
         Ok(Ok(proof_bytes)) => {
+            let proof_bytes = match maybe_pool_viewer_sig {
+                Some((fvk_commitment, signature)) => {
+                    match inject_pool_viewer_sig_into_proof(proof_bytes, &fvk_commitment, &signature)
+                    {
+                        Ok(proof_bytes) => proof_bytes,
+                        Err(err) => {
+                            return prove_verify_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                1,
+                                err.to_string(),
+                            );
+                        }
+                    }
+                }
+                None => proof_bytes,
+            };
+
+            if let Some(storage) = state.proof_storage.as_ref() {
+                match storage.store_proof(proof_bytes).await {
+                    Ok(stored_proof) => {
+                        return (
+                            StatusCode::OK,
+                            Json(ProveVerifyResponse {
+                                success: true,
+                                exit_code: 0,
+                                proof: None,
+                                proof_ref: Some(stored_proof.proof_ref),
+                                proof_download_url: stored_proof.proof_download_url,
+                                error: None,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Err(err) => {
+                        return prove_verify_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            1,
+                            format!("Failed to store generated proof package in S3: {err}"),
+                        );
+                    }
+                }
+            }
+
             if return_binary {
                 (
                     StatusCode::OK,
@@ -1553,6 +1062,8 @@ async fn prove_handler(
                         success: true,
                         exit_code: 0,
                         proof: Some(BASE64_STANDARD.encode(&proof_bytes)),
+                        proof_ref: None,
+                        proof_download_url: None,
                         error: None,
                     }),
                 )
@@ -1589,9 +1100,78 @@ async fn verify_handler(
         }
     };
 
-    let workers = state.config.max_concurrent_verifications;
-    let result =
-        tokio::task::spawn_blocking(move || verify_with_ligero_daemon_api(&req, workers)).await;
+    let method_id = state.config.midnight_method_id;
+
+    let proof_bytes = if let Some(proof_ref) = req.proof_ref.as_ref() {
+        match load_proof_bytes_from_reference(&state, proof_ref).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return prove_verify_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    1,
+                    err.to_string(),
+                );
+            }
+        }
+    } else {
+        let proof_b64 = match req.proof.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                return prove_verify_error_response(
+                    StatusCode::BAD_REQUEST,
+                    1,
+                    "Either 'proof' or 'proof_ref' is required for /verify".to_string(),
+                );
+            }
+        };
+        match BASE64_STANDARD.decode(&proof_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                return prove_verify_error_response(
+                    StatusCode::BAD_REQUEST,
+                    1,
+                    format!("Failed to decode proof: {e}"),
+                );
+            }
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        use flate2::read::DeflateDecoder;
+        use sov_nightstream_adapter::{
+            NightstreamCodeCommitment, NightstreamProofPackage, NightstreamVerifier,
+        };
+        use sov_rollup_interface::zk::CodeCommitment;
+        use std::io::Read as _;
+
+        let method_id_bytes = method_id.ok_or_else(|| {
+            ServiceError::Internal("Midnight method ID not configured".to_string())
+        })?;
+        let commitment = NightstreamCodeCommitment::decode(&method_id_bytes)
+            .map_err(|e| ServiceError::Internal(format!("Invalid method_id: {}", e)))?;
+
+        let mut decoder = DeflateDecoder::new(proof_bytes.as_slice());
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| ServiceError::Internal(format!("Failed to decompress: {e}")))?;
+        let package: NightstreamProofPackage = bincode::deserialize(&decompressed)
+            .map_err(|e| ServiceError::Internal(format!("Failed to deserialize: {e}")))?;
+
+        NightstreamVerifier::ensure_code_commitment(&package.rom_bytes, &commitment.0)
+            .map_err(|e| ServiceError::ProofError(format!("Code commitment mismatch: {e}")))?;
+
+        NightstreamVerifier::verify_proof_package(&package)
+            .map_err(|e| ServiceError::ProofError(format!("Verification failed: {e}")))?;
+
+        // Deserialize public output
+        let _public: midnight_privacy::SpendPublic = bincode::deserialize(&package.public_output)
+            .map_err(|e| {
+            ServiceError::Internal(format!("Failed to deserialize public output: {e}"))
+        })?;
+        Ok(())
+    })
+    .await;
 
     match result {
         Ok(Ok(())) => (
@@ -1600,6 +1180,8 @@ async fn verify_handler(
                 success: true,
                 exit_code: 0,
                 proof: None,
+                proof_ref: None,
+                proof_download_url: None,
                 error: None,
             }),
         )
@@ -1902,7 +1484,7 @@ async fn verify_and_submit_handler(
 
     // Step 3: Verify Ligero proof (in parallel)
     let proof_start = std::time::Instant::now();
-    verify_ligero_proof(&state, value, &proof).await?;
+    verify_value_setter_proof(&state, value, &proof).await?;
     metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
 
     debug!("✓ Proof verification successful for value={}", value);
@@ -1954,8 +1536,14 @@ async fn verify_and_record_midnight_handler(
         .map_err(|e| ServiceError::DecodeError(format!("Invalid base64: {}", e)))?;
     metrics.deserialize_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
+    let remote_proof_bytes = if let Some(proof_ref) = req.proof_ref.as_ref() {
+        Some(load_proof_bytes_from_reference(&state, proof_ref).await?)
+    } else {
+        None
+    };
+
     let parse_start = std::time::Instant::now();
-    let tx: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
+    let tx_without_proof: Transaction<DemoRuntime<RollupSpec>, RollupSpec> =
         borsh::BorshDeserialize::try_from_slice(&tx_bytes).map_err(|e| {
             let err = e.to_string();
             let hint = if err.contains("Unexpected length of input") {
@@ -1972,14 +1560,33 @@ async fn verify_and_record_midnight_handler(
             ))
         })?;
 
+    let tx_hash = tx_without_proof.hash().to_string();
+
+    let tx = if let Some(proof_bytes) = remote_proof_bytes.as_ref() {
+        attach_proof_to_midnight_transaction(&tx_without_proof, proof_bytes)?
+    } else {
+        tx_without_proof.clone()
+    };
+
+    let full_transaction_blob = if remote_proof_bytes.is_some() {
+        let tx_with_proof_bytes = borsh::to_vec(&tx).map_err(|e| {
+            ServiceError::Internal(format!(
+                "Failed to serialize rehydrated midnight transaction: {e}"
+            ))
+        })?;
+        BASE64_STANDARD.encode(tx_with_proof_bytes)
+    } else {
+        req.body.clone()
+    };
+
     let parsed_call = parse_midnight_call(&tx)?;
     metrics.parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
     let signature_start = std::time::Instant::now();
-    verify_midnight_transaction_signature(&tx, &state.rollup_chain_hash)?;
+    let rollup_chain_hash = ensure_rollup_chain_hash(&state).await?;
+    verify_midnight_transaction_signature(&tx_without_proof, &rollup_chain_hash)?;
     metrics.signature_verify_ms = signature_start.elapsed().as_secs_f64() * 1000.0;
 
-    let tx_hash = tx.hash().to_string();
     let transaction_data = create_transaction_without_proof(&tx)?;
 
     async fn handle_no_proof_midnight_call(
@@ -2132,27 +1739,22 @@ async fn verify_and_record_midnight_handler(
                 proof.len()
             );
 
-            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
             let proof_start = std::time::Instant::now();
             // For transfers, expected withdraw_amount is 0
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 proof,
-                state.config.max_concurrent_verifications,
                 anchor_root,
                 &nullifiers,
                 0u128,
                 state.pool_fvk_pk.clone(),
-                ciphertexts_meta,
-                state.config.prover_service_url.as_deref(),
-                Some(&state.http_client),
             )
             .await?;
             metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
 
             let persist_start = std::time::Instant::now();
             // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+            let pre_auth_data = match extract_pre_authenticated_data(&tx_without_proof) {
                 Ok(data) => {
                     debug!("✓ Extracted pre-authenticated data for transfer (includes lightweight tx without proof)");
                     Some(data)
@@ -2187,7 +1789,7 @@ async fn verify_and_record_midnight_handler(
                 true,       // signature_valid
                 Some(true), // proof_verified: true
                 &transaction_data,
-                &req.body,
+                &full_transaction_blob,
                 pre_auth_data,
                 view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
@@ -2251,26 +1853,21 @@ async fn verify_and_record_midnight_handler(
                 view_ciphertexts.as_ref().map(|v| v.len()),
             );
 
-            let ciphertexts_meta = view_ciphertexts_meta(view_ciphertexts.as_ref());
             let proof_start = std::time::Instant::now();
             let proof_public = verify_midnight_withdraw_proof(
                 state.config.midnight_method_id.as_ref(),
                 proof,
-                state.config.max_concurrent_verifications,
                 anchor_root,
                 std::slice::from_ref(&nullifier),
                 withdraw_amount,
                 state.pool_fvk_pk.clone(),
-                ciphertexts_meta,
-                state.config.prover_service_url.as_deref(),
-                Some(&state.http_client),
             )
             .await?;
             metrics.proof_verify_ms = proof_start.elapsed().as_secs_f64() * 1000.0;
 
             let persist_start = std::time::Instant::now();
             // Extract pre-authenticated data for optimized sequencer processing
-            let pre_auth_data = match extract_pre_authenticated_data(&tx) {
+            let pre_auth_data = match extract_pre_authenticated_data(&tx_without_proof) {
                 Ok(data) => {
                     debug!("✓ Extracted pre-authenticated data for withdraw (includes lightweight tx without proof)");
                     Some(data)
@@ -2303,7 +1900,7 @@ async fn verify_and_record_midnight_handler(
                 true,       // signature_valid
                 Some(true), // proof_verified: true (has proof and verified correctly)
                 &transaction_data,
-                &req.body,
+                &full_transaction_blob,
                 pre_auth_data,
                 view_ciphertexts.as_ref(), // Level-B encrypted notes for authority viewing
             )
@@ -2539,67 +2136,36 @@ fn parse_ligero_call_bytes(bytes: &[u8]) -> Result<(u32, Vec<u8>), ServiceError>
     ))
 }
 
-/// Verify Ligero proof using either the remote prover service or local daemon
-async fn verify_ligero_proof(
+/// Verify Nightstream proof for value-setter.
+async fn verify_value_setter_proof(
     state: &AppState,
     value: u32,
     proof: &[u8],
 ) -> Result<(), ServiceError> {
+    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
+    use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+
     let method_id_bytes = state.config.value_setter_method_id.ok_or_else(|| {
         ServiceError::Internal(
             "Value-setter method ID not configured. \
-            The service needs the value_validator_rust.wasm program to compute the method ID."
+            The service needs the value_validator ROM to compute the method ID."
                 .to_string(),
         )
     })?;
-    let method_id = LigeroCodeCommitment(method_id_bytes);
-    let workers = state.config.max_concurrent_verifications;
-    let prover_url = state.config.prover_service_url.clone();
-    let http_client = state.http_client.clone();
+
+    let commitment = NightstreamCodeCommitment::decode(&method_id_bytes)
+        .map_err(|e| ServiceError::Internal(format!("Invalid Nightstream method_id: {}", e)))?;
 
     let proof = proof.to_vec();
 
-    // Decode package first (needed for both paths)
-    let package: sov_ligero_adapter::LigeroProofPackage =
-        bincode::deserialize(&proof).map_err(|err| {
-            ServiceError::ProofError(format!(
-                "Proof payload is not a LigeroProofPackage ({}). \
-                     Regenerate the proof with the updated tooling.",
-                err
-            ))
-        })?;
+    let public: ValueProofPublic =
+        tokio::task::spawn_blocking(move || NightstreamVerifier::verify(&proof, &commitment))
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+            .map_err(|e| {
+                ServiceError::ProofError(format!("Nightstream verification failed: {}", e))
+            })?;
 
-    debug!(
-        "Ligero proof package decoded: proof_bytes={} public_output_bytes={}",
-        package.proof.len(),
-        package.public_output.len()
-    );
-
-    if ligero_skip_verify_enabled() {
-        // Skip verification, just decode public output
-    } else if let Some(url) = prover_url {
-        // Use remote prover service
-        debug!(
-            "Using remote prover service at {} for value-setter verification",
-            url
-        );
-        verify_with_prover_service(&http_client, &url, "value_validator_rust", &package).await?;
-    } else {
-        // Fall back to local daemon pool
-        debug!("Using local daemon pool for value-setter verification");
-        let package_clone = package.clone();
-        tokio::task::spawn_blocking(move || {
-            verify_with_ligero_verifier_daemon(&method_id.0, &package_clone, workers)
-        })
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))??;
-    }
-
-    // Decode and verify public output
-    let public: ValueProofPublic = bincode::deserialize(&package.public_output)
-        .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?;
-
-    // Check that the public output matches the claimed value
     if public.value != value {
         return Err(ServiceError::ProofError(format!(
             "Value mismatch: claimed={}, verified={}",
@@ -2621,6 +2187,8 @@ async fn create_and_sign_non_zk_transaction(
     state: &AppState,
     value: u32,
 ) -> Result<Vec<u8>, ServiceError> {
+    let rollup_chain_hash = ensure_rollup_chain_hash(state).await?;
+
     // Use the cached signing key
     let signing_key = &*state.signing_key;
 
@@ -2652,7 +2220,7 @@ async fn create_and_sign_non_zk_transaction(
     debug!("  Chain ID: {}", state.config.chain_id);
     debug!(
         "  Using rollup chain hash from /rollup/schema: {}",
-        hex::encode(&state.rollup_chain_hash)
+        hex::encode(rollup_chain_hash)
     );
 
     // Create the transaction
@@ -2667,7 +2235,7 @@ async fn create_and_sign_non_zk_transaction(
         nonce,
         signing_key,
         state.config.chain_id,
-        &state.rollup_chain_hash,
+        &rollup_chain_hash,
     )
     .map_err(|e| {
         error!("Failed to create transaction bytes: {}", e);
@@ -2842,6 +2410,82 @@ fn parse_midnight_call(
     }
 }
 
+fn attach_proof_to_midnight_transaction(
+    tx: &DemoTransaction,
+    proof_bytes: &[u8],
+) -> Result<DemoTransaction, ServiceError> {
+    use sov_modules_api::transaction::{Version0, VersionedTx};
+    use sov_modules_api::SafeVec;
+
+    match &tx.versioned_tx {
+        VersionedTx::V0(v0) => {
+            let runtime_call = match &v0.runtime_call {
+                RuntimeCall::MidnightPrivacy(midnight_call) => {
+                    let call = match midnight_call {
+                        MidnightCallMessage::Transfer {
+                            anchor_root,
+                            nullifiers,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Transfer {
+                            proof: SafeVec::try_from(proof_bytes.to_vec()).map_err(|_| {
+                                ServiceError::ParseError("Proof too large for SafeVec".to_string())
+                            })?,
+                            anchor_root: *anchor_root,
+                            nullifiers: nullifiers.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        MidnightCallMessage::Withdraw {
+                            anchor_root,
+                            nullifier,
+                            withdraw_amount,
+                            to,
+                            view_ciphertexts,
+                            gas,
+                            ..
+                        } => MidnightCallMessage::Withdraw {
+                            proof: SafeVec::try_from(proof_bytes.to_vec()).map_err(|_| {
+                                ServiceError::ParseError("Proof too large for SafeVec".to_string())
+                            })?,
+                            anchor_root: *anchor_root,
+                            nullifier: *nullifier,
+                            withdraw_amount: *withdraw_amount,
+                            to: to.clone(),
+                            view_ciphertexts: view_ciphertexts.clone(),
+                            gas: gas.clone(),
+                        },
+                        _ => {
+                            return Err(ServiceError::UnsupportedCall(
+                                "proof_ref is only supported for midnight transfer/withdraw calls"
+                                    .to_string(),
+                            ))
+                        }
+                    };
+
+                    RuntimeCall::MidnightPrivacy(call)
+                }
+                other => {
+                    return Err(ServiceError::UnsupportedCall(format!(
+                        "proof_ref is only supported for midnight_privacy calls, got {other:?}"
+                    )))
+                }
+            };
+
+            Ok(Transaction {
+                versioned_tx: VersionedTx::V0(Version0 {
+                    signature: v0.signature.clone(),
+                    pub_key: v0.pub_key.clone(),
+                    runtime_call,
+                    uniqueness: v0.uniqueness.clone(),
+                    details: v0.details.clone(),
+                }),
+            })
+        }
+    }
+}
+
 pub fn parse_midnight_withdraw_call(
     tx: &Transaction<DemoRuntime<RollupSpec>, RollupSpec>,
 ) -> Result<
@@ -2904,134 +2548,55 @@ pub fn verify_midnight_transaction_signature(
         .map_err(|e| ServiceError::SignatureError(e.to_string()))
 }
 
+/// Verify a midnight proof using the Nightstream backend.
+/// Returns `SpendPublic` decoded from the proof package's public output.
+async fn verify_midnight_proof_nightstream(
+    method_id_opt: Option<&[u8; 32]>,
+    proof_vec: &[u8],
+) -> Result<SpendPublic, ServiceError> {
+    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
+    use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+
+    let method_id_bytes = method_id_opt.ok_or_else(|| {
+        ServiceError::Internal(
+            "Nightstream midnight method ID not configured. \
+            Either provide --nightstream-midnight-method-id or the embedded ROM will be used."
+                .to_string(),
+        )
+    })?;
+
+    let method_id = NightstreamCodeCommitment::decode(method_id_bytes)
+        .map_err(|e| ServiceError::Internal(format!("Invalid Nightstream method_id: {}", e)))?;
+
+    debug!(
+        "Verifying midnight proof with Nightstream backend, method_id=0x{}",
+        hex::encode(method_id_bytes)
+    );
+
+    // Nightstream verification is CPU-intensive, run in a blocking task
+    let proof_owned = proof_vec.to_vec();
+    let method_id_owned = method_id;
+    let public: SpendPublic = tokio::task::spawn_blocking(move || {
+        NightstreamVerifier::verify(&proof_owned, &method_id_owned)
+    })
+    .await
+    .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
+    .map_err(|e| {
+        ServiceError::ProofError(format!("Nightstream proof verification failed: {}", e))
+    })?;
+
+    Ok(public)
+}
+
 pub async fn verify_midnight_withdraw_proof(
     method_id_opt: Option<&[u8; 32]>,
     proof: Vec<u8>,
-    workers: usize,
     expected_anchor_root: MidnightHash32,
     expected_nullifiers: &[MidnightHash32],
     expected_withdraw_amount: u128,
     pool_fvk_pk: Option<Ed25519VerifyingKey>,
-    view_ciphertexts_meta: Option<ViewCiphertextsMeta>,
-    prover_service_url: Option<&str>,
-    http_client: Option<&reqwest::Client>,
 ) -> Result<SpendPublic, ServiceError> {
-    let method_id_bytes = method_id_opt.ok_or_else(|| {
-        ServiceError::Internal(
-            "Midnight method ID not configured. \
-            The service needs the note_spend_guest.wasm program to compute the method ID."
-                .to_string(),
-        )
-    })?;
-    let method_id = LigeroCodeCommitment(*method_id_bytes);
-    let proof_vec = proof;
-
-    // Decode package first
-    let package: sov_ligero_adapter::LigeroProofPackage = bincode::deserialize(&proof_vec)
-        .map_err(|err| {
-            ServiceError::ProofError(format!(
-                "Proof payload is not a LigeroProofPackage ({}). \
-                 Regenerate the proof with the updated tooling.",
-                err
-            ))
-        })?;
-
-    debug!(
-        "Midnight proof package decoded: proof_bytes={} public_output_bytes={}",
-        package.proof.len(),
-        package.public_output.len()
-    );
-
-    // Verify pool signature over viewer commitment before doing expensive proof verification
-    let expected_viewer_fvk_commitment = match pool_fvk_pk.as_ref() {
-        Some(pool_pk) => {
-            let args: Vec<serde_json::Value> =
-                serde_json::from_slice(&package.args_json).map_err(|e| {
-                    ServiceError::ParseError(format!(
-                        "LigeroProofPackage.args_json is not valid JSON: {e}"
-                    ))
-                })?;
-            let expected = enforce_pool_signed_viewer_commitment_in_args(pool_pk, &args)?;
-
-            let meta = view_ciphertexts_meta.as_ref().ok_or_else(|| {
-                ServiceError::ProofError(
-                    "POOL_FVK_PK is set: Transfer/Withdraw tx must include view_ciphertexts (encrypted note payload bytes)".to_string(),
-                )
-            })?;
-            if meta.notes.is_empty() {
-                return Err(ServiceError::ProofError(
-                    "POOL_FVK_PK is set: view_ciphertexts must be non-empty".to_string(),
-                ));
-            }
-            for (idx, note) in meta.notes.iter().enumerate() {
-                if note.ct_len == 0 {
-                    return Err(ServiceError::ProofError(format!(
-                        "POOL_FVK_PK is set: view_ciphertexts[{idx}].ct is empty"
-                    )));
-                }
-                if note.fvk_commitment != expected {
-                    return Err(ServiceError::ProofError(format!(
-                        "POOL_FVK_PK is set: view_ciphertexts[{idx}].fvk_commitment (0x{}) != signed viewer commitment (0x{})",
-                        hex::encode(note.fvk_commitment),
-                        hex::encode(expected)
-                    )));
-                }
-            }
-
-            Some(expected)
-        }
-        None => None,
-    };
-
-    let nullifiers_hex: Vec<String> = expected_nullifiers
-        .iter()
-        .map(|n| format!("0x{}", hex::encode(n)))
-        .collect();
-    let anchor_hex = format!("0x{}", hex::encode(expected_anchor_root));
-
-    // Perform ZK proof verification
-    let verify_result = if ligero_skip_verify_enabled() {
-        Ok(())
-    } else if let (Some(url), Some(client)) = (prover_service_url, http_client) {
-        debug!(
-            "Using remote prover service at {} for midnight verification",
-            url
-        );
-        verify_with_prover_service(client, url, "note_spend_guest", &package).await
-    } else {
-        debug!("Using local daemon pool for midnight verification");
-        let package_clone = package.clone();
-        tokio::task::spawn_blocking(move || {
-            verify_with_ligero_verifier_daemon(&method_id.0, &package_clone, workers)
-        })
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Task join error: {}", e)))?
-    };
-
-    if let Err(e) = verify_result {
-        let backend = if prover_service_url.is_some() {
-            "remote_prover_service"
-        } else {
-            "local_daemon_pool"
-        };
-        error!(
-            backend,
-            anchor_root = %anchor_hex,
-            nullifiers = ?nullifiers_hex,
-            withdraw_amount = expected_withdraw_amount,
-            proof_bytes = proof_vec.len(),
-            package_proof_bytes = package.proof.len(),
-            package_public_output_bytes = package.public_output.len(),
-            package_args_json_bytes = package.args_json.len(),
-            package_private_indices = ?package.private_indices,
-            "Midnight ZK proof verification FAILED"
-        );
-        return Err(e);
-    }
-
-    // Decode and verify public output
-    let public: SpendPublic = bincode::deserialize(&package.public_output)
-        .map_err(|e| ServiceError::ProofError(format!("Failed to decode public output: {e}")))?;
+    let public: SpendPublic = verify_midnight_proof_nightstream(method_id_opt, &proof).await?;
 
     // Verify public output against expected values
     if public.anchor_root != expected_anchor_root {
@@ -3062,81 +2627,94 @@ pub async fn verify_midnight_withdraw_proof(
         )));
     }
 
-    // Verify pool FVK viewer commitments if enabled
-    if let Some(expected_fvk_c) = expected_viewer_fvk_commitment {
-        let atts = public.view_attestations.as_ref().ok_or_else(|| {
+    // Enforce pool-signed viewer FVK commitment when POOL_FVK_PK is configured
+    if let Some(ref pool_pk) = pool_fvk_pk {
+        use ed25519_dalek::Verifier;
+        use sov_nightstream_adapter::NightstreamProofPackage;
+
+        // Decompress and deserialize the proof package to extract pool_viewer_sig
+        let decompressed = {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+            let mut decoder = DeflateDecoder::new(proof.as_slice());
+            let mut buf = Vec::new();
+            decoder.read_to_end(&mut buf).map_err(|e| {
+                ServiceError::ParseError(format!(
+                    "Failed to decompress proof for pool FVK check: {e}"
+                ))
+            })?;
+            buf
+        };
+
+        let package: NightstreamProofPackage =
+            bincode::deserialize(&decompressed).map_err(|e| {
+                ServiceError::ParseError(format!(
+                    "Failed to deserialize NightstreamProofPackage for pool FVK check: {e}"
+                ))
+            })?;
+
+        let pool_sig = package.pool_viewer_sig.ok_or_else(|| {
             ServiceError::ProofError(
-                "Expected proof to include view_attestations (POOL_FVK_PK is set)".to_string(),
+                "POOL_FVK_PK is set: proof package must include pool_viewer_sig \
+                 (pool-signed viewer FVK commitment)"
+                    .to_string(),
             )
         })?;
-        if !atts.iter().any(|a| a.fvk_commitment == expected_fvk_c) {
-            return Err(ServiceError::ProofError(format!(
-                "view_attestations missing expected fvk_commitment 0x{}",
-                hex::encode(expected_fvk_c)
-            )));
-        }
 
-        let meta = view_ciphertexts_meta.as_ref().ok_or_else(|| {
+        // Verify Ed25519 signature over the FVK commitment
+        let signature = ed25519_dalek::Signature::from_slice(&pool_sig.signature).map_err(|e| {
+            ServiceError::ProofError(format!("Invalid Ed25519 signature in pool_viewer_sig: {e}"))
+        })?;
+
+        pool_pk
+            .verify(&pool_sig.fvk_commitment, &signature)
+            .map_err(|e| {
+                ServiceError::ProofError(format!(
+                    "Pool signature verification failed over fvk_commitment 0x{}: {e}",
+                    hex::encode(pool_sig.fvk_commitment)
+                ))
+            })?;
+
+        // Check that view_attestations are present and use the signed FVK commitment
+        let attestations = public.view_attestations.as_ref().ok_or_else(|| {
             ServiceError::ProofError(
-                "POOL_FVK_PK is set: Transfer/Withdraw tx must include view_ciphertexts (encrypted note payload bytes)".to_string(),
+                "POOL_FVK_PK is set: SpendPublic must include view_attestations".to_string(),
             )
         })?;
 
-        let outputs_len = public.output_commitments.len();
-        if outputs_len != meta.notes.len() {
-            return Err(ServiceError::ProofError(format!(
-                "POOL_FVK_PK is set: expected {} view_ciphertexts (one per output commitment), got {}",
-                outputs_len,
-                meta.notes.len()
-            )));
-        }
-
-        use std::collections::HashSet;
-        let output_set: HashSet<MidnightHash32> =
-            public.output_commitments.iter().copied().collect();
-        let ciphertext_set: HashSet<MidnightHash32> = meta.notes.iter().map(|n| n.cm).collect();
-
-        if output_set.len() != outputs_len {
+        if attestations.is_empty() {
             return Err(ServiceError::ProofError(
-                "Proof output_commitments contains duplicate commitments".to_string(),
-            ));
-        }
-        if ciphertext_set.len() != meta.notes.len() {
-            return Err(ServiceError::ProofError(
-                "view_ciphertexts contains duplicate commitments".to_string(),
+                "POOL_FVK_PK is set: view_attestations must be non-empty".to_string(),
             ));
         }
 
-        if output_set != ciphertext_set {
-            let missing: Vec<String> = public
-                .output_commitments
-                .iter()
-                .filter(|cm| !ciphertext_set.contains(*cm))
-                .map(|cm| format!("0x{}", hex::encode(cm)))
-                .collect();
-            let extra: Vec<String> = meta
-                .notes
-                .iter()
-                .filter(|n| !output_set.contains(&n.cm))
-                .map(|n| format!("0x{}", hex::encode(n.cm)))
-                .collect();
-            return Err(ServiceError::ProofError(format!(
-                "POOL_FVK_PK is set: view_ciphertexts/output_commitments mismatch (missing={missing:?}, extra={extra:?})"
-            )));
-        }
-
-        for cm in &public.output_commitments {
-            if !atts
-                .iter()
-                .any(|a| a.cm == *cm && a.fvk_commitment == expected_fvk_c)
-            {
+        // Every attestation must use the pool-signed FVK commitment
+        for (idx, att) in attestations.iter().enumerate() {
+            if att.fvk_commitment != pool_sig.fvk_commitment {
                 return Err(ServiceError::ProofError(format!(
-                    "POOL_FVK_PK is set: view_attestations missing (cm=0x{}, fvk_commitment=0x{})",
-                    hex::encode(cm),
-                    hex::encode(expected_fvk_c),
+                    "POOL_FVK_PK: view_attestations[{idx}].fvk_commitment (0x{}) \
+                     != signed fvk_commitment (0x{})",
+                    hex::encode(att.fvk_commitment),
+                    hex::encode(pool_sig.fvk_commitment),
                 )));
             }
         }
+
+        // Every output commitment must have a corresponding attestation
+        for cm in &public.output_commitments {
+            if !attestations.iter().any(|a| a.cm == *cm) {
+                return Err(ServiceError::ProofError(format!(
+                    "POOL_FVK_PK: output commitment 0x{} has no matching view_attestation",
+                    hex::encode(cm),
+                )));
+            }
+        }
+
+        debug!(
+            "✓ Pool FVK verification passed: fvk_commitment=0x{}, {} attestation(s)",
+            hex::encode(pool_sig.fvk_commitment),
+            attestations.len()
+        );
     }
 
     Ok(public)
@@ -4014,27 +3592,21 @@ async fn submit_worker_tx_to_sequencer(
 // Sovereign Ligero adapter. This service must not require env vars like `LIGERO_VERIFIER_BIN`
 // or `LIGERO_SHADER_PATH` (those binaries are owned by the Ligero repo, not Sovereign).
 
-/// Compute the method ID for the value_validator_rust.wasm program
+/// Compute the method ID for the value_validator ROM (SHA-256 of ROM bytes).
 fn compute_value_setter_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("value_validator_rust")
+    use sha2::{Digest, Sha256};
+    use sov_nightstream_adapter::circuits::value_validator_rom::VALUE_VALIDATOR_ROM;
+    Ok(Sha256::digest(&VALUE_VALIDATOR_ROM).into())
 }
 
-/// Compute the method ID for the note_spend_guest.wasm program
-fn compute_midnight_method_id() -> Result<[u8; 32]> {
-    compute_method_id_for_program("note_spend_guest")
-}
-
-/// Generic function to compute method ID for any guest program
-fn compute_method_id_for_program(program_name: &str) -> Result<[u8; 32]> {
-    // We only pass a circuit name here; `ligero-runner` is responsible for resolving the actual wasm.
-    let program_str = program_name.to_string();
-    let host = <Ligero as Zkvm>::Host::from_args(&program_str);
-    let method_id = host.code_commitment();
-
-    let encoded = method_id.encode();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&encoded[..32]);
-    Ok(result)
+/// Compute the Nightstream midnight method ID from the note_spend ROM bytes.
+/// This is `SHA-256(NOTE_SPEND_ROM)`, reading the canonical ROM from `sov-nightstream-adapter`.
+fn compute_nightstream_midnight_method_id() -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use sov_nightstream_adapter::circuits::note_spend_rom::NOTE_SPEND_ROM;
+    let mut hasher = Sha256::new();
+    hasher.update(&NOTE_SPEND_ROM);
+    hasher.finalize().into()
 }
 
 fn load_private_key<P: AsRef<Path>>(
@@ -4076,162 +3648,4 @@ async fn submit_to_node(state: &AppState, tx_bytes: Vec<u8>) -> Result<String, S
     debug!("Transaction submitted successfully: {}", tx_hash);
 
     Ok(tx_hash)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use serde_json::json;
-
-    fn hex_repeat(byte: u8, n: usize) -> String {
-        hex::encode(vec![byte; n])
-    }
-
-    fn arg_hex32(byte: u8) -> serde_json::Value {
-        json!({ "hex": hex_repeat(byte, 32) })
-    }
-
-    fn arg_i64(v: i64) -> serde_json::Value {
-        json!({ "i64": v })
-    }
-
-    fn build_min_note_spend_args_with_viewer(
-        withdraw_amount: u64,
-        n_out: usize,
-        viewer_fvk_commitment_hex: &str,
-        pool_sig_hex: Option<&str>,
-    ) -> Vec<serde_json::Value> {
-        // Minimal, structurally valid args array for note_spend_guest v2 indexing logic:
-        // - depth=1, n_in=1
-        // - includes blacklist section (1 or 2 checks)
-        // - includes viewer section for n_viewers=1
-        let depth: i64 = 1;
-        let n_in: i64 = 1;
-
-        let mut args: Vec<serde_json::Value> = Vec::new();
-
-        // Header
-        args.push(arg_hex32(0x01)); // domain
-        args.push(arg_hex32(0x02)); // spend_sk
-        args.push(arg_hex32(0x03)); // pk_ivk_owner
-        args.push(arg_i64(depth)); // depth
-        args.push(arg_hex32(0x04)); // anchor
-        args.push(arg_i64(n_in)); // n_in
-
-        // One input (depth=1)
-        args.push(arg_i64(1)); // value_in
-        args.push(arg_hex32(0x05)); // rho_in
-        args.push(arg_hex32(0x06)); // sender_id_in
-        args.push(arg_i64(0)); // pos
-        args.push(arg_hex32(0x07)); // siblings[0]
-        args.push(arg_hex32(0x08)); // nullifier (public)
-
-        // Withdraw binding
-        args.push(arg_i64(withdraw_amount as i64)); // withdraw_amount
-        args.push(arg_hex32(0x00)); // withdraw_to (ignored by locator)
-        args.push(arg_i64(n_out as i64)); // n_out
-
-        // Outputs (5 args each)
-        for _ in 0..n_out {
-            args.push(arg_i64(1)); // value_out
-            args.push(arg_hex32(0x09)); // rho_out
-            args.push(arg_hex32(0x0a)); // pk_spend_out
-            args.push(arg_hex32(0x0b)); // pk_ivk_out
-            args.push(arg_hex32(0x0c)); // cm_out (public)
-        }
-
-        // inv_enforce
-        args.push(arg_hex32(0x0d));
-
-        // blacklist_root
-        args.push(arg_hex32(0x0e));
-
-        // deny-map checks
-        let checks: usize = if withdraw_amount == 0 { 2 } else { 1 };
-        let bl_bucket_size: usize = midnight_privacy::BLACKLIST_BUCKET_SIZE as usize;
-        let bl_depth: usize = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-        for _ in 0..checks {
-            for _ in 0..bl_bucket_size {
-                args.push(arg_hex32(0x0f)); // bucket_entries[*]
-            }
-            args.push(arg_hex32(0x10)); // bucket_inv
-            for _ in 0..bl_depth {
-                args.push(arg_hex32(0x11)); // bucket_siblings[*]
-            }
-        }
-
-        // Viewer section
-        args.push(arg_i64(1)); // n_viewers
-
-        let mut viewer_commit_obj = json!({ "hex": viewer_fvk_commitment_hex });
-        if let Some(sig) = pool_sig_hex {
-            viewer_commit_obj["pool_sig_hex"] = json!(sig);
-        }
-        args.push(viewer_commit_obj); // fvk_commitment (public + pool sig metadata)
-        args.push(arg_hex32(0x12)); // fvk (private; value irrelevant for locator)
-
-        // ct_hash + mac for each output (public)
-        for _ in 0..n_out {
-            args.push(arg_hex32(0x13)); // ct_hash
-            args.push(arg_hex32(0x14)); // mac
-        }
-
-        args
-    }
-
-    #[test]
-    fn enforce_pool_signed_viewer_commitment_happy_path() {
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-
-        let fvk_commitment: [u8; 32] = [42u8; 32];
-        let sig_hex = hex::encode(signing_key.sign(&fvk_commitment).to_bytes());
-
-        let args = build_min_note_spend_args_with_viewer(
-            0, // transfer shape
-            1,
-            &hex::encode(fvk_commitment),
-            Some(&sig_hex),
-        );
-
-        let package = sov_ligero_adapter::LigeroProofPackage {
-            proof: vec![],
-            public_output: vec![],
-            args_json: serde_json::to_vec(&args).unwrap(),
-            private_indices: vec![],
-        };
-        let proof_bytes = bincode::serialize(&package).unwrap();
-
-        let got = enforce_pool_signed_viewer_commitment(&verifying_key, &proof_bytes).unwrap();
-        assert_eq!(got, fvk_commitment);
-    }
-
-    #[test]
-    fn enforce_pool_signed_viewer_commitment_requires_signature() {
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-
-        let fvk_commitment: [u8; 32] = [42u8; 32];
-        let args = build_min_note_spend_args_with_viewer(
-            0, // transfer shape
-            1,
-            &hex::encode(fvk_commitment),
-            None,
-        );
-
-        let package = sov_ligero_adapter::LigeroProofPackage {
-            proof: vec![],
-            public_output: vec![],
-            args_json: serde_json::to_vec(&args).unwrap(),
-            private_indices: vec![],
-        };
-        let proof_bytes = bincode::serialize(&package).unwrap();
-
-        let err = enforce_pool_signed_viewer_commitment(&verifying_key, &proof_bytes).unwrap_err();
-        match err {
-            ServiceError::SignatureError(_) => {}
-            other => panic!("Expected SignatureError, got {other:?}"),
-        }
-    }
 }

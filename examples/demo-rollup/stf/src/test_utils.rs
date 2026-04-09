@@ -68,6 +68,7 @@ where
                 initial_value: Some(0),
                 method_id: [0; 32],
                 admin: admin_address.clone(),
+                backend: "ligero".to_string(),
             },
             midnight_privacy: midnight_privacy::MidnightPrivacyConfig {
                 tree_depth: 32,
@@ -77,6 +78,7 @@ where
                 pool_admins: None,
                 domain: [0; 32],
                 token_id: sov_bank::TokenId::from([0; 32]),
+                backend: "ligero".to_string(),
             },
         }
     }

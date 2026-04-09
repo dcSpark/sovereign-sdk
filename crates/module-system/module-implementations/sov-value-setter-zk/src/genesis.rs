@@ -11,8 +11,8 @@ pub struct ValueSetterZkConfig<S: Spec> {
     /// Initial value (if any). If not provided, the value will be unset until the first transaction.
     pub initial_value: Option<u32>,
 
-    /// Ligetron method ID (code commitment) of the guest program that verifies value constraints.
-    /// This is the SHA-256 hash of (WASM program bytes || packing parameter).
+    /// Code commitment (32 bytes) of the guest program that verifies value constraints.
+    /// Nightstream: SHA-256(ROM bytes).
     pub method_id: [u8; 32],
 
     /// Admin of the module who can update the method ID.

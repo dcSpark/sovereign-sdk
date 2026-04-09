@@ -6,7 +6,6 @@ use midnight_privacy::{
     CallMessage as MidnightCallMessage, FrozenAddressesResponse, PrivacyAddress,
 };
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -14,12 +13,13 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::{Amount, Spec};
+use sov_nightstream_adapter::Nightstream;
 
 use crate::operations::DEFAULT_MAX_FEE;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 #[derive(Debug)]
@@ -92,7 +92,7 @@ pub async fn freeze_address(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -115,7 +115,7 @@ pub async fn unfreeze_address(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -138,7 +138,7 @@ pub async fn add_pool_admin(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;
@@ -161,7 +161,7 @@ pub async fn remove_pool_admin(
         .context("Failed to sign transaction")?;
 
     let submit_result = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;

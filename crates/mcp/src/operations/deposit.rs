@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use demo_stf::runtime::Runtime;
 use midnight_privacy::CallMessage as MidnightCallMessage;
 use sov_address::MultiAddressEvm;
-use sov_ligero_adapter::Ligero as LigeroAdapter;
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -12,12 +11,14 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
 
 use crate::privacy_key::PrivacyKey;
 use crate::provider::Provider;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec =
+    ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 const DOMAIN: [u8; 32] = [1u8; 32];
@@ -134,7 +135,7 @@ pub async fn deposit(
     tracing::info!("Transaction signed and serialized: {} bytes", raw_tx.len());
 
     let tx_hash = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, None)
         .await
         .inspect_err(|e| tracing::error!("Failed to submit transaction: {:?}", e))
         .context("Failed to submit transaction to verifier service")?;

@@ -16,7 +16,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// CLI arguments for the proof verifier service
 #[derive(Debug, Parser)]
 #[command(name = "proof-verifier")]
-#[command(about = "Off-chain parallel proof verification service for Ligero rollup")]
+#[command(about = "Off-chain parallel proof verification service for Nightstream rollup")]
 struct Args {
     /// Address to bind the HTTP server to
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -40,11 +40,11 @@ struct Args {
     )]
     signing_key_path: String,
 
-    /// Ligero method ID (hex-encoded 32 bytes) for value-setter proof verification
+    /// Method ID (hex-encoded 32 bytes) for value-setter proof verification
     #[arg(long)]
     method_id: Option<String>,
 
-    /// Ligero method ID (hex-encoded 32 bytes) for midnight proof verification
+    /// Method ID (hex-encoded 32 bytes) for midnight proof verification
     #[arg(long)]
     midnight_method_id: Option<String>,
 
@@ -67,12 +67,6 @@ struct Args {
     /// them to the sequencer. Use the /midnight-privacy/flush endpoint to release queued txs.
     #[arg(long, default_value_t = false)]
     defer_submission: bool,
-
-    /// Optional URL of a remote ligero-http-server prover/verifier service.
-    /// When set, internal proof verification routes to this URL.
-    /// When omitted, the service uses local in-process daemon pools.
-    #[arg(long)]
-    prover_service_url: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
@@ -154,17 +148,15 @@ async fn main() -> Result<()> {
     let value_setter_method_id = if let Some(method_id_hex) = args.method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!(
-            "No value-setter method ID provided, will auto-compute from value_validator_rust.wasm"
-        );
+        info!("No value-setter method ID provided, will auto-compute from value_validator ROM");
         None
     };
 
-    // Parse optional midnight method ID (will be auto-computed if not provided)
+    // Parse optional midnight method ID (will be auto-computed from Nightstream ROM if not provided)
     let midnight_method_id = if let Some(method_id_hex) = args.midnight_method_id {
         Some(parse_method_id(&method_id_hex)?)
     } else {
-        info!("No midnight method ID provided, will auto-compute from note_spend_guest.wasm");
+        info!("No midnight method ID provided, will auto-compute from Nightstream ROM");
         None
     };
 
@@ -174,20 +166,13 @@ async fn main() -> Result<()> {
     let config = ServiceConfig {
         node_rpc_url: args.node_rpc_url,
         signing_key_path: args.signing_key_path,
-        value_setter_method_id, // Will be auto-computed from value_validator_rust.wasm if None
-        midnight_method_id,     // Will be auto-computed from note_spend_guest.wasm if None
+        value_setter_method_id, // Will be auto-computed from value_validator ROM if None
+        midnight_method_id,     // Will be auto-computed from note_spend ROM if None
         chain_id: args.chain_id,
         max_concurrent_verifications: max_concurrent,
         da_connection_string,
         defer_sequencer_submission: args.defer_submission,
-        prover_service_url: args.prover_service_url,
     };
-
-    if let Some(ref url) = config.prover_service_url {
-        info!("Prover service URL: {} (using remote verification)", url);
-    } else {
-        info!("Prover service URL: not configured (using local daemon pool)");
-    }
 
     // Create application state (loads signing key at startup)
     let state =

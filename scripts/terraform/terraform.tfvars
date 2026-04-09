@@ -39,8 +39,8 @@ ami_id        = "ami-0071c8c431eea0edb" # Ubuntu 24.04 LTS ARM64 (2025-12-12)
 
 # IMPORTANT: Update this to your actual key pair name
 # You can create a key pair in AWS Console or via CLI:
-#   aws ec2 create-key-pair --key-name sovereign-ligero-keypair --query 'KeyMaterial' --output text > ~/.ssh/sovereign-ligero-keypair.pem
-#   chmod 400 ~/.ssh/sovereign-ligero-keypair.pem
+#   aws ec2 create-key-pair --key-name sovereign-sdk-keypair --query 'KeyMaterial' --output text > ~/.ssh/sovereign-sdk-keypair.pem
+#   chmod 400 ~/.ssh/sovereign-sdk-keypair.pem
 key_pair_name = "sovereign-deploy"
 
 # EBS Volume Configuration

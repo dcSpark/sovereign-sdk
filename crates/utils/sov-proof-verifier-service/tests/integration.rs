@@ -301,26 +301,16 @@ async fn test_verify_midnight_withdraw_proof_invalid_payload() {
     match verify_midnight_withdraw_proof(
         Some([0u8; 32]).as_ref(),
         proof,
-        1,
         anchor_root,
         std::slice::from_ref(&nullifier),
         withdraw_amount,
-        None,
-        None,
-        None,
-        None,
     )
     .await
     {
-        // Either ProofError (if WASM file exists) or Internal error (if WASM file not found)
         Err(ServiceError::ProofError(_)) => {
             // Expected: proof is invalid
         }
-        Err(ServiceError::Internal(msg)) if msg.contains("note_spend_guest.wasm") => {
-            // Also acceptable in test environment: WASM file not found
-            // This means we can't even attempt proof verification
-        }
-        other => panic!("expected proof error or missing WASM file, got {other:?}"),
+        other => panic!("expected ProofError for invalid proof, got {other:?}"),
     }
 }
 

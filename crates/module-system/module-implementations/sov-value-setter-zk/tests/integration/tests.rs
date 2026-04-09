@@ -16,6 +16,7 @@ fn test_config_serialization() {
         admin: admin.clone(),
         method_id,
         initial_value: Some(50),
+        backend: "ligero".to_string(),
     };
 
     // Test that config can be serialized and deserialized
@@ -36,6 +37,7 @@ fn test_config_without_initial_value() {
         admin,
         method_id,
         initial_value: None,
+        backend: "ligero".to_string(),
     };
 
     assert_eq!(config.initial_value, None);

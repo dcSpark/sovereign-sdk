@@ -88,6 +88,64 @@ cd crates/utils/sov-proof-verifier-service
 cargo build --release
 ```
 
+### Lambda Container
+
+This service can also run as an AWS Lambda container image via the AWS Lambda Web Adapter.
+
+The repo Dockerfile now exposes a Lambda-compatible image target:
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --target lambda-runtime \
+  -f crates/utils/sov-proof-verifier-service/Dockerfile \
+  -t proof-verifier-lambda:latest \
+  .
+```
+
+To deploy it to AWS with the `midnight` profile:
+
+```bash
+AWS_PROFILE=<profile> \
+AWS_REGION=<region> \
+FUNCTION_NAME=<lambda-function-name> \
+ECR_REPOSITORY=<ecr-repository-name> \
+ROLE_NAME=<iam-role-name> \
+ARCHITECTURE=x86_64 \
+PLATFORM=linux/amd64 \
+MEMORY_SIZE=10240 \
+TIMEOUT=900 \
+EPHEMERAL_STORAGE_MB=4096 \
+AUTH_TYPE=NONE \
+FUNCTION_URL_INVOKE_MODE=RESPONSE_STREAM \
+NIGHTSTREAM_REF=<nightstream-git-ref> \
+NODE_RPC_URL=<rollup-rpc-url> \
+DA_DB=<database-url> \
+BIND_ADDR=0.0.0.0:8080 \
+LAMBDA_SUBNET_IDS=<subnet-id-1>,<subnet-id-2> \
+LAMBDA_SECURITY_GROUP_IDS=<sg-id-1>,<sg-id-2> \
+IMAGE_TAG=<image-tag> \
+./scripts/deploy_proof_verifier_lambda.sh
+```
+
+Optional:
+
+```bash
+POOL_FVK_PK=1ecf7f45dd35e4edc0e09205804211d753725bf7b13c54dd5f98f8e9bfec6abc \
+./scripts/deploy_proof_verifier_lambda.sh
+```
+
+Notes:
+
+- The Lambda image target uses the AWS Lambda Web Adapter and routes traffic to the service on port `8080`.
+- `AUTH_TYPE` must now be specified explicitly.
+- `FUNCTION_URL_INVOKE_MODE` should be `RESPONSE_STREAM` for `/prove`, so long proofs and large proof payloads can complete over the public Lambda URL.
+- The deploy script creates the ECR repository and Lambda execution role if they do not already exist.
+- The deploy script requires all deployment-specific identifiers, networking settings, and URLs to be provided explicitly.
+- The deploy script accepts `POOL_FVK_PK` as an optional deployment-time configuration override.
+- The deploy script configures the Lambda Web Adapter for response streaming.
+- `/prove` and `/verify` can run in Lambda without a colocated rollup node. Endpoints that submit to the sequencer still need a reachable `NODE_RPC_URL`.
+
 ### Run the Service
 
 ```bash

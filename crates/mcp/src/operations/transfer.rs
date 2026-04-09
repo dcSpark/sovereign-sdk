@@ -1,19 +1,15 @@
 //! Transfer operation for Midnight Privacy module
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use demo_stf::runtime::Runtime;
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use midnight_privacy::{
-    nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
+    inv_enforce_v2, nf_key_from_sk, note_commitment, nullifier, pk_from_sk, recipient_from_pk_v2,
     recipient_from_sk_v2, CallMessage as MidnightCallMessage, EncryptedNote, Hash32, MerkleTree,
     PrivacyAddress, SpendPublic,
 };
 use serde::Deserialize;
 use sov_address::MultiAddressEvm;
 use sov_api_spec::types as api_types;
-use sov_ligero_adapter::{Ligero as LigeroAdapter, LigeroProofPackage};
 use sov_mock_da::MockDaSpec;
 use sov_mock_zkvm::MockZkvm;
 use sov_modules_api::capabilities::UniquenessData;
@@ -21,16 +17,22 @@ use sov_modules_api::configurable_spec::ConfigurableSpec;
 use sov_modules_api::execution_mode::Native;
 use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
 use sov_modules_api::Amount;
+use sov_nightstream_adapter::Nightstream as NightstreamAdapter;
+use sov_nightstream_adapter::{
+    BlacklistProof, NoteSpendInput, NoteSpendOutput, NoteSpendWitness, ViewerOutputWitness,
+    ViewerWitness,
+};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep, Instant as TokioInstant};
 
 use crate::fvk_service::ViewerFvkBundle;
-use crate::ligero::{Ligero, LigeroProgramArguments};
+use crate::nightstream::Nightstream;
 use crate::provider::Provider;
 use crate::viewer;
 use crate::wallet::WalletContext;
 
-pub type McpSpec = ConfigurableSpec<MockDaSpec, LigeroAdapter, MockZkvm, MultiAddressEvm, Native>;
+pub type McpSpec =
+    ConfigurableSpec<MockDaSpec, NightstreamAdapter, MockZkvm, MultiAddressEvm, Native>;
 pub type McpRuntime = Runtime<McpSpec>;
 
 const TREE_DEPTH: u8 = 16;
@@ -39,7 +41,7 @@ const INCLUSION_POLL_INTERVAL_MS: u64 = 100;
 const INCLUSION_TIMEOUT_SECS: u64 = 60;
 const INCLUSION_LOG_INTERVAL_SECS: u64 = 5;
 const MERKLE_FETCH_LOG_EVERY: usize = 10;
-const NOTE_SEARCH_LOG_EVERY: usize = 10;
+const _NOTE_SEARCH_LOG_EVERY: usize = 10;
 
 #[derive(Debug)]
 pub struct TransferResult {
@@ -112,7 +114,6 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
     if target_leaves > 0 {
         tree.grow_to_fit(target_leaves);
 
-        // Fetch all notes
         let batch_size = 1000;
         let mut offset = 0;
         let mut batches = 0usize;
@@ -154,13 +155,6 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
                     elapsed_ms = start.elapsed().as_millis(),
                     "Fetched note commitments while rebuilding Merkle tree"
                 );
-            } else {
-                tracing::debug!(
-                    batch = batches,
-                    seen = notes_seen,
-                    target = target_leaves,
-                    "Fetched note commitments batch while rebuilding Merkle tree"
-                );
             }
 
             offset += batch_resp.notes.len();
@@ -169,17 +163,6 @@ async fn fetch_merkle_tree(provider: &Provider) -> Result<(MerkleTree, Hash32)> 
 
     let mut root = [0u8; 32];
     root.copy_from_slice(&state.root);
-
-    tracing::debug!(
-        "Rebuilt Merkle tree: {} leaves, root={}",
-        tree.len(),
-        hex::encode(&root)
-    );
-    tracing::info!(
-        elapsed_ms = start.elapsed().as_millis(),
-        leaves = tree.len(),
-        "Finished rebuilding Merkle tree"
-    );
 
     Ok((tree, root))
 }
@@ -192,7 +175,7 @@ async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> R
     let batch_size = 1000;
     let mut offset = 0;
     let mut batches = 0usize;
-    let mut scanned = 0usize;
+    let mut _scanned = 0usize;
 
     loop {
         let endpoint = format!(
@@ -206,7 +189,7 @@ async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> R
 
         batches += 1;
         let len = batch_resp.notes.len();
-        scanned += len;
+        _scanned += len;
 
         for n in batch_resp.notes.iter() {
             if n.commitment.len() == 32 {
@@ -224,53 +207,7 @@ async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> R
             }
         }
 
-        if batches == 1 || batches % NOTE_SEARCH_LOG_EVERY == 0 || len < batch_size {
-            tracing::info!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                elapsed_ms = search_start.elapsed().as_millis(),
-                "Scanning notes for input commitment"
-            );
-        } else {
-            tracing::debug!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                "Scanning notes for input commitment"
-            );
-        }
-
         if len < batch_size {
-            tracing::warn!(
-                batches_scanned = batches,
-                notes_scanned = scanned,
-                elapsed_ms = search_start.elapsed().as_millis(),
-                target_commitment = commitment_hex,
-                "Finished scanning notes without finding input commitment. \
-                 Total notes in tree: {}. Enable DEBUG logging to see all commitments.",
-                scanned
-            );
-
-            // Log first few commitments at INFO level to help debug
-            if scanned > 0 && scanned <= 10 {
-                tracing::info!("Notes found in tree (showing up to 10):");
-                // Re-fetch first batch to show commitments
-                let first_batch: NotesResp = provider
-                    .query_rest_endpoint("/modules/midnight-privacy/notes?limit=10&offset=0")
-                    .await
-                    .ok()
-                    .unwrap_or_else(|| NotesResp { notes: vec![] });
-
-                for (i, n) in first_batch.notes.iter().enumerate() {
-                    if n.commitment.len() == 32 {
-                        tracing::info!(
-                            "  Note {}: position={}, commitment={}",
-                            i,
-                            n.position,
-                            hex::encode(&n.commitment)
-                        );
-                    }
-                }
-            }
             break;
         }
         offset += batch_size;
@@ -281,8 +218,6 @@ async fn find_note_position(provider: &Provider, note_commitment: [u8; 32]) -> R
 
 /// Get a recent valid anchor root
 async fn get_anchor_root(provider: &Provider) -> Result<Hash32> {
-    let start = StdInstant::now();
-    tracing::info!("Fetching recent anchor root");
     let roots_state: RootsResp = provider
         .query_rest_endpoint("/modules/midnight-privacy/roots/recent")
         .await
@@ -294,12 +229,6 @@ async fn get_anchor_root(provider: &Provider) -> Result<Hash32> {
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No recent roots available"))?;
 
-    tracing::info!(
-        elapsed_ms = start.elapsed().as_millis(),
-        anchor_root = %hex::encode(anchor),
-        "Fetched anchor root"
-    );
-
     Ok(anchor)
 }
 
@@ -308,10 +237,10 @@ async fn wait_for_inclusion(provider: &Provider, tx_hash: &str) -> Result<()> {
     let start = TokioInstant::now();
     let deadline = start + Duration::from_secs(INCLUSION_TIMEOUT_SECS);
     let mut last_log = start;
-    let mut attempts: u64 = 0;
+    let mut _attempts: u64 = 0;
 
     loop {
-        attempts += 1;
+        _attempts += 1;
         if TokioInstant::now() > deadline {
             anyhow::bail!("Timeout waiting for transaction {} to be included", tx_hash);
         }
@@ -331,29 +260,10 @@ async fn wait_for_inclusion(provider: &Provider, tx_hash: &str) -> Result<()> {
                         ltx.receipt
                     );
                 }
-                tracing::info!(
-                    tx_hash,
-                    block = ltx.batch_number,
-                    attempts,
-                    waited_ms = start.elapsed().as_millis(),
-                    "Transaction included successfully"
-                );
                 return Ok(());
             }
-            Err(err) => {
+            Err(_) => {
                 if last_log.elapsed() >= Duration::from_secs(INCLUSION_LOG_INTERVAL_SECS) {
-                    let remaining_secs = deadline
-                        .checked_duration_since(TokioInstant::now())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    tracing::info!(
-                        tx_hash,
-                        attempts,
-                        waited_ms = start.elapsed().as_millis(),
-                        remaining_secs,
-                        "Waiting for transaction inclusion"
-                    );
-                    tracing::debug!(tx_hash, attempts, error = %err, "Latest inclusion check failed");
                     last_log = TokioInstant::now();
                 }
                 sleep(Duration::from_millis(INCLUSION_POLL_INTERVAL_MS)).await;
@@ -368,7 +278,7 @@ async fn create_transfer_unsigned_tx(
     wallet: &WalletContext<McpRuntime, McpSpec>,
     proof_bytes: Vec<u8>,
     anchor_root: Hash32,
-    nullifier: Hash32,
+    nullifiers: Vec<Hash32>,
     view_ciphertexts: Option<Vec<EncryptedNote>>,
 ) -> Result<UnsignedTransaction<McpRuntime, McpSpec>> {
     let chain_data = provider
@@ -385,7 +295,7 @@ async fn create_transfer_unsigned_tx(
     let transfer_call = MidnightCallMessage::<McpSpec>::Transfer {
         proof: safe_proof,
         anchor_root,
-        nullifier,
+        nullifiers,
         view_ciphertexts,
         gas: None,
     };
@@ -427,13 +337,9 @@ async fn create_transfer_unsigned_tx(
 
 /// Transfer funds within the Midnight Privacy shielded pool
 ///
-/// If `send_amount` < `note_value`, creates 2 outputs:
-///   - Output 0: `send_amount` → `output_recipient` (destination)
-///   - Output 1: `note_value - send_amount` → `change_recipient` (change back to sender)
-///
-/// If `send_amount` == `note_value`, creates 1 output (full transfer, no change).
+/// Uses Nightstream prover service: builds SpendPublic and delegates proof generation.
 pub async fn transfer(
-    ligero: &Ligero,
+    nightstream: &Nightstream,
     provider: &Provider,
     wallet: &WalletContext<McpRuntime, McpSpec>,
     spend_sk: Hash32,
@@ -446,7 +352,6 @@ pub async fn transfer(
     destination_pk_ivk: Hash32,
     viewer_fvk_bundle: Option<ViewerFvkBundle>,
 ) -> Result<TransferResult> {
-    // Validate amounts
     if send_amount == 0 {
         anyhow::bail!("send_amount must be greater than 0");
     }
@@ -466,35 +371,19 @@ pub async fn transfer(
     };
     let note_value_u64: u64 = note_value
         .try_into()
-        .context("note_value does not fit into u64 (required by note_spend_guest v2)")?;
+        .context("note_value does not fit into u64")?;
     let send_amount_u64: u64 = send_amount
         .try_into()
-        .context("send_amount does not fit into u64 (required by note_spend_guest v2)")?;
+        .context("send_amount does not fit into u64")?;
     let change_amount_u64: u64 = change_amount
         .try_into()
-        .context("change_amount does not fit into u64 (required by note_spend_guest v2)")?;
+        .context("change_amount does not fit into u64")?;
 
-    tracing::info!(
-        "Starting transfer: note_value={}, send_amount={}, change_amount={}",
-        note_value,
-        send_amount,
-        change_amount
-    );
-    let overall_start = StdInstant::now();
-
-    // Derive the spender's privacy recipient (owner address) from (spend_sk, pk_ivk_owner).
-    // This matches note_spend_guest v2, where the input recipient is derived in-circuit.
     let input_recipient = recipient_from_sk_v2(&DOMAIN, &spend_sk, &pk_ivk_owner);
     let sender_id_out = input_recipient;
     let pk_spend_owner = pk_from_sk(&spend_sk);
 
-    // Step 1: Fetch Merkle tree and find the note
-    let tree_start = StdInstant::now();
     let (tree, _current_root) = fetch_merkle_tree(provider).await?;
-    tracing::info!(
-        elapsed_ms = tree_start.elapsed().as_millis(),
-        "Merkle tree fetch and rebuild completed"
-    );
 
     let input_cm = note_commitment(
         &DOMAIN,
@@ -503,46 +392,18 @@ pub async fn transfer(
         &input_recipient,
         &input_sender_id,
     );
-    tracing::info!(
-        "Looking for note with commitment: {}, computed from value={}, rho={}, recipient={}, sender_id={}",
-        hex::encode(&input_cm),
-        note_value,
-        hex::encode(&input_rho),
-        hex::encode(&input_recipient),
-        hex::encode(&input_sender_id),
-    );
 
-    let position_start = StdInstant::now();
     let position = find_note_position(provider, input_cm)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Input note not found in tree. Searched for commitment: {}. \
-                 This could mean: (1) the deposit transaction hasn't been included yet, \
-                 (2) the verifier is in defer mode and needs /midnight-privacy/flush, \
-                 (3) wrong rho/recipient values were provided, \
-                 (4) wrong value amount",
+                "Input note not found in tree. Searched for commitment: {}",
                 hex::encode(&input_cm)
             )
         })?;
 
-    tracing::info!(
-        position,
-        elapsed_ms = position_start.elapsed().as_millis(),
-        "Found input note position"
-    );
-
-    // Step 2: Get anchor root
-    let anchor_start = StdInstant::now();
     let anchor_root = get_anchor_root(provider).await?;
-    tracing::info!(
-        elapsed_ms = anchor_start.elapsed().as_millis(),
-        anchor_root = %hex::encode(anchor_root),
-        "Anchor root ready"
-    );
 
-    // Step 3: Generate output note parameters
-    // Output 0: send_amount → destination recipient (derived from destination keys)
     let out_rho_0: [u8; 32] = rand::random();
     let out_recipient_0: [u8; 32] =
         recipient_from_pk_v2(&DOMAIN, &destination_pk_spend, &destination_pk_ivk);
@@ -554,7 +415,6 @@ pub async fn transfer(
         &sender_id_out,
     );
 
-    // Output 1 (optional): change → change_recipient (back to sender)
     let (out_rho_1, out_recipient_1, cm_out_1) = if has_change {
         let rho: [u8; 32] = rand::random();
         let recipient = recipient_from_pk_v2(&DOMAIN, &pk_spend_owner, &pk_ivk_owner);
@@ -566,19 +426,11 @@ pub async fn transfer(
 
     let num_outputs: u32 = if has_change { 2 } else { 1 };
 
-    // Step 4: Compute nullifier
     let nf_key = nf_key_from_sk(&DOMAIN, &spend_sk);
     let nf = nullifier(&DOMAIN, &nf_key, &input_rho);
 
-    // Step 4b: Create viewer bundles if a viewer FVK bundle is configured
     let (view_attestations, view_ciphertexts) = if let Some(ref bundle) = viewer_fvk_bundle {
         let fvk = bundle.fvk;
-        tracing::info!(
-            "Viewer FVK configured: generating viewer attestations for {} output(s)",
-            num_outputs
-        );
-
-        // sender_id for spend outputs is the spender's address (derived from spend_sk).
         let mut cm_ins: [Hash32; viewer::MAX_INS] = [[0u8; 32]; viewer::MAX_INS];
         cm_ins[0] = input_cm;
         let (att_0, enc_0) = viewer::make_viewer_bundle(
@@ -608,16 +460,9 @@ pub async fn transfer(
             (Some(vec![att_0]), Some(vec![enc_0]))
         }
     } else {
-        tracing::debug!("No viewer FVK configured: transfer will not include viewer attestation");
         (None, None)
     };
 
-    // Step 4c: Fetch deny-map (blacklist) root + Merkle openings.
-    //
-    // The spend circuit binds to `blacklist_root` as a public input and requires BL_DEPTH sibling
-    // paths (private) for:
-    // - sender (spender identity)
-    // - each output recipient
     let sender_addr = PrivacyAddress::from_keys(&pk_spend_owner, &pk_ivk_owner);
     let dest_addr = PrivacyAddress::from_keys(&destination_pk_spend, &destination_pk_ivk);
 
@@ -651,7 +496,7 @@ pub async fn transfer(
 
     anyhow::ensure!(
         sender_opening.blacklist_root == dest_opening.blacklist_root,
-        "Deny-map root changed while fetching openings (sender vs destination)"
+        "Deny-map root changed while fetching openings"
     );
     let blacklist_root = sender_opening.blacklist_root;
 
@@ -662,515 +507,157 @@ pub async fn transfer(
         anyhow::bail!("Destination privacy address is frozen (blacklisted)");
     }
 
-    // Note: The webgpu_prover generates the proof AND packages it with the public output
-    // (SpendPublic) internally, so we don't need to create it here.
-
-    // Step 5: Generate ZK proof
-    tracing::info!("Generating ZK proof with {} output(s)...", num_outputs);
-
+    // Build NoteSpendWitness for the prover service
     let siblings = tree.open(position as usize);
-    let depth = siblings.len();
 
-    fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
-        let mut out = Bn254Fr::new();
-        out.set_bytes_big(h);
-        out
-    }
+    let witness_inputs = vec![NoteSpendInput {
+        value: note_value_u64,
+        rho: input_rho,
+        sender_id: input_sender_id,
+        position: position as u32,
+        siblings,
+        nullifier: nf,
+    }];
 
-    fn inv_enforce_v2(
-        in_values: &[u64],
-        in_rhos: &[Hash32],
-        out_values: &[u64],
-        out_rhos: &[Hash32],
-    ) -> Hash32 {
-        let mut enforce_prod = Bn254Fr::from_u32(1);
-
-        for v in in_values {
-            enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-        }
-        for v in out_values {
-            enforce_prod.mulmod_checked(&Bn254Fr::from_u64(*v));
-        }
-
-        let mut delta = Bn254Fr::new();
-        for out_rho in out_rhos {
-            let out_fr = bn254fr_from_hash32_be(out_rho);
-            for in_rho in in_rhos {
-                let in_fr = bn254fr_from_hash32_be(in_rho);
-                submod_checked(&mut delta, &out_fr, &in_fr);
-                enforce_prod.mulmod_checked(&delta);
-            }
-        }
-        if out_rhos.len() == 2 {
-            let a = bn254fr_from_hash32_be(&out_rhos[0]);
-            let b = bn254fr_from_hash32_be(&out_rhos[1]);
-            submod_checked(&mut delta, &a, &b);
-            enforce_prod.mulmod_checked(&delta);
-        }
-
-        let mut inv = enforce_prod.clone();
-        inv.inverse();
-        inv.to_bytes_be()
-    }
-
-    let n_in: usize = 1;
-    let n_out: usize = if has_change { 2 } else { 1 };
-    let withdraw_amount: u64 = 0;
-    let withdraw_to: Hash32 = [0u8; 32];
-
-    let in_values = [note_value_u64];
-    let in_rhos = [input_rho];
-    let mut out_values: Vec<u64> = vec![send_amount_u64];
-    let mut out_rhos: Vec<Hash32> = vec![out_rho_0];
+    let mut witness_outputs = vec![NoteSpendOutput {
+        value: send_amount_u64,
+        rho: out_rho_0,
+        pk_spend: destination_pk_spend,
+        pk_ivk: destination_pk_ivk,
+        cm: cm_out_0,
+    }];
     if has_change {
-        out_values.push(change_amount_u64);
-        out_rhos.push(out_rho_1.expect("change rho set when has_change"));
-    }
-    let inv_enforce = inv_enforce_v2(&in_values, &in_rhos, &out_values, &out_rhos);
-
-    fn u64_to_i64(v: u64, label: &'static str) -> Result<i64> {
-        i64::try_from(v).with_context(|| {
-            format!("{label} does not fit into i64 (required by note_spend_guest v2 ABI)")
-        })
+        witness_outputs.push(NoteSpendOutput {
+            value: change_amount_u64,
+            rho: out_rho_1.unwrap(),
+            pk_spend: pk_spend_owner,
+            pk_ivk: pk_ivk_owner,
+            cm: cm_out_1.unwrap(),
+        });
     }
 
-    fn arg32(b: &Hash32) -> LigeroProgramArguments {
-        LigeroProgramArguments::HexBytesB64 {
-            hex: hex::encode(b),
-            bytes_b64: general_purpose::STANDARD.encode(b),
-        }
-    }
-
-    // Build args + private indices in the exact order required by note_spend_guest v2.
-    let mut private_indices: Vec<u32> = Vec::new();
-    let mut proof_args: Vec<LigeroProgramArguments> = Vec::new();
-    let push = |arg: LigeroProgramArguments,
-                private: bool,
-                private_indices: &mut Vec<u32>,
-                proof_args: &mut Vec<LigeroProgramArguments>| {
-        proof_args.push(arg);
-        if private {
-            private_indices.push(proof_args.len() as u32); // 1-based
-        }
-    };
-
-    // Header:
-    push(arg32(&DOMAIN), false, &mut private_indices, &mut proof_args); // 1 domain
-    push(
-        arg32(&spend_sk),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 2 spend_sk
-    push(
-        arg32(&pk_ivk_owner),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 3 pk_ivk_owner
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(depth as u64, "depth")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 4 depth
-    push(
-        arg32(&anchor_root),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 5 anchor
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(n_in as u64, "n_in")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    ); // 6 n_in
-
-    // Input 0:
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(note_value_u64, "value_in")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&input_rho),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&input_sender_id),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // pos_i (private i64; bits derived in-circuit).
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(position, "pos")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Siblings (bottom-up).
-    for s in &siblings {
-        push(arg32(s), true, &mut private_indices, &mut proof_args);
-    }
-
-    // Nullifier (public).
-    push(arg32(&nf), false, &mut private_indices, &mut proof_args);
-
-    // Withdraw binding.
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(withdraw_amount, "withdraw_amount")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&withdraw_to),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(n_out as u64, "n_out")?,
-        },
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Output 0.
-    push(
-        LigeroProgramArguments::I64 {
-            i64: u64_to_i64(send_amount_u64, "value_out_0")?,
-        },
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&out_rho_0),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&destination_pk_spend),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&destination_pk_ivk),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    push(
-        arg32(&cm_out_0),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Output 1 (change).
+    let mut out_values_for_inv = vec![send_amount_u64];
+    let mut out_rhos_for_inv = vec![out_rho_0];
     if has_change {
-        let rho1 = out_rho_1.expect("change rho set when has_change");
-        let cm1 = cm_out_1.expect("change cm set when has_change");
-        push(
-            LigeroProgramArguments::I64 {
-                i64: u64_to_i64(change_amount_u64, "value_out_1")?,
-            },
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(arg32(&rho1), true, &mut private_indices, &mut proof_args);
-        push(
-            arg32(&pk_spend_owner),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(
-            arg32(&pk_ivk_owner),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        push(arg32(&cm1), false, &mut private_indices, &mut proof_args);
+        out_values_for_inv.push(change_amount_u64);
+        out_rhos_for_inv.push(out_rho_1.unwrap());
     }
-
-    // inv_enforce (private).
-    push(
-        arg32(&inv_enforce),
-        true,
-        &mut private_indices,
-        &mut proof_args,
+    let inv_enforce = inv_enforce_v2(
+        &[note_value_u64],
+        &[input_rho],
+        &out_values_for_inv,
+        &out_rhos_for_inv,
     );
 
-    // === Deny-map (blacklist) arguments ===
-    //
-    // ABI extension (note_spend_guest v2 w/ deny-map buckets):
-    //   - blacklist_root (PUBLIC)
-    //   - for each checked id:
-    //       bucket_entries[BLACKLIST_BUCKET_SIZE] (PRIVATE)
-    //       bucket_inv (PRIVATE)
-    //       bucket_siblings[BLACKLIST_TREE_DEPTH] (PRIVATE)
-    //
-    // Viewer arguments, if any, come AFTER this section.
-    let bl_depth = midnight_privacy::BLACKLIST_TREE_DEPTH as usize;
-    anyhow::ensure!(
-        sender_opening.siblings.len() == bl_depth,
-        "sender deny-map opening has wrong sibling length: got {}, expected {}",
-        sender_opening.siblings.len(),
-        bl_depth
-    );
-    anyhow::ensure!(
-        dest_opening.siblings.len() == bl_depth,
-        "destination deny-map opening has wrong sibling length: got {}, expected {}",
-        dest_opening.siblings.len(),
-        bl_depth
-    );
+    let mut blacklist_proofs = vec![BlacklistProof::from_opening(
+        &sender_opening.recipient,
+        sender_opening.bucket_entries,
+        sender_opening.siblings.clone(),
+    )];
+    blacklist_proofs.push(BlacklistProof::from_opening(
+        &dest_opening.recipient,
+        dest_opening.bucket_entries,
+        dest_opening.siblings.clone(),
+    ));
 
-    fn bl_bucket_inv_for_id(
-        id: &Hash32,
-        bucket_entries: &midnight_privacy::BlacklistBucketEntries,
-    ) -> Result<Hash32> {
-        let id_fr = bn254fr_from_hash32_be(id);
-        let mut prod = Bn254Fr::from_u32(1);
-        let mut delta = Bn254Fr::new();
-        for e in bucket_entries.iter() {
-            let e_fr = bn254fr_from_hash32_be(e);
-            submod_checked(&mut delta, &id_fr, &e_fr);
-            prod.mulmod_checked(&delta);
+    let viewer_witnesses: Vec<ViewerWitness> = if let Some(ref atts) = view_attestations {
+        if let Some(ref bundle) = viewer_fvk_bundle {
+            vec![ViewerWitness {
+                fvk_commitment: atts[0].fvk_commitment,
+                fvk: bundle.fvk,
+                per_output: atts
+                    .iter()
+                    .map(|a| ViewerOutputWitness {
+                        ct_hash: a.ct_hash,
+                        mac: a.mac,
+                    })
+                    .collect(),
+            }]
+        } else {
+            vec![]
         }
-        anyhow::ensure!(
-            !prod.is_zero(),
-            "deny-map bucket collision: id is present in bucket entries"
-        );
-        let mut inv = prod.clone();
-        inv.inverse();
-        Ok(inv.to_bytes_be())
-    }
-
-    push(
-        arg32(&blacklist_root),
-        false,
-        &mut private_indices,
-        &mut proof_args,
-    );
-
-    // Opening 0: sender_id (spender identity)
-    for e in sender_opening.bucket_entries.iter() {
-        push(arg32(e), true, &mut private_indices, &mut proof_args);
-    }
-    let sender_inv =
-        bl_bucket_inv_for_id(&sender_opening.recipient, &sender_opening.bucket_entries)?;
-    push(
-        arg32(&sender_inv),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    for sib in sender_opening.siblings.iter().take(bl_depth) {
-        push(arg32(sib), true, &mut private_indices, &mut proof_args);
-    }
-
-    // Opening 1: pay recipient (transfer only; change outputs are enforced to be self in-circuit).
-    for e in dest_opening.bucket_entries.iter() {
-        push(arg32(e), true, &mut private_indices, &mut proof_args);
-    }
-    let dest_inv = bl_bucket_inv_for_id(&dest_opening.recipient, &dest_opening.bucket_entries)?;
-    push(
-        arg32(&dest_inv),
-        true,
-        &mut private_indices,
-        &mut proof_args,
-    );
-    for sib in dest_opening.siblings.iter().take(bl_depth) {
-        push(arg32(sib), true, &mut private_indices, &mut proof_args);
-    }
-
-    // Viewer section arguments (Level B) if viewer FVK is configured.
-    let viewer_fvk_commitment_arg_idx: Option<usize> = if let (Some(ref bundle), Some(ref atts)) =
-        (viewer_fvk_bundle.as_ref(), &view_attestations)
-    {
-        // n_viewers
-        push(
-            LigeroProgramArguments::I64 { i64: 1 },
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        let fvk_commitment_arg_idx = proof_args.len();
-        // fvk_commitment (public)
-        push(
-            arg32(&bundle.fvk_commitment),
-            false,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // fvk (private)
-        push(
-            arg32(&bundle.fvk),
-            true,
-            &mut private_indices,
-            &mut proof_args,
-        );
-        // For each output, ct_hash + mac (public)
-        for att in atts.iter().take(n_out) {
-            push(
-                arg32(&att.ct_hash),
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
-            push(
-                arg32(&att.mac),
-                false,
-                &mut private_indices,
-                &mut proof_args,
-            );
-        }
-        Some(fvk_commitment_arg_idx)
     } else {
-        None
+        vec![]
     };
 
-    // Save args/private indices for packaging (verifier expects a LigeroProofPackage)
-    let proof_args_for_package = proof_args.clone();
-    let private_indices_for_package: Vec<usize> =
-        private_indices.iter().map(|i| *i as usize).collect();
+    let depth = witness_inputs[0].siblings.len();
+    let witness = NoteSpendWitness {
+        domain: DOMAIN,
+        spend_sk,
+        pk_ivk_owner,
+        depth: depth as u32,
+        anchor: anchor_root,
+        inputs: witness_inputs,
+        withdraw_amount: 0,
+        withdraw_to: [0u8; 32],
+        outputs: witness_outputs,
+        inv_enforce,
+        blacklist_root,
+        blacklist_proofs,
+        viewers: viewer_witnesses,
+    };
 
-    let (packing, gpu_threads) = ligero.resolve_prover_params(8192, None);
-    let proof_start = StdInstant::now();
-    let proof_bytes_raw = ligero
-        .generate_proof(packing, gpu_threads, private_indices, proof_args)
-        .inspect_err(|e| tracing::error!("Failed to generate Ligero proof for transfer: {:?}", e))
-        .context("Failed to generate Ligero proof for transfer")?;
-
-    tracing::info!(
-        elapsed_ms = proof_start.elapsed().as_millis(),
-        proof_bytes_len = proof_bytes_raw.len(),
-        "Generated proof bytes"
-    );
-
-    // Package proof with public outputs (SpendPublic) for verifier compatibility
     let mut output_commitments = vec![cm_out_0];
     if has_change {
         output_commitments.push(cm_out_1.unwrap());
     }
-    let public_output = SpendPublic {
+    let public = SpendPublic {
         anchor_root,
         blacklist_root,
-        nullifier: nf,
-        withdraw_amount: 0, // pure shielded transfer, no transparent withdrawal
+        nullifiers: vec![nf],
+        withdraw_amount: 0,
         output_commitments,
         view_attestations,
     };
 
-    let mut args_json_values: Vec<serde_json::Value> = proof_args_for_package
-        .iter()
-        .map(|a| serde_json::to_value(a))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("Failed to serialize Ligero args to JSON values for package")?;
-
-    if let (Some(idx), Some(ref bundle)) =
-        (viewer_fvk_commitment_arg_idx, viewer_fvk_bundle.as_ref())
-    {
-        let obj = args_json_values[idx].as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "viewer.fvk_commitment arg must serialize to a JSON object to attach pool_sig_hex"
-            )
-        })?;
-        obj.insert(
-            "pool_sig_hex".to_string(),
-            serde_json::Value::String(bundle.pool_sig_hex.clone()),
-        );
-    }
-
-    let args_json = serde_json::to_vec(&args_json_values)
-        .context("Failed to serialize Ligero args for package")?;
-    let proof_package = LigeroProofPackage::new(
-        proof_bytes_raw,
-        bincode::serialize(&public_output).context("Failed to serialize spend public output")?,
-        args_json,
-        private_indices_for_package,
-    )
-    .context("Failed to build LigeroProofPackage")?;
-
-    let proof_bytes =
-        bincode::serialize(&proof_package).context("Failed to serialize Ligero proof package")?;
-    tracing::debug!(
-        proof_package_len = proof_bytes.len(),
-        "Serialized Ligero proof package for submission"
+    tracing::info!(
+        "Generating Nightstream ZK proof with {} output(s)...",
+        num_outputs
     );
 
-    // Step 6: Create and sign transaction
-    let unsigned_tx_start = StdInstant::now();
+    let pool_viewer_signature = viewer_fvk_bundle.as_ref().map(|bundle| {
+        crate::nightstream::PoolViewerSignature {
+            fvk_commitment: bundle.fvk_commitment,
+            pool_sig_hex: bundle.pool_sig_hex.clone(),
+        }
+    });
+
+    let generated_proof = nightstream
+        .generate_proof(&witness, &public, pool_viewer_signature.as_ref())
+        .await
+        .inspect_err(|e| {
+            tracing::error!("Failed to generate Nightstream proof for transfer: {:?}", e)
+        })
+        .context("Failed to generate Nightstream proof for transfer")?;
+
+    tracing::debug!(
+        proof_bytes_len = generated_proof.proof_bytes.len(),
+        using_proof_ref = generated_proof.proof_ref.is_some(),
+        "Generated Nightstream proof"
+    );
+
+    let proof_bytes = generated_proof.proof_bytes;
+
     let unsigned_tx = create_transfer_unsigned_tx(
         provider,
         wallet,
         proof_bytes,
         anchor_root,
-        nf,
+        vec![nf],
         view_ciphertexts,
     )
     .await?;
-    tracing::info!(
-        elapsed_ms = unsigned_tx_start.elapsed().as_millis(),
-        "Unsigned transfer transaction created"
-    );
 
-    let sign_start = StdInstant::now();
     let raw_tx = wallet
         .sign_transaction::<McpRuntime>(unsigned_tx)
         .context("Failed to sign transaction")?;
 
-    tracing::info!(
-        elapsed_ms = sign_start.elapsed().as_millis(),
-        tx_bytes_len = raw_tx.len(),
-        "Transaction signed"
-    );
-
-    // Step 7: Submit transaction to verifier service
-    let submit_start = StdInstant::now();
     let tx_hash = provider
-        .submit_to_verifier(raw_tx)
+        .submit_to_verifier(raw_tx, generated_proof.proof_ref.as_ref())
         .await
         .context("Failed to submit transaction to verifier service")?;
 
-    tracing::info!(
-        elapsed_ms = submit_start.elapsed().as_millis(),
-        tx_hash,
-        "Transfer transaction submitted via verifier service"
-    );
-
-    // Step 8: Poll for inclusion
-    tracing::info!("Waiting for transaction inclusion...");
     wait_for_inclusion(provider, &tx_hash).await?;
-    tracing::info!(
-        elapsed_ms = overall_start.elapsed().as_millis(),
-        tx_hash,
-        "Transfer operation completed"
-    );
 
     Ok(TransferResult {
         tx_hash,

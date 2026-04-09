@@ -4,12 +4,9 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 
-/// Locate the built sov-rollup-ligero binary using common env vars or target dir heuristics.
+/// Locate the built rollup-nightstream binary using common env vars or target dir heuristics.
 pub fn find_rollup_binary() -> Result<String> {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov-rollup-ligero") {
-        return Ok(p);
-    }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov_rollup_ligero") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_sov-rollup-nightstream") {
         return Ok(p);
     }
 
@@ -24,15 +21,15 @@ pub fn find_rollup_binary() -> Result<String> {
 
     let target_path = Path::new(&target_dir);
     for profile in &["release", "debug"] {
-        let candidate = target_path.join(profile).join("sov-rollup-ligero");
+        let candidate = target_path.join(profile).join("sov-rollup-nightstream");
         if candidate.exists() {
             return Ok(candidate.to_string_lossy().to_string());
         }
     }
 
     anyhow::bail!(
-        "sov-rollup-ligero binary not found in target/{{release,debug}}; \
-         run `cargo build -p sov-rollup-ligero` or `cargo build -p sov-rollup-ligero --release`."
+        "rollup-nightstream binary not found in target/{{release,debug}}; \
+         run `cargo build -p sov-rollup-nightstream` or `cargo build -p sov-rollup-nightstream --release`."
     );
 }
 

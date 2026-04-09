@@ -13,10 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router, ServiceExt};
 use mcp_external::commitment_tree::{global_tree_syncer, start_background_tree_sync};
 use mcp_external::fvk_service::{fetch_viewer_fvk_bundle, parse_hex_32, ViewerFvkBundle};
-use mcp_external::ligero::Ligero;
-use mcp_external::operations::{
-    deposit, get_privacy_notes, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE,
-};
+use mcp_external::nightstream::Nightstream;
+use mcp_external::operations::{deposit, send_funds, transfer, TransferInputNote, DEFAULT_MAX_FEE};
 use mcp_external::privacy_key::PrivacyKey;
 use mcp_external::provider::Provider;
 use mcp_external::server::{McpSpec, McpWalletContext};
@@ -31,7 +29,6 @@ use sov_proof_verifier_service::{
     create_router as create_verifier_router, AppState, ServiceConfig,
 };
 use sov_rollup_interface::crypto::{PrivateKey as _, PublicKey as _};
-use sov_rollup_interface::zk::{CodeCommitment, Zkvm, ZkvmHost};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -39,17 +36,12 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::EnvFilter;
 
-mod progress;
-use progress::{
-    ScaleUpCounter, ScaleUpProgressResponse, ScaleUpProgressTracker, ScaleUpStage, StartupCounter,
-    StartupProgressResponse, StartupProgressTracker, StartupStage,
-};
-
 const DOMAIN: [u8; 32] = [1u8; 32];
 const DEFAULT_TREE_RESOLVE_RETRY_ATTEMPTS: u32 = 1;
 const DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS: u64 = 750;
+const DEFAULT_NOTE_TREE_WAIT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_NOTE_TREE_WAIT_POLL_MS: u64 = 1_000;
 const POOL_STATE_TABLE: &str = "pool_wallets";
-const POOL_CONFIG_TABLE: &str = "pool_config";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -67,9 +59,8 @@ struct Config {
     proof_generation_interval_ms: u64,
     max_concurrent_proofs: usize,
     da_connection_string: String,
-    ligero_program_path: String,
-    ligero_proof_service_url: String,
-    verifier_prover_service_url: Option<String>,
+    nightstream_program_path: String,
+    nightstream_proof_service_url: String,
     pool_state_file: Option<String>,
 }
 
@@ -107,13 +98,9 @@ impl Config {
         let proof_generation_interval_ms = env_u64("PROOF_GENERATION_INTERVAL_MS", 0);
         let max_concurrent_proofs = env_usize("MAX_CONCURRENT_PROOFS", 5).max(1);
 
-        let ligero_program_path = env_string("LIGERO_PROGRAM_PATH", "note_spend_guest");
-        let ligero_proof_service_url =
-            env_string("LIGERO_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
-        let verifier_prover_service_url = env_optional_string("VERIFIER_PROVER_SERVICE_URL")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
+        let nightstream_program_path = env_string("NIGHTSTREAM_PROGRAM_PATH", "note_spend_guest");
+        let nightstream_proof_service_url =
+            env_string("NIGHTSTREAM_PROOF_SERVICE_URL", "http://127.0.0.1:8080");
         let pool_state_file = env_optional_string("POOL_STATE_FILE")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -133,9 +120,8 @@ impl Config {
             proof_generation_interval_ms,
             max_concurrent_proofs,
             da_connection_string,
-            ligero_program_path,
-            ligero_proof_service_url,
-            verifier_prover_service_url,
+            nightstream_program_path,
+            nightstream_proof_service_url,
             pool_state_file,
         })
     }
@@ -233,13 +219,11 @@ struct ServiceState {
     proof_generation_enabled: AtomicBool,
     proof_generation_interval_ms: AtomicU64,
     max_concurrent_proofs: AtomicUsize,
-    startup_progress: StartupProgressTracker,
-    scale_up_progress: ScaleUpProgressTracker,
     provider: Arc<Provider>,
     deposit_provider: Arc<Provider>,
     http: HttpClient,
     verifier_url: String,
-    ligero: Arc<Ligero>,
+    nightstream: Arc<Nightstream>,
     admin_wallet: Arc<McpWalletContext>,
     gas_token_id: TokenId,
     wallets: RwLock<Vec<PoolWallet>>,
@@ -321,8 +305,6 @@ struct StatusResponse {
     proof_generation_state: &'static str,
     proof_generation_interval_ms: u64,
     max_concurrent_proofs: usize,
-    startup_progress: StartupProgressResponse,
-    scale_up_progress: ScaleUpProgressResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -354,10 +336,6 @@ struct BurstResponse {
 struct FlushResultEntry {
     tx_hash: Option<String>,
     accepted: bool,
-    #[serde(default)]
-    response: Option<serde_json::Value>,
-    #[serde(default)]
-    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,9 +384,9 @@ async fn main() -> Result<()> {
 
     let gas_token_id = provider.get_gas_token_id().await.context("gas token id")?;
 
-    let ligero = Arc::new(Ligero::new(
-        cfg.ligero_proof_service_url.clone(),
-        cfg.ligero_program_path.clone(),
+    let nightstream = Arc::new(Nightstream::new(
+        cfg.nightstream_proof_service_url.clone(),
+        cfg.nightstream_program_path.clone(),
     ));
 
     let admin_wallet = Arc::new(
@@ -438,13 +416,11 @@ async fn main() -> Result<()> {
         proof_generation_enabled: AtomicBool::new(true),
         proof_generation_interval_ms: AtomicU64::new(cfg.proof_generation_interval_ms),
         max_concurrent_proofs: AtomicUsize::new(cfg.max_concurrent_proofs),
-        startup_progress: StartupProgressTracker::new(cfg.max_proofs),
-        scale_up_progress: ScaleUpProgressTracker::new(cfg.max_proofs),
         provider: provider.clone(),
         deposit_provider: deposit_provider.clone(),
         http: HttpClient::new(),
         verifier_url: verifier_url.clone(),
-        ligero: ligero.clone(),
+        nightstream: nightstream.clone(),
         admin_wallet: admin_wallet.clone(),
         gas_token_id,
         wallets: RwLock::new(Vec::new()),
@@ -452,67 +428,17 @@ async fn main() -> Result<()> {
     });
     spawn_state_saver(state.clone());
 
-    if let Some(db_path) = configured_pool_state_sqlite_path(&cfg) {
-        match load_pool_config(db_path).await {
-            Ok(Some(pc)) => {
-                tracing::info!(
-                    env_max_proofs = cfg.max_proofs,
-                    persisted_max_proofs = pc.max_proofs,
-                    env_proof_generation_interval_ms = cfg.proof_generation_interval_ms,
-                    persisted_proof_generation_interval_ms = pc.proof_generation_interval_ms,
-                    env_max_concurrent_proofs = cfg.max_concurrent_proofs,
-                    persisted_max_concurrent_proofs = pc.max_concurrent_proofs,
-                    persisted_proof_generation_active = pc.proof_generation_active,
-                    "Overriding startup config with persisted pool_config"
-                );
-                state
-                    .target_max_proofs
-                    .store(pc.max_proofs, Ordering::Relaxed);
-                state
-                    .proof_generation_enabled
-                    .store(pc.proof_generation_active, Ordering::Relaxed);
-                state
-                    .proof_generation_interval_ms
-                    .store(pc.proof_generation_interval_ms, Ordering::Relaxed);
-                state
-                    .max_concurrent_proofs
-                    .store(pc.max_concurrent_proofs, Ordering::Relaxed);
-            }
-            Ok(None) => {
-                tracing::info!("No persisted pool_config found, using env/defaults");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load persisted pool_config, using env/defaults");
-            }
-        }
-    }
-
     // Start the HTTP server immediately; perform wallet setup + initial pool fill in the background.
     // This makes `/health` and `/status` available while the initial MAX_PROOFS are being generated.
     let setup_state = state.clone();
     tokio::spawn(async move {
-        let startup_target = setup_state.target_max_proofs.load(Ordering::Relaxed);
-        setup_state
-            .startup_progress
-            .begin(startup_target, StartupStage::RestoringState);
-
         // Try to restore from a previous state DB first.
         let restored = match restore_wallets_from_state(&setup_state).await {
             Ok(true) => {
-                let restored_wallet_count = setup_state.wallets.read().await.len();
-                setup_state
-                    .startup_progress
-                    .seed_restored_wallet_progress(restored_wallet_count);
-
                 // Re-fetch viewer FVK bundles (not persisted; cheap to re-fetch).
-                setup_state
-                    .startup_progress
-                    .set_stage(StartupStage::FetchingViewerFvkBundles);
                 if let Err(e) = maybe_fetch_viewer_fvk_bundles(&setup_state).await {
                     tracing::warn!(error = %e, "Failed to re-fetch viewer FVK bundles after restore");
                 }
-
-                setup_state.startup_progress.mark_complete();
                 true
             }
             Ok(false) => false,
@@ -521,7 +447,6 @@ async fn main() -> Result<()> {
                     error = %e,
                     "Failed to restore pool state; refusing to start fresh to prevent data loss"
                 );
-                setup_state.startup_progress.mark_failed();
                 return;
             }
         };
@@ -529,7 +454,6 @@ async fn main() -> Result<()> {
         if !restored {
             if let Err(e) = setup_wallets_and_fill_pool(setup_state.clone()).await {
                 tracing::error!(error = %e, "Startup setup failed; proof pool will not generate proofs");
-                setup_state.startup_progress.mark_failed();
                 return;
             }
         }
@@ -561,16 +485,11 @@ async fn main() -> Result<()> {
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Shutdown signal received, saving pool state and config…");
+        tracing::info!("Shutdown signal received, saving pool state…");
         if let Err(e) = save_pool_state(&shutdown_state).await {
             tracing::error!(error = %e, "Failed to save pool state on shutdown");
         } else {
             tracing::info!("Pool state saved successfully");
-        }
-        if let Err(e) = save_pool_config(&shutdown_state).await {
-            tracing::error!(error = %e, "Failed to save pool config on shutdown");
-        } else {
-            tracing::info!("Pool config saved successfully");
         }
     };
 
@@ -653,9 +572,6 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
     let active = state.proof_generation_enabled.load(Ordering::Relaxed);
     let interval_ms = state.proof_generation_interval_ms.load(Ordering::Relaxed);
     let max_concurrent = state.max_concurrent_proofs.load(Ordering::Relaxed);
-    let current_wallets = state.wallets.read().await.len();
-    let startup_progress = state.startup_progress.snapshot();
-    let scale_up_progress = state.scale_up_progress.snapshot(current_wallets);
     StatusResponse {
         max_proofs,
         ready_proofs: ready,
@@ -663,8 +579,6 @@ async fn status_snapshot(state: &Arc<ServiceState>) -> StatusResponse {
         proof_generation_state: proof_generation_state_label(active),
         proof_generation_interval_ms: interval_ms,
         max_concurrent_proofs: max_concurrent,
-        startup_progress,
-        scale_up_progress,
     }
 }
 
@@ -753,18 +667,12 @@ async fn max_proofs_impl(
             return Err(StatusCode::BAD_REQUEST);
         }
         state.target_max_proofs.store(max_proofs, Ordering::Relaxed);
-        state.scale_up_progress.set_target_wallets(max_proofs);
-        if !state.scale_up_progress.is_in_progress() {
-            let current_wallets = state.wallets.read().await.len();
-            state.scale_up_progress.reset_when_idle(current_wallets);
-        }
         tracing::info!(
             max_proofs,
             wallet_setup_parallelism = state.max_concurrent_proofs.load(Ordering::Relaxed),
             batch_delay_ms = state.cfg.wallet_setup_backoff_ms,
             "Updated MAX_PROOFS target (wallet scale-up is paced)"
         );
-        spawn_save_pool_config(&state);
     }
 
     Ok(Json(status_snapshot(&state).await))
@@ -802,8 +710,6 @@ async fn proof_generation_impl(
         (None, None) => None,
     };
 
-    let mut config_changed = false;
-
     if let Some(enabled) = requested_state {
         state
             .proof_generation_enabled
@@ -813,7 +719,6 @@ async fn proof_generation_impl(
             proof_generation_state = proof_generation_state_label(enabled),
             "Updated proof generation state"
         );
-        config_changed = true;
     }
 
     let body_requested_interval_ms = body
@@ -846,7 +751,6 @@ async fn proof_generation_impl(
             proof_generation_interval_ms = interval_ms,
             "Updated proof generation throttle interval"
         );
-        config_changed = true;
     }
 
     let requested_max_concurrent = body
@@ -864,11 +768,6 @@ async fn proof_generation_impl(
             max_concurrent_proofs = max_concurrent,
             "Updated max concurrent proofs"
         );
-        config_changed = true;
-    }
-
-    if config_changed {
-        spawn_save_pool_config(&state);
     }
 
     Ok(Json(status_snapshot(&state).await))
@@ -1045,17 +944,12 @@ async fn apply_flush_results(
     flush: &FlushSummary,
 ) -> usize {
     let mut accepted_hashes: HashSet<String> = HashSet::new();
-    let mut nullifier_spent_hashes: HashSet<String> = HashSet::new();
     for entry in flush.results.iter() {
         let Some(tx_hash) = entry.tx_hash.as_ref() else {
             continue;
         };
         if entry.accepted {
             accepted_hashes.insert(tx_hash.clone());
-            continue;
-        }
-        if flush_entry_has_nullifier_already_spent(entry) {
-            nullifier_spent_hashes.insert(tx_hash.clone());
         }
     }
 
@@ -1069,8 +963,6 @@ async fn apply_flush_results(
 
     let mut consumed = 0usize;
     let mut advanced = 0usize;
-    let mut stale_current_note_cleared = 0usize;
-    let mut wallets_needing_recovery: HashMap<usize, Option<Hash32>> = HashMap::new();
     for tx_hash in requested_tx_hashes.iter() {
         let Some(&wallet_idx) = by_hash.get(tx_hash) else {
             continue;
@@ -1087,14 +979,6 @@ async fn apply_flush_results(
         if accepted_hashes.contains(tx_hash) {
             w.current_note = Some(pending.next_note);
             advanced += 1;
-        } else if nullifier_spent_hashes.contains(tx_hash) {
-            let stale_rho = w.current_note.as_ref().map(|note| note.rho);
-            if w.current_note.take().is_some() {
-                stale_current_note_cleared += 1;
-            }
-            wallets_needing_recovery
-                .entry(wallet_idx)
-                .or_insert(stale_rho);
         }
         w.pending = None;
         consumed += 1;
@@ -1115,209 +999,11 @@ async fn apply_flush_results(
         flushed = flush.flushed,
         consumed,
         advanced,
-        stale_current_note_cleared,
-        nullifier_spent_rejections = nullifier_spent_hashes.len(),
         ready_after,
         "Applied flush results and consumed requested pending proofs"
     );
 
-    if !wallets_needing_recovery.is_empty() {
-        for (wallet_idx, stale_rho) in wallets_needing_recovery.into_iter() {
-            let state = state.clone();
-            tokio::spawn(async move {
-                if let Err(error) =
-                    recover_wallet_after_nullifier_spent(&state, wallet_idx, stale_rho).await
-                {
-                    tracing::error!(
-                        wallet_idx,
-                        error = %error,
-                        "Failed to recover wallet after nullifier-spent rejection"
-                    );
-                }
-            });
-        }
-    }
-
     ready_after
-}
-
-fn flush_entry_has_nullifier_already_spent(entry: &FlushResultEntry) -> bool {
-    const NEEDLE: &str = "nullifier already spent";
-
-    if let Some(error) = entry.error.as_deref() {
-        if contains_ascii_case_insensitive(error, NEEDLE) {
-            return true;
-        }
-    }
-
-    if let Some(response) = entry.response.as_ref() {
-        if contains_ascii_case_insensitive(&response.to_string(), NEEDLE) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    haystack
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
-}
-
-async fn recover_wallet_after_nullifier_spent(
-    state: &Arc<ServiceState>,
-    wallet_idx: usize,
-    stale_rho: Option<Hash32>,
-) -> Result<()> {
-    let (wallet, privacy_key) = {
-        let wallets = state.wallets.read().await;
-        let wallet = wallets
-            .get(wallet_idx)
-            .ok_or_else(|| anyhow!("wallet idx {} out of range", wallet_idx))?;
-        (wallet.wallet.clone(), wallet.privacy_key.clone())
-    };
-
-    match try_restore_wallet_note_from_indexer(state, wallet_idx, &privacy_key, stale_rho).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(error) => {
-            tracing::warn!(
-                wallet_idx,
-                error = %error,
-                "Indexer-based wallet recovery failed; falling back to fresh deposit"
-            );
-        }
-    }
-
-    tracing::warn!(
-        wallet_idx,
-        "No recoverable unspent note found in indexer after nullifier-spent rejection; reseeding with a fresh deposit"
-    );
-    reseed_wallet_with_fresh_deposit(state, wallet_idx, wallet, privacy_key).await
-}
-
-async fn try_restore_wallet_note_from_indexer(
-    state: &Arc<ServiceState>,
-    wallet_idx: usize,
-    privacy_key: &PrivacyKey,
-    stale_rho: Option<Hash32>,
-) -> Result<bool> {
-    let notes = get_privacy_notes(state.provider.as_ref(), privacy_key, None)
-        .await
-        .with_context(|| {
-            format!(
-                "fetching unspent notes for wallet {} while recovering from nullifier-spent rejection",
-                wallet_idx
-            )
-        })?;
-
-    let mut skipped_stale = 0usize;
-    let mut parse_errors = 0usize;
-    for note in notes.into_iter() {
-        let rho = match parse_hash32(&note.rho) {
-            Ok(rho) => rho,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-        if stale_rho.is_some() && stale_rho == Some(rho) {
-            skipped_stale += 1;
-            continue;
-        }
-        let sender_id = match parse_hash32(&note.sender_id) {
-            Ok(sender_id) => sender_id,
-            Err(_) => {
-                parse_errors += 1;
-                continue;
-            }
-        };
-        let recovered_note = NoteState {
-            value: note.value,
-            rho,
-            sender_id,
-        };
-
-        if let Err(error) =
-            wait_for_note_in_tree(state.provider.as_ref(), privacy_key, &recovered_note).await
-        {
-            tracing::warn!(
-                wallet_idx,
-                note_rho = %note.rho,
-                error = %error,
-                "Candidate recovery note from indexer is not yet tree-visible; trying next candidate"
-            );
-            continue;
-        }
-        return set_wallet_current_note_if_unset(state, wallet_idx, recovered_note).await;
-    }
-
-    if skipped_stale > 0 || parse_errors > 0 {
-        tracing::warn!(
-            wallet_idx,
-            skipped_stale,
-            parse_errors,
-            "Skipped stale or malformed unspent notes while attempting indexer-based recovery"
-        );
-    }
-
-    Ok(false)
-}
-
-async fn reseed_wallet_with_fresh_deposit(
-    state: &Arc<ServiceState>,
-    wallet_idx: usize,
-    wallet: McpWalletContext,
-    privacy_key: PrivacyKey,
-) -> Result<()> {
-    ensure_wallet_gas_reserve(state, &wallet).await?;
-    let deposit_result = deposit(
-        state.deposit_provider.as_ref(),
-        &wallet,
-        state.cfg.deposit_amount,
-        &privacy_key,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "depositing fresh note for wallet {} after nullifier-spent rejection",
-            wallet_idx
-        )
-    })?;
-    let fresh_note = NoteState {
-        value: state.cfg.deposit_amount,
-        rho: deposit_result.rho,
-        sender_id: privacy_key.recipient(&DOMAIN),
-    };
-    wait_for_note_in_tree(state.provider.as_ref(), &privacy_key, &fresh_note).await?;
-    set_wallet_current_note_if_unset(state, wallet_idx, fresh_note).await?;
-    Ok(())
-}
-
-async fn set_wallet_current_note_if_unset(
-    state: &Arc<ServiceState>,
-    wallet_idx: usize,
-    note: NoteState,
-) -> Result<bool> {
-    let mut wallets = state.wallets.write().await;
-    let wallet = wallets
-        .get_mut(wallet_idx)
-        .ok_or_else(|| anyhow!("wallet idx {} out of range", wallet_idx))?;
-    if wallet.pending.is_some() || wallet.current_note.is_some() {
-        return Ok(true);
-    }
-
-    wallet.current_note = Some(note);
-    wallet.generating = false;
-    drop(wallets);
-
-    request_pool_state_save(state);
-    tracing::info!(
-        wallet_idx,
-        "Recovered wallet note after nullifier-spent rejection"
-    );
-    Ok(true)
 }
 
 fn spawn_refill_loop(state: Arc<ServiceState>) {
@@ -1411,15 +1097,6 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
             let target = state.target_max_proofs.load(Ordering::Relaxed);
             let current = state.wallets.read().await.len();
             if current < target {
-                if !state.scale_up_progress.is_in_progress() {
-                    state.scale_up_progress.begin(current, target);
-                } else {
-                    state.scale_up_progress.update_target(target);
-                }
-
-                state
-                    .scale_up_progress
-                    .set_stage(ScaleUpStage::WaitingForSequencerReady);
                 if !sequencer_ready_for_wallet_setup(&state).await {
                     tracing::warn!(
                         current,
@@ -1433,7 +1110,6 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
 
                 let missing = target - current;
                 let to_add = missing.min(wallet_setup_parallelism(&state));
-                state.scale_up_progress.set_batch_size(to_add);
                 tracing::info!(
                     current,
                     target,
@@ -1443,23 +1119,13 @@ fn spawn_wallet_scale_loop(state: Arc<ServiceState>) {
                     "Scaling wallet pool up in batch"
                 );
                 if let Err(e) = setup_and_append_wallets(&state, to_add).await {
-                    state.scale_up_progress.mark_failed();
                     tracing::error!(error = %e, "Failed to scale wallet pool");
                     sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
                 } else {
-                    let current_after = state.wallets.read().await.len();
-                    let target_after = state.target_max_proofs.load(Ordering::Relaxed);
-                    if current_after >= target_after {
-                        state.scale_up_progress.mark_complete(current_after);
-                    }
                     // Smooth large max_proofs increases by pacing successful scale-up batches.
                     sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
                 }
                 continue;
-            }
-
-            if state.scale_up_progress.is_in_progress() {
-                state.scale_up_progress.mark_complete(current);
             }
             sleep(Duration::from_millis(state.cfg.wallet_setup_backoff_ms)).await;
         }
@@ -1553,7 +1219,7 @@ async fn generate_pending_for_wallet(state: &Arc<ServiceState>, wallet_idx: usiz
         let res = loop {
             transfer_attempt += 1;
             let res = transfer(
-                state.ligero.as_ref(),
+                state.nightstream.as_ref(),
                 state.provider.as_ref(),
                 &wallet,
                 spend_sk,
@@ -1683,16 +1349,10 @@ async fn ensure_wallet_gas_reserve(
 async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
     let started = Instant::now();
 
-    let total_wallets = state.cfg.max_proofs;
-    state.startup_progress.set_total_wallets(total_wallets);
-    state
-        .startup_progress
-        .set_stage(StartupStage::CreatingWallets);
-
     let l2_funding_amount = state.cfg.deposit_amount + state.cfg.auto_fund_gas_reserve;
 
-    let mut wallets: Vec<PoolWallet> = Vec::with_capacity(total_wallets);
-    for wallet_idx in 0..total_wallets {
+    let mut wallets: Vec<PoolWallet> = Vec::with_capacity(state.cfg.max_proofs);
+    for _ in 0..state.cfg.max_proofs {
         let wallet_key_hex = generate_key_hex();
         let privacy_key_hex = generate_key_hex();
         let wallet = McpWalletContext::from_private_key_hex(&wallet_key_hex)?;
@@ -1707,46 +1367,25 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
             pending: None,
             generating: false,
         });
-        state.startup_progress.set_progress(
-            StartupStage::CreatingWallets,
-            StartupCounter::WalletsCreated,
-            wallet_idx + 1,
-        );
     }
     *state.wallets.write().await = wallets;
 
-    state
-        .startup_progress
-        .set_stage(StartupStage::FetchingViewerFvkBundles);
     maybe_fetch_viewer_fvk_bundles(&state).await?;
 
-    state
-        .startup_progress
-        .set_stage(StartupStage::FundingWallets);
     tracing::info!(
-        max_proofs = total_wallets,
+        max_proofs = state.cfg.max_proofs,
         l2_funding_amount,
         "Funding wallets from admin"
     );
     fund_wallets(&state, l2_funding_amount).await?;
-
-    state
-        .startup_progress
-        .set_stage(StartupStage::WaitingForWalletBalances);
     wait_for_wallet_balances(&state, l2_funding_amount).await?;
 
-    state
-        .startup_progress
-        .set_stage(StartupStage::SubmittingDeposits);
     tracing::info!(
         deposit_amount = state.cfg.deposit_amount,
         "Submitting deposits"
     );
     let deposit_notes = submit_deposits(&state).await?;
 
-    state
-        .startup_progress
-        .set_stage(StartupStage::WaitingForDepositNotes);
     tracing::info!("Waiting for deposit notes to be indexed");
     let privacy_keys: Vec<PrivacyKey> = {
         let wallets = state.wallets.read().await;
@@ -1757,10 +1396,6 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
             .get(wallet_idx)
             .ok_or_else(|| anyhow!("wallet idx out of range"))?;
         wait_for_note_in_tree(state.provider.as_ref(), privacy_key, note).await?;
-        state.startup_progress.increment_progress(
-            StartupStage::WaitingForDepositNotes,
-            StartupCounter::DepositNotesIndexed,
-        );
     }
 
     {
@@ -1778,7 +1413,6 @@ async fn setup_wallets_and_fill_pool(state: Arc<ServiceState>) -> Result<()> {
         ready,
         "Startup complete"
     );
-    state.startup_progress.mark_complete();
     request_pool_state_save(&state);
 
     Ok(())
@@ -1789,9 +1423,6 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
         return Ok(());
     }
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::CreatingWallets);
     let started = Instant::now();
     let l2_funding_amount = state.cfg.deposit_amount + state.cfg.auto_fund_gas_reserve;
     tracing::info!(
@@ -1817,66 +1448,34 @@ async fn setup_and_append_wallets(state: &Arc<ServiceState>, count: usize) -> Re
             pending: None,
             generating: false,
         });
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::CreatingWallets,
-            ScaleUpCounter::WalletsCreated,
-        );
     }
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::FetchingViewerFvkBundles);
     maybe_fetch_viewer_fvk_bundles_for_wallets(state, &mut new_wallets).await?;
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::FundingWallets);
     fund_wallets_list(state, &new_wallets, l2_funding_amount).await?;
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::WaitingForWalletBalances);
     wait_for_wallet_balances_list(state, &new_wallets, l2_funding_amount).await?;
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::SubmittingDeposits);
     tracing::info!("Submitting new deposits");
     let deposit_notes = submit_deposits_list(state, &new_wallets).await?;
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::WaitingForDepositNotes);
     tracing::info!("Waiting for new deposit notes to be indexed");
     for (wallet_idx, note) in deposit_notes.iter().enumerate() {
         let w = new_wallets
             .get(wallet_idx)
             .ok_or_else(|| anyhow!("wallet idx out of range"))?;
         wait_for_note_in_tree(state.provider.as_ref(), &w.privacy_key, note).await?;
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::WaitingForDepositNotes,
-            ScaleUpCounter::DepositNotesIndexed,
-        );
     }
 
     for (w, note) in new_wallets.iter_mut().zip(deposit_notes.into_iter()) {
         w.current_note = Some(note);
     }
 
-    state
-        .scale_up_progress
-        .set_stage(ScaleUpStage::AppendingWallets);
     let (start_idx, total) = {
         let mut wallets = state.wallets.write().await;
         let start_idx = wallets.len();
         wallets.extend(new_wallets);
         (start_idx, wallets.len())
     };
-    for _ in 0..count {
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::AppendingWallets,
-            ScaleUpCounter::WalletsAppended,
-        );
-    }
 
     tracing::info!(
         start_idx,
@@ -1895,21 +1494,9 @@ async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
     let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
     let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
     let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
-        for _ in 0..wallets.len() {
-            state.scale_up_progress.increment_progress(
-                ScaleUpStage::FetchingViewerFvkBundles,
-                ScaleUpCounter::ViewerFvkBundlesReady,
-            );
-        }
         return Ok(());
     };
     if pool_fvk_pk_raw.is_empty() {
-        for _ in 0..wallets.len() {
-            state.scale_up_progress.increment_progress(
-                ScaleUpStage::FetchingViewerFvkBundles,
-                ScaleUpCounter::ViewerFvkBundlesReady,
-            );
-        }
         return Ok(());
     }
 
@@ -1945,10 +1532,6 @@ async fn maybe_fetch_viewer_fvk_bundles_for_wallets(
     while let Some(res) = join_set.join_next().await {
         let (idx, bundle) = res??;
         out[idx] = Some(bundle);
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::FetchingViewerFvkBundles,
-            ScaleUpCounter::ViewerFvkBundlesReady,
-        );
     }
 
     for (idx, bundle) in out.into_iter().enumerate() {
@@ -1991,9 +1574,6 @@ async fn fund_wallets_list(
 
     while let Some(res) = join_set.join_next().await {
         res??;
-        state
-            .scale_up_progress
-            .increment_progress(ScaleUpStage::FundingWallets, ScaleUpCounter::WalletsFunded);
     }
 
     Ok(())
@@ -2056,10 +1636,6 @@ async fn wait_for_wallet_balances_list(
 
     while let Some(res) = join_set.join_next().await {
         res??;
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::WaitingForWalletBalances,
-            ScaleUpCounter::WalletsBalanceReady,
-        );
     }
 
     Ok(())
@@ -2096,10 +1672,6 @@ async fn submit_deposits_list(
     while let Some(res) = join_set.join_next().await {
         let (idx, note) = res??;
         out[idx] = Some(note);
-        state.scale_up_progress.increment_progress(
-            ScaleUpStage::SubmittingDeposits,
-            ScaleUpCounter::DepositsSubmitted,
-        );
     }
 
     out.into_iter()
@@ -2108,41 +1680,23 @@ async fn submit_deposits_list(
 }
 
 async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()> {
-    let startup_total_wallets = state.startup_progress.total_wallets();
     let pool_fvk_pk_raw = std::env::var("POOL_FVK_PK").ok();
     let pool_fvk_pk_raw = pool_fvk_pk_raw.map(|v| v.trim().to_string());
     let Some(pool_fvk_pk_raw) = pool_fvk_pk_raw else {
-        state.startup_progress.set_progress(
-            StartupStage::FetchingViewerFvkBundles,
-            StartupCounter::ViewerFvkBundlesReady,
-            startup_total_wallets,
-        );
-        if state.startup_progress.is_in_progress() {
-            tracing::info!(
-                stage = StartupStage::FetchingViewerFvkBundles.label(),
-                total_wallets = startup_total_wallets,
-                "Startup viewer FVK fetch skipped because POOL_FVK_PK is not set"
-            );
-        }
         return Ok(());
     };
     if pool_fvk_pk_raw.is_empty() {
-        state.startup_progress.set_progress(
-            StartupStage::FetchingViewerFvkBundles,
-            StartupCounter::ViewerFvkBundlesReady,
-            startup_total_wallets,
-        );
-        if state.startup_progress.is_in_progress() {
-            tracing::info!(
-                stage = StartupStage::FetchingViewerFvkBundles.label(),
-                total_wallets = startup_total_wallets,
-                "Startup viewer FVK fetch skipped because POOL_FVK_PK is empty"
-            );
-        }
         return Ok(());
     }
 
     let pool_fvk_pk = parse_hex_32("POOL_FVK_PK", &pool_fvk_pk_raw)?;
+    tracing::info!(
+        wallets = state.cfg.max_proofs,
+        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
+    );
+
+    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
+    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
     let wallet_targets: Vec<(usize, String, String)> = {
         let wallets = state.wallets.read().await;
         wallets
@@ -2157,15 +1711,6 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
             })
             .collect()
     };
-    let total_wallets = wallet_targets.len();
-
-    tracing::info!(
-        wallets = total_wallets,
-        "POOL_FVK_PK is set; fetching viewer FVK bundles (1 per wallet) from midnight-fvk-service"
-    );
-
-    let sem = Arc::new(Semaphore::new(wallet_setup_parallelism(state)));
-    let mut join_set: JoinSet<Result<(usize, ViewerFvkBundle)>> = JoinSet::new();
 
     for (idx, wallet_address, shielded_address) in wallet_targets.iter().cloned() {
         let http = state.http.clone();
@@ -2188,10 +1733,6 @@ async fn maybe_fetch_viewer_fvk_bundles(state: &Arc<ServiceState>) -> Result<()>
     while let Some(res) = join_set.join_next().await {
         let (idx, bundle) = res??;
         out[idx] = Some(bundle);
-        state.startup_progress.increment_progress(
-            StartupStage::FetchingViewerFvkBundles,
-            StartupCounter::ViewerFvkBundlesReady,
-        );
     }
 
     let mut wallets = state.wallets.write().await;
@@ -2237,9 +1778,6 @@ async fn fund_wallets(state: &Arc<ServiceState>, amount: u128) -> Result<()> {
 
     while let Some(res) = join_set.join_next().await {
         res??;
-        state
-            .startup_progress
-            .increment_progress(StartupStage::FundingWallets, StartupCounter::WalletsFunded);
     }
 
     Ok(())
@@ -2304,10 +1842,6 @@ async fn wait_for_wallet_balances(state: &Arc<ServiceState>, min_balance: u128) 
 
     while let Some(res) = join_set.join_next().await {
         res??;
-        state.startup_progress.increment_progress(
-            StartupStage::WaitingForWalletBalances,
-            StartupCounter::WalletsBalanceReady,
-        );
     }
 
     Ok(())
@@ -2348,10 +1882,6 @@ async fn submit_deposits(state: &Arc<ServiceState>) -> Result<Vec<NoteState>> {
     while let Some(res) = join_set.join_next().await {
         let (idx, note) = res??;
         out[idx] = Some(note);
-        state.startup_progress.increment_progress(
-            StartupStage::SubmittingDeposits,
-            StartupCounter::DepositsSubmitted,
-        );
     }
 
     out.into_iter()
@@ -2397,17 +1927,55 @@ async fn wait_for_note_in_tree(
         .context("note value does not fit into u64")?;
     let recipient = privacy_key.recipient(&DOMAIN);
     let cm = note_commitment(&DOMAIN, value_u64, &note.rho, &recipient, &note.sender_id);
+    let cm_hex = hex::encode(cm);
+    let timeout = Duration::from_secs(note_tree_wait_timeout_secs());
+    let poll = Duration::from_millis(note_tree_wait_poll_ms());
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
 
-    let (_root, _pos, _sib) = global_tree_syncer()
-        .resolve_positions_and_openings(provider, &[cm])
-        .await
-        .with_context(|| {
-            format!(
-                "waiting for note commitment position cm={}",
-                hex::encode(cm)
-            )
-        })?;
-    Ok(())
+    loop {
+        attempts += 1;
+
+        let error = match global_tree_syncer()
+            .resolve_positions_and_openings(provider, &[cm])
+            .await
+        {
+            Ok(_) => {
+                if attempts > 1 {
+                    tracing::info!(
+                        cm = %cm_hex,
+                        attempts,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Note commitment became visible in commitment tree"
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) => err,
+        };
+
+        if started.elapsed() >= timeout {
+            bail!(
+                "Timed out waiting for note commitment position cm={} after {} attempts over {}s: {}",
+                cm_hex,
+                attempts,
+                timeout.as_secs(),
+                format!("{:#}", error)
+            );
+        }
+
+        if attempts == 1 || attempts % 5 == 0 {
+            tracing::info!(
+                cm = %cm_hex,
+                attempts,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                "Waiting for note commitment to appear in commitment tree"
+            );
+        }
+
+        sleep(poll).await;
+    }
 }
 
 async fn wait_for_sequencer_ready(node_url: &str, timeout: Duration) -> Result<()> {
@@ -2435,19 +2003,17 @@ async fn wait_for_sequencer_ready(node_url: &str, timeout: Duration) -> Result<(
     }
 }
 
-fn compute_ligero_method_id(program: &str) -> Result<[u8; 32]> {
-    let program_str = program.to_string();
-    let host = <sov_ligero_adapter::Ligero as Zkvm>::Host::from_args(&program_str);
-    let code_commitment = host.code_commitment();
-    let method_id: [u8; 32] = code_commitment
-        .encode()
+fn compute_nightstream_method_id(_program: &str) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use sov_nightstream_adapter::circuits::note_spend_rom;
+    let method_id: [u8; 32] = Sha256::digest(&note_spend_rom::NOTE_SPEND_ROM)[..]
         .try_into()
-        .map_err(|_| anyhow!("code commitment should be 32 bytes"))?;
+        .map_err(|_| anyhow!("SHA-256 digest should be 32 bytes"))?;
     Ok(method_id)
 }
 
 async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool) -> Result<String> {
-    let method_id = compute_ligero_method_id(&cfg.ligero_program_path)?;
+    let method_id = compute_nightstream_method_id(&cfg.nightstream_program_path)?;
 
     type RollupSpec = sov_proof_verifier_service::RollupSpec;
     type PrivKey = <<RollupSpec as sov_modules_api::Spec>::CryptoSpec as sov_rollup_interface::zk::CryptoSpec>::PrivateKey;
@@ -2482,10 +2048,6 @@ async fn start_embedded_verifier(cfg: &Config, defer_sequencer_submission: bool)
         chain_id: 1,
         da_connection_string: cfg.da_connection_string.clone(),
         defer_sequencer_submission,
-        prover_service_url: cfg
-            .verifier_prover_service_url
-            .clone()
-            .or_else(|| Some(cfg.ligero_proof_service_url.clone())),
     };
 
     let state = AppState::new(verifier_cfg)
@@ -2550,13 +2112,6 @@ CREATE TABLE IF NOT EXISTS {POOL_STATE_TABLE} (\
     pending_next_note_value TEXT,\
     pending_next_note_rho_hex TEXT,\
     pending_next_note_sender_id_hex TEXT\
-);\
-CREATE TABLE IF NOT EXISTS {POOL_CONFIG_TABLE} (\
-    id INTEGER PRIMARY KEY CHECK (id = 1),\
-    max_proofs INTEGER,\
-    proof_generation_active INTEGER,\
-    proof_generation_interval_ms INTEGER,\
-    max_concurrent_proofs INTEGER\
 );"
     ))
     .with_context(|| {
@@ -2913,104 +2468,6 @@ async fn load_pool_state_sqlite(db_path: &str) -> Result<Option<PersistedPoolSta
         .context("Pool state SQLite load task failed to join")?
 }
 
-// ── Pool config persistence ──────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-struct PersistedConfig {
-    max_proofs: usize,
-    proof_generation_active: bool,
-    proof_generation_interval_ms: u64,
-    max_concurrent_proofs: usize,
-}
-
-fn load_pool_config_sync(db_path: &str) -> Result<Option<PersistedConfig>> {
-    if !Path::new(db_path).exists() {
-        return Ok(None);
-    }
-    let conn = open_pool_state_sqlite(db_path)?;
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT max_proofs, proof_generation_active, proof_generation_interval_ms, max_concurrent_proofs FROM {POOL_CONFIG_TABLE} WHERE id = 1"
-        ))
-        .with_context(|| format!("Failed to prepare pool config SELECT in {}", db_path))?;
-
-    let mut rows = stmt
-        .query([])
-        .with_context(|| format!("Failed to query pool config in {}", db_path))?;
-
-    let Some(row) = rows
-        .next()
-        .with_context(|| format!("Failed to read pool config row in {}", db_path))?
-    else {
-        return Ok(None);
-    };
-
-    let max_proofs: Option<i64> = row.get(0)?;
-    let proof_generation_active: Option<i64> = row.get(1)?;
-    let proof_generation_interval_ms: Option<i64> = row.get(2)?;
-    let max_concurrent_proofs: Option<i64> = row.get(3)?;
-
-    let Some(max_proofs) = max_proofs else {
-        return Ok(None);
-    };
-
-    Ok(Some(PersistedConfig {
-        max_proofs: max_proofs as usize,
-        proof_generation_active: proof_generation_active.unwrap_or(1) != 0,
-        proof_generation_interval_ms: proof_generation_interval_ms.unwrap_or(0) as u64,
-        max_concurrent_proofs: max_concurrent_proofs.unwrap_or(5) as usize,
-    }))
-}
-
-async fn load_pool_config(db_path: &str) -> Result<Option<PersistedConfig>> {
-    let db_path = db_path.to_string();
-    tokio::task::spawn_blocking(move || load_pool_config_sync(&db_path))
-        .await
-        .context("Pool config SQLite load task failed to join")?
-}
-
-fn save_pool_config_sync(db_path: &str, cfg: &PersistedConfig) -> Result<()> {
-    let conn = open_pool_state_sqlite(db_path)?;
-    conn.execute(
-        &format!(
-            "INSERT OR REPLACE INTO {POOL_CONFIG_TABLE} (id, max_proofs, proof_generation_active, proof_generation_interval_ms, max_concurrent_proofs) VALUES (1, ?1, ?2, ?3, ?4)"
-        ),
-        rusqlite::params![
-            cfg.max_proofs as i64,
-            cfg.proof_generation_active as i64,
-            cfg.proof_generation_interval_ms as i64,
-            cfg.max_concurrent_proofs as i64,
-        ],
-    )
-    .with_context(|| format!("Failed to upsert pool config in {}", db_path))?;
-    Ok(())
-}
-
-async fn save_pool_config(state: &Arc<ServiceState>) -> Result<()> {
-    let db_path = match configured_pool_state_sqlite_path(&state.cfg) {
-        Some(path) => path.to_string(),
-        None => return Ok(()),
-    };
-    let cfg = PersistedConfig {
-        max_proofs: state.target_max_proofs.load(Ordering::Relaxed),
-        proof_generation_active: state.proof_generation_enabled.load(Ordering::Relaxed),
-        proof_generation_interval_ms: state.proof_generation_interval_ms.load(Ordering::Relaxed),
-        max_concurrent_proofs: state.max_concurrent_proofs.load(Ordering::Relaxed),
-    };
-    tokio::task::spawn_blocking(move || save_pool_config_sync(&db_path, &cfg))
-        .await
-        .context("Pool config SQLite save task failed to join")?
-}
-
-fn spawn_save_pool_config(state: &Arc<ServiceState>) {
-    let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = save_pool_config(&state).await {
-            tracing::warn!(error = %e, "Failed to persist pool config");
-        }
-    });
-}
-
 async fn reconcile_restored_pending_with_worker_db(state: &Arc<ServiceState>) -> Result<()> {
     let pending_hashes = fetch_pending_hashes_from_verifier(state).await?;
 
@@ -3074,13 +2531,7 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
         "Restoring wallets from persisted state"
     );
 
-    let total_wallets = persisted.wallets.len();
-    state.startup_progress.set_total_wallets(total_wallets);
-    state
-        .startup_progress
-        .set_stage(StartupStage::RestoringState);
-
-    let mut wallets = Vec::with_capacity(total_wallets);
+    let mut wallets = Vec::with_capacity(persisted.wallets.len());
     let mut ready_count = 0usize;
 
     for (idx, pw) in persisted.wallets.iter().enumerate() {
@@ -3122,11 +2573,6 @@ async fn restore_wallets_from_state(state: &Arc<ServiceState>) -> Result<bool> {
             pending,
             generating: false,
         });
-        state.startup_progress.set_progress(
-            StartupStage::RestoringState,
-            StartupCounter::WalletsCreated,
-            idx + 1,
-        );
     }
 
     let wallet_count = wallets.len();
@@ -3232,6 +2678,24 @@ fn tree_resolve_retry_delay_ms() -> u64 {
         .or_else(|| std::env::var("MCP_TREE_RESOLVE_RETRY_DELAY_MS").ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_TREE_RESOLVE_RETRY_DELAY_MS)
+}
+
+fn note_tree_wait_timeout_secs() -> u64 {
+    std::env::var("PROOF_POOL_NOTE_TREE_WAIT_TIMEOUT_SECS")
+        .ok()
+        .or_else(|| std::env::var("MCP_NOTE_TREE_WAIT_TIMEOUT_SECS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NOTE_TREE_WAIT_TIMEOUT_SECS)
+}
+
+fn note_tree_wait_poll_ms() -> u64 {
+    std::env::var("PROOF_POOL_NOTE_TREE_WAIT_POLL_MS")
+        .ok()
+        .or_else(|| std::env::var("MCP_NOTE_TREE_WAIT_POLL_MS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NOTE_TREE_WAIT_POLL_MS)
 }
 
 fn is_tree_positions_resolution_error(error_text: &str) -> bool {

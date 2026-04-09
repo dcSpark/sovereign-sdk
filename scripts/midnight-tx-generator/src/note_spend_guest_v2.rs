@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-use ligetron::bn254fr_native::submod_checked;
-use ligetron::Bn254Fr;
 use midnight_privacy::{
     default_blacklist_root, sparse_default_nodes,
     viewing::{ct_hash, fvk_commitment, view_kdf, view_mac},
@@ -8,7 +6,6 @@ use midnight_privacy::{
     BLACKLIST_TREE_DEPTH,
 };
 use serde_json::json;
-use sov_ligero_adapter::LigeroHost;
 
 fn hex32(h: &Hash32) -> String {
     hex::encode(h)
@@ -45,28 +42,9 @@ pub struct DenyMapOpeningV2 {
     pub siblings: Vec<Hash32>,
 }
 
-fn bn254fr_from_hash32_be(h: &Hash32) -> Bn254Fr {
-    let mut out = Bn254Fr::new();
-    out.set_bytes_big(h);
-    out
-}
-
-fn bl_bucket_inv_for_id(id: &Hash32, bucket_entries: &BlacklistBucketEntries) -> Result<Hash32> {
-    let id_fr = bn254fr_from_hash32_be(id);
-    let mut prod = Bn254Fr::from_u32(1);
-    let mut delta = Bn254Fr::new();
-    for e in bucket_entries.iter() {
-        let e_fr = bn254fr_from_hash32_be(e);
-        submod_checked(&mut delta, &id_fr, &e_fr);
-        prod.mulmod_checked(&delta);
-    }
-    anyhow::ensure!(
-        !prod.is_zero(),
-        "deny-map bucket collision: id is present in bucket entries"
-    );
-    let mut inv = prod.clone();
-    inv.inverse();
-    Ok(inv.to_bytes_be())
+// TODO: Replace with Goldilocks field arithmetic when available.
+fn bl_bucket_inv_for_id(_id: &Hash32, _bucket_entries: &BlacklistBucketEntries) -> Result<Hash32> {
+    Ok([0u8; 32])
 }
 
 /// Viewer attestation data for Level-B viewing support.
@@ -306,7 +284,8 @@ pub fn load_fvk_bundle() -> Option<FvkBundle> {
     load_fvk_from_service()
 }
 
-pub fn add_args_to_host(host: &mut LigeroHost, args: &[serde_json::Value]) -> Result<()> {
+/// No-op for Nightstream; was used for Ligero host arg injection.
+pub fn add_args_to_host(_host: &mut impl std::any::Any, _args: &[serde_json::Value]) -> Result<()> {
     for a in args {
         if let Some(hex) = a.get("hex").and_then(|v| v.as_str()) {
             host.add_hex_arg(hex.to_string());

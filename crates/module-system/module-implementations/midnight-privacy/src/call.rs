@@ -26,10 +26,26 @@ use anyhow::anyhow;
 #[cfg(feature = "native")]
 use crate::hash::NullifierKey;
 
-/// Max serialized Ligero proof size accepted by the module (in bytes).
+/// Max serialized proof size accepted by the module (in bytes).
 ///
-/// Proof packages for `note_spend_guest` can be ~25MB (gzip), so keep headroom.
-const MAX_LIGERO_PROOF_BYTES: usize = 40_000_000;
+/// Nightstream proof packages are typically ~8MB after DEFLATE compression.
+/// Keep headroom for larger proofs.
+const MAX_PROOF_BYTES: usize = 40_000_000;
+
+/// Verify a spend proof using the Nightstream backend and return the public output.
+#[cfg(feature = "native")]
+fn verify_spend_proof<S: Spec>(
+    proof: &[u8],
+    method_id_bytes: &[u8; 32],
+) -> Result<crate::types::SpendPublic> {
+    use sov_nightstream_adapter::{NightstreamCodeCommitment, NightstreamVerifier};
+    use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
+
+    let method_id = NightstreamCodeCommitment::decode(method_id_bytes)
+        .map_err(|e| anyhow!("Invalid Nightstream method_id: {}", e))?;
+    NightstreamVerifier::verify(proof, &method_id)
+        .map_err(|e| MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string()).into())
+}
 /// Available call messages for the `MidnightPrivacy` module.
 #[derive(Debug, PartialEq, Eq, Clone, JsonSchema, UniversalWallet)]
 #[serialize(Borsh, Serde)]
@@ -78,7 +94,7 @@ pub enum CallMessage<S: Spec> {
     Transfer {
         /// Serialized Ligero proof package (bincode-encoded)
         /// Note: Ligero proofs are currently ~8MB in size
-        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
+        proof: sov_modules_api::SafeVec<u8, MAX_PROOF_BYTES>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
         /// Nullifiers that the proof derives (1..=4; all must be fresh)
@@ -113,7 +129,7 @@ pub enum CallMessage<S: Spec> {
     Withdraw {
         /// Serialized Ligero proof package (bincode-encoded)
         /// Note: Ligero proofs are currently ~8MB in size
-        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
+        proof: sov_modules_api::SafeVec<u8, MAX_PROOF_BYTES>,
         /// Anchor root that the proof is bound to (must be valid historical root)
         anchor_root: Hash32,
         /// Nullifier that the proof derives (must be fresh)
@@ -469,7 +485,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     pub(crate) fn transfer(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
+        proof: sov_modules_api::SafeVec<u8, MAX_PROOF_BYTES>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifiers: Vec<Hash32>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] view_ciphertexts: Option<
@@ -484,14 +500,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         #[cfg(not(feature = "native"))]
         {
-            anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
+            anyhow::bail!("Proof verification requires the \"native\" feature enabled");
         }
 
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
-
             anyhow::ensure!(
                 !nullifiers.is_empty(),
                 "Transfer requires at least 1 nullifier"
@@ -513,24 +526,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             );
 
             let public = if let Some(public) = cached_public {
-                debug!("Using pre-verified path (skipping Ligero proof verification)");
+                debug!("Using pre-verified path (skipping proof verification)");
                 public
             } else {
-                info!("No pre-verified credential, performing full Ligero proof verification");
+                info!("No pre-verified credential, performing full Nightstream proof verification");
 
-                // Only load and decode method_id when we really need to verify a proof.
                 let method_id_bytes = self
                     .method_id
                     .get(st)?
                     .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
 
-                let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                    .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
-
-                // Verify the proof and extract public output
-                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
-                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
-                })?
+                verify_spend_proof::<S>(&proof, &method_id_bytes)?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values
@@ -722,7 +728,7 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
     pub(crate) fn withdraw(
         &mut self,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-        proof: sov_modules_api::SafeVec<u8, MAX_LIGERO_PROOF_BYTES>,
+        proof: sov_modules_api::SafeVec<u8, MAX_PROOF_BYTES>,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] anchor_root: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] nullifier: Hash32,
         #[cfg_attr(not(feature = "native"), allow(unused_variables))] withdraw_amount: u128,
@@ -739,14 +745,11 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
 
         #[cfg(not(feature = "native"))]
         {
-            anyhow::bail!("Ligero verification requires the \"native\" feature enabled");
+            anyhow::bail!("Proof verification requires the \"native\" feature enabled");
         }
 
         #[cfg(feature = "native")]
         {
-            use sov_ligero_adapter::{LigeroCodeCommitment, LigeroVerifier};
-            use sov_rollup_interface::zk::{CodeCommitment, ZkVerifier};
-
             let credential_check_start = std::time::Instant::now();
             let cached_public = crate::get_pre_verified_spend(&nullifier);
             let credential_check_duration = credential_check_start.elapsed();
@@ -757,22 +760,17 @@ impl<S: Spec> ValueMidnightPrivacy<S> {
             );
 
             let public = if let Some(public) = cached_public {
-                debug!("Using pre-verified path (skipping Ligero proof verification)");
+                debug!("Using pre-verified path (skipping proof verification)");
                 public
             } else {
-                info!("No pre-verified credential, performing full Ligero proof verification");
+                info!("No pre-verified credential, performing full Nightstream proof verification");
 
                 let method_id_bytes = self
                     .method_id
                     .get(st)?
                     .ok_or_else(|| anyhow!("method_id not configured in module state"))?;
 
-                let method_id = LigeroCodeCommitment::decode(&method_id_bytes)
-                    .map_err(|e| anyhow!("Invalid method_id bytes in state: {}", e))?;
-
-                LigeroVerifier::verify(&proof, &method_id).map_err(|e| {
-                    MidnightPrivacyError::<S>::ProofVerificationFailed(e.to_string())
-                })?
+                verify_spend_proof::<S>(&proof, &method_id_bytes)?
             };
 
             // SECURITY: Bind transaction fields to proof-committed values

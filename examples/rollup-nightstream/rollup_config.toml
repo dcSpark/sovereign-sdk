@@ -1,0 +1,68 @@
+# Nightstream-compatible rollup configuration
+#
+# Uses Midnight DA adapter (PostgreSQL) so the rollup and proof-verifier-service
+# share the same worker_verified_transactions table.
+#
+# Settings tuned for Nightstream proofs:
+#   - max_batch_size_bytes: 20MB (Nightstream proofs are ~2-4MB compressed)
+#   - block_time_ms: 2000 (extra time for verify-only circuit synthesis)
+#   - batch_execution_time_limit_millis: 5000 (Nightstream verify ~100ms release, ~2-5s debug)
+
+[da]
+# PostgreSQL DA for local development. Both the rollup and proof-verifier-service
+# share the same database (worker_verified_transactions table).
+connection_string = "postgresql://admin:1234@localhost:5432/da"
+sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
+finalization_blocks = 1
+
+# Where to persist full incoming worker transactions (for auditing/debugging).
+# Options: "none" | "disk" | "gcs"
+save_incoming_worker_txs = "none"
+worker_tx_path = "demo_data/midnight_tx_json"
+
+[da.block_producing.periodic]
+block_time_ms = 2000
+
+[storage]
+path = "demo_data"
+state_cache_size = 4294967296
+
+[runner]
+genesis_height = 0
+da_polling_interval_ms = 50
+
+[runner.http_config]
+bind_host = "127.0.0.1"
+bind_port = 12346
+
+[monitoring]
+telegraf_address = "udp://127.0.0.1:8094"
+
+[proof_manager]
+aggregated_proof_block_jump = 16
+prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+max_number_of_transitions_in_db = 100
+max_number_of_transitions_in_memory = 30
+
+[sequencer]
+blob_processing_timeout_secs = 3000
+max_batch_size_bytes = 20971520
+max_concurrent_blobs = 512
+max_allowed_node_distance_behind = 10
+rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+[sequencer.preferred]
+disable_state_root_consistency_checks = true
+recovery_strategy = "TryToSave"
+batch_execution_time_limit_millis = 5000
+num_cache_warmup_workers = 5
+[sequencer.extension]
+max_log_limit = 20000
+# Example Midnight bridge configuration (disabled)
+# [sequencer.extension.midnight_bridge]
+# signing_key_path = "demo_data/midnight_bridge_signer.json" # JSON PrivateKeyAndAddress
+# mock_events_path = "demo_data/midnight_bridge_events.json" # Uncomment for offline testing
+# indexer_http = "https://indexer.preview.midnight.network/api/v3/graphql"
+# contract_address = "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12"
+# indexer_timeout_ms = 30000
+# poll_interval_ms = 1000
+# max_fee = 1000000

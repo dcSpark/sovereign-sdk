@@ -145,7 +145,6 @@ sov-build = { workspace = true }
 default = []
 # Used for using different encoding between host and guest
 bincode = ["risc0/bincode", "sov-risc0-adapter/bincode"]
-
 [[bin]]
 name = "sov-cli"
 path = "src/sov-cli/main.rs"

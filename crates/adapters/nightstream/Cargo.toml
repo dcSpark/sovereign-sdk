@@ -1,0 +1,56 @@
+[package]
+name = "sov-nightstream-adapter"
+description = "An adapter allowing Nightstream to be used as a zkVM with the Sovereign SDK"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+borsh = { workspace = true, features = ["derive"] }
+schemars = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["alloc", "derive"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+flate2 = "1"
+p3-field = "0.4.1"
+p3-goldilocks = "0.4.1"
+
+sov-rollup-interface = { workspace = true }
+sov-mock-zkvm = { workspace = true }
+
+# Nightstream dependencies
+neo-fold = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d", features = ["poseidon-precompile"] }
+neo-math = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-ajtai = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-memory = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-ccs = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-vm-trace = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-params = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+neo-transcript = { git = "https://github.com/LFDT-Nightstream/Nightstream", rev = "5b98cb6471fccea81b86a335c54d6f3a73f5499d" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+p3-goldilocks = "0.4.1"
+
+[features]
+default = []
+native = [
+    "sov-rollup-interface/native",
+    "sov-mock-zkvm/native",
+]
+
+[[example]]
+name = "generate_proof_tx"
+required-features = ["native"]

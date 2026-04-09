@@ -1,0 +1,10 @@
+[build]
+target = "riscv32i-unknown-none-elf"
+
+[target.riscv32i-unknown-none-elf]
+rustflags = ["-C", "link-arg=-T../riscv32i-unknown-none-elf.ld", "-C", "target-feature=-c"]
+
+[env]
+# The parent repo may set RUSTFLAGS (e.g. `-C target-cpu=native`) globally for host builds.
+# That breaks cross-compiling this guest, so override it locally.
+RUSTFLAGS = ""

@@ -143,7 +143,6 @@ where
 mod tests {
     use demo_stf::runtime::Runtime;
     use sov_address::MultiAddressEvm;
-    use sov_ligero_adapter::Ligero;
     use sov_mock_da::MockDaSpec;
     use sov_mock_zkvm::MockZkvm;
     use sov_modules_api::capabilities::UniquenessData;
@@ -151,12 +150,13 @@ mod tests {
     use sov_modules_api::execution_mode::Native;
     use sov_modules_api::transaction::{PriorityFeeBips, UnsignedTransaction};
     use sov_modules_api::Amount;
+    use sov_nightstream_adapter::Nightstream;
 
     use super::*;
     use crate::test_utils::TEST_PRIVATE_KEY_HEX;
 
     // Define test spec types
-    type TestSpec = ConfigurableSpec<MockDaSpec, Ligero, MockZkvm, MultiAddressEvm, Native>;
+    type TestSpec = ConfigurableSpec<MockDaSpec, Nightstream, MockZkvm, MultiAddressEvm, Native>;
     type TestRuntime = Runtime<TestSpec>;
 
     #[test]
