@@ -17,9 +17,12 @@ In TEE mode, the rollup periodically aggregates DA-backed execution into batch p
 
 ### 3. Bridging - deposits
 
-TODO: extend with a bit of extra detail to look more like sections 2. and 4.
+Moving NIGHT from L1 into the rollup.
 
-The rollup observes the L1 Bridge contract for deposit events where NIGHT token is locked on the contract. Each such event comes with an L2 (rollup) bridging recipient address to which the rollup credits the appropriate bridged funds.
+1. A user (or script) calls the L1 Bridge contract's deposit function, locking NIGHT and specifying an L2 recipient address.
+2. The deposit is recorded on L1 as a cross-domain message with a rolling hash chain (`messageRollingHashes`).
+3. The rollup's bridge worker polls the Midnight indexer for new deposit events, constructs a `Bank::Mint` transaction for each, and submits it to the sequencer.
+4. The minted funds appear at the specified L2 address on the next processed block.
 
 ### 4. Bridging - withdrawals
 
@@ -141,7 +144,7 @@ cat > withdraw_night.json << 'EOF'
 {
   "withdraw_night": {
     "midnight_address": "1e524a8e02b8022f243db6c992f48c866dff4fa3b1c01624f9f2c1d269e11017",
-    "amount": "1000000000000",
+    "amount": "100000000000",
     "gas_limit": null
   }
 }

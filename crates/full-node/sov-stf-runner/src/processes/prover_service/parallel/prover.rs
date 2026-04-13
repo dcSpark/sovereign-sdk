@@ -313,17 +313,20 @@ where
 
                     l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
 
-                    let index = snap
-                        .rollup
-                        .next_cross_domain_message_index
-                        .saturating_sub(1);
+                    // Use last_processed_l1_index as the lookup key — this is the
+                    // index sent as lastProcessedQueueIndex in the batch, and the L1
+                    // contract validates messageQueueHash against this exact index.
+                    // Using nextCrossDomainMessageIndex-1 would pick up deposits
+                    // that arrived after the batch range.
+                    let index = snap.l2_messenger.last_processed_l1_index;
                     if let Some(h) = snap.rollup.message_rolling_hashes.get(&index) {
                         l1_bridge.message_queue_hash = *h;
                     } else {
                         tracing::warn!(
+                            last_processed_l1_index = index,
                             next_cross_domain_message_index =
                                 snap.rollup.next_cross_domain_message_index,
-                            "Missing message rolling hash for expected index; keeping cached value"
+                            "Missing message rolling hash for last_processed index; keeping cached value"
                         );
                     }
 

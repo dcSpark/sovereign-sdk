@@ -18,6 +18,7 @@ async fn post_json<T: serde::de::DeserializeOwned>(
     body: &serde_json::Value,
 ) -> Result<T> {
     let url = format!("{}{}", base_url_normalized(base_url), path);
+    tracing::info!(path, "Sending request to executor service (this may take a while)…");
     let res = client
         .post(&url)
         .json(body)

@@ -142,7 +142,10 @@ where
         prev_batch_hash,
         stf_info_receiver,
         shutdown_receiver,
-        reqwest::Client::new(),
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("Failed to build HTTP client"),
         oracle_url,
         midnight_bridge,
         executor_client,

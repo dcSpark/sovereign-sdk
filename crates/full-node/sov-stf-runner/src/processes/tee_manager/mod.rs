@@ -339,6 +339,16 @@ where
                 da_end_height,
             );
 
+            // Log state roots for diagnostics (truncated to 32 bytes, same as L1).
+            info!(
+                batch_index = self.batch_index,
+                prev_state_root = hex::encode(&public_data.initial_state_root[..32]),
+                post_state_root = hex::encode(&public_data.final_state_root[..32]),
+                da_start_height,
+                da_end_height,
+                "Batch state roots from prover"
+            );
+
             // Build the batch struct early so we can persist it for crash recovery.
             // NOTE: withdraw_root is now sourced from the L2 STF (via the prover's
             // REST query to the rollup), not the L1 indexer snapshot.
@@ -376,7 +386,6 @@ where
             // Resync: query L1 state to detect if the contract is ahead of our
             // cursor (e.g. after crash recovery finalized a batch, or if the
             // executor returned an error but the L1 tx actually succeeded).
-            let mut skip_settlement = false;
             let mut skip_commit = false;
             if let Some(ref executor) = self.executor_client {
                 match executor.get_state().await {
@@ -389,11 +398,13 @@ where
                             "L1 state before batch settlement"
                         );
                         if state.last_finalized_batch_index >= self.batch_index {
-                            // L1 already finalized this batch (or later) — resync cursor.
+                            // L1 already finalized this batch (or later) — resync cursor
+                            // and discard the current proof (its state roots don't chain
+                            // from L1's new lastFinalizedStateRoot).
                             info!(
                                 batch_index = self.batch_index,
                                 l1_finalized = state.last_finalized_batch_index,
-                                "L1 is ahead; resyncing cursor"
+                                "L1 is ahead; resyncing cursor and discarding current proof"
                             );
                             self.batch_index = state.last_finalized_batch_index + 1;
                             self.prev_batch_hash = state.last_finalized_batch_hash;
@@ -401,7 +412,12 @@ where
                                 super::bridge_lifecycle::remove_pending_finalize(sp);
                             }
                             self.l1_settlement_failures = 0;
-                            skip_settlement = true;
+                            // Advance the DA height cursor (the proof was consumed) but
+                            // don't use it — the next call will produce a proof that
+                            // chains correctly from the new cursor.
+                            self.stf_info_receiver
+                                .inc_next_height_to_receive_by(num_proofs_to_create as u64);
+                            return Ok(());
                         } else if state.last_committed_batch_index >= self.batch_index
                             && state.last_committed_batch_index > state.last_finalized_batch_index
                         {
@@ -437,9 +453,7 @@ where
 
             // Commit batch on L1 via executor service (if configured).
             // Track success so we only advance the durable batch cursor when L1 accepted both commit AND finalize.
-            let mut l1_ok = if skip_settlement {
-                true // cursor already resynced above
-            } else if skip_commit {
+            let mut l1_ok = if skip_commit {
                 true // commit already on L1, proceed to finalize
             } else if let Some(ref executor) = self.executor_client {
                 match executor
@@ -582,7 +596,7 @@ where
             // Finalize batch on L1 via executor service (if configured).
             // Only attempt finalize if commit succeeded -- otherwise the contract is not expecting it.
             // Skip if we already resynced the cursor above.
-            if l1_ok && !skip_settlement {
+            if l1_ok {
                 if let (Some(ref executor), Some(rollup_id)) =
                     (self.executor_client.as_ref(), self.rollup_id.as_ref())
                 {
@@ -649,10 +663,8 @@ where
                 .inc_next_height_to_receive_by(num_proofs_to_create as u64);
 
             if l1_ok {
-                if !skip_settlement {
-                    self.batch_index += 1;
-                    self.prev_batch_hash = batch_hash;
-                }
+                self.batch_index += 1;
+                self.prev_batch_hash = batch_hash;
                 self.l1_settlement_failures = 0;
             } else {
                 self.l1_settlement_failures = self.l1_settlement_failures.saturating_add(1);

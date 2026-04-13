@@ -575,10 +575,11 @@ where
         }
 
         let l1_withdraw_root = state_resp.withdraw_root.as_deref().unwrap_or("(not available)");
-        debug!(
+        info!(
             finalized_batch_index,
             l1_withdraw_root,
-            "Withdrawal relay: executor state"
+            next_relay_nonce = self.next_relay_nonce,
+            "Withdrawal relay: checking state"
         );
 
         // 2. Get the withdrawal queue status from the rollup.
@@ -647,7 +648,7 @@ where
             if l1_withdraw_root != "(not available)"
                 && !proof.withdraw_root_hex.eq_ignore_ascii_case(l1_withdraw_root)
             {
-                debug!(
+                info!(
                     nonce,
                     stf_root = %proof.withdraw_root_hex,
                     l1_root = l1_withdraw_root,
