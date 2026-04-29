@@ -9,12 +9,15 @@ It checks:
 - `POST BASE_URL/proof-pool/send` with `proof_quantity=1`
 - `POST TEE_RESET_URL` without auth and treats any returned HTTP status as proof the endpoint is alive; only timeout or connection-refused failures mark it unhealthy
 - `scripts/mcp-external-stress.sh` against `BASE_URL/mcp/mcp` with 3 wallets and 1 tx by default
+- `GET BASE_URL/controller/stats` with optional basic auth and emits the selected mount path's disk usage percentage
 - emits CloudWatch Embedded Metric Format events under the `Midnight/Monitor` namespace
 
 ## Environment variables
 
 - `BASE_URL` (required), for example `https://midnight-l2-testnet.shinkai.com`
 - `MONITOR_ENV` (required), for example `midnight-l2-testnet`
+- `MONITOR_CONTROLLER_BASIC_AUTH_USERNAME` / `MONITOR_CONTROLLER_BASIC_AUTH_PASSWORD` (optional together, but needed if `/controller/stats` is protected)
+- `MONITOR_DISK_USAGE_MOUNT_PATH` (default `/`)
 - `PROOF_POOL_AUTH_TOKEN` (optional, but needed if `/proof-pool/send` is protected)
 - `MONITOR_TEE_RESET_URL` (optional; falls back to `TEE_RESET_URL`, default `http://74.235.106.62:9898/reset`)
 - `HTTP_TIMEOUT_SECS` (default `10`)
@@ -31,6 +34,7 @@ Each invocation emits:
 - `RunStatus{Environment}` = `1` when all checks pass, otherwise `0`
 - `CheckStatus{Environment,Check}` = `1` or `0` for each monitor check
 - `CheckLatencyMs{Environment,Check}` for each monitor check
+- `DiskUsagePercent{Environment,MountPath}` for the selected disk mount
 
 The emitted `Check` dimension values are:
 
@@ -46,6 +50,7 @@ The emitted `Check` dimension values are:
 - `proof-pool:send`
 - `tee:reset-endpoint`
 - `mcp:stress`
+- `system:disk-usage`
 
 The MCP stress check is considered healthy as long as at least one of the configured sends succeeds.
 With the default `3` wallets and `1` tx per wallet, it only fails when `0/3` sends succeed.

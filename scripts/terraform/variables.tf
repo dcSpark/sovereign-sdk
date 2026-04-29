@@ -224,6 +224,12 @@ variable "monitor_tee_reset_port" {
   default     = 9898
 }
 
+variable "monitor_disk_usage_mount_path" {
+  description = "Mount path selected from /controller/stats for disk usage collection"
+  type        = string
+  default     = "/"
+}
+
 variable "slack_workspace_id" {
   description = "Slack workspace/team ID for the AWS Chatbot channel configuration"
   type        = string

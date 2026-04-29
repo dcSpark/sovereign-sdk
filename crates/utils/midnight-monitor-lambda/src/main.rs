@@ -17,11 +17,13 @@ const DEFAULT_STRESS_TXS: usize = 1;
 const DEFAULT_STRESS_SESSION_IDS_FILE: &str = "/tmp/mcp-external-stress-session-ids.txt";
 const DEFAULT_STRESS_SCRIPT_PATH: &str = "scripts/mcp-external-stress.sh";
 const DEFAULT_TEE_RESET_URL: &str = "http://74.235.106.62:9898/reset";
+const DEFAULT_DISK_USAGE_MOUNT_PATH: &str = "/";
 const MONITOR_METRICS_NAMESPACE: &str = "Midnight/Monitor";
 const S5_PEAK_TPS_CHECK: &str = "metrics:s5-peak-tps";
 const PROOF_POOL_SEND_CHECK: &str = "proof-pool:send";
 const TEE_RESET_ENDPOINT_CHECK: &str = "tee:reset-endpoint";
 const MCP_STRESS_CHECK: &str = "mcp:stress";
+const DISK_USAGE_CHECK: &str = "system:disk-usage";
 
 #[derive(Clone, Copy)]
 struct ServiceCheckDef {
@@ -78,7 +80,10 @@ struct Config {
     base_url: String,
     monitor_env: String,
     proof_pool_auth_token: Option<String>,
+    controller_basic_auth_username: Option<String>,
+    controller_basic_auth_password: Option<String>,
     tee_reset_url: String,
+    disk_usage_mount_path: String,
     http_timeout_secs: u64,
     stress_wallets: usize,
     stress_txs: usize,
@@ -92,6 +97,23 @@ impl Config {
         let tee_reset_url = optional_env("MONITOR_TEE_RESET_URL")
             .or_else(|| optional_env("TEE_RESET_URL"))
             .unwrap_or_else(|| DEFAULT_TEE_RESET_URL.to_string());
+        let controller_basic_auth_username = optional_env("MONITOR_CONTROLLER_BASIC_AUTH_USERNAME")
+            .or_else(|| optional_env("CONTROLLER_BASIC_AUTH_USERNAME"));
+        let controller_basic_auth_password = optional_env("MONITOR_CONTROLLER_BASIC_AUTH_PASSWORD")
+            .or_else(|| optional_env("CONTROLLER_BASIC_AUTH_PASSWORD"));
+
+        match (
+            controller_basic_auth_username.as_ref(),
+            controller_basic_auth_password.as_ref(),
+        ) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                bail!(
+                    "MONITOR_CONTROLLER_BASIC_AUTH_USERNAME and MONITOR_CONTROLLER_BASIC_AUTH_PASSWORD must either both be set or both be unset"
+                );
+            }
+        }
+
         reqwest::Url::parse(&tee_reset_url).with_context(|| {
             format!("TEE reset URL must be a valid absolute URL: {tee_reset_url}")
         })?;
@@ -103,7 +125,12 @@ impl Config {
             base_url: normalize_base_url(&base_url),
             monitor_env: required_env("MONITOR_ENV")?,
             proof_pool_auth_token: optional_env("PROOF_POOL_AUTH_TOKEN"),
+            controller_basic_auth_username,
+            controller_basic_auth_password,
             tee_reset_url,
+            disk_usage_mount_path: optional_env("MONITOR_DISK_USAGE_MOUNT_PATH")
+                .or_else(|| optional_env("DISK_USAGE_MOUNT_PATH"))
+                .unwrap_or_else(|| DEFAULT_DISK_USAGE_MOUNT_PATH.to_string()),
             http_timeout_secs: env_parse("HTTP_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT_SECS)?,
             stress_wallets: env_parse("STRESS_WALLETS", DEFAULT_STRESS_WALLETS)?,
             stress_txs: env_parse("STRESS_TXS", DEFAULT_STRESS_TXS)?,
@@ -128,6 +155,7 @@ struct MonitorReport {
     proof_pool_send: OperationCheckResult<ProofPoolSendResult>,
     tee_reset_endpoint: OperationCheckResult<TeeEndpointResult>,
     mcp_stress: OperationCheckResult<StressRunResult>,
+    disk_usage: OperationCheckResult<DiskUsageResult>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -173,6 +201,32 @@ struct OperationCheckResult<T> {
 struct TeeEndpointResult {
     url: String,
     status_code: Option<u16>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DiskUsageResult {
+    url: String,
+    disk_name: String,
+    mount_path: String,
+    usage_percent: f64,
+    total_bytes: u64,
+    used_bytes: u64,
+    available_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerSystemStatsResponse {
+    disks: Vec<ControllerDiskStats>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerDiskStats {
+    name: String,
+    mount_point: String,
+    total_bytes: u64,
+    available_bytes: u64,
+    used_bytes: u64,
+    usage_percent: f64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -232,6 +286,11 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
     if config.proof_pool_auth_token.is_none() {
         warn!("PROOF_POOL_AUTH_TOKEN is not set; proof-pool send will fail if auth is required");
     }
+    if config.controller_basic_auth_username.is_none() {
+        warn!(
+            "MONITOR_CONTROLLER_BASIC_AUTH_USERNAME is not set; disk usage metric collection will fail if /controller/stats requires basic auth"
+        );
+    }
 
     info!(base_url = config.base_url, "running service health checks");
     let health_checks = check_services(&client, &config.base_url).await;
@@ -247,6 +306,24 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
 
     info!("running MCP stress check");
     let mcp_stress = run_mcp_stress_check(&config).await;
+
+    info!(mount_path = %config.disk_usage_mount_path, "collecting disk usage metric");
+    let disk_usage = run_disk_usage_check(&client, &config).await;
+    if disk_usage.healthy {
+        if let Some(result) = disk_usage.result.as_ref() {
+            info!(
+                mount_path = %result.mount_path,
+                usage_percent = result.usage_percent,
+                "collected disk usage metric"
+            );
+        }
+    } else {
+        warn!(
+            mount_path = %config.disk_usage_mount_path,
+            error = disk_usage.error.as_deref().unwrap_or("unknown error"),
+            "disk usage metric collection failed"
+        );
+    }
 
     let all_checks_passed = health_checks.iter().all(|result| result.healthy)
         && s5_peak_tps.healthy
@@ -264,6 +341,7 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
         proof_pool_send,
         tee_reset_endpoint,
         mcp_stress,
+        disk_usage,
     };
 
     emit_metrics(&report)?;
@@ -682,6 +760,100 @@ fn validate_stress_summary(
     })
 }
 
+async fn run_disk_usage_check(
+    client: &Client,
+    config: &Config,
+) -> OperationCheckResult<DiskUsageResult> {
+    let started = Instant::now();
+    match execute_disk_usage_check(client, config).await {
+        Ok(result) => OperationCheckResult {
+            check: DISK_USAGE_CHECK.to_string(),
+            healthy: true,
+            latency_ms: started.elapsed().as_millis(),
+            result: Some(result),
+            error: None,
+        },
+        Err(err) => OperationCheckResult {
+            check: DISK_USAGE_CHECK.to_string(),
+            healthy: false,
+            latency_ms: started.elapsed().as_millis(),
+            result: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+async fn execute_disk_usage_check(client: &Client, config: &Config) -> Result<DiskUsageResult> {
+    let url = format!("{}/controller/stats", config.base_url);
+    let mut request = client.get(&url);
+
+    if let Some(username) = config.controller_basic_auth_username.as_deref() {
+        request = request.basic_auth(username, config.controller_basic_auth_password.as_deref());
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("controller stats request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read controller stats response body")?;
+
+    parse_disk_usage_response(url, &config.disk_usage_mount_path, status.as_u16(), &body)
+}
+
+fn parse_disk_usage_response(
+    url: String,
+    mount_path: &str,
+    status_code: u16,
+    body: &str,
+) -> Result<DiskUsageResult> {
+    if !(200..300).contains(&status_code) {
+        bail!(
+            "controller stats returned {}: {}",
+            status_code,
+            excerpt(body).unwrap_or_else(|| "<empty>".to_string())
+        );
+    }
+
+    let parsed: ControllerSystemStatsResponse = serde_json::from_str(body)
+        .with_context(|| format!("failed to parse controller stats response: {body}"))?;
+
+    let available_mounts = parsed
+        .disks
+        .iter()
+        .map(|disk| disk.mount_point.clone())
+        .collect::<Vec<_>>();
+    let disk = parsed
+        .disks
+        .into_iter()
+        .find(|disk| disk.mount_point == mount_path)
+        .ok_or_else(|| {
+            anyhow!(
+                "disk mount path {} not found in controller stats {}; available mount points: {}",
+                mount_path,
+                url,
+                if available_mounts.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available_mounts.join(", ")
+                }
+            )
+        })?;
+
+    Ok(DiskUsageResult {
+        url,
+        disk_name: disk.name,
+        mount_path: disk.mount_point,
+        usage_percent: disk.usage_percent,
+        total_bytes: disk.total_bytes,
+        used_bytes: disk.used_bytes,
+        available_bytes: disk.available_bytes,
+    })
+}
+
 fn emit_metrics(report: &MonitorReport) -> Result<()> {
     for event in build_metric_events(report)? {
         println!(
@@ -695,7 +867,7 @@ fn emit_metrics(report: &MonitorReport) -> Result<()> {
 
 fn build_metric_events(report: &MonitorReport) -> Result<Vec<Value>> {
     let timestamp = current_timestamp_millis()?;
-    let mut events = Vec::with_capacity(report.health_checks.len() + 5);
+    let mut events = Vec::with_capacity(report.health_checks.len() + 7);
 
     events.push(json!({
         "_aws": {
@@ -759,6 +931,22 @@ fn build_metric_events(report: &MonitorReport) -> Result<Vec<Value>> {
         report.mcp_stress.latency_ms,
         report.mcp_stress.error.as_deref(),
     ));
+    events.push(build_check_metric_event(
+        timestamp,
+        &report.environment,
+        &report.disk_usage.check,
+        report.disk_usage.healthy,
+        report.disk_usage.latency_ms,
+        report.disk_usage.error.as_deref(),
+    ));
+
+    if let Some(disk_usage) = report.disk_usage.result.as_ref() {
+        events.push(build_disk_usage_metric_event(
+            timestamp,
+            &report.environment,
+            disk_usage,
+        ));
+    }
 
     Ok(events)
 }
@@ -803,6 +991,33 @@ fn build_check_metric_event(
     }
 
     Value::Object(event)
+}
+
+fn build_disk_usage_metric_event(
+    timestamp: u64,
+    environment: &str,
+    disk_usage: &DiskUsageResult,
+) -> Value {
+    json!({
+        "_aws": {
+            "Timestamp": timestamp,
+            "CloudWatchMetrics": [{
+                "Namespace": MONITOR_METRICS_NAMESPACE,
+                "Dimensions": [["Environment", "MountPath"]],
+                "Metrics": [
+                    { "Name": "DiskUsagePercent", "Unit": "Percent" }
+                ]
+            }]
+        },
+        "Environment": environment,
+        "MountPath": disk_usage.mount_path,
+        "DiskUsagePercent": disk_usage.usage_percent,
+        "DiskName": disk_usage.disk_name,
+        "DiskTotalBytes": disk_usage.total_bytes,
+        "DiskUsedBytes": disk_usage.used_bytes,
+        "DiskAvailableBytes": disk_usage.available_bytes,
+        "ControllerStatsUrl": disk_usage.url,
+    })
 }
 
 fn failed_checks(report: &MonitorReport) -> Vec<String> {
@@ -979,11 +1194,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        build_metric_events, failed_checks, parse_proof_pool_send_response,
-        parse_s5_peak_tps_response, parse_stress_summary, service_url, validate_stress_summary,
-        HealthCheckResult, MonitorReport, OperationCheckResult, ProofPoolSendResult,
-        S5PeakTpsResult, StressRunResult, TeeEndpointResult, MCP_STRESS_CHECK,
-        PROOF_POOL_SEND_CHECK, S5_PEAK_TPS_CHECK, TEE_RESET_ENDPOINT_CHECK,
+        build_metric_events, failed_checks, parse_disk_usage_response,
+        parse_proof_pool_send_response, parse_s5_peak_tps_response, parse_stress_summary,
+        service_url, validate_stress_summary, DiskUsageResult, HealthCheckResult, MonitorReport,
+        OperationCheckResult, ProofPoolSendResult, S5PeakTpsResult, StressRunResult,
+        TeeEndpointResult, DISK_USAGE_CHECK, MCP_STRESS_CHECK, PROOF_POOL_SEND_CHECK,
+        S5_PEAK_TPS_CHECK, TEE_RESET_ENDPOINT_CHECK,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -1015,7 +1231,7 @@ mod tests {
         let report = sample_report();
         let events = build_metric_events(&report).expect("metric events should build");
 
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), 15);
         assert_eq!(find_metric_value(&events[0], "Heartbeat"), Some(1));
         assert_eq!(find_metric_value(&events[0], "RunStatus"), Some(1));
 
@@ -1030,6 +1246,21 @@ mod tests {
             .find(|event| event["Check"] == MCP_STRESS_CHECK)
             .expect("stress metric should be present");
         assert_eq!(find_metric_value(stress_metric, "CheckStatus"), Some(1));
+
+        let disk_check_metric = events
+            .iter()
+            .find(|event| event["Check"] == DISK_USAGE_CHECK)
+            .expect("disk usage collection metric should be present");
+        assert_eq!(find_metric_value(disk_check_metric, "CheckStatus"), Some(1));
+
+        let disk_usage_metric = events
+            .iter()
+            .find(|event| event["MountPath"] == "/")
+            .expect("disk usage metric should be present");
+        assert_eq!(
+            find_metric_value_f64(disk_usage_metric, "DiskUsagePercent"),
+            Some(90.25)
+        );
     }
 
     #[test]
@@ -1066,6 +1297,65 @@ mod tests {
         .expect_err("PeakTPS == 0 should fail");
 
         assert!(format!("{err:#}").contains("PeakTPS must be > 0"));
+    }
+
+    #[test]
+    fn disk_usage_parser_selects_requested_mount_path() {
+        let result = parse_disk_usage_response(
+            "http://example.com/controller/stats".to_string(),
+            "/",
+            200,
+            r#"{
+                "disks": [
+                    {
+                        "name": "/dev/root",
+                        "mount_point": "/",
+                        "total_bytes": 100,
+                        "available_bytes": 10,
+                        "used_bytes": 90,
+                        "usage_percent": 90.0
+                    },
+                    {
+                        "name": "/dev/data",
+                        "mount_point": "/mnt/data",
+                        "total_bytes": 200,
+                        "available_bytes": 100,
+                        "used_bytes": 100,
+                        "usage_percent": 50.0
+                    }
+                ]
+            }"#,
+        )
+        .expect("disk stats should parse");
+
+        assert_eq!(result.mount_path, "/");
+        assert_eq!(result.disk_name, "/dev/root");
+        assert_eq!(result.used_bytes, 90);
+        assert_eq!(result.usage_percent, 90.0);
+    }
+
+    #[test]
+    fn disk_usage_parser_rejects_missing_mount_path() {
+        let err = parse_disk_usage_response(
+            "http://example.com/controller/stats".to_string(),
+            "/missing",
+            200,
+            r#"{
+                "disks": [
+                    {
+                        "name": "/dev/root",
+                        "mount_point": "/",
+                        "total_bytes": 100,
+                        "available_bytes": 10,
+                        "used_bytes": 90,
+                        "usage_percent": 90.0
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("missing mount path should fail");
+
+        assert!(format!("{err:#}").contains("available mount points: /"));
     }
 
     #[test]
@@ -1200,6 +1490,21 @@ mod tests {
                 }),
                 error: None,
             },
+            disk_usage: OperationCheckResult {
+                check: DISK_USAGE_CHECK.to_string(),
+                healthy: true,
+                latency_ms: 6,
+                result: Some(DiskUsageResult {
+                    url: "http://172.33.91.192/controller/stats".to_string(),
+                    disk_name: "/dev/root".to_string(),
+                    mount_path: "/".to_string(),
+                    usage_percent: 90.25,
+                    total_bytes: 1_000,
+                    used_bytes: 902,
+                    available_bytes: 98,
+                }),
+                error: None,
+            },
         }
     }
 
@@ -1218,5 +1523,9 @@ mod tests {
 
     fn find_metric_value(event: &Value, key: &str) -> Option<u64> {
         event.get(key).and_then(Value::as_u64)
+    }
+
+    fn find_metric_value_f64(event: &Value, key: &str) -> Option<f64> {
+        event.get(key).and_then(Value::as_f64)
     }
 }

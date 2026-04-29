@@ -103,11 +103,12 @@ resource "aws_lambda_function" "monitor" {
 
   environment {
     variables = {
-      BASE_URL              = var.monitor_base_url
-      MONITOR_ENV           = var.monitor_env
-      PROOF_POOL_AUTH_TOKEN = var.monitor_proof_pool_auth_token
-      TEE_RESET_URL         = var.monitor_tee_reset_url
-      RUST_LOG              = "info"
+      BASE_URL                      = var.monitor_base_url
+      MONITOR_ENV                   = var.monitor_env
+      MONITOR_DISK_USAGE_MOUNT_PATH = var.monitor_disk_usage_mount_path
+      PROOF_POOL_AUTH_TOKEN         = var.monitor_proof_pool_auth_token
+      TEE_RESET_URL                 = var.monitor_tee_reset_url
+      RUST_LOG                      = "info"
     }
   }
 
@@ -277,6 +278,26 @@ resource "aws_cloudwatch_metric_alarm" "monitor_lambda_errors" {
   treat_missing_data  = "notBreaching"
   dimensions = {
     FunctionName = aws_lambda_function.monitor.function_name
+  }
+  alarm_actions = [aws_sns_topic.monitor_alerts.arn]
+  ok_actions    = [aws_sns_topic.monitor_alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "monitor_disk_usage" {
+  alarm_name          = "${local.monitor_name}-disk-usage-alarm"
+  alarm_description   = "Alerts when disk usage on ${var.monitor_disk_usage_mount_path} reaches 85%"
+  namespace           = local.monitor_metrics_namespace
+  metric_name         = "DiskUsagePercent"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 85
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    Environment = var.monitor_env
+    MountPath   = var.monitor_disk_usage_mount_path
   }
   alarm_actions = [aws_sns_topic.monitor_alerts.arn]
   ok_actions    = [aws_sns_topic.monitor_alerts.arn]
