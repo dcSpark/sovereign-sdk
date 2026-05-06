@@ -28,13 +28,15 @@ struct TransactionSizeRow {
 pub struct TransactionSizeCollector {
     db: DatabaseConnection,
     last_seen_event_id: Mutex<i32>,
+    retention_secs: i64,
 }
 
 impl TransactionSizeCollector {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: DatabaseConnection, retention_secs: u64) -> Self {
         Self {
             db,
             last_seen_event_id: Mutex::new(0),
+            retention_secs: i64::try_from(retention_secs).unwrap_or(i64::MAX),
         }
     }
 }
@@ -51,10 +53,17 @@ impl MetricCollector for TransactionSizeCollector {
         Box::pin(async move {
             let mut guard = self.last_seen_event_id.lock().await;
             let last_seen = *guard;
+            let retention_cutoff =
+                chrono::Utc::now() - chrono::Duration::seconds(self.retention_secs);
 
-            let rows = load_transaction_size_rows(&self.db, last_seen, MAX_ROWS_PER_COLLECT)
-                .await
-                .with_context(|| "Failed to load midnight_transfer rows")?;
+            let rows = load_transaction_size_rows(
+                &self.db,
+                last_seen,
+                retention_cutoff,
+                MAX_ROWS_PER_COLLECT,
+            )
+            .await
+            .with_context(|| "Failed to load midnight_transfer rows")?;
 
             if rows.len() as i64 == MAX_ROWS_PER_COLLECT {
                 debug!(
@@ -102,6 +111,7 @@ impl MetricCollector for TransactionSizeCollector {
 async fn load_transaction_size_rows(
     db: &DatabaseConnection,
     last_seen: i32,
+    retention_cutoff: chrono::DateTime<chrono::Utc>,
     batch_size: i64,
 ) -> Result<Vec<TransactionSizeRow>> {
     let backend = db.get_database_backend();
@@ -112,9 +122,10 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > $1
+              AND e.created_at >= $2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT $2
+            LIMIT $3
             "#
         }
         DatabaseBackend::Sqlite => {
@@ -123,9 +134,10 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > ?1
+              AND e.created_at >= ?2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT ?2
+            LIMIT ?3
             "#
         }
         _ => {
@@ -134,9 +146,10 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > ?1
+              AND e.created_at >= ?2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT ?2
+            LIMIT ?3
             "#
         }
     };
@@ -144,7 +157,11 @@ async fn load_transaction_size_rows(
     let stmt = Statement::from_sql_and_values(
         backend,
         sql.to_owned(),
-        vec![last_seen.into(), batch_size.into()],
+        vec![
+            last_seen.into(),
+            retention_cutoff.into(),
+            batch_size.into(),
+        ],
     );
 
     TransactionSizeRow::find_by_statement(stmt)

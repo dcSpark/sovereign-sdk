@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         .register(
             metrics::collectors::transaction_size::TransactionSizeCollector::new(
                 indexer_db.clone(),
+                tsink_retention_secs,
             ),
         )
         .await;

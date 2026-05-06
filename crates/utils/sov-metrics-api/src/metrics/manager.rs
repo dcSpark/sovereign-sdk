@@ -4,7 +4,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::warn;
 
 use crate::metrics::collector::{MetricCollector, MetricSpec};
-use crate::metrics::store::MetricsStore;
+use crate::metrics::store::{MetricRecordResult, MetricsStore};
 
 struct RegisteredCollector {
     spec: MetricSpec,
@@ -51,7 +51,9 @@ impl MetricsManager {
                             if samples.is_empty() {
                                 continue;
                             }
-                            if !store.record(spec.name, samples).await {
+                            if store.record(spec.name, samples).await
+                                == MetricRecordResult::NotRegistered
+                            {
                                 warn!(metric = spec.name, "Metric not registered");
                             }
                         }

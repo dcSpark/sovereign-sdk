@@ -31,6 +31,13 @@ struct MetricSeriesConfig {
     interval_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricRecordResult {
+    Recorded,
+    NotRegistered,
+    WriteFailed,
+}
+
 #[derive(Clone)]
 pub struct MetricsStore {
     storage: Arc<dyn Storage>,
@@ -68,17 +75,21 @@ impl MetricsStore {
             .or_insert(MetricSeriesConfig { interval_secs });
     }
 
-    pub async fn record(&self, name: &'static str, samples: Vec<MetricSample>) -> bool {
+    pub async fn record(
+        &self,
+        name: &'static str,
+        samples: Vec<MetricSample>,
+    ) -> MetricRecordResult {
         let registered = {
             let guard = self.inner.read().await;
             guard.contains_key(name)
         };
         if !registered {
-            return false;
+            return MetricRecordResult::NotRegistered;
         }
 
         if samples.is_empty() {
-            return true;
+            return MetricRecordResult::Recorded;
         }
 
         let mut rows = Vec::new();
@@ -87,20 +98,20 @@ impl MetricsStore {
         }
         if rows.is_empty() {
             warn!(metric = name, "Metric payload produced no numeric fields");
-            return false;
+            return MetricRecordResult::WriteFailed;
         }
 
         let storage = self.storage.clone();
         let result = task::spawn_blocking(move || storage.insert_rows(&rows)).await;
         match result {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => MetricRecordResult::Recorded,
             Ok(Err(error)) => {
                 warn!(metric = name, error = %error, "Failed to insert tsink rows");
-                false
+                MetricRecordResult::WriteFailed
             }
             Err(error) => {
                 warn!(metric = name, error = %error, "Failed to join tsink insert task");
-                false
+                MetricRecordResult::WriteFailed
             }
         }
     }
