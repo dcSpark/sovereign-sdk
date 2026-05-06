@@ -227,11 +227,14 @@ resource "aws_iam_role_policy_attachment" "monitor_chatbot_readonly" {
 }
 
 resource "aws_chatbot_slack_channel_configuration" "monitor" {
-  configuration_name          = local.monitor_slack_config_name
-  iam_role_arn                = aws_iam_role.monitor_chatbot.arn
-  slack_team_id               = var.slack_workspace_id
-  slack_channel_id            = var.slack_channel_id
-  sns_topic_arns              = [aws_sns_topic.monitor_alerts.arn]
+  configuration_name = local.monitor_slack_config_name
+  iam_role_arn       = aws_iam_role.monitor_chatbot.arn
+  slack_team_id      = var.slack_workspace_id
+  slack_channel_id   = var.slack_channel_id
+  sns_topic_arns = [
+    aws_sns_topic.monitor_alerts.arn,
+    "arn:aws:sns:us-east-1:914089392944:midnight-city-alerts",
+  ]
   logging_level               = "ERROR"
   guardrail_policy_arns       = ["arn:aws:iam::aws:policy/ReadOnlyAccess"]
   user_authorization_required = false
