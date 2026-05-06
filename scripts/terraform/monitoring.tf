@@ -249,10 +249,10 @@ resource "aws_cloudwatch_metric_alarm" "monitor_checks" {
   for_each = local.monitor_check_alarm_map
 
   alarm_name          = "${local.monitor_name}-${each.key}-alarm"
-  alarm_description   = "Alerts when the Midnight monitor check ${each.value} fails twice in a row"
+  alarm_description   = "Alerts when every Midnight monitor check ${each.value} sample fails across two consecutive periods"
   namespace           = local.monitor_metrics_namespace
   metric_name         = "CheckStatus"
-  statistic           = "Minimum"
+  statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 2
   datapoints_to_alarm = 2

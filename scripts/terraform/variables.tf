@@ -197,7 +197,7 @@ variable "monitor_env" {
 variable "monitor_lambda_image_tag" {
   description = "ECR image tag to deploy for the ARM64 monitor Lambda"
   type        = string
-  default     = "arm64-20260318-2051"
+  default     = "arm64-20260506-165950"
 }
 
 variable "monitor_proof_pool_auth_token" {

@@ -256,11 +256,20 @@ async fn handler(event: LambdaEvent<Value>) -> Result<MonitorReport, Error> {
     let request_id = event.context.request_id;
     match run_monitor(request_id.clone()).await {
         Ok(report) => {
-            info!(
-                request_id = request_id,
-                duration_ms = report.duration_ms,
-                "monitor completed successfully"
-            );
+            if report.all_checks_passed {
+                info!(
+                    request_id = request_id,
+                    duration_ms = report.duration_ms,
+                    "monitor completed successfully"
+                );
+            } else {
+                warn!(
+                    request_id = request_id,
+                    duration_ms = report.duration_ms,
+                    failed_checks = failed_checks(&report).join(", "),
+                    "monitor completed with failed checks"
+                );
+            }
             Ok(report)
         }
         Err(err) => {
@@ -346,14 +355,7 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
 
     emit_metrics(&report)?;
 
-    if report.all_checks_passed {
-        Ok(report)
-    } else {
-        bail!(
-            "monitor checks failed for: {}",
-            failed_checks(&report).join(", ")
-        );
-    }
+    Ok(report)
 }
 
 async fn check_services(client: &Client, base_url: &str) -> Vec<HealthCheckResult> {

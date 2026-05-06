@@ -67,7 +67,7 @@ rds_deletion_protection   = false # Set to true for production
 # Midnight monitor configuration
 monitor_base_url            = "http://172.33.91.192"
 monitor_env                 = "midnight-l2-testnet"
-monitor_lambda_image_tag    = "arm64-20260323-132009"
+monitor_lambda_image_tag    = "arm64-20260506-165950"
 monitor_tee_reset_url       = "http://74.235.106.62:9898/reset"
 monitor_tee_reset_host_cidr = "74.235.106.62/32"
 monitor_tee_reset_port      = 9898
