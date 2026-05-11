@@ -10,6 +10,7 @@ It checks:
 - `POST TEE_RESET_URL` without auth and treats any returned HTTP status as proof the endpoint is alive; only timeout or connection-refused failures mark it unhealthy
 - `scripts/mcp-external-stress.sh` against `BASE_URL/mcp/mcp` with 3 wallets and 1 tx by default
 - `GET BASE_URL/controller/stats` with optional basic auth and emits the selected mount path's disk usage percentage
+- direct Mac worker health URLs from `MONITOR_WORKER_HEALTH_URLS`, emitting one check per worker host
 - emits CloudWatch Embedded Metric Format events under the `Midnight/Monitor` namespace
 
 ## Environment variables
@@ -18,6 +19,7 @@ It checks:
 - `MONITOR_ENV` (required), for example `midnight-l2-testnet`
 - `MONITOR_CONTROLLER_BASIC_AUTH_USERNAME` / `MONITOR_CONTROLLER_BASIC_AUTH_PASSWORD` (optional together, but needed if `/controller/stats` is protected)
 - `MONITOR_DISK_USAGE_MOUNT_PATH` (default `/`)
+- `MONITOR_WORKER_HEALTH_URLS` (optional), comma- or newline-separated direct worker health URLs, for example `http://172.33.109.145:8080/health`
 - `PROOF_POOL_AUTH_TOKEN` (optional, but needed if `/proof-pool/send` is protected)
 - `MONITOR_TEE_RESET_URL` (optional; falls back to `TEE_RESET_URL`, default `http://74.235.106.62:9898/reset`)
 - `HTTP_TIMEOUT_SECS` (default `10`)
@@ -46,6 +48,7 @@ The emitted `Check` dimension values are:
 - `health:metrics`
 - `health:oracle`
 - `health:proof-pool`
+- `health:worker-instance:<host>` for each URL in `MONITOR_WORKER_HEALTH_URLS`
 - `metrics:s5-peak-tps`
 - `proof-pool:send`
 - `tee:reset-endpoint`

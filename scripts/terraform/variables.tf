@@ -230,6 +230,24 @@ variable "monitor_disk_usage_mount_path" {
   default     = "/"
 }
 
+variable "monitor_worker_health_urls" {
+  description = "Direct Mac worker health URLs probed individually by the monitor Lambda"
+  type        = list(string)
+  default     = []
+}
+
+variable "monitor_worker_health_cidrs" {
+  description = "CIDRs the monitor Lambda may use for direct Mac worker health probes"
+  type        = list(string)
+  default     = []
+}
+
+variable "monitor_worker_health_port" {
+  description = "TCP port the monitor Lambda may use for direct Mac worker health probes"
+  type        = number
+  default     = 8080
+}
+
 variable "slack_workspace_id" {
   description = "Slack workspace/team ID for the AWS Chatbot channel configuration"
   type        = string

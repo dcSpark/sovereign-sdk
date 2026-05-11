@@ -16,7 +16,14 @@ locals {
   monitor_target_host_cidr  = "172.33.91.192/32"
   monitor_target_port       = 80
   monitor_private_subnet_1d = aws_subnet.private[index(var.availability_zones, "us-east-1d")].id
-  monitor_check_alarm_map = {
+  monitor_worker_health_hosts = [
+    for url in var.monitor_worker_health_urls : split(":", split("//", url)[1])[0]
+  ]
+  monitor_worker_health_alarm_map = {
+    for host in local.monitor_worker_health_hosts :
+    "health_worker_instance_${replace(replace(host, ".", "_"), "-", "_")}" => "health:worker-instance:${host}"
+  }
+  monitor_check_alarm_map = merge({
     health_rollup     = "health:rollup"
     health_worker     = "health:worker"
     health_fvk        = "health:fvk"
@@ -29,7 +36,7 @@ locals {
     proof_pool_send   = "proof-pool:send"
     tee_reset         = "tee:reset-endpoint"
     mcp_stress        = "mcp:stress"
-  }
+  }, local.monitor_worker_health_alarm_map)
 }
 
 resource "aws_ecr_repository" "monitor" {
@@ -89,6 +96,18 @@ resource "aws_security_group" "monitor_lambda" {
     protocol    = "tcp"
     cidr_blocks = [var.monitor_tee_reset_host_cidr]
   }
+
+  dynamic "egress" {
+    for_each = length(var.monitor_worker_health_cidrs) > 0 ? [1] : []
+
+    content {
+      description = "Mac worker health endpoints"
+      from_port   = var.monitor_worker_health_port
+      to_port     = var.monitor_worker_health_port
+      protocol    = "tcp"
+      cidr_blocks = var.monitor_worker_health_cidrs
+    }
+  }
 }
 
 resource "aws_lambda_function" "monitor" {
@@ -106,6 +125,7 @@ resource "aws_lambda_function" "monitor" {
       BASE_URL                      = var.monitor_base_url
       MONITOR_ENV                   = var.monitor_env
       MONITOR_DISK_USAGE_MOUNT_PATH = var.monitor_disk_usage_mount_path
+      MONITOR_WORKER_HEALTH_URLS    = join(",", var.monitor_worker_health_urls)
       PROOF_POOL_AUTH_TOKEN         = var.monitor_proof_pool_auth_token
       TEE_RESET_URL                 = var.monitor_tee_reset_url
       RUST_LOG                      = "info"

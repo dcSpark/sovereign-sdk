@@ -67,10 +67,21 @@ rds_deletion_protection   = false # Set to true for production
 # Midnight monitor configuration
 monitor_base_url            = "http://172.33.91.192"
 monitor_env                 = "midnight-l2-testnet"
-monitor_lambda_image_tag    = "arm64-20260506-165950"
+monitor_lambda_image_tag    = "arm64-20260511-073657"
 monitor_tee_reset_url       = "http://74.235.106.62:9898/reset"
 monitor_tee_reset_host_cidr = "74.235.106.62/32"
 monitor_tee_reset_port      = 9898
+monitor_worker_health_urls = [
+  "http://172.33.109.145:8080/health",
+  "http://172.33.111.103:8080/health",
+  "http://172.33.107.243:8080/health",
+]
+monitor_worker_health_cidrs = [
+  "172.33.109.145/32",
+  "172.33.111.103/32",
+  "172.33.107.243/32",
+]
+monitor_worker_health_port = 8080
 
 # IMPORTANT: Set the monitor auth token and Slack identifiers via environment variables
 # or a non-checked-in tfvars override file before applying:

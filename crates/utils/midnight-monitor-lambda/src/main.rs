@@ -79,6 +79,7 @@ const SERVICE_CHECKS: [ServiceCheckDef; 8] = [
 struct Config {
     base_url: String,
     monitor_env: String,
+    worker_health_urls: Vec<String>,
     proof_pool_auth_token: Option<String>,
     controller_basic_auth_username: Option<String>,
     controller_basic_auth_password: Option<String>,
@@ -120,10 +121,13 @@ impl Config {
         let stress_script_path = env::var_os("MCP_STRESS_SCRIPT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(default_stress_script_path);
+        let worker_health_urls =
+            parse_worker_health_urls(optional_env("MONITOR_WORKER_HEALTH_URLS"))?;
 
         Ok(Self {
             base_url: normalize_base_url(&base_url),
             monitor_env: required_env("MONITOR_ENV")?,
+            worker_health_urls,
             proof_pool_auth_token: optional_env("PROOF_POOL_AUTH_TOKEN"),
             controller_basic_auth_username,
             controller_basic_auth_password,
@@ -302,7 +306,14 @@ async fn run_monitor(request_id: String) -> Result<MonitorReport> {
     }
 
     info!(base_url = config.base_url, "running service health checks");
-    let health_checks = check_services(&client, &config.base_url).await;
+    let mut health_checks = check_services(&client, &config.base_url).await;
+    if !config.worker_health_urls.is_empty() {
+        info!(
+            worker_count = config.worker_health_urls.len(),
+            "running individual worker health checks"
+        );
+        health_checks.extend(check_worker_instances(&client, &config.worker_health_urls).await);
+    }
 
     info!("running s5 PeakTPS check");
     let s5_peak_tps = run_s5_peak_tps_check(&client, &config).await;
@@ -374,6 +385,31 @@ async fn check_service(
     service: ServiceCheckDef,
 ) -> HealthCheckResult {
     let url = service_url(base_url, service.id, service.health_path);
+    check_http_health(client, service.check, service.id, url).await
+}
+
+async fn check_worker_instances(client: &Client, urls: &[String]) -> Vec<HealthCheckResult> {
+    let mut results = Vec::with_capacity(urls.len());
+
+    for url in urls {
+        results.push(check_worker_instance(client, url).await);
+    }
+
+    results
+}
+
+async fn check_worker_instance(client: &Client, url: &str) -> HealthCheckResult {
+    let check = worker_check_name(url);
+    let service = worker_service_name(url);
+    check_http_health(client, &check, &service, url.to_string()).await
+}
+
+async fn check_http_health(
+    client: &Client,
+    check: &str,
+    service: &str,
+    url: String,
+) -> HealthCheckResult {
     let started = Instant::now();
 
     match client.get(&url).send().await {
@@ -383,8 +419,8 @@ async fn check_service(
                 Ok(body) => body,
                 Err(err) => {
                     return HealthCheckResult {
-                        check: service.check.to_string(),
-                        service: service.id.to_string(),
+                        check: check.to_string(),
+                        service: service.to_string(),
                         url,
                         healthy: false,
                         status_code: status.as_u16(),
@@ -396,8 +432,8 @@ async fn check_service(
             };
 
             HealthCheckResult {
-                check: service.check.to_string(),
-                service: service.id.to_string(),
+                check: check.to_string(),
+                service: service.to_string(),
                 url,
                 healthy: status.is_success(),
                 status_code: status.as_u16(),
@@ -407,8 +443,8 @@ async fn check_service(
             }
         }
         Err(err) => HealthCheckResult {
-            check: service.check.to_string(),
-            service: service.id.to_string(),
+            check: check.to_string(),
+            service: service.to_string(),
             url,
             healthy: false,
             status_code: 0,
@@ -1145,6 +1181,40 @@ fn service_url(base_url: &str, service: &str, path: &str) -> String {
     }
 }
 
+fn parse_worker_health_urls(raw: Option<String>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            let parsed = reqwest::Url::parse(url)
+                .with_context(|| format!("worker health URL must be absolute: {url}"))?;
+            match parsed.scheme() {
+                "http" | "https" => Ok(normalize_base_url(url)),
+                scheme => bail!("worker health URL must use http or https, got {scheme}: {url}"),
+            }
+        })
+        .collect()
+}
+
+fn worker_check_name(url: &str) -> String {
+    format!("health:worker-instance:{}", worker_identifier(url))
+}
+
+fn worker_service_name(url: &str) -> String {
+    format!("worker-instance:{}", worker_identifier(url))
+}
+
+fn worker_identifier(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToString::to_string))
+        .unwrap_or_else(|| url.to_string())
+}
+
 fn default_stress_script_path() -> PathBuf {
     match env::var_os("LAMBDA_TASK_ROOT") {
         Some(task_root) => PathBuf::from(task_root).join(DEFAULT_STRESS_SCRIPT_PATH),
@@ -1198,7 +1268,8 @@ mod tests {
     use super::{
         build_metric_events, failed_checks, parse_disk_usage_response,
         parse_proof_pool_send_response, parse_s5_peak_tps_response, parse_stress_summary,
-        service_url, validate_stress_summary, DiskUsageResult, HealthCheckResult, MonitorReport,
+        parse_worker_health_urls, service_url, validate_stress_summary, worker_check_name,
+        worker_service_name, DiskUsageResult, HealthCheckResult, MonitorReport,
         OperationCheckResult, ProofPoolSendResult, S5PeakTpsResult, StressRunResult,
         TeeEndpointResult, DISK_USAGE_CHECK, MCP_STRESS_CHECK, PROOF_POOL_SEND_CHECK,
         S5_PEAK_TPS_CHECK, TEE_RESET_ENDPOINT_CHECK,
@@ -1211,6 +1282,34 @@ mod tests {
         assert_eq!(
             service_url("https://example.com/", "worker", "/health"),
             "https://example.com/worker/health"
+        );
+    }
+
+    #[test]
+    fn parses_worker_health_urls_from_comma_or_newline_list() {
+        let urls = parse_worker_health_urls(Some(
+            " http://172.33.109.145:8080/health,\nhttps://worker.example/health/ ".to_string(),
+        ))
+        .expect("worker URLs should parse");
+
+        assert_eq!(
+            urls,
+            vec![
+                "http://172.33.109.145:8080/health".to_string(),
+                "https://worker.example/health".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_instance_names_use_url_host() {
+        assert_eq!(
+            worker_check_name("http://172.33.109.145:8080/health"),
+            "health:worker-instance:172.33.109.145"
+        );
+        assert_eq!(
+            worker_service_name("http://172.33.109.145:8080/health"),
+            "worker-instance:172.33.109.145"
         );
     }
 
@@ -1233,7 +1332,7 @@ mod tests {
         let report = sample_report();
         let events = build_metric_events(&report).expect("metric events should build");
 
-        assert_eq!(events.len(), 15);
+        assert_eq!(events.len(), 17);
         assert_eq!(find_metric_value(&events[0], "Heartbeat"), Some(1));
         assert_eq!(find_metric_value(&events[0], "RunStatus"), Some(1));
 
@@ -1242,6 +1341,15 @@ mod tests {
             .find(|event| event["Check"] == "health:worker")
             .expect("worker metric should be present");
         assert_eq!(find_metric_value(worker_metric, "CheckStatus"), Some(1));
+
+        let worker_instance_metric = events
+            .iter()
+            .find(|event| event["Check"] == "health:worker-instance:172.33.109.145")
+            .expect("worker instance metric should be present");
+        assert_eq!(
+            find_metric_value(worker_instance_metric, "CheckStatus"),
+            Some(1)
+        );
 
         let stress_metric = events
             .iter()
@@ -1438,6 +1546,8 @@ mod tests {
                 sample_health("health:metrics", "metrics"),
                 sample_health("health:oracle", "oracle"),
                 sample_health("health:proof-pool", "proof-pool"),
+                sample_worker_health("172.33.109.145"),
+                sample_worker_health("172.33.111.103"),
             ],
             s5_peak_tps: OperationCheckResult {
                 check: S5_PEAK_TPS_CHECK.to_string(),
@@ -1515,6 +1625,19 @@ mod tests {
             check: check.to_string(),
             service: service.to_string(),
             url: format!("http://172.33.91.192/{service}/health"),
+            healthy: true,
+            status_code: 200,
+            latency_ms: 5,
+            body_excerpt: None,
+            error: None,
+        }
+    }
+
+    fn sample_worker_health(host: &str) -> HealthCheckResult {
+        HealthCheckResult {
+            check: format!("health:worker-instance:{host}"),
+            service: format!("worker-instance:{host}"),
+            url: format!("http://{host}:8080/health"),
             healthy: true,
             status_code: 200,
             latency_ms: 5,
