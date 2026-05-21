@@ -11,6 +11,7 @@ RUN apt-get update \
         git \
         libclang-dev \
         libssl-dev \
+        libtss2-dev \
         pkg-config \
         protobuf-compiler \
         ca-certificates \
@@ -31,7 +32,10 @@ ENV GIT_COMMIT_HASH=${GIT_SHA}
 ENV SKIP_GUEST_BUILD=ligero \
     SOV_PROVER_MODE=execute
 
-RUN cargo build --release -p sov-rollup-ligero
+RUN cargo build --release \
+    -p sov-rollup-ligero \
+    -p oracle \
+    --features sov-modules-rollup-blueprint/tee
 
 FROM debian:bullseye-slim AS runtime
 
@@ -39,24 +43,43 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl1.1 \
+        libtss2-esys-3.0.2-0 \
+        openssl \
+        python3 \
+        tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /mcs
 
 COPY --from=builder /workspace/target/release/sov-rollup-ligero /usr/local/bin/sov-rollup-ligero
+COPY --from=builder /workspace/target/release/oracle /usr/local/bin/oracle
+COPY examples/rollup-ligero/docker-entrypoint.sh /usr/local/bin/rollup-ligero-entrypoint
 
-COPY examples/rollup-ligero/rollup_config.toml rollup_config.toml
-RUN sed -i 's/bind_host = "127.0.0.1"/bind_host = "0.0.0.0"/' rollup_config.toml
+COPY examples/rollup-ligero/rollup_config_replica.toml /etc/mcs/rollup_config_replica.toml
+COPY docker/rollup_ligero_oracle_pubkey.env /etc/mcs/oracle_pubkey.env
+COPY crates/oracle/policies /etc/mcs/oracle-policies
+RUN chmod +x /usr/local/bin/rollup-ligero-entrypoint \
+    && command -v tpm2_checkquote >/dev/null
 
-COPY examples/test-data test-data
-RUN mkdir -p demo_data
+COPY examples/test-data /usr/share/mcs/test-data
+RUN mkdir -p /mcs/demo_data_replica /run/mcs
 
 ENV RUST_LOG=info \
-    SOV_PROVER_MODE=execute
+    SOV_PROVER_MODE=execute \
+    SOV_TEE_MOCK_ATTESTATION=0 \
+    SOV_TEE_ATTESTATION_URL=http://attestation:8000/ \
+    MCS_HOME=/mcs \
+    MCS_CONFIG_DIR=/etc/mcs \
+    MCS_SHARE_DIR=/usr/share/mcs \
+    ORACLE_PUBKEY_ENV=/etc/mcs/oracle_pubkey.env \
+    ENABLE_ORACLE=0 \
+    ORACLE_DEV_ACCEPT_ALL=false \
+    ORACLE_SERVER_BIND_ADDRESS=127.0.0.1:8090 \
+    ORACLE_POLICIES_DIR=/etc/mcs/oracle-policies
 
-EXPOSE 12346 9845
+EXPOSE 8090 12347 13201
 
-VOLUME ["/app/demo_data"]
+VOLUME ["/mcs/demo_data_replica"]
 
-ENTRYPOINT ["/usr/local/bin/sov-rollup-ligero"]
-CMD ["--rollup-config-path", "/app/rollup_config.toml", "--genesis-config-dir", "/app/test-data/genesis/demo/mock", "--da-layer", "mock", "--prometheus-exporter-bind", "0.0.0.0:9845"]
+ENTRYPOINT ["/usr/local/bin/rollup-ligero-entrypoint"]
+CMD ["replica"]

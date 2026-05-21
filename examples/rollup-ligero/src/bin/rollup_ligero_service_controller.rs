@@ -591,7 +591,7 @@ struct ServiceDefinition {
 async fn main() -> anyhow::Result<()> {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let demo_data_dir = if is_replica_mode() {
-        script_dir.join("demo_data_replica")
+        script_dir.join("/mcs/demo_data_replica")
     } else {
         script_dir.join("demo_data")
     };

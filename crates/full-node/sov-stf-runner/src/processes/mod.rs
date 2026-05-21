@@ -57,8 +57,8 @@ where
     let mut prev_batch_hash = [0u8; 32];
 
     // Restore from last known state, if available
-    if std::fs::metadata("tee_batch_data.borsh").is_ok() {
-        let data = std::fs::read("tee_batch_data.borsh");
+    if std::fs::metadata("/mcs/tee_batch_data.borsh").is_ok() {
+        let data = std::fs::read("/mcs/tee_batch_data.borsh");
         match data {
             Ok(d) => {
                 let tee_data: TEEBatchData = borsh::from_slice(&d).unwrap_or_default();
@@ -70,7 +70,7 @@ where
                 );
             }
             Err(e) => {
-                warn!("Failed to read tee_batch_data.borsh: {}", e);
+                warn!("Failed to read /mcs/tee_batch_data.borsh: {}", e);
                 warn!("Defaulting to initial batch data values.");
             }
         }

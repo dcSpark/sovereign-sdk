@@ -102,7 +102,7 @@ members = [
     "crates/adapters/sp1",
     "crates/adapters/tee",
     "crates/mcp",
-    "crates/mcp-external", "crates/adapters/tee", "crates/oracle",
+    "crates/mcp-external", "crates/adapters/tee", "crates/oracle", "crates/utils/fake-attestation-server",
 ]
 exclude = [
     "scripts/midnight-tx-generator",
@@ -349,7 +349,8 @@ quick_cache = "0.6.16"
 # End of EVM dependencies
 
 # TEE dependencies
-tee = { path = "crates/adapters/tee", default-features = false }
+tee = { path = "crates/adapters/tee", default-features = false, features = ["maa"] }
+fake-attestation-server = { path = "crates/utils/fake-attestation-server" }
 
 # Profile for profiling with samply/perf - release performance with debug symbols
 [profile.profiling]

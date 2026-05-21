@@ -2,8 +2,8 @@
 # This node syncs from the shared DA database but does not write to it.
 
 [da]
-# Shared DA database - must match the primary node's DA connection
-connection_string = "postgresql://admin:1234@localhost:5432/da"
+# Shared DA database - same as the primary node
+connection_string = ""
 
 # Sequencer address (can be different from primary, but doesn't matter in replica mode)
 sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -43,8 +43,8 @@ telegraf_address = "udp://127.0.0.1:8094"
 
 [proof_manager]
 aggregated_proof_block_jump = 16
-prover_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
-max_number_of_transitions_in_db = 100
+prover_address = "sov19qxhqeld9r9eh9wwuzsf8ag0n65tlnpn9c6wju0n7d5mgulwg5k"
+max_number_of_transitions_in_db = 200
 max_number_of_transitions_in_memory = 30
 
 [sequencer]
@@ -52,7 +52,7 @@ blob_processing_timeout_secs = 3000
 max_batch_size_bytes = 6221225472
 max_concurrent_blobs = 1024
 max_allowed_node_distance_behind = 10
-rollup_address = "sov1lzkjgdaz08su3yevqu6ceywufl35se9f33kztu5cu2spja5hyyf"
+rollup_address = "sov1lrgqpk3jfktvtjzs000sk60thyj8kpwh0myyjadv92e9gcay647"
 
 [sequencer.preferred]
 # CRITICAL: Replica mode - read-only, no transaction acceptance
@@ -61,8 +61,11 @@ disable_state_root_consistency_checks = true
 recovery_strategy = "TryToSave"
 batch_execution_time_limit_millis = 1_000
 fast_ack_after_executor = true
-num_cache_warmup_workers = 4
-num_parallel_tx_workers = 4
+num_cache_warmup_workers = 10
+num_parallel_tx_workers = 10
 
 [sequencer.extension]
 max_log_limit = 20000
+
+[sequencer.extension.tee_configuration]
+tee_attestation_oracle_url = "https://pelt-brutishly-scrooge.ngrok-free.dev"
