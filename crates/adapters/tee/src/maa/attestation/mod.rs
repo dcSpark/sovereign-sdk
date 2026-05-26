@@ -186,7 +186,7 @@ use std::net::{IpAddr, SocketAddr};
 use tempfile::NamedTempFile;
 
 
-const MAA_ATTESTATION_URL: &str = "https://midnightl2.eus.attest.azure.net"
+const MAA_ATTESTATION_URL: &str = "https://midnightl2.eus.attest.azure.net";
 const APPLICATION_PCR_INDEX: u32 = 15;
 const ATTESTATION_DOCUMENT_URL: &str =
     "https://attestation-endpoint.api.mydapp.midnight.io/attestation.json";
