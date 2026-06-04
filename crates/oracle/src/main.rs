@@ -1,25 +1,19 @@
 pub mod config;
 use anyhow::Result;
 use axum::{
-    extract::Json,
-    extract::Path,
-    extract::Query,
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-    routing::post,
-    Router,
+    Router, extract::{ConnectInfo, Json, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, routing::{get, post}
 };
+use axum_client_ip::ClientIp;
 use config::Config;
 use ed25519_dalek::{Signer, SigningKey};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{AnyPool, Row};
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 use std::fs;
 use std::num::NonZeroUsize;
+use std::path::Path as FsPath;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,10 +22,14 @@ use tee::common::Engine;
 use tee::common::TEEPayload;
 use tracing::{error, info, warn};
 
+// The policy is stored in this order:
+//  TEE policy
+//  Application root hash
+//  PCR values
 #[derive(Debug, Default)]
 pub struct MAAPolicyState {
     // Policy id -> Policy data
-    pub allowed: HashMap<[u8; 32], String>,
+    pub allowed: HashMap<[u8; 32], (String, String, String)>,
 }
 
 pub static MAA_POLICY_STATE: Lazy<RwLock<MAAPolicyState>> =
@@ -65,24 +63,49 @@ struct AppState {
     list_cache: Arc<Mutex<lru::LruCache<(i64, i64), ListCacheEntry>>>,
 }
 
-pub fn load_policies_from_dir(dir: &String) -> Result<usize> {
+fn read_json(path: &FsPath) -> Option<String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => {
+            warn!("Failed to read JSON policy: {:?}", path);
+            return None;
+        }
+    };
+
+    if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+        warn!("Skipping invalid JSON policy: {:?}", path);
+        return None;
+    }
+
+    Some(raw)
+}
+
+pub fn load_policies_from_dir(dir: &str) -> Result<usize> {
     let mut new_map = HashMap::new();
 
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+
+        if !path.is_dir() {
             continue;
         }
 
-        let raw = fs::read_to_string(&path)?;
-
-        if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
-            warn!("Skipping invalid JSON policy: {:?}", path);
+        let Some(pcrs) = read_json(&path.join("pcrs.json")) else {
             continue;
-        }
+        };
+
+        let Some(tee_policy) = read_json(&path.join("tee_policy.json")) else {
+            continue;
+        };
+
+        let Some(app_root_hash) = read_json(&path.join("application_root_hash.json")) else {
+            continue;
+        };
+
+        let raw = format!("{tee_policy}{pcrs}{app_root_hash}");
 
         let id: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
-        new_map.insert(id, raw);
+        new_map.insert(id, (tee_policy, pcrs, app_root_hash));
     }
 
     let mut st = MAA_POLICY_STATE.write().unwrap();
@@ -104,7 +127,7 @@ fn decode_b64_payload(payload: &TEEPayload) -> Result<Vec<u8>, (StatusCode, &'st
     Ok(bytes)
 }
 
-fn read_policies() -> Vec<([u8; 32], String)> {
+fn read_policies() -> Vec<([u8; 32], (String, String, String))> {
     let guard = match MAA_POLICY_STATE.read() {
         Ok(g) => g,
         Err(poisoned) => {
@@ -120,9 +143,10 @@ fn read_policies() -> Vec<([u8; 32], String)> {
         .collect()
 }
 
-fn validate_attestation_jwt(
+async fn validate_attestation_jwt(
     maa_jwt: &String,
     dev_accept_all: bool,
+    client_ip: String,
 ) -> Result<(), (StatusCode, &'static str)> {
     if dev_accept_all {
         warn!("ORACLE_DEV_ACCEPT_ALL is enabled: skipping policy verification");
@@ -136,7 +160,7 @@ fn validate_attestation_jwt(
 
     for (policy_id, policy_data) in policies {
         tracing::info!("Checking MAA policy id: {:02x?}", policy_id);
-        match tee::maa::verify(maa_jwt, &policy_data, "midnight-l2") {
+        match tee::maa::verify(maa_jwt, &policy_data.0, &policy_data.1, &policy_data.2, &format!("http://{}:8000", client_ip)).await {
             Ok(_) => return Ok(()),
             Err(err) => warn!("Policy {:?} failed: {:?}", policy_id, err),
         }
@@ -146,10 +170,12 @@ fn validate_attestation_jwt(
 }
 
 async fn validate_batch(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(payload): Json<TEEPayload>,
 ) -> impl IntoResponse {
     info!(payload_len = payload.data.len(), "POST /validate");
+    let client_ip = addr.ip().to_string();
 
     let bytes = match decode_b64_payload(&payload) {
         Ok(b) => b,
@@ -184,7 +210,7 @@ async fn validate_batch(
                 },
             };
 
-            match validate_attestation_jwt(&attestation_jwt, state.dev_accept_all) {
+            match validate_attestation_jwt(&attestation_jwt, state.dev_accept_all, client_ip).await {
                 Ok(()) => {
                     info!("POST /validate - attestation valid");
                     (StatusCode::NO_CONTENT, "")
@@ -201,8 +227,9 @@ async fn validate_batch(
     }
 }
 
-async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayload>) -> Response {
+async fn attest_batch(State(state): State<AppState>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(payload): Json<TEEPayload>) -> Response {
     info!(payload_len = payload.data.len(), "POST /attest");
+    let client_ip = addr.ip().to_string();
 
     let bytes = match decode_b64_payload(&payload) {
         Ok(b) => b,
@@ -256,7 +283,7 @@ async fn attest_batch(State(state): State<AppState>, Json(payload): Json<TEEPayl
         return (StatusCode::BAD_REQUEST, "unsupported attestation type").into_response();
     }
 
-    if let Err(e) = validate_attestation_jwt(&req.attestation_jwt, state.dev_accept_all) {
+    if let Err(e) = validate_attestation_jwt(&req.attestation_jwt, state.dev_accept_all, "13.72.83.138".to_string()).await {
         warn!(
             batch_index = batch_index,
             "POST /attest - attestation validation failed"
@@ -400,11 +427,15 @@ async fn list_policies() -> impl IntoResponse {
 
     let policy_list: Vec<serde_json::Value> = policies
         .iter()
-        .filter_map(|(id, policy_str)| {
-            let policy_json: serde_json::Value = serde_json::from_str(policy_str).ok()?;
+        .filter_map(|(id, policy_data)| {
+            let policy_json: serde_json::Value = serde_json::from_str(&policy_data.0).ok()?;
+            let app_root_hash: serde_json::Value = serde_json::from_str(&policy_data.1).ok()?;
+            let pcr_values: serde_json::Value = serde_json::from_str(&policy_data.2).ok()?;
             Some(serde_json::json!({
                 "policy_id": hex::encode(id),
                 "policy": policy_json,
+                "app_root_hash": app_root_hash,
+                "pcr_values": pcr_values,
             }))
         })
         .collect();
@@ -840,7 +871,7 @@ async fn main() -> Result<()> {
         &cfg.oracle_server_bind_address
     );
 
-    let _ = axum::serve(tcp_listener, app)
+    let _ = axum::serve(tcp_listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
             tracing::info!("\nShutting down");

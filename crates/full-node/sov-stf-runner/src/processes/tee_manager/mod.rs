@@ -348,7 +348,8 @@ where
                 );
                 format!("mock-maa-jwt(batch_index={})", self.batch_index)
             } else {
-                attest(&batch, "midnight-l2")? // Hardcoded for now, should be replaced.
+                let attestation_url = env::var("SOV_TEE_ATTESTATION_URL").ok();
+                attest(&batch, "midnight-l2", attestation_url).await?
             };
 
             if skip_oracle {
@@ -445,7 +446,7 @@ where
             let serialized_tee_data = borsh::to_vec(&tee_data);
             match serialized_tee_data {
                 Ok(d) => {
-                    if let Err(e) = std::fs::write("tee_batch_data.borsh", d) {
+                    if let Err(e) = std::fs::write("/mcs/tee_batch_data.borsh", d) {
                         warn!("Failed to write tee_batch_data.borsh: {}", e);
                     }
                 }

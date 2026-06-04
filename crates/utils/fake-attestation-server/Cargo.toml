@@ -1,0 +1,21 @@
+[package]
+name = "fake-attestation-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true, features=["macros", "json", "query", "tokio", "http1"]}
+tokio = { workspace = true, features=["full"]}
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+tee = { workspace = true, features=["maa"] }
+
+[lints]
+workspace = true

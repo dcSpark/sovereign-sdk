@@ -8,15 +8,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Replica-specific paths
-REPLICA_DATA_DIR_REL="${REPLICA_DATA_DIR_REL:-demo_data_replica}"
-REPLICA_DATA_DIR="$SCRIPT_DIR/$REPLICA_DATA_DIR_REL"
+REPLICA_DATA_DIR_REL="${REPLICA_DATA_DIR_REL:-/mcs/demo_data_replica}"
+
+resolve_script_path() {
+    local path="$1"
+    if [[ "$path" = /* ]]; then
+        echo "$path"
+    else
+        echo "$SCRIPT_DIR/$path"
+    fi
+}
+
+REPLICA_DATA_DIR="$(resolve_script_path "$REPLICA_DATA_DIR_REL")"
 
 REPLICA_GENESIS_DIR_REL="${REPLICA_GENESIS_DIR_REL:-$REPLICA_DATA_DIR_REL/genesis}"
-REPLICA_GENESIS_DIR="$SCRIPT_DIR/$REPLICA_GENESIS_DIR_REL"
+REPLICA_GENESIS_DIR="$(resolve_script_path "$REPLICA_GENESIS_DIR_REL")"
 GENESIS_SRC_DIR="$WORKSPACE_ROOT/examples/test-data/genesis/demo/mock"
 
 ORACLE_KEYPAIR_ENV_REL="${ORACLE_KEYPAIR_ENV_REL:-$REPLICA_DATA_DIR_REL/oracle_keypair.env}"
-ORACLE_KEYPAIR_ENV="$SCRIPT_DIR/$ORACLE_KEYPAIR_ENV_REL"
+ORACLE_KEYPAIR_ENV="$(resolve_script_path "$ORACLE_KEYPAIR_ENV_REL")"
 
 # Oracle configuration for replica
 REPLICA_ORACLE_PORT="${REPLICA_ORACLE_PORT:-8090}"
@@ -27,6 +37,12 @@ REPLICA_RESET="${REPLICA_RESET:-}"
 
 # Track child processes for cleanup
 PIDS=()
+
+# Skip build, if desired
+NO_BUILD="${NO_BUILD:-0}"
+
+# Disable the oracle launch, if desired
+NO_ORACLE="${NO_ORACLE:-0}"
 
 cleanup() {
     local exit_code=$?
@@ -90,6 +106,7 @@ ensure_oracle_keypair() {
     fi
 
     echo "Generating local oracle Ed25519 keypair: $ORACLE_KEYPAIR_ENV_REL"
+    mkdir -p "$(dirname "$ORACLE_KEYPAIR_ENV")"
     local tmpdir
     tmpdir="$(mktemp -d)"
     openssl genpkey -algorithm ED25519 -out "$tmpdir/key.pem" >/dev/null 2>&1
@@ -178,38 +195,48 @@ export RUST_LOG="${RUST_LOG:-info}"
 # TEE mock attestation - enables mock mode for TEE verification
 export SOV_TEE_MOCK_ATTESTATION="${SOV_TEE_MOCK_ATTESTATION:-1}"
 
-ROLLUP_BIN="$WORKSPACE_ROOT/target/release/sov-rollup-ligero"
-ORACLE_BIN="$WORKSPACE_ROOT/target/release/oracle"
-
-if [[ ! -f "$ROLLUP_BIN" ]]; then
-  echo "ERROR: Rollup binary not found at $ROLLUP_BIN"
-  echo "Run: cargo build --release -p sov-rollup-ligero --features sov-modules-rollup-blueprint/tee"
-  exit 1
+# Build with TEE feature, unless NO_BUILD is set
+cd "$WORKSPACE_ROOT"
+if [ "$NO_BUILD" -eq 1 ]; then
+    echo "Skipping build as NO_BUILD is set."
+    echo ""
+else
+    echo "Building replica rollup with TEE support..."
+    cargo build --release -p sov-rollup-ligero --features sov-modules-rollup-blueprint/tee
 fi
-
-if [[ ! -f "$ORACLE_BIN" ]]; then
-  echo "ERROR: Oracle binary not found at $ORACLE_BIN"
-  echo "Run: cargo build --release -p oracle"
-  exit 1
-fi
-
-# Configure oracle
-export ORACLE_SERVER_BIND_ADDRESS="$REPLICA_ORACLE_BIND"
-export ORACLE_SIGNING_KEY_HEX="${ORACLE_SIGNING_KEY_HEX}"
-export ORACLE_DEV_ACCEPT_ALL="${ORACLE_DEV_ACCEPT_ALL:-true}"
-export ORACLE_POLICIES_DIR="$SCRIPT_DIR/policies"
 
 echo ""
-echo "Starting oracle for replica..."
-echo "  Oracle Bind: $REPLICA_ORACLE_BIND"
+if [ "$NO_ORACLE" -eq 1 ]; then
+    echo "Skipping oracle launch as NO_ORACLE is set."
+    echo ""
+else
+    # Build and start Oracle, unless NO_BUILD is set and NO_ORACLE is not set
+    if [ "$NO_BUILD" -eq 1 ]; then
+        echo "Skipping oracle build as NO_BUILD is set."
+        echo ""
+    else
+        echo "Building oracle..."
+        cargo build --release -p oracle
+    fi
 
-"$ORACLE_BIN" &
-ORACLE_PID=$!
-PIDS+=("$ORACLE_PID")
+    # Configure oracle
+    export ORACLE_SERVER_BIND_ADDRESS="$REPLICA_ORACLE_BIND"
+    export ORACLE_SIGNING_KEY_HEX="${ORACLE_SIGNING_KEY_HEX}"
+    export ORACLE_DEV_ACCEPT_ALL="${ORACLE_DEV_ACCEPT_ALL:-true}"
+    export ORACLE_POLICIES_DIR="$SCRIPT_DIR/policies"
 
-# Wait for oracle to be ready
-ORACLE_HOST="${REPLICA_ORACLE_BIND%:*}"
-wait_for_port "oracle" "$ORACLE_HOST" "$REPLICA_ORACLE_PORT" "$ORACLE_PID"
+    echo ""
+    echo "Starting oracle for replica..."
+    echo "  Oracle Bind: $REPLICA_ORACLE_BIND"
+
+    "$WORKSPACE_ROOT/target/release/oracle" &
+    ORACLE_PID=$!
+    PIDS+=("$ORACLE_PID")
+
+    # Wait for oracle to be ready
+    ORACLE_HOST="${REPLICA_ORACLE_BIND%:*}"
+    wait_for_port "oracle" "$ORACLE_HOST" "$REPLICA_ORACLE_PORT" "$ORACLE_PID"
+fi
 
 echo ""
 echo "========================================"
@@ -220,7 +247,9 @@ echo "  API Port: 12347"
 echo "  Prometheus Port: 13201"
 echo "  Storage: $REPLICA_DATA_DIR_REL/"
 echo "  Genesis: $REPLICA_GENESIS_DIR_REL"
-echo "  Oracle: $REPLICA_ORACLE_BIND (pid $ORACLE_PID)"
+if [ "$NO_ORACLE" -eq 0 ]; then
+    echo "  Oracle: $REPLICA_ORACLE_BIND (pid $ORACLE_PID)"
+fi
 echo "  SOV_TEE_MOCK_ATTESTATION=$SOV_TEE_MOCK_ATTESTATION"
 echo ""
 
@@ -228,7 +257,7 @@ cd "$WORKSPACE_ROOT/examples/rollup-ligero"
 
 # Use different Prometheus port than primary (13200) to allow running both on same machine
 # Note: We use a regular command (not exec) so the cleanup trap can stop the oracle
-"$ROLLUP_BIN" \
+"$WORKSPACE_ROOT/target/release/sov-rollup-ligero" \
     --rollup-config-path rollup_config_replica.toml \
     --prometheus-exporter-bind "0.0.0.0:13201" \
     --genesis-config-dir "$REPLICA_GENESIS_DIR_REL" \
