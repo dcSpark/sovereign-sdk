@@ -1,7 +1,7 @@
 use anyhow::Context;
 use sea_orm::{ConnectOptions, Database};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 mod api;
 mod config;
@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let postgres_max_lifetime_secs = config.postgres_max_lifetime_secs;
     let materialized_view_refresh_policy = materialized_views::RefreshPolicy {
         enabled: config.materialized_view_refresh_enabled,
+        refresh_on_startup: config.materialized_view_refresh_on_startup,
         interval_multiplier: config.materialized_view_refresh_interval_multiplier,
         min_interval_secs: config.materialized_view_refresh_min_interval_secs,
     };
@@ -73,13 +74,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
 
-    materialized_views::initialize_materialized_views(
-        indexer_db.clone(),
-        db.clone(),
-        materialized_view_refresh_policy,
-    )
-    .await
-    .context("Failed to initialize metrics materialized views")?;
+    tokio::spawn({
+        let indexer_db = indexer_db.clone();
+        let db = db.clone();
+
+        async move {
+            if let Err(error) = materialized_views::initialize_materialized_views(
+                indexer_db,
+                db,
+                materialized_view_refresh_policy,
+            )
+            .await
+            {
+                warn!(
+                    error = %error,
+                    "Failed to initialize metrics materialized views"
+                );
+            }
+        }
+    });
 
     let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());

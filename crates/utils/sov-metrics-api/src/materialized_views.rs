@@ -13,10 +13,12 @@ pub const INDEXER_ACCOUNT_TOTALS_VIEW: &str = "mv_metrics_account_totals";
 pub const DA_WORKER_TX_TOTALS_VIEW: &str = "mv_metrics_worker_tx_totals";
 
 const MATERIALIZED_VIEW_VERSION_TABLE: &str = "metrics_materialized_view_versions";
+const MATERIALIZED_VIEW_REFRESH_LOCK_KEY: i64 = 730_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RefreshPolicy {
     pub enabled: bool,
+    pub refresh_on_startup: bool,
     pub interval_multiplier: u64,
     pub min_interval_secs: u64,
 }
@@ -301,7 +303,8 @@ async fn setup_and_start_for_db(
         }
 
         let stale_after_secs = refresh_policy.effective_stale_after_secs(*spec);
-        if is_view_stale(&db, *spec, stale_after_secs).await? {
+        let stale = is_view_stale(&db, *spec, stale_after_secs).await?;
+        if stale && refresh_policy.refresh_on_startup {
             refresh_materialized_view(&db, *spec, db_label, true)
                 .await
                 .with_context(|| {
@@ -310,6 +313,12 @@ async fn setup_and_start_for_db(
                         spec.view_name
                     )
                 })?;
+        } else if stale {
+            info!(
+                view = spec.view_name,
+                db = db_label,
+                "Deferring stale materialized view refresh until periodic task"
+            );
         }
         spawn_refresh_task(db.clone(), *spec, db_label, refresh_policy);
     }
@@ -525,8 +534,31 @@ async fn refresh_materialized_view(
             )
         })?;
 
+    let global_locked = try_advisory_lock(&mut refresh_conn, MATERIALIZED_VIEW_REFRESH_LOCK_KEY)
+        .await
+        .context("Failed to acquire global MV refresh advisory lock")?;
+    if !global_locked {
+        debug!(
+            view = spec.view_name,
+            db = db_label,
+            "Skipping MV refresh because another materialized view refresh is running"
+        );
+        return Ok(());
+    }
+
     let locked = try_advisory_lock(&mut refresh_conn, spec.advisory_lock_key).await?;
     if !locked {
+        if let Err(error) =
+            release_advisory_lock(&mut refresh_conn, MATERIALIZED_VIEW_REFRESH_LOCK_KEY).await
+        {
+            warn!(
+                view = spec.view_name,
+                db = db_label,
+                error = %error,
+                "Failed to release global MV advisory lock"
+            );
+        }
+
         debug!(
             view = spec.view_name,
             db = db_label,
@@ -544,6 +576,17 @@ async fn refresh_materialized_view(
             db = db_label,
             error = %error,
             "Failed to release MV advisory lock"
+        );
+    }
+
+    if let Err(error) =
+        release_advisory_lock(&mut refresh_conn, MATERIALIZED_VIEW_REFRESH_LOCK_KEY).await
+    {
+        warn!(
+            view = spec.view_name,
+            db = db_label,
+            error = %error,
+            "Failed to release global MV advisory lock"
         );
     }
 

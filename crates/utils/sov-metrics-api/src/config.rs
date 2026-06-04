@@ -11,9 +11,10 @@ const DEFAULT_POSTGRES_MIN_CONNECTIONS: u32 = 0;
 const DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_POSTGRES_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
 const DEFAULT_POSTGRES_MAX_LIFETIME_SECS: u64 = 30 * 60;
-const DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED: bool = true;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED: bool = false;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_ON_STARTUP: bool = false;
 const DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER: u64 = 1;
-const DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS: u64 = 60;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,6 +34,7 @@ pub struct Config {
     pub postgres_idle_timeout_secs: u64,
     pub postgres_max_lifetime_secs: u64,
     pub materialized_view_refresh_enabled: bool,
+    pub materialized_view_refresh_on_startup: bool,
     pub materialized_view_refresh_interval_multiplier: u64,
     pub materialized_view_refresh_min_interval_secs: u64,
 }
@@ -173,6 +175,11 @@ impl Config {
             DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED,
         )?;
 
+        let materialized_view_refresh_on_startup = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ON_STARTUP",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_ON_STARTUP,
+        )?;
+
         let materialized_view_refresh_interval_multiplier = env_u64_or_default(
             "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER",
             DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER,
@@ -204,6 +211,7 @@ impl Config {
             postgres_idle_timeout_secs,
             postgres_max_lifetime_secs,
             materialized_view_refresh_enabled,
+            materialized_view_refresh_on_startup,
             materialized_view_refresh_interval_multiplier,
             materialized_view_refresh_min_interval_secs,
         })
