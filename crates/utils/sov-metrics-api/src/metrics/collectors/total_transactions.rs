@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 
 use crate::materialized_views::DA_WORKER_TX_TOTALS_VIEW;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
-use crate::metrics::store::MetricSample;
+use crate::metrics::store::{MetricSample, MetricsStore};
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -21,11 +21,24 @@ pub struct TotalTransactionsPayload {
 
 pub struct TotalTransactionsCollector {
     db: DatabaseConnection,
+    store: MetricsStore,
+    materialized_view_reads_enabled: bool,
+    incremental_backfill_enabled: bool,
 }
 
 impl TotalTransactionsCollector {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(
+        db: DatabaseConnection,
+        store: MetricsStore,
+        materialized_view_reads_enabled: bool,
+        incremental_backfill_enabled: bool,
+    ) -> Self {
+        Self {
+            db,
+            store,
+            materialized_view_reads_enabled,
+            incremental_backfill_enabled,
+        }
     }
 }
 
@@ -43,9 +56,18 @@ impl MetricCollector for TotalTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let total_transactions = if self.db.get_database_backend() == DatabaseBackend::Postgres
+            let total_transactions = if self.materialized_view_reads_enabled
+                && self.db.get_database_backend() == DatabaseBackend::Postgres
             {
                 load_total_transactions_from_mv(&self.db).await?
+            } else if self.db.get_database_backend() == DatabaseBackend::Postgres {
+                super::worker_tx_rollup::collect(
+                    &self.db,
+                    &self.store,
+                    self.incremental_backfill_enabled,
+                )
+                .await?
+                .total_transactions
             } else {
                 Entity::find()
                     .filter(

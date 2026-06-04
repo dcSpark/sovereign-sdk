@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
@@ -27,16 +27,18 @@ struct TransactionSizeRow {
 
 pub struct TransactionSizeCollector {
     db: DatabaseConnection,
-    last_seen_event_id: Mutex<i32>,
+    last_seen_event_id: Mutex<Option<i32>>,
     retention_secs: i64,
+    backfill_enabled: bool,
 }
 
 impl TransactionSizeCollector {
-    pub fn new(db: DatabaseConnection, retention_secs: u64) -> Self {
+    pub fn new(db: DatabaseConnection, retention_secs: u64, backfill_enabled: bool) -> Self {
         Self {
             db,
-            last_seen_event_id: Mutex::new(0),
+            last_seen_event_id: Mutex::new(None),
             retention_secs: i64::try_from(retention_secs).unwrap_or(i64::MAX),
+            backfill_enabled,
         }
     }
 }
@@ -52,14 +54,37 @@ impl MetricCollector for TransactionSizeCollector {
     fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
             let mut guard = self.last_seen_event_id.lock().await;
-            let last_seen = *guard;
             let retention_cutoff =
                 chrono::Utc::now() - chrono::Duration::seconds(self.retention_secs);
+            let last_seen = match *guard {
+                Some(last_seen) => last_seen,
+                None if self.backfill_enabled => {
+                    let initial_event_id = load_retention_start_event_id(&self.db, retention_cutoff)
+                        .await
+                        .context("Failed to initialize transaction-size backfill cursor")?;
+                    *guard = Some(initial_event_id);
+                    info!(
+                        initial_event_id,
+                        "Transaction size collector initialized for retention-window backfill"
+                    );
+                    initial_event_id
+                }
+                None => {
+                    let latest_event_id = load_latest_transfer_event_id(&self.db)
+                        .await
+                        .context("Failed to initialize transaction-size cursor")?;
+                    *guard = Some(latest_event_id);
+                    info!(
+                        latest_event_id,
+                        "Transaction size collector initialized without historical backfill"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
 
             let rows = load_transaction_size_rows(
                 &self.db,
                 last_seen,
-                retention_cutoff,
                 MAX_ROWS_PER_COLLECT,
             )
             .await
@@ -101,17 +126,87 @@ impl MetricCollector for TransactionSizeCollector {
                 });
             }
 
-            *guard = latest_seen;
+            *guard = Some(latest_seen);
 
             Ok(samples)
         })
     }
 }
 
+#[derive(Debug, FromQueryResult)]
+struct LatestTransferEventIdRow {
+    latest_event_id: Option<i32>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RetentionStartEventIdRow {
+    first_event_id: Option<i32>,
+}
+
+async fn load_latest_transfer_event_id(db: &DatabaseConnection) -> Result<i32> {
+    let backend = db.get_database_backend();
+    let stmt = Statement::from_string(
+        backend,
+        "
+        SELECT MAX(event_id) AS latest_event_id
+        FROM midnight_transfer
+        "
+        .to_owned(),
+    );
+
+    let row = LatestTransferEventIdRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query latest midnight_transfer event id")?;
+
+    Ok(row.and_then(|row| row.latest_event_id).unwrap_or(0))
+}
+
+async fn load_retention_start_event_id(
+    db: &DatabaseConnection,
+    retention_cutoff: chrono::DateTime<chrono::Utc>,
+) -> Result<i32> {
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DatabaseBackend::Postgres => {
+            r#"
+            SELECT MIN(id) AS first_event_id
+            FROM events
+            WHERE created_at >= $1
+            "#
+        }
+        DatabaseBackend::Sqlite => {
+            r#"
+            SELECT MIN(id) AS first_event_id
+            FROM events
+            WHERE created_at >= ?1
+            "#
+        }
+        _ => {
+            r#"
+            SELECT MIN(id) AS first_event_id
+            FROM events
+            WHERE created_at >= ?1
+            "#
+        }
+    };
+
+    let stmt = Statement::from_sql_and_values(backend, sql.to_owned(), [retention_cutoff.into()]);
+
+    let row = RetentionStartEventIdRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query transaction-size retention start event id")?;
+
+    match row.and_then(|row| row.first_event_id) {
+        Some(first_event_id) => Ok(first_event_id.saturating_sub(1)),
+        None => load_latest_transfer_event_id(db).await,
+    }
+}
+
 async fn load_transaction_size_rows(
     db: &DatabaseConnection,
     last_seen: i32,
-    retention_cutoff: chrono::DateTime<chrono::Utc>,
     batch_size: i64,
 ) -> Result<Vec<TransactionSizeRow>> {
     let backend = db.get_database_backend();
@@ -122,10 +217,9 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > $1
-              AND e.created_at >= $2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT $3
+            LIMIT $2
             "#
         }
         DatabaseBackend::Sqlite => {
@@ -134,10 +228,9 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > ?1
-              AND e.created_at >= ?2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT ?3
+            LIMIT ?2
             "#
         }
         _ => {
@@ -146,10 +239,9 @@ async fn load_transaction_size_rows(
             FROM midnight_transfer t
             INNER JOIN events e ON e.id = t.event_id
             WHERE t.event_id > ?1
-              AND e.created_at >= ?2
               AND t.amount IS NOT NULL
             ORDER BY t.event_id ASC
-            LIMIT ?3
+            LIMIT ?2
             "#
         }
     };
@@ -157,11 +249,7 @@ async fn load_transaction_size_rows(
     let stmt = Statement::from_sql_and_values(
         backend,
         sql.to_owned(),
-        vec![
-            last_seen.into(),
-            retention_cutoff.into(),
-            batch_size.into(),
-        ],
+        vec![last_seen.into(), batch_size.into()],
     );
 
     TransactionSizeRow::find_by_statement(stmt)

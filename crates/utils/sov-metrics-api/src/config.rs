@@ -11,6 +11,14 @@ const DEFAULT_POSTGRES_MIN_CONNECTIONS: u32 = 0;
 const DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_POSTGRES_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
 const DEFAULT_POSTGRES_MAX_LIFETIME_SECS: u64 = 30 * 60;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED: bool = false;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_ON_STARTUP: bool = false;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER: u64 = 1;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS: u64 = 300;
+const DEFAULT_MATERIALIZED_VIEW_READS_ENABLED: bool = false;
+const DEFAULT_INCREMENTAL_ROLLUP_BACKFILL_ENABLED: bool = false;
+const DEFAULT_TRANSACTION_SIZE_COLLECTOR_ENABLED: bool = false;
+const DEFAULT_TRANSACTION_SIZE_BACKFILL_ENABLED: bool = false;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -29,6 +37,14 @@ pub struct Config {
     pub postgres_acquire_timeout_secs: u64,
     pub postgres_idle_timeout_secs: u64,
     pub postgres_max_lifetime_secs: u64,
+    pub materialized_view_refresh_enabled: bool,
+    pub materialized_view_refresh_on_startup: bool,
+    pub materialized_view_refresh_interval_multiplier: u64,
+    pub materialized_view_refresh_min_interval_secs: u64,
+    pub materialized_view_reads_enabled: bool,
+    pub incremental_rollup_backfill_enabled: bool,
+    pub transaction_size_collector_enabled: bool,
+    pub transaction_size_backfill_enabled: bool,
 }
 
 impl Config {
@@ -97,10 +113,8 @@ impl Config {
             Err(_) => DEFAULT_RETENTION_SECS,
         };
 
-        let tps_rounding_decimals = env_u32_or_default(
-            "TPS_ROUNDING_DECIMALS",
-            DEFAULT_TPS_ROUNDING_DECIMALS,
-        )?;
+        let tps_rounding_decimals =
+            env_u32_or_default("TPS_ROUNDING_DECIMALS", DEFAULT_TPS_ROUNDING_DECIMALS)?;
 
         let da_postgres_max_connections = env_u32_or_default(
             "SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS",
@@ -164,6 +178,51 @@ impl Config {
             ));
         }
 
+        let materialized_view_refresh_enabled = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ENABLED",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED,
+        )?;
+
+        let materialized_view_refresh_on_startup = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ON_STARTUP",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_ON_STARTUP,
+        )?;
+
+        let materialized_view_refresh_interval_multiplier = env_u64_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER,
+        )?;
+        if materialized_view_refresh_interval_multiplier == 0 {
+            return Err(anyhow!(
+                "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER must be > 0"
+            ));
+        }
+
+        let materialized_view_refresh_min_interval_secs = env_u64_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS,
+        )?;
+
+        let materialized_view_reads_enabled = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_READS_ENABLED",
+            DEFAULT_MATERIALIZED_VIEW_READS_ENABLED,
+        )?;
+
+        let incremental_rollup_backfill_enabled = env_bool_or_default(
+            "SOV_METRICS_API_INCREMENTAL_ROLLUP_BACKFILL_ENABLED",
+            DEFAULT_INCREMENTAL_ROLLUP_BACKFILL_ENABLED,
+        )?;
+
+        let transaction_size_collector_enabled = env_bool_or_default(
+            "SOV_METRICS_API_TRANSACTION_SIZE_COLLECTOR_ENABLED",
+            DEFAULT_TRANSACTION_SIZE_COLLECTOR_ENABLED,
+        )?;
+
+        let transaction_size_backfill_enabled = env_bool_or_default(
+            "SOV_METRICS_API_TRANSACTION_SIZE_BACKFILL_ENABLED",
+            DEFAULT_TRANSACTION_SIZE_BACKFILL_ENABLED,
+        )?;
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
@@ -179,7 +238,35 @@ impl Config {
             postgres_acquire_timeout_secs,
             postgres_idle_timeout_secs,
             postgres_max_lifetime_secs,
+            materialized_view_refresh_enabled,
+            materialized_view_refresh_on_startup,
+            materialized_view_refresh_interval_multiplier,
+            materialized_view_refresh_min_interval_secs,
+            materialized_view_reads_enabled,
+            incremental_rollup_backfill_enabled,
+            transaction_size_collector_enabled,
+            transaction_size_backfill_enabled,
         })
+    }
+}
+
+fn env_bool_or_default(var_name: &str, default: bool) -> Result<bool> {
+    match env::var(var_name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("{var_name} env var is empty"));
+            }
+
+            match trimmed.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                _ => Err(anyhow!(
+                    "{var_name} must be a boolean: true/false, yes/no, on/off, or 1/0"
+                )),
+            }
+        }
+        Err(_) => Ok(default),
     }
 }
 

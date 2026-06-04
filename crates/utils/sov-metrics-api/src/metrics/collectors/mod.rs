@@ -6,3 +6,4 @@ pub mod token_value_spent;
 pub mod total_tokens_economy;
 pub mod total_transactions;
 pub mod transaction_size;
+mod worker_tx_rollup;

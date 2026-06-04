@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task;
 use tracing::warn;
 use tsink::{DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision};
@@ -42,6 +42,7 @@ pub enum MetricRecordResult {
 pub struct MetricsStore {
     storage: Arc<dyn Storage>,
     inner: Arc<RwLock<HashMap<&'static str, MetricSeriesConfig>>>,
+    tsink_io_lock: Arc<Mutex<()>>,
     retention_secs: u64,
 }
 
@@ -50,6 +51,22 @@ impl MetricsStore {
         fs::create_dir_all(&data_path).with_context(|| {
             format!(
                 "Failed to create tsink data path at {}",
+                data_path.display()
+            )
+        })?;
+        let write_probe_path = data_path.join(format!(
+            ".sov-metrics-api-write-check-{}",
+            std::process::id()
+        ));
+        fs::write(&write_probe_path, b"ok").with_context(|| {
+            format!(
+                "Failed to write test file in tsink data path at {}",
+                data_path.display()
+            )
+        })?;
+        fs::remove_file(&write_probe_path).with_context(|| {
+            format!(
+                "Failed to remove test file in tsink data path at {}",
                 data_path.display()
             )
         })?;
@@ -64,6 +81,7 @@ impl MetricsStore {
         Ok(Self {
             storage,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            tsink_io_lock: Arc::new(Mutex::new(())),
             retention_secs,
         })
     }
@@ -92,21 +110,45 @@ impl MetricsStore {
             return MetricRecordResult::Recorded;
         }
 
+        let min_recorded_at_ms = retention_start_ms(self.retention_secs);
+        let mut dropped_out_of_retention = 0usize;
         let mut rows = Vec::new();
         for sample in &samples {
+            if sample.recorded_at_ms < min_recorded_at_ms {
+                dropped_out_of_retention += 1;
+                continue;
+            }
             rows.extend(rows_from_sample(name, sample));
         }
+        if dropped_out_of_retention > 0 {
+            warn!(
+                metric = name,
+                dropped_out_of_retention,
+                min_recorded_at_ms,
+                "Dropped metric samples outside tsink retention window"
+            );
+        }
         if rows.is_empty() {
+            if dropped_out_of_retention > 0 {
+                return MetricRecordResult::Recorded;
+            }
             warn!(metric = name, "Metric payload produced no numeric fields");
             return MetricRecordResult::WriteFailed;
         }
 
+        let _tsink_io_guard = self.tsink_io_lock.lock().await;
+        let row_count = rows.len();
         let storage = self.storage.clone();
         let result = task::spawn_blocking(move || storage.insert_rows(&rows)).await;
         match result {
             Ok(Ok(())) => MetricRecordResult::Recorded,
             Ok(Err(error)) => {
-                warn!(metric = name, error = %error, "Failed to insert tsink rows");
+                warn!(
+                    metric = name,
+                    row_count,
+                    error = %error,
+                    "Failed to insert tsink rows"
+                );
                 MetricRecordResult::WriteFailed
             }
             Err(error) => {
@@ -130,6 +172,7 @@ impl MetricsStore {
             return None;
         }
 
+        let _tsink_io_guard = self.tsink_io_lock.lock().await;
         let storage = self.storage.clone();
         let result = task::spawn_blocking(move || storage.select_all(name, from_ms, to_ms)).await;
         let series = match result {
@@ -204,6 +247,7 @@ impl MetricsStore {
         start_ms: i64,
         end_ms: i64,
     ) -> Option<MetricSeriesSnapshot> {
+        let _tsink_io_guard = self.tsink_io_lock.lock().await;
         let storage = self.storage.clone();
         let result = task::spawn_blocking(move || storage.select_all(name, start_ms, end_ms)).await;
         let series = match result {
@@ -306,6 +350,16 @@ fn rows_from_sample(name: &'static str, sample: &MetricSample) -> Vec<Row> {
             )
         })
         .collect()
+}
+
+fn retention_start_ms(retention_secs: u64) -> i64 {
+    let retention_ms = match i64::try_from(retention_secs.saturating_mul(1000)) {
+        Ok(value) => value,
+        Err(_) => i64::MAX,
+    };
+    chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(retention_ms)
 }
 
 fn flatten_payload(value: &Value, prefix: Option<&str>, out: &mut Vec<FieldPoint>) {

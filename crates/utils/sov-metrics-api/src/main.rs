@@ -1,7 +1,7 @@
 use anyhow::Context;
 use sea_orm::{ConnectOptions, Database};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 mod api;
 mod config;
@@ -30,6 +30,16 @@ async fn main() -> anyhow::Result<()> {
     let postgres_acquire_timeout_secs = config.postgres_acquire_timeout_secs;
     let postgres_idle_timeout_secs = config.postgres_idle_timeout_secs;
     let postgres_max_lifetime_secs = config.postgres_max_lifetime_secs;
+    let transaction_size_collector_enabled = config.transaction_size_collector_enabled;
+    let transaction_size_backfill_enabled = config.transaction_size_backfill_enabled;
+    let materialized_view_reads_enabled = config.materialized_view_reads_enabled;
+    let incremental_rollup_backfill_enabled = config.incremental_rollup_backfill_enabled;
+    let materialized_view_refresh_policy = materialized_views::RefreshPolicy {
+        enabled: config.materialized_view_refresh_enabled,
+        refresh_on_startup: config.materialized_view_refresh_on_startup,
+        interval_multiplier: config.materialized_view_refresh_interval_multiplier,
+        min_interval_secs: config.materialized_view_refresh_min_interval_secs,
+    };
 
     let ledger_http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -68,9 +78,36 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
 
-    materialized_views::initialize_materialized_views(indexer_db.clone(), db.clone())
+    metrics::rollup_state::ensure_table(&indexer_db)
         .await
-        .context("Failed to initialize metrics materialized views")?;
+        .context("Failed to initialize indexer metrics rollup state")?;
+    metrics::rollup_state::ensure_table(&db)
+        .await
+        .context("Failed to initialize DA metrics rollup state")?;
+
+    if materialized_view_reads_enabled || materialized_view_refresh_policy.enabled {
+        tokio::spawn({
+            let indexer_db = indexer_db.clone();
+            let db = db.clone();
+
+            async move {
+                if let Err(error) = materialized_views::initialize_materialized_views(
+                    indexer_db,
+                    db,
+                    materialized_view_refresh_policy,
+                )
+                .await
+                {
+                    warn!(
+                        error = %error,
+                        "Failed to initialize metrics materialized views"
+                    );
+                }
+            }
+        });
+    } else {
+        info!("Materialized view reads/refresh disabled; skipping metrics MV initialization");
+    }
 
     let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());
@@ -80,6 +117,9 @@ async fn main() -> anyhow::Result<()> {
         .register(
             metrics::collectors::token_value_spent::TokenValueSpentCollector::new(
                 indexer_db.clone(),
+                store.clone(),
+                materialized_view_reads_enabled,
+                incremental_rollup_backfill_enabled,
             ),
         )
         .await;
@@ -87,25 +127,43 @@ async fn main() -> anyhow::Result<()> {
         .register(
             metrics::collectors::total_tokens_economy::TotalTokensEconomyCollector::new(
                 indexer_db.clone(),
+                store.clone(),
+                materialized_view_reads_enabled,
+                incremental_rollup_backfill_enabled,
+            ),
+        )
+        .await;
+    if transaction_size_collector_enabled {
+        manager
+            .register(
+                metrics::collectors::transaction_size::TransactionSizeCollector::new(
+                    indexer_db.clone(),
+                    tsink_retention_secs,
+                    transaction_size_backfill_enabled,
+                ),
+            )
+            .await;
+    } else {
+        info!("Transaction size collector disabled");
+    }
+    manager
+        .register(
+            metrics::collectors::failed_transactions::FailedTransactionsCollector::new(
+                db.clone(),
+                store.clone(),
+                materialized_view_reads_enabled,
+                incremental_rollup_backfill_enabled,
             ),
         )
         .await;
     manager
         .register(
-            metrics::collectors::transaction_size::TransactionSizeCollector::new(
-                indexer_db.clone(),
-                tsink_retention_secs,
+            metrics::collectors::total_transactions::TotalTransactionsCollector::new(
+                db.clone(),
+                store.clone(),
+                materialized_view_reads_enabled,
+                incremental_rollup_backfill_enabled,
             ),
-        )
-        .await;
-    manager
-        .register(
-            metrics::collectors::failed_transactions::FailedTransactionsCollector::new(db.clone()),
-        )
-        .await;
-    manager
-        .register(
-            metrics::collectors::total_transactions::TotalTransactionsCollector::new(db.clone()),
         )
         .await;
     // Accounts collector for EMA metrics endpoints
@@ -113,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
         .register(metrics::collectors::accounts::AccountsCollector::new(
             indexer_db.clone(),
             db.clone(),
+            store.clone(),
+            materialized_view_reads_enabled,
+            incremental_rollup_backfill_enabled,
         ))
         .await;
     manager.start();
@@ -123,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         tps_peak_cache: api::TpsPeakCache::new(),
         ema_metrics_cache: api::EmaMetricsCache::new(),
         indexer_db: indexer_db.clone(),
+        materialized_view_reads_enabled,
         tps_rounding_decimals,
         ledger_api_base_url: ledger_api_base_url.clone(),
         ledger_http_client,

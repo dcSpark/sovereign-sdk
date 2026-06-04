@@ -22,10 +22,22 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `SOV_METRICS_API_POSTGRES_ACQUIRE_TIMEOUT_SECS` (optional): pool acquire timeout seconds, default `30`.
 - `SOV_METRICS_API_POSTGRES_IDLE_TIMEOUT_SECS` (optional): pool idle timeout seconds, default `600`.
 - `SOV_METRICS_API_POSTGRES_MAX_LIFETIME_SECS` (optional): pool max lifetime seconds, default `1800`.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ENABLED` (optional): enables automatic Postgres materialized-view refreshes, default `false`. Set to `true` only when stale dashboard aggregates are acceptable to refresh in the background.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ON_STARTUP` (optional): refreshes stale materialized views during startup, default `false`.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER` (optional): multiplies each built-in refresh interval, default `1`.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS` (optional): lower bound for each automatic materialized-view refresh interval, default `300`. Set to `0` to use the built-in per-view intervals.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_READS_ENABLED` (optional): read report aggregates from Postgres materialized views, default `false`.
+- `SOV_METRICS_API_INCREMENTAL_ROLLUP_BACKFILL_ENABLED` (optional): initialize incremental rollup collectors from historical rows instead of the current tip, default `false`.
+- `SOV_METRICS_API_TRANSACTION_SIZE_COLLECTOR_ENABLED` (optional): enables the `transaction-size` collector used by median transaction-size history, default `false`.
+- `SOV_METRICS_API_TRANSACTION_SIZE_BACKFILL_ENABLED` (optional): when the transaction-size collector is enabled, starts from historical rows instead of the current tip, default `false`.
 
 ## Behavior
 
 - Collectors store raw counters (monotonic totals), not derived rates.
+- On Postgres, expensive aggregate counters are served from lightweight incremental rollup state by default. Each rollup keeps a cursor and only reads rows newer than the cursor.
+- Materialized views are optional accelerators only. `SOV_METRICS_API_MATERIALIZED_VIEW_READS_ENABLED=true` makes report collectors/endpoints read them; `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ENABLED=true` refreshes them in the background. Both default to `false`.
+- Incremental rollup collectors default to starting at the current tip, avoiding historical scans on restart. Set `SOV_METRICS_API_INCREMENTAL_ROLLUP_BACKFILL_ENABLED=true` only when you explicitly want a historical catch-up.
+- The transaction-size collector is disabled by default because historical backfill joins `midnight_transfer` and `events`; when enabled without backfill, it initializes at the current transfer tip and only records new transfers.
 - `total-transactions` samples every 5 seconds (completed tx counter).
 - `failed-transactions-rate` samples every 5 seconds (total + failed counters).
 - `average-transaction-size` is derived from `token-value-spent` counters (transfer amount + count).

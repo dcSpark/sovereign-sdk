@@ -25,6 +25,7 @@ const DEFAULT_INDEXER_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_INDEXER_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_INDEXER_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_INDEXER_MAX_LIFETIME_SECS: u64 = 1_800;
+const DEFAULT_STARTUP_BACKFILLS_ENABLED: bool = false;
 
 fn env_u32(key: &str, default: u32) -> u32 {
     env::var(key)
@@ -40,6 +41,16 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(value) => matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        ),
+        Err(_) => default,
+    }
 }
 
 #[tokio::main]
@@ -87,34 +98,43 @@ async fn main() -> anyhow::Result<()> {
     {
         warn!(error = %e, "Initial backfill failed; will retry in background loop");
     }
-    let idx_clone = idx_db.clone();
-    let vfk_registry_clone = vfk_registry.clone();
-    let fvk_service_clone = fvk_service.clone();
-    tokio::spawn(async move {
-        println!("Starting encrypted-note backfills");
-        if let Err(e) = background_sync::backfill_privacy_fields(
-            &idx_clone,
-            &vfk_registry_clone,
-            fvk_service_clone.as_ref(),
-        )
-        .await
-        {
-            warn!(error = %e, "VFK backfill failed");
-        }
-        if let Err(e) = background_sync::backfill_notes_nullifiers(
-            &idx_clone,
-            &vfk_registry_clone,
-            fvk_service_clone.as_ref(),
-        )
-        .await
-        {
-            warn!(error = %e, "notes_nullifiers backfill failed");
-        }
-        if let Err(e) = background_sync::backfill_spent_nullifiers(&idx_clone).await {
-            warn!(error = %e, "spent_nullifiers backfill failed");
-        }
-        println!("Finished encrypted-note backfills");
-    });
+    if env_bool(
+        "SOV_INDEXER_STARTUP_BACKFILLS_ENABLED",
+        DEFAULT_STARTUP_BACKFILLS_ENABLED,
+    ) {
+        let idx_clone = idx_db.clone();
+        let vfk_registry_clone = vfk_registry.clone();
+        let fvk_service_clone = fvk_service.clone();
+        tokio::spawn(async move {
+            println!("Starting encrypted-note backfills");
+            if let Err(e) = background_sync::backfill_startup_privacy_fields(
+                &idx_clone,
+                &vfk_registry_clone,
+                fvk_service_clone.as_ref(),
+            )
+            .await
+            {
+                warn!(error = %e, "VFK backfill failed");
+            }
+            if let Err(e) = background_sync::backfill_notes_nullifiers(
+                &idx_clone,
+                &vfk_registry_clone,
+                fvk_service_clone.as_ref(),
+            )
+            .await
+            {
+                warn!(error = %e, "notes_nullifiers backfill failed");
+            }
+            if let Err(e) = background_sync::backfill_spent_nullifiers(&idx_clone).await {
+                warn!(error = %e, "spent_nullifiers backfill failed");
+            }
+            println!("Finished encrypted-note backfills");
+        });
+    } else {
+        info!(
+            "Startup maintenance backfills disabled; set SOV_INDEXER_STARTUP_BACKFILLS_ENABLED=true to run them"
+        );
+    }
     println!("Initializing background sync loop");
     background_sync::spawn_sync_loop(
         da_db.clone(),

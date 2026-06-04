@@ -2,6 +2,7 @@ mod collector;
 pub mod collectors;
 pub mod ema;
 mod manager;
+pub mod rollup_state;
 mod store;
 
 pub use ema::{compute_ema_from_samples, compute_tokens_per_second_ema, EmaWindow};

@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 
 use crate::materialized_views::DA_WORKER_TX_TOTALS_VIEW;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
-use crate::metrics::store::MetricSample;
+use crate::metrics::store::{MetricSample, MetricsStore};
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -24,11 +24,24 @@ pub struct FailedTransactionsPayload {
 
 pub struct FailedTransactionsCollector {
     db: DatabaseConnection,
+    store: MetricsStore,
+    materialized_view_reads_enabled: bool,
+    incremental_backfill_enabled: bool,
 }
 
 impl FailedTransactionsCollector {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(
+        db: DatabaseConnection,
+        store: MetricsStore,
+        materialized_view_reads_enabled: bool,
+        incremental_backfill_enabled: bool,
+    ) -> Self {
+        Self {
+            db,
+            store,
+            materialized_view_reads_enabled,
+            incremental_backfill_enabled,
+        }
     }
 }
 
@@ -46,27 +59,36 @@ impl MetricCollector for FailedTransactionsCollector {
                 Column, Entity, TransactionState,
             };
 
-            let (total_transactions, failed_transactions) =
-                if self.db.get_database_backend() == DatabaseBackend::Postgres {
-                    load_failed_transactions_from_mv(&self.db).await?
-                } else {
-                    let total_transactions = Entity::find()
-                        .filter(
-                            Column::TransactionState
-                                .is_in([TransactionState::Accepted, TransactionState::Rejected]),
-                        )
-                        .count(&self.db)
-                        .await
-                        .with_context(|| "Failed to count completed transactions")?;
+            let (total_transactions, failed_transactions) = if self.materialized_view_reads_enabled
+                && self.db.get_database_backend() == DatabaseBackend::Postgres
+            {
+                load_failed_transactions_from_mv(&self.db).await?
+            } else if self.db.get_database_backend() == DatabaseBackend::Postgres {
+                let totals = super::worker_tx_rollup::collect(
+                    &self.db,
+                    &self.store,
+                    self.incremental_backfill_enabled,
+                )
+                .await?;
+                (totals.total_transactions, totals.failed_transactions)
+            } else {
+                let total_transactions = Entity::find()
+                    .filter(
+                        Column::TransactionState
+                            .is_in([TransactionState::Accepted, TransactionState::Rejected]),
+                    )
+                    .count(&self.db)
+                    .await
+                    .with_context(|| "Failed to count completed transactions")?;
 
-                    let failed_transactions = Entity::find()
-                        .filter(Column::TransactionState.eq(TransactionState::Rejected))
-                        .count(&self.db)
-                        .await
-                        .with_context(|| "Failed to count rejected transactions")?;
+                let failed_transactions = Entity::find()
+                    .filter(Column::TransactionState.eq(TransactionState::Rejected))
+                    .count(&self.db)
+                    .await
+                    .with_context(|| "Failed to count rejected transactions")?;
 
-                    (total_transactions, failed_transactions)
-                };
+                (total_transactions, failed_transactions)
+            };
 
             let payload = FailedTransactionsPayload {
                 total_transactions,

@@ -14,12 +14,27 @@ use sea_orm::{
 use sov_midnight_da::storable::worker_verified_transactions;
 use sov_midnight_da::storable::worker_verified_transactions::TransactionState as VerifiedState;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::sync::Arc;
 
 const PRIVACY_DOMAIN: Hash32 = [1u8; 32];
 const PRIVACY_DOMAIN_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 const ACCEPTED_RECONCILE_CURSOR_KEY: &str = "accepted_reconcile_last_id_v1";
+const PRIVACY_DEPOSIT_CURSOR_KEY: &str = "privacy_fields_deposit_last_event_id_v1";
+const PRIVACY_TRANSFER_CURSOR_KEY: &str = "privacy_fields_transfer_last_event_id_v1";
+const PRIVACY_WITHDRAW_CURSOR_KEY: &str = "privacy_fields_withdraw_last_event_id_v1";
 const BACKFILL_BATCH_SIZE: u64 = 500;
+const DEFAULT_SYNC_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 60;
+const EXISTENCE_CHECK_CHUNK_SIZE: usize = 1_000;
+
+fn env_u64_or_default(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
 
 fn is_zero_hash32(hex_str: &str) -> bool {
     let trimmed = hex_str
@@ -695,6 +710,13 @@ struct ExistingEventTxHash {
     tx_hash: String,
 }
 
+#[derive(Debug)]
+struct ReconcileRowInfo {
+    kind: String,
+    nullifiers: Option<Vec<String>>,
+    note_created_rollup_heights: HashMap<String, u64>,
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 struct ReconcileStats {
     missing_events_repaired: usize,
@@ -710,54 +732,56 @@ impl ReconcileStats {
     }
 }
 
-async fn repair_note_created_rollup_heights_for_row(
+async fn load_existing_note_created_cms(
     idx: &DatabaseConnection,
-    row: &worker_verified_transactions::Model,
-    kind: &str,
-) -> Result<usize> {
-    let events_json = extract_events_from_status(row.sequencer_status.as_deref())
-        .ok()
-        .flatten();
-    let note_created_rollup_heights = extract_note_created_rollup_heights(events_json.as_ref());
-    if note_created_rollup_heights.is_empty() {
-        return Ok(0);
+    cm_keys: HashSet<String>,
+) -> Result<HashSet<String>> {
+    if cm_keys.is_empty() {
+        return Ok(HashSet::new());
     }
 
-    // Batch existence check: which commitments are already in midnight_note_created?
-    let cm_keys: Vec<String> = note_created_rollup_heights
-        .keys()
-        .map(|cm| normalize_commitment_hex_for_lookup(cm))
-        .collect();
+    let mut keys: Vec<String> = cm_keys.into_iter().collect();
+    keys.sort();
+    let mut existing = HashSet::new();
 
-    let existing_cms: HashSet<String> = idx::midnight_note_created::Entity::find()
-        .filter(idx::midnight_note_created::Column::Cm.is_in(cm_keys))
-        .select_only()
-        .column(idx::midnight_note_created::Column::Cm)
-        .into_tuple()
-        .all(idx)
-        .await?
-        .into_iter()
-        .collect();
-
-    let mut repaired = 0usize;
-    for (cm, rollup_height) in note_created_rollup_heights {
-        let normalized = normalize_commitment_hex_for_lookup(&cm);
-        if existing_cms.contains(&normalized) {
-            continue; // Already indexed — skip redundant upsert.
-        }
-        db::upsert_note_created_metadata(
-            idx,
-            &cm,
-            &row.tx_hash,
-            row.created_at,
-            Some(rollup_height),
-            kind,
-        )
-        .await?;
-        repaired += 1;
+    for chunk in keys.chunks(EXISTENCE_CHECK_CHUNK_SIZE) {
+        let rows: Vec<String> = idx::midnight_note_created::Entity::find()
+            .filter(idx::midnight_note_created::Column::Cm.is_in(chunk.to_vec()))
+            .select_only()
+            .column(idx::midnight_note_created::Column::Cm)
+            .into_tuple()
+            .all(idx)
+            .await?;
+        existing.extend(rows);
     }
 
-    Ok(repaired)
+    Ok(existing)
+}
+
+async fn load_existing_spent_nullifiers(
+    idx: &DatabaseConnection,
+    nf_keys: HashSet<String>,
+) -> Result<HashSet<String>> {
+    if nf_keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut keys: Vec<String> = nf_keys.into_iter().collect();
+    keys.sort();
+    let mut existing = HashSet::new();
+
+    for chunk in keys.chunks(EXISTENCE_CHECK_CHUNK_SIZE) {
+        let rows: Vec<String> = idx::midnight_spent_nullifiers::Entity::find()
+            .filter(idx::midnight_spent_nullifiers::Column::Nullifier.is_in(chunk.to_vec()))
+            .select_only()
+            .column(idx::midnight_spent_nullifiers::Column::Nullifier)
+            .into_tuple()
+            .all(idx)
+            .await?;
+        existing.extend(rows);
+    }
+
+    Ok(existing)
 }
 
 async fn reconcile_missing_accepted_rows(
@@ -798,47 +822,83 @@ async fn reconcile_missing_accepted_rows(
     let existing_hashes: HashSet<String> =
         existing_rows.into_iter().map(|row| row.tx_hash).collect();
 
-    let mut cur = cursor;
-    let mut stats = ReconcileStats::default();
-    for row in rows {
-        cur = row.id;
+    let mut parsed_rows = Vec::with_capacity(rows.len());
+    let mut note_created_cm_keys = HashSet::new();
+    let mut spent_nullifier_keys = HashSet::new();
+
+    for row in &rows {
         let (kind, _amount, _anchor_root, nullifiers) = parse_kind_amount_roots(
             &row.transaction_data,
         )
         .unwrap_or(("other".to_string(), None, None, None));
+        let events_json = extract_events_from_status(row.sequencer_status.as_deref())
+            .ok()
+            .flatten();
+        let note_created_rollup_heights = extract_note_created_rollup_heights(events_json.as_ref());
 
-        stats.created_rollup_heights_repaired +=
-            repair_note_created_rollup_heights_for_row(idx, &row, &kind).await?;
+        for cm in note_created_rollup_heights.keys() {
+            note_created_cm_keys.insert(normalize_commitment_hex_for_lookup(cm));
+        }
+
+        if existing_hashes.contains(&row.tx_hash) && (kind == "transfer" || kind == "withdraw") {
+            if let Some(nfs) = nullifiers.as_ref() {
+                for nf in nfs {
+                    spent_nullifier_keys.insert(normalize_commitment_hex_for_lookup(nf));
+                }
+            }
+        }
+
+        parsed_rows.push(ReconcileRowInfo {
+            kind,
+            nullifiers,
+            note_created_rollup_heights,
+        });
+    }
+
+    let mut existing_cms = load_existing_note_created_cms(idx, note_created_cm_keys).await?;
+    let mut existing_nfs = load_existing_spent_nullifiers(idx, spent_nullifier_keys).await?;
+
+    let mut cur = cursor;
+    let mut stats = ReconcileStats::default();
+    for (row, info) in rows.iter().zip(parsed_rows.iter()) {
+        cur = row.id;
+
+        for (cm, rollup_height) in &info.note_created_rollup_heights {
+            let normalized = normalize_commitment_hex_for_lookup(cm);
+            if existing_cms.contains(&normalized) {
+                continue;
+            }
+            db::upsert_note_created_metadata(
+                idx,
+                cm,
+                &row.tx_hash,
+                row.created_at,
+                Some(*rollup_height),
+                &info.kind,
+            )
+            .await?;
+            existing_cms.insert(normalized);
+            stats.created_rollup_heights_repaired += 1;
+        }
 
         if existing_hashes.contains(&row.tx_hash) {
             // Event already exists, but we may still be missing flattened spent-nullifier rows.
-            if kind == "transfer" || kind == "withdraw" {
-                if let Some(nfs) = nullifiers.as_ref() {
-                    // Batch existence check: which nullifiers are already indexed?
-                    let nf_keys: Vec<String> = nfs
-                        .iter()
-                        .map(|nf| normalize_commitment_hex_for_lookup(nf))
-                        .collect();
-                    let existing_nfs: HashSet<String> =
-                        idx::midnight_spent_nullifiers::Entity::find()
-                            .filter(
-                                idx::midnight_spent_nullifiers::Column::Nullifier.is_in(nf_keys),
-                            )
-                            .select_only()
-                            .column(idx::midnight_spent_nullifiers::Column::Nullifier)
-                            .into_tuple()
-                            .all(idx)
-                            .await?
-                            .into_iter()
-                            .collect();
-
+            if info.kind == "transfer" || info.kind == "withdraw" {
+                if let Some(nfs) = info.nullifiers.as_ref() {
                     for nf in nfs {
                         let normalized = normalize_commitment_hex_for_lookup(nf);
                         if existing_nfs.contains(&normalized) {
-                            continue; // Already indexed — skip redundant upsert.
+                            continue;
                         }
-                        db::upsert_spent_nullifier(idx, nf, &row.tx_hash, row.created_at, &kind)
-                            .await?;
+                        db::upsert_spent_nullifier(
+                            idx,
+                            nf,
+                            &row.tx_hash,
+                            row.created_at,
+                            &info.kind,
+                        )
+                        .await?;
+                        existing_nfs.insert(normalized);
                         stats.spent_nullifiers_repaired += 1;
                     }
                 }
@@ -877,8 +937,15 @@ pub async fn backfill_index(
         db::set_last_processed_id(idx, cur).await?;
     }
 
-    // Best-effort reconciliation pass: patch accepted DA rows that are still missing in indexer.
-    // This heals races where a tx transitions Pending -> Accepted after `last_id` advanced.
+    Ok(())
+}
+
+pub async fn reconcile_accepted_rows(
+    da: &DatabaseConnection,
+    idx: &DatabaseConnection,
+    fvk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<()> {
     match reconcile_missing_accepted_rows(da, idx, fvk_registry, fvk_service).await {
         Ok(stats) if stats.total() > 0 => {
             tracing::warn!(
@@ -905,11 +972,36 @@ pub fn spawn_sync_loop(
 ) {
     tokio::spawn(async move {
         use tokio::time::{interval, Duration};
-        let mut ticker = interval(Duration::from_millis(1000));
+
+        let sync_interval_ms =
+            env_u64_or_default("SOV_INDEXER_SYNC_INTERVAL_MS", DEFAULT_SYNC_INTERVAL_MS);
+        let reconcile_interval_secs = env_u64_or_default(
+            "SOV_INDEXER_RECONCILE_INTERVAL_SECS",
+            DEFAULT_RECONCILE_INTERVAL_SECS,
+        );
+
+        tracing::info!(
+            sync_interval_ms,
+            reconcile_interval_secs,
+            "Starting indexer sync loops"
+        );
+
+        let mut sync_ticker = interval(Duration::from_millis(sync_interval_ms));
+        let mut reconcile_ticker = interval(Duration::from_secs(reconcile_interval_secs));
+        reconcile_ticker.tick().await;
+
         loop {
-            ticker.tick().await;
-            if let Err(e) = backfill_index(&da, &idx, &fvk_registry, fvk_service.as_ref()).await {
-                tracing::warn!(error = %e, "indexer backfill iteration failed");
+            tokio::select! {
+                _ = sync_ticker.tick() => {
+                    if let Err(e) = backfill_index(&da, &idx, &fvk_registry, fvk_service.as_ref()).await {
+                        tracing::warn!(error = %e, "indexer backfill iteration failed");
+                    }
+                }
+                _ = reconcile_ticker.tick() => {
+                    if let Err(e) = reconcile_accepted_rows(&da, &idx, &fvk_registry, fvk_service.as_ref()).await {
+                        tracing::warn!(error = %e, "indexer reconciliation iteration failed");
+                    }
+                }
             }
         }
     });
@@ -920,9 +1012,32 @@ pub async fn backfill_privacy_fields(
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
 ) -> Result<()> {
-    let dep_updates = backfill_deposits(idx_db, vfk_registry, fvk_service).await?;
-    let transfer_updates = backfill_transfers(idx_db, vfk_registry, fvk_service).await?;
-    let withdraw_updates = backfill_withdraws(idx_db, vfk_registry, fvk_service).await?;
+    backfill_privacy_fields_inner(idx_db, vfk_registry, fvk_service, false).await
+}
+
+pub async fn backfill_startup_privacy_fields(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+) -> Result<()> {
+    backfill_privacy_fields_inner(idx_db, vfk_registry, fvk_service, true).await
+}
+
+async fn backfill_privacy_fields_inner(
+    idx_db: &DatabaseConnection,
+    vfk_registry: &FvkRegistry,
+    fvk_service: Option<&viewer::FvkServiceClient>,
+    use_startup_cursors: bool,
+) -> Result<()> {
+    let deposit_cursor = use_startup_cursors.then_some(PRIVACY_DEPOSIT_CURSOR_KEY);
+    let transfer_cursor = use_startup_cursors.then_some(PRIVACY_TRANSFER_CURSOR_KEY);
+    let withdraw_cursor = use_startup_cursors.then_some(PRIVACY_WITHDRAW_CURSOR_KEY);
+
+    let dep_updates = backfill_deposits(idx_db, vfk_registry, fvk_service, deposit_cursor).await?;
+    let transfer_updates =
+        backfill_transfers(idx_db, vfk_registry, fvk_service, transfer_cursor).await?;
+    let withdraw_updates =
+        backfill_withdraws(idx_db, vfk_registry, fvk_service, withdraw_cursor).await?;
 
     if dep_updates > 0 || transfer_updates > 0 || withdraw_updates > 0 {
         tracing::info!(
@@ -1383,13 +1498,90 @@ async fn backfill_notes_nullifiers_withdraws(
     Ok(updated)
 }
 
+async fn privacy_backfill_cursor(
+    idx_db: &DatabaseConnection,
+    cursor_key: Option<&str>,
+) -> Result<i32> {
+    let Some(cursor_key) = cursor_key else {
+        return Ok(0);
+    };
+
+    Ok(db::get_index_meta(idx_db, cursor_key)
+        .await?
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(0))
+}
+
+async fn set_privacy_backfill_cursor(
+    idx_db: &DatabaseConnection,
+    cursor_key: Option<&str>,
+    last_id: i32,
+) -> Result<()> {
+    if let Some(cursor_key) = cursor_key {
+        db::set_index_meta(idx_db, cursor_key, &last_id.to_string()).await?;
+    }
+    Ok(())
+}
+
+async fn finish_privacy_backfill_cursor(
+    idx_db: &DatabaseConnection,
+    cursor_key: Option<&str>,
+    last_id: i32,
+    max_id: Option<i32>,
+) -> Result<()> {
+    let Some(max_id) = max_id else {
+        return Ok(());
+    };
+    if max_id > last_id {
+        set_privacy_backfill_cursor(idx_db, cursor_key, max_id).await?;
+    }
+    Ok(())
+}
+
+async fn max_deposit_event_id(idx_db: &DatabaseConnection) -> Result<Option<i32>> {
+    let max_id: Option<i32> = idx::midnight_deposit::Entity::find()
+        .select_only()
+        .column(idx::midnight_deposit::Column::EventId)
+        .order_by_desc(idx::midnight_deposit::Column::EventId)
+        .limit(1)
+        .into_tuple()
+        .one(idx_db)
+        .await?;
+    Ok(max_id)
+}
+
+async fn max_transfer_event_id(idx_db: &DatabaseConnection) -> Result<Option<i32>> {
+    let max_id: Option<i32> = idx::midnight_transfer::Entity::find()
+        .select_only()
+        .column(idx::midnight_transfer::Column::EventId)
+        .order_by_desc(idx::midnight_transfer::Column::EventId)
+        .limit(1)
+        .into_tuple()
+        .one(idx_db)
+        .await?;
+    Ok(max_id)
+}
+
+async fn max_withdraw_event_id(idx_db: &DatabaseConnection) -> Result<Option<i32>> {
+    let max_id: Option<i32> = idx::midnight_withdraw::Entity::find()
+        .select_only()
+        .column(idx::midnight_withdraw::Column::EventId)
+        .order_by_desc(idx::midnight_withdraw::Column::EventId)
+        .limit(1)
+        .into_tuple()
+        .one(idx_db)
+        .await?;
+    Ok(max_id)
+}
+
 async fn backfill_deposits(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
+    cursor_key: Option<&str>,
 ) -> Result<usize> {
     let mut updated = 0usize;
-    let mut last_id = 0i32;
+    let mut last_id = privacy_backfill_cursor(idx_db, cursor_key).await?;
 
     loop {
         let rows = idx::midnight_deposit::Entity::find()
@@ -1402,6 +1594,8 @@ async fn backfill_deposits(
             .await?;
 
         if rows.is_empty() {
+            let max_id = max_deposit_event_id(idx_db).await?;
+            finish_privacy_backfill_cursor(idx_db, cursor_key, last_id, max_id).await?;
             break;
         }
 
@@ -1417,6 +1611,7 @@ async fn backfill_deposits(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
+                set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
                 continue;
             };
 
@@ -1435,6 +1630,7 @@ async fn backfill_deposits(
             }
 
             update.update(idx_db).await?;
+            set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
             updated += 1;
         }
     }
@@ -1446,9 +1642,10 @@ async fn backfill_transfers(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
+    cursor_key: Option<&str>,
 ) -> Result<usize> {
     let mut updated = 0usize;
-    let mut last_id = 0i32;
+    let mut last_id = privacy_backfill_cursor(idx_db, cursor_key).await?;
 
     loop {
         let rows = idx::midnight_transfer::Entity::find()
@@ -1467,6 +1664,8 @@ async fn backfill_transfers(
             .await?;
 
         if rows.is_empty() {
+            let max_id = max_transfer_event_id(idx_db).await?;
+            finish_privacy_backfill_cursor(idx_db, cursor_key, last_id, max_id).await?;
             break;
         }
 
@@ -1482,6 +1681,7 @@ async fn backfill_transfers(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
+                set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
                 continue;
             };
 
@@ -1519,6 +1719,7 @@ async fn backfill_transfers(
             }
 
             update.update(idx_db).await?;
+            set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
             updated += 1;
         }
     }
@@ -1530,9 +1731,10 @@ async fn backfill_withdraws(
     idx_db: &DatabaseConnection,
     vfk_registry: &FvkRegistry,
     fvk_service: Option<&viewer::FvkServiceClient>,
+    cursor_key: Option<&str>,
 ) -> Result<usize> {
     let mut updated = 0usize;
-    let mut last_id = 0i32;
+    let mut last_id = privacy_backfill_cursor(idx_db, cursor_key).await?;
 
     loop {
         let rows = idx::midnight_withdraw::Entity::find()
@@ -1545,6 +1747,8 @@ async fn backfill_withdraws(
             .await?;
 
         if rows.is_empty() {
+            let max_id = max_withdraw_event_id(idx_db).await?;
+            finish_privacy_backfill_cursor(idx_db, cursor_key, last_id, max_id).await?;
             break;
         }
 
@@ -1560,11 +1764,13 @@ async fn backfill_withdraws(
             let decrypted_notes =
                 viewer::try_decrypt_notes_with_registry(vfk_registry, row.encrypted_notes.as_ref());
             let Some(decrypted_notes) = decrypted_notes else {
+                set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
                 continue;
             };
 
             let privacy_sender = extract_sender_from_decrypted_notes(Some(&decrypted_notes));
             let Some(privacy_sender) = privacy_sender else {
+                set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
                 continue;
             };
 
@@ -1575,6 +1781,7 @@ async fn backfill_withdraws(
             update.privacy_sender = Set(Some(privacy_sender));
 
             update.update(idx_db).await?;
+            set_privacy_backfill_cursor(idx_db, cursor_key, last_id).await?;
             updated += 1;
         }
     }

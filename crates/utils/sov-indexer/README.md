@@ -23,6 +23,9 @@ Quick start
    - `MIDNIGHT_FVK_SERVICE_URL` (optional): midnight-fvk-service base URL, default `http://127.0.0.1:8088`
    - `MIDNIGHT_FVK_SERVICE_ADMIN_TOKEN` (optional): if set, indexer fetches missing per-wallet FVKs on-demand from midnight-fvk-service (and caches them in `fvk_registry`)
    - `INDEX_DB_RESET` (optional): set to `1`/`true` to drop all index tables before startup (works for sqlite/postgresql). The `fvk_registry` table is preserved.
+   - `SOV_INDEXER_SYNC_INTERVAL_MS` (optional): interval for indexing newly accepted worker rows, default `1000`.
+   - `SOV_INDEXER_RECONCILE_INTERVAL_SECS` (optional): interval for best-effort accepted-row reconciliation, default `60`.
+   - `SOV_INDEXER_STARTUP_BACKFILLS_ENABLED` (optional): set to `true` to run historical encrypted-note/nullifier maintenance backfills on startup, default `false`.
 
 2) Run the service:
    ```bash
