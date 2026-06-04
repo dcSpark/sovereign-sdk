@@ -30,6 +30,8 @@ async fn main() -> anyhow::Result<()> {
     let postgres_acquire_timeout_secs = config.postgres_acquire_timeout_secs;
     let postgres_idle_timeout_secs = config.postgres_idle_timeout_secs;
     let postgres_max_lifetime_secs = config.postgres_max_lifetime_secs;
+    let transaction_size_collector_enabled = config.transaction_size_collector_enabled;
+    let transaction_size_backfill_enabled = config.transaction_size_backfill_enabled;
     let materialized_view_refresh_policy = materialized_views::RefreshPolicy {
         enabled: config.materialized_view_refresh_enabled,
         refresh_on_startup: config.materialized_view_refresh_on_startup,
@@ -112,14 +114,19 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .await;
-    manager
-        .register(
-            metrics::collectors::transaction_size::TransactionSizeCollector::new(
-                indexer_db.clone(),
-                tsink_retention_secs,
-            ),
-        )
-        .await;
+    if transaction_size_collector_enabled {
+        manager
+            .register(
+                metrics::collectors::transaction_size::TransactionSizeCollector::new(
+                    indexer_db.clone(),
+                    tsink_retention_secs,
+                    transaction_size_backfill_enabled,
+                ),
+            )
+            .await;
+    } else {
+        info!("Transaction size collector disabled");
+    }
     manager
         .register(
             metrics::collectors::failed_transactions::FailedTransactionsCollector::new(db.clone()),
