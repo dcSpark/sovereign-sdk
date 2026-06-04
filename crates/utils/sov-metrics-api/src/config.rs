@@ -11,6 +11,9 @@ const DEFAULT_POSTGRES_MIN_CONNECTIONS: u32 = 0;
 const DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_POSTGRES_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
 const DEFAULT_POSTGRES_MAX_LIFETIME_SECS: u64 = 30 * 60;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED: bool = true;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER: u64 = 1;
+const DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS: u64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -29,6 +32,9 @@ pub struct Config {
     pub postgres_acquire_timeout_secs: u64,
     pub postgres_idle_timeout_secs: u64,
     pub postgres_max_lifetime_secs: u64,
+    pub materialized_view_refresh_enabled: bool,
+    pub materialized_view_refresh_interval_multiplier: u64,
+    pub materialized_view_refresh_min_interval_secs: u64,
 }
 
 impl Config {
@@ -97,10 +103,8 @@ impl Config {
             Err(_) => DEFAULT_RETENTION_SECS,
         };
 
-        let tps_rounding_decimals = env_u32_or_default(
-            "TPS_ROUNDING_DECIMALS",
-            DEFAULT_TPS_ROUNDING_DECIMALS,
-        )?;
+        let tps_rounding_decimals =
+            env_u32_or_default("TPS_ROUNDING_DECIMALS", DEFAULT_TPS_ROUNDING_DECIMALS)?;
 
         let da_postgres_max_connections = env_u32_or_default(
             "SOV_METRICS_API_DA_POSTGRES_MAX_CONNECTIONS",
@@ -164,6 +168,26 @@ impl Config {
             ));
         }
 
+        let materialized_view_refresh_enabled = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ENABLED",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED,
+        )?;
+
+        let materialized_view_refresh_interval_multiplier = env_u64_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER,
+        )?;
+        if materialized_view_refresh_interval_multiplier == 0 {
+            return Err(anyhow!(
+                "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER must be > 0"
+            ));
+        }
+
+        let materialized_view_refresh_min_interval_secs = env_u64_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS",
+            DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS,
+        )?;
+
         Ok(Self {
             da_connection_string,
             indexer_db_connection_string,
@@ -179,7 +203,30 @@ impl Config {
             postgres_acquire_timeout_secs,
             postgres_idle_timeout_secs,
             postgres_max_lifetime_secs,
+            materialized_view_refresh_enabled,
+            materialized_view_refresh_interval_multiplier,
+            materialized_view_refresh_min_interval_secs,
         })
+    }
+}
+
+fn env_bool_or_default(var_name: &str, default: bool) -> Result<bool> {
+    match env::var(var_name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("{var_name} env var is empty"));
+            }
+
+            match trimmed.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                _ => Err(anyhow!(
+                    "{var_name} must be a boolean: true/false, yes/no, on/off, or 1/0"
+                )),
+            }
+        }
+        Err(_) => Ok(default),
     }
 }
 

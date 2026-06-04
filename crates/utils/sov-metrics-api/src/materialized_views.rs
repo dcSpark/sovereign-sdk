@@ -15,6 +15,32 @@ pub const DA_WORKER_TX_TOTALS_VIEW: &str = "mv_metrics_worker_tx_totals";
 const MATERIALIZED_VIEW_VERSION_TABLE: &str = "metrics_materialized_view_versions";
 
 #[derive(Clone, Copy, Debug)]
+pub struct RefreshPolicy {
+    pub enabled: bool,
+    pub interval_multiplier: u64,
+    pub min_interval_secs: u64,
+}
+
+impl RefreshPolicy {
+    fn effective_refresh_interval_secs(self, spec: ViewSpec) -> u64 {
+        spec.refresh_interval_secs
+            .saturating_mul(self.interval_multiplier.max(1))
+            .max(self.min_interval_secs)
+    }
+
+    fn effective_stale_after_secs(self, spec: ViewSpec) -> i64 {
+        let interval_secs = self.effective_refresh_interval_secs(spec);
+        let interval_secs = if interval_secs > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            interval_secs as i64
+        };
+
+        spec.stale_after_secs.max(interval_secs)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ViewSpec {
     view_name: &'static str,
     version: i32,
@@ -237,15 +263,16 @@ struct AgeRow {
 pub async fn initialize_materialized_views(
     indexer_db: DatabaseConnection,
     da_db: DatabaseConnection,
+    refresh_policy: RefreshPolicy,
 ) -> Result<()> {
     if indexer_db.get_database_backend() == DatabaseBackend::Postgres {
         info!("Initializing indexer materialized views for metrics API");
-        setup_and_start_for_db(indexer_db, INDEXER_VIEW_SPECS, "indexer").await?;
+        setup_and_start_for_db(indexer_db, INDEXER_VIEW_SPECS, "indexer", refresh_policy).await?;
     }
 
     if da_db.get_database_backend() == DatabaseBackend::Postgres {
         info!("Initializing DA materialized views for metrics API");
-        setup_and_start_for_db(da_db, DA_VIEW_SPECS, "da").await?;
+        setup_and_start_for_db(da_db, DA_VIEW_SPECS, "da", refresh_policy).await?;
     }
 
     Ok(())
@@ -255,6 +282,7 @@ async fn setup_and_start_for_db(
     db: DatabaseConnection,
     specs: &'static [ViewSpec],
     db_label: &'static str,
+    refresh_policy: RefreshPolicy,
 ) -> Result<()> {
     ensure_version_table(&db)
         .await
@@ -262,7 +290,18 @@ async fn setup_and_start_for_db(
 
     for spec in specs {
         ensure_view_schema(&db, *spec, db_label).await?;
-        if is_view_stale(&db, *spec).await? {
+
+        if !refresh_policy.enabled {
+            info!(
+                view = spec.view_name,
+                db = db_label,
+                "Skipping materialized view auto-refresh because it is disabled"
+            );
+            continue;
+        }
+
+        let stale_after_secs = refresh_policy.effective_stale_after_secs(*spec);
+        if is_view_stale(&db, *spec, stale_after_secs).await? {
             refresh_materialized_view(&db, *spec, db_label, true)
                 .await
                 .with_context(|| {
@@ -272,7 +311,7 @@ async fn setup_and_start_for_db(
                     )
                 })?;
         }
-        spawn_refresh_task(db.clone(), *spec, db_label);
+        spawn_refresh_task(db.clone(), *spec, db_label, refresh_policy);
     }
 
     Ok(())
@@ -385,7 +424,11 @@ async fn upsert_view_version(db: &DatabaseConnection, view_name: &str, version: 
     Ok(())
 }
 
-async fn is_view_stale(db: &DatabaseConnection, spec: ViewSpec) -> Result<bool> {
+async fn is_view_stale(
+    db: &DatabaseConnection,
+    spec: ViewSpec,
+    stale_after_secs: i64,
+) -> Result<bool> {
     let stmt = Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
@@ -412,19 +455,35 @@ async fn is_view_stale(db: &DatabaseConnection, spec: ViewSpec) -> Result<bool> 
     };
 
     let age_seconds = row.and_then(|row| row.age_seconds).unwrap_or(i64::MAX);
-    Ok(age_seconds >= spec.stale_after_secs)
+    Ok(age_seconds >= stale_after_secs)
 }
 
-fn spawn_refresh_task(db: DatabaseConnection, spec: ViewSpec, db_label: &'static str) {
+fn spawn_refresh_task(
+    db: DatabaseConnection,
+    spec: ViewSpec,
+    db_label: &'static str,
+    refresh_policy: RefreshPolicy,
+) {
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(spec.refresh_interval_secs));
+        let refresh_interval_secs = refresh_policy.effective_refresh_interval_secs(spec);
+        let stale_after_secs = refresh_policy.effective_stale_after_secs(spec);
+
+        info!(
+            view = spec.view_name,
+            db = db_label,
+            refresh_interval_secs,
+            stale_after_secs,
+            "Starting periodic materialized view refresh"
+        );
+
+        let mut ticker = interval(Duration::from_secs(refresh_interval_secs));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await;
 
         loop {
             ticker.tick().await;
 
-            match is_view_stale(&db, spec).await {
+            match is_view_stale(&db, spec, stale_after_secs).await {
                 Ok(false) => continue,
                 Ok(true) => {}
                 Err(error) => {

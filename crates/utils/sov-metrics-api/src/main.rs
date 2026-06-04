@@ -30,6 +30,11 @@ async fn main() -> anyhow::Result<()> {
     let postgres_acquire_timeout_secs = config.postgres_acquire_timeout_secs;
     let postgres_idle_timeout_secs = config.postgres_idle_timeout_secs;
     let postgres_max_lifetime_secs = config.postgres_max_lifetime_secs;
+    let materialized_view_refresh_policy = materialized_views::RefreshPolicy {
+        enabled: config.materialized_view_refresh_enabled,
+        interval_multiplier: config.materialized_view_refresh_interval_multiplier,
+        min_interval_secs: config.materialized_view_refresh_min_interval_secs,
+    };
 
     let ledger_http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -68,9 +73,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to connect indexer DB {indexer_conn}"))?;
 
-    materialized_views::initialize_materialized_views(indexer_db.clone(), db.clone())
-        .await
-        .context("Failed to initialize metrics materialized views")?;
+    materialized_views::initialize_materialized_views(
+        indexer_db.clone(),
+        db.clone(),
+        materialized_view_refresh_policy,
+    )
+    .await
+    .context("Failed to initialize metrics materialized views")?;
 
     let store = metrics::MetricsStore::new(tsink_data_path, tsink_retention_secs)?;
     let mut manager = metrics::MetricsManager::new(store.clone());

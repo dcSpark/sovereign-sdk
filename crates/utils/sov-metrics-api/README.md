@@ -22,10 +22,14 @@ Small HTTP API that exposes raw counter metrics from the verifier worker DB
 - `SOV_METRICS_API_POSTGRES_ACQUIRE_TIMEOUT_SECS` (optional): pool acquire timeout seconds, default `30`.
 - `SOV_METRICS_API_POSTGRES_IDLE_TIMEOUT_SECS` (optional): pool idle timeout seconds, default `600`.
 - `SOV_METRICS_API_POSTGRES_MAX_LIFETIME_SECS` (optional): pool max lifetime seconds, default `1800`.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_ENABLED` (optional): enables automatic Postgres materialized-view refreshes, default `true`. Set to `false` as an emergency RDS load-shedding switch.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER` (optional): multiplies each built-in refresh interval, default `1`.
+- `SOV_METRICS_API_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS` (optional): lower bound for each automatic materialized-view refresh interval, default `60`. Set to `0` to use the built-in per-view intervals.
 
 ## Behavior
 
 - Collectors store raw counters (monotonic totals), not derived rates.
+- On Postgres, several expensive aggregate counters are served through materialized views. The API refreshes each view in the background, with a default minimum refresh interval of 60 seconds to avoid continuously scanning large RDS tables.
 - `total-transactions` samples every 5 seconds (completed tx counter).
 - `failed-transactions-rate` samples every 5 seconds (total + failed counters).
 - `average-transaction-size` is derived from `token-value-spent` counters (transfer amount + count).
