@@ -9,17 +9,21 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, Statement,
+    ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, PaginatorTrait, Statement,
 };
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
 use utoipa::ToSchema;
 
 use crate::materialized_views::INDEXER_ACCOUNT_TOTALS_VIEW;
 use crate::metrics::collector::{BoxFuture, MetricCollector, MetricSpec};
-use crate::metrics::store::MetricSample;
+use crate::metrics::rollup_state::{self, RollupState};
+use crate::metrics::store::{MetricSample, MetricsStore};
 
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
+const MAX_DISCLOSURE_ROWS_PER_COLLECT: i64 = 2_000;
+const TRANSFER_DISCLOSURE_STATE_KEY: &str = "account_transfer_disclosures_v1";
+const WITHDRAW_DISCLOSURE_STATE_KEY: &str = "account_withdraw_disclosures_v1";
 
 /// Payload for the accounts metric series.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -40,18 +44,30 @@ pub struct AccountsPayload {
 /// - Disclosure events count
 pub struct AccountsCollector {
     indexer_db: DatabaseConnection,
+    store: MetricsStore,
     #[allow(dead_code)]
     da_db: DatabaseConnection,
     /// Window in seconds for "recent" sending accounts.
     sending_window_secs: u64,
+    materialized_view_reads_enabled: bool,
+    incremental_backfill_enabled: bool,
 }
 
 impl AccountsCollector {
-    pub fn new(indexer_db: DatabaseConnection, da_db: DatabaseConnection) -> Self {
+    pub fn new(
+        indexer_db: DatabaseConnection,
+        da_db: DatabaseConnection,
+        store: MetricsStore,
+        materialized_view_reads_enabled: bool,
+        incremental_backfill_enabled: bool,
+    ) -> Self {
         Self {
             indexer_db,
+            store,
             da_db,
             sending_window_secs: 300, // 5 minutes default
+            materialized_view_reads_enabled,
+            incremental_backfill_enabled,
         }
     }
 
@@ -72,7 +88,9 @@ impl MetricCollector for AccountsCollector {
 
     fn collect<'a>(&'a self) -> BoxFuture<'a, Result<Vec<MetricSample>>> {
         Box::pin(async move {
-            if self.indexer_db.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+            if self.materialized_view_reads_enabled
+                && self.indexer_db.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+            {
                 let payload = load_account_totals_from_mv(&self.indexer_db).await?;
                 return Ok(vec![MetricSample {
                     recorded_at_ms: Utc::now().timestamp_millis(),
@@ -88,8 +106,12 @@ impl MetricCollector for AccountsCollector {
             let sending_accounts =
                 count_recent_senders(&self.indexer_db, self.sending_window_secs).await?;
 
-            // Count disclosure events (view_attestations in transfers/withdraws)
-            let total_disclosure_events = count_disclosure_events(&self.indexer_db).await?;
+            let total_disclosure_events = count_disclosure_events(
+                &self.indexer_db,
+                &self.store,
+                self.incremental_backfill_enabled,
+            )
+            .await?;
 
             let payload = AccountsPayload {
                 total_accounts,
@@ -207,25 +229,187 @@ async fn count_recent_senders(db: &DatabaseConnection, window_secs: u64) -> Resu
     Ok(result.map(|r| r.cnt as u64).unwrap_or(0))
 }
 
-/// Counts disclosure events (transfers/withdraws with view_attestations).
-async fn count_disclosure_events(db: &DatabaseConnection) -> Result<u64> {
-    use crate::indexer_db::{midnight_transfer, midnight_withdraw};
-
-    // Count transfers with view_attestations
-    let transfer_disclosures = midnight_transfer::Entity::find()
-        .filter(midnight_transfer::Column::ViewAttestations.is_not_null())
-        .count(db)
-        .await
-        .context("Failed to count transfer disclosures")?;
-
-    // Count withdraws with view_attestations
-    let withdraw_disclosures = midnight_withdraw::Entity::find()
-        .filter(midnight_withdraw::Column::ViewAttestations.is_not_null())
-        .count(db)
-        .await
-        .context("Failed to count withdraw disclosures")?;
+async fn count_disclosure_events(
+    db: &DatabaseConnection,
+    store: &MetricsStore,
+    backfill_enabled: bool,
+) -> Result<u64> {
+    let seed_total_disclosures = load_disclosure_seed_from_store(store).await.unwrap_or(0);
+    let transfer_disclosures = collect_disclosure_rollup(
+        db,
+        TRANSFER_DISCLOSURE_STATE_KEY,
+        DisclosureTable::Transfer,
+        backfill_enabled,
+        seed_total_disclosures,
+    )
+    .await?;
+    let withdraw_disclosures = collect_disclosure_rollup(
+        db,
+        WITHDRAW_DISCLOSURE_STATE_KEY,
+        DisclosureTable::Withdraw,
+        backfill_enabled,
+        0,
+    )
+    .await?;
 
     Ok(transfer_disclosures + withdraw_disclosures)
+}
+
+async fn load_disclosure_seed_from_store(store: &MetricsStore) -> Option<u64> {
+    let latest = store.snapshot("accounts").await?.latest?;
+    let payload: AccountsPayload = serde_json::from_value(latest.payload).ok()?;
+    Some(payload.total_disclosure_events)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DisclosureTable {
+    Transfer,
+    Withdraw,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DisclosureEventIdRow {
+    event_id: i32,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct LatestDisclosureEventIdRow {
+    latest_event_id: Option<i32>,
+}
+
+async fn collect_disclosure_rollup(
+    db: &DatabaseConnection,
+    state_key: &str,
+    table: DisclosureTable,
+    backfill_enabled: bool,
+    seed_total: u64,
+) -> Result<u64> {
+    let mut state = match rollup_state::load(db, state_key).await? {
+        Some(state) => state,
+        None if backfill_enabled => {
+            info!(state_key, "Initializing disclosure rollup from beginning");
+            RollupState::empty()
+        }
+        None => {
+            let latest_event_id = load_latest_disclosure_event_id(db, table).await?;
+            let state = RollupState {
+                last_id: i64::from(latest_event_id),
+                total_transactions: i64::try_from(seed_total)
+                    .context("Disclosure seed total does not fit in i64")?,
+                ..RollupState::empty()
+            };
+            rollup_state::save(db, state_key, &state).await?;
+            info!(
+                state_key,
+                latest_event_id, seed_total, "Initialized disclosure rollup at current tip"
+            );
+            return Ok(seed_total);
+        }
+    };
+
+    let mut total = u64::try_from(state.total_transactions)
+        .context("Invalid persisted disclosure event count")?;
+    let rows =
+        load_disclosure_rows(db, table, state.last_id, MAX_DISCLOSURE_ROWS_PER_COLLECT).await?;
+    if rows.len() as i64 == MAX_DISCLOSURE_ROWS_PER_COLLECT {
+        debug!(
+            state_key,
+            batch_size = MAX_DISCLOSURE_ROWS_PER_COLLECT,
+            last_id = state.last_id,
+            "Disclosure rollup reached batch limit; backlog remains"
+        );
+    }
+
+    for row in rows {
+        if i64::from(row.event_id) > state.last_id {
+            state.last_id = i64::from(row.event_id);
+        }
+        total = total
+            .checked_add(1)
+            .context("Disclosure event count overflow")?;
+    }
+
+    state.total_transactions =
+        i64::try_from(total).context("Disclosure event count does not fit in i64")?;
+    rollup_state::save(db, state_key, &state).await?;
+
+    Ok(total)
+}
+
+async fn load_latest_disclosure_event_id(
+    db: &DatabaseConnection,
+    table: DisclosureTable,
+) -> Result<i32> {
+    let backend = db.get_database_backend();
+    let table_name = match table {
+        DisclosureTable::Transfer => "midnight_transfer",
+        DisclosureTable::Withdraw => "midnight_withdraw",
+    };
+    let stmt = Statement::from_string(
+        backend,
+        format!(
+            "
+            SELECT MAX(event_id) AS latest_event_id
+            FROM {table_name}
+            WHERE view_attestations IS NOT NULL
+            "
+        ),
+    );
+
+    let row = LatestDisclosureEventIdRow::find_by_statement(stmt)
+        .one(db)
+        .await
+        .context("Failed to query latest disclosure event id")?;
+
+    Ok(row.and_then(|row| row.latest_event_id).unwrap_or(0))
+}
+
+async fn load_disclosure_rows(
+    db: &DatabaseConnection,
+    table: DisclosureTable,
+    last_id: i64,
+    batch_size: i64,
+) -> Result<Vec<DisclosureEventIdRow>> {
+    let backend = db.get_database_backend();
+    let table_name = match table {
+        DisclosureTable::Transfer => "midnight_transfer",
+        DisclosureTable::Withdraw => "midnight_withdraw",
+    };
+    let sql = match backend {
+        sea_orm::DatabaseBackend::Postgres => {
+            format!(
+                r#"
+                SELECT event_id
+                FROM {table_name}
+                WHERE event_id > $1
+                  AND view_attestations IS NOT NULL
+                ORDER BY event_id ASC
+                LIMIT $2
+                "#
+            )
+        }
+        _ => {
+            format!(
+                r#"
+                SELECT event_id
+                FROM {table_name}
+                WHERE event_id > ?1
+                  AND view_attestations IS NOT NULL
+                ORDER BY event_id ASC
+                LIMIT ?2
+                "#
+            )
+        }
+    };
+
+    DisclosureEventIdRow::find_by_statement(Statement::from_sql_and_values(
+        backend,
+        sql,
+        vec![last_id.into(), batch_size.into()],
+    ))
+    .all(db)
+    .await
+    .context("Failed to query disclosure event rows")
 }
 
 #[derive(Debug, FromQueryResult)]

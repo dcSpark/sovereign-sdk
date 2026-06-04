@@ -91,6 +91,7 @@ pub struct AppState {
     pub tps_peak_cache: TpsPeakCache,
     pub ema_metrics_cache: EmaMetricsCache,
     pub indexer_db: DatabaseConnection,
+    pub materialized_view_reads_enabled: bool,
     /// Number of decimal places for TPS, PeakTPS, and TokensPerSecond on EMA endpoints.
     pub tps_rounding_decimals: u32,
     /// Base URL for the rollup ledger API, used to query slot TPS.
@@ -1089,7 +1090,7 @@ async fn average_transaction_size(
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_average_from_mv(backend) {
+    if should_query_average_from_mv(backend, state.materialized_view_reads_enabled) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
@@ -1269,7 +1270,7 @@ async fn median_transaction_size(
         use sea_orm::ConnectionTrait;
         state.indexer_db.get_database_backend()
     };
-    if should_query_median_from_mv(backend) {
+    if should_query_median_from_mv(backend, state.materialized_view_reads_enabled) {
         use sea_orm::{FromQueryResult, Statement};
 
         #[derive(Debug, FromQueryResult)]
@@ -1675,12 +1676,18 @@ fn window_ms(window_seconds: Option<u64>) -> Option<i64> {
     }
 }
 
-fn should_query_average_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
-    backend == sea_orm::DatabaseBackend::Postgres
+fn should_query_average_from_mv(
+    backend: sea_orm::DatabaseBackend,
+    materialized_view_reads_enabled: bool,
+) -> bool {
+    materialized_view_reads_enabled && backend == sea_orm::DatabaseBackend::Postgres
 }
 
-fn should_query_median_from_mv(backend: sea_orm::DatabaseBackend) -> bool {
-    backend == sea_orm::DatabaseBackend::Postgres
+fn should_query_median_from_mv(
+    backend: sea_orm::DatabaseBackend,
+    materialized_view_reads_enabled: bool,
+) -> bool {
+    materialized_view_reads_enabled && backend == sea_orm::DatabaseBackend::Postgres
 }
 
 fn resolve_range(from_ms: Option<i64>, to_ms: Option<i64>) -> Option<(i64, i64)> {
@@ -2578,15 +2585,26 @@ mod tests {
     fn average_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_average_from_mv(DatabaseBackend::Postgres));
-        assert!(!should_query_average_from_mv(DatabaseBackend::Sqlite));
+        assert!(should_query_average_from_mv(
+            DatabaseBackend::Postgres,
+            true
+        ));
+        assert!(!should_query_average_from_mv(
+            DatabaseBackend::Postgres,
+            false
+        ));
+        assert!(!should_query_average_from_mv(DatabaseBackend::Sqlite, true));
     }
 
     #[test]
     fn median_mv_query_gate_requires_postgres() {
         use sea_orm::DatabaseBackend;
 
-        assert!(should_query_median_from_mv(DatabaseBackend::Postgres));
-        assert!(!should_query_median_from_mv(DatabaseBackend::Sqlite));
+        assert!(should_query_median_from_mv(DatabaseBackend::Postgres, true));
+        assert!(!should_query_median_from_mv(
+            DatabaseBackend::Postgres,
+            false
+        ));
+        assert!(!should_query_median_from_mv(DatabaseBackend::Sqlite, true));
     }
 }

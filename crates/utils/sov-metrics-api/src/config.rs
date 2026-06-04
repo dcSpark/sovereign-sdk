@@ -15,6 +15,8 @@ const DEFAULT_MATERIALIZED_VIEW_REFRESH_ENABLED: bool = false;
 const DEFAULT_MATERIALIZED_VIEW_REFRESH_ON_STARTUP: bool = false;
 const DEFAULT_MATERIALIZED_VIEW_REFRESH_INTERVAL_MULTIPLIER: u64 = 1;
 const DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS: u64 = 300;
+const DEFAULT_MATERIALIZED_VIEW_READS_ENABLED: bool = false;
+const DEFAULT_INCREMENTAL_ROLLUP_BACKFILL_ENABLED: bool = false;
 const DEFAULT_TRANSACTION_SIZE_COLLECTOR_ENABLED: bool = false;
 const DEFAULT_TRANSACTION_SIZE_BACKFILL_ENABLED: bool = false;
 
@@ -39,6 +41,8 @@ pub struct Config {
     pub materialized_view_refresh_on_startup: bool,
     pub materialized_view_refresh_interval_multiplier: u64,
     pub materialized_view_refresh_min_interval_secs: u64,
+    pub materialized_view_reads_enabled: bool,
+    pub incremental_rollup_backfill_enabled: bool,
     pub transaction_size_collector_enabled: bool,
     pub transaction_size_backfill_enabled: bool,
 }
@@ -199,6 +203,16 @@ impl Config {
             DEFAULT_MATERIALIZED_VIEW_REFRESH_MIN_INTERVAL_SECS,
         )?;
 
+        let materialized_view_reads_enabled = env_bool_or_default(
+            "SOV_METRICS_API_MATERIALIZED_VIEW_READS_ENABLED",
+            DEFAULT_MATERIALIZED_VIEW_READS_ENABLED,
+        )?;
+
+        let incremental_rollup_backfill_enabled = env_bool_or_default(
+            "SOV_METRICS_API_INCREMENTAL_ROLLUP_BACKFILL_ENABLED",
+            DEFAULT_INCREMENTAL_ROLLUP_BACKFILL_ENABLED,
+        )?;
+
         let transaction_size_collector_enabled = env_bool_or_default(
             "SOV_METRICS_API_TRANSACTION_SIZE_COLLECTOR_ENABLED",
             DEFAULT_TRANSACTION_SIZE_COLLECTOR_ENABLED,
@@ -228,6 +242,8 @@ impl Config {
             materialized_view_refresh_on_startup,
             materialized_view_refresh_interval_multiplier,
             materialized_view_refresh_min_interval_secs,
+            materialized_view_reads_enabled,
+            incremental_rollup_backfill_enabled,
             transaction_size_collector_enabled,
             transaction_size_backfill_enabled,
         })
