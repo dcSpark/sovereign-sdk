@@ -50,7 +50,7 @@ requested number of pending transactions to the sequencer, and the service refil
 - `PROOF_GENERATION_INTERVAL_MS` - minimum delay between refill batches in the refill loop (default: `0`, no interval throttle)
 - `MAX_CONCURRENT_PROOFS` - concurrent proof generations (default: `5`)
 - Wallet setup/funding/deposit scale-up parallelism also follows `MAX_CONCURRENT_PROOFS` at runtime.
-- `POOL_STATE_FILE` - SQLite file used to persist wallet/pending-proof state (example: `examples/rollup-ligero/pool_state.sqlite`)
+- `POOL_STATE_FILE` - SQLite file used to persist wallet/pending-proof state (example: `examples/rollup-ligero/demo_data/pool_state.sqlite`)
 - `PROOF_POOL_TREE_RESOLVE_RETRY_ATTEMPTS` - extra retries for transient tree lag / stale anchor root during self-transfer generation (default: `1`)
 - `PROOF_POOL_TREE_RESOLVE_RETRY_DELAY_MS` - delay between those retries in ms (default: `750`)
 - `LIGERO_PROGRAM_PATH` - circuit name or wasm path (default: `note_spend_guest`)

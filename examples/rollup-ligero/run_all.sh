@@ -528,7 +528,12 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ -n "$BUILD_MODE" ]; then
   print_step "Building binaries ($BUILD_MODE)"
 
   print_info "Building rollup-ligero..."
-  SKIP_GUEST_BUILD=1 cargo build $BUILD_MODE -p sov-rollup-ligero 2>&1 | tail -3
+  ROLLUP_FEATURE_ARGS=()
+  if [[ -n "${ROLLUP_CARGO_FEATURES:-}" ]]; then
+    ROLLUP_FEATURE_ARGS=(--features "$ROLLUP_CARGO_FEATURES")
+    print_info "  with features: $ROLLUP_CARGO_FEATURES"
+  fi
+  SKIP_GUEST_BUILD=1 cargo build $BUILD_MODE -p sov-rollup-ligero "${ROLLUP_FEATURE_ARGS[@]}" 2>&1 | tail -5
   print_ok "sov-rollup-ligero"
 
   print_info "Building proof-verifier-service..."

@@ -92,6 +92,10 @@ export SOV_PROVER_MODE=prove
 ./target/release/sov-rollup-ligero
 ```
 
+For TEE-mode settlement flow and L1 Bridge integration (executor setup, config, and logs), see:
+
+- [`MIDNIGHT_BRIDGE.md`](./MIDNIGHT_BRIDGE.md)
+
 ## Service Orchestration
 
 ### Run All Services Locally
@@ -268,17 +272,67 @@ You can use the standard `sov-cli` from the main demo-rollup to interact with th
 ```bash
 # Build the CLI from demo-rollup
 cd ../demo-rollup
-cargo build --release --bin sov-cli --features arbitrary
+cargo build --bin sov-cli
 
 # Create a wallet
-../../target/release/sov-cli keys import
+../../target/debug/sov-cli keys import
 
-# Import a transaction
-../../target/release/sov-cli transactions import value_tx.json
+# Import a transaction (example: ValueSetter call)
+../../target/debug/sov-cli transactions import from-file value-setter \
+  --path value_tx.json \
+  --max-fee 1000000000
 
 # Publish transactions
-../../target/release/sov-cli transactions publish-batch http://127.0.0.1:12345
+../../target/debug/sov-cli node submit-batch by-address <your-address>
 ```
+
+### Midnight Withdrawals Prototype
+
+The demo runtime now ships a bare-bones Midnight L2 → L1 withdrawal queue. It burns the canonical NIGHT token inside `sov_bank`, records the request, and exposes a REST endpoint you can treat as a temporary proof source.
+
+1. **Craft the call.** Create `withdraw_night.json` with the new module and call name.
+
+    ```json
+    {
+      "withdraw_night": {
+        "midnight_address": "midnight1exampledestination000000000000000",
+        "amount": "1000000",
+        "gas_limit": null
+      }
+    }
+    ```
+
+2. **Submit through the CLI** (or any signing flow) just like other transactions:
+
+    ```bash
+    ../../target/debug/sov-cli transactions import from-file midnight-withdrawals \
+      --path withdraw_night.json \
+      --max-fee 1000000000
+    ../../target/debug/sov-cli node submit-batch by-address <your-address>
+    ```
+
+3. **Observe balances dropping.** Query the gas token balance to confirm the burn:
+
+    ```bash
+    curl http://127.0.0.1:12346/modules/bank/tokens/gas_token/balances/<your-address>
+    ```
+
+4. **Fetch the lightweight proof.** Every withdrawal is stored by nonce and mirrored over REST:
+
+    ```bash
+    curl http://127.0.0.1:12346/modules/midnight-withdrawals/withdrawals/0 | jq
+    curl http://127.0.0.1:12346/modules/midnight-withdrawals/withdrawals/latest-nonce
+    ```
+
+   The JSON contains the sender, target Midnight identifier, amount, and the gas hint. This is the minimal evidence that the withdrawal happened until the Merkle tree and L1 verification contracts are implemented.
+
+**Next steps toward the full architecture (Section 9 in the bridge design):**
+
+- Build a real `L2Messenger`/`L2MessageQueue` module that maintains an append-only Merkle tree (steps 3–4).
+- Extend the batch attestation/TEE output so every finalized batch carries the `withdrawRoot`, enabling the L1 contracts to verify proofs (step 5).
+- Deploy Midnight-side contracts that consume the queued messages, enforce replay protection, and transfer NIGHT back to the user (steps 6–7).
+
+Until these milestones ship, the REST response above is the canonical source of truth for testing the L2 → L1 UX.
 
 The CLI is compatible because both rollups use the same STF (State Transition Function) and modules.
 

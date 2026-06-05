@@ -268,8 +268,11 @@ impl StorableMidnightDaService {
             Some(da_layer) => da_layer.clone(),
         };
 
-        // For read-only replicas, spawn a background task to poll for new blocks
-        // added by the primary node to the shared database.
+        // Read-only replicas still need an eager background poller because they
+        // don't produce blocks themselves.  For writable nodes the periodic block
+        // producer is started later via `spawn_background_tasks` so that callers
+        // can perform one-time work (genesis init, contract deployment) without
+        // accumulating a DA block backlog.
         let handle = if config.readonly_mode {
             let poll_interval =
                 Duration::from_millis(config.readonly_poll_interval_ms.unwrap_or(1000));
@@ -279,9 +282,7 @@ impl StorableMidnightDaService {
                 poll_interval,
             ))
         } else {
-            config
-                .block_producing
-                .spawn_block_producing_if_needed(shutdown_receiver, da_layer.clone())
+            None
         };
 
         Self::construct(
@@ -635,6 +636,14 @@ impl DaService for StorableMidnightDaService {
 
     async fn take_background_join_handle(&self) -> Option<JoinHandle<()>> {
         self.block_producer_handle.lock().await.take()
+    }
+
+    async fn spawn_background_tasks(
+        &self,
+        shutdown_receiver: tokio::sync::watch::Receiver<()>,
+    ) -> Option<JoinHandle<()>> {
+        self.block_producing
+            .spawn_block_producing_if_needed(shutdown_receiver, self.da_layer.clone())
     }
 
     async fn get_signer(&self) -> <Self::Spec as DaSpec>::Address {

@@ -16,15 +16,17 @@ use sov_modules_api::rest::StateUpdateReceiver;
 use sov_modules_api::{NodeEndpoints, Spec, Storage, SyncStatus, ZkVerifier};
 use sov_modules_rollup_blueprint::pluggable_traits::PluggableSpec;
 use sov_modules_rollup_blueprint::proof_sender::SovApiProofSender;
-use sov_modules_rollup_blueprint::{FullNodeBlueprint, RollupBlueprint, SequencerCreationReceipt};
+use sov_modules_rollup_blueprint::{
+    FullNodeBlueprint, RollupBlueprint, SequencerCreationReceipt, WalletBlueprint,
+};
 use sov_rollup_interface::zk::aggregated_proof::CodeCommitment;
 use sov_sequencer::{ProofBlobSender, Sequencer};
 use sov_stf_runner::processes::{ParallelProverService, ProverService, RollupProverConfig};
 use sov_stf_runner::RollupConfig;
-// use tracing::warn;
+use tracing::warn;
 
 use crate::eth_dev_signer;
-// use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
+use crate::midnight_bridge::{spawn_midnight_bridge, BridgeCursorStore};
 
 /// Rollup with a [`ConfigurableSpec`] with [`MidnightDaSpec`] as Da spec, [`Ligero`] inner vm and [`MockZkvm`] for outer vm
 #[derive(Default)]
@@ -52,6 +54,8 @@ where
     type Spec = MockRollupSpec<WitnessGeneration>;
     type Runtime = Runtime<Self::Spec>;
 }
+
+impl WalletBlueprint<Native> for MockDemoRollup<Native> {}
 
 #[async_trait]
 impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
@@ -114,8 +118,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             buffer_raw_txs: true,
         };
 
-        // let mut endpoints = NodeEndpoints {
-        let endpoints = NodeEndpoints {
+        let mut endpoints = NodeEndpoints {
             jsonrpsee_module: sov_ethereum::get_ethereum_rpc(
                 eth_rpc_config,
                 Arc::clone(&sequencer),
@@ -124,8 +127,6 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             ..Default::default()
         };
 
-        // Midnight bridge disabled for this rollup; keep implementation intact.
-        /*
         let cursor_store = if extension.midnight_bridge.is_some() {
             match BridgeCursorStore::open(&rollup_config.storage.path) {
                 Ok(store) => Some(store),
@@ -142,12 +143,40 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             None
         };
 
-        if let Some(handle) =
-            spawn_midnight_bridge(Arc::clone(&sequencer), &extension, cursor_store)?
-        {
+        let resolved_addr =
+            sov_stf_runner::processes::bridge_lifecycle::load_contract_address(
+                &rollup_config.storage.path,
+            );
+
+        let rollup_dedup_url = rollup_config
+            .runner
+            .http_config
+            .public_address
+            .clone()
+            .or_else(|| {
+                // Use 127.0.0.1 when bind_host is 0.0.0.0 so the bridge can reach the rollup
+                // (0.0.0.0 is a server bind address, not a connectable address).
+                let host = if rollup_config.runner.http_config.bind_host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &rollup_config.runner.http_config.bind_host
+                };
+                Some(format!(
+                    "http://{}:{}",
+                    host,
+                    rollup_config.runner.http_config.bind_port
+                ))
+            });
+
+        if let Some(handle) = spawn_midnight_bridge(
+            Arc::clone(&sequencer),
+            &extension,
+            cursor_store,
+            resolved_addr.as_deref(),
+            rollup_dedup_url,
+        )? {
             endpoints.background_handles.push(handle);
         }
-        */
 
         Ok(endpoints)
     }
@@ -172,6 +201,23 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
         let outer_vm = MockZkvmHost::new_non_blocking();
         let da_verifier = Default::default();
 
+        let rollup_url = rollup_config
+            .runner
+            .http_config
+            .public_address
+            .clone()
+            .or_else(|| {
+                let host = if rollup_config.runner.http_config.bind_host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &rollup_config.runner.http_config.bind_host
+                };
+                Some(format!(
+                    "http://{}:{}",
+                    host, rollup_config.runner.http_config.bind_port
+                ))
+            });
+
         ParallelProverService::new_with_default_workers(
             inner_vm,
             outer_vm,
@@ -180,6 +226,7 @@ impl FullNodeBlueprint<Native> for MockDemoRollup<Native> {
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address,
             Some(rollup_config.storage.path.clone()),
+            rollup_url,
         )
     }
 

@@ -250,6 +250,18 @@ pub trait DaService: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Spawn (or re-spawn) background tasks such as periodic block production.
+    ///
+    /// The default implementation is a no-op.  Concrete DA services that have
+    /// deferrable background work (e.g. periodic block production) should
+    /// override this and return the [`tokio::task::JoinHandle`].
+    async fn spawn_background_tasks(
+        &self,
+        _shutdown_receiver: tokio::sync::watch::Receiver<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        None
+    }
+
     /// Returns a [`DaSpec::Address`] that signs blobs submitted by this instance of [`DaService`]
     async fn get_signer(&self) -> <Self::Spec as DaSpec>::Address;
 }

@@ -177,6 +177,7 @@ impl FullNodeBlueprint<Native> for CelestiaNomtDemoRollup<Native> {
             CodeCommitment::default(),
             rollup_config.proof_manager.prover_address,
             Some(rollup_config.storage.path.clone()),
+            None,
         )
     }
 

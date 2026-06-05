@@ -1,0 +1,7 @@
+{
+  "withdraw_night": {
+    "midnight_address": "1e524a8e02b8022f243db6c992f48c866dff4fa3b1c01624f9f2c1d269e11017",
+    "amount": "100000000000",
+    "gas_limit": null
+  }
+}

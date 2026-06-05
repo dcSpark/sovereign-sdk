@@ -1,13 +1,26 @@
 #[cfg(all(feature = "maa", target_os = "linux"))]
 use std::{env, fs, path::PathBuf, process::Command};
 
+/// Path where the Azure Guest Attestation SDK installs the header (see attestation_verifier/README.md).
+#[allow(dead_code)] // used only inside #[cfg(all(feature = "maa", target_os = "linux"))] block
+const AZ_SDK_INCLUDE_HEADER: &str = "/usr/include/azguestattestation1/AttestationClient.h";
+
 fn main() {
     // The MAA attestation client requires Azure-specific libraries (azguestattestation)
-    // that are only available on Linux Azure VMs. Skip building on non-Linux platforms.
+    // that are only available on Linux (and typically on Azure VMs). Skip building on non-Linux platforms.
     #[cfg(all(feature = "maa", target_os = "linux"))]
     {
         // Re-run if anything in the attestation_verifier directory changes.
         println!("cargo:rerun-if-changed=attestation_verifier");
+
+        let sdk_header = PathBuf::from(AZ_SDK_INCLUDE_HEADER);
+        if !sdk_header.exists() {
+            println!(
+                "cargo:warning=MAA attestation client not built: Azure Guest Attestation SDK not found (missing {}). Install it for real MAA attestation; local mock attestation (SOV_TEE_MOCK_ATTESTATION=1, ORACLE_DEV_ACCEPT_ALL=1) does not require it.",
+                AZ_SDK_INCLUDE_HEADER
+            );
+            return;
+        }
 
         let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let att_dir = manifest.join("attestation_verifier");

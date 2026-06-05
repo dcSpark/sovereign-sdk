@@ -12,8 +12,8 @@ The crate ships with an integration-style test that can hit a real Midnight inde
 
 1. Export the indexer HTTP endpoint and bridge contract address:
    ```bash
-   export MIDNIGHT_INDEXER_ENDPOINT=https://indexer.preview.midnight.network/api/v3/graphql
-   export MIDNIGHT_CONTRACT_ADDRESS=fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12
+   export MIDNIGHT_INDEXER_ENDPOINT=http://localhost:8088/api/v3/graphql
+   export MIDNIGHT_CONTRACT_ADDRESS=1a7db08f9532105a8a79b1dd75a098d38b4a5513f8c0745e733ea807a6d9eb07
    ```
 2. Execute the test:
    ```bash

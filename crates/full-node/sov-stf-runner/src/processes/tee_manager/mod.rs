@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{env, num::NonZero};
 
 use backon::{BackoffBuilder, ExponentialBuilder};
@@ -17,9 +18,10 @@ use types::{BlockProofInfo, BlockProofStatus, UnAggregatedProofList};
 
 use self::types::AggregateProofMetadata;
 use super::StateTransitionInfo;
+use crate::processes::executor_client::{batch_public_data_to_executor_json, ExecutorClient};
 use crate::processes::tee_manager::types::merkle_root_from_leaves;
-use crate::processes::TEEBatchData;
 use crate::processes::{hash_to_bytes32, ProverService, PublicDataTee, Receiver};
+use tracing::info;
 
 mod types;
 
@@ -94,6 +96,13 @@ pub struct TeeProofManager<Ps: ProverService> {
     http_client: reqwest::Client,
     oracle_url: String,
     midnight_bridge: Option<MidnightIndexerClient>,
+    executor_client: Option<ExecutorClient>,
+    rollup_id: Option<[u8; 32]>,
+    storage_path: Option<PathBuf>,
+    /// Rollup REST base URL for querying STF module state (e.g. withdraw_root).
+    rollup_url: Option<String>,
+    /// Consecutive L1 settlement failure count (for exponential backoff).
+    l1_settlement_failures: u32,
 }
 
 impl<Ps: ProverService> TeeProofManager<Ps>
@@ -114,6 +123,10 @@ where
         http_client: reqwest::Client,
         oracle_url: String,
         midnight_bridge: Option<MidnightIndexerClient>,
+        executor_client: Option<ExecutorClient>,
+        rollup_id: Option<[u8; 32]>,
+        storage_path: Option<PathBuf>,
+        rollup_url: Option<String>,
     ) -> Self {
         Self {
             prover_service,
@@ -132,6 +145,11 @@ where
             http_client,
             oracle_url,
             midnight_bridge,
+            executor_client,
+            rollup_id,
+            storage_path,
+            rollup_url,
+            l1_settlement_failures: 0,
         }
     }
 
@@ -321,8 +339,19 @@ where
                 da_end_height,
             );
 
-            tracing::debug!("Generating TEE attestation...");
+            // Log state roots for diagnostics (truncated to 32 bytes, same as L1).
+            info!(
+                batch_index = self.batch_index,
+                prev_state_root = hex::encode(&public_data.initial_state_root[..32]),
+                post_state_root = hex::encode(&public_data.final_state_root[..32]),
+                da_start_height,
+                da_end_height,
+                "Batch state roots from prover"
+            );
 
+            // Build the batch struct early so we can persist it for crash recovery.
+            // NOTE: withdraw_root is now sourced from the L2 STF (via the prover's
+            // REST query to the rollup), not the L1 indexer snapshot.
             let batch = BatchPublicDataV1 {
                 version: 1,
                 layer2_chain_id: public_data.layer2_chain_id,
@@ -337,6 +366,140 @@ where
                 last_processed_queue_index: public_data.last_processed_queue_index,
                 message_queue_hash: public_data.message_queue_hash,
                 withdraw_root: public_data.withdraw_root,
+            };
+
+            // Backoff: if previous settlement failed, wait before retrying.
+            if self.l1_settlement_failures > 0 {
+                let delay_secs = std::cmp::min(
+                    2u64.saturating_pow(self.l1_settlement_failures),
+                    60,
+                );
+                info!(
+                    batch_index = self.batch_index,
+                    failures = self.l1_settlement_failures,
+                    delay_secs,
+                    "Backing off before retrying L1 settlement"
+                );
+                sleep(Duration::from_secs(delay_secs)).await;
+            }
+
+            // Resync: query L1 state to detect if the contract is ahead of our
+            // cursor (e.g. after crash recovery finalized a batch, or if the
+            // executor returned an error but the L1 tx actually succeeded).
+            let mut skip_commit = false;
+            if let Some(ref executor) = self.executor_client {
+                match executor.get_state().await {
+                    Ok(state) => {
+                        info!(
+                            batch_index = self.batch_index,
+                            l1_finalized = state.last_finalized_batch_index,
+                            l1_committed = state.last_committed_batch_index,
+                            prev_batch_hash = hex::encode(self.prev_batch_hash),
+                            "L1 state before batch settlement"
+                        );
+                        if state.last_finalized_batch_index >= self.batch_index {
+                            // L1 already finalized this batch (or later) — resync cursor
+                            // and discard the current proof (its state roots don't chain
+                            // from L1's new lastFinalizedStateRoot).
+                            info!(
+                                batch_index = self.batch_index,
+                                l1_finalized = state.last_finalized_batch_index,
+                                "L1 is ahead; resyncing cursor and discarding current proof"
+                            );
+                            self.batch_index = state.last_finalized_batch_index + 1;
+                            self.prev_batch_hash = state.last_finalized_batch_hash;
+                            if let Some(ref sp) = self.storage_path {
+                                super::bridge_lifecycle::remove_pending_finalize(sp);
+                            }
+                            self.l1_settlement_failures = 0;
+                            // Advance the DA height cursor (the proof was consumed) but
+                            // don't use it — the next call will produce a proof that
+                            // chains correctly from the new cursor.
+                            self.stf_info_receiver
+                                .inc_next_height_to_receive_by(num_proofs_to_create as u64);
+                            return Ok(());
+                        } else if state.last_committed_batch_index >= self.batch_index
+                            && state.last_committed_batch_index > state.last_finalized_batch_index
+                        {
+                            // Batch already committed but not finalized — skip commit,
+                            // proceed directly to finalize.
+                            info!(
+                                batch_index = self.batch_index,
+                                "Batch already committed on L1; skipping commit, proceeding to finalize"
+                            );
+                            skip_commit = true;
+                        } else if state.last_finalized_batch_hash != self.prev_batch_hash
+                            && state.last_finalized_batch_index + 1 == self.batch_index
+                        {
+                            // Our prev_batch_hash doesn't match L1's — resync.
+                            warn!(
+                                batch_index = self.batch_index,
+                                our_prev = hex::encode(self.prev_batch_hash),
+                                l1_prev = hex::encode(state.last_finalized_batch_hash),
+                                "prev_batch_hash mismatch; resyncing from L1"
+                            );
+                            self.prev_batch_hash = state.last_finalized_batch_hash;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            batch_index = self.batch_index,
+                            error = %e,
+                            "Failed to query executor state for resync; proceeding with cached cursor"
+                        );
+                    }
+                }
+            }
+
+            // Commit batch on L1 via executor service (if configured).
+            // Track success so we only advance the durable batch cursor when L1 accepted both commit AND finalize.
+            let mut l1_ok = if skip_commit {
+                true // commit already on L1, proceed to finalize
+            } else if let Some(ref executor) = self.executor_client {
+                match executor
+                    .commit_batch(&self.prev_batch_hash, &batch_hash)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            batch_index = self.batch_index,
+                            "L1 commitBatch submitted via executor"
+                        );
+
+                        // Persist batch data so we can finalize on restart if the
+                        // process crashes between commit and finalize.
+                        if let Some(ref sp) = self.storage_path {
+                            if let Some(ref rid) = self.rollup_id {
+                                if let Ok(bpd_json) = batch_public_data_to_executor_json(&batch, rid) {
+                                    let pf = super::bridge_lifecycle::PendingFinalize {
+                                        batch_index: self.batch_index,
+                                        batch_public_data_json: bpd_json,
+                                        rollup_id_hex: hex::encode(rid),
+                                    };
+                                    if let Err(e) = super::bridge_lifecycle::persist_pending_finalize(sp, &pf) {
+                                        warn!(error = %e, "Failed to persist pending-finalize (non-fatal)");
+                                    }
+                                }
+                            }
+                        }
+
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            batch_index = self.batch_index,
+                            error = %e,
+                            "Executor commit_batch failed; batch cursor will NOT advance"
+                        );
+                        false
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    batch_index = self.batch_index,
+                    "Executor not configured; skipping L1 commit/finalize (configure [sequencer.extension.midnight_bridge] to enable)"
+                );
+                true // no executor configured, L1 interaction is optional
             };
 
             let mock_attestation = env_flag_enabled("SOV_TEE_MOCK_ATTESTATION");
@@ -410,7 +573,7 @@ where
             let attestation = sov_modules_api::TEEAttestation {
                 attestation: borsh::to_vec(&signed_attestation)?,
                 raw_aggregated_proof: agg_proof.raw_aggregated_proof,
-                batch_data: batch,
+                batch_data: batch.clone(),
                 attestation_type: sov_modules_api::TEEAttestationType::MAA,
             };
 
@@ -430,28 +593,86 @@ where
                 .publish_tee_attestation_blob_with_metadata(attestation)
                 .await?;
 
+            // Finalize batch on L1 via executor service (if configured).
+            // Only attempt finalize if commit succeeded -- otherwise the contract is not expecting it.
+            // Skip if we already resynced the cursor above.
+            if l1_ok {
+                if let (Some(ref executor), Some(rollup_id)) =
+                    (self.executor_client.as_ref(), self.rollup_id.as_ref())
+                {
+                    match batch_public_data_to_executor_json(&batch, rollup_id) {
+                        Ok(batch_public_data_json) => {
+                            const SIGNATURE_MAX_NONCE: u64 = 256;
+                            const SIGNER_BITMAP: u8 = 0b111; // three signers
+                            const FINALIZE_TIMESTAMP: u64 = 0;
+
+                            match executor
+                                .build_signatures(&batch_public_data_json, SIGNATURE_MAX_NONCE)
+                                .await
+                            {
+                                Ok(signatures_json) => {
+                                    if let Err(e) = executor
+                                        .finalize_batch(
+                                            &batch_public_data_json,
+                                            &signatures_json,
+                                            SIGNER_BITMAP,
+                                            FINALIZE_TIMESTAMP,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            batch_index = self.batch_index,
+                                            error = %e,
+                                            "Executor finalize_batch failed; batch cursor will NOT advance"
+                                        );
+                                        l1_ok = false;
+                                    } else {
+                                        info!(
+                                            batch_index = self.batch_index,
+                                            "L1 finalizeBatch submitted via executor"
+                                        );
+                                        if let Some(ref sp) = self.storage_path {
+                                            super::bridge_lifecycle::remove_pending_finalize(sp);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        batch_index = self.batch_index,
+                                        error = %e,
+                                        "Executor build_signatures failed; batch cursor will NOT advance"
+                                    );
+                                    l1_ok = false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                batch_index = self.batch_index,
+                                error = %e,
+                                "Failed to serialize batch public data for executor; batch cursor will NOT advance"
+                            );
+                            l1_ok = false;
+                        }
+                    }
+                }
+            }
+
             // Update the next height to receive
             self.stf_info_receiver
                 .inc_next_height_to_receive_by(num_proofs_to_create as u64);
 
-            self.batch_index += 1;
-
-            self.prev_batch_hash = batch_hash;
-
-            let tee_data = TEEBatchData {
-                last_batch_index: self.batch_index,
-                last_prev_batch_hash: self.prev_batch_hash,
-            };
-            let serialized_tee_data = borsh::to_vec(&tee_data);
-            match serialized_tee_data {
-                Ok(d) => {
-                    if let Err(e) = std::fs::write("tee_batch_data.borsh", d) {
-                        warn!("Failed to write tee_batch_data.borsh: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to serialize TEE batch data for writing: {}", e);
-                }
+            if l1_ok {
+                self.batch_index += 1;
+                self.prev_batch_hash = batch_hash;
+                self.l1_settlement_failures = 0;
+            } else {
+                self.l1_settlement_failures = self.l1_settlement_failures.saturating_add(1);
+                warn!(
+                    batch_index = self.batch_index,
+                    failures = self.l1_settlement_failures,
+                    "L1 commit/finalize failed; batch cursor NOT advanced (will retry with backoff)"
+                );
             }
         }
         tracing::debug!("Finished processing STF info");

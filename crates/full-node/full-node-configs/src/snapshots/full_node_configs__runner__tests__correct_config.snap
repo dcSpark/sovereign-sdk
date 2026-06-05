@@ -67,7 +67,9 @@ expression: config
       "max_log_limit": 1000,
       "midnight_bridge": null,
       "tee_configuration": {
-        "tee_attestation_oracle_url": "http://127.0.0.1:8090"
+        "tee_attestation_oracle_url": "http://127.0.0.1:8090",
+        "executor_url": null,
+        "rollup_id_hex": null
       }
     }
   },

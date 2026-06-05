@@ -17,7 +17,9 @@ borsh = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["alloc", "derive"] }
 strum = { workspace = true, features = ["derive"] }
 schemars = { workspace = true }
+hex = { workspace = true }
 
+sov-midnight-adapter = { workspace = true }
 sov-accounts = { workspace = true }
 sov-address = { workspace = true, features = ["evm"] }
 sov-attester-incentives = { workspace = true }
@@ -70,11 +72,8 @@ native = [
     "sov-rollup-apis",
     "sov-paymaster/native",
     "sov-address/native",
-    "sov-test-modules/native"
+    "sov-test-modules/native",
 ]
 
 # We only activate test-utils if we also have native since all our test-code use native by default.
-test-utils = [
-    "native",
-    "sov-test-utils",
-]
+test-utils = ["native", "sov-test-utils"]

@@ -289,6 +289,9 @@ pub async fn initialize_runner(
                 "https://indexer.preview.midnight.network/api/v3/graphql".to_owned(),
                 "fa8533250190a9d2b39686523e7b13e7dc30647a341f8163dceaec2cdc365f12".to_owned(),
             )),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();

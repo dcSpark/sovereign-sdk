@@ -77,6 +77,8 @@ pub(crate) struct Prover<Address, StateRoot, Witness, Da: DaService> {
     l1_bridge_cache_path: Option<PathBuf>,
     l1_bridge_cached: Arc<RwLock<L1BridgeData>>,
     warned_no_midnight_bridge: AtomicBool,
+    /// Rollup REST base URL for querying STF module state (e.g. withdraw_root).
+    rollup_url: Option<String>,
     phantom: std::marker::PhantomData<(StateRoot, Witness, Da)>,
 }
 
@@ -88,11 +90,39 @@ where
     StateRoot: Serialize + DeserializeOwned + Clone + AsRef<[u8]> + Send + Sync + 'static,
     Witness: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    /// Fetches the current withdraw root from the L2 STF via the rollup REST API.
+    /// Called inside `block_in_place`, so uses a blocking HTTP request.
+    fn fetch_stf_withdraw_root(rollup_url: &str) -> anyhow::Result<[u8; 32]> {
+        let queue_url = format!(
+            "{}/modules/midnight-withdrawals/withdrawals/queue",
+            rollup_url.trim_end_matches('/')
+        );
+        let resp = reqwest::blocking::get(&queue_url)
+            .map_err(|e| anyhow::anyhow!("STF withdrawal queue request failed: {e}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("STF withdrawal queue returned HTTP {}", resp.status());
+        }
+        #[derive(serde::Deserialize)]
+        struct QueueStatus {
+            withdraw_root_hex: String,
+        }
+        let status: QueueStatus = resp
+            .json()
+            .map_err(|e| anyhow::anyhow!("Failed to parse STF queue response: {e}"))?;
+        let bytes = hex::decode(&status.withdraw_root_hex)
+            .map_err(|e| anyhow::anyhow!("Failed to decode withdraw_root_hex: {e}"))?;
+        let root: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("withdraw_root must be 32 bytes, got {}", v.len()))?;
+        Ok(root)
+    }
+
     pub(crate) fn new(
         prover_address: Address,
         num_threads: usize,
         code_commitment: CodeCommitment,
         storage_path: Option<PathBuf>,
+        rollup_url: Option<String>,
     ) -> Self {
         let l1_bridge_cache_path = storage_path
             .as_ref()
@@ -119,6 +149,7 @@ where
             l1_bridge_cache_path,
             l1_bridge_cached: Arc::new(RwLock::new(cached)),
             warned_no_midnight_bridge: AtomicBool::new(false),
+            rollup_url,
             phantom: PhantomData,
         }
     }
@@ -282,21 +313,46 @@ where
 
                     l1_bridge.layer2_chain_id = snap.rollup.layer2_chain_id;
 
-                    let index = snap
-                        .rollup
-                        .next_cross_domain_message_index
-                        .saturating_sub(1);
+                    // Use last_processed_l1_index as the lookup key — this is the
+                    // index sent as lastProcessedQueueIndex in the batch, and the L1
+                    // contract validates messageQueueHash against this exact index.
+                    // Using nextCrossDomainMessageIndex-1 would pick up deposits
+                    // that arrived after the batch range.
+                    let index = snap.l2_messenger.last_processed_l1_index;
                     if let Some(h) = snap.rollup.message_rolling_hashes.get(&index) {
                         l1_bridge.message_queue_hash = *h;
                     } else {
                         tracing::warn!(
+                            last_processed_l1_index = index,
                             next_cross_domain_message_index =
                                 snap.rollup.next_cross_domain_message_index,
-                            "Missing message rolling hash for expected index; keeping cached value"
+                            "Missing message rolling hash for last_processed index; keeping cached value"
                         );
                     }
 
-                    if let Some(root) = snap.rollup.withdraw_roots.values().next_back() {
+                    // Prefer the STF's own withdraw root over the L1 snapshot value.
+                    // The L1 snapshot reflects the previous batch's root (circular
+                    // dependency: L1 only has the root after we finalize).
+                    if let Some(ref url) = self.rollup_url {
+                        match Self::fetch_stf_withdraw_root(url) {
+                            Ok(root) => {
+                                tracing::info!(
+                                    withdraw_root = hex::encode(root),
+                                    "Using STF withdraw root from rollup REST API"
+                                );
+                                l1_bridge.withdraw_root = root;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Failed to fetch STF withdraw root; falling back to L1 snapshot"
+                                );
+                                if let Some(root) = snap.rollup.withdraw_roots.values().next_back() {
+                                    l1_bridge.withdraw_root = *root;
+                                }
+                            }
+                        }
+                    } else if let Some(root) = snap.rollup.withdraw_roots.values().next_back() {
                         l1_bridge.withdraw_root = *root;
                     } else {
                         tracing::warn!(

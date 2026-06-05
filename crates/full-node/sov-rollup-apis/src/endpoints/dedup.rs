@@ -126,13 +126,13 @@ impl<S: Spec> SovereignDeDupEndpoint<S> {
         query: DedupQuery,
     ) -> Result<DedupResponse, anyhow::Error> {
         let credential_id = CredentialId::from_str(&credential_id)?;
-        tracing::info!(%credential_id, "Going to provide dedup for");
+        tracing::debug!(%credential_id, "Going to provide dedup for");
         let uniqueness = Uniqueness::<S>::default();
 
         match query.select {
             Some(SelectField::Generation) => {
                 let generation = uniqueness.next_generation(&credential_id, &mut state)?;
-                tracing::info!(%credential_id, %generation, "Providing generation for credential id");
+                tracing::debug!(%credential_id, %generation, "Providing generation for credential id");
                 Ok(DedupResponse {
                     nonce: None,
                     generation: Some(generation),

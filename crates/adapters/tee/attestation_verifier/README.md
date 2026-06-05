@@ -2,6 +2,8 @@
 
 Allows to verify the AMD-SEV-SNP attestation that was generated after creating your SRS5, using the official Azure Attestation SDK.
 
+**Optional for local development:** If you only use mock attestation (`SOV_TEE_MOCK_ATTESTATION=1`) and a dev oracle (`ORACLE_DEV_ACCEPT_ALL=1`), you do not need to install the Azure SDK or build this CLI. The `tee` crate build will skip the C++ attestation client when `/usr/include/azguestattestation1/AttestationClient.h` is not present.
+
 Example: 
 
 ```bash
